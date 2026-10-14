@@ -166,7 +166,7 @@ fn compound_attr_write_nil_receiver_still_fires() {
 
 /// rigor-rs#366: a compound attribute write inside a literal block body is
 /// still EVALUATED — in the block's own scope — so
-/// `x.each { h.default ||= 0; h[:a].m }` runs `widen_attribute_write`
+/// `[1].each { h.default ||= 0; h[:a].m }` runs `widen_attribute_write`
 /// there and drops `h`'s indexed narrowings for the in-body reads that
 /// follow it, while the OUTER scope's records survive and fire
 /// post-block. Before `closure_evaluated` fed the in-block replay the
@@ -834,6 +834,182 @@ fn blocked_position_attr_write_keeps_indexed_narrowing() {
                 .any(|d| d.rule_id == CALL_UNDEFINED_METHOD
                     && d.message.contains("\"s\" | 1")),
             "expected the evaluated write to drop the record for {tail:?}, got {diags:?}"
+        );
+    }
+}
+
+/// rigor-rs#363 — `break`'s argument scope lands on `join_break_scopes`,
+/// a LOCALS-only union: a scope effect there (an indexed-record drop or
+/// a slot mutation) never propagates — not to the post-loop scope, not
+/// to a later in-body read, not even to a read inside the argument
+/// itself. `eval_for` joins break scopes the same way. The exception is
+/// the `CONTENT_MUTATORS` family (`CONTENT_ADDERS` — `[]=`/`store`/
+/// `replace`/`<<`/`push` … — plus the String-only mutators such as
+/// `upcase!`/`gsub!`): the reference joins their stored arguments into
+/// the continuation binding as element evidence, so a later element
+/// read declines even though the record survives — the port emulates
+/// that by keeping the drop. Every other row keeps `h[:a]` = `"s" | 1`.
+#[test]
+fn break_arg_attr_write_keeps_indexed_narrowing() {
+    let prelude =
+        "def c; rand(2).even?; end\ndef d; rand(2).odd?; end\nh = {a: 1}\nh[:a] ||= \"s\"\n";
+    // One `"s" | 1` diagnostic each — the post-loop read.
+    for tail in [
+        // The issue rows: lexical while / until / for.
+        "while c; break h.default ||= 0; end\n",
+        "until c; break h.default ||= 0; end\n",
+        "for i in [1]; break h.default ||= 0; end\n",
+        // Nested under an arm still targets the loop.
+        "while c; if d; break h.default ||= 0; end; end\n",
+        "while c; case d; when 1; break h.default ||= 0; end; end\n",
+        // A slot mutation joins the same way.
+        "while c; break (h[:a] << 2); end\n",
+        // Non-content-adder mutators join the same way: their drops are
+        // scope effects the locals-only union never carries.
+        "while c; break h.merge!({b: 2}); end\n",
+        "while c; break h.update({b: 2}); end\n",
+        "while c; break h.clear; end\n",
+        "while c; break h.delete(:a); end\n",
+        "while c; break h.delete_if { |k, _| k == :a }; end\n",
+        "while c; break h.keep_if { |k, _| k == :a }; end\n",
+        "while c; break h.transform_values! { |v| v }; end\n",
+        // `for` runs `join_break_scopes` with no `loop_content_writeback`
+        // — even the adder family keeps its record, and so does a
+        // content write nested in a block inside the argument.
+        "for i in [1]; break h[:a] = 9; end\n",
+        "for i in [1]; break h.store(:a, 9); end\n",
+        "for i in [1]; break h.replace({b: 2}); end\n",
+        "for i in [1]; break ([1].each { h[:a] = 9 }); end\n",
+        // `break` inside a block targets the yielding call, whose scope
+        // the flat env models as dropped — but the block body's own
+        // write is a closure mutation, so the record survives anyway.
+        "[1].each { break h.default ||= 0 }\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            1,
+            "expected the post-loop read to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
+        );
+    }
+    // The suppression is positional, not post-loop only: a read after
+    // the `break` in the same body and a read inside the argument
+    // itself both keep the record — two diagnostics each.
+    for tail in [
+        "while c; if d; break h.default ||= 0; end; h[:a].frobnicate; end\n",
+        "while c; break (h.default ||= 0; h[:a].frobnicate); end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            2,
+            "expected both reads to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
+        );
+    }
+    // The positional edge extends to every use the iterated body still
+    // contains: a scanned `[]=` inside a `break` argument drops the
+    // record ONLY past the join — a sibling `break` argument, a later
+    // in-body read, an `ensure` read and in-argument reads all keep it.
+    // `next`'s argument DOES join the fixpoint (post-loop it drops),
+    // but body/argument reads keep the record the same way. And a
+    // scan-visible `END { }` operand never evaluates, so only the
+    // post-loop read declines.
+    for (tail, expected) in [
+        ("while c; break (h[:a] = 9; h[:a].frobnicate); break (h[:a] = 8; h[:a].frobnicate); end\n", 2),
+        ("while c; if d; break h[:a] = 9; end; h[:a].frobnicate; end\n", 1),
+        ("while c; h[:a].frobnicate; break h[:a] = 9; end\n", 1),
+        ("while c; begin; break h[:a] = 9; ensure; h[:a].frobnicate; end; end\n", 1),
+        ("while c; next (h[:a] = 9; h[:a].frobnicate); end\n", 1),
+        ("while c; h[:a].frobnicate; next h[:a] = 9; end\n", 1),
+        ("while c; next h[:a] = 9; h[:a].frobnicate; end\n", 1),
+        ("for i in [1]; next (h[:a] = 9; h[:a].frobnicate); end\n", 1),
+        ("while c; END { h[:a] = 9; h[:a].frobnicate }; break; end\n", 1),
+        ("while c; END { h[:a] = 9 }; h[:a].frobnicate; break; end\n", 1),
+        // Controls: never-evaluated writes the scan does NOT cover keep
+        // the record even post-loop — a top-level `END`, an `END`
+        // inside a `for` (no writeback), and a compound attribute write
+        // (not a CONTENT_MUTATORS call).
+        ("END { h[:a] = 9 }\n", 1),
+        ("for i in [1]; END { h[:a] = 9 }; end\n", 1),
+        ("while c; END { h.default ||= 9 }; break; end\n", 1),
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        let errors: Vec<_> = diags
+            .iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1"))
+            .collect();
+        assert_eq!(
+            errors.len(),
+            expected,
+            "expected {expected} `\"s\" | 1` diagnostic(s) for {tail:?}, got {diags:?}"
+        );
+    }
+    // Must-still-land controls — effects the reference DOES join still
+    // drop or shadow the record: a `next` argument feeds the loop
+    // fixpoint carrying the drop; the CONTENT_ADDERS family joins stored
+    // arguments as element evidence, so the read declines (`[]=`/`store`/
+    // `replace` — the port emulates by keeping the drop); a rebind
+    // rewrites the binding; and a body write lands on the joined
+    // iteration scope.
+    for tail in [
+        "while c; next h.default ||= 0; end\n",
+        "while c; break h[:a] = 9; end\n",
+        "while c; break (h[:a] ||= 9); end\n",
+        "while c; break h.store(:a, 9); end\n",
+        "while c; break h.replace({b: 2}); end\n",
+        "while c; break (h = {}); end\n",
+        "while c; h.default ||= 0; break; end\n",
+        // String-only mutators are `CONTENT_MUTATORS` too — the writeback
+        // scan covers them.
+        "while c; break h.upcase!; end\n",
+        "while c; break h.gsub!(\"x\", \"y\"); end\n",
+        "while c; break h.force_encoding(\"utf-8\"); end\n",
+        // The scan is textual over the whole iterated body: a content
+        // mutation in a dead `rescue` clause, a folded `if` arm or a
+        // nested block still lands on the post-body scope.
+        "while c; begin; raise; rescue; break h[:a] = 9; end; end\n",
+        "while c; begin; raise; rescue; h[:a] = 9; break; end; end\n",
+        "while c; if false; h[:a] = 9; end; end\n",
+        "while c; if nil; h[:a] = 9; end; end\n",
+        "while c; if d; h[:a] = 9; return; end; end\n",
+        "while c; break ([1].each { h[:a] = 9 }); end\n",
+        "while c; break ([1].each { if d; h[:a] = 9; return; end }); end\n",
+        // A `for` nested under a `while` is still writeback-scanned
+        // (the scan is textual over the whole body), and a `while` under
+        // a `for` shadows via its own writeback — `[]=` declines the
+        // read in both.
+        "while c; for i in [1]; break h[:a] = 9; end; end\n",
+        "for i in [1]; while c; break h[:a] = 9; end; end\n",
+        // A scan-visible mutation inside a never-EVALUATED operand
+        // still lands past the body's join — `END { }` (and `BEGIN`,
+        // `super`, `yield`) bodies are textually read by
+        // `loop_content_writeback` / `content_writeback_block_captures`
+        // even under a `break` argument.
+        "while c; END { h[:a] = 9 }; break; end\n",
+        "until c; END { h[:a] = 9 }; end\n",
+        "loop do; END { h[:a] = 9 }; break; end\n",
+        "[1].each { END { h[:a] = 9 } }\n",
+        "while c; END { if false; h[:a] = 9; end }; break; end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.rule_id == CALL_UNDEFINED_METHOD
+                    && d.message.contains("\"s\" | 1")),
+            "expected the joined write to drop the record for {tail:?}, got {diags:?}"
         );
     }
 }

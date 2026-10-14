@@ -142,6 +142,40 @@ pub(crate) struct DeadPositions {
     /// exiting `and`/`or` right side. Unlike `folded`, the region RUNS —
     /// its writes reach reads inside it and die with it at the join.
     dropped: Vec<Span>,
+    /// Every `while`/`until`/block/lambda body span — a region the
+    /// reference's content-writeback TEXT scans cover
+    /// (`loop_content_writeback`, `content_writeback_block_captures`). A
+    /// scan-visible content mutation inside one lands its drop on the
+    /// post-region scope even when the write's own position never lands —
+    /// a folded `if` arm, a join-dropped `break`-terminated `rescue`
+    /// clause — because the scan reads the body textually
+    /// (rigor-rs#363 review; [`Self::mutation_reaches`]).
+    iterated: Vec<Span>,
+    /// The `bare_locals_only` spans `LoweredAst` recorded — a `for`'s
+    /// `break` argument, whose scope lands on `join_break_scopes` with
+    /// NO writeback pass to rescue it: an iterated body nested inside
+    /// the argument (a block in `break (xs.each { h[:a] = 9 })`) must
+    /// not un-suppress the write.
+    bare: Vec<Span>,
+    /// The iterated `locals_only` spans — `while`/`until` `break`
+    /// argument positions. A scanned write inside one lands its drop on
+    /// the post-join scope only: a read inside the argument still sees
+    /// the record (`break (h[:a] ||= 9; h[:a].m)` fires `"s" | 1`
+    /// in-argument, declines post-loop — rigor-rs#363 review).
+    locals_only: Vec<Span>,
+    /// The `scanned_inert` carriers — `END { }`/`BEGIN { }`/`super(…)`/
+    /// `yield(…)` operands inside an iterated body: never evaluated (the
+    /// write's own position lands nothing) but covered by the body's
+    /// writeback text scan, so a scanned mutation there reaches ONLY a
+    /// use past the body's join (rigor-rs#363 review).
+    scanned_inert: Vec<Span>,
+    /// `(argument span, owning lexical-loop body span)` per valued `next`
+    /// under a lexical loop — the argument's marks join the fixpoint (a
+    /// post-loop use sees the drop) but a use inside the owning body —
+    /// in-argument, earlier or later in-body — keeps the record
+    /// (`while c; next (h[:a] = 9; h[:a].m); end` fires in-argument on
+    /// the oracle — rigor-rs#363 review).
+    next_args: Vec<(Span, Span)>,
 }
 
 impl DeadPositions {
@@ -214,6 +248,76 @@ impl DeadPositions {
                     && (use_.0 >= arm.end || arm.ensure.is_some_and(|e| contains(e, use_))));
         }
         true
+    }
+
+    /// `write_reaches` for a content-writeback-SCANNED mutation (a
+    /// `CONTENT_MUTATORS` call or an index-write form on a bare local —
+    /// `content_mutation_target`): the write's own position may never
+    /// land — a folded arm, a join-dropped `break`-terminated clause —
+    /// but an enclosing iterated body's textual scan applies its drop
+    /// to the post-body scope anyway (`while c; begin; raise; rescue;
+    /// break h[:a] = 9; end; end` drops `h[:a]` on the oracle —
+    /// rigor-rs#363 review). A read inside the same body evaluates
+    /// normally and keeps the prior record, so the exemption only holds
+    /// for a `use_` the body does not contain.
+    pub(crate) fn mutation_reaches(&self, write: Span, use_: Span, scanned: bool) -> bool {
+        // A write inside a `locals_only` `break` argument lands on the
+        // argument's discarded scope — for a SCANNED method the
+        // writeback rebind carries the drop to the post-join scope, but
+        // ONLY there: every use the iterated body still contains — a
+        // read inside the argument itself, inside a SIBLING `break`
+        // argument, a later in-body or `ensure` read — keeps the record
+        // (`while c; break (h[:a] = 9; h[:a].m); break (h[:a] = 8;
+        // h[:a].n); end` fires `m` and `n` on the oracle, declines
+        // post-loop — rigor-rs#363 review). A non-scanned write's drop
+        // lands nowhere at all.
+        if self.locals_only.iter().any(|&l| contains(l, write)) {
+            return scanned
+                && self
+                    .iterated
+                    .iter()
+                    .any(|&b| contains(b, write) && !contains(b, use_));
+        }
+        // A valued `next` argument joins the iteration fixpoint — its
+        // marks DO land on the post-loop scope (`next h[:a] = 9`
+        // declines post-loop) — but a use the owning body still
+        // contains evaluates pre-join and keeps the record
+        // (`while c; next (h[:a] = 9; h[:a].m); end` fires in-argument;
+        // `h[:a].before; next h[:a] = 9` fires — rigor-rs#363 review).
+        if self
+            .next_args
+            .iter()
+            .any(|&(a, b)| contains(a, write) && contains(b, use_))
+        {
+            return false;
+        }
+        // A scanned-inert operand (`END { }`/`BEGIN { }`/`super(…)`/
+        // `yield(…)` inside an iterated body) never evaluates — the mark
+        // reaches a use ONLY through the writeback text scan, i.e. past
+        // the body's join: `while c; END { h[:a] = 9 }; break; end`
+        // declines post-loop while `END { h[:a] = 9; h[:a].m }` keeps
+        // the record inside the operand (rigor-rs#363 review).
+        if self.scanned_inert.iter().any(|&s| contains(s, write)) {
+            return scanned
+                && self
+                    .iterated
+                    .iter()
+                    .any(|&b| contains(b, write) && !contains(b, use_));
+        }
+        self.write_reaches(write, use_)
+            || (scanned
+                && !self.bare.iter().any(|&s| contains(s, write))
+                && self
+                    .iterated
+                    .iter()
+                    .any(|&b| contains(b, write) && !contains(b, use_)))
+    }
+
+    /// Whether `span` lies inside an iterated body's writeback-scan
+    /// region (see `iterated`) — for the keep-the-mark question the
+    /// folded-arm retain asks before any use site is known.
+    pub(crate) fn inside_iterated(&self, span: Span) -> bool {
+        self.iterated.iter().any(|&b| contains(b, span))
     }
 
     /// Whether `span` sits inside a folded-dead arm — for questions with no
@@ -300,6 +404,11 @@ impl<'i> Typer<'i> {
         }
         let mut dead = DeadPositions {
             dropped: ast.discarded_spans().to_vec(),
+            iterated: ast.iterated_body_spans().to_vec(),
+            bare: ast.bare_locals_only_spans().to_vec(),
+            locals_only: ast.locals_only_spans().to_vec(),
+            scanned_inert: ast.scanned_inert_spans().to_vec(),
+            next_args: ast.next_arg_spans().to_vec(),
             ..Default::default()
         };
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());

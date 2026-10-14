@@ -140,6 +140,59 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`Recovered::iterative`]: crate::ast::Recovered::iterative
     pub(crate) blocked_iterative_spans: Vec<Span>,
+    /// Depth of `while`/`until`/`for` bodies the lowering sits inside —
+    /// counted so a `break` argument under one is known to land its
+    /// scope on the loop's break join. `join_break_scopes`
+    /// (`statement_evaluator.rb`) unions the break scope's LOCAL
+    /// bindings only: the indexed-narrowing table is not part of the
+    /// join, so an attribute write's record drop in that scope never
+    /// propagates (rigor-rs#363). Masked inside block/lambda bodies —
+    /// a `break` there targets the yielding call, not the loop.
+    pub(crate) lexical_loop: u32,
+    /// The spans of `break` nodes whose argument scope lands on a
+    /// lexical loop's locals-only break join ([`Self::lexical_loop`] —
+    /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]). Split by
+    /// whether an iterated body encloses the span: `while`/`until` run
+    /// `loop_content_writeback`, which text-scans the whole body — even
+    /// inside a nested `for` — and re-joins the CONTENT_MUTATORS
+    /// mutators' stored arguments into the continuation binding, so a
+    /// later element read declines anyway. `for` alone collects no
+    /// writeback, so `bare_locals_only_spans` (no enclosing iterated
+    /// body) suppresses every mutator's drop.
+    ///
+    /// [`LoweredAst::in_locals_only_carrier`]:
+    ///     crate::ast::LoweredAst::in_locals_only_carrier
+    pub(crate) locals_only_spans: Vec<Span>,
+    /// [`Self::locals_only_spans`] under no iterated body — `eval_for`
+    /// joins break scopes through `join_break_scopes` but runs no
+    /// `loop_content_writeback`, so nothing re-joins an adder mark's
+    /// store evidence (rigor-rs#363).
+    pub(crate) bare_locals_only_spans: Vec<Span>,
+    /// Every body span lowered under `recovery_iterative` — `while`/
+    /// `until` bodies and block/lambda bodies: the regions the
+    /// reference's content-writeback TEXT scans cover
+    /// (`loop_content_writeback`, `content_writeback_block_captures`).
+    /// A scan-visible content mutation inside one lands its drop on the
+    /// post-region scope even when the write's own position is
+    /// never-evaluated or join-dropped — a folded `if` arm, a dead
+    /// `rescue` clause — because the scan reads the body textually
+    /// (rigor-rs#363 review).
+    pub(crate) iterated_body_spans: Vec<Span>,
+    /// The STACK of enclosing lexical-loop body spans — pushed on each
+    /// `while`/`until`/`for` `lexical_loop` bump — so a valued `next`
+    /// pairs its argument with the INNERMOST body's join it lands on
+    /// (`while c; for i; next w; end; h[:a].m` reaches the in-body read
+    /// past the `for` — rigor-rs#363 review). A body-less loop pushes a
+    /// degenerate span so the stack stays aligned with the counter.
+    pub(crate) lexical_loop_bodies: Vec<Span>,
+    /// `(argument span, owning lexical-loop body span)` for every valued
+    /// `next` under a lexical loop — `DeadPositions::mutation_reaches`
+    /// consumes the pair: a `next` argument joins the iteration fixpoint
+    /// (its marks DO land post-loop, unlike `break`'s locals-only join),
+    /// but a use the owning body still contains evaluates pre-join and
+    /// keeps the record — `next (h[:a] = 9; h[:a].m)` fires in-argument
+    /// on the oracle (rigor-rs#363 review).
+    pub(crate) next_arg_spans: Vec<(Span, Span)>,
 }
 
 impl<'src> Builder<'src> {
@@ -612,8 +665,17 @@ impl<'src> Builder<'src> {
                         self.recovery_iterative += 1;
                         self.closure_depth += 1;
                         let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
+                        // A `break` inside the block targets the yielding
+                        // call, not an enclosing lexical loop — its
+                        // argument scope never lands on `join_break_scopes`
+                        // (rigor-rs#363).
+                        let lexical_loop = std::mem::replace(&mut self.lexical_loop, 0);
+                        if let Some(b) = bn.body() {
+                            self.iterated_body_spans.push(span_of(&b.location()));
+                        }
                         let body = self.lower_optional_body(bn.body().as_ref());
                         self.typed_depth = operand_typed;
+                        self.lexical_loop = lexical_loop;
                         self.recovery_iterative -= 1;
                         self.closure_depth -= 1;
                         body
@@ -1161,11 +1223,22 @@ impl<'src> Builder<'src> {
             // wrapped compound index write inside widens its receiver
             // whatever position or jump it sits under (rigor-rs#312).
             self.recovery_iterative += 1;
+            self.lexical_loop += 1;
+            let body_span = if let Some(s) = while_node.statements() {
+                let b = span_of(&s.location());
+                self.iterated_body_spans.push(b);
+                b
+            } else {
+                (span.0, span.0)
+            };
+            self.lexical_loop_bodies.push(body_span);
             let body = while_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
+            self.lexical_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -1178,11 +1251,22 @@ impl<'src> Builder<'src> {
         if let Some(until_node) = node.as_until_node() {
             let predicate = Some(self.lower_node(&until_node.predicate()));
             self.recovery_iterative += 1;
+            self.lexical_loop += 1;
+            let body_span = if let Some(s) = until_node.statements() {
+                let b = span_of(&s.location());
+                self.iterated_body_spans.push(b);
+                b
+            } else {
+                (span.0, span.0)
+            };
+            self.lexical_loop_bodies.push(body_span);
             let body = until_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
+            self.lexical_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -1207,12 +1291,28 @@ impl<'src> Builder<'src> {
             // (rigor-rs#312).
             self.recovery_joined += 1;
             self.recovery_next_sink += 1;
+            // `eval_for` (`statement_evaluator.rb`) joins its break
+            // scopes through the same locals-only `join_break_scopes`,
+            // so a `break` argument's scope effects never propagate
+            // here either (rigor-rs#363).
+            self.lexical_loop += 1;
+            // `for` bodies are NOT `iterated_body_spans` (no writeback
+            // scan) — the stack entry exists only to pair a valued
+            // `next` inside with the body it lands under.
+            self.lexical_loop_bodies.push(
+                for_node
+                    .statements()
+                    .map(|s| span_of(&s.location()))
+                    .unwrap_or((span.0, span.0)),
+            );
             let body = for_node
                 .statements()
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
+            self.lexical_loop_bodies.pop();
             self.recovery_joined -= 1;
             self.recovery_next_sink -= 1;
+            self.lexical_loop -= 1;
             let (index, index_writes) = for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
@@ -1650,8 +1750,13 @@ impl<'src> Builder<'src> {
             self.recovery_iterative += 1;
             self.closure_depth += 1;
             let operand_typed = std::mem::replace(&mut self.typed_depth, 0);
+            let lexical_loop = std::mem::replace(&mut self.lexical_loop, 0);
+            if let Some(b) = lambda.body() {
+                self.iterated_body_spans.push(span_of(&b.location()));
+            }
             let body = self.lower_optional_body(lambda.body().as_ref());
             self.typed_depth = operand_typed;
+            self.lexical_loop = lexical_loop;
             self.recovery_iterative -= 1;
             self.closure_depth -= 1;
             return self.push(Node::Lambda {
@@ -1715,6 +1820,24 @@ impl<'src> Builder<'src> {
             return match n.arguments() {
                 None => self.push(Node::Other { span, jump: Some(JumpKind::Next) }),
                 Some(args) => {
+                    // A valued `next` under a lexical loop joins the
+                    // iteration fixpoint rather than `join_break_scopes`
+                    // — its marks land on the post-loop scope — but a
+                    // use the owning body still contains evaluates
+                    // pre-join and keeps the record
+                    // (`while c; next (h[:a] = 9; h[:a].m); end` fires
+                    // in-argument on the oracle — rigor-rs#363 review).
+                    // `lexical_loop` is masked inside a block/lambda:
+                    // a `next` there targets the block itself.
+                    if self.lexical_loop > 0 {
+                        self.next_arg_spans.push((
+                            span,
+                            self.lexical_loop_bodies
+                                .last()
+                                .copied()
+                                .unwrap_or((0, 0)),
+                        ));
+                    }
                     let body = self.lower_body(&args.arguments());
                     self.push(Node::Statements {
                         body,
@@ -1728,6 +1851,24 @@ impl<'src> Builder<'src> {
             return match n.arguments() {
                 None => self.push(Node::Other { span, jump: Some(JumpKind::Break) }),
                 Some(args) => {
+                    // Under a lexical loop the argument's scope lands on
+                    // `join_break_scopes` — a LOCALS-only union, so a scope
+                    // effect the argument performs (an attribute write's
+                    // indexed-record drop) never propagates, not even to
+                    // reads inside the argument itself (rigor-rs#363).
+                    // A block/lambda body masks `lexical_loop`: a `break`
+                    // there targets the yielding call instead. With no
+                    // iterated body enclosing it (`recovery_iterative`),
+                    // the loop is a bare `for` — `eval_for` runs no
+                    // `loop_content_writeback`, so nothing re-joins an
+                    // adder mark's store evidence.
+                    if self.lexical_loop > 0 {
+                        if self.recovery_iterative > 0 {
+                            self.locals_only_spans.push(span);
+                        } else {
+                            self.bare_locals_only_spans.push(span);
+                        }
+                    }
                     let body = self.lower_body(&args.arguments());
                     self.push(Node::Statements {
                         body,
@@ -2106,8 +2247,10 @@ impl<'src> Builder<'src> {
     /// join (`for`'s `next_sink`, `while`/`until`/block/lambda's `iterative`
     /// — `eval_loop` merges the scope at every targeting `next` for all of
     /// them); an arm holding a `break` targeting an iterated body lands its
-    /// locals through `join_break_scopes` — a `for` body's `break` does NOT
-    /// land (`eval_for` collects no break scopes); and an arm holding a
+    /// locals through `join_break_scopes` — `eval_for` joins break scopes
+    /// too, but the `for` lowering runs under `next_sink` rather than
+    /// `iterative`, so a `for` body's `break` arm is not treated as
+    /// landing here; and an arm holding a
     /// `retry` lands its scope on the retry edge (`retry_edge_for` re-enters
     /// the `begin` carrying it — `rescue; unless r; r = ex; retry; end;
     /// raise; end` keeps `r` bound).

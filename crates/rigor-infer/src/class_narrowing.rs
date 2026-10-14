@@ -1060,10 +1060,11 @@ impl<'i> Typer<'i> {
                 value,
                 write_name,
                 evaluated,
+                span,
                 ..
             } => {
-                let (receiver, value, writer, evaluated) =
-                    (*receiver, *value, write_name.clone(), *evaluated);
+                let (receiver, value, writer, evaluated, span) =
+                    (*receiver, *value, write_name.clone(), *evaluated, *span);
                 if let Some(r) = receiver {
                     self.class_flow_expr(
                         ast, r, tenv, cenv, coarse, writes, interner, out, false,
@@ -1072,7 +1073,10 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(
                     ast, value, tenv, cenv, coarse, writes, interner, out, false,
                 );
-                if evaluated && is_shape_mutator(&writer) {
+                // A lexical `break` argument's scope lands on the
+                // locals-only break join — the writer's chain
+                // invalidation applies nowhere (rigor-rs#363).
+                if evaluated && is_shape_mutator(&writer) && !ast.in_locals_only_carrier(span) {
                     if let Some(Node::LocalVariableRead { name, .. }) =
                         receiver.map(|r| ast.get(r))
                     {

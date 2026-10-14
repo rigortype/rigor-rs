@@ -61,3 +61,34 @@ pub fn is_shape_mutator(method: &str) -> bool {
         || HASH_LOOKUP_MUTATORS.contains(&method)
         || STRING_MUTATORS.contains(&method)
 }
+
+/// `ContentJoin`'s stored-argument mutators — `ARRAY_CONTENT_ADDERS`
+/// (`content_join.rb`) plus `HASH_CONTENT_ADDERS`' `store` (`[]=` is
+/// already an array adder). These are the calls whose arguments the
+/// reference joins into the continuation collection as element
+/// evidence, so a mutation through one inside a locals-only-join
+/// position (`break`'s argument — rigor-rs#363) still leaves the
+/// receiver binding answering "contents unknown" — every later element
+/// lookup declines even though the narrowing-table record survives
+/// that join. The port emulates that by keeping the record drop for
+/// these methods only.
+pub const CONTENT_ADDERS: &[&str] = &[
+    "<<", "push", "append", "prepend", "unshift", "concat", "insert", "[]=", "fill", "replace",
+    "store",
+];
+
+/// `StatementEvaluator::CONTENT_MUTATORS` (`statement_evaluator.rb`): the
+/// call names a content-writeback TEXT SCAN counts —
+/// `CONTENT_ADDERS | (StringMutation::MUTATORS - ARRAY_MUTATORS -
+/// HASH_MUTATORS)`. A name an Array or Hash table also lists stays with
+/// those tables' adders — the scan cannot see the receiver's class, and
+/// the Array join reads a non-adder's arguments as appended elements
+/// (`slice!(0)`'s index), so a String-only mutator on a Hash receiver
+/// (`h.upcase!`) still counts: the join rebinds the local on empty
+/// evidence and the element lookup declines (rigor-rs#363 review).
+pub fn is_content_mutator(method: &str) -> bool {
+    CONTENT_ADDERS.contains(&method)
+        || (STRING_MUTATORS.contains(&method)
+            && !ARRAY_MUTATORS.contains(&method)
+            && !HASH_MUTATORS.contains(&method))
+}

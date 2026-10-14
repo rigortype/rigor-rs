@@ -35,7 +35,7 @@ pub(crate) fn span_hull(ast: &LoweredAst, ids: &[NodeId]) -> Option<rigor_parse:
 // cannot depend on this crate. Re-exported so the existing
 // `crate::flow_writes::…` / `crate::{ARRAY_MUTATORS,…}` paths keep working.
 pub(crate) use rigor_parse::mutators::{
-    ARRAY_MUTATORS, HASH_MUTATORS, STRING_MUTATORS, is_shape_mutator,
+    ARRAY_MUTATORS, HASH_MUTATORS, STRING_MUTATORS, is_content_mutator, is_shape_mutator,
 };
 // `HASH_LOOKUP_MUTATORS` is exercised from `tests.rs` only today.
 #[cfg(test)]
@@ -608,8 +608,16 @@ pub(crate) fn toplevel_mutations(
             }
         }
     }
-    out.retain(|(id, w, name, ..)| {
-        !ast.in_inert_carrier(*w)
+    out.retain(|(id, w, name, method, _)| {
+        (!ast.in_inert_carrier(*w)
+            // …unless an iterated body's writeback TEXT SCAN covers the
+            // position — `while c; END { h[:a] = 9 }; break; end` still
+            // drops `h[:a]` post-loop on the oracle (rigor-rs#363
+            // review). The operand never evaluates, so only a
+            // CONTENT_MUTATORS mark survives here — a compound ATTRIBUTE
+            // write's widening stays suppressed (`END { h.default ||=
+            // 0 }` keeps the record on both).
+            || (is_content_mutator(method) && ast.in_scanned_inert_carrier(*w)))
             // A mutation mark under a `Recovered::blocked` position never
             // lands — unless an ITERATED body's writeback text scan covers
             // it (rigor-rs#312) or the mark is a compound ATTRIBUTE write,

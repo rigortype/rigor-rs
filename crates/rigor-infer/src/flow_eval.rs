@@ -18,7 +18,7 @@ use crate::{
 use crate::dead::DeadOp;
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
-    IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
+    is_content_mutator, IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -103,8 +103,17 @@ impl<'i> Typer<'i> {
         // fires `for 1` on the oracle, not a widened decline). A `rescue`
         // arm's writes keep widening: they are real writes whose reach the
         // position rule in `DeadPositions::write_reaches` decides per-use.
+        // One mutation exception survives: a content-writeback-scan call
+        // (`CONTENT_MUTATORS`/index write) inside an iterated body — the
+        // reference's textual scan lands it on the post-body scope even
+        // from a folded arm (`while c; if false; h[:a] = 9; end; end`
+        // still drops `h[:a]` on the oracle — rigor-rs#363 review).
+        // `mutation_reaches` decides the per-use reach; a use INSIDE the
+        // body keeps the record.
         rebinds.retain(|(s, _)| !dead.covers(*s));
-        mutations.retain(|(s, ..)| !dead.covers(*s));
+        mutations.retain(|(s, _, m, _)| {
+            !dead.covers(*s) || (is_content_mutator(m) && dead.inside_iterated(*s))
+        });
         closure_muts.retain(|(_, w, _)| !dead.covers(*w));
         let indexed = collect_indexed_flow(ast);
         // Boundaries only matter while a recorded effect could postdate a use
@@ -686,7 +695,9 @@ impl<'i> Typer<'i> {
         for (wspan, name, method, drop_key) in &flow.mutations {
             if wspan.0 >= span.0
                 && wspan.1 <= span.1
-                && flow.dead.write_reaches(*wspan, site)
+                && flow
+                    .dead
+                    .mutation_reaches(*wspan, site, is_content_mutator(method))
             {
                 self.apply_mutation_effects(
                     ast,
@@ -870,6 +881,9 @@ impl<'i> Typer<'i> {
                 && wspan.0 >= span.0
                 && wspan.1 <= span.1
                 && flow.dead.write_reaches(*wspan, site)
+                // A block body's `break` argument lands on the locals-only
+                // break join — its drop applies nowhere (rigor-rs#363).
+                && !ast.in_locals_only_carrier(*wspan)
             {
                 drop_indexed_narrowings(env, name);
             }
@@ -913,15 +927,38 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
-        self.drop_indexed_mutation(name, method, drop_key, env);
+        // `break`'s argument scope lands on `join_break_scopes` — a
+        // LOCALS-only union — so an indexed-record drop there (a scope
+        // effect, not a binding) never propagates, not even to reads
+        // inside the argument (rigor-rs#363). The exception is the
+        // CONTENT_MUTATORS scan set (`[]=`/`store`/`replace`/`<<` … plus
+        // the String-only mutators `upcase!`/`sub!`/…) under an iterated
+        // body: `loop_content_writeback` text-scans it and re-joins the
+        // receiver binding, so the read declines anyway — the flat env
+        // cannot express "record present, read declined", so the port
+        // keeps the drop.
+        // `break h[:a] = 9` under `while` stays silent; under a bare
+        // `for` (no writeback) or any non-scanned mutator — `break
+        // h.merge!(…)`, `break a.pop` — the record survives and fires,
+        // exactly as the oracle reports.
+        if !ast.locals_only_suppresses(wspan, is_content_mutator(method)) {
+            self.drop_indexed_mutation(name, method, drop_key, env);
+        }
         // A `[]=` replayed through a content write-back boundary drops
         // EVERY narrowing rooted at the receiver, whatever `drop_key`
         // says: `content_writeback_block_captures` /
         // `loop_content_writeback` rebind the captured local on those
         // paths, and the rebind invalidates its records — the compound
         // `h[k] op= v` a `drop_key == None` entry otherwise keeps alive
-        // is exactly the stale record of rigor-rs#388.
-        if method == "[]=" && self.path_content_writeback(ast, root, wspan) {
+        // is exactly the stale record of rigor-rs#388. A `for` `break`
+        // argument is the exception: its scope lands on the locals-only
+        // join, so a nested block's captured `[]=` lands nowhere
+        // (`for i in xs; break (x.each { h[:a] = 9 }); end` keeps the
+        // record — rigor-rs#363 review).
+        if method == "[]="
+            && !ast.in_bare_locals_only_carrier(wspan)
+            && self.path_content_writeback(ast, root, wspan)
+        {
             drop_indexed_narrowings(env, name);
         }
         let evaluated = uncond
@@ -943,7 +980,19 @@ impl<'i> Typer<'i> {
         } else {
             None
         };
-        if MUTATOR_METHODS.contains(&method) {
+        // The receiver-binding widen is a scope effect too: inside a
+        // locals-only `break` argument it lands nowhere for a
+        // NON-scanned mutator — `break h.clear` leaves `h` at its
+        // literal carrier on the oracle, so `h[:a]` still answers `1`
+        // (rigor-rs#363 review) — and under a bare `for` at all. A
+        // SCANNED mutator's writeback DOES rejoin the receiver to a
+        // different carrier (`Hash[:a | Symbol, 1 | 9]`), so its widen
+        // must still land: keeping the `{a: 1}` literal there would let
+        // a post-loop `h[:a]` read serve stale `1` evidence the oracle
+        // does not emit.
+        if MUTATOR_METHODS.contains(&method)
+            && !ast.locals_only_suppresses(wspan, is_content_mutator(method))
+        {
             if let Some(&pre) = env.get(name) {
                 if evaluated {
                     if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
@@ -973,6 +1022,13 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
+        // A slot mutation inside a lexical `break` argument lands on the
+        // locals-only break join — its record widening or drop never
+        // propagates: `break h[:a] << 2` keeps `h[:a]`'s `"s" | 1`
+        // (rigor-rs#363).
+        if ast.in_locals_only_carrier(m.span) {
+            return;
+        }
         let lookup = indexed_narrowing_key(&m.name, &m.key);
         let Some(&recorded) = env.get(&lookup) else {
             return;
@@ -1408,7 +1464,9 @@ impl<'i> Typer<'i> {
                             .collect();
                         let live_mutations: Vec<_> = mutations
                             .iter()
-                            .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                            .filter(|(w, _, m, _)| {
+                                dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                            })
                             .cloned()
                             .collect();
                         widen_flow_writes(&live_rebinds, span, env, interner);
@@ -1431,7 +1489,9 @@ impl<'i> Typer<'i> {
                             .collect();
                         let live_mutations: Vec<_> = mutations
                             .iter()
-                            .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                            .filter(|(w, _, m, _)| {
+                                dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                            })
                             .cloned()
                             .collect();
                         widen_flow_writes(&live_rebinds, span, env, interner);
@@ -1456,7 +1516,9 @@ impl<'i> Typer<'i> {
                     .collect();
                 let live_mutations: Vec<_> = mutations
                     .iter()
-                    .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                    .filter(|(w, _, m, _)| {
+                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                    })
                     .cloned()
                     .collect();
                 widen_flow_writes(&live_rebinds, span, env, interner);
@@ -1478,7 +1540,9 @@ impl<'i> Typer<'i> {
                     .collect();
                 let live_mutations: Vec<_> = mutations
                     .iter()
-                    .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                    .filter(|(w, _, m, _)| {
+                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                    })
                     .cloned()
                     .collect();
                 widen_flow_writes(&live_rebinds, span, env, interner);
@@ -1632,8 +1696,16 @@ impl<'i> Typer<'i> {
         for (_, ev) in events {
             match ev {
                 Ev::Drop(i) => {
-                    let (_, name, method, drop_key) = &mutations[i];
-                    self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
+                    let (wspan, name, method, drop_key) = &mutations[i];
+                    // The `apply_mutation_effects` locals-only gate
+                    // (rigor-rs#363): a `break` argument's scope lands on
+                    // the locals-only break join, so the record drop
+                    // applies nowhere — except an iterated-body
+                    // content-scan call, whose writeback-joined rebind
+                    // declines the read anyway.
+                    if !ast.locals_only_suppresses(*wspan, is_content_mutator(method)) {
+                        self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
+                    }
                 }
                 Ev::Insert(i) => {
                     env.insert(stored[i].1.clone(), stored[i].2);
@@ -1813,11 +1885,15 @@ impl<'i> Typer<'i> {
         let mut mutations = toplevel_mutations(ast);
         let indexed = collect_indexed_flow(ast);
         // rigor-rs#368 — a write/mutation inside a folded-dead arm never
-        // lands; it must not widen this env either.
+        // lands; it must not widen this env either. Same iterated-body
+        // writeback exception as the `check_flow` retain above
+        // (rigor-rs#363 review).
         let dead = self.dead_positions(ast, &mut Vec::new());
         writes.retain(|(s, _)| !dead.covers(*s));
         rebinds.retain(|(s, _)| !dead.covers(*s));
-        mutations.retain(|(s, ..)| !dead.covers(*s));
+        mutations.retain(|(s, _, m, _)| {
+            !dead.covers(*s) || (is_content_mutator(m) && dead.inside_iterated(*s))
+        });
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
