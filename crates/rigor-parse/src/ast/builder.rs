@@ -1007,7 +1007,7 @@ impl<'src> Builder<'src> {
                 .is_some_and(|e| case_arm_exits(&e.as_node()) && !self.arm_lands(&e.as_node()));
             let live = arms
                 .iter()
-                .filter(|a| !(case_arm_exits(a) && !self.arm_lands(a)))
+                .filter(|a| !case_arm_exits(a) || self.arm_lands(a))
                 .count()
                 + usize::from(!else_dead);
             let mut branches = Vec::new();
@@ -1052,7 +1052,7 @@ impl<'src> Builder<'src> {
             };
             let live = arms
                 .iter()
-                .filter(|a| !(case_arm_exits(a) && !self.arm_lands(a)))
+                .filter(|a| !case_arm_exits(a) || self.arm_lands(a))
                 .count()
                 + usize::from(!else_dead);
             let mut branches = Vec::new();
