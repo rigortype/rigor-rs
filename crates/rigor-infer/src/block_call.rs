@@ -921,7 +921,11 @@ impl<'i> Typer<'i> {
     /// yet its VALUE is `push`'s return (`Array`), which is what
     /// [`Self::expr_value_bot`] needs to know (probed: `tap { [1, 2].push(raise
     /// "x") }` keeps the receiver, i.e. the call's value is non-bot).
-    fn call_declares_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
+    ///
+    /// `dead.rs` reuses it for `branch_terminates?`'s Bot half — the same
+    /// Kernel-spelled non-returning call terminates an arm
+    /// (`rescue …; Kernel.raise` drops from `live_rescues`, rigor-rs#386).
+    pub(crate) fn call_declares_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
         let Node::Call { receiver, method, .. } = ast.get(id) else {
             return false;
         };

@@ -180,6 +180,20 @@ impl<'i> Typer<'i> {
                 let value = *value;
                 self.type_of(ast, value, env, interner)
             }
+            // A plain write AS AN EXPRESSION evaluates to its RHS — the
+            // reference routes `LocalVariableWriteNode` &co through
+            // `type_of_assignment_write` (`expression_typer.rb`), so
+            // `if (q = nil)` folds `Constant[nil]` and warns always-falsey
+            // (rigor-rs#386). Op-writes (`q ||= v`) are excluded: their
+            // result keeps the old value on one edge, which is NOT `v`'s
+            // type (`q = 0; q ||= nil` evaluates truthy).
+            Node::LocalVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::InstanceVariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. } => {
+                let value = *value;
+                self.type_of(ast, value, env, interner)
+            }
             Node::Call {
                 receiver: Some(r),
                 method,

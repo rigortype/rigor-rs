@@ -76,6 +76,14 @@ struct RescueArm {
     /// clause's `rescue` keyword / the `else` / `ensure` / `end` boundary,
     /// since Prism's `RescueNode#location` runs to the LAST clause's end.
     span: Span,
+    /// The owning `begin`'s protected-body hull — `None` for an empty body.
+    /// The reference evaluates every clause from the `begin`'s ENTRY scope
+    /// (`collect_rescue_chain_results`,
+    /// `statement_evaluator.rb`), so a write in `main` never reaches a read
+    /// inside an arm (rigor-rs#386 — `begin q=1 rescue Float(q).w end` is
+    /// oracle-silent). A `retry` does not reopen this either:
+    /// `widen_entry_for_retry` carries only names the entry already binds.
+    main: Option<Span>,
     /// The arm contributes to the continuation only when it falls through —
     /// `false` once `branch_terminates?` drops it from `live_rescues`.
     live: bool,
@@ -141,9 +149,26 @@ impl DeadPositions {
         if self.folded.iter().any(|(d, _)| contains(*d, write)) {
             return false;
         }
+        // A write in a `begin`'s protected body never reaches a read inside
+        // one of that begin's `rescue` clauses — the clause evaluates from
+        // the entry scope, so it binds nothing there (`begin q=1 rescue
+        // Float(q).w end`, rigor-rs#386); a `retry` carries only
+        // entry-bound names (`widen_entry_for_retry`), which arrive via
+        // their own pre-`begin` writes anyway. The use must START inside
+        // the clause: the last clause's clipped span ends at the `begin`'s
+        // own end, so a zero-width probe at (end, end) — the post-`begin`
+        // continuation site flow_eval queries — would otherwise count as
+        // "inside the clause" and suppress the main hull's mutations from
+        // widening the post-`begin` state.
+        if self.rescue.iter().any(|a| {
+            a.span.0 <= use_.0 && use_.0 < a.span.1 && a.main.is_some_and(|m| contains(m, write))
+        }) {
+            return false;
+        }
         if let Some(arm) = self.rescue.iter().find(|a| contains(a.span, write)) {
             return contains(arm.span, use_)
-                || (arm.live && (use_.0 >= arm.end || arm.ensure.is_some_and(|e| contains(e, use_))));
+                || (arm.live
+                    && (use_.0 >= arm.end || arm.ensure.is_some_and(|e| contains(e, use_))));
         }
         true
     }
@@ -282,6 +307,15 @@ impl<'i> Typer<'i> {
                     ..
                 } if !clauses.is_empty() => {
                     let ensure = body_hull(ast, ensure_body);
+                    // The protected body reaches NO clause's reads — the
+                    // clauses evaluate from the entry scope, and a `retry`
+                    // does NOT change that: `widen_entry_for_retry` carries
+                    // only names the ENTRY already binds (a body-only write
+                    // "reads as Dynamic[top] on the first entry" — the edge
+                    // refuses it), so `begin q=1 rescue Float(q).w end` is
+                    // oracle-silent even when the clause retries
+                    // (rigor-rs#386).
+                    let main = body_hull(ast, main_body);
                     // Prism's `RescueNode#location` covers the whole clause
                     // TAIL — clause 1 of two ends at the LAST clause's `end`
                     // — so clip each arm's span to its own extent: the next
@@ -311,6 +345,7 @@ impl<'i> Typer<'i> {
                             .unwrap_or(span.1);
                         dead.rescue.push(RescueArm {
                             span: (c.span.0, own_end),
+                            main,
                             live: !self.arm_exits(ast, &c.body, seen),
                             end: span.1,
                             ensure,
@@ -437,6 +472,48 @@ impl<'i> Typer<'i> {
                     .implicit_self_literal(&qual, kind, method)
                     .or_else(|| self.file_def_literal(ast, method, *span, seen))
             }
+            // A `Const.m` no-arg call folds through the singleton literal-tail
+            // table the call-dispatch tier-4c walk records (`def self.off? =
+            // !on?` makes `C.off?` fold falsey) — the same answer
+            // `flow.always-truthy-condition` already gives for the spelling
+            // (rigor-rs#386). Anything unresolved keeps `expr_scalar`'s
+            // answer.
+            Node::Call {
+                receiver: Some(recv),
+                method,
+                args,
+                block_body,
+                span,
+                ..
+            } if args.is_empty() && block_body.is_empty() => match ast.get(*recv) {
+                Node::ConstantRead { name, .. } => self
+                    .source
+                    .const_singleton_literal(name, method)
+                    .or_else(|| self.expr_scalar(ast, pred, seen)),
+                // `self.class.m` inside a `def` — `self.class` is the
+                // enclosing class object itself, so `self.class.off?`
+                // folds like `C.off?` (`self_type_for_method_body`).
+                // A singleton-side `self` IS the class, so `self.class`
+                // is `Class` — decline there.
+                Node::Call {
+                    receiver: Some(r2),
+                    method: m2,
+                    args: a2,
+                    block_body: b2,
+                    ..
+                } if m2 == "class"
+                    && a2.is_empty()
+                    && b2.is_empty()
+                    && matches!(ast.get(*r2), Node::SelfExpr { .. }) =>
+                {
+                    match self.call_self(ast, *span) {
+                        CallSelf::Instance(q) => self.source.const_singleton_literal(&q, method),
+                        CallSelf::Singleton(_) | CallSelf::Unmodelled => None,
+                    }
+                    .or_else(|| self.expr_scalar(ast, pred, seen))
+                }
+                _ => self.expr_scalar(ast, pred, seen),
+            },
             _ => self.expr_scalar(ast, pred, seen),
         };
         scalar.map(|s| !matches!(s, Scalar::Nil | Scalar::Bool(false)))
@@ -1014,9 +1091,158 @@ impl<'i> Typer<'i> {
             // same (`f(raise)`). A receiver call's exit is already covered by
             // `receiver`'s own check.
             Node::LocalVariableWrite { value, .. } => self.stmt_exits(ast, *value, seen),
-            Node::Call { receiver, args, .. } => {
+            Node::Call {
+                receiver,
+                method,
+                args,
+                span,
+                ..
+            } => {
                 receiver.is_some_and(|r| self.stmt_exits(ast, r, seen))
                     || args.iter().any(|&a| self.stmt_exits(ast, a, seen))
+                    // `branch_terminates?`'s OTHER half — a `Bot`-typed call
+                    // terminates too (`statement_evaluator.rb:4997`): the
+                    // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
+                    // `::Kernel.abort`) and an implicit-self call a same-file
+                    // toplevel `def` answers with a provably-bot body
+                    // (`begin 1 rescue q = 1; die end`, rigor-rs#386). The
+                    // `self_type_answers?` veto gates the toplevel-def half:
+                    // `die` inside `class C; def die` dispatches to C's own
+                    // method, not the private `Object` one.
+                    || self.call_declares_bot(ast, id)
+                    || (receiver.is_none()
+                        && !self.self_answers(ast, *span, method)
+                        && self.def_exits(ast, method, seen))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether an implicit-self `method` call types `bot` on the oracle
+    /// because a same-file TOP-LEVEL `def method; …` has a provably-bot body
+    /// (`def die; raise; end` — ADR-24's `bot` def-return inference feeding
+    /// `branch_terminates?`). Same-file toplevel defs only: a `def` nested
+    /// in a class/module binds inside that owner, not `Object`, so it
+    /// cannot answer this call; a cross-file def's body is not in this AST.
+    /// Every miss declines — the arm stays live, which only ever loses a
+    /// diagnostic.
+    fn def_exits(&self, ast: &LoweredAst, method: &str, seen: &mut Vec<String>) -> bool {
+        let key = format!("bot-def:{method}");
+        if seen.contains(&key) || seen.len() >= 6 {
+            return false;
+        }
+        seen.push(key);
+        // `name` stays `Some` only for a bare `def x` — `def self.x` /
+        // `def obj.x` / `class <<` are excluded by construction — and the
+        // container-span check drops defs nested in a class/module/def,
+        // exactly `toplevel_def_in_file`'s rule.
+        let containers: Vec<Span> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::ClassDef { span, .. }
+                | Node::ModuleDef { span, .. }
+                | Node::Definition { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        // A redefinition REPLACES the binding — `def die; raise; end` then
+        // `def die; nil; end` answers `nil`, so only the LAST toplevel def
+        // of the name decides (`def_method` overwrites the same key).
+        let last = ast.iter().filter_map(|(_, n)| match n {
+            Node::Definition {
+                name: Some(m),
+                body,
+                span,
+                ..
+            } if m == method
+                && !containers
+                    .iter()
+                    .any(|&c| c != *span && c.0 <= span.0 && span.1 <= c.1) =>
+            {
+                Some((*span, body))
+            }
+            _ => None,
+        });
+        let exits = last
+            .max_by_key(|(s, _)| s.0)
+            .is_some_and(|(_, body)| self.arm_bot(ast, body, seen));
+        seen.pop();
+        exits
+    }
+
+    /// [`Self::arm_exits`] for a `def` BODY — the tail statement types `bot`
+    /// rather than merely leaving the scope: `return`/`break`/`next` still
+    /// produce a normal method return, so they do NOT count here
+    /// (`def m; return; end` returns `nil`; `def die; raise; end` is `bot`).
+    fn arm_bot(&self, ast: &LoweredAst, body: &[NodeId], seen: &mut Vec<String>) -> bool {
+        body.last().is_some_and(|&l| self.stmt_bot(ast, l, seen))
+    }
+
+    /// [`Self::stmt_exits`]'s Bot counterpart — does the statement yield a
+    /// value at all? Same shape walk minus the jump statements (they
+    /// produce the jump's payload or the method's `nil`), plus the
+    /// non-returning-call cases a `def` tail can carry.
+    fn stmt_bot(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> bool {
+        match ast.get(id) {
+            // `return e` yields `e`'s value — `return raise` produces none.
+            Node::Return { values, .. } => match values.as_slice() {
+                [v] => self.stmt_bot(ast, *v, seen),
+                _ => false,
+            },
+            // The bare jumps yield the implicit `nil`/`e` — a value, not bot.
+            Node::Other { .. } => false,
+            // `next e` / `break e` yield `e` — bot iff `e` itself is.
+            Node::Statements {
+                kind: StatementsKind::Jump(JumpKind::Next | JumpKind::Break),
+                body,
+                ..
+            } => self.arm_bot(ast, body, seen),
+            Node::Statements { body, kind, .. } => {
+                matches!(kind, StatementsKind::Sequence) && self.arm_bot(ast, body, seen)
+            }
+            Node::Call {
+                receiver: None,
+                method,
+                ..
+            } if EXIT_CALLS.contains(&method.as_str()) => true,
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                is_unless,
+                ..
+            } => match self.expr_truthiness(ast, *predicate, seen) {
+                Some(truthy) => {
+                    let live = if truthy != *is_unless {
+                        then_body
+                    } else {
+                        else_body
+                    };
+                    self.arm_bot(ast, live, seen)
+                }
+                None => {
+                    self.arm_bot(ast, then_body, seen) && self.arm_bot(ast, else_body, seen)
+                }
+            },
+            // A clause-less `begin` is a parenthesised carrier — its tail.
+            Node::BeginRescue { clauses, body, .. } if clauses.is_empty() => {
+                self.arm_bot(ast, body, seen)
+            }
+            Node::LocalVariableWrite { value, .. } => self.stmt_bot(ast, *value, seen),
+            Node::Logical { left, .. } => self.stmt_bot(ast, *left, seen),
+            Node::Call {
+                receiver,
+                method,
+                args,
+                span,
+                ..
+            } => {
+                receiver.is_some_and(|r| self.stmt_bot(ast, r, seen))
+                    || args.iter().any(|&a| self.stmt_bot(ast, a, seen))
+                    || self.call_declares_bot(ast, id)
+                    || (receiver.is_none()
+                        && !self.self_answers(ast, *span, method)
+                        && self.def_exits(ast, method, seen))
             }
             _ => false,
         }

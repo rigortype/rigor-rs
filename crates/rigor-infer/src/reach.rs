@@ -563,6 +563,10 @@ impl<'i> Typer<'i> {
         let mut binder: Option<(rigor_parse::Span, bool)> = None;
         let mut blocks_around: Vec<rigor_parse::Span> = Vec::new();
         let mut loop_spans: Vec<rigor_parse::Span> = Vec::new();
+        // `true` once an enclosing literal block binds `root` as a parameter
+        // (`|n|`, `|;l|`, `it`, `_1.._9` — `block_params` covers every form):
+        // the read resolves the yielded value, never an outer write.
+        let mut block_param_bound = false;
         let mut note_binder = |span: rigor_parse::Span, proc_like: bool| {
             if contains(span, use_span) {
                 let narrower = binder.is_none_or(|(b, _)| span.1 - span.0 < b.1 - b.0);
@@ -607,7 +611,13 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
-                Node::Call { receiver, method, block_body, .. } if !block_body.is_empty() => {
+                Node::Call {
+                    receiver,
+                    method,
+                    block_body,
+                    block_params,
+                    ..
+                } if !block_body.is_empty() => {
                     // A call's own span covers its receiver and arguments too, so
                     // the binder region is the BLOCK BODY's extent.
                     let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
@@ -615,6 +625,18 @@ impl<'i> Typer<'i> {
                     if let (Some(lo), Some(hi)) = (lo, hi) {
                         if contains((lo, hi), use_span) {
                             blocks_around.push((lo, hi));
+                            // Only a NON-proc-like block's param floors the
+                            // name: `each`/`loop` yield whatever their receiver
+                            // carries (untyped for `h.each`), which the UNTYPED
+                            // seed below stands in for. A proc-like block's
+                            // param is typed by its yield contract (`1.tap {
+                            // |v| }` binds `v` to `1`) and keeps the ordinary
+                            // write join.
+                            if !proc_like_block(ast, *receiver, method)
+                                && block_params.iter().any(|(p, _)| p == root)
+                            {
+                                block_param_bound = true;
+                            }
                         }
                         note_binder((lo, hi), proc_like_block(ast, *receiver, method));
                     }
@@ -669,7 +691,17 @@ impl<'i> Typer<'i> {
                 // own, with the same `Dynamic[top]` for an unwritten local.
                 let program_region = match binder {
                     Some((_, true)) | None => true,
-                    Some((_, false)) => operand.is_some(),
+                    // A statement-level `each`/`loop` block does not split the
+                    // scope on the reference — `propagate` descends and the
+                    // body's reads resolve against the enclosing scope the
+                    // same flow-approximate way — so the file is still the
+                    // region. The exception is a name the block BINDS itself
+                    // (`|n|`, `|;l|`, `it`, `_1.._9`): it reads the yielded
+                    // value, not an outer write, and keeps the OPAQUE answer
+                    // (rigor-rs#386 — the blanket OPAQUE bypassed
+                    // `dead.write_reaches`, leaking dead rescue/`if` writes
+                    // into `Float(q)`-style reads inside `each`/`loop do`).
+                    Some((_, false)) => operand.is_some() || !block_param_bound,
                 };
                 if !program_region {
                     return (Reach::OPAQUE, None);
@@ -741,13 +773,18 @@ impl<'i> Typer<'i> {
                 continue;
             }
             match n {
-                Node::LocalVariableWrite { name, value, span, .. }
-                    if name == root
-                        && in_region(*span)
+                Node::LocalVariableWrite { name, value, span, .. } if name == root => {
+                    // A read inside the write's own RHS runs before the
+                    // binding lands — `begin q = 1 rescue Float(q).w end`
+                    // lowers `q = (1 rescue Float(q).w)`, whose `q` reads
+                    // the PREVIOUS binding, not this write (rigor-rs#386).
+                    if in_region(*span)
                         && dead.write_reaches(*span, use_span)
-                        && !closure_bound_elsewhere(ast, *span, root, use_span) =>
-                {
-                    writes.push((*span, LocalWrite::Plain(*value)));
+                        && !closure_bound_elsewhere(ast, *span, root, use_span)
+                        && !contains(ast.get(*value).span(), use_span)
+                    {
+                        writes.push((*span, LocalWrite::Plain(*value)));
+                    }
                 }
                 // A `for` index binds the element type, which this analysis
                 // cannot see into: decline (rigor-rs#151).
@@ -762,7 +799,8 @@ impl<'i> Typer<'i> {
                     if name == root
                         && in_region(*span)
                         && dead.write_reaches(*span, use_span)
-                        && !closure_bound_elsewhere(ast, *span, root, use_span) =>
+                        && !closure_bound_elsewhere(ast, *span, root, use_span)
+                        && !contains(ast.get(*value).span(), use_span) =>
                 {
                     writes.push((*span, LocalWrite::Op(*value)));
                 }
@@ -770,7 +808,8 @@ impl<'i> Typer<'i> {
                     if in_region(*span)
                         && dead.write_reaches(*span, use_span)
                         && !closure_bound_elsewhere(ast, *span, root, use_span)
-                        && targets.bound_names().iter().any(|(n, _)| n == root) =>
+                        && targets.bound_names().iter().any(|(n, _)| n == root)
+                        && !contains(ast.get(*value).span(), use_span) =>
                 {
                     writes.push((*span, LocalWrite::Multi(*value)));
                 }
@@ -835,7 +874,26 @@ impl<'i> Typer<'i> {
                     !blocks_around.iter().any(|&b| contains(b, *w))
                         && (operand.is_none() || loopy || w.1 <= kill_span.0)
                 });
-                if params.iter().any(|p| p == root) || !outer_write {
+                // A read inside a statement-level block sees the scope
+                // `propagate` descends through: a write inside an enclosing
+                // block binds the name there exactly as one outside does —
+                // `each { if c; q = 1; end; Float(q) }` reads `q` as `1|nil`,
+                // not unbound — so the nil-injection seed applies to it too
+                // (rigor-rs#386). A never-entered closure's static snapshot
+                // still counts only writes before its boundary.
+                let inner_write = operand.is_none()
+                    && writes
+                        .iter()
+                        .any(|(w, _)| blocks_around.iter().any(|&b| contains(b, *w)));
+                // A name a statement-level block binds as a parameter reads
+                // the YIELDED value — the untyped carrier for an `h.each` —
+                // never an outer write, exactly like a `def` parameter
+                // (`h.each { |v| v = "x" if v.nil?; Float(v) }` is silent on
+                // the oracle: `v` is `"x" | untyped`, which declines).
+                if params.iter().any(|p| p == root)
+                    || block_param_bound
+                    || !(outer_write || inner_write)
+                {
                     pin = pin_join(pin, None);
                     Reach::UNTYPED
                 } else {
@@ -848,8 +906,19 @@ impl<'i> Typer<'i> {
             if kill.is_some_and(|k| span.0 < k.0) {
                 continue;
             }
-            if !loopy && (span.1 > use_span.0) {
-                continue; // at or after the read, and nothing loops back
+            // A write positioned AFTER the read only reaches it through a
+            // carrier that holds BOTH — a loop body (or a retrying `begin`)
+            // containing them re-runs through the write before the next
+            // pass's read, and a never-entered closure is no carrier for
+            // itself (a real enclosing loop still is). A write after the
+            // carrier's own end never loops back: `q = nil; while c; if q …
+            // end; break; end; q = 1` must not let the post-loop `q = 1`
+            // reach the in-loop `if q` (rigor-rs#386).
+            if span.1 > use_span.0
+                && !loop_spans.iter().any(|&l| contains(l, *span))
+                && !(operand.is_none() && blocks_around.iter().any(|&b| contains(b, *span)))
+            {
+                continue;
             }
             reach = reach.join(match *write {
                 LocalWrite::Plain(v) => {
