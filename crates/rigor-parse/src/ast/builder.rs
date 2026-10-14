@@ -1260,6 +1260,17 @@ impl<'src> Builder<'src> {
                     body.extend(ids.iter().copied());
                     clause_body = ids;
                 }
+                // A dead arm's `=> target` carries no scope either — record
+                // its span so an index-target write there stays blocked.
+                if arm_dead {
+                    if let Some(reference) = r.reference() {
+                        let span = span_of(&reference.location());
+                        self.blocked_spans.push(span);
+                        if self.recovery_iterative > 0 {
+                            self.blocked_iterative_spans.push(span);
+                        }
+                    }
+                }
                 let bound_name = r
                     .reference()
                     .and_then(|reference| reference.as_local_variable_target_node())
