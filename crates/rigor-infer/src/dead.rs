@@ -182,7 +182,13 @@ impl DeadPositions {
             return false;
         }
         if let Some(arm) = self.rescue.iter().find(|a| contains(a.span, write)) {
-            return contains(arm.span, use_)
+            // "Inside the arm" must start BEFORE its clipped end: the last
+            // clause's span runs to the `begin`'s own `end`, so a zero-width
+            // post-`begin` probe at (end, end) would otherwise count as
+            // in-arm and let a dead arm's write reach the continuation
+            // (`x = 1; begin 2 rescue x = "s" raise end; x.w` fires
+            // `for 1` on the oracle — the arm never lands, rigor-rs#362).
+            return (use_.0 < arm.span.1 && contains(arm.span, use_))
                 || (arm.live
                     && (use_.0 >= arm.end || arm.ensure.is_some_and(|e| contains(e, use_))));
         }

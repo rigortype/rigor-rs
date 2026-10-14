@@ -899,14 +899,14 @@ impl<'src> Builder<'src> {
                         && statements.is_some();
                     let then_body = statements.map(|s| {
                         if then_dropped {
-                            self.lower_body_blocked(&s.body())
+                            self.lower_body_discarded(&s.body())
                         } else {
                             self.lower_body(&s.body())
                         }
                     });
                     let else_body = subsequent.map(|sub| {
                         if else_dropped {
-                            vec![self.lower_blocked(&sub)]
+                            vec![self.lower_discarded(&sub)]
                         } else {
                             vec![self.lower_node(&sub)]
                         }
@@ -953,14 +953,14 @@ impl<'src> Builder<'src> {
                         && statements.is_some();
                     let then_body = statements.map(|s| {
                         if body_dropped {
-                            self.lower_body_blocked(&s.body())
+                            self.lower_body_discarded(&s.body())
                         } else {
                             self.lower_body(&s.body())
                         }
                     });
                     let else_body = else_clause.map(|e| {
                         if else_dropped {
-                            vec![self.lower_blocked(&e.as_node())]
+                            vec![self.lower_discarded(&e.as_node())]
                         } else {
                             vec![self.lower_node(&e.as_node())]
                         }
@@ -1014,7 +1014,7 @@ impl<'src> Builder<'src> {
             for arm in &arms {
                 let dead = case_arm_exits(arm) && !self.arm_lands(arm);
                 if dead && live != 0 {
-                    branches.push(self.lower_blocked(arm));
+                    branches.push(self.lower_discarded(arm));
                 } else {
                     branches.push(self.lower_node(arm));
                 }
@@ -1025,7 +1025,7 @@ impl<'src> Builder<'src> {
                 .and_then(|e| e.statements())
                 .map(|s| {
                     if else_dead_and_dropped {
-                        self.lower_body_blocked(&s.body())
+                        self.lower_body_discarded(&s.body())
                     } else {
                         self.lower_body(&s.body())
                     }
@@ -1059,7 +1059,7 @@ impl<'src> Builder<'src> {
             for arm in &arms {
                 let dead = case_arm_exits(arm) && !self.arm_lands(arm);
                 if dead && live != 0 {
-                    branches.push(self.lower_blocked(arm));
+                    branches.push(self.lower_discarded(arm));
                 } else {
                     branches.push(self.lower_node(arm));
                 }
@@ -1070,7 +1070,7 @@ impl<'src> Builder<'src> {
                 .and_then(|e| e.statements())
                 .map(|s| {
                     if else_dead_and_dropped {
-                        self.lower_body_blocked(&s.body())
+                        self.lower_body_discarded(&s.body())
                     } else {
                         self.lower_body(&s.body())
                     }
@@ -1231,6 +1231,13 @@ impl<'src> Builder<'src> {
             // the SAME ids per clause (no double-lowering).
             let mut clauses: Vec<RescueClause> = Vec::new();
             let mut rescue = begin_node.rescue_clause();
+            // A `begin`/`rescue`/`end` keyword clause is EVALUATED — its
+            // scope is only dropped at the post-`begin` join — while a
+            // rescue MODIFIER's arm (`x = y rescue z`) binds nothing even
+            // internally on the oracle (`x = y rescue (q = 2; q.w)` is
+            // silent — rigor-rs#362), so dead clauses of the two forms take
+            // the two different marks.
+            let keyword_begin = begin_node.begin_keyword_loc().is_some();
             while let Some(r) = rescue {
                 // A clause whose body exits unconditionally contributes no
                 // scope to the post-`begin` join (`live_rescue_results`
@@ -1243,7 +1250,9 @@ impl<'src> Builder<'src> {
                     });
                 let mut exceptions = Vec::new();
                 for exc in r.exceptions().iter() {
-                    let id = if arm_dead {
+                    let id = if arm_dead && keyword_begin {
+                        self.lower_discarded(&exc)
+                    } else if arm_dead {
                         self.lower_blocked(&exc)
                     } else {
                         self.lower_node(&exc)
@@ -1253,7 +1262,9 @@ impl<'src> Builder<'src> {
                 }
                 let mut clause_body = Vec::new();
                 if let Some(s) = r.statements() {
-                    let ids = if arm_dead {
+                    let ids = if arm_dead && keyword_begin {
+                        self.lower_body_discarded(&s.body())
+                    } else if arm_dead {
                         self.lower_body_blocked(&s.body())
                     } else {
                         self.lower_body(&s.body())
@@ -1320,7 +1331,7 @@ impl<'src> Builder<'src> {
             // rigor-rs#362 — `c && (h.default ||= 0; return)` lands nothing).
             let right_node = and_node.right();
             let right = if unconditional_exit(&right_node) && !self.arm_lands(&right_node) {
-                self.lower_blocked(&right_node)
+                self.lower_discarded(&right_node)
             } else {
                 self.lower_node(&right_node)
             };
@@ -1336,7 +1347,7 @@ impl<'src> Builder<'src> {
             let left = self.lower_node(&or_node.left());
             let right_node = or_node.right();
             let right = if unconditional_exit(&right_node) && !self.arm_lands(&right_node) {
-                self.lower_blocked(&right_node)
+                self.lower_discarded(&right_node)
             } else {
                 self.lower_node(&right_node)
             };
@@ -2007,12 +2018,17 @@ impl<'src> Builder<'src> {
     }
 
     /// Lower `node` under the `blocked` recovery mark — the handled path's
-    /// `blocked_subtree`: the position's post-scope is discarded before any
-    /// join or never scope-evaluates (a `when`/`in` condition, a terminated
-    /// or folded-dead arm, an `and`/`or` right side that exits), so its
-    /// writes land no bindings, widenings or narrowing drops downstream.
-    /// `lower_recovered` records the same span pair for `Recovered`
-    /// children; this is the `lower_node` counterpart.
+    /// `blocked_subtree`: the position NEVER scope-evaluates (a `when`/`in`
+    /// condition or pattern, a folded-dead arm, a rescue MODIFIER's arm,
+    /// an `and`/`or` operand the wrapper discards), so its writes land no
+    /// bindings, widenings or narrowing drops anywhere — reads inside the
+    /// position itself witness nothing either (`when (q = 1; q.w)` is
+    /// silent on the oracle — rigor-rs#362). A position the reference
+    /// DOES evaluate before discarding its post-scope — a terminated arm,
+    /// a dead `begin`/`rescue` clause — is [`Self::lower_discarded`]
+    /// instead: its writes still bind for in-position reads
+    /// (rigor-rs#368). `lower_recovered` records the same span pair for
+    /// `Recovered` children; this is the `lower_node` counterpart.
     fn lower_blocked(&mut self, node: &PrismNode<'_>) -> NodeId {
         let span = span_of(&node.location());
         self.blocked_spans.push(span);
@@ -2023,6 +2039,33 @@ impl<'src> Builder<'src> {
         let id = self.lower_node(node);
         self.recovery_blocked -= 1;
         id
+    }
+
+    /// [`Self::lower_blocked`] WITHOUT the span recording — for a position
+    /// the reference still EVALUATES but whose post-scope the join drops:
+    /// a terminated `if`/`case`/`in`/rescue-clause arm or an `and`/`or`
+    /// right side that exits (`live_rescue_results`,
+    /// `join_case_branch_scopes`, `eval_if`'s edges). Writes there DO bind
+    /// for reads inside the same position (`rescue; x = 2; x.w; raise`
+    /// fires `for 2` — rigor-rs#368), so `blocked_spans` must not cover
+    /// them: `DeadPositions::write_reaches` already answers the positional
+    /// rule per read. The counter still bumps so the `AttrWrite` gate sees
+    /// the position as discarded — an `h.default ||= 0` here drops no
+    /// indexed narrowing anywhere, in-arm reads included on the oracle's
+    /// model (the arm's own scope is thrown away too).
+    fn lower_discarded(&mut self, node: &PrismNode<'_>) -> NodeId {
+        self.recovery_blocked += 1;
+        let id = self.lower_node(node);
+        self.recovery_blocked -= 1;
+        id
+    }
+
+    /// [`Self::lower_discarded`] for a `StatementsNode`'s body list.
+    fn lower_body_discarded(&mut self, body: &ruby_prism::NodeList<'_>) -> Vec<NodeId> {
+        self.recovery_blocked += 1;
+        let ids = body.iter().map(|n| self.lower_node(&n)).collect();
+        self.recovery_blocked -= 1;
+        ids
     }
 
     /// [`Self::lower_blocked`] for a `StatementsNode`'s body list — one
