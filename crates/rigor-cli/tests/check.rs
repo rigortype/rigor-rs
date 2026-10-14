@@ -360,6 +360,45 @@ fn nested_block_attr_write_drops_indexed_narrowing() {
     }
 }
 
+/// rigor-rs#381 — an attr write inside an INERT carrier in a block body
+/// (`END { }`/`BEGIN { }`/`defined?`/`super`/`yield` operands — the
+/// reference never evaluates them in sequence) must not be replayed into
+/// the block's scope: replaying dropped `h[:a]`'s indexed records where
+/// the oracle keeps them. `closure_mutations` now applies the same
+/// `in_inert_carrier` retain `toplevel_mutations` has. Every row keeps
+/// `h[:a]` = `"s" | 1`, so BOTH the in-body and the post-block read fire.
+#[test]
+fn inert_carrier_attr_write_inside_block_keeps_indexed_narrowing() {
+    for src in [
+        // The issue row — `END { }` inside a block.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { END { h.default ||= 0 }; h[:a].frobnicate }\nh[:a].frobnicate\n"[..],
+        // … at nested depth (the review extension: the owner re-key now
+        // applies those writes one level in too).
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { [2].each { END { h.default ||= 0 }; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+        // A `defined?` operand inside a block.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { defined?(h.default ||= 0); h[:a].frobnicate }\nh[:a].frobnicate\n"[..],
+        // A block nested INSIDE `END` — its body never runs either.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nEND { [1].each { h.default ||= 0; h[:a].frobnicate } }\nh[:a].frobnicate\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(
+            diags.len(),
+            2,
+            "expected both reads to fire for {src:?}, got {diags:?}"
+        );
+    }
+    // Must-still-fire: an EVALUATED attr write inside the block still
+    // lands — it widens the receiver for the in-body read (silent there)
+    // while the post-block read keeps `"s" | 1` and fires.
+    let src = b"h = {a: 1}\nh[:a] ||= \"s\"\n[1].each { h.default ||= 0; h[:a].frobnicate }\nh[:a].frobnicate\n";
+    let diags = check(src);
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected only the post-block read to fire for {src:?}, got {diags:?}"
+    );
+}
+
 #[test]
 fn container_nested_block_attr_write_drops_indexed_narrowing() {
     // rigor-rs#380 — a literal block under a non-descending container
