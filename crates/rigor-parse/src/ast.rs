@@ -984,6 +984,14 @@ pub enum StatementsKind {
     /// before the write; a conditional under `super(…)` is flattened away).
     /// A write in it must not bind; the binders widen it instead.
     Recovered,
+    /// The rescue-expression half of a `rescue` MODIFIER (`expr rescue arm`)
+    /// — lowered as the trailing child of the `Recovered` parent so the flow
+    /// walk can keep the two halves' envs apart: the protected expression's
+    /// writes must not leak into the arm's reads (the reference's locals are
+    /// never recorded there — `scope.rb:284`), and the arm's own writes are
+    /// never recorded either — they reach the post-statement env only through
+    /// the conditional join.
+    RecoveredArm,
     /// Code whose writes never reach the local scope, as far as flow is
     /// concerned: a `defined?` operand (never evaluated), an `END { }` body
     /// (deferred to exit), a `BEGIN { }` body, and the arguments and block of
@@ -2504,6 +2512,25 @@ impl<'src> Builder<'src> {
                 span: span_of(&interp.location()),
             });
         }
+        if let Some(interp) = node.as_interpolated_x_string_node() {
+            // A backtick xstring (`<<~`H`` / `` `cmd #{x}` ``) is the same
+            // reachability shape as an interpolated string — the reference's
+            // `eval_value_container` walks the interpolation in sequence, so
+            // a write inside `#{…}` binds where the xstring sits. The generic
+            // recovery carrier below cannot hold it: its span is the heredoc
+            // opener only, a body escapes it, and a block's span-hull would
+            // then claim the write (rigor-rs#177).
+            let parts: Vec<NodeId> = interp
+                .parts()
+                .iter()
+                .map(|p| self.lower_node(&p))
+                .collect();
+            return self.push(Node::InterpolatedString {
+                parts,
+                span: span_of(&interp.location()),
+            });
+        }
+
         if let Some(embedded) = node.as_embedded_statements_node() {
             // The `#{ … }` inside a string: lower its statements and KEEP the link
             // (a `Statements` wrapper, mirroring Prism's tree shape). The link
@@ -2687,6 +2714,37 @@ impl<'src> Builder<'src> {
             }
             let body: Vec<NodeId> = recovered.iter().map(|c| self.lower_node(c)).collect();
             return self.push(Node::Statements { body, span, kind: StatementsKind::Inert });
+        }
+
+        // A `rescue` MODIFIER (`expr rescue arm`) keeps its two halves
+        // distinct: the protected expression lowers flat (as the generic
+        // recovery below would), the rescue expression nests under a
+        // `RecoveredArm` carrier so the flow walk can evaluate it from the
+        // ENTRY env — the protected expression's writes never reach its
+        // reads, and the arm's own writes join only the exit env
+        // (rigor-rs#177).
+        if let Some(rm) = node.as_rescue_modifier_node() {
+            let mut body: Vec<NodeId> = collect_recoverable_children(&rm.expression())
+                .iter()
+                .map(|c| self.lower_node(c))
+                .collect();
+            let arm_body: Vec<NodeId> = collect_recoverable_children(&rm.rescue_expression())
+                .iter()
+                .map(|c| self.lower_node(c))
+                .collect();
+            if !arm_body.is_empty() {
+                let arm = self.push(Node::Statements {
+                    body: arm_body,
+                    span: span_of(&rm.rescue_expression().location()),
+                    kind: StatementsKind::RecoveredArm,
+                });
+                body.push(arm);
+            }
+            return self.push(Node::Statements {
+                body,
+                span,
+                kind: StatementsKind::Recovered,
+            });
         }
 
         // Anything outside the handled subset: RECOVER any meaningful descendant
