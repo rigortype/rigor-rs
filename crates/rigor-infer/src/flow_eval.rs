@@ -276,7 +276,22 @@ impl<'i> Typer<'i> {
                         return;
                     }
                     if sspan.1 <= site.0 {
-                        self.apply_subtree_effects(ast, s, site, false, env, flow, interner);
+                        // rigor-rs#362 — the arm's own earlier statements
+                        // evaluate in order on the oracle (`if c; x = 2;
+                        // x.w; return; end` fires `for 2`), so replay them
+                        // with real bindings the way the `rescue` clause
+                        // arm below does, not the flat untyped subtree
+                        // replay.
+                        self.bind_check_statement(
+                            ast,
+                            s,
+                            env,
+                            &flow.rebinds,
+                            &flow.mutations,
+                            &flow.indexed,
+                            &flow.dead,
+                            interner,
+                        );
                     }
                 }
             }
@@ -464,13 +479,21 @@ impl<'i> Typer<'i> {
                 return;
             }
             if cspan.1 <= site.0 && edge != FlowEdge::Barrier {
-                self.apply_subtree_effects(
+                // An earlier statement in the same sequential scope ran
+                // before `site` on the oracle — replay it with real
+                // bindings (`begin;1;rescue;x=2;x.w` and `if c; else;
+                // x=2; x.w; end` both fire `for 2`), the way
+                // `bind_check_statement` already does for the toplevel
+                // env, rather than the flat untyped subtree replay
+                // (rigor-rs#362 review).
+                self.bind_check_statement(
                     ast,
                     child,
-                    site,
-                    uncond && edge == FlowEdge::Uncond,
                     env,
-                    flow,
+                    &flow.rebinds,
+                    &flow.mutations,
+                    &flow.indexed,
+                    &flow.dead,
                     interner,
                 );
             }
@@ -742,7 +765,7 @@ impl<'i> Typer<'i> {
                         } else {
                             owner
                         };
-                        self.apply_closure_mutations(ast, sib, env, flow, sib_owner);
+                        self.apply_closure_mutations(ast, sib, site, env, flow, sib_owner);
                     }
                 }
                 if edge == FlowEdge::Barrier {
@@ -828,18 +851,26 @@ impl<'i> Typer<'i> {
     /// unconditionally on the post-subtree scope: the reference joins every
     /// arm and a record absent on any path is gone. `method` is not carried
     /// — every collected writer is a shape mutator, never `[]=`, so the
-    /// drop is always the receiver's whole record set.
+    /// drop is always the receiver's whole record set. A write inside an
+    /// evaluated-but-join-dropped position still must reach `site`
+    /// positionally (rigor-rs#362 — `each { if d; w; return; end; r }`
+    /// keeps `h`'s record for the post-`if` in-body read).
     fn apply_closure_mutations(
         &self,
         ast: &LoweredAst,
         id: NodeId,
+        site: rigor_parse::Span,
         env: &mut TypeEnv,
         flow: &CheckFlow,
         owner: NodeId,
     ) {
         let span = ast.get(id).span();
         for (o, wspan, name) in &flow.closure_mutations {
-            if *o == owner && wspan.0 >= span.0 && wspan.1 <= span.1 {
+            if *o == owner
+                && wspan.0 >= span.0
+                && wspan.1 <= span.1
+                && flow.dead.write_reaches(*wspan, site)
+            {
                 drop_indexed_narrowings(env, name);
             }
         }
@@ -1390,9 +1421,24 @@ impl<'i> Typer<'i> {
                         }
                     }
                     None => {
-                        widen_flow_writes(rebinds, span, env, interner);
-                        self.drop_indexed_rebinds(rebinds, span, env);
-                        self.widen_mutated_locals(ast, mutations, indexed, id, span, env, interner);
+                        // rigor-rs#362 — a non-folded `if`'s terminated arm
+                        // still evaluates but its scope dies at the join:
+                        // its writes must not widen the post-`if` env.
+                        let live_rebinds: Vec<_> = rebinds
+                            .iter()
+                            .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                            .cloned()
+                            .collect();
+                        let live_mutations: Vec<_> = mutations
+                            .iter()
+                            .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                            .cloned()
+                            .collect();
+                        widen_flow_writes(&live_rebinds, span, env, interner);
+                        self.drop_indexed_rebinds(&live_rebinds, span, env);
+                        self.widen_mutated_locals(
+                            ast, &live_mutations, indexed, id, span, env, interner,
+                        );
                     }
                 }
             }
@@ -1419,9 +1465,25 @@ impl<'i> Typer<'i> {
             }
             other => {
                 let span = other.span();
-                widen_flow_writes(rebinds, span, env, interner);
-                self.drop_indexed_rebinds(rebinds, span, env);
-                self.widen_mutated_locals(ast, mutations, indexed, id, span, env, interner);
+                // rigor-rs#362 — the `if`/`begin` arms above already filter
+                // through `dead.write_reaches`; every other statement kind
+                // (`case`, `&&`/`||`, a `while` holding a terminated arm)
+                // needs the same drop: a write inside an
+                // evaluated-but-join-dropped position must not widen the
+                // post-statement scope.
+                let live_rebinds: Vec<_> = rebinds
+                    .iter()
+                    .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                    .cloned()
+                    .collect();
+                let live_mutations: Vec<_> = mutations
+                    .iter()
+                    .filter(|(w, ..)| dead.write_reaches(*w, (span.1, span.1)))
+                    .cloned()
+                    .collect();
+                widen_flow_writes(&live_rebinds, span, env, interner);
+                self.drop_indexed_rebinds(&live_rebinds, span, env);
+                self.widen_mutated_locals(ast, &live_mutations, indexed, id, span, env, interner);
             }
         }
     }

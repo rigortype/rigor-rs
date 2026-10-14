@@ -124,6 +124,14 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`Recovered::blocked`]: crate::ast::Recovered::blocked
     pub(crate) blocked_spans: Vec<Span>,
+    /// The spans of positions the reference EVALUATES but whose post-scope
+    /// the join drops — terminated `if`/`case`/`in`/rescue-clause arms and
+    /// exiting `and`/`or` right sides (rigor-rs#362). Not a carrier: reads
+    /// inside still witness the position's writes;
+    /// [`DeadPositions::write_reaches`] scopes them per read.
+    ///
+    /// [`DeadPositions::write_reaches`]: rigor_infer::dead::DeadPositions::write_reaches
+    pub(crate) discarded_spans: Vec<Span>,
     /// The `blocked_spans` subset inside an iterated body the writeback TEXT
     /// scan still covers ([`Recovered::iterative`]): a local rebind there
     /// still binds nothing, but a `[]=`/mutator content mark lands on the
@@ -2044,31 +2052,32 @@ impl<'src> Builder<'src> {
         id
     }
 
-    /// [`Self::lower_blocked`] WITHOUT the span recording — for a position
-    /// the reference still EVALUATES but whose post-scope the join drops:
-    /// a terminated `if`/`case`/`in`/rescue-clause arm or an `and`/`or`
-    /// right side that exits (`live_rescue_results`,
-    /// `join_case_branch_scopes`, `eval_if`'s edges). Writes there DO bind
-    /// for reads inside the same position (`rescue; x = 2; x.w; raise`
-    /// fires `for 2` — rigor-rs#368), so `blocked_spans` must not cover
-    /// them: `DeadPositions::write_reaches` already answers the positional
-    /// rule per read. The counter still bumps so the `AttrWrite` gate sees
-    /// the position as discarded — an `h.default ||= 0` here drops no
-    /// indexed narrowing anywhere, in-arm reads included on the oracle's
-    /// model (the arm's own scope is thrown away too).
+    /// Lower `node` as a position the reference still EVALUATES but whose
+    /// post-scope the join drops — a terminated `if`/`case`/`in`/
+    /// rescue-clause arm or an `and`/`or` right side that exits
+    /// (`live_rescue_results`, `join_case_branch_scopes`, `eval_if`'s
+    /// edges). The span goes to `discarded_spans`, NOT `blocked_spans`:
+    /// the position's writes DO land inside it (`rescue; x = 2; x.w;
+    /// raise` fires `for 2`; `if c; h.default ||= 0; h[:a].f; return;
+    /// end` drops the record in-arm — rigor-rs#368/#362), so writes keep
+    /// `evaluated` and `DeadPositions::write_reaches` answers per read
+    /// whether the scope lands. `blocked` is only for positions the
+    /// oracle never scope-evaluates.
     fn lower_discarded(&mut self, node: &PrismNode<'_>) -> NodeId {
-        self.recovery_blocked += 1;
-        let id = self.lower_node(node);
-        self.recovery_blocked -= 1;
-        id
+        self.discarded_spans.push(span_of(&node.location()));
+        self.lower_node(node)
     }
 
-    /// [`Self::lower_discarded`] for a `StatementsNode`'s body list.
+    /// [`Self::lower_discarded`] for a `StatementsNode`'s body list — one
+    /// `discarded` span covering the WHOLE arm: an arm's earlier write
+    /// reaches its later reads (`rescue; x = 2; x.w` fires `for 2`), so
+    /// per-statement spans would sever the arm's own flow.
     fn lower_body_discarded(&mut self, body: &ruby_prism::NodeList<'_>) -> Vec<NodeId> {
-        self.recovery_blocked += 1;
-        let ids = body.iter().map(|n| self.lower_node(&n)).collect();
-        self.recovery_blocked -= 1;
-        ids
+        if let (Some(first), Some(last)) = (body.iter().next(), body.iter().last()) {
+            self.discarded_spans
+                .push((first.location().start_offset(), last.location().end_offset()));
+        }
+        body.iter().map(|n| self.lower_node(&n)).collect()
     }
 
     /// [`Self::lower_blocked`] for a `StatementsNode`'s body list — one

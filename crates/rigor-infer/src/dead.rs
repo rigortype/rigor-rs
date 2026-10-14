@@ -137,6 +137,11 @@ pub(crate) struct DeadPositions {
     /// write it contains reaches a read it contains on a LATER pass even
     /// when the same-pass scope ordering would drop it.
     loops: Vec<Span>,
+    /// The evaluated-but-join-dropped spans `LoweredAst` recorded
+    /// (rigor-rs#362): a terminated `if`/`case`/`in`/rescue-clause arm or an
+    /// exiting `and`/`or` right side. Unlike `folded`, the region RUNS —
+    /// its writes reach reads inside it and die with it at the join.
+    dropped: Vec<Span>,
 }
 
 impl DeadPositions {
@@ -151,6 +156,22 @@ impl DeadPositions {
     /// from the arm's entry scope.
     pub(crate) fn write_reaches(&self, write: Span, use_: Span) -> bool {
         if self.folded.iter().any(|(d, _)| contains(*d, write)) {
+            return false;
+        }
+        // rigor-rs#362 — a write in an evaluated-but-join-dropped position
+        // reaches reads inside its own region (the arm evaluates —
+        // `if c; h.default ||= 0; h[:a].f; return; end` sees the widening
+        // in-arm) but nothing outside it: the join drops the arm's scope,
+        // so the continuation keeps the prior narrowing. "Inside" must
+        // START before the region's end — a zero-width continuation probe
+        // at (end, end) would otherwise count as in-region and let the
+        // dead arm's writes reach the post-scope (`c && (w; return)`,
+        // where the dropped RHS ends at the statement's own end).
+        if self
+            .dropped
+            .iter()
+            .any(|&d| contains(d, write) && !(d.0 <= use_.0 && use_.0 < d.1))
+        {
             return false;
         }
         // A write in a `begin`'s protected body never reaches a read inside
@@ -278,6 +299,7 @@ impl<'i> Typer<'i> {
             return self.dead_partial.borrow().clone();
         }
         let mut dead = DeadPositions::default();
+        dead.dropped = ast.discarded_spans().to_vec();
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());
         // Publish the accumulator to re-entrant callers only where a recursion
         // point follows AND it changed — the publish clones the recorded arms,

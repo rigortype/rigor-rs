@@ -126,6 +126,16 @@ struct CarrierSpans {
     /// binds nothing, but a `[]=`/mutator content mark lands (rigor-rs#312;
     /// [`LoweredAst::in_iterative_blocked_carrier`]).
     iterative_blocked: Vec<Span>,
+    /// The spans of positions the reference EVALUATES but whose post-scope
+    /// the join drops — a terminated `if`/`case`/`in`/rescue-clause arm, an
+    /// exiting `and`/`or` right side (rigor-rs#362). Not a carrier: a write
+    /// inside binds for reads inside the same region
+    /// (`DeadPositions::write_reaches` answers the positional rule per
+    /// read), so nothing here is excluded absolutely the way `blocked`
+    /// spans are.
+    ///
+    /// [`DeadPositions::write_reaches`]: rigor_infer::dead::DeadPositions::write_reaches
+    discarded: Vec<Span>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -233,6 +243,13 @@ impl LoweredAst {
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
     }
 
+    /// The spans of evaluated-but-join-dropped positions (rigor-rs#362) —
+    /// `DeadPositions::write_reaches` consumes them: a write inside one
+    /// reaches a read inside the same region but not the continuation.
+    pub fn discarded_spans(&self) -> &[Span] {
+        &self.carrier_spans.discarded
+    }
+
     /// Whether `id` is a node a `(e)` single-statement parens unwrapped to —
     /// the reference's syntax-level test (`ParenthesesNode` is not `NilNode`)
     /// a literal-discriminating consumer must honor. See
@@ -332,6 +349,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         closure_depth: 0,
         scanned_inert_spans: Vec::new(),
         blocked_spans: Vec::new(),
+        discarded_spans: Vec::new(),
         blocked_iterative_spans: Vec::new(),
     };
     let root_prism = result.node();
@@ -357,6 +375,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         scanned_inert: builder.scanned_inert_spans,
         blocked: builder.blocked_spans,
         iterative_blocked: builder.blocked_iterative_spans,
+        discarded: builder.discarded_spans,
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
