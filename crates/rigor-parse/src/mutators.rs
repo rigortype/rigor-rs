@@ -61,3 +61,18 @@ pub fn is_shape_mutator(method: &str) -> bool {
         || HASH_LOOKUP_MUTATORS.contains(&method)
         || STRING_MUTATORS.contains(&method)
 }
+
+/// `ContentJoin`'s stored-argument mutators — `ARRAY_CONTENT_ADDERS`
+/// (`content_join.rb`) plus `HASH_CONTENT_ADDERS`' `store` (`[]=` is
+/// already an array adder). These are the calls whose arguments the
+/// reference joins into the continuation collection as element
+/// evidence, so a mutation through one inside a locals-only-join
+/// position (`break`'s argument — rigor-rs#363) still leaves the
+/// receiver binding answering "contents unknown" — every later element
+/// lookup declines even though the narrowing-table record survives
+/// that join. The port emulates that by keeping the record drop for
+/// these methods only.
+pub const CONTENT_ADDERS: &[&str] = &[
+    "<<", "push", "append", "prepend", "unshift", "concat", "insert", "[]=", "fill", "replace",
+    "store",
+];

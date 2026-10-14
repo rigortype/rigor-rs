@@ -18,7 +18,7 @@ use crate::{
 use crate::dead::DeadOp;
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
-    IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
+    IndexedFlow, CONTENT_ADDERS, MUTATOR_METHODS, STRING_MUTATORS,
 };
 
 impl<'i> Typer<'i> {
@@ -917,18 +917,20 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         // `break`'s argument scope lands on `join_break_scopes` — a
-        // LOCALS-only union — so an attribute write's indexed-record drop
-        // (a scope effect, not a binding) never propagates, not even to
-        // reads inside the argument (rigor-rs#363). `[]=` and mutator-call
-        // marks are not attribute writes: the `[]=` invalidation rides the
-        // narrowing table itself and a mutator's binding widening still
-        // joins, so keeping their drop is the zero-FP side (`break
-        // h[:a] = 9` and `break h << 2` stay silent, as the oracle
-        // reports them).
-        if !(ast.in_locals_only_carrier(wspan)
-            && method != "[]="
-            && !MUTATOR_METHODS.contains(&method))
-        {
+        // LOCALS-only union — so an indexed-record drop there (a scope
+        // effect, not a binding) never propagates, not even to reads
+        // inside the argument (rigor-rs#363). The exception is the
+        // CONTENT_ADDERS family (`<<`/`push`/`[]=`/`store`/`replace` …):
+        // the reference joins their stored arguments into the
+        // continuation binding as element evidence, so every later
+        // element lookup declines even though the record survives the
+        // join. The flat env cannot express "record present, read
+        // declined", so the port keeps the drop for those methods —
+        // `break h[:a] = 9`, `break a << 2` and `break h.store(k, v)`
+        // stay silent, while `break h.merge!(…)`, `break h.clear` and
+        // `break a.pop` keep their records and fire, exactly as the
+        // oracle reports them.
+        if !(ast.in_locals_only_carrier(wspan) && !CONTENT_ADDERS.contains(&method)) {
             self.drop_indexed_mutation(name, method, drop_key, env);
         }
         // A `[]=` replayed through a content write-back boundary drops
@@ -1659,11 +1661,12 @@ impl<'i> Typer<'i> {
                     let (wspan, name, method, drop_key) = &mutations[i];
                     // The `apply_mutation_effects` locals-only gate
                     // (rigor-rs#363): a `break` argument's scope lands on
-                    // the locals-only break join, so an attribute write's
-                    // drop there applies nowhere.
+                    // the locals-only break join, so the record drop
+                    // applies nowhere — except the CONTENT_ADDERS family,
+                    // whose joined store evidence declines the read
+                    // anyway, emulated by keeping the drop.
                     if !(ast.in_locals_only_carrier(*wspan)
-                        && method != "[]="
-                        && !MUTATOR_METHODS.contains(&method.as_str()))
+                        && !CONTENT_ADDERS.contains(&method.as_str()))
                     {
                         self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
                     }

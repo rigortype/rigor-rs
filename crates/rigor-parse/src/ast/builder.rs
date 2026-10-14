@@ -1233,9 +1233,10 @@ impl<'src> Builder<'src> {
             // (rigor-rs#312).
             self.recovery_joined += 1;
             self.recovery_next_sink += 1;
-            // `for` collects no break scopes at all — a `break` argument's
-            // scope lands nowhere, so it shares the locals-only treatment
-            // (rigor-rs#363).
+            // `eval_for` (`statement_evaluator.rb`) joins its break
+            // scopes through the same locals-only `join_break_scopes`,
+            // so a `break` argument's scope effects never propagate
+            // here either (rigor-rs#363).
             self.lexical_loop += 1;
             let body = for_node
                 .statements()
@@ -2149,8 +2150,10 @@ impl<'src> Builder<'src> {
     /// join (`for`'s `next_sink`, `while`/`until`/block/lambda's `iterative`
     /// — `eval_loop` merges the scope at every targeting `next` for all of
     /// them); an arm holding a `break` targeting an iterated body lands its
-    /// locals through `join_break_scopes` — a `for` body's `break` does NOT
-    /// land (`eval_for` collects no break scopes); and an arm holding a
+    /// locals through `join_break_scopes` — `eval_for` joins break scopes
+    /// too, but the `for` lowering runs under `next_sink` rather than
+    /// `iterative`, so a `for` body's `break` arm is not treated as
+    /// landing here; and an arm holding a
     /// `retry` lands its scope on the retry edge (`retry_edge_for` re-enters
     /// the `begin` carrying it — `rescue; unless r; r = ex; retry; end;
     /// raise; end` keeps `r` bound).

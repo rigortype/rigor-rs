@@ -839,11 +839,15 @@ fn blocked_position_attr_write_keeps_indexed_narrowing() {
 }
 
 /// rigor-rs#363 — `break`'s argument scope lands on `join_break_scopes`,
-/// a LOCALS-only union: an attribute write's indexed-record drop there
-/// (a scope effect, not a binding) never propagates — not to the
-/// post-loop scope, not to a later in-body read, not even to a read
-/// inside the argument itself. `for` collects no break scopes at all,
-/// so the same holds there. Every row keeps `h[:a]` = `"s" | 1`.
+/// a LOCALS-only union: a scope effect there (an indexed-record drop or
+/// a slot mutation) never propagates — not to the post-loop scope, not
+/// to a later in-body read, not even to a read inside the argument
+/// itself. `eval_for` joins break scopes the same way. The exception is
+/// the CONTENT_ADDERS family (`[]=`/`store`/`replace`/`<<`/`push` …):
+/// the reference joins their stored arguments into the continuation
+/// binding as element evidence, so a later element read declines even
+/// though the record survives — the port emulates that by keeping the
+/// drop. Every other row keeps `h[:a]` = `"s" | 1`.
 #[test]
 fn break_arg_attr_write_keeps_indexed_narrowing() {
     let prelude =
@@ -859,6 +863,15 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         "while c; case d; when 1; break h.default ||= 0; end; end\n",
         // A slot mutation joins the same way.
         "while c; break (h[:a] << 2); end\n",
+        // Non-content-adder mutators join the same way: their drops are
+        // scope effects the locals-only union never carries.
+        "while c; break h.merge!({b: 2}); end\n",
+        "while c; break h.update({b: 2}); end\n",
+        "while c; break h.clear; end\n",
+        "while c; break h.delete(:a); end\n",
+        "while c; break h.delete_if { |k, _| k == :a }; end\n",
+        "while c; break h.keep_if { |k, _| k == :a }; end\n",
+        "while c; break h.transform_values! { |v| v }; end\n",
         // `break` inside a block targets the yielding call, whose scope
         // the flat env models as dropped — but the block body's own
         // write is a closure mutation, so the record survives anyway.
@@ -897,14 +910,17 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
     }
     // Must-still-land controls — effects the reference DOES join still
     // drop or shadow the record: a `next` argument feeds the loop
-    // fixpoint carrying the drop; `[]=` invalidates the table itself;
-    // an operand `||=` mints and widens through the same table; a
-    // rebind rewrites the binding; and a body write lands on the joined
+    // fixpoint carrying the drop; the CONTENT_ADDERS family joins stored
+    // arguments as element evidence, so the read declines (`[]=`/`store`/
+    // `replace` — the port emulates by keeping the drop); a rebind
+    // rewrites the binding; and a body write lands on the joined
     // iteration scope.
     for tail in [
         "while c; next h.default ||= 0; end\n",
         "while c; break h[:a] = 9; end\n",
         "while c; break (h[:a] ||= 9); end\n",
+        "while c; break h.store(:a, 9); end\n",
+        "while c; break h.replace({b: 2}); end\n",
         "while c; break (h = {}); end\n",
         "while c; h.default ||= 0; break; end\n",
     ] {
