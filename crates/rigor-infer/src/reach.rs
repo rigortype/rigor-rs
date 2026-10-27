@@ -8,7 +8,7 @@ use rigor_types::Scalar;
 
 use crate::dead::DeadPositions;
 use crate::folding;
-use crate::reach_index::{LocalEvent, LocalWrite, ScopeNode};
+use crate::reach_index::{LocalEvent, LocalWrite, ReachIndex, ScopeNode};
 use crate::Typer;
 
 impl<'i> Typer<'i> {
@@ -1270,7 +1270,6 @@ impl<'i> Typer<'i> {
     // of a write that never binds (rigor-rs#341). The index holds those
     // extents; the nested-section scan below excludes them.
     let idx = self.reach_index(ast);
-    let case_clauses = &idx.case_clauses;
     let mut kill = None;
     let mut body: &[NodeId] = body;
     for _ in 0..64 {
@@ -1278,7 +1277,7 @@ impl<'i> Typer<'i> {
             break;
         };
         for &s in &body[..pos] {
-            if self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen) {
+            if self.definitely_assigns(ast, s, is_target, &idx, dead, seen) {
                 kill = Some(ast.get(s).span());
             }
         }
@@ -1357,7 +1356,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         is_target: &dyn Fn(&Node) -> bool,
-        case_clauses: &[rigor_parse::Span],
+        idx: &ReachIndex,
         dead: &DeadPositions,
         seen: &mut Vec<String>,
     ) -> bool {
@@ -1369,12 +1368,7 @@ impl<'i> Typer<'i> {
     // one recovered under a blocked wrapper position (a modifier rescue's
     // flattened `case` — rigor-rs#357) or one inside a folded-dead arm
     // (rigor-rs#368).
-    if case_clauses
-        .iter()
-        .any(|&c| c.0 <= span.0 && span.1 <= c.1)
-        || ast.in_blocked_carrier(span)
-        || dead.covers(span)
-    {
+    if idx.in_case_clause(span) || idx.in_blocked_carrier(ast, span) || dead.covers(span) {
         return false;
     }
     if is_target(node) {
@@ -1382,7 +1376,7 @@ impl<'i> Typer<'i> {
     }
     match node {
         Node::If { predicate, then_body, else_body, is_unless, .. } => {
-            self.definitely_assigns(ast, *predicate, is_target, case_clauses, dead, seen)
+            self.definitely_assigns(ast, *predicate, is_target, idx, dead, seen)
                 || match self.expr_truthiness(ast, *predicate, seen) {
                     // The fold keeps one arm (`live_branch_for_if`) — only it
                     // can definitely assign.
@@ -1394,25 +1388,25 @@ impl<'i> Typer<'i> {
                             else_body
                         },
                         is_target,
-                        case_clauses,
+                        idx,
                         dead,
                         seen,
                     ),
                     None => {
-                        self.arm_assigns(ast, then_body, is_target, case_clauses, dead, seen)
+                        self.arm_assigns(ast, then_body, is_target, idx, dead, seen)
                             && self
-                                .arm_assigns(ast, else_body, is_target, case_clauses, dead, seen)
+                                .arm_assigns(ast, else_body, is_target, idx, dead, seen)
                     }
                 }
         }
         Node::Case { predicate, branches, else_body, .. } => {
             predicate.is_some_and(|p| {
-                self.definitely_assigns(ast, p, is_target, case_clauses, dead, seen)
+                self.definitely_assigns(ast, p, is_target, idx, dead, seen)
             }) || (!else_body.is_empty()
-                && self.arm_assigns(ast, else_body, is_target, case_clauses, dead, seen)
+                && self.arm_assigns(ast, else_body, is_target, idx, dead, seen)
                 && branches.iter().all(|&w| match ast.get(w) {
                     Node::When { body, .. } => {
-                        self.arm_assigns(ast, body, is_target, case_clauses, dead, seen)
+                        self.arm_assigns(ast, body, is_target, idx, dead, seen)
                     }
                     _ => false,
                 }))
@@ -1422,13 +1416,13 @@ impl<'i> Typer<'i> {
         // never runs in sequence (rigor-rs#153).
         Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
             body.iter()
-                .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+                .any(|&s| self.definitely_assigns(ast, s, is_target, idx, dead, seen))
         }
         // A clause-less `begin` — which is also the carrier an `if`'s `else`
         // clause lowers to — runs its body to the end.
         Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
             body.iter()
-                .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+                .any(|&s| self.definitely_assigns(ast, s, is_target, idx, dead, seen))
         }
         _ => false,
     }
@@ -1441,12 +1435,12 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         b: &[NodeId],
         is_target: &dyn Fn(&Node) -> bool,
-        case_clauses: &[rigor_parse::Span],
+        idx: &ReachIndex,
         dead: &DeadPositions,
         seen: &mut Vec<String>,
     ) -> bool {
         b.iter()
-            .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+            .any(|&s| self.definitely_assigns(ast, s, is_target, idx, dead, seen))
             || self.arm_exits(ast, b, seen)
     }
 }

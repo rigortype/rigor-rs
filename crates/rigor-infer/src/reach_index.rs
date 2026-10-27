@@ -130,6 +130,8 @@ pub(crate) struct ReachIndex {
     last_toplevel_defs: HashMap<String, NodeId>,
     /// [`Typer::call_self`] per call site.
     call_selves: RefCell<HashMap<Span, CallSelf>>,
+    /// [`LoweredAst::in_blocked_carrier`] per span.
+    blocked: RefCell<HashMap<Span, bool>>,
     /// [`ReachIndex::class_ivar_scope`] per read span.
     ivar_scopes: RefCell<HashMap<Span, Rc<IvarScope>>>,
     /// [`unrecorded_closure`] per read span.
@@ -306,6 +308,7 @@ impl ReachIndex {
             toplevel_defs,
             last_toplevel_defs,
             call_selves: RefCell::new(HashMap::new()),
+            blocked: RefCell::new(HashMap::new()),
             ivar_scopes: RefCell::new(HashMap::new()),
             def_spans,
             lambda_spans,
@@ -347,6 +350,17 @@ impl ReachIndex {
     /// Whether a `def <name>` sits at file scope.
     pub(crate) fn toplevel_def(&self, name: &str) -> bool {
         self.toplevel_defs.contains(name)
+    }
+
+    /// [`LoweredAst::in_blocked_carrier`] for `span`, memoized — the
+    /// definite-assignment walk asks it per statement on every read's path.
+    pub(crate) fn in_blocked_carrier(&self, ast: &LoweredAst, span: Span) -> bool {
+        if let Some(&hit) = self.blocked.borrow().get(&span) {
+            return hit;
+        }
+        let out = ast.in_blocked_carrier(span);
+        self.blocked.borrow_mut().insert(span, out);
+        out
     }
 
     /// The last (by start) file-scope bare `def name`, if any.
