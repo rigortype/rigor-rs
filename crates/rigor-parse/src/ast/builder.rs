@@ -23,9 +23,25 @@ use super::{
 };
 
 /// What a family method of [`Builder::lower_node`] returns for a node that is
-/// not one of its types. `push` never mints it: its `debug_assert!` keeps
-/// every id below `u32::MAX`, which no real arena reaches.
+/// not one of its types. `push`'s `debug_assert!` keeps every real id below
+/// `u32::MAX`, but only in debug builds. In release nothing checks it; a
+/// collision would need an arena of `u32::MAX` nodes, so it is unreachable in
+/// practice. Were it reached, `lower_node` would read the real id as "no
+/// match" and the fallback would lower that node a second time: wrong output,
+/// not UB.
 const UNMATCHED: NodeId = NodeId(u32::MAX);
+
+/// [`Builder::lower_node`]'s family methods in try order, by name, for the
+/// debug disjointness check's messages. `FAMILIES.len()` stands for the
+/// fallback.
+#[cfg(debug_assertions)]
+const FAMILIES: [&str; 5] = [
+    "lower_calls",
+    "lower_expressions",
+    "lower_control",
+    "lower_definitions",
+    "lower_jumps",
+];
 
 /// Mutable accumulator for the owned arena during the lowering walk.
 pub(crate) struct Builder<'src> {
@@ -223,25 +239,140 @@ impl<'src> Builder<'src> {
     /// Lower one borrowed Prism node (and its children) into owned nodes,
     /// returning the id of the produced root. Recursion is bounded by the
     /// source's nesting depth.
+    ///
+    /// The arms live in five family methods, tried in this order:
+    /// [`Self::lower_calls`], [`Self::lower_expressions`],
+    /// [`Self::lower_control`], [`Self::lower_definitions`],
+    /// [`Self::lower_jumps`]. A family returns [`UNMATCHED`] if and only if
+    /// none of its arms matched; an arm never returns it. A node no family
+    /// claims reaches [`Self::lower_fallback`].
+    ///
+    /// The try order cannot change the output, because the families' Prism
+    /// type sets are pairwise disjoint: every arm's predicate is a pure
+    /// `as_X_node()` chain, and no type appears in two families. Debug builds
+    /// enforce this on every node (`check_families_disjoint`): once family
+    /// *k* matches, the later families run on the same node and must each
+    /// return `UNMATCHED`. A new Prism type goes into exactly one family, as
+    /// an arm before that family's trailing `UNMATCHED`.
+    ///
+    /// The families and the fallback are `#[inline(never)]`, which keeps
+    /// their frames out of this one: only one family frame is live per
+    /// nesting level. Without it LLVM inlines the families back, and the
+    /// release nesting limit on a 2 MiB thread roughly halves (#413). It is
+    /// not a perf hint.
     pub(crate) fn lower_node(&mut self, node: &PrismNode<'_>) -> NodeId {
         let span = span_of(&node.location());
         let id = self.lower_calls(node, span);
         if id != UNMATCHED {
+            #[cfg(debug_assertions)]
+            self.check_families_disjoint(node, span, 0, id);
             return id;
         }
         let id = self.lower_expressions(node);
         if id != UNMATCHED {
+            #[cfg(debug_assertions)]
+            self.check_families_disjoint(node, span, 1, id);
             return id;
         }
         let id = self.lower_control(node, span);
         if id != UNMATCHED {
+            #[cfg(debug_assertions)]
+            self.check_families_disjoint(node, span, 2, id);
             return id;
         }
         let id = self.lower_definitions(node);
         if id != UNMATCHED {
+            #[cfg(debug_assertions)]
+            self.check_families_disjoint(node, span, 3, id);
             return id;
         }
-        self.lower_jumps(node, span)
+        let id = self.lower_jumps(node, span);
+        if id != UNMATCHED {
+            #[cfg(debug_assertions)]
+            self.check_families_disjoint(node, span, 4, id);
+            return id;
+        }
+        let id = self.lower_fallback(node, span);
+        #[cfg(debug_assertions)]
+        self.check_families_disjoint(node, span, FAMILIES.len(), id);
+        id
+    }
+
+    /// [`Self::lower_node`]'s last resort, for a node no family claims. It
+    /// always pushes a node, so it never returns [`UNMATCHED`].
+    // Not a perf hint: keeps this frame out of `lower_node`'s, since the
+    // fallback recurses into it through `lower_recovered` (#413, #416).
+    #[inline(never)]
+    fn lower_fallback(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
+        // Anything outside the handled subset: RECOVER any meaningful descendant
+        // nodes (local reads / op-writes / calls) so structural walks see them.
+        //
+        // The long tail of Prism nodes (`super`, `yield`, a `*splat`
+        // arg, a block-arg, an assoc-splat, …) has no owned variant. Lowering them
+        // to a bare span-only `Other` would DROP their subtree — and with it any
+        // `LocalVariableRead` underneath. For `flow.dead-assignment` that is a
+        // false-positive source: `return [entries, policy]` / `super(x: a)` /
+        // `[*rest.map { … }]` read locals that would then look unread. We collect
+        // the relevant descendant nodes via the Prism `Visit` recursion and lower
+        // each into the arena, linked under a `Statements` carrier (Dynamic-typed;
+        // purely a reachability handle). This also keeps a CALL inside such a
+        // wrapper reachable for the existing call rules — a strict improvement.
+        let recovered = collect_recoverable_children(node, self.recovery_marks());
+        if recovered.is_empty() {
+            return self.push(Node::Other { span, jump: None });
+        }
+        let body: Vec<NodeId> = self.lower_recovered(recovered);
+        self.push(Node::Statements { body, span, kind: StatementsKind::Recovered })
+    }
+
+    /// The debug half of [`Self::lower_node`]'s disjointness contract: `node`
+    /// was lowered to `id` by `FAMILIES[matched]`, or by the fallback when
+    /// `matched == FAMILIES.len()`. Asserts `id` is a real id, then runs every
+    /// LATER family on `node` and asserts each returns [`UNMATCHED`].
+    ///
+    /// While the invariant holds, each of those calls is a run of failed
+    /// `as_X_node()` tests: it pushes nothing and recurses nowhere. The
+    /// earlier families already returned `UNMATCHED` on the way to `matched`,
+    /// and the fallback is never re-run, since it always pushes. Called after
+    /// the matched family has returned, so no extra frame is live across the
+    /// recursion.
+    #[cfg(debug_assertions)]
+    #[inline(never)]
+    fn check_families_disjoint(
+        &mut self,
+        node: &PrismNode<'_>,
+        span: Span,
+        matched: usize,
+        id: NodeId,
+    ) {
+        assert_ne!(
+            id,
+            UNMATCHED,
+            "lower_node returned UNMATCHED for Prism {} at line {} (byte {})",
+            prism_type_name(node),
+            self.line_at(span.0),
+            span.0,
+        );
+        for later in matched + 1..FAMILIES.len() {
+            let other = match later {
+                1 => self.lower_expressions(node),
+                2 => self.lower_control(node, span),
+                3 => self.lower_definitions(node),
+                4 => self.lower_jumps(node, span),
+                _ => unreachable!("family {later} is never a later family"),
+            };
+            assert_eq!(
+                other,
+                UNMATCHED,
+                "Prism {} at line {} (byte {}) matched both {} and {}: \
+                 the lower_node families' type sets must be disjoint",
+                prism_type_name(node),
+                self.line_at(span.0),
+                span.0,
+                FAMILIES[matched],
+                FAMILIES[later],
+            );
+        }
     }
 
     /// Lower a Prism `NodeList` body (statement sequence) into owned ids in
@@ -503,6 +634,17 @@ impl<'src> Builder<'src> {
 /// captured outer local), decoded to owned `String`s.
 fn constant_list_names(list: &ruby_prism::ConstantList<'_>) -> Vec<String> {
     list.iter().map(|c| constant_string(c.as_slice())).collect()
+}
+
+/// Prism's type name for `node` (`CallNode`, `IfNode`, …): the head of its
+/// `Debug` rendering, which ruby-prism writes as `TypeName(fields…)`. Only
+/// the debug disjointness check's failure messages call it, because the
+/// rendering walks the whole subtree.
+#[cfg(debug_assertions)]
+fn prism_type_name(node: &PrismNode<'_>) -> String {
+    let rendered = format!("{node:?}");
+    let end = rendered.find('(').unwrap_or(rendered.len());
+    rendered[..end].to_string()
 }
 
 /// Whether a Prism node is an assignment the lowering cannot reproduce —

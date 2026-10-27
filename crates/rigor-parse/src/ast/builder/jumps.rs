@@ -1,19 +1,30 @@
-//! `Builder::lower_jumps` holds the jump and carrier arms of `Builder::lower_node`,
-//! then the fallback that recovers any other node's meaningful descendants.
+//! `Builder::lower_jumps` holds the jump and carrier arms of `Builder::lower_node`:
+//! `return`, `alias`, the four jumps, `defined?`, the `BEGIN`/`END`/`super`/`yield`
+//! carriers and the unmodeled writes. A node no family claims falls through to
+//! `Builder::lower_fallback` in `builder.rs`.
+//!
+//! The unmodeled writes are the `UnmodeledWrite` carriers: the COMPOUND
+//! instance, class, global and constant writes (`@x += 1`, `@@x ||= 1`,
+//! `$x &&= 1`, `K += 1`), every `K::V` path write, and the pattern-match writes
+//! (`expr => pat`, `expr in pat`, a regex literal's named captures). The PLAIN
+//! writes (`@x = 1`, `@@x = 1`, `$x = 1`, `K = 1`) are owned variants in
+//! `expressions.rs`, as are the local writes, plain and compound.
 
 use crate::ruby_prism::Node as PrismNode;
 
 use super::{
     collect_defined_operand_children, collect_recoverable_children, is_unmodeled_write,
     pattern_bound_locals, Builder, JumpKind, Node, NodeId, ScopeMarks, Span, StatementsKind,
+    UNMATCHED,
 };
 
 impl<'src> Builder<'src> {
     /// [`Self::lower_node`]'s jump and carrier arms (`return`, `alias`, the four
-    /// jumps, `defined?`, `BEGIN`/`END`/`super`/`yield`, the unmodeled writes),
-    /// then the fallback that recovers any other node's meaningful descendants.
+    /// jumps, `defined?`, `BEGIN`/`END`/`super`/`yield`, the unmodeled writes).
+    // Not a perf hint: keeps this frame out of `lower_node`'s recursion.
+    // Inlined, the release nesting limit on a 2 MiB thread roughly halves (#413).
     #[inline(never)]
-    pub(crate) fn lower_jumps(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
+    pub(super) fn lower_jumps(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
         if let Some(ret) = node.as_return_node() {
             // An explicit `return` — a real owned variant (sig-gen's
             // `DefReturnTyper` port needs the VALUE expressions to union a def's
@@ -261,24 +272,6 @@ impl<'src> Builder<'src> {
             });
         }
 
-        // Anything outside the handled subset: RECOVER any meaningful descendant
-        // nodes (local reads / op-writes / calls) so structural walks see them.
-        //
-        // The long tail of Prism nodes (`super`, `yield`, a `*splat`
-        // arg, a block-arg, an assoc-splat, …) has no owned variant. Lowering them
-        // to a bare span-only `Other` would DROP their subtree — and with it any
-        // `LocalVariableRead` underneath. For `flow.dead-assignment` that is a
-        // false-positive source: `return [entries, policy]` / `super(x: a)` /
-        // `[*rest.map { … }]` read locals that would then look unread. We collect
-        // the relevant descendant nodes via the Prism `Visit` recursion and lower
-        // each into the arena, linked under a `Statements` carrier (Dynamic-typed;
-        // purely a reachability handle). This also keeps a CALL inside such a
-        // wrapper reachable for the existing call rules — a strict improvement.
-        let recovered = collect_recoverable_children(node, self.recovery_marks());
-        if recovered.is_empty() {
-            return self.push(Node::Other { span, jump: None });
-        }
-        let body: Vec<NodeId> = self.lower_recovered(recovered);
-        self.push(Node::Statements { body, span, kind: StatementsKind::Recovered })
+        UNMATCHED
     }
 }

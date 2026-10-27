@@ -13,8 +13,10 @@ use super::{
 impl<'src> Builder<'src> {
     /// [`Self::lower_node`]'s definition arms: `def`, `class`, `module` and
     /// `class << self`.
+    // Not a perf hint: keeps this frame out of `lower_node`'s recursion.
+    // Inlined, the release nesting limit on a 2 MiB thread roughly halves (#413).
     #[inline(never)]
-    pub(crate) fn lower_definitions(&mut self, node: &PrismNode<'_>) -> NodeId {
+    pub(super) fn lower_definitions(&mut self, node: &PrismNode<'_>) -> NodeId {
         if let Some(def) = node.as_def_node() {
             // Lower the method body so its calls reach the walk. Parameters are
             // intentionally NOT bound to any type: an unknown local read is
