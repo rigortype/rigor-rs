@@ -145,3 +145,13 @@ Mutant results:
 Two contrived silent cases remain, and both are filed as #420:
 - `br"…"` raw prefixes are mis-blanked;
 - a claim written inline in `lower_node` is invisible to both checks.
+
+## Follow-up: #420 (PR #421, merge `a6bbe5d`)
+
+The inventory test was hardened in four ways:
+- `blank` now reads `br"…"`, `cr"…"` and their hashed forms as raw strings;
+- the total count lock was dropped, because the per-family locks already imply it, and failure messages now say what to update;
+- an `if let` pattern must be `Some(..)`;
+- `lower_node`'s own body may not call `as_*_node`.
+
+The reviewer fuzzed `blank` against a reference lexer. Over 300k token sequences, head was never worse than master, which was wrong on 45k. Enum patterns and non-`lower_*` helpers in `lower_node` still claim a type silently; that gap is #425. The guard chain #416 → #418 → #420 → #425 is now hardening against contrived inputs: each round closed smaller holes.
