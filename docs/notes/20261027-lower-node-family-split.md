@@ -126,3 +126,22 @@ Release lowering is byte-identical. Release depth is equal to master on 1.95 and
 **The 432 B finding is toolchain-dependent.** Without `#[inline(never)]` on the fallback, 1.95 inlines it and `lower_node`'s frame grows to 432 B. 1.88 does not inline it. Frame claims must name the toolchain; CI and the shipped binaries use 1.88.
 
 **The runtime check's coverage gap is #418.** 19 of the 90 claimed types never occur in a fixture, so a duplicate of one of them passes (Mutant C). #418 adds the static inventory test, F3.
+
+## Follow-up: #418 (PR #419, merge `c655981`)
+
+`family_inventory.rs` adds a static test, `lower_node_families_claim_disjoint_prism_types`. It is text-based:
+- it blanks comments and string literals;
+- it walks each family body by bracket depth;
+- it reads only arm predicates, resolving `pred(node)` helpers that are pure `||` chains;
+- it panics on any top-level layout it does not know.
+
+The test locks the claimed types per family at 7, 35, 13, 4 and 31, for a total of 90. A new lowering test covers the 19 types no fixture held, so the runtime check now sees them too. Stale `jumps.rs` and `is_unmodeled_write` comments were corrected.
+
+Mutant results:
+- the implementer's 98 duplicate mutants were all caught;
+- the reviewer's 57 predicate forms were each caught or stopped by a layout panic;
+- all 90 types, duplicated across families, were all reported.
+
+Two contrived silent cases remain, and both are filed as #420:
+- `br"…"` raw prefixes are mis-blanked;
+- a claim written inline in `lower_node` is invisible to both checks.
