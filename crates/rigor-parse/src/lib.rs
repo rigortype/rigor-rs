@@ -9,6 +9,9 @@
 pub use ruby_prism;
 
 pub mod ast;
+/// The analysis depth bound (rigor-rs#412): [`parse_bounded`].
+pub mod depth;
+pub use depth::{parse_bounded, TooDeep, MAX_NESTING_DEPTH};
 /// The `SHAPE_MUTATORS` name tables — shared between the lowering-time
 /// `OperandEffects` gate (`ast::operand_effects`, rigor-rs#361) and
 /// `rigor-infer`'s flow analysis.
