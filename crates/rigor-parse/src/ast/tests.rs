@@ -1925,7 +1925,8 @@ fn lowers_the_prism_types_no_fixture_holds() {
     }
     // Owned variants, never the carrier: `x.f += 1` and `a[i] += 1` (not
     // one of the 19) have lowered in `lower_calls` since rigor-rs#343.
-    let owned: [(&str, fn(&Node) -> bool); 6] = [
+    type Lowered = fn(&Node) -> bool;
+    let owned: [(&str, Lowered); 6] = [
         ("alias new_m old_m", |n| matches!(n, Node::Alias { .. })),
         ("x.f &&= 1", |n| matches!(n, Node::AttrWrite { compound: Compound::And, .. })),
         ("x.f += 1", |n| matches!(n, Node::AttrWrite { compound: Compound::Op(_), .. })),
