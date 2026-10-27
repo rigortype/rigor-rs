@@ -1,0 +1,424 @@
+//! The per-AST tables behind [`Typer::local_reach`] (rigor-rs#422).
+//!
+//! `local_reach` is re-entered for every write that can reach a read, up to
+//! the `seen` cap, and every call used to repeat several whole-arena scans
+//! that read nothing but the syntax tree: the scope-shape pass, the
+//! [`unrecorded_closure`] boundary walk, [`unevaluated_case_clause_spans`],
+//! the write collector (with an `in_inert_carrier` test per node) and, once
+//! per candidate write, the `closure_bound_elsewhere` scan. On a generated
+//! lexer with 324 writes of one local that was about 310 full scans per call.
+//!
+//! [`ReachIndex`] holds those answers, built once per `LoweredAst`
+//! ([`Typer::reach_index`]) and shared by every reach query on it. It is exact
+//! by construction: nothing here reads `seen`, the dead set or any memo, so
+//! each table answers exactly what the per-call scan it replaced did. The
+//! filters that depend on the READ (`dead.write_reaches`, the closure test
+//! and the own-RHS containment) still run per call, in the original order.
+
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use rigor_parse::{LoweredAst, Node, NodeId, Span};
+
+use crate::reach::{proc_like_block, unevaluated_case_clause_spans, unrecorded_closure};
+use crate::Typer;
+
+/// `outer` contains `inner` — half-open byte spans, equal spans count.
+fn contains(outer: Span, inner: Span) -> bool {
+    outer.0 <= inner.0 && inner.1 <= outer.1
+}
+
+/// One write of a local, as [`Typer::local_reach`] collects them.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LocalWrite {
+    /// `x = v`.
+    Plain(NodeId),
+    /// `x op= v` — keeps the old value on some path, so it never cuts one off.
+    Op(NodeId),
+    /// `a, x = v` — the right-hand side.
+    Multi(NodeId),
+}
+
+/// One node of the scope-shape pass, in arena order — the five node kinds
+/// `local_reach`'s first loop matched. Arena order matters: the narrowest
+/// `def` and the narrowest binder keep the FIRST of two equal-width spans.
+pub(crate) enum ScopeNode {
+    /// `Node::Definition`.
+    Def { span: Span, id: NodeId },
+    /// `Node::Lambda` (`->`).
+    Lambda { span: Span },
+    /// `Node::Loop`.
+    Loop { span: Span },
+    /// A `Node::BeginRescue` with at least one clause: its span and every
+    /// clause's span (a retrying clause makes the `begin` a loop carrier).
+    Rescue { span: Span, clauses: Vec<Span> },
+    /// A block-bearing `Node::Call`: the block BODY's extent, whether the
+    /// block is proc-like, and the names its parameters bind.
+    Block { extent: Span, proc_like: bool, params: Vec<String> },
+}
+
+/// One node of the write collector that touches a given local, in arena
+/// order, with every READ-INDEPENDENT filter already applied (the name, the
+/// region, the inert / blocked carriers, the guard shape). What is left per
+/// read is [`Typer::local_reach`]'s loop over these.
+pub(crate) enum LocalEvent {
+    /// A write of the local inside the region. Still per read:
+    /// `dead.write_reaches`, the closure test and the own-RHS containment.
+    Write { span: Span, value_span: Span, write: LocalWrite },
+    /// A `for` index binding the local: its in-region index spans. Refuses
+    /// (UNKNOWN) when any of them `write_reaches` the read.
+    ForIndex(Vec<Span>),
+    /// A `rescue => local` binding: the clause spans that bind it. Refuses
+    /// (OPAQUE) when any of them `write_reaches` the read.
+    RescueBinding(Vec<Span>),
+    /// `local.is_a?(C)` / `kind_of?` / `instance_of?` with a constant class
+    /// operand: stepped over under `skip_class_guards`, otherwise refuses.
+    ExactGuard,
+    /// Any other class guard on the local (a guard call, a `case` subject):
+    /// refuses.
+    Guard,
+}
+
+/// The per-AST tables. See the module docs.
+pub(crate) struct ReachIndex {
+    /// [`unevaluated_case_clause_spans`] — computed once instead of per call.
+    pub(crate) case_clauses: Vec<Span>,
+    /// Every `def` span, in arena order.
+    pub(crate) def_spans: Vec<Span>,
+    /// Every `->` span, in arena order.
+    pub(crate) lambda_spans: Vec<Span>,
+    /// The scope-shape nodes, in arena order.
+    pub(crate) scopes: Vec<ScopeNode>,
+    /// Per bound name, the extents of the closures that bind it — the node
+    /// set of `closure_bound_elsewhere` and of the `floored` test:
+    /// `Node::Lambda { span, locals }` and `Node::Call { block_span:
+    /// Some(_), block_locals }`, in arena order.
+    closures: HashMap<String, Vec<Span>>,
+    /// Per local name, the nodes the write collector can match for it, in
+    /// arena order (see [`LocalEvent`]).
+    by_name: HashMap<String, Vec<NodeId>>,
+    /// [`unrecorded_closure`] per read span.
+    unrecorded: RefCell<HashMap<Span, Option<(NodeId, Span)>>>,
+    /// [`Typer::clause_retries`] per clause span.
+    retries: RefCell<HashMap<Span, bool>>,
+    /// The collector's events per `(region, skip_defs, local)`.
+    events: RefCell<HashMap<(Span, bool, String), Rc<[LocalEvent]>>>,
+}
+
+/// The class-guard methods the write collector refuses on.
+fn is_guard_method(method: &str) -> bool {
+    matches!(method, "is_a?" | "kind_of?" | "instance_of?" | "===")
+}
+
+/// The exact `root.is_a?(C)` shape `skip_class_guards` steps over.
+fn is_exact_guard_method(method: &str) -> bool {
+    matches!(method, "is_a?" | "kind_of?" | "instance_of?")
+}
+
+impl ReachIndex {
+    /// One pass over the arena (plus [`unevaluated_case_clause_spans`]'s).
+    fn build(ast: &LoweredAst) -> ReachIndex {
+        let mut def_spans = Vec::new();
+        let mut lambda_spans = Vec::new();
+        let mut scopes = Vec::new();
+        let mut closures: HashMap<String, Vec<Span>> = HashMap::new();
+        let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
+        let mut note = |name: &str, id: NodeId| {
+            let ids = by_name.entry(name.to_string()).or_default();
+            if ids.last() != Some(&id) {
+                ids.push(id);
+            }
+        };
+        let local_read = |i: NodeId| match ast.get(i) {
+            Node::LocalVariableRead { name, .. } => Some(name.as_str()),
+            _ => None,
+        };
+        for (id, n) in ast.iter() {
+            match n {
+                Node::Definition { span, .. } => {
+                    def_spans.push(*span);
+                    scopes.push(ScopeNode::Def { span: *span, id });
+                }
+                Node::Lambda { span, locals, .. } => {
+                    lambda_spans.push(*span);
+                    scopes.push(ScopeNode::Lambda { span: *span });
+                    for l in locals {
+                        closures.entry(l.clone()).or_default().push(*span);
+                    }
+                }
+                Node::Loop { span, index, .. } => {
+                    scopes.push(ScopeNode::Loop { span: *span });
+                    for (name, _) in index {
+                        note(name, id);
+                    }
+                }
+                Node::BeginRescue { clauses, span, .. } => {
+                    if !clauses.is_empty() {
+                        scopes.push(ScopeNode::Rescue {
+                            span: *span,
+                            clauses: clauses.iter().map(|c| c.span).collect(),
+                        });
+                    }
+                    for c in clauses {
+                        if let Some(name) = c.bound_name.as_deref() {
+                            note(name, id);
+                        }
+                    }
+                }
+                Node::LocalVariableWrite { name, .. } | Node::LocalVariableOpWrite { name, .. } => {
+                    note(name, id);
+                }
+                Node::MultiWrite { targets, .. } => {
+                    for (name, _) in targets.bound_names() {
+                        note(&name, id);
+                    }
+                }
+                Node::Case { predicate: Some(p), .. } => {
+                    if let Some(name) = local_read(*p) {
+                        note(name, id);
+                    }
+                }
+                _ => {}
+            }
+            if let Node::Call {
+                receiver,
+                method,
+                args,
+                block_body,
+                block_params,
+                block_span,
+                block_locals,
+                ..
+            } = n
+            {
+                if !block_body.is_empty() {
+                    let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
+                    let hi = block_body.iter().map(|&b| ast.get(b).span().1).max();
+                    if let (Some(lo), Some(hi)) = (lo, hi) {
+                        scopes.push(ScopeNode::Block {
+                            extent: (lo, hi),
+                            proc_like: proc_like_block(ast, *receiver, method),
+                            params: block_params.iter().map(|(p, _)| p.clone()).collect(),
+                        });
+                    }
+                }
+                if let Some(b) = block_span {
+                    for l in block_locals {
+                        closures.entry(l.clone()).or_default().push(*b);
+                    }
+                }
+                if is_guard_method(method) {
+                    for name in receiver.iter().chain(args.iter()).filter_map(|&i| local_read(i)) {
+                        note(name, id);
+                    }
+                }
+            }
+        }
+        ReachIndex {
+            case_clauses: unevaluated_case_clause_spans(ast),
+            def_spans,
+            lambda_spans,
+            scopes,
+            closures,
+            by_name,
+            unrecorded: RefCell::new(HashMap::new()),
+            retries: RefCell::new(HashMap::new()),
+            events: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Whether `span` sits inside a `when` condition / `in` pattern.
+    pub(crate) fn in_case_clause(&self, span: Span) -> bool {
+        self.case_clauses.iter().any(|&c| contains(c, span))
+    }
+
+    /// The extents of the closures that bind `name` (see `closures`).
+    pub(crate) fn closures_binding(&self, name: &str) -> &[Span] {
+        self.closures.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Whether `name` is bound by a literal block / `->` that contains `span`
+    /// but NOT `use_span` — a parameter, `;`-local or body-introduced local
+    /// (Prism's `BlockNode#locals`, which a captured outer local never joins).
+    /// A write to it rebinds THAT closure's scope only, so it cannot reach a
+    /// read outside the block: `xs.each { |x| x = 1 }` leaves a top-level `x`
+    /// untouched, and `x` inside one `lambda`'s body is a different variable
+    /// from `x` inside a sibling's. The write-collector of
+    /// [`Typer::local_reach`] skips such writes, the cross-closure bleed that
+    /// otherwise minted a precise value for a name the reference reads as
+    /// `Dynamic[top]`.
+    pub(crate) fn closure_bound_elsewhere(&self, span: Span, name: &str, use_span: Span) -> bool {
+        self.closures_binding(name)
+            .iter()
+            .any(|&extent| contains(extent, span) && !contains(extent, use_span))
+    }
+
+    /// [`unrecorded_closure`] for `use_span`, memoized.
+    pub(crate) fn unrecorded_closure(
+        &self,
+        ast: &LoweredAst,
+        use_span: Span,
+    ) -> Option<(NodeId, Span)> {
+        if let Some(hit) = self.unrecorded.borrow().get(&use_span) {
+            return *hit;
+        }
+        let out = unrecorded_closure(ast, use_span);
+        self.unrecorded.borrow_mut().insert(use_span, out);
+        out
+    }
+
+    /// [`Typer::clause_retries`] for `clause_span`, memoized.
+    pub(crate) fn clause_retries(&self, typer: &Typer<'_>, ast: &LoweredAst, clause_span: Span) -> bool {
+        if let Some(hit) = self.retries.borrow().get(&clause_span) {
+            return *hit;
+        }
+        let out = typer.clause_retries(ast, clause_span);
+        self.retries.borrow_mut().insert(clause_span, out);
+        out
+    }
+
+    /// The write collector's events for `root` inside `region` — every node
+    /// the per-call loop of [`Typer::local_reach`] used to match, in arena
+    /// order, with the read-independent filters applied. `skip_defs` is the
+    /// whole-file region's exclusion of `def` bodies.
+    pub(crate) fn events(
+        &self,
+        ast: &LoweredAst,
+        region: Span,
+        skip_defs: bool,
+        root: &str,
+    ) -> Rc<[LocalEvent]> {
+        let key = (region, skip_defs, root.to_string());
+        if let Some(hit) = self.events.borrow().get(&key) {
+            return hit.clone();
+        }
+        let out: Rc<[LocalEvent]> = self.collect_events(ast, region, skip_defs, root).into();
+        self.events.borrow_mut().insert(key, out.clone());
+        out
+    }
+
+    fn collect_events(
+        &self,
+        ast: &LoweredAst,
+        region: Span,
+        skip_defs: bool,
+        root: &str,
+    ) -> Vec<LocalEvent> {
+        let in_region = |s: Span| {
+            if !contains(region, s) || self.in_case_clause(s) || ast.in_blocked_carrier(s) {
+                return false;
+            }
+            if self.lambda_spans.iter().any(|&l| contains(l, s)) {
+                return false;
+            }
+            !(skip_defs && self.def_spans.iter().any(|&d| contains(d, s)))
+        };
+        // A guard is a narrowing, not a binding, so the `->` skip does not
+        // apply to it — only the region does (see `local_reach`).
+        let guards_here = |s: Span| {
+            contains(region, s) && !self.in_case_clause(s) && !ast.in_blocked_carrier(s)
+        };
+        let reads_root = |i: NodeId| {
+            matches!(ast.get(i), Node::LocalVariableRead { name, .. } if name == root)
+        };
+        let mut out = Vec::new();
+        let Some(ids) = self.by_name.get(root) else {
+            return out;
+        };
+        for &id in ids {
+            let n = ast.get(id);
+            // A write under `defined?` / `END` / `BEGIN` never runs in
+            // sequence on the reference, so it contributes no value
+            // (rigor-rs#153) — and the node is skipped for every arm.
+            if ast.in_inert_carrier(n.span()) {
+                continue;
+            }
+            match n {
+                Node::LocalVariableWrite { name, value, span, .. } if name == root => {
+                    if in_region(*span) {
+                        out.push(LocalEvent::Write {
+                            span: *span,
+                            value_span: ast.get(*value).span(),
+                            write: LocalWrite::Plain(*value),
+                        });
+                    }
+                }
+                Node::Loop { index, .. } => {
+                    let spans: Vec<Span> = index
+                        .iter()
+                        .filter(|(n, s)| n == root && in_region(*s))
+                        .map(|(_, s)| *s)
+                        .collect();
+                    if !spans.is_empty() {
+                        out.push(LocalEvent::ForIndex(spans));
+                    }
+                }
+                Node::LocalVariableOpWrite { name, value, span }
+                    if name == root && in_region(*span) =>
+                {
+                    out.push(LocalEvent::Write {
+                        span: *span,
+                        value_span: ast.get(*value).span(),
+                        write: LocalWrite::Op(*value),
+                    });
+                }
+                Node::MultiWrite { targets, value, span, .. }
+                    if in_region(*span)
+                        && targets.bound_names().iter().any(|(n, _)| n == root) =>
+                {
+                    out.push(LocalEvent::Write {
+                        span: *span,
+                        value_span: ast.get(*value).span(),
+                        write: LocalWrite::Multi(*value),
+                    });
+                }
+                Node::BeginRescue { clauses, span, .. } if in_region(*span) => {
+                    let spans: Vec<Span> = clauses
+                        .iter()
+                        .filter(|c| c.bound_name.as_deref() == Some(root))
+                        .map(|c| c.span)
+                        .collect();
+                    if !spans.is_empty() {
+                        out.push(LocalEvent::RescueBinding(spans));
+                    }
+                }
+                Node::Call { receiver, method, args, span, .. }
+                    if guards_here(*span)
+                        && is_guard_method(method)
+                        && (receiver.is_some_and(reads_root)
+                            || args.iter().copied().any(reads_root)) =>
+                {
+                    let exact = is_exact_guard_method(method)
+                        && receiver.is_some_and(reads_root)
+                        && matches!(args.as_slice(), [c] if matches!(ast.get(*c), Node::ConstantRead { .. }));
+                    out.push(if exact { LocalEvent::ExactGuard } else { LocalEvent::Guard });
+                }
+                Node::Case { predicate, span, .. }
+                    if guards_here(*span) && predicate.is_some_and(reads_root) =>
+                {
+                    out.push(LocalEvent::Guard);
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+}
+
+impl<'i> Typer<'i> {
+    /// The [`ReachIndex`] of `ast`, built on first use and memoized on the
+    /// [`Typer`] per `ast` identity (the `dead_cache` keying, plus the arena
+    /// length as a guard against a reused address).
+    pub(crate) fn reach_index(&self, ast: &LoweredAst) -> Rc<ReachIndex> {
+        let key = (ast as *const LoweredAst as usize, ast.len());
+        if let Some((cached_key, idx)) = &*self.reach_index.borrow() {
+            if *cached_key == key {
+                return idx.clone();
+            }
+        }
+        let idx = Rc::new(ReachIndex::build(ast));
+        *self.reach_index.borrow_mut() = Some((key, idx.clone()));
+        idx
+    }
+}

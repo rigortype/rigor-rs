@@ -98,6 +98,13 @@ pub struct Typer<'i> {
     /// `definitely_assigns` → `expr_truthiness` fanout polynomial on
     /// generated-parser files.
     pub(crate) truthy_provisional: RefCell<std::collections::HashSet<(usize, u32)>>,
+    /// rigor-rs#422: the per-AST tables behind `local_reach` (the scope
+    /// shapes, the closure index, the `when`/`in` extents, the write
+    /// collector's candidates), memoized by `(ast identity, arena length)`.
+    /// They read only the syntax tree, so one build serves every reach
+    /// query on that AST — see [`crate::reach_index::ReachIndex`].
+    pub(crate) reach_index:
+        RefCell<Option<((usize, usize), std::rc::Rc<crate::reach_index::ReachIndex>)>>,
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
@@ -108,13 +115,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()) }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None) }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()) }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None) }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -125,7 +132,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()) }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from
