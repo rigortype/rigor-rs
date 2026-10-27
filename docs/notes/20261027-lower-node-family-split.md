@@ -114,3 +114,15 @@ reached master) did not occur.
 `git config rerere.enabled true` to skip the init prompt; that setting is
 shared repo config. Verdict: use it for multi-PR arcs, from one worktree that
 owns every branch in the stack.
+
+## Follow-up: #416 (PR #417, merge `43fcd83`)
+
+The fallback moved out of `lower_jumps` into `#[inline(never)] lower_fallback`, so all five families now end in `UNMATCHED`. In debug builds, `check_families_disjoint` re-runs the later families after a match and asserts that none of them claims the node. Mutants that copy the `nil` arm into a later or an earlier family both fail `cargo test`.
+
+The family methods became `pub(super)`. `lower_node` keeps one reassigned `let mut id`, because shadowing lets cost 16 B of debug frame.
+
+Release lowering is byte-identical. Release depth is equal to master on 1.95 and 1.88. Shapes that recurse through the fallback improve (`f(*f(*…))` 855 → 1020).
+
+**The 432 B finding is toolchain-dependent.** Without `#[inline(never)]` on the fallback, 1.95 inlines it and `lower_node`'s frame grows to 432 B. 1.88 does not inline it. Frame claims must name the toolchain; CI and the shipped binaries use 1.88.
+
+**The runtime check's coverage gap is #418.** 19 of the 90 claimed types never occur in a fixture, so a duplicate of one of them passes (Mutant C). #418 adds the static inventory test, F3.
