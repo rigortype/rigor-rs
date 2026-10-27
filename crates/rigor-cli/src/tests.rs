@@ -1,4 +1,5 @@
 use super::*;
+use rigor_parse::parse;
 
 /// A `Diagnostic` with the given severity/message; offset 0 so line/col are
 /// 1/1 for an empty source, or computed from a provided source.

@@ -525,6 +525,7 @@ fn scan_paths(paths: &[String], index: &CoreIndex, workers: Option<usize>) -> Re
     let results = match workers {
         Some(n) => rayon::ThreadPoolBuilder::new()
             .num_threads(n)
+            .stack_size(crate::ANALYSIS_STACK_BYTES)
             .build()
             .map(|pool| pool.install(scan_all))
             .unwrap_or_else(|_| scan_all()),
@@ -559,7 +560,9 @@ fn scan_file(path: &str, index: &CoreIndex) -> Result<FileResult, Vec<String>> {
         Ok(s) => s,
         Err(e) => return Err(vec![format!("cannot read {path}: {e}")]),
     };
-    let parse_result = ruby_prism::parse(&source);
+    // Past the depth bound (rigor-rs#412) the file is listed with the other
+    // files that could not be scanned, the way an unreadable one is.
+    let parse_result = rigor_parse::parse_bounded(&source).map_err(|e| vec![e.message()])?;
     let errors: Vec<String> = parse_result
         .errors()
         .map(|d| d.message().to_string())

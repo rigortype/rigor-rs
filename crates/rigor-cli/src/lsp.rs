@@ -48,7 +48,7 @@ use lsp_types::{
 
 use rigor_index::CoreIndex;
 use rigor_infer::{Harvest, SourceIndex, Typer};
-use rigor_parse::{comment_lines, lower, lower_with_key, parse, FileKey, LoweredAst, Node};
+use rigor_parse::{comment_lines, lower, lower_with_key, parse_bounded, FileKey, LoweredAst, Node};
 use rigor_rules::{analyze_with_source_and_folder, filter_suppressed, Severity, SuppressSet};
 use rigor_types::{Interner, Type, TypeId};
 
@@ -1123,9 +1123,10 @@ fn document_file_key(canonical: Option<&Path>) -> FileKey {
 
 /// Read + lower ONE project file the way [`build_overlay`] does: ERB templates are
 /// skipped (Prism's recovery over `<%= … %>` yields a garbage AST — matching
-/// `check`), and a read error or a parser panic yields `None` rather than a crash
-/// (ADR-0016). `None` therefore means "this file contributes nothing to the
-/// project index", which is also the right answer for a file that was deleted.
+/// `check`), and a read error, a parser panic or a tree past the depth bound
+/// (rigor-rs#412) yields `None` rather than a crash (ADR-0016). `None` therefore
+/// means "this file contributes nothing to the project index", which is also the
+/// right answer for a file that was deleted.
 fn lower_one(path: &str) -> Option<LoweredAst> {
     let source = std::fs::read(path).ok()?;
     if rigor_parse::looks_like_erb_template(&source) {
@@ -1136,7 +1137,7 @@ fn lower_one(path: &str) -> Option<LoweredAst> {
     // `overlay_source_index` preserves the per-file constant gate's answer.
     let key = document_file_key(Some(Path::new(path)));
     panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = parse(&source);
+        let result = parse_bounded(&source).ok()?;
         // A file with parse errors contributes nothing to the index, the same
         // answer `check` gives it (`main.rs` stage 1) and the reference's
         // dependency walker gives it: Prism's recovery invents bindings, so
@@ -2929,7 +2930,9 @@ fn compute_diagnostics(
         return (Vec::new(), None, None);
     }
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
-        let result = parse(&bytes);
+        // Past the depth bound (rigor-rs#412) the buffer is not analysed; it
+        // publishes the `internal-error` finding `check` reports for the file.
+        let result = parse_bounded(&bytes).map_err(|too_deep| too_deep.message())?;
         // A buffer Prism could not parse gets no semantic diagnostics, matching
         // `check` (`main.rs` stage 1) and the reference, which returns its parse
         // diagnostics without ever reaching the typing pass. Mid-keystroke the
@@ -2938,7 +2941,7 @@ fn compute_diagnostics(
         // keystroke. `None` here clears the file's diagnostics, as `didClose`
         // and the ERB skip above already do.
         if result.errors().next().is_some() {
-            return None;
+            return Ok(None);
         }
         let comments = comment_lines(&result, &bytes);
         // Issue #102: the buffer is the content of a file at a known path, so its
@@ -2979,12 +2982,16 @@ fn compute_diagnostics(
         // nothing and cost staleness (probe §4 — this is the one gate that keeps
         // the fallback posture literally unchanged).
         let project_index = overlay_build.is_some().then(|| Arc::clone(&source));
-        Some((diags, comments, overlay_build, project_index))
+        Ok(Some((diags, comments, overlay_build, project_index)))
     }));
 
     let (mut diags, comments, overlay_build, project_index) = match analysed {
-        Ok(Some(quad)) => quad,
-        Ok(None) | Err(_) => return (Vec::new(), None, None),
+        Ok(Ok(Some(quad))) => quad,
+        Ok(Err(msg)) => {
+            let skipped = crate::internal_error_diag(msg);
+            return (vec![to_lsp_diagnostic(text, &skipped)], None, None);
+        }
+        Ok(Ok(None)) | Err(_) => return (Vec::new(), None, None),
     };
     // Suppression-marker surveillance, before `filter_suppressed` (self-suppressible).
     diags.extend(rigor_rules::suppression_marker_diagnostics(&comments));
@@ -3066,7 +3073,8 @@ fn hover(
     let key = document_file_key(uri_to_canonical_path(&pos.text_document.uri).as_deref());
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let ast = lower_with_key(&parse(text.as_bytes()), key);
+        // Past the depth bound (rigor-rs#412): a null hover.
+        let ast = lower_with_key(&parse_bounded(text.as_bytes()).ok()?, key);
         let node_id = crate::type_of::locate_node(&ast, offset)?;
         // Deferred init, so the single-file index is not even BUILT on a hit.
         let single_file;
@@ -3234,7 +3242,8 @@ fn completion(
     let key = document_file_key(uri_to_canonical_path(&tdp.text_document.uri).as_deref());
 
     let result = panic::catch_unwind(AssertUnwindSafe(|| {
-        let ast = lower_with_key(&parse(synth.as_bytes()), key);
+        // Past the depth bound (rigor-rs#412): a null completion.
+        let ast = lower_with_key(&parse_bounded(synth.as_bytes()).ok()?, key);
         // Our injected call is the unique `Call` whose method-name token starts
         // exactly at `stub_at`.
         let receiver = ast.iter().find_map(|(_, n)| match n {
@@ -3310,8 +3319,9 @@ fn namespace_completion(
         // name (`Foo::Bar::<stub>`), so the enclosing namespace is the name with
         // the stub segment removed. A stub with no `::` before it is `::Stub`,
         // a TOP-LEVEL reference with no parent — nothing to enumerate, which is
-        // also what the reference returns for a parent-less path.
-        lower(&parse(synth.as_bytes())).iter().find_map(|(_, n)| match n {
+        // also what the reference returns for a parent-less path. Past the
+        // depth bound (rigor-rs#412): nothing.
+        lower(&parse_bounded(synth.as_bytes()).ok()?).iter().find_map(|(_, n)| match n {
             Node::ConstantRead { name, .. } => {
                 name.strip_suffix(suffix.as_str()).map(str::to_string)
             }
@@ -3434,7 +3444,9 @@ fn document_symbols(
 ) -> Option<DocumentSymbolResponse> {
     let text = buffers.text(&params.text_document.uri)?;
     let syms = panic::catch_unwind(AssertUnwindSafe(|| {
-        let ast = lower(&parse(text.as_bytes()));
+        // Past the depth bound (rigor-rs#412): no symbols.
+        let Ok(parsed) = parse_bounded(text.as_bytes()) else { return Vec::new() };
+        let ast = lower(&parsed);
         crate::outline::build(&ast).iter().map(|s| to_document_symbol(s, text)).collect::<Vec<_>>()
     }))
     .ok()?;

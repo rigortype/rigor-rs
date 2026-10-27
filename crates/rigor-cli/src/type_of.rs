@@ -28,7 +28,7 @@ use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
-use rigor_parse::{lower, parse, LoweredAst, Node, NodeId};
+use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, TypeId};
 
 use crate::optparse::Item;
@@ -194,9 +194,16 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
         }
     };
 
-    // Parse + lower exactly as `check` does (the same project path).
-    let bytes = source.as_bytes();
-    let ast = lower(&parse(bytes));
+    // Parse + lower exactly as `check` does (the same project path). A tree
+    // past the depth bound is refused like an unreadable file (rigor-rs#412).
+    let parsed = match parse_bounded(source.as_bytes()) {
+        Ok(parsed) => parsed,
+        Err(too_deep) => {
+            eprintln!("type-of: {file}: {}", too_deep.message());
+            return ExitCode::from(1);
+        }
+    };
+    let ast = lower(&parsed);
 
     // Locate the deepest node whose span contains the offset.
     let Some(node_id) = locate_node(&ast, offset) else {
@@ -484,6 +491,7 @@ fn render_json(probe: &Probe) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rigor_parse::parse;
 
     /// Type the node located at a 1-based (line, column) in `src`, returning
     /// `(node_kind, type_render)` — the two fields `type-of` prints.

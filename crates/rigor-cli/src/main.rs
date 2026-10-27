@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 use rigor_index::CoreIndex;
-use rigor_parse::{lower_with_key, parse, FileKey};
+use rigor_parse::{lower_with_key, parse_bounded, FileKey};
 use rigor_rules::{analyze_with_source_and_folder, catalog, Diagnostic, Severity};
 use rigor_types::Interner;
 
@@ -98,7 +98,44 @@ Commands:
   help       Print this help
 ";
 
+/// The stack every analysis thread runs on (rigor-rs#412, ADR-0045): the
+/// command thread [`main`] spawns and every rayon worker, both in the global
+/// pool and in `coverage --workers`.
+///
+/// Sized for a tree at the depth bound ([`rigor_parse::MAX_NESTING_DEPTH`]),
+/// measured on release aarch64 builds:
+/// - Prism's cap: every construct needs at most 13 MiB (`defined?`).
+/// - Uncapped chains at the bound: at most 1.43 KiB per level (an `elsif`
+///   chain), about 36 MiB at 25,000 levels.
+///
+/// The stack is reserved, not committed: 64 and 256 MiB measured the same
+/// wall time and peak RSS as the 2 MiB default on three corpora. Under Linux
+/// strict overcommit (`vm.overcommit_memory = 2`), each thread's reservation
+/// still counts against the commit limit.
+pub(crate) const ANALYSIS_STACK_BYTES: usize = 256 << 20;
+
 fn main() -> ExitCode {
+    rayon::ThreadPoolBuilder::new()
+        .stack_size(ANALYSIS_STACK_BYTES)
+        .build_global()
+        .expect("nothing uses the global rayon pool before main configures it (rigor-rs#412)");
+    // The main thread's own stack is the platform's (8 MiB on macOS and
+    // Linux, 1 MiB on Windows), and Prism alone needs 8.1 MiB at its cap. So
+    // every command runs on a spawned thread instead. It is named "main", so
+    // panic and overflow messages read as they did before.
+    let command = std::thread::Builder::new()
+        .name("main".to_string())
+        .stack_size(ANALYSIS_STACK_BYTES)
+        .spawn(run_command)
+        .expect("spawn the command thread");
+    match command.join() {
+        Ok(code) => code,
+        Err(payload) => panic::resume_unwind(payload),
+    }
+}
+
+/// The command dispatch, on the thread [`main`] sizes.
+fn run_command() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         // `CLI#run`: no command, `help`, `-h`, `--help` → the command list on
@@ -1503,6 +1540,10 @@ fn analyze_files(
     enum Lowered {
         Parsed(rigor_parse::LoweredAst, Vec<(usize, usize, String)>),
         Unparseable(Vec<Diagnostic>),
+        /// Nested past the depth bound (rigor-rs#412): skipped exactly like a
+        /// panicked file — the `internal-error` finding and stderr line, no
+        /// harvest.
+        TooDeep(String),
     }
 
     /// One stage-1 work item: `order`/`analyze` mark the analyzed files
@@ -1637,7 +1678,13 @@ fn analyze_files(
             }
             let source_bytes = source.as_bytes().to_vec();
             let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
-                let result = parse(&source_bytes);
+                // The depth bound comes first, before any walker and before
+                // the parse-error branch, so a refused tree is never walked,
+                // nor dropped on this stack (rigor-rs#412).
+                let result = match parse_bounded(&source_bytes) {
+                    Ok(result) => result,
+                    Err(too_deep) => return Lowered::TooDeep(too_deep.message()),
+                };
                 // A file Prism could not parse is analysed by NEITHER tool. The
                 // reference's `analyze_file_body` returns its parse diagnostics
                 // and never reaches `ScopeIndexer.index`, so every semantic rule
@@ -1724,6 +1771,11 @@ fn analyze_files(
                     msg: panic_message(&panic_val),
                 },
                 Err(_) => Stage1::Excluded,
+                // Past the depth bound: the panicked file's outcome, verbatim.
+                Ok(Lowered::TooDeep(msg)) if item.analyze => {
+                    Stage1::Panic { order, path: path.to_string(), msg }
+                }
+                Ok(Lowered::TooDeep(_)) => Stage1::Excluded,
             }
         })
         .collect();

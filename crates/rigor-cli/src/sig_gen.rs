@@ -86,7 +86,7 @@ use ruby_rbs::node::{MethodDefinitionKind, Node as RbsNode, RBSLocationRange};
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
-use rigor_parse::{lower, parse, LoweredAst, Node, NodeId, ParamShape, Visibility};
+use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId, ParamShape, Visibility};
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod meta_class;
@@ -350,8 +350,8 @@ fn generate_file(path: &str, include_private: bool, sig_env: &SigEnv) -> Vec<Can
 }
 
 /// Produce candidates + the `--write` namespace metadata for one source file. A
-/// parse/read failure (or a file with no reachable named class body) yields no
-/// candidates.
+/// parse/read failure, a tree past the depth bound (rigor-rs#412), or a file
+/// with no reachable named class body yields no candidates.
 fn generate_file_with_info(
     path: &str,
     include_private: bool,
@@ -360,7 +360,9 @@ fn generate_file_with_info(
     let Ok(source) = std::fs::read_to_string(path) else {
         return (Vec::new(), NamespaceInfo::default());
     };
-    let parsed = parse(source.as_bytes());
+    let Ok(parsed) = parse_bounded(source.as_bytes()) else {
+        return (Vec::new(), NamespaceInfo::default());
+    };
     // Every `Data.define` / `Struct.new` class in the file, keyed by FQN. Read
     // BEFORE the walks: it decides which constant writes are namespaces (their
     // `do ... end` block's defs bind on the new class) and which classes carry a
