@@ -16,6 +16,11 @@ use super::{
     Recovered, RescueClause, ScopeMarks, Span, StatementsKind,
 };
 
+/// What a family method of [`Builder::lower_node`] returns for a node that is
+/// not one of its types. `push` never mints it: its `debug_assert!` keeps
+/// every id below `u32::MAX`, which no real arena reaches.
+const UNMATCHED: NodeId = NodeId(u32::MAX);
+
 /// Mutable accumulator for the owned arena during the lowering walk.
 pub(crate) struct Builder<'src> {
     pub(crate) nodes: Vec<Node>,
@@ -198,6 +203,7 @@ pub(crate) struct Builder<'src> {
 impl<'src> Builder<'src> {
     /// Push an owned node, returning its fresh [`NodeId`].
     fn push(&mut self, node: Node) -> NodeId {
+        debug_assert!(self.nodes.len() < u32::MAX as usize);
         let id = NodeId(self.nodes.len() as u32);
         self.nodes.push(node);
         id
@@ -213,97 +219,30 @@ impl<'src> Builder<'src> {
     /// source's nesting depth.
     pub(crate) fn lower_node(&mut self, node: &PrismNode<'_>) -> NodeId {
         let span = span_of(&node.location());
+        let id = self.lower_calls(node, span);
+        if id != UNMATCHED {
+            return id;
+        }
+        let id = self.lower_expressions(node);
+        if id != UNMATCHED {
+            return id;
+        }
+        let id = self.lower_control(node, span);
+        if id != UNMATCHED {
+            return id;
+        }
+        let id = self.lower_definitions(node);
+        if id != UNMATCHED {
+            return id;
+        }
+        self.lower_jumps(node, span)
+    }
 
-        if let Some(program) = node.as_program_node() {
-            let stmts = program.statements();
-            let body = self.lower_body(&stmts.body());
-            return self.push(Node::Program {
-                body,
-                span: span_of(&program.location()),
-            });
-        }
-
-        if let Some(stmts) = node.as_statements_node() {
-            let body = self.lower_body(&stmts.body());
-            return self.push(Node::Statements {
-                body,
-                span: span_of(&stmts.location()),
-                kind: StatementsKind::Sequence,
-            });
-        }
-
-        if let Some(write) = node.as_local_variable_write_node() {
-            let name = constant_string(write.name().as_slice());
-            let value = self.lower_node(&write.value());
-            return self.push(Node::LocalVariableWrite {
-                name,
-                value,
-                name_span: span_of(&write.name_loc()),
-                span: span_of(&write.location()),
-            });
-        }
-
-        // Operator / and / or local writes (`x += 1`, `y ||= 5`, `z &&= w`). All
-        // three lower to the same owned variant: their target name is a READ of
-        // the prior binding (mirrors the reference `reading_assignment?`), and the
-        // assigned value is lowered for call reachability. Without this variant
-        // they fall through to `Node::Other` and the dead-assignment walk loses
-        // sight of the target read — the one false-positive risk this rule has.
-        if let Some(opw) = node.as_local_variable_operator_write_node() {
-            let name = constant_string(opw.name().as_slice());
-            let value = self.lower_node(&opw.value());
-            return self.push(Node::LocalVariableOpWrite {
-                name,
-                value,
-                span: span_of(&opw.location()),
-            });
-        }
-        if let Some(andw) = node.as_local_variable_and_write_node() {
-            let name = constant_string(andw.name().as_slice());
-            let value = self.lower_node(&andw.value());
-            return self.push(Node::LocalVariableOpWrite {
-                name,
-                value,
-                span: span_of(&andw.location()),
-            });
-        }
-        if let Some(orw) = node.as_local_variable_or_write_node() {
-            let name = constant_string(orw.name().as_slice());
-            let value = self.lower_node(&orw.value());
-            return self.push(Node::LocalVariableOpWrite {
-                name,
-                value,
-                span: span_of(&orw.location()),
-            });
-        }
-
-        // `a, b = rhs` / `a, (b, c), *rest = rhs`. The target tree is lowered
-        // structurally (NOT into the arena — targets bind names, they are not
-        // value expressions) and the RHS is lowered as a normal child.
-        if let Some(mw) = node.as_multi_write_node() {
-            let mut recovered = Vec::new();
-            let targets = lower_multi_targets(
-                &mw.lefts(),
-                mw.rest().as_ref(),
-                &mw.rights(),
-                span_of(&mw.location()),
-                &mut recovered,
-                self.recovery_iterative > 0,
-            );
-            // Lower the expressions embedded in non-local targets so the
-            // structural walks keep seeing those reads/calls — the old
-            // recovered-children carrier did, and `flow.dead-assignment`
-            // depends on it (netrc `item[3], item[5] = info`).
-            let target_exprs: Vec<NodeId> = self.lower_recovered(recovered);
-            let value = self.lower_node(&mw.value());
-            return self.push(Node::MultiWrite {
-                targets,
-                value,
-                target_exprs,
-                span: span_of(&mw.location()),
-            });
-        }
-
+    /// [`Self::lower_node`]'s call-shaped arms: the compound index writes
+    /// (`h[k] ||= v`), the compound attribute writes (`recv.attr ||= v`) and
+    /// `CallNode` (receiver, arguments, block).
+    #[inline(never)]
+    fn lower_calls(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
         // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — Prism's three compound
         // index-write nodes. A plain `h[k] = v` stays a `[]=` `Node::Call`;
         // the compound forms read the slot AND store through `[]=`, so they
@@ -493,86 +432,6 @@ impl<'src> Builder<'src> {
             });
         }
 
-        if let Some(read) = node.as_local_variable_read_node() {
-            let name = constant_string(read.name().as_slice());
-            return self.push(Node::LocalVariableRead {
-                name,
-                span: span_of(&read.location()),
-            });
-        }
-
-        if let Some(read) = node.as_it_local_variable_read_node() {
-            // Ruby 3.4 `it` — the node carries no `name`; the implicit local is
-            // always `it`, matching the binding `block_param_names` installs
-            // for `ItParametersNode` (`reference/rigor`'s `it_read`).
-            return self.push(Node::LocalVariableRead {
-                name: "it".to_string(),
-                span: span_of(&read.location()),
-            });
-        }
-
-        if let Some(s) = node.as_string_node() {
-            // `unescaped()` is the decoded contents (`"Hello"` -> Hello).
-            let value = String::from_utf8_lossy(s.unescaped()).into_owned();
-            return self.push(Node::StringLit {
-                value,
-                span: span_of(&s.location()),
-            });
-        }
-
-        if let Some(int) = node.as_integer_node() {
-            // Prism's `TryInto<i32>` covers only `i32`; the digit view widens
-            // that to all of `i64`. A Bignum lowers `value` to `None` — never
-            // to a wrong value (`3_000_000_000` once lowered to `0` and
-            // folded) — while `digits` keeps the exact decimal spelling so
-            // the typer can pin it as `Scalar::BigInt` (rigor-rs#194).
-            let value = integer_value(&int.value());
-            let digits = if value.is_none() {
-                Some(integer_decimal(&int.value()))
-            } else {
-                None
-            };
-            return self.push(Node::IntegerLit {
-                value,
-                digits,
-                span: span_of(&int.location()),
-            });
-        }
-
-        if let Some(f) = node.as_float_node() {
-            return self.push(Node::FloatLit {
-                value: f.value(),
-                span: span_of(&f.location()),
-            });
-        }
-
-        if let Some(sym) = node.as_symbol_node() {
-            // `unescaped()` is the decoded symbol name (`:foo` -> foo).
-            let value = String::from_utf8_lossy(sym.unescaped()).into_owned();
-            return self.push(Node::SymbolLit {
-                value,
-                span: span_of(&sym.location()),
-            });
-        }
-
-        if let Some(n) = node.as_nil_node() {
-            return self.push(Node::NilLit {
-                span: span_of(&n.location()),
-            });
-        }
-
-        if let Some(t) = node.as_true_node() {
-            return self.push(Node::TrueLit {
-                span: span_of(&t.location()),
-            });
-        }
-
-        if let Some(fa) = node.as_false_node() {
-            return self.push(Node::FalseLit {
-                span: span_of(&fa.location()),
-            });
-        }
-
         if let Some(call) = node.as_call_node() {
             // The receiver, the positional arguments and the `&expr`
             // block-pass are OPERAND positions — `OperandWalk.thread_operand`
@@ -737,6 +596,13 @@ impl<'src> Builder<'src> {
             });
         }
 
+        UNMATCHED
+    }
+
+    /// [`Self::lower_node`]'s definition arms: `def`, `class`, `module` and
+    /// `class << self`.
+    #[inline(never)]
+    fn lower_definitions(&mut self, node: &PrismNode<'_>) -> NodeId {
         if let Some(def) = node.as_def_node() {
             // Lower the method body so its calls reach the walk. Parameters are
             // intentionally NOT bound to any type: an unknown local read is
@@ -935,6 +801,13 @@ impl<'src> Builder<'src> {
             });
         }
 
+        UNMATCHED
+    }
+
+    /// [`Self::lower_node`]'s control-flow arms: `if`/`unless`/`else`,
+    /// `case`/`when`/`in`, the loops, `begin`/`rescue`/`ensure`, `and`/`or`.
+    #[inline(never)]
+    fn lower_control(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
         if let Some(if_node) = node.as_if_node() {
             // `if` / ternary. Prism's ternary is also an IfNode. Arms whose
             // scope the join discards carry the blocked counter, mirroring
@@ -1470,6 +1343,185 @@ impl<'src> Builder<'src> {
             });
         }
 
+        UNMATCHED
+    }
+
+    /// [`Self::lower_node`]'s expression arms: the program and statement
+    /// wrappers, local reads and writes, multi-writes, literals, collections,
+    /// parentheses, instance/class/global variables, constants, `self`,
+    /// interpolation and lambdas.
+    #[inline(never)]
+    fn lower_expressions(&mut self, node: &PrismNode<'_>) -> NodeId {
+        if let Some(program) = node.as_program_node() {
+            let stmts = program.statements();
+            let body = self.lower_body(&stmts.body());
+            return self.push(Node::Program {
+                body,
+                span: span_of(&program.location()),
+            });
+        }
+
+        if let Some(stmts) = node.as_statements_node() {
+            let body = self.lower_body(&stmts.body());
+            return self.push(Node::Statements {
+                body,
+                span: span_of(&stmts.location()),
+                kind: StatementsKind::Sequence,
+            });
+        }
+
+        if let Some(write) = node.as_local_variable_write_node() {
+            let name = constant_string(write.name().as_slice());
+            let value = self.lower_node(&write.value());
+            return self.push(Node::LocalVariableWrite {
+                name,
+                value,
+                name_span: span_of(&write.name_loc()),
+                span: span_of(&write.location()),
+            });
+        }
+
+        // Operator / and / or local writes (`x += 1`, `y ||= 5`, `z &&= w`). All
+        // three lower to the same owned variant: their target name is a READ of
+        // the prior binding (mirrors the reference `reading_assignment?`), and the
+        // assigned value is lowered for call reachability. Without this variant
+        // they fall through to `Node::Other` and the dead-assignment walk loses
+        // sight of the target read — the one false-positive risk this rule has.
+        if let Some(opw) = node.as_local_variable_operator_write_node() {
+            let name = constant_string(opw.name().as_slice());
+            let value = self.lower_node(&opw.value());
+            return self.push(Node::LocalVariableOpWrite {
+                name,
+                value,
+                span: span_of(&opw.location()),
+            });
+        }
+        if let Some(andw) = node.as_local_variable_and_write_node() {
+            let name = constant_string(andw.name().as_slice());
+            let value = self.lower_node(&andw.value());
+            return self.push(Node::LocalVariableOpWrite {
+                name,
+                value,
+                span: span_of(&andw.location()),
+            });
+        }
+        if let Some(orw) = node.as_local_variable_or_write_node() {
+            let name = constant_string(orw.name().as_slice());
+            let value = self.lower_node(&orw.value());
+            return self.push(Node::LocalVariableOpWrite {
+                name,
+                value,
+                span: span_of(&orw.location()),
+            });
+        }
+
+        // `a, b = rhs` / `a, (b, c), *rest = rhs`. The target tree is lowered
+        // structurally (NOT into the arena — targets bind names, they are not
+        // value expressions) and the RHS is lowered as a normal child.
+        if let Some(mw) = node.as_multi_write_node() {
+            let mut recovered = Vec::new();
+            let targets = lower_multi_targets(
+                &mw.lefts(),
+                mw.rest().as_ref(),
+                &mw.rights(),
+                span_of(&mw.location()),
+                &mut recovered,
+                self.recovery_iterative > 0,
+            );
+            // Lower the expressions embedded in non-local targets so the
+            // structural walks keep seeing those reads/calls — the old
+            // recovered-children carrier did, and `flow.dead-assignment`
+            // depends on it (netrc `item[3], item[5] = info`).
+            let target_exprs: Vec<NodeId> = self.lower_recovered(recovered);
+            let value = self.lower_node(&mw.value());
+            return self.push(Node::MultiWrite {
+                targets,
+                value,
+                target_exprs,
+                span: span_of(&mw.location()),
+            });
+        }
+
+        if let Some(read) = node.as_local_variable_read_node() {
+            let name = constant_string(read.name().as_slice());
+            return self.push(Node::LocalVariableRead {
+                name,
+                span: span_of(&read.location()),
+            });
+        }
+
+        if let Some(read) = node.as_it_local_variable_read_node() {
+            // Ruby 3.4 `it` — the node carries no `name`; the implicit local is
+            // always `it`, matching the binding `block_param_names` installs
+            // for `ItParametersNode` (`reference/rigor`'s `it_read`).
+            return self.push(Node::LocalVariableRead {
+                name: "it".to_string(),
+                span: span_of(&read.location()),
+            });
+        }
+
+        if let Some(s) = node.as_string_node() {
+            // `unescaped()` is the decoded contents (`"Hello"` -> Hello).
+            let value = String::from_utf8_lossy(s.unescaped()).into_owned();
+            return self.push(Node::StringLit {
+                value,
+                span: span_of(&s.location()),
+            });
+        }
+
+        if let Some(int) = node.as_integer_node() {
+            // Prism's `TryInto<i32>` covers only `i32`; the digit view widens
+            // that to all of `i64`. A Bignum lowers `value` to `None` — never
+            // to a wrong value (`3_000_000_000` once lowered to `0` and
+            // folded) — while `digits` keeps the exact decimal spelling so
+            // the typer can pin it as `Scalar::BigInt` (rigor-rs#194).
+            let value = integer_value(&int.value());
+            let digits = if value.is_none() {
+                Some(integer_decimal(&int.value()))
+            } else {
+                None
+            };
+            return self.push(Node::IntegerLit {
+                value,
+                digits,
+                span: span_of(&int.location()),
+            });
+        }
+
+        if let Some(f) = node.as_float_node() {
+            return self.push(Node::FloatLit {
+                value: f.value(),
+                span: span_of(&f.location()),
+            });
+        }
+
+        if let Some(sym) = node.as_symbol_node() {
+            // `unescaped()` is the decoded symbol name (`:foo` -> foo).
+            let value = String::from_utf8_lossy(sym.unescaped()).into_owned();
+            return self.push(Node::SymbolLit {
+                value,
+                span: span_of(&sym.location()),
+            });
+        }
+
+        if let Some(n) = node.as_nil_node() {
+            return self.push(Node::NilLit {
+                span: span_of(&n.location()),
+            });
+        }
+
+        if let Some(t) = node.as_true_node() {
+            return self.push(Node::TrueLit {
+                span: span_of(&t.location()),
+            });
+        }
+
+        if let Some(fa) = node.as_false_node() {
+            return self.push(Node::FalseLit {
+                span: span_of(&fa.location()),
+            });
+        }
+
         if let Some(arr) = node.as_array_node() {
             // Elements are `eval_value_container` operands — TYPED, never
             // `evaluate`d (`x = [h.default ||= 0]` keeps `h`'s indexed
@@ -1766,6 +1818,14 @@ impl<'src> Builder<'src> {
             });
         }
 
+        UNMATCHED
+    }
+
+    /// [`Self::lower_node`]'s jump and carrier arms (`return`, `alias`, the four
+    /// jumps, `defined?`, `BEGIN`/`END`/`super`/`yield`, the unmodeled writes),
+    /// then the fallback that recovers any other node's meaningful descendants.
+    #[inline(never)]
+    fn lower_jumps(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
         if let Some(ret) = node.as_return_node() {
             // An explicit `return` — a real owned variant (sig-gen's
             // `DefReturnTyper` port needs the VALUE expressions to union a def's
