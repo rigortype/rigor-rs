@@ -1,6 +1,11 @@
 //! `Builder::lower_expressions` holds the expression arms of
 //! `Builder::lower_node`, from the program wrapper and locals to literals,
 //! collections and lambdas.
+//!
+//! Only the PLAIN instance, class, global and constant writes (`@x = 1`,
+//! `@@x = 1`, `$x = 1`, `K = 1`) are here. Their compound forms (`@x += 1`),
+//! every `K::V` path write and the pattern-match writes are `UnmodeledWrite`
+//! carriers in `jumps.rs`. The local writes, plain and compound, are here.
 
 use crate::ruby_prism::Node as PrismNode;
 
@@ -15,8 +20,10 @@ impl<'src> Builder<'src> {
     /// wrappers, local reads and writes, multi-writes, literals, collections,
     /// parentheses, instance/class/global variables, constants, `self`,
     /// interpolation and lambdas.
+    // Not a perf hint: keeps this frame out of `lower_node`'s recursion.
+    // Inlined, the release nesting limit on a 2 MiB thread roughly halves (#413).
     #[inline(never)]
-    pub(crate) fn lower_expressions(&mut self, node: &PrismNode<'_>) -> NodeId {
+    pub(super) fn lower_expressions(&mut self, node: &PrismNode<'_>) -> NodeId {
         if let Some(program) = node.as_program_node() {
             let stmts = program.statements();
             let body = self.lower_body(&stmts.body());

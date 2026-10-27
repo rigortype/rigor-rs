@@ -13,8 +13,10 @@ impl<'src> Builder<'src> {
     /// [`Self::lower_node`]'s call-shaped arms: the compound index writes
     /// (`h[k] ||= v`), the compound attribute writes (`recv.attr ||= v`) and
     /// `CallNode` (receiver, arguments, block).
+    // Not a perf hint: keeps this frame out of `lower_node`'s recursion.
+    // Inlined, the release nesting limit on a 2 MiB thread roughly halves (#413).
     #[inline(never)]
-    pub(crate) fn lower_calls(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
+    pub(super) fn lower_calls(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
         // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — Prism's three compound
         // index-write nodes. A plain `h[k] = v` stays a `[]=` `Node::Call`;
         // the compound forms read the slot AND store through `[]=`, so they
