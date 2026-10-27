@@ -226,7 +226,7 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::LocalVariableRead { name, span } => {
                 let key = format!("{name}@{}", span.0);
-                if seen.contains(&key) || seen.len() >= 4 {
+                if self.seen_contains(seen, &key) || seen.len() >= 4 {
                     return None;
                 }
                 seen.push(key);
@@ -451,7 +451,7 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
     ) -> Reach {
         let key = format!("{}@{}", root.spelling(), use_span.0);
-        if seen.contains(&key) {
+        if self.seen_contains(seen, &key) {
             return Reach::NONE;
         }
         if seen.len() >= 4 {
@@ -531,7 +531,10 @@ impl<'i> Typer<'i> {
     /// disagreeing or unscalarable (`op=`, multi-write) contributor — every
     /// early return carries `None` — and is only meaningful to callers beside
     /// the returned [`Reach`] (see [`Typer::expr_scalar`]).
-    pub(crate) fn local_reach(
+    ///
+    /// Callers go through the memoizing [`Typer::local_reach`]
+    /// (rigor-rs#422, `reach_memo.rs`).
+    pub(crate) fn local_reach_uncached(
         &self,
         ast: &LoweredAst,
         root: &str,

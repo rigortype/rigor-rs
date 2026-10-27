@@ -547,9 +547,15 @@ impl<'i> Typer<'i> {
             return *hit;
         }
         if !self.truthy_in_flight.borrow_mut().insert(key) {
+            // The answer holds only while this fold runs: a reach
+            // computation that sees it is reused only until then
+            // (rigor-rs#422).
+            self.note_truthy_reentry(key);
             return None;
         }
-        let out = self.expr_truthiness_fold(ast, pred, seen);
+        // A fold that runs to completion is memoized below, so the reach
+        // computations around it depend only on its answer (rigor-rs#422).
+        let out = self.behind_truthy_barrier(|| self.expr_truthiness_fold(ast, pred, seen));
         self.truthy_in_flight.borrow_mut().remove(&key);
         // A fold run inside `dead_positions` read the PARTIAL dead set —
         // cache it for the scan's own reuse, but stamp it provisional so the
@@ -1295,7 +1301,7 @@ impl<'i> Typer<'i> {
     /// diagnostic.
     fn def_exits(&self, ast: &LoweredAst, method: &str, seen: &mut Vec<String>) -> bool {
         let key = format!("bot-def:{method}");
-        if seen.contains(&key) || seen.len() >= 6 {
+        if self.seen_contains(seen, &key) || seen.len() >= 6 {
             return false;
         }
         seen.push(key);
