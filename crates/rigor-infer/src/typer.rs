@@ -103,8 +103,7 @@ pub struct Typer<'i> {
     /// collector's candidates), memoized by `(ast identity, arena length)`.
     /// They read only the syntax tree, so one build serves every reach
     /// query on that AST — see [`crate::reach_index::ReachIndex`].
-    pub(crate) reach_index:
-        RefCell<Option<((usize, usize), std::rc::Rc<crate::reach_index::ReachIndex>)>>,
+    pub(crate) reach_index: RefCell<crate::reach_index::ReachIndexCache>,
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a

@@ -83,6 +83,13 @@ pub(crate) enum LocalEvent {
     Guard,
 }
 
+/// The write collector's cache key: `(region, skip_defs, local name)`.
+type EventsKey = (Span, bool, String);
+
+/// [`Typer::reach_index`]'s memo: the index with the `(AST address, arena
+/// length)` identity it was built for.
+pub(crate) type ReachIndexCache = Option<((usize, usize), Rc<ReachIndex>)>;
+
 /// The per-AST tables. See the module docs.
 pub(crate) struct ReachIndex {
     /// [`unevaluated_case_clause_spans`] — computed once instead of per call.
@@ -124,7 +131,7 @@ pub(crate) struct ReachIndex {
     /// [`Typer::clause_retries`] per clause span.
     retries: RefCell<HashMap<Span, bool>>,
     /// The collector's events per `(region, skip_defs, local)`.
-    events: RefCell<HashMap<(Span, bool, String), Rc<[LocalEvent]>>>,
+    events: RefCell<HashMap<EventsKey, Rc<[LocalEvent]>>>,
 }
 
 /// The class-guard methods the write collector refuses on.
@@ -429,7 +436,7 @@ impl ReachIndex {
             }
             let width = sp.1 - sp.0;
             let better = best.is_none_or(|(bw, bid)| width > bw || (width == bw && id < bid));
-            if better && statement_sections(ast, id).into_iter().any(|b| holds(b)) {
+            if better && statement_sections(ast, id).into_iter().any(holds) {
                 best = Some((width, id));
             }
         }
