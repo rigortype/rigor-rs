@@ -3,7 +3,7 @@
 //! cvar / gvar / chain arms) — the gate of the #521 / #1021 untyped-argument
 //! declines — with the definite-assignment and untyped-root helpers behind it.
 
-use rigor_parse::{LoweredAst, Node, NodeId, Span, StatementsKind};
+use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::Scalar;
 
 use crate::dead::DeadPositions;
@@ -429,24 +429,10 @@ impl<'i> Typer<'i> {
     /// A `def <name>` at FILE scope in this AST — the same-file fallback for
     /// `is_toplevel_def` when the `Typer` was built on an empty
     /// [`crate::SourceIndex`] (unit tests). Definitions nested inside a
-    /// class/module/def are not file-scope.
+    /// class/module/def are not file-scope. The set is the index's
+    /// ([`ReachIndex::toplevel_def`](crate::reach_index::ReachIndex::toplevel_def)).
     fn toplevel_def_in_file(&self, ast: &LoweredAst, name: &str) -> bool {
-        let containers: Vec<Span> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::ClassDef { span, .. }
-                | Node::ModuleDef { span, .. }
-                | Node::Definition { span, .. } => Some(*span),
-                _ => None,
-            })
-            .collect();
-        ast.iter().any(|(_, n)| {
-            matches!(n, Node::Definition { name: Some(m), span, .. }
-                if m == name
-                    && !containers
-                        .iter()
-                        .any(|&c| c != *span && c.0 <= span.0 && span.1 <= c.1))
-        })
+        self.reach_index(ast).toplevel_def(name)
     }
 
     /// Dispatch a root to its arm. `seen` carries the `(root, position)` pairs
@@ -578,7 +564,7 @@ impl<'i> Typer<'i> {
         };
         for s in &idx.scopes {
             match s {
-                ScopeNode::Def { span, id } => {
+                ScopeNode::Def { span, id, .. } => {
                     if contains(*span, use_span) {
                         let narrower = def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0);
                         if narrower {
@@ -924,59 +910,55 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
     ) -> Reach {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-        let scope = self.class_ivar_scope(ast, use_span);
+        let idx = self.reach_index(ast);
+        let scope = idx.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
         // rigor-rs#368 — same dead-position rule as `local_reach`, applied to
         // the class-body / top-level writes (a `def`-interior write is the
         // text-scanned census entry the reference's class-ivar index keeps).
         let dead = self.dead_positions(ast, seen);
-        let idx = self.reach_index(ast);
         let in_case_clause = |s: rigor_parse::Span| idx.in_case_clause(s);
-        let mut writes: Vec<(rigor_parse::Span, NodeId)> = Vec::new();
+        // The scan's node kinds come from the index (rigor-rs#422): a
+        // multi-assignment with an unnameable target refuses the whole test
+        // wherever it sits in the class body, so it is tested first.
+        if idx.multi_nonlocal.iter().any(|&s| scope.contains(s)) {
+            return Reach::OPAQUE;
+        }
+        // A `def`-body write is what the class-ivar table collects — a TEXT
+        // scan, so it sees a write inside a `when` condition too (`case v
+        // when (@x = 1; Integer) then …` inside a `def` fires on the
+        // reference) — while a class-body/top-level write binds only inside
+        // that same body, which a never-evaluated condition extent does not
+        // reach (rigor-rs#341), and neither does an extent recovered under a
+        // blocked wrapper position (rigor-rs#357).
+        let writes: Vec<(rigor_parse::Span, NodeId)> = idx
+            .ivar_writes(root)
+            .iter()
+            .copied()
+            .filter(|&(span, _)| {
+                scope.contains(span)
+                    && (scope.def_of(span).is_some()
+                        || (!use_in_def
+                            && !in_case_clause(span)
+                            && !ast.in_blocked_carrier(span)
+                            && dead.write_reaches(span, use_span)))
+            })
+            .collect();
         let mut def: Option<(rigor_parse::Span, NodeId)> = None;
         let mut loopy = false;
-        for (id, n) in ast.iter() {
-            match n {
-                Node::MultiWrite { targets, span, .. }
-                    if scope.contains(*span) && has_non_local_target(targets) =>
-                {
-                    return Reach::OPAQUE;
-                }
-                // A `def`-body write is what the class-ivar table collects —
-                // a TEXT scan, so it sees a write inside a `when` condition
-                // too (`case v when (@x = 1; Integer) then …` inside a `def`
-                // fires on the reference) — while a class-body/top-level
-                // write binds only inside that same body, which a
-                // never-evaluated condition extent does not reach
-                // (rigor-rs#341), and neither does an extent recovered
-                // under a blocked wrapper position (rigor-rs#357).
-                Node::InstanceVariableWrite { name, value, span, .. }
-                    if name == root
-                        && scope.contains(*span)
-                        && (scope.def_of(*span).is_some()
-                            || (!use_in_def
-                                && !in_case_clause(*span)
-                                && !ast.in_blocked_carrier(*span)
-                                && dead.write_reaches(*span, use_span))) =>
-                {
-                    writes.push((*span, *value));
-                }
-                Node::Definition { span, is_singleton_class: false, .. }
+        for s in &idx.scopes {
+            match s {
+                ScopeNode::Def { span, id, singleton_class: false }
                     if contains(*span, use_span)
                         && scope.contains(*span)
                         && def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0) =>
                 {
-                    def = Some((*span, id));
+                    def = Some((*span, *id));
                 }
-                Node::Loop { span, .. } if contains(*span, use_span) => loopy = true,
-                Node::Lambda { span, .. } if contains(*span, use_span) => loopy = true,
-                Node::Call { block_body, .. } if !block_body.is_empty() => {
-                    let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
-                    let hi = block_body.iter().map(|&b| ast.get(b).span().1).max();
-                    if let (Some(lo), Some(hi)) = (lo, hi) {
-                        loopy |= contains((lo, hi), use_span);
-                    }
+                ScopeNode::Loop { span } | ScopeNode::Lambda { span } => {
+                    loopy |= contains(*span, use_span);
                 }
+                ScopeNode::Block { extent, .. } => loopy |= contains(*extent, use_span),
                 _ => {}
             }
         }
@@ -1028,7 +1010,7 @@ impl<'i> Typer<'i> {
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
     ) -> Reach {
-        let scope = self.class_ivar_scope(ast, use_span);
+        let scope = self.reach_index(ast).class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
         // rigor-rs#368 — same dead-position rule as `ivar_reach`.
         let dead = self.dead_positions(ast, seen);
@@ -1114,43 +1096,6 @@ impl<'i> Typer<'i> {
         }
         let prefix = self.enclosing_prefix(use_span);
         !self.constant_names_a_known_class(&self.resolve_constant_as_written(root, prefix))
-    }
-
-    /// The class/module body that owns an ivar or cvar read at `use_span`, as a
-    /// span plus the `def` spans inside it — the port of the reference's
-    /// "qualified prefix" keying. The innermost enclosing `ClassDef`/`ModuleDef`
-    /// wins, and a class NESTED inside it is a barrier (its ivars belong to its
-    /// own class, row i9). With no enclosing class the region is the whole file,
-    /// which is where a top-level `def`'s own `@x = …` still binds (row i6)
-    /// while a top-level class-body write does not reach it (row t2).
-    fn class_ivar_scope(&self, ast: &LoweredAst, use_span: rigor_parse::Span) -> IvarScope {
-        let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-        let mut region = ast.get(ast.root()).span();
-        let mut class_spans: Vec<rigor_parse::Span> = Vec::new();
-        for (_, n) in ast.iter() {
-            let span = match n {
-                Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => *span,
-                _ => continue,
-            };
-            class_spans.push(span);
-            if contains(span, use_span) && span.1 - span.0 < region.1 - region.0 {
-                region = span;
-            }
-        }
-        let barriers: Vec<rigor_parse::Span> = class_spans
-            .into_iter()
-            .filter(|&c| contains(region, c) && c != region)
-            .collect();
-        let defs: Vec<(rigor_parse::Span, Option<String>)> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::Definition { span, name, .. } if contains(region, *span) => {
-                    Some((*span, name.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        IvarScope { region, barriers, defs }
     }
 }
 
@@ -1810,7 +1755,7 @@ pub(crate) fn proc_like_block(ast: &LoweredAst, receiver: Option<NodeId>, method
 /// constant, index or attribute target ([`rigor_parse::MultiTarget::Ignored`]).
 /// The reference's `record_multi_write_ivars` DOES collect an ivar target
 /// (row i5 fires), so an unnameable slot refuses the ivar test outright.
-fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
+pub(crate) fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
     fn any_ignored(t: &rigor_parse::MultiTarget) -> bool {
         match t {
             rigor_parse::MultiTarget::Ignored { .. }
@@ -1825,16 +1770,16 @@ fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
 }
 
 /// The class/module body an ivar or cvar read belongs to, resolved once per
-/// test by [`Typer::class_ivar_scope`].
-struct IvarScope {
+/// read span by [`ReachIndex::class_ivar_scope`](crate::reach_index::ReachIndex::class_ivar_scope).
+pub(crate) struct IvarScope {
     /// The innermost enclosing `ClassDef`/`ModuleDef` span, or the whole file.
-    region: rigor_parse::Span,
+    pub(crate) region: rigor_parse::Span,
     /// Class/module bodies NESTED inside `region` — barriers, because their
     /// ivars belong to their own class (row i9).
-    barriers: Vec<rigor_parse::Span>,
+    pub(crate) barriers: Vec<rigor_parse::Span>,
     /// Every `def` inside `region`, with its name (`initialize` is the
     /// read-before-write nil exemption).
-    defs: Vec<(rigor_parse::Span, Option<String>)>,
+    pub(crate) defs: Vec<(rigor_parse::Span, Option<String>)>,
 }
 
 impl IvarScope {

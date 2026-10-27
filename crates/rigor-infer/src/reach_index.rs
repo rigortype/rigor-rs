@@ -16,13 +16,14 @@
 //! and the own-RHS containment) still run per call, in the original order.
 
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use rigor_parse::{LoweredAst, Node, NodeId, Span};
 
 use crate::reach::{
-    proc_like_block, statement_sections, unevaluated_case_clause_spans, unrecorded_closure,
+    has_non_local_target, proc_like_block, statement_sections, unevaluated_case_clause_spans,
+    unrecorded_closure, IvarScope,
 };
 use crate::Typer;
 
@@ -46,8 +47,8 @@ pub(crate) enum LocalWrite {
 /// `local_reach`'s first loop matched. Arena order matters: the narrowest
 /// `def` and the narrowest binder keep the FIRST of two equal-width spans.
 pub(crate) enum ScopeNode {
-    /// `Node::Definition`.
-    Def { span: Span, id: NodeId },
+    /// `Node::Definition` (`singleton_class`: a `class << x` frame).
+    Def { span: Span, id: NodeId, singleton_class: bool },
     /// `Node::Lambda` (`->`).
     Lambda { span: Span },
     /// `Node::Loop`.
@@ -105,6 +106,19 @@ pub(crate) struct ReachIndex {
     by_start: Vec<(usize, NodeId)>,
     /// [`ReachIndex::nested_section_owner`] per `(statement, read span)`.
     sections: RefCell<HashMap<(NodeId, Span), Option<NodeId>>>,
+    /// Every multi-assignment with an unnameable (ivar, index, attribute,
+    /// constant) target, in arena order — the ivar arm refuses on one.
+    pub(crate) multi_nonlocal: Vec<Span>,
+    /// Per ivar name, its `@x = …` writes `(span, value)`, in arena order.
+    ivar_writes: HashMap<String, Vec<(Span, NodeId)>>,
+    /// Every `class`/`module` span, in arena order.
+    class_spans: Vec<Span>,
+    /// Every `def` span with its name, in arena order.
+    def_names: Vec<(Span, Option<String>)>,
+    /// The names of the `def`s at file scope (no class/module/def around).
+    toplevel_defs: HashSet<String>,
+    /// [`ReachIndex::class_ivar_scope`] per read span.
+    ivar_scopes: RefCell<HashMap<Span, Rc<IvarScope>>>,
     /// [`unrecorded_closure`] per read span.
     unrecorded: RefCell<HashMap<Span, Option<(NodeId, Span)>>>,
     /// [`Typer::clause_retries`] per clause span.
@@ -128,6 +142,10 @@ impl ReachIndex {
     fn build(ast: &LoweredAst) -> ReachIndex {
         let mut def_spans = Vec::new();
         let mut lambda_spans = Vec::new();
+        let mut multi_nonlocal = Vec::new();
+        let mut ivar_writes: HashMap<String, Vec<(Span, NodeId)>> = HashMap::new();
+        let mut class_spans = Vec::new();
+        let mut def_names = Vec::new();
         let mut scopes = Vec::new();
         let mut closures: HashMap<String, Vec<Span>> = HashMap::new();
         let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -143,9 +161,20 @@ impl ReachIndex {
         };
         for (id, n) in ast.iter() {
             match n {
-                Node::Definition { span, .. } => {
+                Node::Definition { span, name, is_singleton_class, .. } => {
                     def_spans.push(*span);
-                    scopes.push(ScopeNode::Def { span: *span, id });
+                    def_names.push((*span, name.clone()));
+                    scopes.push(ScopeNode::Def {
+                        span: *span,
+                        id,
+                        singleton_class: *is_singleton_class,
+                    });
+                }
+                Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => {
+                    class_spans.push(*span);
+                }
+                Node::InstanceVariableWrite { name, value, span, .. } => {
+                    ivar_writes.entry(name.clone()).or_default().push((*span, *value));
                 }
                 Node::Lambda { span, locals, .. } => {
                     lambda_spans.push(*span);
@@ -176,9 +205,12 @@ impl ReachIndex {
                 Node::LocalVariableWrite { name, .. } | Node::LocalVariableOpWrite { name, .. } => {
                     note(name, id);
                 }
-                Node::MultiWrite { targets, .. } => {
+                Node::MultiWrite { targets, span, .. } => {
                     for (name, _) in targets.bound_names() {
                         note(&name, id);
+                    }
+                    if has_non_local_target(targets) {
+                        multi_nonlocal.push(*span);
                     }
                 }
                 Node::Case { predicate: Some(p), .. } => {
@@ -222,6 +254,16 @@ impl ReachIndex {
                 }
             }
         }
+        // A `def` is file-scope when no class, module or other `def` span
+        // contains it (`toplevel_def_in_file`'s rule).
+        let containers: Vec<Span> = class_spans.iter().chain(def_spans.iter()).copied().collect();
+        let toplevel_defs: HashSet<String> = def_names
+            .iter()
+            .filter(|(span, _)| {
+                !containers.iter().any(|&c| c != *span && contains(c, *span))
+            })
+            .filter_map(|(_, name)| name.clone())
+            .collect();
         let mut by_start: Vec<(usize, NodeId)> =
             ast.iter().map(|(id, n)| (n.span().0, id)).collect();
         by_start.sort_unstable();
@@ -229,6 +271,12 @@ impl ReachIndex {
             case_clauses: unevaluated_case_clause_spans(ast),
             by_start,
             sections: RefCell::new(HashMap::new()),
+            multi_nonlocal,
+            ivar_writes,
+            class_spans,
+            def_names,
+            toplevel_defs,
+            ivar_scopes: RefCell::new(HashMap::new()),
             def_spans,
             lambda_spans,
             scopes,
@@ -264,6 +312,51 @@ impl ReachIndex {
         self.closures_binding(name)
             .iter()
             .any(|&extent| contains(extent, span) && !contains(extent, use_span))
+    }
+
+    /// Whether a `def <name>` sits at file scope.
+    pub(crate) fn toplevel_def(&self, name: &str) -> bool {
+        self.toplevel_defs.contains(name)
+    }
+
+    /// The `@x = …` writes of ivar `name`, `(span, value)` in arena order.
+    pub(crate) fn ivar_writes(&self, name: &str) -> &[(Span, NodeId)] {
+        self.ivar_writes.get(name).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// The class/module body that owns an ivar or cvar read at `use_span`, as a
+    /// span plus the `def` spans inside it — the port of the reference's
+    /// "qualified prefix" keying. The innermost enclosing `ClassDef`/`ModuleDef`
+    /// wins, and a class NESTED inside it is a barrier (its ivars belong to its
+    /// own class, row i9). With no enclosing class the region is the whole file,
+    /// which is where a top-level `def`'s own `@x = …` still binds (row i6)
+    /// while a top-level class-body write does not reach it (row t2).
+    /// Memoized per read span.
+    pub(crate) fn class_ivar_scope(&self, ast: &LoweredAst, use_span: Span) -> Rc<IvarScope> {
+        if let Some(hit) = self.ivar_scopes.borrow().get(&use_span) {
+            return hit.clone();
+        }
+        let mut region = ast.get(ast.root()).span();
+        for &span in &self.class_spans {
+            if contains(span, use_span) && span.1 - span.0 < region.1 - region.0 {
+                region = span;
+            }
+        }
+        let barriers: Vec<Span> = self
+            .class_spans
+            .iter()
+            .copied()
+            .filter(|&c| contains(region, c) && c != region)
+            .collect();
+        let defs: Vec<(Span, Option<String>)> = self
+            .def_names
+            .iter()
+            .filter(|(span, _)| contains(region, *span))
+            .cloned()
+            .collect();
+        let out = Rc::new(IvarScope { region, barriers, defs });
+        self.ivar_scopes.borrow_mut().insert(use_span, out.clone());
+        out
     }
 
     /// [`unrecorded_closure`] for `use_span`, memoized.
