@@ -6,8 +6,8 @@
 //! parse — lowering, `Visit` scans, inference, even Prism's own
 //! `pm_node_destroy` — would then recurse once per link. [`parse_bounded`]
 //! measures the tree's nesting before any of them runs and refuses a tree
-//! deeper than [`MAX_NESTING_DEPTH`]. Every analysis thread's stack is sized
-//! for a tree at that bound (`ANALYSIS_STACK_BYTES` in rigor-cli).
+//! deeper than [`MAX_NESTING_DEPTH`]. Every analysis thread's stack
+//! ([`ANALYSIS_STACK_BYTES`]) is sized for a tree at that bound.
 
 use std::ffi::c_void;
 use std::mem::ManuallyDrop;
@@ -23,6 +23,23 @@ use ruby_prism::ParseResult;
 /// real files is 61. An uncapped chain costs one level per link, or two for
 /// an `if`/`unless`/`while` modifier.
 pub const MAX_NESTING_DEPTH: usize = 25_000;
+
+/// The stack every analysis thread runs on: the command thread rigor-cli
+/// spawns, and every rayon worker, both in the global pool and in
+/// `coverage --workers`. A host that cannot reserve it falls back to 64 MiB,
+/// then to the platform default (rigor-cli `threads.rs`).
+///
+/// Sized for a tree at [`MAX_NESTING_DEPTH`], measured on release aarch64
+/// builds (ADR-0045):
+/// - Prism's cap: every construct needs at most 13 MiB (`defined?`).
+/// - Uncapped chains at the bound: at most 1.43 KiB per level (an `elsif`
+///   chain), 35 MiB measured at 24,990 levels.
+///
+/// The stack is reserved, not committed: 64 and 256 MiB measured the same
+/// wall time and peak RSS as the 2 MiB default on three corpora. Under Linux
+/// strict overcommit (`vm.overcommit_memory = 2`), each thread's reservation
+/// still counts against the commit limit.
+pub const ANALYSIS_STACK_BYTES: usize = 256 << 20;
 
 /// A tree deeper than [`MAX_NESTING_DEPTH`]: the file is not analysed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,21 +115,27 @@ struct Walk {
 /// without unwinding, and a level costs ~93 B in release and ~1.5 KiB in
 /// debug, against ~160 B and ~12 KiB through `Visit`.
 extern "C" fn walk_node(node: *const c_void, data: *mut c_void) -> bool {
-    // SAFETY: `data` is the `Walk` that `measure` owns for the whole walk,
-    // and nothing else aliases it while the walk runs.
-    let walk = unsafe { &mut *data.cast::<Walk>() };
-    if walk.over {
-        return false;
-    }
-    walk.depth += 1;
-    walk.max = walk.max.max(walk.depth);
-    if walk.depth > walk.limit {
-        walk.over = true;
-    } else {
+    let walk = data.cast::<Walk>();
+    // SAFETY: `data` is the `Walk` that `measure` owns for the whole walk. The
+    // recursive call below re-enters this function with the same pointer, so no
+    // reference to the `Walk` is held across it: each one ends before the call.
+    let descend = unsafe {
+        let walk = &mut *walk;
+        if walk.over {
+            return false;
+        }
+        walk.depth += 1;
+        walk.max = walk.max.max(walk.depth);
+        walk.over = walk.depth > walk.limit;
+        !walk.over
+    };
+    if descend {
         // SAFETY: `node` is a live node of the parse result `measure` borrows.
         unsafe { pm_visit_child_nodes(node, walk_node, data) };
     }
-    walk.depth -= 1;
+    // SAFETY: as above; the recursive call has returned, so this is the only
+    // live reference to the `Walk`.
+    unsafe { (*walk).depth -= 1 };
     false
 }
 
@@ -201,7 +224,7 @@ mod tests {
         // (~93 B/level release, ~1.5 KiB debug) only part of the way, so run
         // on a thread sized like an analysis thread.
         let err = std::thread::Builder::new()
-            .stack_size(256 << 20)
+            .stack_size(ANALYSIS_STACK_BYTES)
             .spawn(|| {
                 let src = format!("x{}", ".a".repeat(MAX_NESTING_DEPTH + 10));
                 parse_bounded(src.as_bytes()).map(|_| ()).unwrap_err()
