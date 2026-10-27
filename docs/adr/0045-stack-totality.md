@@ -111,12 +111,15 @@ thread and for a worker, from 35 kinds:
   are tracked separately from #412.
 
 **The bound's stack budget.**
-- An `elsif` chain costs one edge and about 1.43 KiB per level. At 25,000
-  levels that is about 36 MiB.
+- An `elsif` chain costs one edge and about 1.43 KiB per level. The
+  smallest stack that carries 24,990 levels measures 35 MiB.
 - An `if`-modifier chain costs two edges per level, so it stops at 12,500
   levels.
 - The bounded walk itself is 2.3 MiB.
-- Total: about 40 MiB against a 256 MiB stack, a margin of 6×.
+- Total: under 40 MiB against a 256 MiB stack, a margin of about 6×.
+- Just under the bound, the release build analyses all of these, as one file
+  and as two: `elsif` ×24,990 (22 s), `rescue` clauses ×24,990, `if a`
+  modifiers ×12,490, `&&` ×24,990, and an `x.a` chain ×24,990 (45 s).
 
 **The cost of reserving the stack.** A larger stack changes neither time nor
 memory. Medians over interleaved runs; every variant produced identical output:
@@ -164,7 +167,8 @@ memory. Medians over interleaved runs; every variant produced identical output:
   Prism's cap. That is out of scope. The regression test
   (`rigor-cli/tests/deep_nesting.rs`) uses depths that a debug binary
   carries.
-- **x86_64 Linux and Windows** were not measured locally. The margins above
-  are aarch64 numbers.
+- **x86_64 Linux and Windows** were not measured locally; the margins above
+  are aarch64 numbers. CI's x86_64 Linux job runs the regression test, in
+  debug, on every push. Windows is unmeasured.
 - **Below the bound nothing changes.** A file past it reports
   `internal-error`, where the reference aborts the whole run.

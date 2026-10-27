@@ -106,7 +106,7 @@ Commands:
 /// measured on release aarch64 builds:
 /// - Prism's cap: every construct needs at most 13 MiB (`defined?`).
 /// - Uncapped chains at the bound: at most 1.43 KiB per level (an `elsif`
-///   chain), about 36 MiB at 25,000 levels.
+///   chain), 35 MiB measured at 24,990 levels.
 ///
 /// The stack is reserved, not committed: 64 and 256 MiB measured the same
 /// wall time and peak RSS as the 2 MiB default on three corpora. Under Linux
