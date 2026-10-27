@@ -39,6 +39,8 @@ thing that stops two agents taking the same issue.
    `push.default = tracking` sends a bare `git push -u` to **master**. Then run
    `gh pr create --draft` with `Closes #N` in the body, and remove
    `in-progress`. From here the draft PR is the in-flight state.
+   An issue that lands as several dependent PRs (a split, a layered change)
+   stacks them with gh-stack: `harness/split/README.md` → "Stacking the PRs".
 6. **Implement, push, keep going.** Run `harness/gate.sh` before each push,
    push, and read CI with `gh pr checks` while you work on (see *Gates*).
    Record the measured outcome in the PR body: the probe tables and the gate

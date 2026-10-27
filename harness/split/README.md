@@ -124,3 +124,44 @@ script also warns about constructs whose meaning moves with the file:
   different item (prelude shadowing, a glob), `self::`/`super::` paths,
   `macro_rules!` textual scope, and traits in scope for method calls. The
   #204 reviews did exactly this.
+
+## Splitting one fn by arm groups (#279)
+
+`Builder::lower_node` (64 `if let … { return … }` arms) was split by node
+family in two stacked PRs. Only the first PR was not move-only:
+
+1. **Group the arms into methods.** Each family method keeps its arms
+   byte-identical and ends in a sentinel (`UNMATCHED`). The last family ends
+   in the fallback instead. The dispatcher tries the families in turn.
+   `verify_move` must leave only scaffold rows: the sentinel, the dispatch,
+   the signatures and docs, the closers. The generator stayed out of the tree,
+   and the reviewers re-checked arm identity with their own scripts.
+2. **Move each method to a file** with `split_mod.py` and `fixvis.py` (steps
+   2–5 above). Each method's attributes travel with it.
+
+The split is only behaviour-preserving if no node can satisfy the predicates
+of two arms. Prove it before grouping: every predicate must be a pure
+`as_X_node()` (or a chain of them), and the type names must be pairwise
+distinct. Also check the fallback stays last. Keep `#[inline(never)]` on
+the family methods: without it LLVM inlines them back and the recursion
+frame grows instead of shrinking (#413's measurements).
+
+## Stacking the PRs (gh-stack)
+
+#279 piloted [gh-stack](https://github.com/github/gh-stack). It went smoothly
+end to end (outcome: `docs/notes/20261027-lower-node-family-split.md`):
+
+- `gh stack init --base master BRANCH`, then `gh stack add BRANCH2`. Neither
+  sets an upstream, so a bare `git push` errors instead of reaching master.
+- `gh stack submit --auto` pushes, opens the PRs as drafts and creates the
+  stack. An upper layer's auto title is the branch name: fix it with
+  `gh pr edit`.
+- `gh stack merge` refuses drafts. Run `gh pr ready` on each PR, then
+  `gh stack merge STACK# --yes --merge` (pass the method explicitly). It made
+  one merge commit, and GitHub marked every PR in the stack MERGED.
+- Stack state lives in the worktree's own git dir. Run every stack command
+  from the one worktree that owns all the stack's branches.
+- Not yet exercised: `gh stack rebase` and `sync`. In a scratch repo, `rebase`
+  failed when a stack branch was checked out in another worktree, and still
+  exited 0. A `sync` after trunk moves rebases every head, which voids every
+  per-head measurement.
