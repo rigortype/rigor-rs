@@ -21,6 +21,7 @@ use std::rc::Rc;
 
 use rigor_parse::{LoweredAst, Node, NodeId, Span};
 
+use crate::dead::CallSelf;
 use crate::reach::{
     has_non_local_target, proc_like_block, statement_sections, unevaluated_case_clause_spans,
     unrecorded_closure, IvarScope,
@@ -124,6 +125,11 @@ pub(crate) struct ReachIndex {
     def_names: Vec<(Span, Option<String>)>,
     /// The names of the `def`s at file scope (no class/module/def around).
     toplevel_defs: HashSet<String>,
+    /// Per name, the LAST (by start) file-scope bare `def` of it — the
+    /// binding `def_exits` reads.
+    last_toplevel_defs: HashMap<String, NodeId>,
+    /// [`Typer::call_self`] per call site.
+    call_selves: RefCell<HashMap<Span, CallSelf>>,
     /// [`ReachIndex::class_ivar_scope`] per read span.
     ivar_scopes: RefCell<HashMap<Span, Rc<IvarScope>>>,
     /// [`unrecorded_closure`] per read span.
@@ -153,6 +159,7 @@ impl ReachIndex {
         let mut ivar_writes: HashMap<String, Vec<(Span, NodeId)>> = HashMap::new();
         let mut class_spans = Vec::new();
         let mut def_names = Vec::new();
+        let mut def_ids = Vec::new();
         let mut scopes = Vec::new();
         let mut closures: HashMap<String, Vec<Span>> = HashMap::new();
         let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
@@ -171,6 +178,7 @@ impl ReachIndex {
                 Node::Definition { span, name, is_singleton_class, .. } => {
                     def_spans.push(*span);
                     def_names.push((*span, name.clone()));
+                    def_ids.push(id);
                     scopes.push(ScopeNode::Def {
                         span: *span,
                         id,
@@ -271,6 +279,19 @@ impl ReachIndex {
             })
             .filter_map(|(_, name)| name.clone())
             .collect();
+        let mut last_toplevel_defs: HashMap<String, NodeId> = HashMap::new();
+        for (&(span, ref name), &id) in def_names.iter().zip(&def_ids) {
+            let Some(name) = name else { continue };
+            if containers.iter().any(|&c| c != span && contains(c, span)) {
+                continue;
+            }
+            let later = last_toplevel_defs
+                .get(name)
+                .is_none_or(|&prev| ast.get(prev).span().0 <= span.0);
+            if later {
+                last_toplevel_defs.insert(name.clone(), id);
+            }
+        }
         let mut by_start: Vec<(usize, NodeId)> =
             ast.iter().map(|(id, n)| (n.span().0, id)).collect();
         by_start.sort_unstable();
@@ -283,6 +304,8 @@ impl ReachIndex {
             class_spans,
             def_names,
             toplevel_defs,
+            last_toplevel_defs,
+            call_selves: RefCell::new(HashMap::new()),
             ivar_scopes: RefCell::new(HashMap::new()),
             def_spans,
             lambda_spans,
@@ -324,6 +347,21 @@ impl ReachIndex {
     /// Whether a `def <name>` sits at file scope.
     pub(crate) fn toplevel_def(&self, name: &str) -> bool {
         self.toplevel_defs.contains(name)
+    }
+
+    /// The last (by start) file-scope bare `def name`, if any.
+    pub(crate) fn last_toplevel_def(&self, name: &str) -> Option<NodeId> {
+        self.last_toplevel_defs.get(name).copied()
+    }
+
+    /// [`Typer::call_self`] for `site`, memoized.
+    pub(crate) fn call_self(&self, typer: &Typer<'_>, ast: &LoweredAst, site: Span) -> CallSelf {
+        if let Some(hit) = self.call_selves.borrow().get(&site) {
+            return hit.clone();
+        }
+        let out = typer.call_self_uncached(ast, site);
+        self.call_selves.borrow_mut().insert(site, out.clone());
+        out
     }
 
     /// The `@x = …` writes of ivar `name`, `(span, value)` in arena order.

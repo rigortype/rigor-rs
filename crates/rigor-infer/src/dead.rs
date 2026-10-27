@@ -51,6 +51,7 @@ const EXIT_CALLS: &[&str] = &["raise", "throw", "exit", "abort", "fail"];
 /// The `scope.self_type` shape a call site's `self` takes — the input
 /// `self_type_answers?` (`expression_typer.rb:1541`) dispatches on for the
 /// toplevel-`def` bind veto.
+#[derive(Clone, Debug)]
 pub(crate) enum CallSelf {
     /// `self` is an instance of the qualified class — a `def` body that is
     /// not singleton-side (`self_type_for_method_body` → `Nominal[path]`).
@@ -777,7 +778,17 @@ impl<'i> Typer<'i> {
     /// names the innermost frame and REPLACES the whole stack otherwise,
     /// and `class << <other>` leaves the context unchanged
     /// (`singleton_context_for`, `statement_evaluator.rb:4856`).
+    ///
+    /// A syntax-only answer, memoized per site by the [`ReachIndex`]
+    /// (rigor-rs#422: the scan ran per call on the kill path).
+    ///
+    /// [`ReachIndex`]: crate::reach_index::ReachIndex
     pub(crate) fn call_self(&self, ast: &LoweredAst, site: Span) -> CallSelf {
+        self.reach_index(ast).call_self(self, ast, site)
+    }
+
+    /// [`Typer::call_self`]'s scan.
+    pub(crate) fn call_self_uncached(&self, ast: &LoweredAst, site: Span) -> CallSelf {
         let mut chain: Vec<&Node> = Vec::new();
         for (_, n) in ast.iter() {
             let span = match n {
@@ -1291,37 +1302,16 @@ impl<'i> Typer<'i> {
         // `name` stays `Some` only for a bare `def x` — `def self.x` /
         // `def obj.x` / `class <<` are excluded by construction — and the
         // container-span check drops defs nested in a class/module/def,
-        // exactly `toplevel_def_in_file`'s rule.
-        let containers: Vec<Span> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::ClassDef { span, .. }
-                | Node::ModuleDef { span, .. }
-                | Node::Definition { span, .. } => Some(*span),
-                _ => None,
-            })
-            .collect();
-        // A redefinition REPLACES the binding — `def die; raise; end` then
-        // `def die; nil; end` answers `nil`, so only the LAST toplevel def
-        // of the name decides (`def_method` overwrites the same key).
-        let last = ast.iter().filter_map(|(_, n)| match n {
-            Node::Definition {
-                name: Some(m),
-                body,
-                span,
-                ..
-            } if m == method
-                && !containers
-                    .iter()
-                    .any(|&c| c != *span && c.0 <= span.0 && span.1 <= c.1) =>
-            {
-                Some((*span, body))
-            }
-            _ => None,
+        // exactly `toplevel_def_in_file`'s rule. A redefinition REPLACES the
+        // binding — `def die; raise; end` then `def die; nil; end` answers
+        // `nil`, so only the LAST toplevel def of the name decides
+        // (`def_method` overwrites the same key). The index holds that def
+        // per name (rigor-rs#422).
+        let last = self.reach_index(ast).last_toplevel_def(method);
+        let exits = last.is_some_and(|id| match ast.get(id) {
+            Node::Definition { body, .. } => self.arm_bot(ast, body, seen),
+            _ => false,
         });
-        let exits = last
-            .max_by_key(|(s, _)| s.0)
-            .is_some_and(|(_, body)| self.arm_bot(ast, body, seen));
         seen.pop();
         exits
     }
