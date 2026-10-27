@@ -262,37 +262,40 @@ impl<'src> Builder<'src> {
     /// not a perf hint.
     pub(crate) fn lower_node(&mut self, node: &PrismNode<'_>) -> NodeId {
         let span = span_of(&node.location());
-        let id = self.lower_calls(node, span);
+        // One `id`, reassigned rather than shadowed: an unoptimised build
+        // gives every `let` its own slot in this frame, which each nesting
+        // level pays (debug frame 128 B, against 160 B with six `let`s).
+        let mut id = self.lower_calls(node, span);
         if id != UNMATCHED {
             #[cfg(debug_assertions)]
             self.check_families_disjoint(node, span, 0, id);
             return id;
         }
-        let id = self.lower_expressions(node);
+        id = self.lower_expressions(node);
         if id != UNMATCHED {
             #[cfg(debug_assertions)]
             self.check_families_disjoint(node, span, 1, id);
             return id;
         }
-        let id = self.lower_control(node, span);
+        id = self.lower_control(node, span);
         if id != UNMATCHED {
             #[cfg(debug_assertions)]
             self.check_families_disjoint(node, span, 2, id);
             return id;
         }
-        let id = self.lower_definitions(node);
+        id = self.lower_definitions(node);
         if id != UNMATCHED {
             #[cfg(debug_assertions)]
             self.check_families_disjoint(node, span, 3, id);
             return id;
         }
-        let id = self.lower_jumps(node, span);
+        id = self.lower_jumps(node, span);
         if id != UNMATCHED {
             #[cfg(debug_assertions)]
             self.check_families_disjoint(node, span, 4, id);
             return id;
         }
-        let id = self.lower_fallback(node, span);
+        id = self.lower_fallback(node, span);
         #[cfg(debug_assertions)]
         self.check_families_disjoint(node, span, FAMILIES.len(), id);
         id
@@ -300,8 +303,9 @@ impl<'src> Builder<'src> {
 
     /// [`Self::lower_node`]'s last resort, for a node no family claims. It
     /// always pushes a node, so it never returns [`UNMATCHED`].
-    // Not a perf hint: keeps this frame out of `lower_node`'s, since the
-    // fallback recurses into it through `lower_recovered` (#413, #416).
+    // Not a perf hint: keeps this frame out of `lower_node`'s recursion (the
+    // fallback recurses through `lower_recovered`). Inlined, `lower_node`'s
+    // release frame grows from 80 B to 432 B, paid at every level (#416).
     #[inline(never)]
     fn lower_fallback(&mut self, node: &PrismNode<'_>, span: Span) -> NodeId {
         // Anything outside the handled subset: RECOVER any meaningful descendant
@@ -333,9 +337,9 @@ impl<'src> Builder<'src> {
     /// While the invariant holds, each of those calls is a run of failed
     /// `as_X_node()` tests: it pushes nothing and recurses nowhere. The
     /// earlier families already returned `UNMATCHED` on the way to `matched`,
-    /// and the fallback is never re-run, since it always pushes. Called after
-    /// the matched family has returned, so no extra frame is live across the
-    /// recursion.
+    /// and the fallback is never re-run, since it always pushes. It runs
+    /// after the matched family has returned, so it adds nothing to the
+    /// per-level frame: at the deepest point only the leaf's check is live.
     #[cfg(debug_assertions)]
     #[inline(never)]
     fn check_families_disjoint(
@@ -353,7 +357,7 @@ impl<'src> Builder<'src> {
             self.line_at(span.0),
             span.0,
         );
-        for later in matched + 1..FAMILIES.len() {
+        for (later, later_name) in FAMILIES.iter().enumerate().skip(matched + 1) {
             let other = match later {
                 1 => self.lower_expressions(node),
                 2 => self.lower_control(node, span),
@@ -370,7 +374,7 @@ impl<'src> Builder<'src> {
                 self.line_at(span.0),
                 span.0,
                 FAMILIES[matched],
-                FAMILIES[later],
+                later_name,
             );
         }
     }
