@@ -59,3 +59,24 @@ At the pin, the reference finished 700 nested `if`s and a 700-link chain; it
 aborted from 1,500. The two-file runs that crashed the port on master
 (SIGABRT on a 2 MiB rayon worker) now finish too. The release acceptance
 covers every construct at Prism's cap, on one file and on two.
+
+## Outcome (PR #426, merge `3f2bf41`, 2026-10-28)
+
+There were two review rounds. Round 1 returned Needs fix for two reasons:
+- **Aliasing UB.** `walk_node` held a `&mut` across the C re-entry.
+- **An over-broad claim.** Inferred type depth is a second axis the bound does not cover (#427).
+
+Two smaller changes were folded into the same round:
+- **Honest wording.** A refused file now says "skipped", not "internal panic".
+- **A per-thread stack fallback.** Stacks fall back from 256 MiB to 64 MiB, then to the Rust default, inside a single `build_global` spawn handler. rayon's `Once` makes `build_global` one-shot, even when it fails.
+
+Round 2 was Approved. It emulated memory caps with a `pthread_create` shim and found one regression: the pool can take the reservation budget before the command thread does. That is filed as #431.
+
+| follow-up | issue |
+|---|---|
+| type depth | #427 |
+| commit the stack tooling; measure x86_64 and Windows | #428 |
+| static guard on parse sites and pools | #429 |
+| the hand-declared Prism binding | #430 |
+| pool-before-command ordering | #431 |
+| deterministic fuel; Prism's quadratic `&&` parse | #424 |
