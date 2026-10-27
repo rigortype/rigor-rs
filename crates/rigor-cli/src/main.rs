@@ -15,7 +15,7 @@ use std::process::ExitCode;
 
 use rayon::prelude::*;
 use rigor_index::CoreIndex;
-use rigor_parse::{lower_with_key, parse, FileKey};
+use rigor_parse::{lower_with_key, parse_bounded, FileKey};
 use rigor_rules::{analyze_with_source_and_folder, catalog, Diagnostic, Severity};
 use rigor_types::Interner;
 
@@ -51,6 +51,7 @@ mod ruby_mode;
 mod severity;
 mod sidecar;
 mod sig_gen;
+mod threads;
 mod type_of;
 
 /// The reference's full subcommand surface (ADR-0015).
@@ -99,6 +100,18 @@ Commands:
 ";
 
 fn main() -> ExitCode {
+    // rigor-rs#412 (ADR-0045): every analysis thread gets a reserved
+    // `ANALYSIS_STACK_BYTES` stack, falling back to smaller sizes on hosts
+    // that cannot reserve it. The pool first, before anything uses rayon.
+    threads::configure_global_pool();
+    // The main thread's own stack is the platform's (8 MiB on macOS and
+    // Linux, 1 MiB on Windows), and Prism alone needs 8.1 MiB at its cap. So
+    // the command runs on a spawned thread named "main".
+    threads::run_command_thread(run_command)
+}
+
+/// The command dispatch, on the thread [`main`] starts.
+fn run_command() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         // `CLI#run`: no command, `help`, `-h`, `--help` → the command list on
@@ -1494,6 +1507,10 @@ fn analyze_files(
         /// byte offset to a line/column exactly as every other finding does.
         ParseErrors { order: usize, path: String, source: String, diags: Vec<Diagnostic> },
         Panic { order: usize, path: String, msg: String },
+        /// Nested past the depth bound (rigor-rs#412): skipped the way a
+        /// panicked file is (the `internal-error` finding, no harvest), but
+        /// worded as the deliberate refusal it is.
+        TooDeep { order: usize, path: String, msg: String },
     }
 
     /// The two outcomes of the panic-isolated parse+lower closure: a file that
@@ -1503,6 +1520,8 @@ fn analyze_files(
     enum Lowered {
         Parsed(rigor_parse::LoweredAst, Vec<(usize, usize, String)>),
         Unparseable(Vec<Diagnostic>),
+        /// Nested past the depth bound (rigor-rs#412): see `Stage1::TooDeep`.
+        TooDeep(String),
     }
 
     /// One stage-1 work item: `order`/`analyze` mark the analyzed files
@@ -1637,7 +1656,13 @@ fn analyze_files(
             }
             let source_bytes = source.as_bytes().to_vec();
             let lowered = panic::catch_unwind(AssertUnwindSafe(|| {
-                let result = parse(&source_bytes);
+                // The depth bound comes first, before any walker and before
+                // the parse-error branch, so a refused tree is never walked,
+                // nor dropped on this stack (rigor-rs#412).
+                let result = match parse_bounded(&source_bytes) {
+                    Ok(result) => result,
+                    Err(too_deep) => return Lowered::TooDeep(too_deep.message()),
+                };
                 // A file Prism could not parse is analysed by NEITHER tool. The
                 // reference's `analyze_file_body` returns its parse diagnostics
                 // and never reaches `ScopeIndexer.index`, so every semantic rule
@@ -1724,6 +1749,12 @@ fn analyze_files(
                     msg: panic_message(&panic_val),
                 },
                 Err(_) => Stage1::Excluded,
+                // Past the depth bound: like a panicked file, a discovery-only
+                // one contributes nothing.
+                Ok(Lowered::TooDeep(msg)) if item.analyze => {
+                    Stage1::TooDeep { order, path: path.to_string(), msg }
+                }
+                Ok(Lowered::TooDeep(_)) => Stage1::Excluded,
             }
         })
         .collect();
@@ -1787,8 +1818,12 @@ fn analyze_files(
                 had_io_error = true;
             }
             Stage1::Panic { order, path, msg } => {
-                eprintln!("rigor {verb}: internal panic on {path}: {msg}");
+                eprintln!("{}", internal_panic_line(verb, &path, &msg));
                 findings.push((order, path, String::new(), internal_error_diag(msg)));
+            }
+            Stage1::TooDeep { order, path, msg } => {
+                eprintln!("{}", depth_skip_line(verb, &path, &msg));
+                findings.push((order, path, String::new(), depth_refusal_diag(msg)));
             }
         }
     }
@@ -1933,7 +1968,7 @@ fn analyze_files(
     // Drain stage-3 outcomes in input order: deterministic stderr + findings.
     for s3 in stage3 {
         if let Some((path, msg)) = &s3.panic {
-            eprintln!("rigor {verb}: internal panic on {path}: {msg}");
+            eprintln!("{}", internal_panic_line(verb, path, msg));
         }
         findings.extend(s3.findings);
     }
@@ -3280,16 +3315,38 @@ fn parse_diagnostics(result: &rigor_parse::ruby_prism::ParseResult<'_>) -> Vec<D
 /// info-severity excludes it from the differential harness's error/warning parity
 /// gate — a crashed file never counts as a false positive.
 fn internal_error_diag(msg: String) -> Diagnostic {
+    internal_error_finding(format!("internal error while analysing file: {msg}"))
+}
+
+/// The `internal-error` finding for a file refused by the depth bound
+/// (rigor-rs#412, ADR-0045): the same rule, severity and failing exit as a
+/// panicked file, but carrying the refusal's own message, since nothing
+/// panicked.
+fn depth_refusal_diag(msg: String) -> Diagnostic {
+    internal_error_finding(msg)
+}
+
+fn internal_error_finding(message: String) -> Diagnostic {
     Diagnostic {
         rule_id: "internal-error",
         start_offset: 0,
         end_offset: 0,
-        message: format!("internal error while analysing file: {msg}"),
+        message,
         severity: Severity::Info,
         source_family: "builtin",
         receiver_type: None,
         method_name: None,
     }
+}
+
+/// The stderr line for a file whose analysis panicked (ADR-0016).
+fn internal_panic_line(verb: &str, path: &str, msg: &str) -> String {
+    format!("rigor {verb}: internal panic on {path}: {msg}")
+}
+
+/// The stderr line for a file refused by the depth bound (rigor-rs#412).
+fn depth_skip_line(verb: &str, path: &str, msg: &str) -> String {
+    format!("rigor {verb}: skipped {path}: {msg}")
 }
 
 /// Extract a human-readable description from a panic payload.

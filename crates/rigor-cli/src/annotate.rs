@@ -37,7 +37,7 @@ use std::process::ExitCode;
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
-use rigor_parse::{lower, parse, LoweredAst, Node, NodeId};
+use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId};
 use rigor_types::Interner;
 
 const USAGE: &str = "Usage: rigor annotate [options] FILE";
@@ -131,7 +131,16 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
         }
     };
 
-    let ast = lower(&parse(source.as_bytes()));
+    // A tree past the depth bound is refused like an unreadable file
+    // (rigor-rs#412).
+    let parsed = match parse_bounded(source.as_bytes()) {
+        Ok(parsed) => parsed,
+        Err(too_deep) => {
+            eprintln!("annotate: {file}: {}", too_deep.message());
+            return ExitCode::from(1);
+        }
+    };
+    let ast = lower(&parsed);
     let index = CoreIndex::new();
     let source_index = SourceIndex::build(&ast, &index);
     let typer = Typer::with_source(&index, &source_index);
@@ -377,21 +386,27 @@ fn annotations_json_string(line_types: &BTreeMap<usize, String>) -> String {
 /// The `{ line => type }` annotations JSON for `source`, typed against `index`
 /// (reused by the `annotate` MCP tool). Types are inferred against the top-level
 /// env, exactly as `rigor annotate --format json`.
-#[must_use]
-pub fn annotations_json(index: &CoreIndex, source: &str) -> String {
-    let ast = lower(&parse(source.as_bytes()));
+///
+/// # Errors
+///
+/// The [`rigor_parse::TooDeep`] message when `source` nests past the depth
+/// bound (rigor-rs#412).
+pub fn annotations_json(index: &CoreIndex, source: &str) -> Result<String, String> {
+    let parsed = parse_bounded(source.as_bytes()).map_err(|e| e.message())?;
+    let ast = lower(&parsed);
     let source_index = SourceIndex::build(&ast, index);
     let typer = Typer::with_source(index, &source_index);
     let mut interner = Interner::new();
     let env = typer.build_toplevel_env(&ast, &mut interner);
     let line_types =
         collect_line_types(&ast, &typer, &source_index, index, &env, &mut interner, source);
-    annotations_json_string(&line_types)
+    Ok(annotations_json_string(&line_types))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rigor_parse::parse;
 
     fn line_types(src: &str) -> BTreeMap<usize, String> {
         let ast = lower(&parse(src.as_bytes()));

@@ -468,15 +468,16 @@ fn report_rows(files: &[String], full: bool, plugins: bool) -> Vec<Row> {
 }
 
 /// One file's units, or nothing at all. Fail-soft per file, matching upstream's
-/// fail-soft per unit: a file that does not read, does not parse, or is an ERB
-/// template contributes no units — which can only cost UNDER.
+/// fail-soft per unit: a file that does not read, does not parse, nests past
+/// the depth bound (rigor-rs#412), or is an ERB template contributes no units
+/// — which can only cost UNDER.
 fn scan_file(path: &str) -> std::collections::BTreeMap<String, Summary> {
     let empty = std::collections::BTreeMap::new();
     let Ok(source) = std::fs::read(path) else { return empty };
     if rigor_parse::looks_like_erb_template(&source) {
         return empty;
     }
-    let result = rigor_parse::parse(&source);
+    let Ok(result) = rigor_parse::parse_bounded(&source) else { return empty };
     if result.errors().next().is_some() {
         return empty;
     }

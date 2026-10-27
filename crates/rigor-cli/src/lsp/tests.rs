@@ -1,4 +1,5 @@
 use super::*;
+use rigor_parse::parse;
 
 /// A minimal tier-1 project context (empty core index, no sidecar, generation
 /// 0) for the pure `compute_diagnostics` / `hover` / `completion` unit tests.
