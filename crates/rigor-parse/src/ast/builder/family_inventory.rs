@@ -20,10 +20,11 @@
 //! An `if let` pattern is exactly `Some(..)`: `if let None = node.as_x_node()`
 //! would claim every type but X.
 //!
-//! One arm per type; every arm ends in `return`. A second arm for a type is
-//! dead code, so the test fails on it, even within one family. That includes
-//! a fall-through arm followed by a second arm for its type, by design.
-//! `lower_node` itself claims no type: its body holds no `as_x_node()` call.
+//! One arm per type; every arm ends in `return`. The first arm for a type
+//! returns, so a second one is dead code, and the test fails on it even
+//! within one family. It also fails on a fall-through arm followed by a
+//! second arm for its type: that is by design. `lower_node` itself claims
+//! no type: its body holds no `as_x_node()` call.
 //!
 //! Only COND and the `node.as_x_node()` heads of a `let` chain count. Arm
 //! bodies, `.map` closures, comments and literals are skipped. Any other
