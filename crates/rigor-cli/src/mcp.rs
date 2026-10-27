@@ -328,8 +328,11 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
 
     let bytes = source.as_bytes().to_vec();
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Past the depth bound (rigor-rs#412) the tool fails as a panic does.
-        let result = parse_bounded(&bytes).map_err(|e| e.message())?;
+        // Past the depth bound (rigor-rs#412) the tool fails with the refusal.
+        let result = match parse_bounded(&bytes) {
+            Ok(parsed) => parsed,
+            Err(too_deep) => return Err(too_deep.message()),
+        };
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
         let src = SourceIndex::build(&ast, &ctx.index);
@@ -340,8 +343,7 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
         Ok((diags, comments))
     }))
-    .map_err(|_| "internal error: analysis panicked on this source".to_string())?
-    .map_err(|msg: String| format!("internal error: {msg}"))?;
+    .map_err(|_| "internal error: analysis panicked on this source".to_string())??;
 
     let (mut diags, comments) = analysed;
     diags.extend(suppression_marker_diagnostics(&comments));
@@ -382,8 +384,11 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
 
     let bytes = source.as_bytes().to_vec();
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Past the depth bound (rigor-rs#412) the tool fails as a panic does.
-        let result = parse_bounded(&bytes).map_err(|e| e.message())?;
+        // Past the depth bound (rigor-rs#412) the tool fails with the refusal.
+        let result = match parse_bounded(&bytes) {
+            Ok(parsed) => parsed,
+            Err(too_deep) => return Err(too_deep.message()),
+        };
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
         let src = SourceIndex::build(&ast, &ctx.index);
@@ -394,8 +399,7 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
         Ok((diags, comments))
     }))
-    .map_err(|_| "internal error: analysis panicked on this source".to_string())?
-    .map_err(|msg: String| format!("internal error: {msg}"))?;
+    .map_err(|_| "internal error: analysis panicked on this source".to_string())??;
 
     let (mut diags, comments) = analysed;
     diags.extend(suppression_marker_diagnostics(&comments));
@@ -415,7 +419,6 @@ fn tool_annotate(ctx: &ServerContext, args: &Value) -> Result<String, String> {
     let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
     panic::catch_unwind(AssertUnwindSafe(|| crate::annotate::annotations_json(&ctx.index, source)))
         .map_err(|_| "internal error: annotation panicked on this source".to_string())?
-        .map_err(|msg| format!("internal error: {msg}"))
 }
 
 /// The `sig_gen` tool: generate RBS-skeleton candidates for the given FILE paths
@@ -458,8 +461,11 @@ fn tool_type_of(ctx: &ServerContext, args: &Value) -> Result<String, String> {
 
     let offset = crate::type_of::position_to_offset(source, line, column)?;
     let rendered = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Past the depth bound (rigor-rs#412) the tool fails as a panic does.
-        let parsed = parse_bounded(source.as_bytes()).map_err(|e| e.message())?;
+        // Past the depth bound (rigor-rs#412) the tool fails with the refusal.
+        let parsed = match parse_bounded(source.as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(too_deep) => return Err(too_deep.message()),
+        };
         let ast = lower(&parsed);
         let Some(node_id) = crate::type_of::locate_node(&ast, offset) else {
             return Ok(None);
@@ -475,8 +481,7 @@ fn tool_type_of(ctx: &ServerContext, args: &Value) -> Result<String, String> {
             crate::type_of::render_type(&interner, &ctx.index, &src, ty),
         )))
     }))
-    .map_err(|_| "internal error: typing panicked on this source".to_string())?
-    .map_err(|msg: String| format!("internal error: {msg}"))?;
+    .map_err(|_| "internal error: typing panicked on this source".to_string())??;
 
     let (node, ty) = rendered.ok_or_else(|| {
         format!("no expression found at line {line}, column {column}")
@@ -499,12 +504,14 @@ fn tool_explain(args: &Value) -> Result<String, String> {
 fn tool_outline(args: &Value) -> Result<String, String> {
     let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
     let syms = panic::catch_unwind(AssertUnwindSafe(|| {
-        // Past the depth bound (rigor-rs#412) the tool fails as a panic does.
-        let parsed = parse_bounded(source.as_bytes()).map_err(|e| e.message())?;
+        // Past the depth bound (rigor-rs#412) the tool fails with the refusal.
+        let parsed = match parse_bounded(source.as_bytes()) {
+            Ok(parsed) => parsed,
+            Err(too_deep) => return Err(too_deep.message()),
+        };
         Ok(crate::outline::build(&lower(&parsed)))
     }))
-    .map_err(|_| "internal error: parsing panicked on this source".to_string())?
-    .map_err(|msg: String| format!("internal error: {msg}"))?;
+    .map_err(|_| "internal error: parsing panicked on this source".to_string())??;
 
     let tree: Vec<Value> = syms.iter().map(|s| outline_json(s, source)).collect();
     let report = json!({ "outline": tree, "count": syms.len() });

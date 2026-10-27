@@ -88,26 +88,27 @@ fn deep_nesting_survives_on_the_command_thread_and_on_a_worker() {
 }
 
 #[test]
-fn a_chain_past_the_depth_bound_is_skipped_like_a_panicked_file() {
+fn a_chain_past_the_depth_bound_is_refused_with_an_info_finding() {
     let dir = TempDir::new("deep-chain");
     dir.write("a.rb", &format!("x{}\n", ".a".repeat(30_000)));
     dir.write("b.rb", TYPO);
+    let refusal = "source nesting depth 30003 exceeds the analysis limit of 25000 \
+                   (rigor-rs#412); file not analysed";
 
     for files in [&["a.rb"][..], &["a.rb", "b.rb"][..]] {
         let out = rigor_check(dir.path(), files);
         let rows = rows(&out);
         let skipped: Vec<_> = rows.iter().filter(|r| r["path"] == "a.rb").collect();
         assert_eq!(skipped.len(), 1, "{rows:?}");
+        // Skipped the way a panicked file is (ADR-0016): `internal-error`,
+        // info, a failing run. The wording is the refusal's own: nothing
+        // panicked.
         assert_eq!(skipped[0]["rule"], "internal-error");
         assert_eq!(skipped[0]["severity"], "info");
-        let message = skipped[0]["message"].as_str().unwrap();
-        assert!(
-            message.contains("depth 30003 exceeds the analysis limit of 25000"),
-            "{message}"
-        );
-        // The panicked-file path, verbatim: the stderr line and a failing run.
+        assert_eq!(skipped[0]["message"], refusal);
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert!(stderr.contains("rigor check: internal panic on a.rb: "), "{stderr}");
+        assert!(stderr.contains(&format!("rigor check: skipped a.rb: {refusal}\n")), "{stderr}");
+        assert!(!stderr.contains("panic"), "{stderr}");
         assert_eq!(out.status.code(), Some(1));
         // The rest of the run is analysed as usual.
         assert_eq!(rows.len(), files.len(), "{rows:?}");

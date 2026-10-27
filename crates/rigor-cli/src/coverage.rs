@@ -525,7 +525,8 @@ fn scan_paths(paths: &[String], index: &CoreIndex, workers: Option<usize>) -> Re
     let results = match workers {
         Some(n) => rayon::ThreadPoolBuilder::new()
             .num_threads(n)
-            .stack_size(crate::ANALYSIS_STACK_BYTES)
+            // The analysis-thread stacks (rigor-rs#412), with their fallback.
+            .spawn_handler(crate::threads::spawn_pool_thread)
             .build()
             .map(|pool| pool.install(scan_all))
             .unwrap_or_else(|_| scan_all()),

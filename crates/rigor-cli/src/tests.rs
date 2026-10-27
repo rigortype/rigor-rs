@@ -1075,3 +1075,111 @@ fn exclude_fnmatch_leading_period_rule() {
     assert!(!exclude_fnmatch(&excludes, "./app/gen.rb"));
     assert!(exclude_fnmatch(&excludes, "app/gen.rb"));
 }
+
+/// rigor-rs#412 must-still-fire control for the depth refusal's own wording:
+/// a REAL panic during analysis still reads "internal error while analysing
+/// file" in its finding and "internal panic" on stderr. The panic comes from
+/// a sidecar folder that panics on the one fold `255.to_s(16)` routes to it.
+#[test]
+fn a_real_panic_keeps_the_internal_panic_wording() {
+    struct PanickingFolder;
+    impl rigor_infer::RubyFolder for PanickingFolder {
+        fn fold(
+            &self,
+            _receiver: &rigor_types::Scalar,
+            _method: &str,
+            _args: &[rigor_types::Scalar],
+        ) -> Option<rigor_types::Scalar> {
+            panic!("boom-412")
+        }
+    }
+
+    let root = std::env::temp_dir().join(format!("rigor_412_panic_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.rb"), b"x = 255.to_s(16)\nx.size\n").unwrap();
+    let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+    // `paths:` pinned to this directory: the default (`lib`) is cwd-relative,
+    // and the LSP tests move the process cwd into projects of their own.
+    let mut cfg = Config::default();
+    cfg.paths = vec![root.to_string_lossy().into_owned()];
+    let (findings, _) = analyze_files(
+        &[a_rb.as_str()],
+        Some(&[a_rb.as_str()]),
+        &cfg,
+        "check",
+        Some(&PanickingFolder),
+        &config::BleedingEdgeSelector::None,
+        false,
+    );
+    let _ = std::fs::remove_dir_all(&root);
+
+    let internal: Vec<&Diagnostic> =
+        findings.iter().map(|(_, _, _, d)| d).filter(|d| d.rule_id == "internal-error").collect();
+    assert_eq!(internal.len(), 1, "{findings:?}");
+    // The payload text itself is whatever stage 3's isolation recovers;
+    // the wording around it is the control.
+    assert!(
+        internal[0].message.starts_with("internal error while analysing file: "),
+        "{}",
+        internal[0].message
+    );
+    assert_eq!(internal[0].severity, Severity::Info);
+    assert!(finding_fails_run(internal[0]));
+    assert_eq!(
+        internal_panic_line("check", "a.rb", "boom-412"),
+        "rigor check: internal panic on a.rb: boom-412"
+    );
+}
+
+/// rigor-rs#412: a file past the depth bound is skipped like a panicked file
+/// (an `internal-error` info finding that fails the run, no harvest) but
+/// carries the refusal's own message, with no "internal error" prefix.
+#[test]
+fn a_file_past_the_depth_bound_carries_the_refusal_message() {
+    // The bounded walk runs on the calling thread (a one-file run does not
+    // split): give it an analysis thread's stack, not the test thread's.
+    let findings = std::thread::Builder::new()
+        .stack_size(rigor_parse::ANALYSIS_STACK_BYTES)
+        .spawn(|| {
+            let root = std::env::temp_dir().join(format!("rigor_412_deep_{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            let src = format!("x{}\n", ".a".repeat(rigor_parse::MAX_NESTING_DEPTH));
+            std::fs::write(root.join("a.rb"), src).unwrap();
+            let a_rb = root.join("a.rb").to_string_lossy().into_owned();
+            // `paths:` pinned here, so cwd-relative discovery (the LSP tests
+            // move the cwd) can never add a second file, split the worklist and
+            // move the deep file onto a 2 MiB test-pool worker.
+            let mut cfg = Config::default();
+            cfg.paths = vec![root.to_string_lossy().into_owned()];
+            let (findings, _) = analyze_files(
+                &[a_rb.as_str()],
+                Some(&[a_rb.as_str()]),
+                &cfg,
+                "check",
+                None,
+                &config::BleedingEdgeSelector::None,
+                false,
+            );
+            let _ = std::fs::remove_dir_all(&root);
+            findings
+        })
+        .unwrap()
+        .join()
+        .unwrap();
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    let d = &findings[0].3;
+    assert_eq!(d.rule_id, "internal-error");
+    assert_eq!(d.severity, Severity::Info);
+    assert_eq!(
+        d.message,
+        "source nesting depth 25003 exceeds the analysis limit of 25000 (rigor-rs#412); \
+         file not analysed"
+    );
+    assert!(finding_fails_run(d));
+    assert_eq!(
+        depth_skip_line("check", "a.rb", &d.message),
+        format!("rigor check: skipped a.rb: {}", d.message)
+    );
+}

@@ -261,9 +261,10 @@ fn run_stdio() -> Result<(), String> {
         overlay_budget: OVERLAY_BUILD_BUDGET_DEFAULT,
     };
 
-    // Pre-warm the rayon global pool at startup (ADR-0029 "pre-warmed worker
-    // pool"): the pool spawns its worker threads lazily on first use, so touch it
-    // once here to avoid paying that init on the first keystroke's dispatch. The
+    // The rayon global pool is pre-warmed (ADR-0029 "pre-warmed worker pool"):
+    // `main` builds it before any command runs (rigor-rs#412), so its workers
+    // already exist and the first keystroke's dispatch pays no pool init. This
+    // no-op spawn is a cheap touch kept from when the pool was built lazily. The
     // pool size honours `RAYON_NUM_THREADS` natively (the existing knob); no LSP
     // `--workers` flag is added.
     rayon::spawn(|| {});
@@ -2931,7 +2932,7 @@ fn compute_diagnostics(
     }
     let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
         // Past the depth bound (rigor-rs#412) the buffer is not analysed; it
-        // publishes the `internal-error` finding `check` reports for the file.
+        // publishes the `internal-error` refusal `check` reports for the file.
         let result = parse_bounded(&bytes).map_err(|too_deep| too_deep.message())?;
         // A buffer Prism could not parse gets no semantic diagnostics, matching
         // `check` (`main.rs` stage 1) and the reference, which returns its parse
@@ -2988,7 +2989,7 @@ fn compute_diagnostics(
     let (mut diags, comments, overlay_build, project_index) = match analysed {
         Ok(Ok(Some(quad))) => quad,
         Ok(Err(msg)) => {
-            let skipped = crate::internal_error_diag(msg);
+            let skipped = crate::depth_refusal_diag(msg);
             return (vec![to_lsp_diagnostic(text, &skipped)], None, None);
         }
         Ok(Ok(None)) | Err(_) => return (Vec::new(), None, None),
