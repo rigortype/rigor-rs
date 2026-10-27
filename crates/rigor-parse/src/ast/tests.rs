@@ -1908,3 +1908,37 @@ fn begin_rescue_main_body_excludes_rescue_else_ensure() {
     assert_eq!(&body[..main_body.len()], &main_body[..]);
 }
 
+/// rigor-rs#418: one line for each of the 19 Prism types no fixture holds,
+/// so the debug `check_families_disjoint` runs on every one of them. Before
+/// this, a second family claiming `$g &&= v` passed every test (Mutant C).
+#[test]
+fn lowers_the_prism_types_no_fixture_holds() {
+    let carrier = |src: &str| {
+        let ast = lower(&crate::parse(src.as_bytes()));
+        ast.iter().any(|(_, n)| matches!(n, Node::UnmodeledWrite { .. }))
+    };
+    for src in [
+        "@@x &&= 1", "@@x += 1", "@@x ||= 1", "K &&= 1", "K += 1", "A::K &&= 1", "A::K += 1",
+        "A::K ||= 1", "$g &&= 1", "$g += 1", "$g ||= 1", "@x &&= 1", "x in Integer", "x => y",
+    ] {
+        assert!(carrier(src), "expected an UnmodeledWrite for {src:?}");
+    }
+    // Owned variants, never the carrier: `x.f += 1` and `a[i] += 1` (not
+    // one of the 19) have lowered in `lower_calls` since rigor-rs#343.
+    let owned: [(&str, fn(&Node) -> bool); 6] = [
+        ("alias new_m old_m", |n| matches!(n, Node::Alias { .. })),
+        ("x.f &&= 1", |n| matches!(n, Node::AttrWrite { compound: Compound::And, .. })),
+        ("x.f += 1", |n| matches!(n, Node::AttrWrite { compound: Compound::Op(_), .. })),
+        ("a[i] += 1", |n| matches!(n, Node::IndexWrite { compound: Compound::Op(_), .. })),
+        (":\"s#{x}\"", |n| matches!(n, Node::InterpolatedSymbol { .. })),
+        ("begin; rescue; retry; end", |n| {
+            matches!(n, Node::Statements { kind: StatementsKind::Jump(JumpKind::Retry), .. })
+        }),
+    ];
+    for (src, lowered) in owned {
+        let ast = lower(&crate::parse(src.as_bytes()));
+        assert!(ast.iter().any(|(_, n)| lowered(n)), "unexpected lowering of {src:?}");
+        assert!(!carrier(src), "unexpected UnmodeledWrite for {src:?}");
+    }
+}
+

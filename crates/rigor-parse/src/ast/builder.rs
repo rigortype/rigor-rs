@@ -6,6 +6,8 @@ mod expressions;
 mod control;
 mod definitions;
 mod jumps;
+#[cfg(test)]
+mod family_inventory;
 
 use crate::ruby_prism::{self, Node as PrismNode};
 
@@ -253,7 +255,10 @@ impl<'src> Builder<'src> {
     /// enforce this on every node (`check_families_disjoint`): once family
     /// *k* matches, the later families run on the same node and must each
     /// return `UNMATCHED`. A new Prism type goes into exactly one family, as
-    /// an arm before that family's trailing `UNMATCHED`.
+    /// an arm before that family's trailing `UNMATCHED`. A test checks the
+    /// same statically, for every claimed type a debug run may never lower:
+    /// it parses the arms' layout, which `builder/family_inventory.rs`'s
+    /// module doc describes.
     ///
     /// The families and the fallback are `#[inline(never)]`, which keeps
     /// their frames out of this one: only one family frame is live per
@@ -652,13 +657,15 @@ fn prism_type_name(node: &PrismNode<'_>) -> String {
 }
 
 /// Whether a Prism node is an assignment the lowering cannot reproduce —
-/// every operator/and/or write on a non-local target (`@x += 1`, `K += 1`),
-/// a `K::V` constant-path write, and the
-/// pattern-binding nodes (`expr => pat`, `expr in pat`). Local writes,
-/// multiwrites, `for` indexes, the compound ATTRIBUTE writes (`x.f ||= v` —
-/// `Node::AttrWrite`, rigor-rs#343), and the plain `K = v`/`@x = v`/`$g = v`/`@@x =
-/// v` forms have owned variants already; multiwrite TARGETS never reach
-/// `lower_node` standalone (a `MultiWriteNode` wraps them).
+/// every operator/and/or write on an instance, class, global or constant
+/// target (`@x += 1`, `K += 1`), a `K::V` constant-path write, and the
+/// pattern-binding nodes (`expr => pat`, `expr in pat`, a regex literal's
+/// named captures). Local writes, multiwrites, `for` indexes, the compound
+/// INDEX writes (`h[k] ||= v` — `Node::IndexWrite`, rigor-rs#135), the
+/// compound ATTRIBUTE writes (`x.f ||= v` — `Node::AttrWrite`, rigor-rs#343),
+/// and the plain `K = v`/`@x = v`/`$g = v`/`@@x = v` forms have owned variants
+/// already; multiwrite TARGETS never reach `lower_node` standalone (a
+/// `MultiWriteNode` wraps them).
 fn is_unmodeled_write(node: &PrismNode<'_>) -> bool {
     node.as_class_variable_and_write_node().is_some()
         || node.as_class_variable_operator_write_node().is_some()

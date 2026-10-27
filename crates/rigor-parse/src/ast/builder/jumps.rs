@@ -235,8 +235,11 @@ impl<'src> Builder<'src> {
         }
 
         // Assignment shapes with no owned variant — operator/and/or writes to
-        // ivars, cvars, globals, constants, `x.f` / `a[i]` targets, `K::V`
-        // path writes, and `expr => pat` / `expr in pat` bindings. The node is
+        // ivars, cvars, globals and constants, `K::V` path writes, and
+        // `expr => pat` / `expr in pat` / named-capture bindings. (The
+        // compound `a[i]` and `x.f` writes are owned, in `lower_calls`:
+        // `Node::IndexWrite`, rigor-rs#135, and `Node::AttrWrite`,
+        // rigor-rs#343.) The node is
         // additionally marked with a sibling [`Node::UnmodeledWrite`] (visible
         // to span-scanning consumers — the per-element block-fold gate must
         // decline rather than answer a tail with the pre-write binding,
