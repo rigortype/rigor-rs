@@ -17,6 +17,14 @@
 //! - `let name = node.as_x_node().map(..)`, then any number of
 //!   `.or_else(|| node.as_y_node().map(..))` links (`calls.rs`).
 //!
+//! An `if let` pattern is exactly `Some(..)`: `if let None = node.as_x_node()`
+//! would claim every type but X.
+//!
+//! One arm per type; every arm ends in `return`. A second arm for a type is
+//! dead code, so the test fails on it, even within one family. That includes
+//! a fall-through arm followed by a second arm for its type, by design.
+//! `lower_node` itself claims no type: its body holds no `as_x_node()` call.
+//!
 //! Only COND and the `node.as_x_node()` heads of a `let` chain count. Arm
 //! bodies, `.map` closures, comments and literals are skipped. Any other
 //! top-level statement fails the test: a new arm shape needs a case here.
@@ -71,19 +79,62 @@ fn lower_node_families_claim_disjoint_prism_types() {
         twice.join("\n")
     );
 
-    for ((method, arms, types), (_, _, _, want_types, min_arms)) in
+    // No lock on the total: with the types distinct, it is the sum of
+    // FAMILY_FILES's counts.
+    for ((method, arms, types), (_, file, _, want_types, min_arms)) in
         claimed.iter().zip(FAMILY_FILES)
     {
-        assert!(*arms >= min_arms, "{method}: {arms} arms, expected at least {min_arms}");
-        assert_eq!(types.len(), want_types, "{method} claims {types:?}");
+        assert!(
+            *arms >= min_arms,
+            "{method}: {arms} arms, under the floor of {min_arms}: if arms were merged, lower \
+             {method}'s floor in FAMILY_FILES; if not, the extraction found too few"
+        );
+        assert_eq!(
+            types.len(),
+            want_types,
+            "{method} ({file}) claims {} Prism types, not {want_types}: update {method}'s \
+             count in FAMILY_FILES. It claims {types:?}",
+            types.len()
+        );
     }
-    assert_eq!(owner.len(), 90);
 }
 
-/// The `self.lower_*` methods `lower_node`'s body calls, in order.
+/// `blank` on literal prefixes (#420): `br` and `cr` start raw strings,
+/// `b` and `c` escaped ones, and none of them starts a literal from inside
+/// an identifier. Byte chars and lifetimes keep working.
+#[test]
+fn blank_reads_literal_prefixes() {
+    for (src, want) in [
+        (r#"br"\" + "\"{""#, r#"br" " + "   ""#),
+        (r#"(cr"\", "\"{")"#, r#"(cr" ", "   ")"#),
+        (r##"br#"say "{" hi"#;"##, r##"br#"          "#;"##),
+        (r##"cr#"say "{" hi"#;"##, r##"cr#"          "#;"##),
+        (r#"b"\"{" + c"\"{""#, r#"b"   " + c"   ""#),
+        (r#"xbr"\"{" _cr"\"{" bar"\"{" sub"\"{""#, r#"xbr"   " _cr"   " bar"   " sub"   ""#),
+        (r#"[b'"', b'\'', b'{'] &'b x"#, r#"[b' ', b'  ', b' '] &'b x"#),
+        (r#"'br: loop { br"\" }"#, r#"'br: loop { br" " }"#),
+        (r#"r#match + r"\" + "{""#, r#"r#match + r" " + " ""#),
+    ] {
+        assert_eq!(blank(src), want, "blank({src:?})");
+    }
+}
+
+/// The `self.lower_*` methods `lower_node`'s body calls, in order. The body
+/// may hold no `as_x_node()` call: a claim there escapes this test and the
+/// debug check alike.
 fn dispatched_families() -> Vec<&'static str> {
     let text = blank(BUILDER);
     let (open, close) = fn_body(&text, "lower_node", "builder.rs");
+    for (at, _) in text[open..close].match_indices("as_") {
+        let at = open + at;
+        let name = ident_at(&text, at);
+        let downcast = name.strip_prefix("as_").and_then(|s| s.strip_suffix("_node")).is_some();
+        let line = text[..at].matches('\n').count() + 1;
+        assert!(
+            is_ident_byte(text.as_bytes()[at - 1]) || !downcast,
+            "builder.rs:{line}: lower_node calls `{name}` itself: a type's arm goes in a family"
+        );
+    }
     let body = &BUILDER[open..close];
     let mut called: Vec<&str> = Vec::new();
     for (at, _) in text[open..close].match_indices("self.lower_") {
@@ -159,6 +210,12 @@ fn cond_types(cond: &str, lets: &mut BTreeMap<String, Vec<String>>, at: &str) ->
         return split_top(cond, "||").iter().flat_map(|t| term_types(t, at)).collect();
     }
     let eq = find_top(cond.as_bytes(), 0, b"=").unwrap_or_else(|| panic!("{at}: `let` without `=`"));
+    let pat = cond["let".len()..eq].trim();
+    let some = pat.strip_prefix("Some").map(str::trim_start).filter(|p| p.starts_with('('));
+    assert!(
+        some.is_some_and(|p| close_of(p.as_bytes(), 0) == p.len() - 1),
+        "{at}: an `if let` pattern is `Some(..)`, not `{pat}`"
+    );
     let scrutinee = cond[eq + 1..].trim();
     if let Some((ty, rest)) = as_node_call(scrutinee) {
         assert!(rest.trim().is_empty(), "{at}: `if let` tests one `node.as_x_node()` only");
@@ -317,8 +374,12 @@ fn close_of(s: &[u8], open: usize) -> usize {
 /// The identifier starting at byte `i` of `s` (empty if none).
 fn ident_at(s: &str, i: usize) -> &str {
     let tail = &s[i..];
-    let len = tail.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(tail.len());
+    let len = tail.bytes().position(|c| !is_ident_byte(c)).unwrap_or(tail.len());
     &tail[..len]
+}
+
+fn is_ident_byte(c: u8) -> bool {
+    c.is_ascii_alphanumeric() || c == b'_'
 }
 
 fn is_ident(s: &str) -> bool {
@@ -338,10 +399,14 @@ fn blank(src: &str) -> String {
             }
         }
     };
+    // Whether byte `j` starts a token: no identifier byte runs into it.
+    let starts = |j: usize| j == 0 || !is_ident_byte(b[j - 1]);
     let mut i = 0;
     while i < b.len() {
-        let prev_ident = i > 0 && (b[i - 1].is_ascii_alphanumeric() || b[i - 1] == b'_');
-        let raw = if b[i] == b'r' && !prev_ident { raw_quote(&b[i + 1..]) } else { None };
+        // An `r` starts a raw string alone, or after a `b` or `c` that
+        // starts its token (`br"…"`, `cr"…"`), never inside an identifier.
+        let prefix = starts(i) || (b"bc".contains(&b[i - 1]) && starts(i - 1));
+        let raw = if b[i] == b'r' && prefix { raw_quote(&b[i + 1..]) } else { None };
         if b[i..].starts_with(b"//") {
             let end = src[i..].find('\n').map_or(b.len(), |n| i + n);
             wipe(i, end);
@@ -364,7 +429,8 @@ fn blank(src: &str) -> String {
             }
             wipe(start, i);
         } else if let Some(hashes) = raw {
-            // `r"…"` / `r#"…"#`: no escapes, ends at `"` plus as many `#`.
+            // `r"…"` / `r#"…"#`, also after `b` or `c`: no escapes, ends at
+            // `"` plus as many `#`.
             let body = i + 2 + hashes;
             let mut closing = vec![b'"'];
             closing.extend(std::iter::repeat_n(b'#', hashes));

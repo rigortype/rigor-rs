@@ -1908,9 +1908,11 @@ fn begin_rescue_main_body_excludes_rescue_else_ensure() {
     assert_eq!(&body[..main_body.len()], &main_body[..]);
 }
 
-/// rigor-rs#418: one line for each of the 19 Prism types no fixture holds,
-/// so the debug `check_families_disjoint` runs on every one of them. Before
-/// this, a second family claiming `$g &&= v` passed every test (Mutant C).
+/// rigor-rs#418: one source for each of the 19 Prism types no fixture holds
+/// (14 carrier writes, then 5 owned variants), plus `a[i] += 1`: 20 sources.
+/// So the debug `check_families_disjoint` runs on every one of the 19.
+/// Before this, a second family claiming `$g &&= v` passed every test
+/// (Mutant C).
 #[test]
 fn lowers_the_prism_types_no_fixture_holds() {
     let carrier = |src: &str| {
@@ -1923,8 +1925,11 @@ fn lowers_the_prism_types_no_fixture_holds() {
     ] {
         assert!(carrier(src), "expected an UnmodeledWrite for {src:?}");
     }
-    // Owned variants, never the carrier: `x.f += 1` and `a[i] += 1` (not
-    // one of the 19) have lowered in `lower_calls` since rigor-rs#343.
+    // Owned variants, never the carrier. `x.f &&= 1` and `x.f += 1` are two
+    // of the 19 (CallAndWrite, CallOperatorWrite); `lower_calls` has lowered
+    // them to `AttrWrite` since rigor-rs#343 (PR #358). `a[i] += 1`
+    // (IndexOperatorWrite) is not one of the 19: it is here as the `IndexWrite`
+    // it has lowered to since rigor-rs#135 (PR #297).
     type Lowered = fn(&Node) -> bool;
     let owned: [(&str, Lowered); 6] = [
         ("alias new_m old_m", |n| matches!(n, Node::Alias { .. })),
