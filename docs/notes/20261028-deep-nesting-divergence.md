@@ -1,7 +1,9 @@
 # Deep nesting: where the reference aborts and the port reports (#412)
 
-[ADR-0045](../adr/0045-stack-totality.md) makes the port total on deep
-nesting: it never overflows its stack. The reference does not survive the same
+With [ADR-0045](../adr/0045-stack-totality.md), `rigor check` and `rigor lsp`
+no longer die of a stack overflow on source nesting up to 25,000 Prism child
+edges, and deeper source is refused. Inferred-type depth is a separate axis
+(#427) that the bound does not cover. The reference does not survive the same
 inputs. It catches its `SystemStackError` in `cli.rb`'s `rescue *FATAL_ERRORS`
 and aborts the whole run:
 - stderr: `rigor: analysis aborted: SystemStackError: stack level too deep`,
@@ -19,8 +21,11 @@ mirror, so the port does not mirror one.
 **The divergence.** Where the reference aborts and the port finishes, the port's
 report is a reference defect, tracked upstream. It is not a false positive to
 suppress. Above the port's own bound (25,000 Prism child edges), the port
-reports an `internal-error` `:info` finding for that file and keeps analysing
-the rest of the run.
+skips the file and keeps analysing the rest of the run. It reports an
+`internal-error` `:info` finding with the refusal's own message (nothing
+panicked) and prints `rigor check: skipped <path>: …` on stderr. A file
+past the bound that also has syntax errors reports the refusal, not its parse
+errors.
 
 ## Probe tables
 
@@ -48,7 +53,7 @@ system Ruby's default VM stack, with `--no-cache`.
 | `if x` ×1500 / ×3332 | exit 70 | one warning per level, exit 0 |
 | `x.a` chain ×700 | match: one `call.unresolved-toplevel`, exit 0 | match |
 | `x.a` chain ×1500 / ×5000 | exit 70 | one warning, exit 0 |
-| `x.a` chain ×30000 | exit 70 | `internal-error` `:info` ("source nesting depth 30003 exceeds the analysis limit of 25000 …"), exit 1 |
+| `x.a` chain ×30000 | exit 70 | `internal-error` `:info` ("source nesting depth 30003 exceeds the analysis limit of 25000 (rigor-rs#412); file not analysed"), exit 1 |
 
 At the pin, the reference finished 700 nested `if`s and a 700-link chain; it
 aborted from 1,500. The two-file runs that crashed the port on master

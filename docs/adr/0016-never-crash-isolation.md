@@ -14,3 +14,5 @@ This matches the reference's never-crash + zero-false-positive discipline: a ski
 ## The `internal-error` diagnostic (audit R5)
 
 The synthetic diagnostic emitted for a skipped (panicked) file is a **deliberate rigor-rs-specific signal with no reference counterpart**, so it must not be treated as a parity false positive. It is emitted at **`:info` severity**, which the [differential harness](0002-diagnostic-set-parity.md) excludes from its error/warning comparison — a crashed file therefore never counts as a divergence. Rule id `internal-error`, `source_family` `builtin`. This keeps never-crash observable to the user without breaching the one-sided parity gate.
+
+The same `internal-error` rule also carries the **depth refusal** ([ADR-0045](0045-stack-totality.md)): a file nested past the analysis bound is skipped the same way, but with its own message ("source nesting depth N exceeds the analysis limit of 25000 …") and the stderr line `rigor <verb>: skipped <path>: …`, because nothing panicked. A panicked file keeps "internal error while analysing file: …" and `internal panic on …`.

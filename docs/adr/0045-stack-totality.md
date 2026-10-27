@@ -32,26 +32,40 @@ an empty report). See
 
 ## Decision
 
-1. **Every analysis thread gets a 256 MiB stack** (`ANALYSIS_STACK_BYTES`,
-   `rigor-cli/src/main.rs`):
-   - `main` first builds the global rayon pool with that stack. An `Err`
-     there is a bug, so it is not ignored.
+1. **Every analysis thread gets a 256 MiB stack**
+   (`rigor_parse::ANALYSIS_STACK_BYTES`, spawned by `rigor-cli/src/threads.rs`):
+   - `main` first builds the global rayon pool, once, with a spawn handler
+     that gives each worker the stack. `build_global` is one-shot: rayon
+     marks the registry as set even when building fails, so a retry with a
+     smaller size would leave no pool at all. The fallback therefore happens
+     per thread, inside the handler: 256 MiB, then 64 MiB, then the platform
+     default.
    - `main` then runs the whole command on a spawned thread named `main`, so
-     panic and overflow messages read as before.
-   - The `coverage --workers=N` pool gets the same size.
+     panic and overflow messages read as before. It falls back the same way,
+     and runs the command on the process's main thread if no thread can be
+     created at all.
+   - The `coverage --workers=N` pool uses the same handler.
+   - A large stack never stops a command from starting. A thread that falls
+     back prints one stderr line per process ("could not reserve 256 MiB
+     thread stacks …"); the normal path prints nothing.
 2. **A depth bound of 25,000** (`rigor_parse::MAX_NESTING_DEPTH`):
    - Depth is counted in Prism child edges; the program node is depth 1.
    - `rigor_parse::parse_bounded` measures it right after the parse, before
      any walker runs. Every production parse site calls it: `check` stage 1,
      every LSP handler, `coverage`, `sig-gen`, `type-of`, `annotate`,
      `effects` and the MCP tools.
-   - In `check`, a file past the bound is skipped exactly like a panicked file
-     (ADR-0016): the `internal-error` `:info` finding, the `internal panic
-     on …` stderr line, no harvest, and a failing exit. Its message names the
-     depth and the limit.
+   - In `check`, a file past the bound is skipped the way a panicked file is
+     (ADR-0016): an `internal-error` `:info` finding, no harvest, and a
+     failing exit. The wording is the refusal's own, since nothing panicked.
+     The finding's message is "source nesting depth N exceeds the analysis
+     limit of 25000 (rigor-rs#412); file not analysed". The stderr line is
+     `rigor check: skipped <path>: <that message>`.
    - The LSP publishes the same finding for the buffer. Hover, completion and
      documentSymbol answer null.
-   - The other commands treat such a file as they treat an unreadable one.
+   - The other commands treat such a file as they treat an unreadable one:
+     `type-of` and `annotate` print the message and exit 1, `coverage` lists
+     it with the files it could not scan, `sig-gen` and `effects` skip it, and
+     an MCP tool returns the message as its error.
 3. **A refused tree is never dropped on the caller's stack.** It is measured
    in full and dropped on a thread sized from the source length: 16 MiB plus
    256 B per byte in release, 4 KiB per byte in debug. If that thread cannot
@@ -157,6 +171,29 @@ memory. Medians over interleaved runs; every variant produced identical output:
 
 ## Consequences
 
+- **The bound counts syntactic depth only.** Inferred-type depth is a
+  second axis it does not cover (#427). Rebinding `x` 70 times to
+  `[[[…9000 levels…[x]…]]]` measures 9,004 child edges, yet `check`
+  overflows in `rigor_types::display::describe_named` (about 440 B per type
+  level), and `rigor lsp` dies on didOpen. Master already overflows on this
+  shape with 2 lines; the 256 MiB stacks raise the threshold about 30×.
+- **A file past the bound that also has syntax errors** reports the depth
+  refusal instead of its parse errors. The bound is checked before the
+  parse-error branch, so a refused tree is never walked. On master,
+  `x.a…×30000` followed by `)` reported `unexpected ')', ignoring it`. This
+  sits inside the divergence region, where the reference exits 70.
+- **Prism's own parse is quadratic on `&&`, `||`, `and` and `or` chains**, so
+  refusing such a file still pays for the parse: `Prism.parse_success?` takes
+  0.8 s at 30k links, 4.0 s at 60k and 14.8 s at 120k. "Time binds before
+  stack does" above is about rigor's own passes; this cost is Prism's.
+- **Two surfaces differ on purpose.**
+  - In the LSP, a buffer past the bound publishes its `internal-error`
+    finding, while a buffer that panics publishes nothing, as it did before.
+    The refusal is deterministic and the user can act on it; a panic is a
+    rigor bug, and the LSP's panic path is unchanged.
+  - `coverage` lists a refused file under "Parse errors:". That list is
+    coverage's existing bucket for every file it could not scan, including
+    unreadable ones.
 - **Linux strict overcommit.** Under `vm.overcommit_memory = 2`, every
   thread's 256 MiB reservation counts against the commit limit: one command
   thread plus one per core. Default heuristic overcommit, macOS and Windows
