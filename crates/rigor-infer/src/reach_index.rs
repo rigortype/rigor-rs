@@ -21,7 +21,9 @@ use std::rc::Rc;
 
 use rigor_parse::{LoweredAst, Node, NodeId, Span};
 
-use crate::reach::{proc_like_block, unevaluated_case_clause_spans, unrecorded_closure};
+use crate::reach::{
+    proc_like_block, statement_sections, unevaluated_case_clause_spans, unrecorded_closure,
+};
 use crate::Typer;
 
 /// `outer` contains `inner` — half-open byte spans, equal spans count.
@@ -98,6 +100,11 @@ pub(crate) struct ReachIndex {
     /// Per local name, the nodes the write collector can match for it, in
     /// arena order (see [`LocalEvent`]).
     by_name: HashMap<String, Vec<NodeId>>,
+    /// Every node's start offset with its id, sorted — the range index of
+    /// [`ReachIndex::nested_section_owner`].
+    by_start: Vec<(usize, NodeId)>,
+    /// [`ReachIndex::nested_section_owner`] per `(statement, read span)`.
+    sections: RefCell<HashMap<(NodeId, Span), Option<NodeId>>>,
     /// [`unrecorded_closure`] per read span.
     unrecorded: RefCell<HashMap<Span, Option<(NodeId, Span)>>>,
     /// [`Typer::clause_retries`] per clause span.
@@ -215,8 +222,13 @@ impl ReachIndex {
                 }
             }
         }
+        let mut by_start: Vec<(usize, NodeId)> =
+            ast.iter().map(|(id, n)| (n.span().0, id)).collect();
+        by_start.sort_unstable();
         ReachIndex {
             case_clauses: unevaluated_case_clause_spans(ast),
+            by_start,
+            sections: RefCell::new(HashMap::new()),
             def_spans,
             lambda_spans,
             scopes,
@@ -266,6 +278,69 @@ impl ReachIndex {
         let out = unrecorded_closure(ast, use_span);
         self.unrecorded.borrow_mut().insert(use_span, out);
         out
+    }
+
+    /// The node whose statement section holds `use_span` when statement
+    /// `stmt` itself has none — `latest_definite_assignment`'s descent
+    /// through an expression (`x = items.map { |v| t = 1; Float(t) }`, an
+    /// `if` predicate's block). Among the nodes strictly inside `stmt`'s
+    /// span that contain the read (outside a `when`/`in` extent and a
+    /// blocked carrier), it is the WIDEST one with a section holding the
+    /// read, the first in arena order among equal widths; `None` when there
+    /// is none, or when any such node is a `->` (its writes never bind, rows
+    /// r11/p13).
+    ///
+    /// That is exactly the arena-order scan it replaces (a later node only
+    /// displaced the best one when strictly wider, and a `->` returned
+    /// `None` wherever it sat), restricted through `by_start` to the nodes
+    /// that can contain the read — every one starts between `stmt`'s start
+    /// and the read's — and memoized per `(stmt, use_span)`.
+    pub(crate) fn nested_section_owner(
+        &self,
+        ast: &LoweredAst,
+        stmt: NodeId,
+        use_span: Span,
+    ) -> Option<NodeId> {
+        if let Some(hit) = self.sections.borrow().get(&(stmt, use_span)) {
+            return *hit;
+        }
+        let out = self.scan_nested_section_owner(ast, stmt, use_span);
+        self.sections.borrow_mut().insert((stmt, use_span), out);
+        out
+    }
+
+    fn scan_nested_section_owner(
+        &self,
+        ast: &LoweredAst,
+        stmt: NodeId,
+        use_span: Span,
+    ) -> Option<NodeId> {
+        let outer = ast.get(stmt).span();
+        let holds = |b: &[NodeId]| b.iter().any(|&s| contains(ast.get(s).span(), use_span));
+        let lo = self.by_start.partition_point(|&(s, _)| s < outer.0);
+        let hi = self.by_start.partition_point(|&(s, _)| s <= use_span.0);
+        let mut best: Option<(usize, NodeId)> = None;
+        for &(_, id) in &self.by_start[lo..hi.max(lo)] {
+            let n = ast.get(id);
+            let sp = n.span();
+            if id == stmt
+                || !contains(outer, sp)
+                || !contains(sp, use_span)
+                || self.in_case_clause(sp)
+                || ast.in_blocked_carrier(sp)
+            {
+                continue;
+            }
+            if matches!(n, Node::Lambda { .. }) {
+                return None;
+            }
+            let width = sp.1 - sp.0;
+            let better = best.is_none_or(|(bw, bid)| width > bw || (width == bw && id < bid));
+            if better && statement_sections(ast, id).into_iter().any(|b| holds(b)) {
+                best = Some((width, id));
+            }
+        }
+        best.map(|(_, id)| id)
     }
 
     /// [`Typer::clause_retries`] for `clause_span`, memoized.

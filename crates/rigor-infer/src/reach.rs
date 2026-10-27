@@ -1322,10 +1322,10 @@ impl<'i> Typer<'i> {
     // scope-evaluated ([`unevaluated_case_clause_spans`]), so for a read
     // inside one the statement path ends at the `case` — descending into
     // the clause's own `Statements` would mint a definite assignment out
-    // of a write that never binds (rigor-rs#341).
+    // of a write that never binds (rigor-rs#341). The index holds those
+    // extents; the nested-section scan below excludes them.
     let idx = self.reach_index(ast);
     let case_clauses = &idx.case_clauses;
-    let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
     let mut kill = None;
     let mut body: &[NodeId] = body;
     for _ in 0..64 {
@@ -1345,31 +1345,12 @@ impl<'i> Typer<'i> {
         // hold a cut. A `->` between the statement and the read stops the
         // walk — its writes never bind (rows r11/p13).
         let stmt = body[pos];
+        // The nested node is a syntax-only answer per (statement, read), so
+        // the index memoizes it ([`ReachIndex::nested_section_owner`]).
         let next: Option<&[NodeId]> =
             statement_sections(ast, stmt).into_iter().find(|b| holds(b)).or_else(|| {
-                let outer = ast.get(stmt).span();
-                let mut best: Option<(rigor_parse::Span, &[NodeId])> = None;
-                for (id, n) in ast.iter() {
-                    let sp = n.span();
-                    if id == stmt
-                        || !contains(outer, sp)
-                        || !contains(sp, use_span)
-                        || in_case_clause(sp)
-                        || ast.in_blocked_carrier(sp)
-                    {
-                        continue;
-                    }
-                    if matches!(n, Node::Lambda { .. }) {
-                        return None;
-                    }
-                    if best.is_some_and(|(b, _)| sp.1 - sp.0 <= b.1 - b.0) {
-                        continue;
-                    }
-                    if let Some(section) = statement_sections(ast, id).into_iter().find(|b| holds(b)) {
-                        best = Some((sp, section));
-                    }
-                }
-                best.map(|(_, section)| section)
+                let owner = idx.nested_section_owner(ast, stmt, use_span)?;
+                statement_sections(ast, owner).into_iter().find(|b| holds(b))
             });
         match next {
             Some(b) => body = b,
@@ -1384,7 +1365,7 @@ impl<'i> Typer<'i> {
 /// bodies and `else`, a loop body, a `begin`'s body / `ensure` / `rescue`
 /// clauses, a block body, a parenthesised sequence. A `->` body is not one
 /// (see [`latest_definite_assignment`]), nor is a nested `def`'s.
-fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
+pub(crate) fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
     match ast.get(id) {
         Node::If { then_body, else_body, .. } => vec![then_body, else_body],
         Node::Case { branches, else_body, .. } => branches
