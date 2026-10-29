@@ -19,6 +19,8 @@
 //! | `call_dispatch` | block-less call typing (`type_call`, the RBS return lookup) |
 //! | `block_call` | calls carrying a literal block (exactly-once, never-completes) |
 //! | `reach` | argument reach — the untyped-argument declines |
+//! | `reach_index` | the per-AST tables behind `local_reach` (rigor-rs#422) |
+//! | `reach_memo` | the `local_reach` memo and its audit mode (rigor-rs#422) |
 //! | `flow_writes` | span-keyed rebind/mutation tables (free functions) |
 //! | `flow_eval` | top-level env builders, [`Typer::always_truthy_snapshots`] |
 //! | `nilable` | [`Typer::nilable_receiver_snapshots`] |
@@ -55,6 +57,8 @@ mod flow_eval;
 mod flow_writes;
 mod nilable;
 mod reach;
+mod reach_index;
+mod reach_memo;
 mod typer;
 
 use std::collections::HashMap;

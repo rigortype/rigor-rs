@@ -3,11 +3,12 @@
 //! cvar / gvar / chain arms) — the gate of the #521 / #1021 untyped-argument
 //! declines — with the definite-assignment and untyped-root helpers behind it.
 
-use rigor_parse::{LoweredAst, Node, NodeId, Span, StatementsKind};
+use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::Scalar;
 
 use crate::dead::DeadPositions;
 use crate::folding;
+use crate::reach_index::{LocalEvent, LocalWrite, ReachIndex, ScopeNode};
 use crate::Typer;
 
 impl<'i> Typer<'i> {
@@ -225,7 +226,7 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::LocalVariableRead { name, span } => {
                 let key = format!("{name}@{}", span.0);
-                if seen.contains(&key) || seen.len() >= 4 {
+                if self.seen_contains(seen, &key) || seen.len() >= 4 {
                     return None;
                 }
                 seen.push(key);
@@ -428,24 +429,10 @@ impl<'i> Typer<'i> {
     /// A `def <name>` at FILE scope in this AST — the same-file fallback for
     /// `is_toplevel_def` when the `Typer` was built on an empty
     /// [`crate::SourceIndex`] (unit tests). Definitions nested inside a
-    /// class/module/def are not file-scope.
+    /// class/module/def are not file-scope. The set is the index's
+    /// ([`ReachIndex::toplevel_def`](crate::reach_index::ReachIndex::toplevel_def)).
     fn toplevel_def_in_file(&self, ast: &LoweredAst, name: &str) -> bool {
-        let containers: Vec<Span> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::ClassDef { span, .. }
-                | Node::ModuleDef { span, .. }
-                | Node::Definition { span, .. } => Some(*span),
-                _ => None,
-            })
-            .collect();
-        ast.iter().any(|(_, n)| {
-            matches!(n, Node::Definition { name: Some(m), span, .. }
-                if m == name
-                    && !containers
-                        .iter()
-                        .any(|&c| c != *span && c.0 <= span.0 && span.1 <= c.1))
-        })
+        self.reach_index(ast).toplevel_def(name)
     }
 
     /// Dispatch a root to its arm. `seen` carries the `(root, position)` pairs
@@ -464,7 +451,7 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
     ) -> Reach {
         let key = format!("{}@{}", root.spelling(), use_span.0);
-        if seen.contains(&key) {
+        if self.seen_contains(seen, &key) {
             return Reach::NONE;
         }
         if seen.len() >= 4 {
@@ -544,7 +531,10 @@ impl<'i> Typer<'i> {
     /// disagreeing or unscalarable (`op=`, multi-write) contributor — every
     /// early return carries `None` — and is only meaningful to callers beside
     /// the returned [`Reach`] (see [`Typer::expr_scalar`]).
-    pub(crate) fn local_reach(
+    ///
+    /// Callers go through the memoizing [`Typer::local_reach`]
+    /// (rigor-rs#422, `reach_memo.rs`).
+    pub(crate) fn local_reach_uncached(
         &self,
         ast: &LoweredAst,
         root: &str,
@@ -553,12 +543,12 @@ impl<'i> Typer<'i> {
         skip_class_guards: bool,
     ) -> (Reach, Option<Scalar>) {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-        // One pass for the scope shapes: every `def` span, every `->` span, the
-        // innermost `def` around the use site, the narrowest binder (a `def`, a
-        // `->`, or any block-bearing call) around it, and every block extent
-        // around it.
-        let mut def_spans: Vec<rigor_parse::Span> = Vec::new();
-        let mut lambda_spans: Vec<rigor_parse::Span> = Vec::new();
+        // Every scan below that reads only the syntax tree comes from the
+        // per-AST tables (rigor-rs#422); the per-read filters still run here.
+        let idx = self.reach_index(ast);
+        // One pass over the index's scope shapes: the innermost `def` around
+        // the use site, the narrowest binder (a `def`, a `->`, or any
+        // block-bearing call) around it, and every block extent around it.
         let mut def: Option<(rigor_parse::Span, NodeId)> = None;
         let mut binder: Option<(rigor_parse::Span, bool)> = None;
         let mut blocks_around: Vec<rigor_parse::Span> = Vec::new();
@@ -575,26 +565,28 @@ impl<'i> Typer<'i> {
                 }
             }
         };
-        for (id, n) in ast.iter() {
-            match n {
-                Node::Definition { span, .. } => {
-                    def_spans.push(*span);
+        for s in &idx.scopes {
+            match s {
+                ScopeNode::Def { span, id, .. } => {
                     if contains(*span, use_span) {
                         let narrower = def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0);
                         if narrower {
-                            def = Some((*span, id));
+                            def = Some((*span, *id));
                         }
                     }
                     note_binder(*span, false);
                 }
-                Node::Lambda { span, .. } => {
-                    lambda_spans.push(*span);
+                ScopeNode::Lambda { span } => {
                     if contains(*span, use_span) {
                         blocks_around.push(*span);
                     }
                     note_binder(*span, true);
                 }
-                Node::Loop { span, .. } if contains(*span, use_span) => loop_spans.push(*span),
+                ScopeNode::Loop { span } => {
+                    if contains(*span, use_span) {
+                        loop_spans.push(*span);
+                    }
+                }
                 // `retry` re-enters the `begin`: a rescue arm's own writes can
                 // reach reads earlier in the arm on the next pass — the same
                 // carrier a loop is (rigor-rs#368; `retried = false; begin;
@@ -604,44 +596,31 @@ impl<'i> Typer<'i> {
                 // so its writes reach the arm's reads on the retried pass
                 // (`attempts += 1` above `rescue; if attempts < MAX; retry` —
                 // gitlab-foss `migrator.rb`).
-                Node::BeginRescue { clauses, span, .. } => {
-                    for c in clauses {
-                        if contains(c.span, use_span) && self.clause_retries(ast, c.span) {
+                ScopeNode::Rescue { span, clauses } => {
+                    for &c in clauses {
+                        if contains(c, use_span) && idx.clause_retries(self, ast, c) {
                             loop_spans.push(*span);
                         }
                     }
                 }
-                Node::Call {
-                    receiver,
-                    method,
-                    block_body,
-                    block_params,
-                    ..
-                } if !block_body.is_empty() => {
-                    // A call's own span covers its receiver and arguments too, so
-                    // the binder region is the BLOCK BODY's extent.
-                    let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
-                    let hi = block_body.iter().map(|&b| ast.get(b).span().1).max();
-                    if let (Some(lo), Some(hi)) = (lo, hi) {
-                        if contains((lo, hi), use_span) {
-                            blocks_around.push((lo, hi));
-                            // Only a NON-proc-like block's param floors the
-                            // name: `each`/`loop` yield whatever their receiver
-                            // carries (untyped for `h.each`), which the UNTYPED
-                            // seed below stands in for. A proc-like block's
-                            // param is typed by its yield contract (`1.tap {
-                            // |v| }` binds `v` to `1`) and keeps the ordinary
-                            // write join.
-                            if !proc_like_block(ast, *receiver, method)
-                                && block_params.iter().any(|(p, _)| p == root)
-                            {
-                                block_param_bound = true;
-                            }
+                // A call's own span covers its receiver and arguments too, so
+                // the binder region is the BLOCK BODY's extent.
+                ScopeNode::Block { extent, proc_like, params } => {
+                    if contains(*extent, use_span) {
+                        blocks_around.push(*extent);
+                        // Only a NON-proc-like block's param floors the
+                        // name: `each`/`loop` yield whatever their receiver
+                        // carries (untyped for `h.each`), which the UNTYPED
+                        // seed below stands in for. A proc-like block's
+                        // param is typed by its yield contract (`1.tap {
+                        // |v| }` binds `v` to `1`) and keeps the ordinary
+                        // write join.
+                        if !*proc_like && params.iter().any(|p| p == root) {
+                            block_param_bound = true;
                         }
-                        note_binder((lo, hi), proc_like_block(ast, *receiver, method));
                     }
+                    note_binder(*extent, *proc_like);
                 }
-                _ => {}
             }
         }
         // Issue #146: a read inside a literal block / `->` no scope-recording
@@ -650,7 +629,7 @@ impl<'i> Typer<'i> {
         // ENCLOSING scope as of the closure's position: the closure's own
         // writes never reach it, its bound names read `Dynamic[top]`, and a
         // captured local sees only what the enclosing scope binds there.
-        let operand = unrecorded_closure(ast, use_span);
+        let operand = idx.unrecorded_closure(ast, use_span);
         if let Some((_, boundary)) = operand {
             // A name bound by ANY closure inside the typed-only boundary — a
             // parameter, `;`-local or body-introduced local — is floored to
@@ -658,16 +637,10 @@ impl<'i> Typer<'i> {
             // say: `{ a: [1].each { |n| Float(n) } }` stays silent even when
             // an unrelated block elsewhere wrote the same name (cross-block
             // bleed is how this was reached).
-            let floored = ast.iter().any(|(_, n)| {
-                let (extent, locals) = match n {
-                    Node::Lambda { span, locals, .. } => (*span, locals),
-                    Node::Call { block_span: Some(b), block_locals, .. } => (*b, block_locals),
-                    _ => return false,
-                };
-                contains(boundary, extent)
-                    && contains(extent, use_span)
-                    && locals.iter().any(|l| l == root)
-            });
+            let floored = idx
+                .closures_binding(root)
+                .iter()
+                .any(|&extent| contains(boundary, extent) && contains(extent, use_span));
             if floored {
                 return (Reach::UNTYPED, None);
             }
@@ -722,24 +695,15 @@ impl<'i> Typer<'i> {
         // (a rescue modifier — `x = (case v when (q = 1; Integer) then 1
         // end) rescue nil`) leaves no `Node::When` to span, but the same
         // positions are marked `Recovered::blocked`, so those extents are
-        // excluded identically (rigor-rs#357).
-        let case_clauses = unevaluated_case_clause_spans(ast);
-        let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
+        // excluded identically (rigor-rs#357). The index's `case_clauses` are
+        // those extents; the write collector's region test excludes them.
+        //
         // rigor-rs#368 — provably-dead positions: a folded `if`/`unless` arm's
         // writes reach nothing at all, and a `rescue` arm's write reaches a
         // read inside its own arm or `ensure`, plus the post-`begin` scope —
         // only when the arm falls through (`live_rescues`,
         // `branch_terminates?`). The position rule is `dead.write_reaches`.
         let dead = self.dead_positions(ast, seen);
-        let in_region = |s: rigor_parse::Span| {
-            if !contains(region, s) || in_case_clause(s) || ast.in_blocked_carrier(s) {
-                return false;
-            }
-            if lambda_spans.iter().any(|&l| contains(l, s)) {
-                return false;
-            }
-            !(skip_defs && def_spans.iter().any(|&d| contains(d, s)))
-        };
         // Only the blocks INSIDE the region can hold a block parameter, and only
         // they (or a loop) can carry a later write back round to the read.
         blocks_around.retain(|&b| contains(region, b));
@@ -753,98 +717,46 @@ impl<'i> Typer<'i> {
         } else {
             !blocks_around.is_empty() || !loop_spans.is_empty()
         };
-        // A guard is a narrowing, not a binding, so the `->` skip does not apply
-        // to it — only the region does. A guard inside a `when` condition or an
-        // `in` pattern/guard is excluded for the same reason a write is:
-        // `case_when_scopes` narrows the SUBJECT local only, so `q.is_a?(C)`
-        // there types no `q` (rigor-rs#341) — and so is a guard recovered
-        // under a blocked wrapper position (rigor-rs#357).
-        let guards_here = |s: rigor_parse::Span| {
-            contains(region, s) && !in_case_clause(s) && !ast.in_blocked_carrier(s)
-        };
-        let reads_root = |i: NodeId| {
-            matches!(ast.get(i), Node::LocalVariableRead { name, .. } if name == root)
-        };
+        // The write collector: the region's writes of `root` and the nodes
+        // that refuse the whole test, in arena order, with every
+        // read-independent filter already applied by the index
+        // ([`ReachIndex::events`] — the region, the `->` skip, the inert and
+        // blocked carriers, the `when`/`in` extents, the guard shapes). A
+        // guard is a narrowing, not a binding, so the `->` skip does not
+        // apply to it — only the region does. A guard inside a `when`
+        // condition or an `in` pattern/guard is excluded for the same reason
+        // a write is: `case_when_scopes` narrows the SUBJECT local only, so
+        // `q.is_a?(C)` there types no `q` (rigor-rs#341) — and so is a guard
+        // recovered under a blocked wrapper position (rigor-rs#357).
         let mut writes: Vec<(rigor_parse::Span, LocalWrite)> = Vec::new();
-        for (_, n) in ast.iter() {
-            // A write under `defined?` / `END` / `BEGIN` never runs in sequence
-            // on the reference, so it contributes no value (rigor-rs#153).
-            if ast.in_inert_carrier(n.span()) {
-                continue;
-            }
-            match n {
-                Node::LocalVariableWrite { name, value, span, .. } if name == root => {
-                    // A read inside the write's own RHS runs before the
-                    // binding lands — `begin q = 1 rescue Float(q).w end`
-                    // lowers `q = (1 rescue Float(q).w)`, whose `q` reads
-                    // the PREVIOUS binding, not this write (rigor-rs#386).
-                    if in_region(*span)
-                        && dead.write_reaches(*span, use_span)
-                        && !closure_bound_elsewhere(ast, *span, root, use_span)
-                        && !contains(ast.get(*value).span(), use_span)
+        for event in idx.events(ast, region, skip_defs, root).iter() {
+            match event {
+                // A read inside the write's own RHS runs before the binding
+                // lands — `begin q = 1 rescue Float(q).w end` lowers `q = (1
+                // rescue Float(q).w)`, whose `q` reads the PREVIOUS binding,
+                // not this write (rigor-rs#386).
+                LocalEvent::Write { span, value_span, write } => {
+                    if dead.write_reaches(*span, use_span)
+                        && !idx.closure_bound_elsewhere(*span, root, use_span)
+                        && !contains(*value_span, use_span)
                     {
-                        writes.push((*span, LocalWrite::Plain(*value)));
+                        writes.push((*span, *write));
                     }
                 }
                 // A `for` index binds the element type, which this analysis
                 // cannot see into: decline (rigor-rs#151).
-                Node::Loop { index, .. }
-                    if index.iter().any(|(n, s)| {
-                        n == root && in_region(*s) && dead.write_reaches(*s, use_span)
-                    }) =>
-                {
-                    return (Reach::UNKNOWN, None);
+                LocalEvent::ForIndex(spans) => {
+                    if spans.iter().any(|&s| dead.write_reaches(s, use_span)) {
+                        return (Reach::UNKNOWN, None);
+                    }
                 }
-                Node::LocalVariableOpWrite { name, value, span }
-                    if name == root
-                        && in_region(*span)
-                        && dead.write_reaches(*span, use_span)
-                        && !closure_bound_elsewhere(ast, *span, root, use_span)
-                        && !contains(ast.get(*value).span(), use_span) =>
-                {
-                    writes.push((*span, LocalWrite::Op(*value)));
+                LocalEvent::RescueBinding(spans) => {
+                    if spans.iter().any(|&s| dead.write_reaches(s, use_span)) {
+                        return (Reach::OPAQUE, None);
+                    }
                 }
-                Node::MultiWrite { targets, value, span, .. }
-                    if in_region(*span)
-                        && dead.write_reaches(*span, use_span)
-                        && !closure_bound_elsewhere(ast, *span, root, use_span)
-                        && targets.bound_names().iter().any(|(n, _)| n == root)
-                        && !contains(ast.get(*value).span(), use_span) =>
-                {
-                    writes.push((*span, LocalWrite::Multi(*value)));
-                }
-                Node::BeginRescue { clauses, span, .. }
-                    if in_region(*span)
-                        && clauses.iter().any(|c| {
-                            c.bound_name.as_deref() == Some(root)
-                                && dead.write_reaches(c.span, use_span)
-                        }) =>
-                {
-                    return (Reach::OPAQUE, None);
-                }
-                Node::Call { receiver, method, args, span, .. }
-                    if skip_class_guards
-                        && guards_here(*span)
-                        && matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?")
-                        && receiver.is_some_and(reads_root)
-                        && matches!(args.as_slice(), [c] if matches!(ast.get(*c), Node::ConstantRead { .. })) => {}
-                Node::Call { receiver, method, args, span, .. }
-                    if guards_here(*span)
-                        && matches!(
-                            method.as_str(),
-                            "is_a?" | "kind_of?" | "instance_of?" | "==="
-                        )
-                        && (receiver.is_some_and(reads_root)
-                            || args.iter().copied().any(&reads_root)) =>
-                {
-                    return (Reach::OPAQUE, None);
-                }
-                Node::Case { predicate, span, .. }
-                    if guards_here(*span) && predicate.is_some_and(reads_root) =>
-                {
-                    return (Reach::OPAQUE, None);
-                }
-                _ => {}
+                LocalEvent::ExactGuard if skip_class_guards => {}
+                LocalEvent::ExactGuard | LocalEvent::Guard => return (Reach::OPAQUE, None),
             }
         }
         let is_target = |n: &Node| match n {
@@ -1001,60 +913,55 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
     ) -> Reach {
         let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-        let scope = self.class_ivar_scope(ast, use_span);
+        let idx = self.reach_index(ast);
+        let scope = idx.class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
         // rigor-rs#368 — same dead-position rule as `local_reach`, applied to
         // the class-body / top-level writes (a `def`-interior write is the
         // text-scanned census entry the reference's class-ivar index keeps).
         let dead = self.dead_positions(ast, seen);
-        let case_clauses = unevaluated_case_clause_spans(ast);
-        let in_case_clause =
-            |s: rigor_parse::Span| case_clauses.iter().any(|&c| c.0 <= s.0 && s.1 <= c.1);
-        let mut writes: Vec<(rigor_parse::Span, NodeId)> = Vec::new();
+        let in_case_clause = |s: rigor_parse::Span| idx.in_case_clause(s);
+        // The scan's node kinds come from the index (rigor-rs#422): a
+        // multi-assignment with an unnameable target refuses the whole test
+        // wherever it sits in the class body, so it is tested first.
+        if idx.multi_nonlocal.iter().any(|&s| scope.contains(s)) {
+            return Reach::OPAQUE;
+        }
+        // A `def`-body write is what the class-ivar table collects — a TEXT
+        // scan, so it sees a write inside a `when` condition too (`case v
+        // when (@x = 1; Integer) then …` inside a `def` fires on the
+        // reference) — while a class-body/top-level write binds only inside
+        // that same body, which a never-evaluated condition extent does not
+        // reach (rigor-rs#341), and neither does an extent recovered under a
+        // blocked wrapper position (rigor-rs#357).
+        let writes: Vec<(rigor_parse::Span, NodeId)> = idx
+            .ivar_writes(root)
+            .iter()
+            .copied()
+            .filter(|&(span, _)| {
+                scope.contains(span)
+                    && (scope.def_of(span).is_some()
+                        || (!use_in_def
+                            && !in_case_clause(span)
+                            && !ast.in_blocked_carrier(span)
+                            && dead.write_reaches(span, use_span)))
+            })
+            .collect();
         let mut def: Option<(rigor_parse::Span, NodeId)> = None;
         let mut loopy = false;
-        for (id, n) in ast.iter() {
-            match n {
-                Node::MultiWrite { targets, span, .. }
-                    if scope.contains(*span) && has_non_local_target(targets) =>
-                {
-                    return Reach::OPAQUE;
-                }
-                // A `def`-body write is what the class-ivar table collects —
-                // a TEXT scan, so it sees a write inside a `when` condition
-                // too (`case v when (@x = 1; Integer) then …` inside a `def`
-                // fires on the reference) — while a class-body/top-level
-                // write binds only inside that same body, which a
-                // never-evaluated condition extent does not reach
-                // (rigor-rs#341), and neither does an extent recovered
-                // under a blocked wrapper position (rigor-rs#357).
-                Node::InstanceVariableWrite { name, value, span, .. }
-                    if name == root
-                        && scope.contains(*span)
-                        && (scope.def_of(*span).is_some()
-                            || (!use_in_def
-                                && !in_case_clause(*span)
-                                && !ast.in_blocked_carrier(*span)
-                                && dead.write_reaches(*span, use_span))) =>
-                {
-                    writes.push((*span, *value));
-                }
-                Node::Definition { span, is_singleton_class: false, .. }
+        for s in &idx.scopes {
+            match s {
+                ScopeNode::Def { span, id, singleton_class: false }
                     if contains(*span, use_span)
                         && scope.contains(*span)
                         && def.is_none_or(|(d, _)| span.1 - span.0 < d.1 - d.0) =>
                 {
-                    def = Some((*span, id));
+                    def = Some((*span, *id));
                 }
-                Node::Loop { span, .. } if contains(*span, use_span) => loopy = true,
-                Node::Lambda { span, .. } if contains(*span, use_span) => loopy = true,
-                Node::Call { block_body, .. } if !block_body.is_empty() => {
-                    let lo = block_body.iter().map(|&b| ast.get(b).span().0).min();
-                    let hi = block_body.iter().map(|&b| ast.get(b).span().1).max();
-                    if let (Some(lo), Some(hi)) = (lo, hi) {
-                        loopy |= contains((lo, hi), use_span);
-                    }
+                ScopeNode::Loop { span } | ScopeNode::Lambda { span } => {
+                    loopy |= contains(*span, use_span);
                 }
+                ScopeNode::Block { extent, .. } => loopy |= contains(*extent, use_span),
                 _ => {}
             }
         }
@@ -1106,7 +1013,7 @@ impl<'i> Typer<'i> {
         use_span: rigor_parse::Span,
         seen: &mut Vec<String>,
     ) -> Reach {
-        let scope = self.class_ivar_scope(ast, use_span);
+        let scope = self.reach_index(ast).class_ivar_scope(ast, use_span);
         let use_in_def = scope.def_of(use_span).is_some();
         // rigor-rs#368 — same dead-position rule as `ivar_reach`.
         let dead = self.dead_positions(ast, seen);
@@ -1192,43 +1099,6 @@ impl<'i> Typer<'i> {
         }
         let prefix = self.enclosing_prefix(use_span);
         !self.constant_names_a_known_class(&self.resolve_constant_as_written(root, prefix))
-    }
-
-    /// The class/module body that owns an ivar or cvar read at `use_span`, as a
-    /// span plus the `def` spans inside it — the port of the reference's
-    /// "qualified prefix" keying. The innermost enclosing `ClassDef`/`ModuleDef`
-    /// wins, and a class NESTED inside it is a barrier (its ivars belong to its
-    /// own class, row i9). With no enclosing class the region is the whole file,
-    /// which is where a top-level `def`'s own `@x = …` still binds (row i6)
-    /// while a top-level class-body write does not reach it (row t2).
-    fn class_ivar_scope(&self, ast: &LoweredAst, use_span: rigor_parse::Span) -> IvarScope {
-        let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-        let mut region = ast.get(ast.root()).span();
-        let mut class_spans: Vec<rigor_parse::Span> = Vec::new();
-        for (_, n) in ast.iter() {
-            let span = match n {
-                Node::ClassDef { span, .. } | Node::ModuleDef { span, .. } => *span,
-                _ => continue,
-            };
-            class_spans.push(span);
-            if contains(span, use_span) && span.1 - span.0 < region.1 - region.0 {
-                region = span;
-            }
-        }
-        let barriers: Vec<rigor_parse::Span> = class_spans
-            .into_iter()
-            .filter(|&c| contains(region, c) && c != region)
-            .collect();
-        let defs: Vec<(rigor_parse::Span, Option<String>)> = ast
-            .iter()
-            .filter_map(|(_, n)| match n {
-                Node::Definition { span, name, .. } if contains(region, *span) => {
-                    Some((*span, name.clone()))
-                }
-                _ => None,
-            })
-            .collect();
-        IvarScope { region, barriers, defs }
     }
 }
 
@@ -1369,17 +1239,6 @@ impl Reach {
     }
 }
 
-/// One write of a local, as [`Typer::local_reach`] collects them.
-#[derive(Debug, Clone, Copy)]
-enum LocalWrite {
-    /// `x = v`.
-    Plain(NodeId),
-    /// `x op= v` — keeps the old value on some path, so it never cuts one off.
-    Op(NodeId),
-    /// `a, x = v` — the right-hand side.
-    Multi(NodeId),
-}
-
 /// The span of the LAST statement on `use_span`'s statement path that
 /// DEFINITELY assigns the variable `is_target` recognises — the flow cut of
 /// [`Typer::local_reach`] and [`Typer::ivar_reach`].
@@ -1411,9 +1270,9 @@ impl<'i> Typer<'i> {
     // scope-evaluated ([`unevaluated_case_clause_spans`]), so for a read
     // inside one the statement path ends at the `case` — descending into
     // the clause's own `Statements` would mint a definite assignment out
-    // of a write that never binds (rigor-rs#341).
-    let case_clauses = unevaluated_case_clause_spans(ast);
-    let in_case_clause = |s: rigor_parse::Span| case_clauses.iter().any(|&c| contains(c, s));
+    // of a write that never binds (rigor-rs#341). The index holds those
+    // extents; the nested-section scan below excludes them.
+    let idx = self.reach_index(ast);
     let mut kill = None;
     let mut body: &[NodeId] = body;
     for _ in 0..64 {
@@ -1421,7 +1280,7 @@ impl<'i> Typer<'i> {
             break;
         };
         for &s in &body[..pos] {
-            if self.definitely_assigns(ast, s, is_target, &case_clauses, dead, seen) {
+            if self.definitely_assigns(ast, s, is_target, &idx, dead, seen) {
                 kill = Some(ast.get(s).span());
             }
         }
@@ -1433,31 +1292,12 @@ impl<'i> Typer<'i> {
         // hold a cut. A `->` between the statement and the read stops the
         // walk — its writes never bind (rows r11/p13).
         let stmt = body[pos];
+        // The nested node is a syntax-only answer per (statement, read), so
+        // the index memoizes it ([`ReachIndex::nested_section_owner`]).
         let next: Option<&[NodeId]> =
             statement_sections(ast, stmt).into_iter().find(|b| holds(b)).or_else(|| {
-                let outer = ast.get(stmt).span();
-                let mut best: Option<(rigor_parse::Span, &[NodeId])> = None;
-                for (id, n) in ast.iter() {
-                    let sp = n.span();
-                    if id == stmt
-                        || !contains(outer, sp)
-                        || !contains(sp, use_span)
-                        || in_case_clause(sp)
-                        || ast.in_blocked_carrier(sp)
-                    {
-                        continue;
-                    }
-                    if matches!(n, Node::Lambda { .. }) {
-                        return None;
-                    }
-                    if best.is_some_and(|(b, _)| sp.1 - sp.0 <= b.1 - b.0) {
-                        continue;
-                    }
-                    if let Some(section) = statement_sections(ast, id).into_iter().find(|b| holds(b)) {
-                        best = Some((sp, section));
-                    }
-                }
-                best.map(|(_, section)| section)
+                let owner = idx.nested_section_owner(ast, stmt, use_span)?;
+                statement_sections(ast, owner).into_iter().find(|b| holds(b))
             });
         match next {
             Some(b) => body = b,
@@ -1472,7 +1312,7 @@ impl<'i> Typer<'i> {
 /// bodies and `else`, a loop body, a `begin`'s body / `ensure` / `rescue`
 /// clauses, a block body, a parenthesised sequence. A `->` body is not one
 /// (see [`latest_definite_assignment`]), nor is a nested `def`'s.
-fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
+pub(crate) fn statement_sections(ast: &LoweredAst, id: NodeId) -> Vec<&[NodeId]> {
     match ast.get(id) {
         Node::If { then_body, else_body, .. } => vec![then_body, else_body],
         Node::Case { branches, else_body, .. } => branches
@@ -1519,7 +1359,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         is_target: &dyn Fn(&Node) -> bool,
-        case_clauses: &[rigor_parse::Span],
+        idx: &ReachIndex,
         dead: &DeadPositions,
         seen: &mut Vec<String>,
     ) -> bool {
@@ -1531,12 +1371,7 @@ impl<'i> Typer<'i> {
     // one recovered under a blocked wrapper position (a modifier rescue's
     // flattened `case` — rigor-rs#357) or one inside a folded-dead arm
     // (rigor-rs#368).
-    if case_clauses
-        .iter()
-        .any(|&c| c.0 <= span.0 && span.1 <= c.1)
-        || ast.in_blocked_carrier(span)
-        || dead.covers(span)
-    {
+    if idx.in_case_clause(span) || idx.in_blocked_carrier(ast, span) || dead.covers(span) {
         return false;
     }
     if is_target(node) {
@@ -1544,7 +1379,7 @@ impl<'i> Typer<'i> {
     }
     match node {
         Node::If { predicate, then_body, else_body, is_unless, .. } => {
-            self.definitely_assigns(ast, *predicate, is_target, case_clauses, dead, seen)
+            self.definitely_assigns(ast, *predicate, is_target, idx, dead, seen)
                 || match self.expr_truthiness(ast, *predicate, seen) {
                     // The fold keeps one arm (`live_branch_for_if`) — only it
                     // can definitely assign.
@@ -1556,25 +1391,25 @@ impl<'i> Typer<'i> {
                             else_body
                         },
                         is_target,
-                        case_clauses,
+                        idx,
                         dead,
                         seen,
                     ),
                     None => {
-                        self.arm_assigns(ast, then_body, is_target, case_clauses, dead, seen)
+                        self.arm_assigns(ast, then_body, is_target, idx, dead, seen)
                             && self
-                                .arm_assigns(ast, else_body, is_target, case_clauses, dead, seen)
+                                .arm_assigns(ast, else_body, is_target, idx, dead, seen)
                     }
                 }
         }
         Node::Case { predicate, branches, else_body, .. } => {
             predicate.is_some_and(|p| {
-                self.definitely_assigns(ast, p, is_target, case_clauses, dead, seen)
+                self.definitely_assigns(ast, p, is_target, idx, dead, seen)
             }) || (!else_body.is_empty()
-                && self.arm_assigns(ast, else_body, is_target, case_clauses, dead, seen)
+                && self.arm_assigns(ast, else_body, is_target, idx, dead, seen)
                 && branches.iter().all(|&w| match ast.get(w) {
                     Node::When { body, .. } => {
-                        self.arm_assigns(ast, body, is_target, case_clauses, dead, seen)
+                        self.arm_assigns(ast, body, is_target, idx, dead, seen)
                     }
                     _ => false,
                 }))
@@ -1584,13 +1419,13 @@ impl<'i> Typer<'i> {
         // never runs in sequence (rigor-rs#153).
         Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
             body.iter()
-                .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+                .any(|&s| self.definitely_assigns(ast, s, is_target, idx, dead, seen))
         }
         // A clause-less `begin` — which is also the carrier an `if`'s `else`
         // clause lowers to — runs its body to the end.
         Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
             body.iter()
-                .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+                .any(|&s| self.definitely_assigns(ast, s, is_target, idx, dead, seen))
         }
         _ => false,
     }
@@ -1603,12 +1438,12 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         b: &[NodeId],
         is_target: &dyn Fn(&Node) -> bool,
-        case_clauses: &[rigor_parse::Span],
+        idx: &ReachIndex,
         dead: &DeadPositions,
         seen: &mut Vec<String>,
     ) -> bool {
         b.iter()
-            .any(|&s| self.definitely_assigns(ast, s, is_target, case_clauses, dead, seen))
+            .any(|&s| self.definitely_assigns(ast, s, is_target, idx, dead, seen))
             || self.arm_exits(ast, b, seen)
     }
 }
@@ -1706,7 +1541,7 @@ fn untyped_expr_root(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<Untyped
 /// literal block, a `->` body). Every closure inside `boundary` is unentered
 /// — nested operand positions (`f(g { … })`, `h = [xs.map { … }]`) mark
 /// every ancestor they pass through.
-fn unrecorded_closure(
+pub(crate) fn unrecorded_closure(
     ast: &LoweredAst,
     use_span: rigor_parse::Span,
 ) -> Option<(NodeId, rigor_parse::Span)> {
@@ -1807,7 +1642,7 @@ fn pinned_scalar_reach(scalar: &Scalar) -> Reach {
 /// minted `Float` (rigor-rs#341 — the [`edge_evaluates`] `when`-pattern
 /// exclusion's sibling hole). A `case` SUBJECT's own span is not one:
 /// the predicate IS sub-evaled.
-fn unevaluated_case_clause_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+pub(crate) fn unevaluated_case_clause_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
     let mut unmodeled: Vec<rigor_parse::Span> = Vec::new();
     let mut branches: Vec<NodeId> = Vec::new();
     for (_, n) in ast.iter() {
@@ -1832,32 +1667,6 @@ fn unevaluated_case_clause_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
         }
     }
     out
-}
-
-/// Whether `name` is bound by a literal block / `->` that contains `span`
-/// but NOT `use_span` — a parameter, `;`-local or body-introduced local
-/// (Prism's `BlockNode#locals`, which a captured outer local never joins).
-/// A write to it rebinds THAT closure's scope only, so it cannot reach a
-/// read outside the block: `xs.each { |x| x = 1 }` leaves a top-level `x`
-/// untouched, and `x` inside one `lambda`'s body is a different variable
-/// from `x` inside a sibling's. The write-collectors of [`Typer::local_reach`]
-/// skip such writes, the cross-closure bleed that otherwise minted a precise
-/// value for a name the reference reads as `Dynamic[top]`.
-fn closure_bound_elsewhere(
-    ast: &LoweredAst,
-    span: rigor_parse::Span,
-    name: &str,
-    use_span: rigor_parse::Span,
-) -> bool {
-    let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-    ast.iter().any(|(_, n)| {
-        let (extent, locals) = match n {
-            Node::Lambda { span: s, locals, .. } => (*s, locals),
-            Node::Call { block_span: Some(b), block_locals, .. } => (*b, block_locals),
-            _ => return false,
-        };
-        contains(extent, span) && !contains(extent, use_span) && locals.iter().any(|l| l == name)
-    })
 }
 
 /// Whether `child_span`'s subtree is reached by a scope-recording evaluation
@@ -1926,7 +1735,7 @@ fn edge_evaluates(ast: &LoweredAst, parent: NodeId, child_span: rigor_parse::Spa
 /// `proc { }` and `Proc.new { }`. Every other block (`each`, `map`, a project
 /// method's) has its parameters typed from the RBS yield instead, so its
 /// parameter is NOT reference-untyped (rows r9/r10/m11, which fire).
-fn proc_like_block(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
+pub(crate) fn proc_like_block(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
     match receiver {
         None => matches!(method, "lambda" | "proc"),
         Some(r) => {
@@ -1943,7 +1752,7 @@ fn proc_like_block(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> 
 /// constant, index or attribute target ([`rigor_parse::MultiTarget::Ignored`]).
 /// The reference's `record_multi_write_ivars` DOES collect an ivar target
 /// (row i5 fires), so an unnameable slot refuses the ivar test outright.
-fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
+pub(crate) fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
     fn any_ignored(t: &rigor_parse::MultiTarget) -> bool {
         match t {
             rigor_parse::MultiTarget::Ignored { .. }
@@ -1958,16 +1767,16 @@ fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool {
 }
 
 /// The class/module body an ivar or cvar read belongs to, resolved once per
-/// test by [`Typer::class_ivar_scope`].
-struct IvarScope {
+/// read span by [`ReachIndex::class_ivar_scope`](crate::reach_index::ReachIndex::class_ivar_scope).
+pub(crate) struct IvarScope {
     /// The innermost enclosing `ClassDef`/`ModuleDef` span, or the whole file.
-    region: rigor_parse::Span,
+    pub(crate) region: rigor_parse::Span,
     /// Class/module bodies NESTED inside `region` — barriers, because their
     /// ivars belong to their own class (row i9).
-    barriers: Vec<rigor_parse::Span>,
+    pub(crate) barriers: Vec<rigor_parse::Span>,
     /// Every `def` inside `region`, with its name (`initialize` is the
     /// read-before-write nil exemption).
-    defs: Vec<(rigor_parse::Span, Option<String>)>,
+    pub(crate) defs: Vec<(rigor_parse::Span, Option<String>)>,
 }
 
 impl IvarScope {
