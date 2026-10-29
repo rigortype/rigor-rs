@@ -69,6 +69,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 >1,600 s → 0.2 s, all 16,623 gem files ~10 s. Not decline-only (#442). 0 FP / 9,435; → #441–#443. [note](notes/20261030-fanout-cap-436.md)
 - **2026-10-30 #422 CLOSED** (stack #434 = PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; 10 of 12 slow gem files → <7 s (lexer-F0/F1 → #436), output byte-identical. 0 FP / 9,435; → #435–#439. [note](notes/20261030-reach-memo-422.md)
 - **2026-10-28 #412 CLOSED** (PR #426): 256 MiB analysis stacks + a 25,000-edge nesting bound (deeper files "skipped", `internal-error`); the reference aborts (rigor#2455). 0 FP / 9,435; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
 - **2026-09-30 #309 CLOSED** (PR #333): rescue-carrier post-scope join in coll snapshots + literal-arm evidence. 0 FP; → #337–#339. [note](notes/20260930-issue-309-rescue-snapshot.md)
@@ -90,9 +91,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-10-10 #380 CLOSED** (PR #389): `Loop`/`Case`/`When`-body/`begin` else-ensure descend to the site's deferred body; `preserve_env` skips the `flow.env` capture. 0 FP / 815; → #390. [note](notes/20261010-i380-nondescending-containers.md)
 - **2026-10-10 #388 CLOSED** (PR #391): `[]=` at content write-back positions (Barrier bodies, `while`/`until`) drops all rooted indexed records. 0 FP / 815; → #392/#393. [note](notes/20261010-i388-block-index-opwrite.md)
 - **2026-10-14 #382 CLOSED** (PR #394): param class rejection gates on host-resolvable arg class (generated 1769-name table); `Numeric→Integer` gap closed. 0 FP / 815; → #395/#396. [note](notes/20261014-i382-hostresolvable-arg-class.md)
-- **2026-10-14 #386 CLOSED** (PR #397): dead-position reach — rescue entry scope (loop back-edge exception), `stmt_exits` Bot half, `Const.m` arm fold, block-interior reach + nil-inject seed, write-predicate fold; top-level `class <<` sites. 0 FP / 9,337; → #398/#399. [note](notes/20261014-i386-dead-position-leaks.md)
-- **2026-10-14 #381 CLOSED** (PR #400): `closure_mutations` gains `toplevel_mutations`' `in_inert_carrier` retain — `END`/`BEGIN`/`defined?`/`super`/`yield` attr writes inside blocks stop dropping indexed records. 0 FP / 9,337; → #401/#402. [note](notes/20261014-i381-inert-carrier-attr-writes.md)
-- **2026-10-14 #362 CLOSED** (PR #403): `blocked` (never-evaluated) vs `discarded` (evaluated, join-dropped) split — `discarded_spans` + `write_reaches` relative rule; sequential `bind_check_statement` replay in `entry_descend`. 0 FP / 9,337. [note](notes/20261014-i362-discarded-arm-attr-writes.md)
+- **2026-10-14 #386 CLOSED** (PR #397): dead-position reach leaks (rescue entry scope, `stmt_exits` Bot half, `Const.m` fold, block interiors, `class <<`). 0 FP / 9,337; → #398/#399. [note](notes/20261014-i386-dead-position-leaks.md)
+- **2026-10-14 #381 CLOSED** (PR #400): `closure_mutations` gains the `in_inert_carrier` retain (inert-carrier attr writes in blocks keep indexed records). 0 FP / 9,337; → #401/#402. [note](notes/20261014-i381-inert-carrier-attr-writes.md)
+- **2026-10-14 #362 CLOSED** (PR #403): `blocked` vs `discarded` split (`discarded_spans`, `write_reaches` relative rule). 0 FP / 9,337. [note](notes/20261014-i362-discarded-arm-attr-writes.md)
 - **2026-10-14 #363 CLOSED** (PR #404): break-arg attr mutations invisible past `join_break_scopes` locals-only join — `lexical_loop` + `locals_only`/`bare_locals_only`/`iterated_body_spans`. 0 FP; → #406–#408. [note](notes/20261014-i363-break-arg-scope.md)
 - **2026-09-30 #332 CLOSED** (PR #334): pin-value threading (`local_reach` → `(Reach, Option<Scalar>)`); nominal multi-arg + `when`-pattern FPs. 0 FP / 818; → #340/#341. [note](notes/20260930-issue-332-multi-arg.md)
 - **2026-09-30 #312 CLOSED** (PR #324): recovery collector models `joined`/`blocked`/loop-writeback marks — index writes widen where the reference joins. 0 FP; → #325. [note](notes/20260930-issue-312-recovery.md)
