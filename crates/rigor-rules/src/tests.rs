@@ -4371,3 +4371,48 @@ fn issue_368_live_position_writes_still_witness_end_to_end() {
         );
     }
 }
+
+/// rigor-rs#436 — the reaching-write fan-out cap (`MAX_REACHING_WRITES`,
+/// 256). The reference fires on every row below. The port keeps firing while
+/// at most 256 writes of `v` reach the read, and declines from 257 on.
+#[test]
+fn issue_436_reaching_write_cap_boundary() {
+    fn undefined(src: &str) -> Vec<String> {
+        run(src.as_bytes())
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    }
+    // One plain write plus `n` conditional ones: `n + 1` reaching writes.
+    let fan_def = |n: usize| {
+        format!("def f(c)\n  v = 1\n{}  \"abc\"[v].zz\nend\n", "  v = 1 if c\n".repeat(n))
+    };
+    let fan_top =
+        |n: usize| format!("v = 1\n{}\"abc\"[v].zz\n", "v = 1 if rand > 0.5\n".repeat(n));
+    for (shape, fan) in [("def", &fan_def as &dyn Fn(usize) -> String), ("top", &fan_top)] {
+        assert_eq!(undefined(&fan(255)).len(), 1, "{shape}: 256 writes must still fire");
+        assert!(undefined(&fan(256)).is_empty(), "{shape}: 257 writes must decline");
+    }
+    // Only writes that pass `dead.write_reaches` count. 300 writes in a
+    // rescue arm ending in `raise`, or under a folded-dead `if t`, are
+    // collector events that never reach the read after them, which still
+    // sees one write and fires. (A literal `if false` arm is no test: its
+    // writes are not collector events at all.)
+    let writes = "    v = 2\n".repeat(300);
+    let read = "  \"abc\"[v].zz\nend\n";
+    let rescue_dead =
+        format!("def f(c)\n  v = 1\n  begin\n    c.g\n  rescue\n{writes}    raise\n  end\n{read}");
+    let fold_dead = format!("def f(c)\n  v = 1\n  t = nil\n  if t\n{writes}  end\n{read}");
+    for (shape, src) in [("rescue", &rescue_dead), ("fold", &fold_dead)] {
+        assert_eq!(undefined(src).len(), 1, "{shape}: dead writes must not count");
+    }
+    // A class guard answers inside the event loop, before the cap: past 256
+    // writes `v` is still a `String` after the guard, so `Float(v)` types and
+    // `.zz` fires `for Float`, as on the reference.
+    let guard = format!(
+        "def f(c)\n  v = c\n{}  return unless v.is_a?(String)\n  Float(v).zz\nend\n",
+        "  v = 1 if c\n".repeat(300)
+    );
+    assert_eq!(undefined(&guard), ["undefined method `zz' for Float"]);
+}
