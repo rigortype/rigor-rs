@@ -40,9 +40,11 @@ use crate::Typer;
 /// 256 clears every file but the two lexers, which then check in under a
 /// second. It does NOT bound the walk below it: one local with W
 /// conditional self-rewrites in a loop still costs about W^4 (W = 96 takes
-/// a minute). A decline only withholds a diagnostic, so the cap can cost
-/// coverage but never mint one. It is a `const` and not configuration, so
-/// the output never depends on the environment.
+/// a minute; rigor-rs#441). The cap is not purely a decline: a capped
+/// top-level `if` predicate stops folding, so an arm the reference treats as
+/// dead goes live without its narrowing (rigor-rs#442), and the skipped walk
+/// moves a predicate fold's first visit (rigor-rs#437). It is a `const` and
+/// not configuration, so the output never depends on the environment.
 const MAX_REACHING_WRITES: usize = 256;
 
 impl<'i> Typer<'i> {
