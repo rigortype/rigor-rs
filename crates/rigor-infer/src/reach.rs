@@ -11,6 +11,36 @@ use crate::folding;
 use crate::reach_index::{LocalEvent, LocalWrite, ReachIndex, ScopeNode};
 use crate::Typer;
 
+/// The most writes of one local that may reach a read before
+/// [`Typer::local_reach`] gives up and answers [`Reach::UNKNOWN`]
+/// (rigor-rs#436).
+///
+/// The reference has no backward walk to bound: it types a read with one
+/// forward pass and a 3-pass loop fixpoint. Its rule for an unbounded join is
+/// a budget that returns the gradual floor, never a fabricated precise type
+/// (`docs/type-specification/inference-budgets.md`, cf. `union_size`, range
+/// 4–256). This is that budget for the port's walk, which re-enters every
+/// reaching write's value and costs about W^4 in the fan-out W. Generated
+/// state machines are the outliers: parser's `lexer-F0.rb` / `lexer-F1.rb`
+/// rewrite `p` hundreds of times inside one `while true` and ran for more
+/// than 1,600 s each.
+///
+/// W counts the writes that survive the read-dependent filters
+/// (`dead.write_reaches`, the closure test, the own-RHS test), before the
+/// definite-assignment cut. Its maximum, measured uncapped at `3beeed5`:
+///
+/// | set | max W | where |
+/// |---|---|---|
+/// | standing sweep, 8 corpora | 35 | mail `address_lists_parser.rb` |
+/// | the 16,621 other gem files | 176 | rdoc `markdown.rb` (×3 versions) |
+/// | parser `lexer-F0.rb` / `lexer-F1.rb` | ≥ 324 / 691 | `advance`'s `p` |
+///
+/// 256 clears every file but the two lexers, which then check in under a
+/// second. A decline only withholds a diagnostic, so the cap can cost
+/// coverage but never mint one. It is a `const` and not configuration, so
+/// the output never depends on the environment.
+const MAX_REACHING_WRITES: usize = 256;
+
 impl<'i> Typer<'i> {
     /// What can the REFERENCE's type for this argument expression hold? — the
     /// gate of the #521 / #1021 declines (see [`Typer::type_implicit_self_call`]
@@ -532,6 +562,9 @@ impl<'i> Typer<'i> {
     /// early return carries `None` — and is only meaningful to callers beside
     /// the returned [`Reach`] (see [`Typer::expr_scalar`]).
     ///
+    /// More than [`MAX_REACHING_WRITES`] reaching writes answer
+    /// [`Reach::UNKNOWN`] (rigor-rs#436).
+    ///
     /// Callers go through the memoizing [`Typer::local_reach`]
     /// (rigor-rs#422, `reach_memo.rs`).
     pub(crate) fn local_reach_uncached(
@@ -758,6 +791,14 @@ impl<'i> Typer<'i> {
                 LocalEvent::ExactGuard if skip_class_guards => {}
                 LocalEvent::ExactGuard | LocalEvent::Guard => return (Reach::OPAQUE, None),
             }
+        }
+        // The fan-out budget (rigor-rs#436): past `MAX_REACHING_WRITES`
+        // surviving writes the read is the gradual floor. It sits after the
+        // collector, so the `for`-index, rescue-binding and guard returns
+        // above keep their answers, and it counts the writes before the
+        // definite-assignment cut below drops the earlier ones.
+        if writes.len() > MAX_REACHING_WRITES {
+            return (Reach::UNKNOWN, None);
         }
         let is_target = |n: &Node| match n {
             Node::LocalVariableWrite { name, .. } => name == root,
