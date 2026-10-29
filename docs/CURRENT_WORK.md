@@ -69,6 +69,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-10-30 #422 CLOSED** (stack #434 = PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; 10 of 12 slow gem files → <7 s (lexer-F0/F1 → #436), output byte-identical. 0 FP / 9,435; → #435–#439. [note](notes/20261030-reach-memo-422.md)
 - **2026-10-28 #412 CLOSED** (PR #426): 256 MiB analysis stacks + a 25,000-edge nesting bound (deeper files "skipped", `internal-error`); the reference aborts (rigor#2455). 0 FP / 9,435; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
 - **2026-09-30 #309 CLOSED** (PR #333): rescue-carrier post-scope join in coll snapshots + literal-arm evidence. 0 FP; → #337–#339. [note](notes/20260930-issue-309-rescue-snapshot.md)
 - **2026-09-30 #325 CLOSED** (PR #336): `IndexedFlow` stored-slot narrowing — `h[k] ||= v` records reach `h[k]` reads. 0 FP; → #342–#344. [note](notes/20260930-issue-325-slot-narrowing.md)
@@ -111,12 +112,12 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-28 #199 CLOSED** (PR #281): list config keys via `Array().map(&:to_s)` — scalar keeps entries, `signature_paths: ~` keeps nil→default. 0 FP. [note](notes/20260928-issue-199-scalar-list-keys.md)
 - **Splits** #204/#234/#258/#260/#279/#416/#418/#420: infer lib 14,084→144, rules 4,497→95; ast 3,756→80; source_index 4,650→668; lower_node→5 files (gh-stack). [note](notes/20261027-lower-node-family-split.md)
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review met the deepest infer file; branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`). [note](notes/20260927-abandoned-infer-pr-stream.md).
-- **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once — nominal self slot, `arm_of`/`join` auto-splat, reopen-aware union answering (`Node::Alias` + ancestor walk), `paths:` widen = `expand(paths|argv)>files` + excludes + undecidable-decline. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
+- **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
 - **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver (`declaration_prefix` re-anchoring). **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
 - **2026-09-26 #166 CLOSED** (PR #174): block/lambda params shadow toplevel locals — bound set = Prism `locals`; membership structural not span. 0 FP; fx 116b. [note](notes/20260926-issue-166-block-param-shadow.md).
 - **2026-09-26 #165 CLOSED** (PR #175): `wrong-arity` declines on splat/kwarg/`...`; `&b`→#176. 0 FP; fx 116. [note](notes/20260926-issue-165-splat-arity.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families; **0 FP / 9,337**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
-- **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind (`Inert` = `defined?`/`END`/`BEGIN`/`super`/`yield`, writes dropped; `Recovered` widens); `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. [note](notes/20260925-issues-151-153-binder-writes.md).
+- **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind; `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. [note](notes/20260925-issues-151-153-binder-writes.md).
 - **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
 - **2026-09-25 #133 CLOSED by a decline** (PR #148): the flat top-level binder never saw a nested rebind; rules now widen such locals, Dynamic-only gates keep the old env. **0 FP / 9,337, = master**; fixture 112 7→0 FPs. → #152. [note](notes/20260925-issue-133-jump-path-rebind.md).
 - **2026-09-25 re-pin `v0.3.9 → e59b7b89` (master, 1,030 commits)**: **0 FP / 9,337, 111 fixtures**, effects 0 OVER. Raw bump: 8 fixture + 9 sweep FPs (#1021 `imprecise_arg?` → reach analysis; `fb781023` unported = +3,002 gaps, #141); re-synced `core_overlay/`, plugin sig, mutator sets; 10 invisible retractions (#133–#138). [note](notes/20260925-repin-e59b7b89.md).
