@@ -25,18 +25,22 @@ use crate::Typer;
 /// rewrite `p` hundreds of times inside one `while true` and ran for more
 /// than 1,600 s each.
 ///
-/// W counts the writes that survive the read-dependent filters
-/// (`dead.write_reaches`, the closure test, the own-RHS test), before the
-/// definite-assignment cut. Its maximum, measured uncapped at `3beeed5`:
+/// W counts the writes that survive the collector's read-dependent filters
+/// (`dead.write_reaches`, the closure test, the own-RHS test). The writes the
+/// later cuts drop (before a definite assignment, or after the read outside
+/// a loop) still count. Its maximum per file set, measured at the cap site:
 ///
 /// | set | max W | where |
 /// |---|---|---|
-/// | standing sweep, 8 corpora | 35 | mail `address_lists_parser.rb` |
+/// | standing sweep, 8 corpora | 176 | mail's vendored rdoc `markdown.rb` |
+/// | … without vendored rdoc | 35 | mail `address_lists_parser.rb` |
 /// | the 16,621 other gem files | 176 | rdoc `markdown.rb` (×3 versions) |
-/// | parser `lexer-F0.rb` / `lexer-F1.rb` | ≥ 324 / 691 | `advance`'s `p` |
+/// | parser `lexer-F0.rb` / `lexer-F1.rb` | ≥ 437 / ≥ 691 | `advance`'s `p` |
 ///
 /// 256 clears every file but the two lexers, which then check in under a
-/// second. A decline only withholds a diagnostic, so the cap can cost
+/// second. It does NOT bound the walk below it: one local with W
+/// conditional self-rewrites in a loop still costs about W^4 (W = 96 takes
+/// a minute). A decline only withholds a diagnostic, so the cap can cost
 /// coverage but never mint one. It is a `const` and not configuration, so
 /// the output never depends on the environment.
 const MAX_REACHING_WRITES: usize = 256;
