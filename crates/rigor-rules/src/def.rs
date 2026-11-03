@@ -350,6 +350,18 @@ pub(crate) fn ivar_write_mismatch_diagnostics(
             if other_class == "NilClass" || *other_class == first_class {
                 continue; // clear-to-nil idiom / same class ⇒ silent.
             }
+            // Upstream v0.4.2 (#1662): the class's RBS declaration of the ivar
+            // (`@x: T` or an `attr_*` slot, own or inherited) admits both
+            // writes ⇒ the union is the author's intent. Acceptance is
+            // conservative-true (an unprovable rejection admits), so this only
+            // ever declines more.
+            if let Some(declared) = index.ivar_declared_type(class_name, ivar_name) {
+                if index.param_accepts_arg_class(&declared, &first_class)
+                    && index.param_accepts_arg_class(&declared, other_class)
+                {
+                    continue;
+                }
+            }
             let w = &writes[i];
             out.push(Diagnostic {
                 rule_id: DEF_IVAR_WRITE_MISMATCH,

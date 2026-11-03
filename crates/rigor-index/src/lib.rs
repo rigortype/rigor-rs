@@ -574,6 +574,12 @@ impl CoreIndex {
         self.data.param_admits_nil(t)
     }
 
+    /// Upstream v0.4.2 (#1662): the RBS-declared type of an instance variable,
+    /// own or inherited. See `CoreData::ivar_declared_type`.
+    pub fn ivar_declared_type(&self, class_name: &str, ivar: &str) -> Option<RetainedParamType> {
+        self.data.ivar_declared_type(class_name, ivar)
+    }
+
     /// Whether an RBS parameter type provably accepts a (non-nil) argument of
     /// class `arg_class` (conservative-true; only a proven rejection returns
     /// `false`). Resolves `type` aliases / interfaces — used by the MULTI-overload

@@ -548,6 +548,13 @@ struct ClassEntry {
     attr_methods: HashSet<&'static str>,
     /// The SINGLETON twin of [`Self::attr_methods`] (`attr_reader self.x`).
     singleton_attr_methods: HashSet<&'static str>,
+    /// Upstream v0.4.2 (#1662): the instance variables this declaration
+    /// types — an `@x: T` member, or the slot a non-singleton `attr_*` member
+    /// implies (`@name`, unless it names another or none) — for
+    /// `def.ivar-write-mismatch`'s "the declaration admits both writes"
+    /// silence. The key `*` stands for an `attr_*` whose `(@ivar)` the port
+    /// does not resolve (it types an ivar the port cannot name).
+    ivar_types: HashMap<&'static str, RetainedParamType>,
     /// `method name -> per-overload positional shapes`, the ATM substrate
     /// (Slice 1). ADDITIVE alongside `methods`: the merged arity/return path
     /// above is untouched; this retains the per-overload, per-parameter detail
@@ -3268,6 +3275,28 @@ impl CoreData {
     /// - `Union` ⇒ ANY member accepting accepts.
     /// - `Optional` / `Variable` / `Tuple` / `Other` ⇒ accept conservatively
     ///   (the reference `else`).
+    /// Upstream v0.4.2 (#1662): the RBS-declared type of instance variable
+    /// `ivar` on `class_name` — an `@x: T` member or an `attr_*` slot, own
+    /// (qualified entry first) or on an ancestor. An attribute whose `(@ivar)`
+    /// the port does not resolve answers `Other` (admits everything).
+    pub fn ivar_declared_type(&self, class_name: &str, ivar: &str) -> Option<RetainedParamType> {
+        let pick = |e: &ClassEntry| {
+            e.ivar_types
+                .get(ivar)
+                .or_else(|| e.ivar_types.get("*"))
+                .cloned()
+        };
+        if let Some(t) = self.qualified.get(class_name).and_then(pick) {
+            return Some(t);
+        }
+        let short = class_name.rsplit("::").next().unwrap_or(class_name);
+        if !self.classes.contains_key(short) {
+            return None;
+        }
+        let (chain, _) = self.ancestors(short);
+        chain.iter().find_map(|a| self.classes.get(a).and_then(pick))
+    }
+
     pub fn param_accepts_arg_class(&self, t: &RetainedParamType, arg_class: &str) -> bool {
         self.param_accepts_arg_class_depth(t, arg_class, 0)
     }
@@ -3632,6 +3661,7 @@ impl CoreData {
                     // The stub declares no attribute members.
                     attr_methods: HashSet::new(),
                     singleton_attr_methods: HashSet::new(),
+                    ivar_types: HashMap::new(),
                     // The stub models no per-overload param shapes (the ATM
                     // substrate needs the real embedded RBS); empty keeps the
                     // `method_overloads` accessor inert under the fallback.
@@ -4317,6 +4347,25 @@ impl Builder {
         }
     }
 
+    /// Upstream v0.4.2 (#1662): the ivar slot a non-singleton attribute
+    /// member types (see [`ClassEntry::ivar_types`]).
+    fn record_attr_ivar(
+        entry: &mut ClassEntry,
+        name: &str,
+        ivar: ruby_rbs::node::AttrIvarName,
+        ty: &Node,
+        code: &str,
+        ctx: Option<&FileSigCtx>,
+    ) {
+        let key = match ivar {
+            ruby_rbs::node::AttrIvarName::Unspecified => intern(&format!("@{name}")),
+            ruby_rbs::node::AttrIvarName::Empty => return,
+            ruby_rbs::node::AttrIvarName::Name(_) => "*",
+        };
+        let ty = retained_param_type(ty, code, ctx);
+        entry.ivar_types.entry(key).or_insert(ty);
+    }
+
     /// Issue #168: record the collected member-level type references on
     /// `entry`, deduplicated — see [`ClassEntry::referenced_type_names`].
     fn record_ref_names(entry: &mut ClassEntry, names: impl IntoIterator<Item = &'static str>) {
@@ -4487,6 +4536,9 @@ impl Builder {
                 // `x=`, an accessor both; `kind()` splits instance from
                 // singleton (`attr_reader self.x`).
                 Node::AttrReader(a) => {
+                    if a.kind() != AttributeKind::Singleton {
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx);
+                    }
                     // Issue #168: a non-singleton attribute's TYPE is a
                     // member-level reference (`kind == :singleton` stands it
                     // down, exactly like `def self.x`).
@@ -4500,6 +4552,9 @@ impl Builder {
                 }
                 Node::AttrWriter(a) => {
                     if a.kind() != AttributeKind::Singleton {
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx);
+                    }
+                    if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
                         collect_type_node_names(&a.type_(), ctx, &mut names);
                         Self::record_ref_names(entry, names);
@@ -4509,12 +4564,19 @@ impl Builder {
                 }
                 Node::AttrAccessor(a) => {
                     if a.kind() != AttributeKind::Singleton {
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx);
+                    }
+                    if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
                         collect_type_node_names(&a.type_(), ctx, &mut names);
                         Self::record_ref_names(entry, names);
                     }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, true, true);
+                }
+                Node::InstanceVariable(iv) => {
+                    let ty = retained_param_type(&iv.type_(), code, ctx);
+                    entry.ivar_types.entry(intern(iv.name().as_str())).or_insert(ty);
                 }
                 Node::Include(inc) => {
                     // Issue #168: the type ARGUMENTS are member references;
@@ -4732,6 +4794,9 @@ impl Builder {
         // Attribute members are pure existence, so a reopen simply unions them.
         slot.attr_methods.extend(entry.attr_methods);
         slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
+        for (ivar, ty) in entry.ivar_types {
+            slot.ivar_types.entry(ivar).or_insert(ty);
+        }
         for name in entry.referenced_type_names {
             if !slot.referenced_type_names.contains(&name) {
                 slot.referenced_type_names.push(name);
@@ -4880,6 +4945,9 @@ impl Builder {
         // Attribute members are pure existence, so a reopen simply unions them.
         slot.attr_methods.extend(entry.attr_methods);
         slot.singleton_attr_methods.extend(entry.singleton_attr_methods);
+        for (ivar, ty) in entry.ivar_types {
+            slot.ivar_types.entry(ivar).or_insert(ty);
+        }
         for pre in entry.prepends {
             if !slot.prepends.contains(&pre) {
                 slot.prepends.push(pre);
