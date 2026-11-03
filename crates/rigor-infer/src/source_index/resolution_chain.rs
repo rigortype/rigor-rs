@@ -44,7 +44,8 @@ pub(crate) struct AncestryIndex {
     possible: HashSet<(String, String)>,
     contested: HashSet<(String, String)>,
     dirty: HashSet<String>,
-    prepends: HashMap<String, Vec<String>>,
+    /// Per owner, its direct mixin statements in order: `(prepend?, group)`.
+    groups: HashMap<String, Vec<(bool, Vec<String>)>>,
     decl_files: HashMap<String, usize>,
     def_owners: HashSet<String>,
 }
@@ -73,11 +74,8 @@ impl AncestryIndex {
         self.contested.extend(facts.contested_visibilities.iter().cloned());
         self.dirty.extend(facts.dirty_owners.iter().cloned());
         self.def_owners.extend(facts.def_owners.iter().cloned());
-        for (owner, raw) in &facts.direct_prepends {
-            let list = self.prepends.entry(owner.clone()).or_default();
-            if !list.contains(raw) {
-                list.push(raw.clone());
-            }
+        for (owner, prepend, names) in &facts.direct_mixins {
+            self.groups.entry(owner.clone()).or_default().push((*prepend, names.clone()));
         }
         let mut seen: HashSet<&str> = HashSet::new();
         for q in declared {
@@ -161,14 +159,33 @@ impl Builder<'_> {
             let sub = self.sub_lin(name, sup);
             entries.extend(sub);
         }
-        let prepends: Vec<String> =
-            self.idx.ancestry.prepends.get(name).cloned().unwrap_or_default();
-        let includes: Vec<String> = entry
+        // Each statement's group in statement order, its arguments LAST-FIRST
+        // (Ruby's `include`/`prepend` with several modules appends them in
+        // reverse, so `include B, A` is `[C, B, A]`). A repeated prepend is a
+        // no-op (the first statement wins); a repeated include keeps its
+        // first position, as the flat `includes` list always did.
+        let groups: Vec<(bool, Vec<String>)> =
+            self.idx.ancestry.groups.get(name).cloned().unwrap_or_default();
+        let mut prepends: Vec<String> = Vec::new();
+        let mut includes: Vec<String> = Vec::new();
+        for (prepend, names) in &groups {
+            for raw in names.iter().rev() {
+                let list = if *prepend { &mut prepends } else { &mut includes };
+                if !list.contains(raw) {
+                    list.push(raw.clone());
+                }
+            }
+        }
+        includes.retain(|raw| !prepends.contains(raw));
+        // Every edge the harvest holds must come from a statement the census
+        // saw; anything else has no known order.
+        if entry
             .includes
             .iter()
-            .filter(|raw| !prepends.contains(raw))
-            .cloned()
-            .collect();
+            .any(|raw| !prepends.contains(raw) && !includes.contains(raw))
+        {
+            self.failed = true;
+        }
         let mut origin = 0usize;
         for raw in &prepends {
             let sub = self.sub_lin(name, raw);

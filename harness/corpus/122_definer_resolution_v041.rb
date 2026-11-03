@@ -344,3 +344,67 @@ class FkSub3 < FkBase3
   private
   def fc = 2
 end
+
+# --- multi-argument include / prepend: a group is appended LAST-FIRST ------
+# (13) `include A, B` is `[C, A, B]` and `include B, A` is `[C, B, A]` (the
+# same as `include A; include B`); `prepend A, B` is `[A, B, C]`. MUST STILL
+# FIRE where the public definer ends up nearest (13a, 13c, 13d, 13f, 13h);
+# silent where the private one does (13b, 13e, 13g).
+module GrA
+  def gm; end
+end
+module GrB
+  private
+  def gm; end
+end
+class Gr13a
+  include GrA, GrB
+  private
+  def gm; end
+end
+class Gr13b
+  include GrB, GrA
+  private
+  def gm; end
+end
+class Gr13c
+  include GrB
+  include GrA
+  private
+  def gm; end
+end
+class GrBase
+  def gm; end
+end
+class Gr13d < GrBase
+  include GrA, GrB
+  private
+  def gm; end
+end
+class Gr13e < GrBase
+  include GrB, GrA
+  private
+  def gm; end
+end
+class GrP1
+  prepend GrA, GrB
+end
+class Gr13f < GrP1
+  private
+  def gm; end
+end
+class GrP2
+  prepend GrB, GrA
+end
+class Gr13g < GrP2
+  private
+  def gm; end
+end
+class GrP3
+  prepend GrB
+  prepend GrA
+end
+class Gr13h < GrP3
+  private
+  def gm; end
+end

@@ -91,6 +91,41 @@
       "column": 7,
       "severity": "warning",
       "message": "visibility of `fc' reduced from public to private (overrides FkM#fc); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 363,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `gm' reduced from public to private (overrides GrA#gm); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 374,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `gm' reduced from public to private (overrides GrA#gm); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 382,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `gm' reduced from public to private (overrides GrA#gm); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 394,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `gm' reduced from public to private (overrides GrA#gm); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 409,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `gm' reduced from public to private (overrides GrA#gm); breaks substitutability"
     }
   ]
 }

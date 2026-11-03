@@ -34,9 +34,11 @@
 //! * [`AncestryFacts::def_owners`] — owners with any `def`, so a module that
 //!   holds only a hook or only conditional defs still counts as a project
 //!   entry on a chain.
-//! * [`AncestryFacts::direct_prepends`] — the direct `prepend` statements, in
-//!   statement order, so the chain can place them ahead of the class (the
-//!   port's `includes` list carries both kinds unsorted).
+//! * [`AncestryFacts::direct_mixins`] — the direct `include` / `prepend`
+//!   statements (`true` = prepend), each with its argument GROUP, in
+//!   statement order: `include B, A` is not `include B; include A` (Ruby
+//!   appends a group's arguments last-first, so the first argument ends up
+//!   nearest), and the port's flat `includes` list cannot tell them apart.
 //!
 //! Owners are lists of CANDIDATE qualified names (a declaration has one; a
 //! receiver constant `X.include(M)` has one per enclosing lexical scope,
@@ -80,7 +82,7 @@ pub struct AncestryFacts {
     pub possible_methods: Vec<(String, String)>,
     pub contested_visibilities: Vec<(String, String)>,
     pub dirty_owners: Vec<String>,
-    pub direct_prepends: Vec<(String, String)>,
+    pub direct_mixins: Vec<(String, bool, Vec<String>)>,
     /// Owners with any `def` in their body (instance or singleton, recorded or
     /// not) — the reference's `known_user_class?` reads a `def` of either
     /// kind as making a name a project class.
@@ -305,11 +307,7 @@ impl Census {
                         if clash {
                             self.wildcard(owner.clone(), MixinSide::Include);
                         }
-                        if kind == "prepend" {
-                            for t in &names {
-                                self.out.direct_prepends.push((key.clone(), t.clone()));
-                            }
-                        }
+                        self.out.direct_mixins.push((key.clone(), kind == "prepend", names.clone()));
                     }
                     return;
                 }
