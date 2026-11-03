@@ -15,8 +15,20 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **upstream master `e59b7b89`** (2026-09-25; no tag, `version.rb` still `0.3.9`) |
-| Commit | `e59b7b89` |
+| **Pinned ref** | **`v0.4.0`** (2026-09-27) |
+| Commit | `07f49bdb` |
+
+> **`e59b7b89 → v0.4.0` (2026-11-04): 289 commits, step one of a tag-by-tag
+> walk to `v0.4.7`.** rbs stays 4.2.0. The only re-sync that moved is
+> `core_overlay/process.rbs` (`Process.last_status`, #1438). The plugin sig,
+> `vendored_gem_sigs/`, effects and `capability_roles/` are byte-identical. The
+> raw bump measured 1 fixture FP + 2 sweep FPs in two upstream commits:
+> `900bc64c` (#1359, `while`/`until` entry and exit edges) and `1be2fd0b`
+> (#1453, guards narrow constant receivers; `respond_to?` reads `Dynamic` on
+> its truthy edge). A **`git bisect` attributed one sweep FP to `c1f96e24`**;
+> re-running each side showed `1be2fd0b`. Re-run a bisect's verdict before
+> believing it. The fragment probe found six gate-invisible FPs, filed as
+> #446–#451. See the [note](docs/notes/20261104-repin-v040.md).
 
 > **`v0.3.9 → e59b7b89` (2026-09-25): 1,030 commits, the first non-tag pin since
 > the `v0.3.0` RC.** rbs stays 4.2.0. Three re-sync halves moved:
