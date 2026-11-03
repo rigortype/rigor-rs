@@ -59,20 +59,6 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 217,
-      "column": 7,
-      "severity": "error",
-      "message": "undefined method `frobnicate_b31a' for Array"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 219,
-      "column": 5,
-      "severity": "error",
-      "message": "undefined method `frobnicate_b31b' for Array"
-    },
-    {
-      "rule": "call.undefined-method",
       "line": 225,
       "column": 5,
       "severity": "error",

@@ -3,6 +3,13 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
+      "line": 47,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_ddd' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 54,
       "column": 9,
       "severity": "error",
