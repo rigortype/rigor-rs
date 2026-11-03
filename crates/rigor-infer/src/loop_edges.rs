@@ -421,10 +421,8 @@ impl<'i> Typer<'i> {
     /// a read an unmodelled construct keeps off the child links still
     /// counts — the decline side).
     pub(crate) fn reads_subject(&self, ast: &LoweredAst, id: NodeId, subject: &Subject) -> bool {
-        let idx = self.reach_index(ast);
         let span = ast.get(id).span();
-        let found = idx.nodes_within(ast, span).any(|n| subject.is_read(ast, n));
-        found
+        self.reach_index(ast).nodes_within(ast, span).any(|n| subject.is_read(ast, n))
     }
 
     /// Every subject read inside `id`'s span, deduplicated, in start order.
