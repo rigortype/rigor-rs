@@ -15,8 +15,8 @@
 //!   computed argument), the reference's `DiscoveryIndex#unpositioned_mixins`
 //!   (`MixinAccumulator`). A name the port cannot hold is the WILDCARD `"*"`.
 //!   A declaration that is not itself direct (`class C … end if X`, a class
-//!   opened inside a block or method) taints both of its sides with `"*"`:
-//!   the port's harvest does not see its edges at all.
+//!   opened inside a block or method) marks none of its body's statements
+//!   direct, so its edges are listed and its defs read `possible`.
 //! * [`AncestryFacts::possible_methods`] — an instance `def` the port's harvest
 //!   did not record (anything but a direct statement or the argument of a
 //!   direct visibility modifier). The reference reads such a definer as
@@ -31,6 +31,9 @@
 //! * [`AncestryFacts::dirty_owners`] — an owner defining a mixin hook
 //!   (`self.included` & co.) or `method_missing`: `Relevance` never reads its
 //!   closure as unable to answer a name.
+//! * [`AncestryFacts::def_owners`] — owners with any `def`, so a module that
+//!   holds only a hook or only conditional defs still counts as a project
+//!   entry on a chain.
 //! * [`AncestryFacts::direct_prepends`] — the direct `prepend` statements, in
 //!   statement order, so the chain can place them ahead of the class (the
 //!   port's `includes` list carries both kinds unsorted).
@@ -78,6 +81,10 @@ pub struct AncestryFacts {
     pub contested_visibilities: Vec<(String, String)>,
     pub dirty_owners: Vec<String>,
     pub direct_prepends: Vec<(String, String)>,
+    /// Owners with any `def` in their body (instance or singleton, recorded or
+    /// not) — the reference's `known_user_class?` reads a `def` of either
+    /// kind as making a name a project class.
+    pub def_owners: Vec<String>,
 }
 
 const TOGGLES: [&str; 4] = ["private", "protected", "public", "module_function"];
@@ -215,11 +222,10 @@ impl Census {
             return;
         }
         let qualified = self.qualify(&name);
-        if !direct {
-            // The port's harvest never sees this declaration's edges or defs.
-            self.wildcard(vec![qualified.clone()], MixinSide::Include);
-            self.wildcard(vec![qualified.clone()], MixinSide::Extend);
-        } else {
+        // A declaration that is not itself direct (`class C … end if X`) marks
+        // no statement of its body direct: its edges are listed unpositioned
+        // and its defs read `possible`, as the reference reads them.
+        if direct {
             self.mark_direct_body(body.as_ref());
         }
         let saved_prefix = std::mem::replace(
@@ -397,6 +403,11 @@ impl<'pr> Visit<'pr> for Census {
         let mut hook = false;
         if self.in_def == 0 {
             if let Some(owner) = self.owner() {
+                for o in &owner {
+                    if !self.out.def_owners.contains(o) {
+                        self.out.def_owners.push(o.clone());
+                    }
+                }
                 if singleton_def {
                     if ALL_HOOKS.contains(&name.as_str()) {
                         self.out.dirty_owners.extend(owner.iter().cloned());

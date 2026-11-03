@@ -632,7 +632,7 @@ impl<'i> Typer<'i> {
                     CallSelf::Unmodelled => (String::new(), DefKind::Instance),
                 };
                 self.source
-                    .implicit_self_literal(&qual, kind, method)
+                    .implicit_self_literal(self.index, &qual, kind, method)
                     .or_else(|| self.file_def_literal(ast, method, *span, seen))
             }
             // A `Const.m` no-arg call folds through the singleton literal-tail

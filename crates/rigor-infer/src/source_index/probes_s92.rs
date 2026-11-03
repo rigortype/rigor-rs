@@ -914,7 +914,7 @@ fn legacy_fold_expr(
             let (owner, kind) = match self_kind {
                 DefKind::Singleton => (self_qual.to_string(), DefKind::Singleton),
                 DefKind::Instance => {
-                    (idx.resolve_instance_owner(self_qual, &method)?, DefKind::Instance)
+                    (idx.resolve_instance_owner_bfs(self_qual, &method)?, DefKind::Instance)
                 }
             };
             legacy_resolve_fold_key(

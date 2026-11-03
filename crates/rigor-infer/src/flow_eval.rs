@@ -2413,7 +2413,7 @@ impl<'i> Typer<'i> {
             if block_body.is_empty() {
                 let method = method.clone();
                 if let Some(q) = self_qual {
-                    if let Some(scalar) = self.source.implicit_self_literal(q, self_kind, &method) {
+                    if let Some(scalar) = self.source.implicit_self_literal(self.index, q, self_kind, &method) {
                         return interner.intern(Type::Constant(scalar));
                     }
                 }

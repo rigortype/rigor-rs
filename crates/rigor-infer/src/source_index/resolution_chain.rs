@@ -46,6 +46,7 @@ pub(crate) struct AncestryIndex {
     dirty: HashSet<String>,
     prepends: HashMap<String, Vec<String>>,
     decl_files: HashMap<String, usize>,
+    def_owners: HashSet<String>,
 }
 
 impl AncestryIndex {
@@ -71,6 +72,7 @@ impl AncestryIndex {
         self.possible.extend(facts.possible_methods.iter().cloned());
         self.contested.extend(facts.contested_visibilities.iter().cloned());
         self.dirty.extend(facts.dirty_owners.iter().cloned());
+        self.def_owners.extend(facts.def_owners.iter().cloned());
         for (owner, raw) in &facts.direct_prepends {
             let list = self.prepends.entry(owner.clone()).or_default();
             if !list.contains(raw) {
@@ -196,14 +198,17 @@ impl Builder<'_> {
 impl SourceIndex {
     /// The reference's `known_user_class?` under the `:methods` flavor, as far
     /// as the port's tables show it: a project entry that records a
-    /// superclass, a method, a visibility or a mixin edge. Anything else (an
-    /// empty or constants-only module) is an EXTERNAL entry on a chain.
+    /// superclass, a method, a visibility, a mixin edge (direct or not) or a
+    /// `def` of either kind. Anything else (an empty or constants-only module)
+    /// is an EXTERNAL entry on a chain.
     pub(crate) fn known_user(&self, name: &str) -> bool {
         self.override_classes.get(name).is_some_and(|e| {
             e.superclass.is_some()
                 || !e.methods.is_empty()
                 || !e.includes.is_empty()
                 || !e.method_visibilities.is_empty()
+                || self.ancestry.def_owners.contains(name)
+                || self.ancestry.include_listed.contains_key(name)
         })
     }
 
@@ -301,6 +306,27 @@ impl SourceIndex {
     fn uncertain_definer(&self, owner: &str, method: &str) -> bool {
         let key = (owner.to_string(), method.to_string());
         self.ancestry.possible.contains(&key) || self.ancestry.contested.contains(&key)
+    }
+
+    /// Upstream v0.4.1 (#1594, ADR-119 C2-b1): whether a call of `method` on
+    /// an instance of the project class `name` (the collapsed name the
+    /// typer's registry holds) may be typed from that class's OWN `def`:
+    /// every qualified class the name can denote that defines `method` must
+    /// read itself as the `Known` definer on its Ruby-order chain. A class the
+    /// override index does not hold says nothing (the caller's own gates
+    /// stand).
+    pub fn own_def_typing_settled(&self, core: &CoreIndex, name: &str, method: &str) -> bool {
+        let suffix = format!("::{name}");
+        self.override_classes
+            .keys()
+            .filter(|k| *k == name || k.ends_with(&suffix))
+            .filter(|k| self.owner_defines(k, method, DefKind::Instance))
+            .all(|k| {
+                self.settled_definer(core, k, method, false, |n| {
+                    self.owner_defines(n, method, DefKind::Instance)
+                })
+                .is_some_and(|d| d == *k)
+            })
     }
 
     /// The `Known` owner `DefinerResolution` reads for `method` on the

@@ -2671,10 +2671,12 @@ fn override_vis_project_order_is_normative() {
 
 /// Issue #92 invariant 1, example 2 — the same for `include` ACCUMULATION
 /// order, on a fully idiomatic shape (one class reopened in two files, each
-/// adding an include). `override_ancestor_names` walks includes in
-/// accumulated order, so the MRO's nearest defining ancestor flips with the
-/// file order: M1 first ⇒ a public definer ⇒ fires; M2 first ⇒ a private
-/// definer ⇒ silent.
+/// adding an include). Before v0.4.1 the MRO's nearest defining ancestor
+/// flipped with the file order. Since upstream v0.4.1 (ADR-119 WD2, the
+/// multi-file mark) a class declared in two or more files with two or more
+/// mixin edges has no known edge order — their order across files is load
+/// order — so the override lint declines in BOTH orders (oracle-probed at the
+/// v0.4.1 pin: silent either way).
 #[test]
 fn override_vis_project_include_order_is_normative() {
     let mods =
@@ -2683,13 +2685,25 @@ fn override_vis_project_include_order_is_normative() {
     let a = b"class Foo\n  include M1\nend\n" as &[u8];
     let b = b"class Foo\n  include M2\n  private\n  def m; 3; end\nend\n" as &[u8];
     let forward = override_vis_project(&[mods, a, b], 2);
-    assert_eq!(forward.len(), 1, "mods,a,b must fire, got {forward:?}");
-    assert_eq!(
-        forward[0].message,
-        "visibility of `m' reduced from public to private (overrides M1#m); breaks substitutability"
-    );
+    assert!(forward.is_empty(), "mods,a,b must stay silent, got {forward:?}");
     let reversed = override_vis_project(&[mods, b, a], 1);
     assert!(reversed.is_empty(), "mods,b,a must stay silent, got {reversed:?}");
+}
+
+/// MUST STILL FIRE beside the multi-file decline above: a class declared in
+/// two files with only ONE mixin edge has no cross-file order to doubt
+/// (oracle-probed at the v0.4.1 pin: fires).
+#[test]
+fn override_vis_multi_file_single_edge_still_fires() {
+    let mods = b"module M1\n  def m; 1; end\nend\n" as &[u8];
+    let a = b"class Foo\n  include M1\nend\n" as &[u8];
+    let b = b"class Foo\n  private\n  def m; 3; end\nend\n" as &[u8];
+    let diags = override_vis_project(&[mods, a, b], 2);
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "visibility of `m' reduced from public to private (overrides M1#m); breaks substitutability"
+    );
 }
 
 #[test]

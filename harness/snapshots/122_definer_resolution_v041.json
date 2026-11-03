@@ -1,0 +1,75 @@
+{
+  "fixture": "harness/corpus/122_definer_resolution_v041.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 247,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 252,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 257,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 263,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 269,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 277,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 25,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `m1' reduced from public to private (overrides OvBase1#m1); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 79,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `m4a' reduced from public to private (overrides OvMf4a#m4a); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 88,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `m4b' reduced from public to private (overrides OvMf4b#m4b); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 157,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `m7' reduced from public to private (overrides OvBase7#m7); breaks substitutability"
+    }
+  ]
+}

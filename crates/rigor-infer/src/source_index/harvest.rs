@@ -584,7 +584,7 @@ impl SourceIndex {
             }
         }
         idx.definers = invert_definers(&defs);
-        idx.literal_returns = idx.compute_literal_returns(&defs);
+        idx.literal_returns = idx.compute_literal_returns(core, &defs);
 
         idx
     }
