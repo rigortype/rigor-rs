@@ -275,3 +275,72 @@ class Ty11f
   def t11f = 1
 end
 Ty11f.new.t11f.upcase
+
+# --- forks: a module reaching the chain by a second route ----------------
+# (12) MUST STILL FIRE (a)-(c): the one include-side skip whose retro world
+# names the same parent (the mastodon `SignatureVerification` shape, a
+# prepend the superclass also prepends - the gitlab `PipelineTimingCheck`
+# shape - and #1570's redundant include); silent (d)-(e): the two worlds
+# name different parents, or more than one entry forks.
+module FkHelper
+  def fa = 1
+end
+module FkVerify
+  include FkHelper
+end
+class FkApp
+  include FkHelper
+end
+class FkCtl < FkApp
+  include FkVerify
+  private
+  def fa = 2
+end
+# (b) a prepend the superclass also prepends
+module FkTiming
+  def fb = 1
+end
+class FkRef
+  prepend FkTiming
+end
+class FkAbs < FkRef
+  prepend FkTiming
+end
+class FkEpic < FkAbs
+  private
+  def fb = 2
+end
+# (c) #1570 redundant include, base does not define
+module FkM
+  def fc = 1
+end
+class FkBase
+  include FkM
+end
+class FkSub < FkBase
+  include FkM
+  private
+  def fc = 2
+end
+# (d) #1570 redundant include, base defines too: worlds disagree
+class FkBase2
+  include FkM
+  def fc = 0
+end
+class FkSub2 < FkBase2
+  include FkM
+  private
+  def fc = 2
+end
+# (e) two modules whose whole chains are already present
+module FkN
+  include FkM
+end
+class FkBase3
+  include FkN
+end
+class FkSub3 < FkBase3
+  include FkN
+  private
+  def fc = 2
+end

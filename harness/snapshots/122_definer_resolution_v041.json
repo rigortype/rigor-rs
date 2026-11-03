@@ -70,6 +70,27 @@
       "column": 7,
       "severity": "warning",
       "message": "visibility of `m7' reduced from public to private (overrides OvBase7#m7); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 297,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `fa' reduced from public to private (overrides FkHelper#fa); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 311,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `fb' reduced from public to private (overrides FkTiming#fb); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 323,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `fc' reduced from public to private (overrides FkM#fc); breaks substitutability"
     }
   ]
 }

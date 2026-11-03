@@ -112,26 +112,39 @@ struct Mark {
 }
 
 pub(crate) struct Chain {
+    /// The world in which every insertion was made (Ruby's order when the
+    /// statements ran with the forked module's other route LATER).
     pub(crate) entries: Vec<ChainEntry>,
+    /// With exactly one include-side fork, the RETRO world: the same chain
+    /// with the forked insertion skipped (the other route ran first, so Ruby
+    /// skipped the `include`). A reader stands only where both agree.
+    retro: Option<Vec<ChainEntry>>,
     marks: Vec<Mark>,
 }
+
+/// A chain entry and whether the one forked `include` inserted it.
+type Tagged = (ChainEntry, bool);
 
 struct Builder<'a> {
     idx: &'a SourceIndex,
     nodes: Vec<String>,
     stack: Vec<String>,
     failed: bool,
+    forks: usize,
 }
 
 impl Builder<'_> {
-    fn project_count(entries: &[ChainEntry]) -> usize {
-        entries.iter().filter(|e| matches!(e, ChainEntry::Project(_))).count()
+    fn project_count(entries: &[Tagged]) -> usize {
+        entries.iter().filter(|(e, _)| matches!(e, ChainEntry::Project(_))).count()
     }
 
     /// The chain of the project class/module `name`: its prepend region, the
     /// class, its includes (latest statement nearest), then its superclass's
-    /// chain. Any fork, cycle or cut sets `failed`.
-    fn lin(&mut self, name: &str) -> Vec<ChainEntry> {
+    /// chain. A cycle, a cut, a prepend fork or a second fork sets `failed`;
+    /// ONE include-side skip — the last entry of the inserted sub-chain is
+    /// already on the chain (#1570) — is inserted tagged, so the retro world
+    /// can drop it.
+    fn lin(&mut self, name: &str) -> Vec<Tagged> {
         if self.failed || self.stack.iter().any(|s| s == name) {
             self.failed = true;
             return Vec::new();
@@ -140,10 +153,10 @@ impl Builder<'_> {
             self.nodes.push(name.to_string());
         }
         let Some(entry) = self.idx.override_classes.get(name) else {
-            return vec![ChainEntry::Project(name.to_string())];
+            return vec![(ChainEntry::Project(name.to_string()), false)];
         };
         self.stack.push(name.to_string());
-        let mut entries = vec![ChainEntry::Project(name.to_string())];
+        let mut entries = vec![(ChainEntry::Project(name.to_string()), false)];
         if let Some(sup) = &entry.superclass {
             let sub = self.sub_lin(name, sup);
             entries.extend(sub);
@@ -159,16 +172,46 @@ impl Builder<'_> {
         let mut origin = 0usize;
         for raw in &prepends {
             let sub = self.sub_lin(name, raw);
-            if Self::forks(&entries, &sub) {
+            // A direct prepend of a module is always inserted, even where the
+            // superclass's chain carries it (`[W, C, B, W]`): only the module
+            // already in this class's prepend region, or another entry of its
+            // own chain the chain already carries, is a fork.
+            let module = self
+                .idx
+                .resolve_override_ancestor(name, raw)
+                .map(ChainEntry::Project);
+            let in_region = module
+                .as_ref()
+                .is_some_and(|m| entries[..origin].iter().any(|(x, _)| x == m));
+            let others: Vec<Tagged> =
+                sub.iter().filter(|(e, _)| Some(e) != module.as_ref()).cloned().collect();
+            if in_region || Self::forks(&entries, &others) {
                 self.failed = true;
             }
             origin += sub.len();
             entries.splice(0..0, sub);
         }
         for raw in &includes {
-            let sub = self.sub_lin(name, raw);
+            let mut sub = self.sub_lin(name, raw);
             if Self::forks(&entries, &sub) {
-                self.failed = true;
+                // The one fork the reference settles: an include-side skip
+                // on the LAST entry of the sub-chain being inserted (#1570:
+                // the module already sits further down the chain).
+                let present: Vec<usize> = sub
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, (e, _))| {
+                        matches!(e, ChainEntry::Project(_)) && entries.iter().any(|(x, _)| x == e)
+                    })
+                    .map(|(i, _)| i)
+                    .collect();
+                let last = sub.len() - 1;
+                if self.forks == 0 && present == [last] && !sub.iter().any(|(_, t)| *t) {
+                    self.forks = 1;
+                    sub[last].1 = true;
+                } else {
+                    self.failed = true;
+                }
             }
             entries.splice(origin + 1..origin + 1, sub);
         }
@@ -179,18 +222,22 @@ impl Builder<'_> {
         entries
     }
 
-    fn forks(entries: &[ChainEntry], sub: &[ChainEntry]) -> bool {
-        sub.iter()
-            .any(|e| matches!(e, ChainEntry::Project(_)) && entries.contains(e))
+    fn forks(entries: &[Tagged], sub: &[Tagged]) -> bool {
+        sub.iter().any(|(e, _)| {
+            matches!(e, ChainEntry::Project(_)) && entries.iter().any(|(x, _)| x == e)
+        })
     }
 
-    fn sub_lin(&mut self, owner: &str, raw: &str) -> Vec<ChainEntry> {
+    fn sub_lin(&mut self, owner: &str, raw: &str) -> Vec<Tagged> {
         match self.idx.resolve_override_ancestor(owner, raw) {
             Some(p) if self.idx.known_user(&p) => self.lin(&p),
-            _ => vec![ChainEntry::External {
-                raw: raw.strip_prefix("::").unwrap_or(raw).to_string(),
-                from: owner.to_string(),
-            }],
+            _ => vec![(
+                ChainEntry::External {
+                    raw: raw.strip_prefix("::").unwrap_or(raw).to_string(),
+                    from: owner.to_string(),
+                },
+                false,
+            )],
         }
     }
 }
@@ -218,17 +265,22 @@ impl SourceIndex {
         if !self.override_classes.contains_key(class) {
             return None;
         }
-        let mut b = Builder { idx: self, nodes: Vec::new(), stack: Vec::new(), failed: false };
-        let entries = b.lin(class);
+        let mut b =
+            Builder { idx: self, nodes: Vec::new(), stack: Vec::new(), failed: false, forks: 0 };
+        let tagged = b.lin(class);
         if b.failed {
             return None;
         }
+        let retro = (b.forks == 1).then(|| {
+            tagged.iter().filter(|(_, t)| !t).map(|(e, _)| e.clone()).collect()
+        });
+        let entries = tagged.into_iter().map(|(e, _)| e).collect();
         let marks = b
             .nodes
             .iter()
             .filter_map(|node| self.mark_of(node))
             .collect();
-        Some(Chain { entries, marks })
+        Some(Chain { entries, retro, marks })
     }
 
     fn mark_of(&self, node: &str) -> Option<Mark> {
@@ -347,34 +399,55 @@ impl SourceIndex {
         if !chain.marks.iter().all(|m| self.discharged(core, m, method)) {
             return None;
         }
-        let start = if skip_self {
-            chain
-                .entries
-                .iter()
-                .position(|e| matches!(e, ChainEntry::Project(n) if n == class))?
-                + 1
-        } else {
-            0
-        };
-        for e in &chain.entries[start..] {
-            match e {
-                ChainEntry::External { raw, from } => {
-                    if !external_lacks(core, from, raw, method) {
-                        return None;
-                    }
+        let answer = first_definer(self, core, &chain.entries, class, method, skip_self, &defines)?;
+        match &chain.retro {
+            None => Some(answer),
+            Some(retro) => {
+                let other = first_definer(self, core, retro, class, method, skip_self, &defines)?;
+                (other == answer).then_some(answer)
+            }
+        }
+    }
+}
+
+/// The first definer of `method` on one world of a chain, read from the
+/// class's own entry (`skip_self`: the entry after it), or `None` where a
+/// definer Ruby may not reach could answer first.
+fn first_definer(
+    idx: &SourceIndex,
+    core: &CoreIndex,
+    entries: &[ChainEntry],
+    class: &str,
+    method: &str,
+    skip_self: bool,
+    defines: &impl Fn(&str) -> bool,
+) -> Option<String> {
+    let start = if skip_self {
+        entries
+            .iter()
+            .position(|e| matches!(e, ChainEntry::Project(n) if n == class))?
+            + 1
+    } else {
+        0
+    };
+    for e in &entries[start..] {
+        match e {
+            ChainEntry::External { raw, from } => {
+                if !external_lacks(core, from, raw, method) {
+                    return None;
                 }
-                ChainEntry::Project(n) => {
-                    if self.uncertain_definer(n, method) {
-                        return None;
-                    }
-                    if defines(n) {
-                        return Some(n.clone());
-                    }
+            }
+            ChainEntry::Project(n) => {
+                if idx.uncertain_definer(n, method) {
+                    return None;
+                }
+                if defines(n) {
+                    return Some(n.clone());
                 }
             }
         }
-        None
     }
+    None
 }
 
 /// `external_lacks?` — true only for an ancestor RBS knows whose declaration
