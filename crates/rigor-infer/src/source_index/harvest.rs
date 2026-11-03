@@ -361,6 +361,15 @@ impl SourceIndex {
                 );
             }
         }
+        // Upstream v0.4.1: the ancestry facts, a union keyed by qualified
+        // owner, plus how many files declare each qualified class.
+        for (h, ast) in files {
+            let h = h.borrow();
+            idx.ancestry.ingest(
+                ast.ancestry_facts(),
+                h.override_classes.iter().map(|oc| oc.qualified.as_str()),
+            );
+        }
 
         // Passes 1c / 1d / 1e + stage 2b's bare-name set: unions — the two
         // def-attribution halves need the COMPLETE project census before the
@@ -575,7 +584,7 @@ impl SourceIndex {
             }
         }
         idx.definers = invert_definers(&defs);
-        idx.literal_returns = idx.compute_literal_returns(&defs);
+        idx.literal_returns = idx.compute_literal_returns(core, &defs);
 
         idx
     }

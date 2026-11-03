@@ -1,6 +1,7 @@
 //! ADR-0038 interprocedural literal-tail fold: the Pass-4a tail capture (issue #113), the Pass-4b
 //! fold with its overridable degrade (#94), and its lookups.
 
+use rigor_index::CoreIndex;
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use rigor_parse::{LoweredAst, Node, NodeId};
@@ -106,13 +107,14 @@ impl SourceIndex {
     /// keystone). The value already has the overridable degrade applied.
     pub fn implicit_self_literal(
         &self,
+        core: &CoreIndex,
         self_qual: &str,
         self_kind: DefKind,
         method: &str,
     ) -> Option<Scalar> {
         let (owner, kind) = match self_kind {
             DefKind::Singleton => self.resolve_singleton_slot(self_qual, method)?,
-            DefKind::Instance => (self.resolve_instance_owner(self_qual, method)?, DefKind::Instance),
+            DefKind::Instance => (self.resolve_instance_owner(core, self_qual, method)?, DefKind::Instance),
         };
         self.literal_returns
             .get(&(owner, method.to_string(), kind))
@@ -164,6 +166,7 @@ impl SourceIndex {
     /// once per definer-candidate instead of once per `(candidate, owner)` pair.
     pub(crate) fn compute_literal_returns(
         &self,
+        core: &CoreIndex,
         defs: &FoldDefs<'_>,
     ) -> HashMap<(String, String, DefKind), Scalar> {
         let mut memo: HashMap<(String, String, DefKind), Option<Scalar>> = HashMap::new();
@@ -173,7 +176,7 @@ impl SourceIndex {
         let mut closures: AncestorClosures = AncestorClosures::new();
         for key in defs.keys() {
             let mut visiting: HashSet<(String, String, DefKind)> = HashSet::new();
-            self.resolve_fold_key(key, defs, &mut memo, &mut visiting, &mut closures);
+            self.resolve_fold_key(core, key, defs, &mut memo, &mut visiting, &mut closures);
         }
         memo.into_iter().filter_map(|(k, v)| v.map(|s| (k, s))).collect()
     }
@@ -184,6 +187,7 @@ impl SourceIndex {
     /// literal as a flow constant is unsound — the reference `degrade_if_overridable`).
     fn resolve_fold_key(
         &self,
+        core: &CoreIndex,
         key: &(String, String, DefKind),
         defs: &FoldDefs<'_>,
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
@@ -197,7 +201,7 @@ impl SourceIndex {
             return None; // cycle (recursive method) ⇒ decline, don't memoize.
         }
         visiting.insert(key.clone());
-        let raw = self.fold_key_sites(key, defs, memo, visiting, closures);
+        let raw = self.fold_key_sites(core, key, defs, memo, visiting, closures);
         let result = match raw {
             Some(_) if self.overridden_in_project(&key.0, &key.1, key.2, closures) => None,
             other => other,
@@ -212,6 +216,7 @@ impl SourceIndex {
     /// declines the whole method (we read only the tail).
     fn fold_key_sites(
         &self,
+        core: &CoreIndex,
         key: &(String, String, DefKind),
         defs: &FoldDefs<'_>,
         memo: &mut HashMap<(String, String, DefKind), Option<Scalar>>,
@@ -224,7 +229,7 @@ impl SourceIndex {
             if site.has_explicit_return {
                 return None;
             }
-            let s = self.fold_tail(site.tail, &key.0, key.2, defs, memo, visiting, closures)?;
+            let s = self.fold_tail(core, site.tail, &key.0, key.2, defs, memo, visiting, closures)?;
             match &acc {
                 None => acc = Some(s),
                 Some(prev) if *prev != s => return None, // disagreeing reopen.
@@ -251,6 +256,7 @@ impl SourceIndex {
     #[allow(clippy::too_many_arguments)]
     fn fold_tail(
         &self,
+        core: &CoreIndex,
         tail: &FoldTail,
         self_qual: &str,
         self_kind: DefKind,
@@ -271,13 +277,14 @@ impl SourceIndex {
                 let (owner, kind) = match self_kind {
                     DefKind::Singleton => self.resolve_singleton_slot(self_qual, method)?,
                     DefKind::Instance => {
-                        (self.resolve_instance_owner(self_qual, method)?, DefKind::Instance)
+                        (self.resolve_instance_owner(core, self_qual, method)?, DefKind::Instance)
                     }
                 };
-                self.resolve_fold_key(&(owner, method.clone(), kind), defs, memo, visiting, closures)
+                self.resolve_fold_key(core, &(owner, method.clone(), kind), defs, memo, visiting, closures)
             }
             // `Const.method` — an OWN-CLASS singleton project call.
             FoldExpr::ConstCall { owner, method } => self.resolve_fold_key(
+                core,
                 &(owner.clone(), method.clone(), DefKind::Singleton),
                 defs,
                 memo,
@@ -294,17 +301,18 @@ impl SourceIndex {
             // emits. `folding::fold` holds exactly that boundary.
             FoldExpr::Not { operand } => {
                 let s =
-                    self.fold_tail(operand, self_qual, self_kind, defs, memo, visiting, closures)?;
+                    self.fold_tail(core, operand, self_qual, self_kind, defs, memo, visiting, closures)?;
                 crate::folding::fold(&s, "!", &[])
             }
             // A core fold on a value-pinned receiver + args (`1 + 1`, `"x" ==
             // "y"`). Declines unless every part folds.
             FoldExpr::CoreCall { recv, method, args } => {
                 let recv =
-                    self.fold_tail(recv, self_qual, self_kind, defs, memo, visiting, closures)?;
+                    self.fold_tail(core, recv, self_qual, self_kind, defs, memo, visiting, closures)?;
                 let mut arg_scalars = Vec::with_capacity(args.len());
                 for a in args {
                     arg_scalars.push(self.fold_tail(
+                        core,
                         a, self_qual, self_kind, defs, memo, visiting, closures,
                     )?);
                 }
@@ -318,7 +326,25 @@ impl SourceIndex {
     /// `resolve_user_def_with_owner`: an unrelated same-name method elsewhere is
     /// never reached, so an implicit-self call resolves ONLY through the enclosing
     /// class's own project chain (the cross-class zero-FP keystone).
-    pub(crate) fn resolve_instance_owner(&self, qual: &str, method: &str) -> Option<String> {
+    pub(crate) fn resolve_instance_owner(
+        &self,
+        core: &CoreIndex,
+        qual: &str,
+        method: &str,
+    ) -> Option<String> {
+        let owner = self.resolve_instance_owner_bfs(qual, method)?;
+        // Upstream v0.4.1 (#1594, ADR-119 C2-b1): the typing read answers only
+        // where `DefinerResolution` is `Known` on the Ruby-order chain, and
+        // names the same definer the breadth-first walk found.
+        let settled = self.settled_definer(core, qual, method, false, |n| {
+            self.owner_defines(n, method, DefKind::Instance)
+        })?;
+        (settled == owner).then_some(owner)
+    }
+
+    /// The breadth-first walk the typing read replaced (kept for the
+    /// gate's same-definer check and the legacy-fold probe).
+    pub(crate) fn resolve_instance_owner_bfs(&self, qual: &str, method: &str) -> Option<String> {
         if self.owner_defines(qual, method, DefKind::Instance) {
             return Some(qual.to_string());
         }

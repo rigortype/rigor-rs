@@ -120,6 +120,29 @@ impl SourceIndex {
         None
     }
 
+    /// Upstream v0.4.1 (rigortype/rigor#1578, #1606, #1623, #1631): the
+    /// override lints' parent read — the nearest project ancestor AFTER
+    /// `class` on its Ruby-order chain that defines `method`, with its
+    /// recorded visibility (`None` = unknown, never synthesized), read only
+    /// where `DefinerResolution` would answer `Known`: no unpositioned or
+    /// multi-file mixin it cannot discharge, no fork, no external ahead of
+    /// the parent that may define the name, no `possible` def or contested
+    /// visibility on the way. Every other case is `None` (silent).
+    pub fn override_parent(
+        &self,
+        core: &rigor_index::CoreIndex,
+        class: &str,
+        method: &str,
+    ) -> Option<(String, Option<Visibility>)> {
+        let owner = self.settled_definer(core, class, method, true, |n| {
+            self.override_classes.get(n).is_some_and(|e| {
+                e.methods.contains(method) || e.method_visibilities.contains_key(method)
+            })
+        })?;
+        let vis = self.method_visibility(&owner, method);
+        Some((owner, vis))
+    }
+
     /// The direct PROJECT ancestors of the QUALIFIED `class`, resolved + ordered:
     /// each `include` / `prepend` (in source order) FIRST, then the `superclass`
     /// — Ruby's MRO ordering. Names that resolve to no project class (RBS /
@@ -193,7 +216,7 @@ impl SourceIndex {
     /// `resolve_override_ancestor_name`: try `<prefix>::<raw>` for each enclosing
     /// scope of the subclass, longest-prefix first, falling back to the bare name.
     /// A leading `::` on the raw name is stripped (a top-level absolute path).
-    fn resolve_override_ancestor(&self, subclass: &str, raw: &str) -> Option<String> {
+    pub(crate) fn resolve_override_ancestor(&self, subclass: &str, raw: &str) -> Option<String> {
         let raw = raw.strip_prefix("::").unwrap_or(raw);
         let segments: Vec<&str> = subclass.split("::").collect();
         // Drop the subclass's own last segment; try its enclosing scopes

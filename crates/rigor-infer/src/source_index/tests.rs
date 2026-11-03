@@ -512,7 +512,7 @@ fn implicit_self_same_class_instance_folds() {
     let core = CoreIndex::new();
     let (_a, idx) = build_one(b"class Widget\n  def flag\n    false\n  end\nend\n", &core);
     assert_eq!(
-        idx.implicit_self_literal("Widget", DefKind::Instance, "flag"),
+        idx.implicit_self_literal(&core, "Widget", DefKind::Instance, "flag"),
         Some(Scalar::Bool(false))
     );
 }
@@ -530,7 +530,7 @@ fn implicit_self_inherited_instance_folds() {
         &core,
     );
     assert_eq!(
-        idx.implicit_self_literal("User", DefKind::Instance, "flag"),
+        idx.implicit_self_literal(&core, "User", DefKind::Instance, "flag"),
         Some(Scalar::Bool(false))
     );
 }
@@ -548,7 +548,7 @@ fn implicit_self_included_module_folds() {
         &core,
     );
     assert_eq!(
-        idx.implicit_self_literal("User", DefKind::Instance, "flag"),
+        idx.implicit_self_literal(&core, "User", DefKind::Instance, "flag"),
         Some(Scalar::Bool(false))
     );
 }
@@ -566,7 +566,7 @@ fn implicit_self_cross_class_declines() {
         ],
         &core,
     );
-    assert_eq!(idx.implicit_self_literal("User", DefKind::Instance, "flag"), None);
+    assert_eq!(idx.implicit_self_literal(&core, "User", DefKind::Instance, "flag"), None);
 }
 
 #[test]
@@ -579,12 +579,12 @@ fn implicit_self_singleton_kind_folds_own_class() {
         &core,
     );
     assert_eq!(
-        idx.implicit_self_literal("Gitlab::Database", DefKind::Singleton, "read_only?"),
+        idx.implicit_self_literal(&core, "Gitlab::Database", DefKind::Singleton, "read_only?"),
         Some(Scalar::Bool(false))
     );
     // The instance table is SEPARATE — no instance `read_only?` exists.
     assert_eq!(
-        idx.implicit_self_literal("Gitlab::Database", DefKind::Instance, "read_only?"),
+        idx.implicit_self_literal(&core, "Gitlab::Database", DefKind::Instance, "read_only?"),
         None
     );
 }
@@ -602,7 +602,7 @@ fn related_subclass_override_degrades_even_when_values_match() {
         ],
         &core,
     );
-    assert_eq!(idx.implicit_self_literal("Base", DefKind::Instance, "flag"), None);
+    assert_eq!(idx.implicit_self_literal(&core, "Base", DefKind::Instance, "flag"), None);
 }
 
 #[test]

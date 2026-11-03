@@ -531,6 +531,13 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
+            // Upstream v0.4.1 (#1594): a call reached through an ancestry the
+            // file cannot order — a conditional / block / hook / receiver-form
+            // mixin, a fork, an external ahead of the definer, a possible def
+            // — types `Dynamic`, even for the class's own `def`.
+            if !self.source.own_def_typing_settled(self.index, &src_name, method) {
+                return interner.untyped();
+            }
             if let Some(ret_core) = self.source.method_return(&src_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_core) {
                     return interner.intern(Type::Nominal { class: class_id, args: vec![] });

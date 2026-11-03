@@ -39,9 +39,12 @@ fn visibility_word(v: rigor_parse::Visibility) -> &'static str {
 ///
 ///   1. The override is an instance method present in the visibility table
 ///      (`override_vis` — singleton defs are excluded upstream by lowering).
-///   2. [`SourceIndex::nearest_ancestor_defining`] finds a PROJECT-source
-///      ancestor that defines `method` (RBS / third-party ancestors are not
-///      walked — slice-1 carve-out; an unresolvable / absent ancestor declines).
+///   2. [`SourceIndex::override_parent`] finds the nearest PROJECT-source
+///      ancestor after the class on its Ruby-order chain that defines
+///      `method`, and only where upstream v0.4.1's `DefinerResolution` would
+///      answer `Known` (no unpositioned mixin it cannot discharge, no fork, no
+///      external ahead of the parent that may define the name, no `possible`
+///      def or contested visibility on the way); anything else declines.
 ///   3. **The parent visibility is KNOWN (`Some`).** We NEVER synthesize `Public`
 ///      from a missing/absent ancestor visibility entry — this is THE documented
 ///      false-positive cluster in the reference (Mastodon 160 → 35). Only compare
@@ -57,6 +60,7 @@ fn visibility_word(v: rigor_parse::Visibility) -> &'static str {
 /// Parent#m); breaks substitutability ``.
 pub(crate) fn check_override_visibility(
     source: &rigor_infer::SourceIndex,
+    index: &CoreIndex,
     // The FULLY LEXICALLY-QUALIFIED name of the overriding class (e.g.
     // `Organizations::GroupsController`), so the ancestor walk resolves against
     // the project-wide qualified override index precisely.
@@ -66,7 +70,9 @@ pub(crate) fn check_override_visibility(
     name_span: (usize, usize),
 ) -> Option<Diagnostic> {
     // Gate 2: a project ancestor must DEFINE the method.
-    let (parent_class, parent_vis) = source.nearest_ancestor_defining(qualified_class, method)?;
+    // Upstream v0.4.1: the parent is read off the Ruby-order chain, and only
+    // where the reference's `DefinerResolution` answers `Known`.
+    let (parent_class, parent_vis) = source.override_parent(index, qualified_class, method)?;
     // Gate 3 (the keystone): the parent visibility must be KNOWN — NEVER
     // synthesize Public from a missing entry.
     let parent_vis = parent_vis?;

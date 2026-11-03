@@ -313,7 +313,7 @@ pub fn analyze_with_source_and_folder(
                 continue; // not in the table (singleton / untracked) ⇒ silent.
             };
             if let Some(diag) =
-                check_override_visibility(source, qualified, method, override_vis, *name_span)
+                check_override_visibility(source, index, qualified, method, override_vis, *name_span)
             {
                 out.push(diag);
             }

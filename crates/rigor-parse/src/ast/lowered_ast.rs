@@ -3,7 +3,7 @@
 
 use crate::ruby_prism::ParseResult;
 
-use super::{collect_const_mutations, Builder, ConstMutation, Node, NodeId, Span, StatementsKind};
+use super::{collect_ancestry_facts, AncestryFacts, collect_const_mutations, Builder, ConstMutation, Node, NodeId, Span, StatementsKind};
 
 /// Monotonic source of [`FileKey::Anonymous`]. One `lower()` call == one
 /// pathless input, so a process-global counter gives every such lowering a
@@ -97,6 +97,9 @@ pub struct LoweredAst {
     /// instead (rigor-rs#137, upstream rigor#1245). The names still shadow the
     /// enclosing scope for every node under the recovered child.
     closure_bindings: Vec<(u32, Vec<String>)>,
+    /// Upstream v0.4.1 — the ancestry facts the direct-statement harvest
+    /// cannot vouch for ([`AncestryFacts`]). Boxed: one pointer on the AST.
+    ancestry_facts: Box<AncestryFacts>,
 }
 
 /// The span side tables for positions whose post-scope the reference never
@@ -386,6 +389,13 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// Upstream v0.4.1 — this file's [`AncestryFacts`]: the mixin edges,
+    /// definers and visibility slots the direct-statement harvest cannot
+    /// vouch for.
+    pub fn ancestry_facts(&self) -> &AncestryFacts {
+        &self.ancestry_facts
+    }
+
     /// Every `(arena id, bound names)` of a recovered child lowered under a
     /// crossed `BlockNode`/`LambdaNode` — see the `closure_bindings` field.
     /// Consumers needing "is `id` the root of a shadowed subtree" test these;
@@ -487,6 +497,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
+    let ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
     let mut local_read_starts: Vec<usize> = builder
         .nodes
         .iter()
@@ -530,5 +541,6 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         carrier_spans,
         paren_unwrapped,
         closure_bindings,
+        ancestry_facts,
     }
 }
