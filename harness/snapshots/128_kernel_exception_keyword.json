@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/128_kernel_exception_keyword.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `zork_b' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `zork_ctl' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 22,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `zork_ctl2' for 1.5"
+    }
+  ]
+}
