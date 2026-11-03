@@ -203,27 +203,6 @@
       "column": 13,
       "severity": "error",
       "message": "undefined method `frobnicate_w2' for String"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 382,
-      "column": 11,
-      "severity": "error",
-      "message": "undefined method `frobnicate_w3' for Integer"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 387,
-      "column": 11,
-      "severity": "error",
-      "message": "undefined method `frobnicate_w4' for Integer"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 392,
-      "column": 11,
-      "severity": "error",
-      "message": "undefined method `frobnicate_w5' for Integer"
     }
   ]
 }

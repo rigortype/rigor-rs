@@ -36,7 +36,7 @@
 //!    `MutationWidening::ARRAY_MUTATORS` (31) /
 //!    `MutationClassifier::HASH_MUTATORS` (20 — the widening's `HASH_MUTATORS`
 //!    ∪ `HashLookupMutation::MUTATORS` ∪ `rehash`, since the `e59b7b89` pin) /
-//!    `StringMutation::MUTATORS` (35). Upstream keeps those as Ruby
+//!    `StringMutation::MUTATORS` (42). Upstream keeps those as Ruby
 //!    literals and its internal spec forbids `core.yml` re-spelling them, so
 //!    `harness/vendor_effects.py` EXTRACTS them into
 //!    `vendor/effects/mutators.yml` ([`mutators`]) and [`Catalog`] expands the
@@ -80,7 +80,7 @@ pub use registry::Registry;
 
 /// The reference pin these bytes were taken at. Moves only with
 /// `UPSTREAM.md`'s pin, via `harness/vendor_effects.py`.
-pub const PIN: &str = "master (e59b7b89)";
+pub const PIN: &str = "v0.4.2";
 
 /// `data/effects/registry.yml`, verbatim.
 pub const REGISTRY_YML: &str =
@@ -114,7 +114,7 @@ pub const CORE_SHA256: &str =
 /// extraction's output rather than an upstream file's bytes — which is exactly
 /// what has to stay stable: a re-pin that moves a `%i[…]` literal moves this.
 pub const MUTATORS_SHA256: &str =
-    "dc7d009df9ccbbb092c98867814aae08252fcfd6807b2e2be49ae1b8996b631f";
+    "05f648d90176a31d03a476f812dcf546294357c2e417daa4e4cf8492dc694812";
 
 static REGISTRY: LazyLock<Registry> = LazyLock::new(|| {
     Registry::from_yaml_str(REGISTRY_YML).expect("vendored registry.yml must parse")

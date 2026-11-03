@@ -66,6 +66,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 142,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_jjj' for 1 | 2"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 185,
       "column": 9,
       "severity": "error",

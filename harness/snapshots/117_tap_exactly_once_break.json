@@ -87,6 +87,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 180,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `push' for 1 | 2"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 196,
       "column": 4,
       "severity": "error",
