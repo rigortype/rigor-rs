@@ -10,6 +10,27 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 145,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `frobnicate_z9' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 150,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `frobnicate_q4' for Array[String]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 163,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `frobnicate_q5' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 303,
       "column": 17,
       "severity": "error",
