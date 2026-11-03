@@ -22,7 +22,7 @@ CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
   standing exception tables EMPTY; new entries are real findings
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
-State (verified 2026-11-04, at `v0.4.0`): harness **120 fixtures / 0
+State (verified 2026-11-04, at `v0.4.0`): harness **122 fixtures / 0
 unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 779
 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
 Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
