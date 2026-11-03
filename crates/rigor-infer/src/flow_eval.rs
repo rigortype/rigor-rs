@@ -2321,16 +2321,13 @@ impl<'i> Typer<'i> {
             // always-truthy on the reference).
             other => {
                 let span = other.span();
-                let is_loop = matches!(other, Node::Loop { .. });
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, span, env, interner);
                 widen_flow_writes(writes, span, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
-                if is_loop {
-                    self.widen_loop_exit(ast, id, env, interner);
-                }
+                self.widen_loop_exits_within(ast, span, env, interner);
             }
         }
     }

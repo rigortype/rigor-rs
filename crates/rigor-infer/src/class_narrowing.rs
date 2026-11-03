@@ -2245,7 +2245,7 @@ impl<'i> Typer<'i> {
 /// the lowered `else`-clause / parenthesized-group shape; a real
 /// `begin`/`rescue` declines, its tail `return` may be skipped by a raise
 /// before it).
-fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
+pub(crate) fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
     match body.last() {
         Some(&last) => stmt_terminates(ast, last),
         None => false,

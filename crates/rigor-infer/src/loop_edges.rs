@@ -27,7 +27,7 @@ use crate::Typer;
 
 /// One edge's effect on a local's carrier `T`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Edge {
+pub(crate) enum Edge {
     /// The edge keeps `T` exactly.
     Keep,
     /// The edge is unreachable for `T` (the reference narrows to `Bot`).
@@ -38,7 +38,7 @@ enum Edge {
 
 /// `a` then `b` on the same edge (`&&`'s truthy edge): an unreachable or
 /// unmodelled first step decides alone.
-fn seq(a: Edge, b: impl FnOnce() -> Edge) -> Edge {
+pub(crate) fn seq(a: Edge, b: impl FnOnce() -> Edge) -> Edge {
     match a {
         Edge::Keep => b(),
         other => other,
@@ -46,11 +46,40 @@ fn seq(a: Edge, b: impl FnOnce() -> Edge) -> Edge {
 }
 
 /// The join of two edges' scopes. `T ∪ Bot` is `T`.
-fn join(a: Edge, b: Edge) -> Edge {
+pub(crate) fn join(a: Edge, b: Edge) -> Edge {
     match (a, b) {
         (Edge::Other, _) | (_, Edge::Other) => Edge::Other,
         (Edge::Keep, _) | (_, Edge::Keep) => Edge::Keep,
         (Edge::Empty, Edge::Empty) => Edge::Empty,
+    }
+}
+
+/// What a guard narrows: a local, or a constant read keyed by its spelling
+/// (upstream `1be2fd0b` keeps a constant's narrowing in a scope table keyed
+/// by spelling — `::File` and `File` are different keys there, probes
+/// g3 e/f) and whether it is rooted.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub(crate) enum Subject {
+    Local(String),
+    Const(String, bool),
+}
+
+impl Subject {
+    /// The subject `id` reads, if it is a bare local or static constant.
+    pub(crate) fn of(ast: &LoweredAst, id: NodeId) -> Option<Subject> {
+        match ast.get(id) {
+            Node::LocalVariableRead { name, .. } => Some(Subject::Local(name.clone())),
+            Node::ConstantRead { name, dynamic_base: false, rooted, .. } if !name.is_empty() => {
+                let rooted = *rooted || name.starts_with("::");
+                Some(Subject::Const(name.trim_start_matches("::").to_string(), rooted))
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `id` is a read of this subject.
+    pub(crate) fn is_read(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        Subject::of(ast, id).as_ref() == Some(self)
     }
 }
 
@@ -74,11 +103,38 @@ impl<'i> Typer<'i> {
         if matches!(kind, LoopKind::For) {
             return Vec::new();
         }
-        let mut out = Vec::new();
-        local_reads(ast, *p, &mut out);
+        let mut out: Vec<String> = self
+            .subjects_within(ast, *p)
+            .into_iter()
+            .filter_map(|(s, _)| match s {
+                Subject::Local(n) => Some(n),
+                Subject::Const(..) => None,
+            })
+            .collect();
         out.sort();
-        out.dedup();
         out
+    }
+
+    /// [`Typer::widen_loop_exit`] for every `while`/`until` loop inside
+    /// `span` (the statement an engine just stepped over without descending,
+    /// which may hold a nested loop — `while c; until h.is_a?(X); end; end`).
+    pub(crate) fn widen_loop_exits_within(
+        &self,
+        ast: &LoweredAst,
+        span: Span,
+        env: &mut crate::TypeEnv,
+        interner: &mut Interner,
+    ) {
+        let loops: Vec<NodeId> = ast
+            .iter()
+            .filter(|(_, n)| {
+                matches!(n, Node::Loop { span: s, .. } if span.0 <= s.0 && s.1 <= span.1)
+            })
+            .map(|(id, _)| id)
+            .collect();
+        for id in loops {
+            self.widen_loop_exit(ast, id, env, interner);
+        }
     }
 
     /// Widen in `env` every predicate local of loop `id` whose binding the
@@ -174,8 +230,26 @@ impl<'i> Typer<'i> {
         edge: bool,
         interner: &Interner,
     ) -> Edge {
-        if !reads_local(ast, pred, local) {
-            // An operand that never mentions the local leaves it alone on
+        self.subject_edge(ast, pred, &Subject::Local(local.to_string()), ty, edge, false, interner)
+    }
+
+    /// [`Typer::edge_effect`] over any guard [`Subject`]. With
+    /// `respond_only` every atom but `subject.respond_to?(:m)` counts as
+    /// keeping the carrier — for a caller whose other engines already model
+    /// those atoms.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn subject_edge(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+        subject: &Subject,
+        ty: TypeId,
+        edge: bool,
+        respond_only: bool,
+        interner: &Interner,
+    ) -> Edge {
+        if !self.reads_subject(ast, pred, subject) {
+            // An operand that never mentions the subject leaves it alone on
             // both edges — unless it folds, which makes one edge dead
             // (`… && false`): decline that rather than model it.
             return if self.expr_truthiness(ast, pred, &mut Vec::new()).is_some() {
@@ -184,24 +258,33 @@ impl<'i> Typer<'i> {
                 Edge::Keep
             };
         }
+        let eff = |n: NodeId, e: bool| {
+            self.subject_edge(ast, n, subject, ty, e, respond_only, interner)
+        };
+        let atom = |e: Edge| if respond_only { Edge::Keep } else { e };
         match ast.get(pred) {
             Node::Statements { body, kind: StatementsKind::Sequence, .. } if body.len() == 1 => {
-                self.edge_effect(ast, body[0], local, ty, edge, interner)
+                eff(body[0], edge)
             }
-            Node::LocalVariableRead { name, .. } if name == local => {
-                match self.truthiness(interner, ty) {
-                    Some(t) if t == edge => Edge::Keep,
-                    Some(_) => Edge::Empty,
-                    None => Edge::Other,
-                }
-            }
+            _ if subject.is_read(ast, pred) => atom(match self.truthiness(interner, ty) {
+                Some(t) if t == edge => Edge::Keep,
+                Some(_) => Edge::Empty,
+                None => Edge::Other,
+            }),
             Node::Logical { left, right, is_and, .. } => {
                 let (l, r) = (*left, *right);
-                let eff = |n: NodeId, e: bool| self.edge_effect(ast, n, local, ty, e, interner);
+                // A constant's narrowing is a scope-table entry: a join with
+                // a path that never narrowed it drops the entry, so `Keep`
+                // absorbs (`if File.respond_to?(:x) and File.respond_to?(:y)
+                // … else File.x` fires on the reference).
+                let j = |a: Edge, b: Edge| match subject {
+                    Subject::Const(..) if a == Edge::Keep || b == Edge::Keep => Edge::Keep,
+                    _ => join(a, b),
+                };
                 match (*is_and, edge) {
                     (true, true) => seq(eff(l, true), || eff(r, true)),
-                    (true, false) => join(eff(l, false), seq(eff(l, true), || eff(r, false))),
-                    (false, true) => join(eff(l, true), seq(eff(l, false), || eff(r, true))),
+                    (true, false) => j(eff(l, false), seq(eff(l, true), || eff(r, false))),
+                    (false, true) => j(eff(l, true), seq(eff(l, false), || eff(r, true))),
                     (false, false) => seq(eff(l, false), || eff(r, false)),
                 }
             }
@@ -209,32 +292,65 @@ impl<'i> Typer<'i> {
                 if block_body.is_empty() =>
             {
                 let (r, span) = (*r, *span);
-                let recv_is_local = matches!(
-                    ast.get(r),
-                    Node::LocalVariableRead { name, .. } if name == local
-                );
+                let recv_is_subject = subject.is_read(ast, r);
                 match (method.as_str(), args.as_slice()) {
-                    ("!", []) => self.edge_effect(ast, r, local, ty, !edge, interner),
-                    ("nil?", []) if recv_is_local => match self.nilness(interner, ty) {
+                    ("!", []) => eff(r, !edge),
+                    ("nil?", []) if recv_is_subject => atom(match self.nilness(interner, ty) {
                         Some(is_nil) if is_nil == edge => Edge::Keep,
                         Some(_) => Edge::Empty,
                         None => Edge::Other,
-                    },
-                    ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_local => {
-                        self.class_edge(ast, *c, span, method == "instance_of?", ty, edge, interner)
+                    }),
+                    ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => atom(
+                        self.class_edge(ast, *c, span, method == "instance_of?", ty, edge, interner),
+                    ),
+                    ("===", [arg]) if subject.is_read(ast, *arg) && !self.reads_subject(ast, r, subject) => {
+                        atom(self.class_edge(ast, r, span, false, ty, edge, interner))
                     }
-                    ("===", [arg])
-                        if matches!(
-                            ast.get(*arg),
-                            Node::LocalVariableRead { name, .. } if name == local
-                        ) && !reads_local(ast, r, local) =>
-                    {
-                        self.class_edge(ast, r, span, false, ty, edge, interner)
+                    ("respond_to?", [m]) if recv_is_subject => {
+                        let name = match ast.get(*m) {
+                            Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => {
+                                Some(value.as_str())
+                            }
+                            _ => None,
+                        };
+                        match name {
+                            Some(m) => self.respond_edge(ty, m, edge, interner),
+                            None => Edge::Other,
+                        }
                     }
-                    _ => Edge::Other,
+                    _ => atom(Edge::Other),
                 }
             }
-            _ => Edge::Other,
+            _ => atom(Edge::Other),
+        }
+    }
+
+    /// `subject.respond_to?(:m)` (upstream `1be2fd0b`, rigor#1453): the
+    /// truthy edge drops every member whose class RBS knows to lack `m`, and
+    /// a carrier with no member left reads `Dynamic[top]`. It keeps the
+    /// carrier only when the carrier provably has `m`. The falsey edge keeps
+    /// it (probe: `unless s.respond_to?(:upcase); s.frob; end` fires `for
+    /// "x"`; `unless File.respond_to?(:makedirs)` fires `for
+    /// singleton(File)`).
+    fn respond_edge(&self, ty: TypeId, method: &str, edge: bool, interner: &Interner) -> Edge {
+        if !edge {
+            return Edge::Keep;
+        }
+        let has = match interner.get(ty) {
+            Type::Singleton(class) => self
+                .source
+                .class_name_for_id(*class)
+                .map(|n| self.index.class_has_singleton_method(n, method)),
+            Type::Constant(_) | Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape(_) => self
+                .index
+                .class_name_of(interner, ty)
+                .map(|n| self.index.class_has_method(n, method)),
+            _ => None,
+        };
+        if has == Some(true) {
+            Edge::Keep
+        } else {
+            Edge::Other
         }
     }
 
@@ -288,12 +404,37 @@ impl<'i> Typer<'i> {
 }
 
 impl<'i> Typer<'i> {
+    /// Whether `id`'s span holds a read of `subject` (span containment, so
+    /// a read an unmodelled construct keeps off the child links still
+    /// counts — the decline side).
+    pub(crate) fn reads_subject(&self, ast: &LoweredAst, id: NodeId, subject: &Subject) -> bool {
+        let idx = self.reach_index(ast);
+        let span = ast.get(id).span();
+        let found = idx.nodes_within(ast, span).any(|n| subject.is_read(ast, n));
+        found
+    }
+
+    /// Every subject read inside `id`'s span, deduplicated, in start order.
+    pub(crate) fn subjects_within(&self, ast: &LoweredAst, id: NodeId) -> Vec<(Subject, NodeId)> {
+        let idx = self.reach_index(ast);
+        let span = ast.get(id).span();
+        let mut out: Vec<(Subject, NodeId)> = Vec::new();
+        for n in idx.nodes_within(ast, span) {
+            if let Some(s) = Subject::of(ast, n) {
+                if !out.iter().any(|(o, _)| *o == s) {
+                    out.push((s, n));
+                }
+            }
+        }
+        out
+    }
+
     /// `Some(true)` when every value of `ty` is truthy, `Some(false)` when
     /// every value is falsey, `None` otherwise (and for `Dynamic`/`Top`).
     fn truthiness(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
         match interner.get(ty) {
             Type::Constant(s) => Some(!matches!(s, Scalar::Nil | Scalar::Bool(false))),
-            Type::Tuple(_) | Type::HashShape(_) => Some(true),
+            Type::Tuple(_) | Type::HashShape(_) | Type::Singleton(_) => Some(true),
             Type::Nominal { .. } => self.nominal_excludes(interner, ty, "FalseClass")
                 .then(|| self.nominal_excludes(interner, ty, "NilClass"))
                 .and_then(|ok| ok.then_some(true)),
@@ -306,7 +447,7 @@ impl<'i> Typer<'i> {
     fn nilness(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
         match interner.get(ty) {
             Type::Constant(s) => Some(matches!(s, Scalar::Nil)),
-            Type::Tuple(_) | Type::HashShape(_) => Some(false),
+            Type::Tuple(_) | Type::HashShape(_) | Type::Singleton(_) => Some(false),
             Type::Nominal { .. } => self.nominal_excludes(interner, ty, "NilClass").then_some(false),
             _ => None,
         }
@@ -325,25 +466,3 @@ impl<'i> Typer<'i> {
         )
     }
 }
-
-/// Every `LocalVariableRead` name under `id`.
-fn local_reads(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
-    let span = ast.get(id).span();
-    for (_, n) in ast.iter() {
-        if let Node::LocalVariableRead { name, span: s } = n {
-            if span.0 <= s.0 && s.1 <= span.1 {
-                out.push(name.clone());
-            }
-        }
-    }
-}
-
-/// Whether `id`'s span holds a read of `local`.
-fn reads_local(ast: &LoweredAst, id: NodeId, local: &str) -> bool {
-    let span = ast.get(id).span();
-    ast.iter().any(|(_, n)| {
-        matches!(n, Node::LocalVariableRead { name, span: s }
-            if name == local && span.0 <= s.0 && s.1 <= span.1)
-    })
-}
-
