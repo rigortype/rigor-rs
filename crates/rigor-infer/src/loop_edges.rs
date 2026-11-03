@@ -126,9 +126,19 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         let idx = self.reach_index(ast);
+        // A loop inside a block or `->` body nested in `span` narrows that
+        // closure's scope only: its exit edge never reaches past the closure.
+        let closures: Vec<Span> = idx
+            .nodes_within(ast, span)
+            .filter_map(|id| closure_extent(ast.get(id)))
+            .collect();
         let loops: Vec<NodeId> = idx
             .nodes_within(ast, span)
-            .filter(|&id| matches!(ast.get(id), Node::Loop { .. }))
+            .filter(|&id| {
+                let s = ast.get(id).span();
+                matches!(ast.get(id), Node::Loop { .. })
+                    && !closures.iter().any(|c| c.0 <= s.0 && s.1 <= c.1)
+            })
             .collect();
         for id in loops {
             self.widen_loop_exit(ast, id, env, interner);
@@ -475,5 +485,15 @@ impl<'i> Typer<'i> {
             self.index.class_ordering(other, name),
             ClassOrdering::Disjoint | ClassOrdering::Superclass
         )
+    }
+}
+
+/// The body extent of a literal block (`Call::block_span`) or the span of a
+/// `->` — the closures whose scope a loop inside them narrows.
+pub(crate) fn closure_extent(n: &Node) -> Option<Span> {
+    match n {
+        Node::Call { block_span: Some(b), .. } => Some(*b),
+        Node::Lambda { span, .. } => Some(*span),
+        _ => None,
     }
 }

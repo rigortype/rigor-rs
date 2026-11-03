@@ -152,6 +152,8 @@ impl<'i> Typer<'i> {
     fn collect_loop_edges(&self, ast: &LoweredAst) -> Vec<LoopEdges> {
         let writes = collect_flow_writes(ast);
         let defs = crate::method_body_spans(ast);
+        let closures: Vec<rigor_parse::Span> =
+            ast.iter().filter_map(|(_, n)| crate::loop_edges::closure_extent(n)).collect();
         let mut out = Vec::new();
         for (id, n) in ast.iter() {
             let Node::Loop { span, .. } = n else { continue };
@@ -176,7 +178,19 @@ impl<'i> Typer<'i> {
                 .filter(|d| d.0 <= span.0 && span.1 <= d.1)
                 .min_by_key(|d| d.1 - d.0)
                 .copied();
-            out.push(LoopEdges { id, span, body: Self::loop_body_hull(ast, id), def, locals });
+            let closure = closures
+                .iter()
+                .filter(|c| c.0 <= span.0 && span.1 <= c.1)
+                .min_by_key(|c| c.1 - c.0)
+                .copied();
+            out.push(LoopEdges {
+                id,
+                span,
+                body: Self::loop_body_hull(ast, id),
+                def,
+                closure,
+                locals,
+            });
         }
         out
     }
@@ -188,7 +202,8 @@ impl<'i> Typer<'i> {
     /// so a predicate local whose edge the reference does not leave
     /// unchanged ([`Typer::loop_edge_keeps`]) is widened at the site — the
     /// decline side. A site after the loop is covered until the local's next
-    /// write; a loop inside a `def` the site is not in is a different scope.
+    /// write; a loop inside a `def` or a block / `->` body the site is not in
+    /// narrows a different scope.
     fn loop_edge_overlay(
         &self,
         ast: &LoweredAst,
@@ -198,7 +213,10 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         for l in &flow.loops {
-            if l.def.is_some_and(|d| !(d.0 <= site.0 && site.1 <= d.1)) {
+            let outside = |c: Option<rigor_parse::Span>| {
+                c.is_some_and(|c| !(c.0 <= site.0 && site.1 <= c.1))
+            };
+            if outside(l.def) || outside(l.closure) {
                 continue;
             }
             let side = if l.body.is_some_and(|b| b.0 <= site.0 && site.1 <= b.1) {
@@ -2576,6 +2594,9 @@ struct LoopEdges {
     /// The innermost `def` around the loop — a site outside it reads a
     /// different local scope.
     def: Option<rigor_parse::Span>,
+    /// The innermost block / `->` body around the loop: its exit edge
+    /// narrows that closure's scope only.
+    closure: Option<rigor_parse::Span>,
     /// `(predicate local, first write of it after the loop)`.
     locals: Vec<(String, Option<usize>)>,
 }
