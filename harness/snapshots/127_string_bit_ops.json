@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/127_string_bit_ops.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 12,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frobnicate_t' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 16,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `quux_w' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `frob_ctl' for \"ab\""
+    }
+  ]
+}

@@ -216,6 +216,25 @@ impl SourceIndex {
     /// `resolve_override_ancestor_name`: try `<prefix>::<raw>` for each enclosing
     /// scope of the subclass, longest-prefix first, falling back to the bare name.
     /// A leading `::` on the raw name is stripped (a top-level absolute path).
+    /// Upstream v0.4.2 (ADR-121 WD7): whether the constant `raw`, read in the
+    /// lexical scope `prefix`, names a class or module the PROJECT declares
+    /// (the reference's `project_module?`; Ruby's lexical lookup, longest
+    /// prefix first). A `false` reads as "a module whose refinements nothing
+    /// here can read", the declining side.
+    pub fn declares_constant_at(&self, prefix: &[String], raw: &str) -> bool {
+        if let Some(rooted) = raw.strip_prefix("::") {
+            return self.override_classes.contains_key(rooted);
+        }
+        (0..=prefix.len()).rev().any(|i| {
+            let candidate = if i == 0 {
+                raw.to_string()
+            } else {
+                format!("{}::{}", prefix[..i].join("::"), raw)
+            };
+            self.override_classes.contains_key(&candidate)
+        })
+    }
+
     pub(crate) fn resolve_override_ancestor(&self, subclass: &str, raw: &str) -> Option<String> {
         let raw = raw.strip_prefix("::").unwrap_or(raw);
         let segments: Vec<&str> = subclass.split("::").collect();
