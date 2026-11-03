@@ -1,0 +1,110 @@
+{
+  "fixture": "harness/corpus/120_loop_entry_exit_edges.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob_b2' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 40,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob_e1' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 49,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob_f1' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob_f2' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 61,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob_g2' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob_i1' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 86,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob_k2' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 95,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob_l1' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 103,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob_m1' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 105,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob_m2' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 123,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frob_o1' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 125,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frob_o2' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 151,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `frob_t4b' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 156,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `frob_t5a' for Array"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 158,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `frob_t5b' for Array"
+    }
+  ]
+}

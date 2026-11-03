@@ -359,9 +359,10 @@ impl<'i> Typer<'i> {
     /// the truthy edge and collapses it on the falsey one (probes: `until
     /// h.is_a?(Array)` fires `for Array`, `while h.is_a?(Array)` is silent
     /// after the loop); `Disjoint` is the mirror image (`while
-    /// h.is_a?(String)` fires after the loop and is silent inside). Every
-    /// other ordering — a proper subclass guard that narrows, an unresolvable
-    /// class that widens a nominal — declines.
+    /// h.is_a?(String)` fires after the loop and is silent inside), and an
+    /// unorderable guard keeps the carrier on its falsey edge. Every other
+    /// answer — a proper subclass guard that narrows, an unorderable guard's
+    /// widening truthy edge — declines.
     #[allow(clippy::too_many_arguments)]
     fn class_edge(
         &self,
@@ -398,6 +399,10 @@ impl<'i> Typer<'i> {
             (ClassOrdering::Subclass | ClassOrdering::Equal, false) => Edge::Empty,
             (ClassOrdering::Disjoint, true) => Edge::Empty,
             (ClassOrdering::Disjoint, false) => Edge::Keep,
+            // The falsey edge of an unorderable guard keeps the carrier
+            // (`begin … end while h.is_a?(Unknown)` fires `for Array` after
+            // the loop) — only its truthy edge widens.
+            (ClassOrdering::Unknown, false) => Edge::Keep,
             _ => Edge::Other,
         }
     }
