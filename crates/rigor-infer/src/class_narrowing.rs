@@ -1982,7 +1982,7 @@ impl<'i> Typer<'i> {
     /// the project declares the name in a lexically visible scope — the same
     /// predicate `resolved_static_constant` declines on — so the guard can
     /// collapse a precise carrier without ever narrowing TO a project nominal.
-    fn guard_constant(
+    pub(crate) fn guard_constant(
         &self,
         ast: &LoweredAst,
         id: NodeId,
@@ -2245,7 +2245,7 @@ impl<'i> Typer<'i> {
 /// the lowered `else`-clause / parenthesized-group shape; a real
 /// `begin`/`rescue` declines, its tail `return` may be skipped by a raise
 /// before it).
-fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
+pub(crate) fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
     match body.last() {
         Some(&last) => stmt_terminates(ast, last),
         None => false,

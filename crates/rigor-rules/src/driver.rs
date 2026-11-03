@@ -91,7 +91,12 @@ pub fn analyze_with_source_and_folder(
     // whole call site is skipped rather than one rule.
     let narrowing = typer.class_narrowing_pass(ast, interner);
     let class_snaps = narrowing.calls;
-    let dead_calls = narrowing.dead;
+    let mut dead_calls = narrowing.dead;
+    // Upstream `1be2fd0b`: a constant receiver under a guard on the same
+    // constant, and any receiver under its own `respond_to?(:m)` guard, may
+    // read a narrowed (often `Dynamic[top]`) binding on the reference where
+    // the port still holds the unguarded carrier — skipped the same way.
+    dead_calls.extend(typer.guard_suppressed_calls(ast, interner));
     // Collection-shape snapshot map (collection-shape slice, stage 1): call node
     // id -> "Array"/"Hash", the class a bare-local receiver's collection carrier
     // (literal seed, mutator-widened kept nominal, or tier-folded chain result)

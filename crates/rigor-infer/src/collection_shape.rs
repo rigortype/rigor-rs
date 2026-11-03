@@ -332,11 +332,21 @@ impl<'i> Typer<'i> {
                 // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).
                 self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
             }
-            // Unmodeled statement (`while`/`until`, ivar writes, …): widen every
+            // `while`/`until`/`for`: unmodeled like the arm below — widen
+            // every local it writes, do NOT descend — plus the exit edge
+            // (upstream #1359): a predicate local the reference's exit
+            // narrowing changes is widened too (`until h.is_a?(Unknown)`).
+            Node::Loop { span, .. } => {
+                let span = *span;
+                widen_flow_writes(ctx.writes, span, tenv, interner);
+                self.widen_loop_exits_within(ast, span, tenv, interner);
+            }
+            // Unmodeled statement (ivar writes, …): widen every
             // local it writes and do NOT descend.
             other => {
                 let span = other.span();
                 widen_flow_writes(ctx.writes, span, tenv, interner);
+                self.widen_loop_exits_within(ast, span, tenv, interner);
             }
         }
     }
@@ -456,8 +466,10 @@ impl<'i> Typer<'i> {
                     }
                 } else {
                     // Expression-position block: no descent (the position rule),
-                    // and every contained write widens.
+                    // and every contained write widens — and so does a nested
+                    // loop's exit-edge local (upstream #1359).
                     widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    self.widen_loop_exits_within(ast, call_span, tenv, interner);
                 }
                 // Keep-nominal widening — unless something inside the call
                 // REBOUND the same local (`output << (output = x)`).
@@ -565,6 +577,7 @@ impl<'i> Typer<'i> {
                 self.coll_flow_expr(ast, left, &mut scratch, ctx, interner, out, false);
                 self.coll_flow_expr(ast, right, &mut scratch, ctx, interner, out, false);
                 widen_flow_writes(ctx.writes, lspan, tenv, interner);
+                self.widen_loop_exits_within(ast, lspan, tenv, interner);
             }
             Node::LocalVariableWrite { name, value, .. } => {
                 let (name, value) = (name.clone(), *value);
@@ -610,6 +623,7 @@ impl<'i> Typer<'i> {
             other => {
                 let span = other.span();
                 widen_flow_writes(ctx.writes, span, tenv, interner);
+                self.widen_loop_exits_within(ast, span, tenv, interner);
             }
         }
     }
@@ -679,6 +693,7 @@ impl<'i> Typer<'i> {
             let Node::When { conditions, body, .. } = ast.get(br) else {
                 // `case`/`in` pattern carrier — unmodeled, no descent.
                 widen_flow_writes(ctx.writes, case_span, tenv, interner);
+                self.widen_loop_exits_within(ast, case_span, tenv, interner);
                 return;
             };
             let (conditions, body) = (conditions.clone(), body.clone());

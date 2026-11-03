@@ -209,8 +209,9 @@ def b17
   h.frobnicate_b17b
 end
 
-# (18) a `while` predicate narrows nothing on this port, so nothing escapes it
-# either (`b31a` is a recorded coverage gap: the reference fires there).
+# (18) since `v0.4.0` (`900bc64c`, rigor#1359) the body enters on the guard's
+# truthy edge — widened, so `b31a` is silent — and the widened body end joins
+# into the exit scope, so `b31b` goes silent too (fixture 120 has the rest).
 def b31
   h = Array.new
   while h.is_a?(UnknownZzzClass)

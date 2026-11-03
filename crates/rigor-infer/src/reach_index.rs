@@ -447,6 +447,22 @@ impl ReachIndex {
     /// `None` wherever it sat), restricted through `by_start` to the nodes
     /// that can contain the read — every one starts between `stmt`'s start
     /// and the read's — and memoized per `(stmt, use_span)`.
+    /// Every node whose span lies inside `span` (equal spans count), in
+    /// start order — the `by_start` range scan, so a small span costs only
+    /// the nodes it holds.
+    pub(crate) fn nodes_within<'a>(
+        &'a self,
+        ast: &'a LoweredAst,
+        span: Span,
+    ) -> impl Iterator<Item = NodeId> + 'a {
+        let lo = self.by_start.partition_point(|&(s, _)| s < span.0);
+        let hi = self.by_start.partition_point(|&(s, _)| s < span.1.max(span.0 + 1));
+        self.by_start[lo..hi.max(lo)]
+            .iter()
+            .map(|&(_, id)| id)
+            .filter(move |&id| contains(span, ast.get(id).span()))
+    }
+
     pub(crate) fn nested_section_owner(
         &self,
         ast: &LoweredAst,

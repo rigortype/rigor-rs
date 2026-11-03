@@ -55,6 +55,8 @@ mod dead;
 mod expr_type;
 mod flow_eval;
 mod flow_writes;
+mod guard_suppression;
+mod loop_edges;
 mod nilable;
 mod reach;
 mod reach_index;

@@ -59,42 +59,28 @@
     },
     {
       "rule": "call.undefined-method",
-      "line": 217,
-      "column": 7,
-      "severity": "error",
-      "message": "undefined method `frobnicate_b31a' for Array"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 219,
-      "column": 5,
-      "severity": "error",
-      "message": "undefined method `frobnicate_b31b' for Array"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 225,
+      "line": 226,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_b26a' for Array"
     },
     {
       "rule": "call.undefined-method",
-      "line": 263,
+      "line": 264,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_b41b' for [1, 2]"
     },
     {
       "rule": "call.undefined-method",
-      "line": 270,
+      "line": 271,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_b42b' for { a: 1 }"
     },
     {
       "rule": "call.undefined-method",
-      "line": 278,
+      "line": 279,
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_b43b' for [1, 2]"
