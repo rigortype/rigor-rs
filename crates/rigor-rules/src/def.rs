@@ -32,6 +32,16 @@ fn visibility_word(v: rigor_parse::Visibility) -> &'static str {
     }
 }
 
+/// The reference's `IMPLICITLY_PRIVATE_METHODS` (`LIFECYCLE_HOOKS` +
+/// `respond_to_missing?`, upstream #1723).
+const IMPLICITLY_PRIVATE_METHODS: &[&str] = &[
+    "initialize",
+    "initialize_copy",
+    "initialize_dup",
+    "initialize_clone",
+    "respond_to_missing?",
+];
+
 /// Apply `def.override-visibility-reduced` to one overriding instance method.
 ///
 /// Fires (returns `Some`) iff ALL of these hold — each `None` is a DECLINE (a
@@ -69,6 +79,12 @@ pub(crate) fn check_override_visibility(
     override_vis: rigor_parse::Visibility,
     name_span: (usize, usize),
 ) -> Option<Diagnostic> {
+    // Upstream v0.4.2 (#1723, ADR-35 WD10): CRuby makes these private on every
+    // non-singleton `def` whatever section it is written in, so a discovered
+    // visibility for them is not the runtime one and no reduction is provable.
+    if IMPLICITLY_PRIVATE_METHODS.contains(&method) {
+        return None;
+    }
     // Gate 2: a project ancestor must DEFINE the method.
     // Upstream v0.4.1: the parent is read off the Ruby-order chain, and only
     // where the reference's `DefinerResolution` answers `Known`.

@@ -400,5 +400,20 @@ pub fn analyze_with_source_and_folder(
     // `type_of` transparently here.
     ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut out);
 
+    // Upstream v0.4.2 (#1706 / issue #1697): a module the project mixes into
+    // `Object` gives every object its instance methods, so no receiver's
+    // `call.undefined-method` can witness a name such a module declares (the
+    // reference's `object_mixin_may_define?`, asked last in both the scalar and
+    // the union rule). Applied once here over every undefined-method path; the
+    // reference's "the receiver reaches `Object`" gate is not modelled, so a
+    // `BasicObject` receiver declines too (a superset).
+    out.retain(|d| {
+        d.rule_id != crate::CALL_UNDEFINED_METHOD
+            || !d
+                .method_name
+                .as_deref()
+                .is_some_and(|m| source.object_mixin_may_define(index, m, true))
+    });
+
     out
 }

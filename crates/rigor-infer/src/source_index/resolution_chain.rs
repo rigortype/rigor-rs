@@ -48,6 +48,9 @@ pub(crate) struct AncestryIndex {
     groups: HashMap<String, Vec<(bool, Vec<String>)>>,
     decl_files: HashMap<String, usize>,
     def_owners: HashSet<String>,
+    /// Upstream v0.4.2 (#1706): every file's top-level `include` names
+    /// ([`AncestryFacts::toplevel_includes`]), project-wide, deduplicated.
+    toplevel_includes: Vec<String>,
 }
 
 impl AncestryIndex {
@@ -74,6 +77,11 @@ impl AncestryIndex {
         self.contested.extend(facts.contested_visibilities.iter().cloned());
         self.dirty.extend(facts.dirty_owners.iter().cloned());
         self.def_owners.extend(facts.def_owners.iter().cloned());
+        for raw in &facts.toplevel_includes {
+            if !self.toplevel_includes.contains(raw) {
+                self.toplevel_includes.push(raw.clone());
+            }
+        }
         for (owner, prepend, names) in &facts.direct_mixins {
             self.groups.entry(owner.clone()).or_default().push((*prepend, names.clone()));
         }
@@ -470,6 +478,99 @@ fn first_definer(
 /// `external_lacks?` — true only for an ancestor RBS knows whose declaration
 /// lacks `method`. The spelling resolves against `from`'s lexical nesting,
 /// most qualified first; a name RBS does not know may answer.
+/// Upstream v0.4.2 (#1706) — the [`SourceIndex::object_mixin_may_define`]
+/// answer for an external entry `raw` written from `from`: the first
+/// candidate the bundled RBS declares answers by its method table (a bare
+/// call also reaches a module's singleton function, `include Math; sqrt(2)`);
+/// an entry no candidate declares is OPAQUE, which answers a bare call and
+/// not a call with a receiver (the reference's `EXPLICIT_RECEIVER_SKIP`).
+fn external_may_define(core: &CoreIndex, from: &str, raw: &str, method: &str, explicit: bool) -> bool {
+    let raw = raw.strip_prefix("::").unwrap_or(raw);
+    let segments: Vec<&str> = from.split("::").collect();
+    for i in (0..segments.len()).rev() {
+        let cand = if i == 0 {
+            raw.to_string()
+        } else {
+            format!("{}::{}", segments[..i].join("::"), raw)
+        };
+        let known = if core.knows_qualified_class(&cand) {
+            Some(core.qualified_class_has_method(&cand, method))
+        } else if !cand.contains("::") && core.knows_toplevel_class(&cand) {
+            Some(core.class_has_method(&cand, method))
+        } else {
+            None
+        };
+        if let Some(has) = known {
+            // `class_has_singleton_method` also answers `Class`/`Module`
+            // methods the reference's own-declaration test excludes: a
+            // superset, so it only declines more.
+            return has || (!explicit && core.class_has_singleton_method(&cand, method));
+        }
+    }
+    !explicit
+}
+
+impl SourceIndex {
+    /// Upstream v0.4.2 (#1706 / issue #1697; `Inference::ObjectMixins.may_define?`)
+    /// — whether a module the project mixes into `Object` may define `method`:
+    /// a top-level `include M` in any analysed file (`main.include`, i.e.
+    /// `Object.include`), or an `include M` in a project `class Object`, or
+    /// `Object`'s own project definitions. `explicit` is the receiver form
+    /// (`call.undefined-method`): it counts only a declared definition, while a
+    /// bare top-level call (`call.unresolved-toplevel`) is also answered by an
+    /// unresolvable module, whose surface cannot be enumerated.
+    ///
+    /// A pure SILENCER, conservative on every uncertainty: a project module the
+    /// port cannot chain, a wildcard or hook-dirty entry, and a private or
+    /// singleton-only RBS declaration all answer `true` where the reference may
+    /// not, which only declines more.
+    pub fn object_mixin_may_define(&self, core: &CoreIndex, method: &str, explicit: bool) -> bool {
+        let mut edges: Vec<(&str, &str)> =
+            self.ancestry.toplevel_includes.iter().map(|r| ("", r.as_str())).collect();
+        if let Some(obj) = self.override_classes.get("Object") {
+            edges.extend(obj.includes.iter().map(|r| ("Object", r.as_str())));
+            if self.known_user("Object") && self.records_name("Object", method) {
+                return true;
+            }
+        }
+        if let Some(listed) = self.ancestry.include_listed.get("Object") {
+            edges.extend(listed.iter().map(|r| ("Object", r.as_str())));
+        }
+        edges.into_iter().any(|(owner, raw)| self.mixin_edge_may_define(core, owner, raw, method, explicit))
+    }
+
+    fn mixin_edge_may_define(
+        &self,
+        core: &CoreIndex,
+        owner: &str,
+        raw: &str,
+        method: &str,
+        explicit: bool,
+    ) -> bool {
+        if raw == MIXIN_WILDCARD {
+            return !explicit;
+        }
+        match self.resolve_override_ancestor(owner, raw) {
+            Some(p) if self.known_user(&p) => {
+                let Some(chain) = self.instance_chain(&p) else {
+                    return true;
+                };
+                chain.entries.iter().any(|e| match e {
+                    ChainEntry::External { raw, from } => {
+                        external_may_define(core, from, raw, method, explicit)
+                    }
+                    ChainEntry::Project(q) => {
+                        self.ancestry.wildcard_include(q)
+                            || self.ancestry.dirty.contains(q)
+                            || self.records_name(q, method)
+                    }
+                })
+            }
+            _ => external_may_define(core, owner, raw, method, explicit),
+        }
+    }
+}
+
 fn external_lacks(core: &CoreIndex, from: &str, raw: &str, method: &str) -> bool {
     let segments: Vec<&str> = from.split("::").collect();
     for i in (0..segments.len()).rev() {

@@ -87,6 +87,13 @@ pub struct AncestryFacts {
     /// not) — the reference's `known_user_class?` reads a `def` of either
     /// kind as making a name a project class.
     pub def_owners: Vec<String>,
+    /// Upstream v0.4.2 (#1706 / issue #1697) — the module names of every
+    /// receiverless `include` written as a DIRECT program statement: `main.include`,
+    /// which mixes into `Object` (the reference's `ObjectMixins::TOPLEVEL_INCLUDE_KEY`
+    /// edges). A non-constant argument is [`WILDCARD`]. An `include` in a block, a
+    /// method, a conditional, a `send(:include, …)` and a top-level `extend` are not
+    /// recorded, exactly as the reference's `toplevel_include_owner` leaves them.
+    pub toplevel_includes: Vec<String>,
 }
 
 const TOGGLES: [&str; 4] = ["private", "protected", "public", "module_function"];
@@ -283,6 +290,15 @@ impl Census {
         let complete = !names.is_empty() && names.iter().all(Option::is_some);
         let names: Vec<String> = names.into_iter().flatten().collect();
         let recv = call.receiver();
+        if recv.is_none() && !via_send && kind == "include" && self.frames.len() == 1 && self.is_direct(n)
+        {
+            if complete {
+                self.out.toplevel_includes.extend(names.iter().cloned());
+            } else if !args.is_empty() {
+                self.out.toplevel_includes.push(WILDCARD.to_string());
+            }
+            return;
+        }
         let self_recv = recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
         if recv.is_none() || self_recv {
             let Some(owner) = self.owner() else { return };

@@ -15,6 +15,19 @@ use crate::{catalog, Diagnostic, Severity, CALL_UNRESOLVED_TOPLEVEL};
 /// appears — never a false positive, only a missed witness if wrong.
 const RUNTIME_KERNEL_TOPLEVEL: &[&str] = &["gem"];
 
+/// `MAIN_SINGLETON_CLASS_NAME` in the reference's `check_rules.rb`.
+const MAIN_SINGLETON_CLASS: &str = "RBS::Unnamed::TopLevelSelfClass";
+
+/// The reference's `main_singleton_method?` (upstream #1683): `ruby2_keywords`
+/// (CRuby's `main` has it, RBS does not declare it) or a method RBS core
+/// declares on `RBS::Unnamed::TopLevelSelfClass` (`include`, `using`,
+/// `define_method`, `public`, `private`).
+fn main_singleton_method(index: &CoreIndex, method: &str) -> bool {
+    method == "ruby2_keywords"
+        || (index.knows_qualified_class(MAIN_SINGLETON_CLASS)
+            && index.qualified_class_has_method(MAIN_SINGLETON_CLASS, method))
+}
+
 /// Emit `call.unresolved-toplevel` for every toplevel implicit-self call whose
 /// name is unresolved. Zero-FP gate (fires ⊆ the reference): suppress on the
 /// `Object` RBS surface (`class_has_method("Object", …)` — witnessed-absent only
@@ -77,6 +90,20 @@ pub(crate) fn unresolved_toplevel_diagnostics(
             // (RubyGems' `Kernel#gem`) is the core-only case the net-ssh FP audit
             // surfaced. FP-safe: this only ever silences.
             if RUNTIME_KERNEL_TOPLEVEL.contains(&method.as_str()) {
+                continue;
+            }
+            // Upstream v0.4.2 (#1683 / issue #1383): `main`'s private singleton
+            // methods — read off RBS core's `RBS::Unnamed::TopLevelSelfClass`,
+            // plus `ruby2_keywords`. Judged at every toplevel call site, a
+            // top-level block's body included, exactly as the reference does.
+            if main_singleton_method(index, method) {
+                continue;
+            }
+            // Upstream v0.4.2 (#1706 / issue #1697): a module the project mixes
+            // into `Object` (a top-level `include M` in ANY analysed file, or an
+            // `include M` in `class Object`) may define the name — or, when its
+            // surface is unknown, any name at all.
+            if source.object_mixin_may_define(index, method, false) {
                 continue;
             }
             let severity = catalog(CALL_UNRESOLVED_TOPLEVEL)
