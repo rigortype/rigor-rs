@@ -602,6 +602,10 @@ pub enum Node {
         body: Vec<NodeId>,
         index: Vec<(String, Span)>,
         index_writes: IndexWrites,
+        /// `while` / `until` / `for`, and whether a `while`/`until` is the
+        /// `begin … end while` form whose body runs once before the predicate
+        /// is first tested (upstream #1359's loop-entry edge, `eval_loop`).
+        kind: LoopKind,
         span: Span,
     },
     /// `begin`/`rescue`/`else`/`ensure`. The protected body, each rescue body,
@@ -913,6 +917,22 @@ pub enum Compound {
     /// `h[k] op= v` — stores the dispatched `h[k] op v` result; widens only.
     /// Carries the operator name for the stored-type dispatch.
     Op(String),
+}
+
+/// Which loop a [`Node::Loop`] is. The reference's `eval_loop` enters the
+/// single body pass on the predicate's loop-entry edge — truthy for `while`,
+/// falsey for `until` — unless the body runs before the first test
+/// (`begin … end while`, `begin_modifier`), and narrows the exit scope on the
+/// opposite edge. A `for` lowers its collection into `predicate` and narrows
+/// nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoopKind {
+    /// `while c` (`begin_modifier`: `begin … end while c`).
+    While { begin_modifier: bool },
+    /// `until c` (`begin_modifier`: `begin … end until c`).
+    Until { begin_modifier: bool },
+    /// `for x in coll`.
+    For,
 }
 
 /// Which control-flow jump an argument-less [`Node::Other`] or a

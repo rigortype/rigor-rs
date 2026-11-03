@@ -332,7 +332,16 @@ impl<'i> Typer<'i> {
                 // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).
                 self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
             }
-            // Unmodeled statement (`while`/`until`, ivar writes, …): widen every
+            // `while`/`until`/`for`: unmodeled like the arm below — widen
+            // every local it writes, do NOT descend — plus the exit edge
+            // (upstream #1359): a predicate local the reference's exit
+            // narrowing changes is widened too (`until h.is_a?(Unknown)`).
+            Node::Loop { span, .. } => {
+                let span = *span;
+                widen_flow_writes(ctx.writes, span, tenv, interner);
+                self.widen_loop_exit(ast, id, tenv, interner);
+            }
+            // Unmodeled statement (ivar writes, …): widen every
             // local it writes and do NOT descend.
             other => {
                 let span = other.span();

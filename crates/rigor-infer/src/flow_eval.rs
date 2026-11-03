@@ -89,6 +89,7 @@ impl<'i> Typer<'i> {
                     closure_mutations: Vec::new(),
                     indexed: IndexedFlow::default(),
                     dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
+                    loops: Vec::new(),
                 }
             }
         };
@@ -141,6 +142,87 @@ impl<'i> Typer<'i> {
             closure_mutations: closure_muts,
             indexed,
             dead,
+            loops: self.collect_loop_edges(ast),
+        }
+    }
+
+    /// [`CheckFlow::loops`]: every `while`/`until` loop with a predicate
+    /// local, its body hull, its innermost `def`, and per local the first
+    /// write after the loop (a later binding the overlay must not cover).
+    fn collect_loop_edges(&self, ast: &LoweredAst) -> Vec<LoopEdges> {
+        let writes = collect_flow_writes(ast);
+        let defs = crate::method_body_spans(ast);
+        let mut out = Vec::new();
+        for (id, n) in ast.iter() {
+            let Node::Loop { span, .. } = n else { continue };
+            let span = *span;
+            let names = self.loop_predicate_locals(ast, id);
+            if names.is_empty() {
+                continue;
+            }
+            let locals = names
+                .into_iter()
+                .map(|name| {
+                    let next = writes
+                        .iter()
+                        .filter(|(w, n)| *n == name && w.0 >= span.1)
+                        .map(|(w, _)| w.0)
+                        .min();
+                    (name, next)
+                })
+                .collect();
+            let def = defs
+                .iter()
+                .filter(|d| d.0 <= span.0 && span.1 <= d.1)
+                .min_by_key(|d| d.1 - d.0)
+                .copied();
+            out.push(LoopEdges { id, span, body: Self::loop_body_hull(ast, id), def, locals });
+        }
+        out
+    }
+
+    /// Upstream #1359 (`eval_loop`'s `loop_pass_entry` /
+    /// `narrow_loop_exit_edge`): a site inside a `while`/`until` body reads
+    /// the predicate's loop-entry edge, and a site after the loop reads the
+    /// exit edge over the joined scope. No engine here models either edge,
+    /// so a predicate local whose edge the reference does not leave
+    /// unchanged ([`Typer::loop_edge_keeps`]) is widened at the site — the
+    /// decline side. A site after the loop is covered until the local's next
+    /// write; a loop inside a `def` the site is not in is a different scope.
+    fn loop_edge_overlay(
+        &self,
+        ast: &LoweredAst,
+        flow: &CheckFlow,
+        site: rigor_parse::Span,
+        env: &mut Cow<'_, TypeEnv>,
+        interner: &mut Interner,
+    ) {
+        for l in &flow.loops {
+            if l.def.is_some_and(|d| !(d.0 <= site.0 && site.1 <= d.1)) {
+                continue;
+            }
+            let side = if l.body.is_some_and(|b| b.0 <= site.0 && site.1 <= b.1) {
+                crate::loop_edges::LoopSide::Body
+            } else if site.0 >= l.span.1 {
+                crate::loop_edges::LoopSide::Exit
+            } else {
+                continue;
+            };
+            for (name, next) in &l.locals {
+                if side == crate::loop_edges::LoopSide::Exit && next.is_some_and(|w| w < site.0) {
+                    continue;
+                }
+                let Some(&ty) = env.get(name.as_str()) else { continue };
+                if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                    continue;
+                }
+                if !self.loop_edge_keeps(ast, l.id, name, ty, side, interner) {
+                    let u = interner.untyped();
+                    let env = env.to_mut();
+                    env.insert(name.clone(), u);
+                    drop_indexed_narrowings(env, name);
+                }
+            }
         }
     }
 
@@ -196,6 +278,8 @@ impl<'i> Typer<'i> {
         // q.w; end` is silent on the oracle). This also catches a dead-arm
         // site the boundary descent cannot reach (buried under a `Loop` /
         // `Case` — `apply_subtree_effects` is flat there).
+        let mut base = base;
+        self.loop_edge_overlay(ast, flow, site, &mut base, interner);
         if let Some(subjects) = flow.dead.subjects_at(site) {
             let mut env = base.into_owned();
             for (name, op) in subjects {
@@ -2232,14 +2316,21 @@ impl<'i> Typer<'i> {
             }
             // Loop / case / logical / call(+block) / any other node:
             // widen every local written in the span, do not descend for snapshots.
+            // A `while`/`until` also widens the predicate locals its exit
+            // edge changes (upstream #1359 — `while q; end; if q` is not
+            // always-truthy on the reference).
             other => {
                 let span = other.span();
+                let is_loop = matches!(other, Node::Loop { .. });
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, span, env, interner);
                 widen_flow_writes(writes, span, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
+                if is_loop {
+                    self.widen_loop_exit(ast, id, env, interner);
+                }
             }
         }
     }
@@ -2475,4 +2566,19 @@ pub struct CheckFlow {
     /// the arm (`live_branch_for_if` / `live_rescues`). Shared with the
     /// `Typer`'s `dead_cache` entry — `Rc` so neither clones the set.
     dead: std::rc::Rc<crate::dead::DeadPositions>,
+    /// Upstream #1359 — every `while`/`until` loop whose predicate reads a
+    /// local, with the data [`Typer::loop_edge_overlay`] needs.
+    loops: Vec<LoopEdges>,
+}
+
+/// One `while`/`until` loop for [`Typer::loop_edge_overlay`].
+struct LoopEdges {
+    id: NodeId,
+    span: rigor_parse::Span,
+    body: Option<rigor_parse::Span>,
+    /// The innermost `def` around the loop — a site outside it reads a
+    /// different local scope.
+    def: Option<rigor_parse::Span>,
+    /// `(predicate local, first write of it after the loop)`.
+    locals: Vec<(String, Option<usize>)>,
 }

@@ -2,6 +2,7 @@
 //! the conditionals, `case`, the loops, `begin`/`rescue`/`ensure`, and `and`/`or`.
 
 use crate::ruby_prism::Node as PrismNode;
+use crate::ast::LoopKind;
 
 use super::{
     case_arm_exits, constant_string, for_index_writes, literal_truthiness, pattern_bound_locals,
@@ -325,6 +326,7 @@ impl<'src> Builder<'src> {
                 body,
                 index: Vec::new(),
                 index_writes: Vec::new(),
+                kind: LoopKind::While { begin_modifier: while_node.is_begin_modifier() },
                 span: span_of(&while_node.location()),
             });
         }
@@ -353,6 +355,7 @@ impl<'src> Builder<'src> {
                 body,
                 index: Vec::new(),
                 index_writes: Vec::new(),
+                kind: LoopKind::Until { begin_modifier: until_node.is_begin_modifier() },
                 span: span_of(&until_node.location()),
             });
         }
@@ -400,6 +403,7 @@ impl<'src> Builder<'src> {
                 body,
                 index,
                 index_writes,
+                kind: LoopKind::For,
                 span: span_of(&for_node.location()),
             });
         }
