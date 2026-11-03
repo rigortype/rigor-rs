@@ -11,20 +11,20 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT: pin `e59b7b89`, 0 FP / 9,337 / 815 gaps.**
+▶ **NEXT: re-pin tag by tag to `v0.4.7`; next `v0.4.1`.**
 CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
-- **Pin is master `e59b7b89`** (rbs 4.2.0 vendored). Both
+- **Pin is `v0.4.0`** (rbs 4.2.0 vendored). Both
   standing exception tables EMPTY; new entries are real findings
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
-State (verified 2026-10-10, at `e59b7b89`): harness **118 fixtures / 0
-unregistered / 0 divergent**, coverage 651/708; standing sweep **0 FP /
-9,337 files / 815 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
+State (verified 2026-11-04, at `v0.4.0`): harness **120 fixtures / 0
+unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 779
+gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
 Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -69,6 +69,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-04 re-pin → `v0.4.0`** (PR #445): 0 FP / 9,441 / 779 gaps. Raw 3 FPs: `900bc64c` loop edges, `1be2fd0b` guards; → #446–#454. [note](notes/20261104-repin-v040.md)
 - **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 >1,600 s → 0.2 s, all 16,623 gem files ~10 s. Not decline-only (#442). 0 FP / 9,435; → #441–#443. [note](notes/20261030-fanout-cap-436.md)
 - **2026-10-30 #422 CLOSED** (stack #434 = PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; 10 of 12 slow gem files → <7 s (lexer-F0/F1 → #436), output byte-identical. 0 FP / 9,435; → #435–#439. [note](notes/20261030-reach-memo-422.md)
 - **2026-10-28 #412 CLOSED** (PR #426): 256 MiB analysis stacks + a 25,000-edge nesting bound (deeper files "skipped", `internal-error`); the reference aborts (rigor#2455). 0 FP / 9,435; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
@@ -121,7 +122,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind; `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. [note](notes/20260925-issues-151-153-binder-writes.md).
 - **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
 - **2026-09-25 #133 CLOSED by a decline** (PR #148): the flat top-level binder never saw a nested rebind; rules now widen such locals, Dynamic-only gates keep the old env. **0 FP / 9,337, = master**; fixture 112 7→0 FPs. → #152. [note](notes/20260925-issue-133-jump-path-rebind.md).
-- **2026-09-25 re-pin `v0.3.9 → e59b7b89` (master, 1,030 commits)**: **0 FP / 9,337, 111 fixtures**, effects 0 OVER. Raw bump: 8 fixture + 9 sweep FPs (#1021 `imprecise_arg?` → reach analysis; `fb781023` unported = +3,002 gaps, #141); re-synced `core_overlay/`, plugin sig, mutator sets; 10 invisible retractions (#133–#138). [note](notes/20260925-repin-e59b7b89.md).
+- **2026-09-25 re-pin `v0.3.9 → e59b7b89`** (1,030 commits): 0 FP / 9,337. Raw 8+9 FPs (#1021 reach analysis; `fb781023` unported, #141); 10 invisible retractions → #133–#138. [note](notes/20260925-repin-e59b7b89.md)
 - **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — member is the erased class of the value's `stmt_value_type`; union-carrier stores widen per-arm. **0 FP / 9,337**; #132. [note](notes/20260921-issue-128-store-value-typing.md).
 - **2026-09-21 upstream re-pin `v0.3.8 → v0.3.9`** (447 commits): **0 FP / 9,337, gaps 799→892**, 108 fixtures, 0 OVER. Raw bump: 4 FPs in three families (`declines_bot?` shaped carriers, rooted `::RUBY_VERSION`, `MutationRejoin`). Residues: #128–#130. [note](notes/20260921-repin-v039.md).
 - **2026-09-09 #123 CLOSED — 26 holes = THREE defects** — `overlay/` loads LAST, chain LAZY: **22** `module ::Kernel` keyed `Gem::Kernel`; **5** `prepend` uningested; **6** SELF-TYPE unrecorded. **26→0**, 0 FP / 9204 — DORMANT until `check_call`'s declaration-only conjunct drops. [note](notes/20260909-qualified-ancestor-closure-holes.md).
