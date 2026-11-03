@@ -102,6 +102,26 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
+## Standing sweep-set baseline (2026-11-04, `v0.4.1`)
+
+Same tool, reference at `v0.4.1` (`8a5d6e2c`), release binary at PR #456's
+head. **9,441 files, 0 FP candidates, 768 coverage gaps.** The raw bump
+measured **35 FP candidates**, all `def.override-visibility-reduced`, and each
+one had been a matched row at `v0.4.0`. MATCHED fell by exactly those 35:
+mastodon 420→410, gitlab 1088→1079, mail 9649→9648, concurrent 5714→5699.
+The fix removed the 35 FPs and lost no matched row.
+
+| corpus | files | matched | coverage gaps |
+|---|---|---|---|
+| mastodon/app | 1236 | 410 | 15 |
+| gitlab-foss/lib | 4676 | 1079 | 144 |
+| survey/mail | 874 | 9648 | 303 |
+| survey/Ruby | 192 | 23 | 9 |
+| survey/dependabot-core | 1864 | 173499 | 172 |
+| survey/concurrent-ruby | 345 | 5699 | 95 |
+| survey/net-ssh | 202 | 157 | 26 |
+| survey/haml/lib | 52 | 5 | 4 |
+
 ## Standing sweep-set baseline (2026-11-04)
 
 `python3 harness/fp_audit.py --gaps --sweep`, reference pinned at `v0.4.0`

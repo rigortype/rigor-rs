@@ -15,8 +15,18 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.0`** (2026-09-27) |
-| Commit | `07f49bdb` |
+| **Pinned ref** | **`v0.4.1`** (2026-10-08) |
+| Commit | `8a5d6e2c` |
+
+> **`v0.4.0 → v0.4.1` (2026-11-04): 439 commits, step two of the walk to
+> `v0.4.7`.** No vendored surface moved. The raw bump measured 0 fixture FPs
+> and **35 sweep FPs**, all `def.override-visibility-reduced`, and each one is
+> a row v0.4.0 had matched. Upstream now declines override lints and own-`def`
+> typing wherever Ruby's ancestor order is not provable (#1578, #1594, #1606,
+> #1623, #1631). Rake's `Task.prepend Module.new {…}` was enough to trigger
+> it. The port now has a per-file ancestry census (`ancestry_facts.rs`) and a
+> Ruby-order chain (`resolution_chain.rs`). See the
+> [note](docs/notes/20261104-repin-v041.md).
 
 > **`e59b7b89 → v0.4.0` (2026-11-04): 289 commits, step one of a tag-by-tag
 > walk to `v0.4.7`.** rbs stays 4.2.0. The only re-sync that moved is
