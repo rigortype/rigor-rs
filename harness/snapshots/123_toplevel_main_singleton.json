@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/123_toplevel_main_singleton.rb",
+  "diagnostics": [
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 32,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tl_nope_toplevel`. If a project file defines `tl_nope_toplevel` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 33,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `extend_object_zz`. If a project file defines `extend_object_zz` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 34,
+      "column": 12,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tl_nope_in_block`. If a project file defines `tl_nope_in_block` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 55,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `tl_plain' reduced from public to private (overrides TlParent#tl_plain); breaks substitutability"
+    }
+  ]
+}

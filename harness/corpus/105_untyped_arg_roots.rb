@@ -292,8 +292,9 @@ end
 # (8) an entry whose every write is PRECISE discriminates: a ctor literal
 # (row r3), a ctor `nil` (row n2), a typed write in a non-ctor method (row v2),
 # and — whatever the class writes elsewhere — a definite write in the reading
-# `def` itself before the read (row v8). `rand` also still pins through a
-# `Dynamic[top] | 1` entry (row v6, see fixture 99 section (13)).
+# `def` itself before the read (row v8). Row v6 (`rand` over a `Dynamic[top] |
+# 1` entry) fired here through v0.4.1 and is SILENT since upstream v0.4.2 (#1798
+# joins every overload the untyped part may reach; fixture 99 section (13)).
 class R3IvarLiteral
   def initialize
     @lit = "x"

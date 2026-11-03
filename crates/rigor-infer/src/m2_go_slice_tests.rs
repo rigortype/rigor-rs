@@ -191,9 +191,9 @@ fn kernel_array_and_rand_type() {
     assert_eq!(ty(b"def f(c)\n  rand(c)\nend\n"), "Dynamic[top]");
     assert_eq!(ty(b"def f(c)\n  c = 5\n  rand(c)\nend\n"), "Class<1>");
     assert_eq!(ty(b"rand(1..5)\n"), "Dynamic[top]");
-    // A union's precise members still pin `rand` (only `(int)` accepts a
-    // String member, grid G1), unless one is a Range (or `0`).
-    assert_eq!(ty(b"def f(c)\n  c = 'x' if c.nil?\n  rand(c)\nend\n"), "Class<1>");
+    // Upstream v0.4.2 (#1798): a union with an untyped member joins every
+    // overload its untyped part may reach, so `rand` declines like the rest.
+    assert_eq!(ty(b"def f(c)\n  c = 'x' if c.nil?\n  rand(c)\nend\n"), "Dynamic[top]");
     assert_eq!(ty(b"def f(c)\n  c = (1..2) if c.nil?\n  rand(c)\nend\n"), "Dynamic[top]");
 }
 

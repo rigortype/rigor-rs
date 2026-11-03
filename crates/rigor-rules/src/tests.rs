@@ -4430,3 +4430,42 @@ fn issue_436_reaching_write_cap_boundary() {
     );
     assert_eq!(undefined(&guard), ["undefined method `zz' for Float"]);
 }
+
+/// Cross-file: every diagnostic of `files[focus]` against a PROJECT source
+/// built over all `files`, as `(rule, method)` pairs.
+fn project_rule_methods(files: &[&[u8]], focus: usize) -> Vec<(&'static str, String)> {
+    let asts: Vec<_> = files.iter().map(|s| lower(&parse(s))).collect();
+    let refs: Vec<&LoweredAst> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut interner = Interner::new();
+    analyze_with_source(&asts[focus], &mut interner, &index, &source)
+        .into_iter()
+        .map(|d| (d.rule_id, d.method_name.unwrap_or_default()))
+        .collect()
+}
+
+/// Upstream v0.4.2 (#1706 / issue #1697), oracle-measured on a two-file
+/// project: a top-level `include` in ONE file reaches every other file. An
+/// unknown module silences each bare top-level call there but no explicit
+/// receiver; a known module silences only the names it defines.
+#[test]
+fn toplevel_include_reaches_other_files() {
+    let other: &[u8] = b"frob_b\n1.frob_int\nmine_x\n1.mine_x\n";
+    // Unknown module: the bare call declines, the receiver call still fires.
+    let got = project_rule_methods(&[b"include SomeGem::Helpers\n", other], 1);
+    assert!(!got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(!got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "mine_x".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "mine_x".into())), "{got:?}");
+    // Known module: its method declines on both forms, other names fire.
+    let got =
+        project_rule_methods(&[b"module Mine; def mine_x = 1; end\ninclude Mine\n", other], 1);
+    assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(!got.iter().any(|(_, m)| m == "mine_x"), "{got:?}");
+    // MUST STILL FIRE: no top-level include anywhere (the include is in a block).
+    let got = project_rule_methods(&[b"[1].each { include SomeGem::Helpers }\n", other], 1);
+    assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "mine_x".into())), "{got:?}");
+}

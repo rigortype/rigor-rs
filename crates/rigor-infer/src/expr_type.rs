@@ -1514,9 +1514,11 @@ impl<'i> Typer<'i> {
         // carrier OR a union with an untyped member — so a CONDITIONAL rebind
         // that leaves the parameter reachable (`s = "x" if s.nil?`, the
         // reference's `Dynamic[top] | "x"`) now declines too (rows a7/a20/q3),
-        // while an unconditional one (`s = "x"`, row q4) still fires. `rand` is
-        // the one conversion whose join a union's precise members can still pin
-        // (see [`Reach`]), so it asks [`Reach::declines_rand`] instead.
+        // while an unconditional one (`s = "x"`, row q4) still fires. `rand`
+        // used to ask a narrower question, because a union's precise members
+        // could pin its `(int)` overload; upstream v0.4.2 (#1798) joins every
+        // overload the untyped part may reach, so it now declines with the rest
+        // (fixture 99 rows w3-w5, 105 v6).
         //
         // The decline ANSWERS `Dynamic[top]` rather than returning `None`,
         // because the explicit `Kernel.Float(u)` spelling routes here too and a
@@ -1525,14 +1527,7 @@ impl<'i> Typer<'i> {
         if matches!(method, "Float" | "Integer" | "Array" | "rand") {
             let untyped = interner.untyped();
             let declines = args.iter().any(|&a| {
-                self.type_of(ast, a, env, interner) == untyped && {
-                    let reach = self.arg_reach(ast, a);
-                    if method == "rand" {
-                        reach.declines_rand()
-                    } else {
-                        reach.untyped
-                    }
-                }
+                self.type_of(ast, a, env, interner) == untyped && self.arg_reach(ast, a).untyped
             });
             if declines {
                 return Some(untyped);

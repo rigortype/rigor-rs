@@ -32,9 +32,9 @@
 # untyped member (`Dynamic[top] | "x"`, what `s = "x" if s.nil?` leaves) skips
 # the strict pass too, the gradual pass keeps every overload that accepts all
 # the members, and the four conversions join to `Dynamic[union]` again. Rows
-# a7/a20/q3 moved from FIRE to SILENT with it — section (6b). `rand` alone still
-# pins through such a union: only its `(int)` overload accepts a String/nil/...
-# member, so it fires unless a member is a Range (section (13)).
+# a7/a20/q3 moved from FIRE to SILENT with it — section (6b). `rand` alone kept
+# pinning through such a union until upstream v0.4.2 (#1798), which joins every
+# overload the union's untyped part may reach: section (13) is now all silent.
 #
 # Every firing line and every silent control is oracle-measured — at the
 # `v0.3.8` pin (`ffb456b0`), and every row re-measured at `e59b7b89` — one fresh
@@ -373,10 +373,12 @@ def w2(s)
   String(s).frobnicate_w2
 end
 
-# (13) `rand` over a union with an untyped member: only `(int)` accepts a
-# String, nil, Integer, ... member leniently, so the join is `Integer` and the
-# reference FIRES; a Range member keeps a Range overload alive and declines, as
-# does the bare carrier (row a5).
+# (13) `rand` over a union with an untyped member. Through v0.4.1 only `(int)`
+# accepted a String, nil, Integer, ... member leniently, the join was `Integer`
+# and rows w3-w5 FIRED. Upstream v0.4.2 (#1798, with #1677/#1781/#1782) joins
+# every overload the untyped part may reach (`Float | Integer`), so all four rows
+# are SILENT, like the bare carrier (row a5); a precisely typed argument keeps
+# firing (rows a8, a31).
 def w3(s)
   s = "x" if s.nil?
   rand(s).frobnicate_w3
