@@ -1,0 +1,559 @@
+//! Upstream v0.4.1 (ADR-119; rigortype/rigor#1594, #1606, #1623, #1631) — the
+//! per-file ancestry FACTS whose order or presence the port's direct-statement
+//! harvest cannot vouch for.
+//!
+//! The port's class tables (`Node::ClassDef::{methods, method_visibilities,
+//! includes}` and the override index built from them) hold only what a DIRECT
+//! statement wrote: a statement of the program, or of the body of a class or
+//! module declaration that is itself direct. The reference (since v0.4.1)
+//! declines an ancestry-order read wherever something else could reshape the
+//! answer, and this census names those things so the port can decline too:
+//!
+//! * [`AncestryFacts::unpositioned`] — a mixin edge written anywhere but a
+//!   direct statement (a conditional, a block, a method, a hook, a `begin`,
+//!   a receiver form `X.include(M)`, a `send(:include, M)`, `self.include`, a
+//!   computed argument), the reference's `DiscoveryIndex#unpositioned_mixins`
+//!   (`MixinAccumulator`). A name the port cannot hold is the WILDCARD `"*"`.
+//!   A declaration that is not itself direct (`class C … end if X`, a class
+//!   opened inside a block or method) taints both of its sides with `"*"`:
+//!   the port's harvest does not see its edges at all.
+//! * [`AncestryFacts::possible_methods`] — an instance `def` the port's harvest
+//!   did not record (anything but a direct statement or the argument of a
+//!   direct visibility modifier). The reference reads such a definer as
+//!   `possible` (`Certainty`) and asks past it; the port never sees it, so a
+//!   reader must decline on it instead of walking past it to a farther
+//!   definer.
+//! * [`AncestryFacts::contested_visibilities`] — a visibility slot that may
+//!   not hold: a `def` written after a bare `private`/`protected`/`public`/
+//!   `module_function` that is not a direct statement (`VisibilityTable`'s
+//!   uncertain toggle), or a named `private :x` that is not a direct
+//!   statement.
+//! * [`AncestryFacts::dirty_owners`] — an owner defining a mixin hook
+//!   (`self.included` & co.) or `method_missing`: `Relevance` never reads its
+//!   closure as unable to answer a name.
+//! * [`AncestryFacts::direct_prepends`] — the direct `prepend` statements, in
+//!   statement order, so the chain can place them ahead of the class (the
+//!   port's `includes` list carries both kinds unsorted).
+//!
+//! Owners are lists of CANDIDATE qualified names (a declaration has one; a
+//! receiver constant `X.include(M)` has one per enclosing lexical scope,
+//! longest first); a consumer applies a fact to every candidate, which only
+//! ever declines more.
+//!
+//! Everything here can only make a reader DECLINE; nothing here makes one fire.
+
+use std::collections::HashSet;
+
+use crate::ruby_prism::{self, Node as PrismNode, Visit};
+
+use super::{constant_path_string, constant_string, strict_constant_path_string};
+
+/// The name an owner side lists when an edge was written that the port cannot
+/// hold (the reference's `MixinAccumulator::WILDCARD`).
+pub const WILDCARD: &str = "*";
+
+/// Which side of an owner's ancestry a mixin edge reshapes: `include` /
+/// `prepend` the instance side, `extend` (and `include` inside
+/// `class << self`) the singleton side.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum MixinSide {
+    Include,
+    Extend,
+}
+
+/// One unpositioned mixin note: `owners` (candidate qualified names), the side,
+/// and the module names written (or [`WILDCARD`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UnpositionedMixin {
+    pub owners: Vec<String>,
+    pub side: MixinSide,
+    pub names: Vec<String>,
+}
+
+/// See the module docs.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AncestryFacts {
+    pub unpositioned: Vec<UnpositionedMixin>,
+    pub possible_methods: Vec<(String, String)>,
+    pub contested_visibilities: Vec<(String, String)>,
+    pub dirty_owners: Vec<String>,
+    pub direct_prepends: Vec<(String, String)>,
+}
+
+const TOGGLES: [&str; 4] = ["private", "protected", "public", "module_function"];
+const MODIFIERS: [&str; 3] = ["private", "protected", "public"];
+const MIXIN_KINDS: [&str; 3] = ["include", "prepend", "extend"];
+const SEND_NAMES: [&str; 3] = ["send", "public_send", "__send__"];
+const EVAL_CALLS: [&str; 6] =
+    ["class_eval", "module_eval", "class_exec", "module_exec", "instance_eval", "instance_exec"];
+const HOOK_DEFS: [&str; 4] = ["included", "extended", "prepended", "inherited"];
+/// `Relevance::HOOKS` — every singleton hook Ruby calls while a module enters
+/// another's ancestry.
+const ALL_HOOKS: [&str; 7] = [
+    "included",
+    "extended",
+    "prepended",
+    "inherited",
+    "append_features",
+    "extend_object",
+    "prepend_features",
+];
+
+fn span_key(n: &PrismNode<'_>) -> (usize, usize) {
+    let l = n.location();
+    (l.start_offset(), l.end_offset())
+}
+
+/// One owner frame: the candidate names (`None` = an owner the walk cannot
+/// name, which records nothing), whether `self` is the singleton, and the
+/// running visibility default's uncertainty.
+struct Frame {
+    owner: Option<Vec<String>>,
+    singleton: bool,
+    uncertain: bool,
+}
+
+struct Census {
+    out: AncestryFacts,
+    /// The lexical class/module prefix (constant resolution only).
+    prefix: Vec<String>,
+    frames: Vec<Frame>,
+    /// Spans of the DIRECT statements: program statements and statements of
+    /// direct declaration bodies.
+    direct: HashSet<(usize, usize)>,
+    /// Spans of the `def` arguments of a direct visibility modifier
+    /// (`private def x`), which the port's harvest records.
+    recorded_arg_defs: HashSet<(usize, usize)>,
+    /// `def` nesting: inside a method body nothing is recorded but mixin calls.
+    in_def: usize,
+    /// The parameter names of the enclosing `self.included(base)`-style hooks.
+    hook_params: Vec<String>,
+    /// Per owner (first candidate), the direct include / prepend targets — a
+    /// target written both ways is one body the tables cannot represent.
+    direct_includes: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+}
+
+impl Census {
+    fn frame(&self) -> &Frame {
+        self.frames.last().expect("root frame")
+    }
+
+    fn owner(&self) -> Option<Vec<String>> {
+        self.frame().owner.clone()
+    }
+
+    fn is_direct(&self, n: &PrismNode<'_>) -> bool {
+        self.in_def == 0 && self.direct.contains(&span_key(n))
+    }
+
+    fn mark_direct_body(&mut self, body: Option<&PrismNode<'_>>) {
+        if let Some(stmts) = body.and_then(|b| b.as_statements_node()) {
+            for s in stmts.body().iter() {
+                self.direct.insert(span_key(&s));
+            }
+        }
+    }
+
+    fn unpositioned(&mut self, owners: Vec<String>, side: MixinSide, names: Vec<String>) {
+        if owners.is_empty() {
+            return;
+        }
+        self.out.unpositioned.push(UnpositionedMixin { owners, side, names });
+    }
+
+    fn wildcard(&mut self, owners: Vec<String>, side: MixinSide) {
+        self.unpositioned(owners, side, vec![WILDCARD.to_string()]);
+    }
+
+    /// The candidate qualified names a constant `raw` denotes from the current
+    /// lexical prefix, longest first.
+    fn candidates(&self, raw: &str) -> Vec<String> {
+        let raw = raw.strip_prefix("::").unwrap_or(raw);
+        let mut out = Vec::new();
+        for i in (0..=self.prefix.len()).rev() {
+            if i == 0 {
+                out.push(raw.to_string());
+            } else {
+                out.push(format!("{}::{}", self.prefix[..i].join("::"), raw));
+            }
+        }
+        out
+    }
+
+    fn qualify(&self, name: &str) -> String {
+        if self.prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.prefix.join("::"), name)
+        }
+    }
+
+    fn hook_receiver(&self, recv: &PrismNode<'_>) -> bool {
+        if let Some(lv) = recv.as_local_variable_read_node() {
+            let name = constant_string(lv.name().as_slice());
+            return self.hook_params.contains(&name);
+        }
+        if let Some(call) = recv.as_call_node() {
+            if call.arguments().is_none() {
+                if let Some(r) = call.receiver() {
+                    return self.hook_receiver(&r);
+                }
+            }
+        }
+        false
+    }
+
+    fn declaration(&mut self, n: &PrismNode<'_>, name: String, body: Option<PrismNode<'_>>) {
+        let direct = self.is_direct(n);
+        if name.is_empty() {
+            // An unnameable declaration owns nothing the port can hold.
+            self.frames.push(Frame { owner: None, singleton: false, uncertain: false });
+            if let Some(b) = &body {
+                self.visit(b);
+            }
+            self.frames.pop();
+            return;
+        }
+        let qualified = self.qualify(&name);
+        if !direct {
+            // The port's harvest never sees this declaration's edges or defs.
+            self.wildcard(vec![qualified.clone()], MixinSide::Include);
+            self.wildcard(vec![qualified.clone()], MixinSide::Extend);
+        } else {
+            self.mark_direct_body(body.as_ref());
+        }
+        let saved_prefix = std::mem::replace(
+            &mut self.prefix,
+            qualified.split("::").map(str::to_string).collect(),
+        );
+        let saved_def = std::mem::replace(&mut self.in_def, 0);
+        let saved_hooks = std::mem::take(&mut self.hook_params);
+        self.frames.push(Frame { owner: Some(vec![qualified]), singleton: false, uncertain: false });
+        if let Some(b) = &body {
+            self.visit(b);
+        }
+        self.frames.pop();
+        self.hook_params = saved_hooks;
+        self.in_def = saved_def;
+        self.prefix = saved_prefix;
+    }
+
+    /// `[kind, arguments, via_send]` of a mixin call (the reference's
+    /// `mixin_call_view`).
+    fn mixin_view<'pr>(
+        &self,
+        call: &ruby_prism::CallNode<'pr>,
+    ) -> Option<(&'static str, Vec<PrismNode<'pr>>, bool)> {
+        let name = constant_string(call.name().as_slice());
+        let mut args: Vec<PrismNode<'pr>> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if let Some(k) = MIXIN_KINDS.iter().find(|k| **k == name) {
+            return Some((k, args, false));
+        }
+        if !SEND_NAMES.contains(&name.as_str()) {
+            return None;
+        }
+        let first = args.first()?;
+        let lit = if let Some(s) = first.as_symbol_node() {
+            String::from_utf8_lossy(s.unescaped()).into_owned()
+        } else if let Some(s) = first.as_string_node() {
+            String::from_utf8_lossy(s.unescaped()).into_owned()
+        } else {
+            return None;
+        };
+        let k = MIXIN_KINDS.iter().find(|k| **k == lit)?;
+        args.remove(0);
+        Some((k, args, true))
+    }
+
+    fn record_mixin(&mut self, n: &PrismNode<'_>, call: &ruby_prism::CallNode<'_>) {
+        let Some((kind, args, via_send)) = self.mixin_view(call) else {
+            return;
+        };
+        let names: Vec<Option<String>> =
+            args.iter().map(strict_constant_path_string).collect();
+        let complete = !names.is_empty() && names.iter().all(Option::is_some);
+        let names: Vec<String> = names.into_iter().flatten().collect();
+        let recv = call.receiver();
+        let self_recv = recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
+        if recv.is_none() || self_recv {
+            let Some(owner) = self.owner() else { return };
+            let singleton = self.frame().singleton;
+            let side = match (singleton, kind) {
+                (true, "extend") => return,
+                (true, _) | (false, "extend") => MixinSide::Extend,
+                _ => MixinSide::Include,
+            };
+            if recv.is_none() && !via_send && complete {
+                if self.is_direct(n) && !singleton {
+                    if kind != "extend" {
+                        let key = owner[0].clone();
+                        let entry = self.direct_includes.entry(key.clone()).or_default();
+                        let (mine, other) = if kind == "prepend" {
+                            (&mut entry.1, &entry.0)
+                        } else {
+                            (&mut entry.0, &entry.1)
+                        };
+                        let clash = names.iter().any(|t| other.contains(t));
+                        mine.extend(names.iter().cloned());
+                        if clash {
+                            self.wildcard(owner.clone(), MixinSide::Include);
+                        }
+                        if kind == "prepend" {
+                            for t in &names {
+                                self.out.direct_prepends.push((key.clone(), t.clone()));
+                            }
+                        }
+                    }
+                    return;
+                }
+                self.unpositioned(owner, side, names);
+            } else {
+                self.wildcard(owner, side);
+            }
+            return;
+        }
+        let recv = recv.expect("receiver");
+        if let Some(sc) = recv.as_call_node() {
+            let sc_name = constant_string(sc.name().as_slice());
+            let plain = sc.receiver().is_none_or(|r| r.as_self_node().is_some());
+            if sc_name == "singleton_class" && sc.arguments().is_none() && plain {
+                if let Some(owner) = self.owner() {
+                    self.wildcard(owner, MixinSide::Extend);
+                }
+                return;
+            }
+        }
+        if let Some(raw) = strict_constant_path_string(&recv) {
+            let side = if kind == "extend" { MixinSide::Extend } else { MixinSide::Include };
+            let owners = self.candidates(&raw);
+            self.wildcard(owners, side);
+            return;
+        }
+        if self.hook_receiver(&recv) {
+            if let Some(owner) = self.owner() {
+                self.wildcard(owner.clone(), MixinSide::Include);
+                self.wildcard(owner, MixinSide::Extend);
+            }
+        }
+    }
+
+    fn block_mixes_in(&self, n: &PrismNode<'_>) -> bool {
+        struct Finder<'a> {
+            census: &'a Census,
+            found: bool,
+        }
+        impl<'pr> Visit<'pr> for Finder<'_> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                if self.census.mixin_view(node).is_some() {
+                    self.found = true;
+                    return;
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let mut f = Finder { census: self, found: false };
+        f.visit(n);
+        f.found
+    }
+}
+
+impl<'pr> Visit<'pr> for Census {
+    fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+        for s in node.statements().body().iter() {
+            self.direct.insert(span_key(&s));
+        }
+        ruby_prism::visit_program_node(self, node);
+    }
+
+    fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+        if let Some(sup) = node.superclass() {
+            self.visit(&sup);
+        }
+        let name = constant_path_string(&node.constant_path());
+        self.declaration(&node.as_node(), name, node.body());
+    }
+
+    fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+        let name = constant_path_string(&node.constant_path());
+        self.declaration(&node.as_node(), name, node.body());
+    }
+
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        let expr = node.expression();
+        self.visit(&expr);
+        let owner = if expr.as_self_node().is_some() { self.owner() } else { None };
+        self.frames.push(Frame { owner, singleton: true, uncertain: false });
+        if let Some(b) = node.body() {
+            self.visit(&b);
+        }
+        self.frames.pop();
+    }
+
+    fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
+        let name = constant_string(node.name().as_slice());
+        let recv_self = node.receiver().is_some_and(|r| r.as_self_node().is_some());
+        let singleton_def = recv_self || (node.receiver().is_none() && self.frame().singleton);
+        let mut hook = false;
+        if self.in_def == 0 {
+            if let Some(owner) = self.owner() {
+                if singleton_def {
+                    if ALL_HOOKS.contains(&name.as_str()) {
+                        self.out.dirty_owners.extend(owner.iter().cloned());
+                    }
+                    hook = HOOK_DEFS.contains(&name.as_str());
+                } else if node.receiver().is_none() {
+                    let key = span_key(&node.as_node());
+                    let recorded = self.direct.contains(&key) || self.recorded_arg_defs.contains(&key);
+                    for o in &owner {
+                        if !recorded {
+                            self.out.possible_methods.push((o.clone(), name.clone()));
+                        }
+                        if self.frame().uncertain {
+                            self.out.contested_visibilities.push((o.clone(), name.clone()));
+                        }
+                    }
+                    if name == "method_missing" {
+                        self.out.dirty_owners.extend(owner.iter().cloned());
+                    }
+                }
+            }
+        }
+        let saved_hooks = self.hook_params.len();
+        if hook {
+            if let Some(params) = node.parameters() {
+                for p in params.requireds().iter().chain(params.optionals().iter()) {
+                    if let Some(rp) = p.as_required_parameter_node() {
+                        self.hook_params.push(constant_string(rp.name().as_slice()));
+                    } else if let Some(op) = p.as_optional_parameter_node() {
+                        self.hook_params.push(constant_string(op.name().as_slice()));
+                    }
+                }
+            }
+        }
+        self.in_def += 1;
+        ruby_prism::visit_def_node(self, node);
+        self.in_def -= 1;
+        self.hook_params.truncate(saved_hooks);
+    }
+
+    fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+        let n = node.as_node();
+        let name = constant_string(node.name().as_slice());
+        let args: Vec<PrismNode<'pr>> =
+            node.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        let recv = node.receiver();
+        let direct = self.is_direct(&n);
+        let mut direct_modifier = false;
+        if recv.is_none() && self.in_def == 0 && TOGGLES.contains(&name.as_str()) {
+            if args.is_empty() && node.block().is_none() {
+                // A bare toggle: only a direct one settles the running default.
+                if let Some(f) = self.frames.last_mut() {
+                    f.uncertain = !direct;
+                }
+            } else if !args.is_empty() {
+                if direct {
+                    direct_modifier = MODIFIERS.contains(&name.as_str());
+                } else if let Some(owner) = self.owner() {
+                    for a in &args {
+                        let lit = if let Some(s) = a.as_symbol_node() {
+                            Some(String::from_utf8_lossy(s.unescaped()).into_owned())
+                        } else {
+                            a.as_string_node()
+                                .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
+                        };
+                        if let Some(lit) = lit {
+                            for o in &owner {
+                                self.out.contested_visibilities.push((o.clone(), lit.clone()));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        self.record_mixin(&n, node);
+
+        // An eval block on an object the walk cannot name: in a hook, or
+        // holding a mixin call, it reshapes the enclosing class.
+        let block = node.block().and_then(|b| b.as_block_node());
+        let eval = EVAL_CALLS.contains(&name.as_str());
+        if eval {
+            if let (Some(r), Some(b)) = (&recv, &block) {
+                if r.as_self_node().is_none()
+                    && strict_constant_path_string(r).is_none()
+                    && (self.hook_receiver(r) || self.block_mixes_in(&b.as_node()))
+                {
+                    if let Some(owner) = self.owner() {
+                        self.wildcard(owner.clone(), MixinSide::Include);
+                        self.wildcard(owner, MixinSide::Extend);
+                    }
+                }
+            }
+        }
+
+        if let Some(r) = &recv {
+            self.visit(r);
+        }
+        if let Some(arguments) = node.arguments() {
+            if direct_modifier {
+                for a in &args {
+                    if a.as_def_node().is_some() {
+                        self.recorded_arg_defs.insert(span_key(a));
+                    }
+                }
+            }
+            self.visit(&arguments.as_node());
+        }
+        let Some(blk) = node.block() else { return };
+        let Some(b) = blk.as_block_node() else {
+            self.visit(&blk);
+            return;
+        };
+        // Which owner the block's `self` is.
+        let recv_const = recv.as_ref().and_then(strict_constant_path_string);
+        let meta_new = matches!(
+            (recv_const.as_deref(), name.as_str()),
+            (Some("Class" | "::Class" | "Module" | "::Module" | "Struct" | "::Struct"), "new")
+                | (Some("Data" | "::Data"), "define")
+        );
+        let frame = if meta_new {
+            Some(Frame { owner: None, singleton: false, uncertain: false })
+        } else if eval {
+            let instance_side = name == "instance_eval" || name == "instance_exec";
+            let owner = match (&recv, &recv_const) {
+                (None, _) => self.owner(),
+                (Some(r), _) if r.as_self_node().is_some() => self.owner(),
+                (Some(_), Some(raw)) => Some(self.candidates(raw)),
+                _ => None,
+            };
+            let owner = if instance_side { None } else { owner };
+            Some(Frame { owner, singleton: false, uncertain: false })
+        } else {
+            None
+        };
+        let pushed = frame.is_some();
+        if let Some(f) = frame {
+            self.frames.push(f);
+        }
+        ruby_prism::visit_block_node(self, &b);
+        if pushed {
+            self.frames.pop();
+        }
+    }
+}
+
+/// Collect the [`AncestryFacts`] of one file.
+pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
+    let mut c = Census {
+        out: AncestryFacts::default(),
+        prefix: Vec::new(),
+        frames: vec![Frame { owner: None, singleton: false, uncertain: false }],
+        direct: HashSet::new(),
+        recorded_arg_defs: HashSet::new(),
+        in_def: 0,
+        hook_params: Vec::new(),
+        direct_includes: std::collections::HashMap::new(),
+    };
+    c.visit(root);
+    c.out
+}

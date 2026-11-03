@@ -47,6 +47,8 @@ mod constants;
 mod literal_fold;
 mod def_attribution;
 mod override_index;
+mod resolution_chain;
+pub(crate) use resolution_chain::AncestryIndex;
 mod harvest;
 
 use std::collections::{HashMap, HashSet};
@@ -447,6 +449,9 @@ pub struct SourceIndex {
     /// `def.override-visibility-reduced` (see [`OverrideClass`]). Keyed by FULL
     /// qualified name to avoid the last-component name-collision merge.
     override_classes: HashMap<String, OverrideClass>,
+    /// Upstream v0.4.1 (ADR-119): the merged ancestry facts the
+    /// direct-statement harvest cannot vouch for — see [`AncestryIndex`].
+    ancestry: AncestryIndex,
     /// PROJECT-WIDE toplevel method names, for `call.unresolved-toplevel` (ref
     /// ADR-34). A name is here iff SOME analyzed file declares it OUTSIDE any
     /// class/module — a toplevel `def foo` (Object private method), or an

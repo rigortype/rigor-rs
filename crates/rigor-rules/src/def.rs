@@ -57,6 +57,7 @@ fn visibility_word(v: rigor_parse::Visibility) -> &'static str {
 /// Parent#m); breaks substitutability ``.
 pub(crate) fn check_override_visibility(
     source: &rigor_infer::SourceIndex,
+    index: &CoreIndex,
     // The FULLY LEXICALLY-QUALIFIED name of the overriding class (e.g.
     // `Organizations::GroupsController`), so the ancestor walk resolves against
     // the project-wide qualified override index precisely.
@@ -66,7 +67,9 @@ pub(crate) fn check_override_visibility(
     name_span: (usize, usize),
 ) -> Option<Diagnostic> {
     // Gate 2: a project ancestor must DEFINE the method.
-    let (parent_class, parent_vis) = source.nearest_ancestor_defining(qualified_class, method)?;
+    // Upstream v0.4.1: the parent is read off the Ruby-order chain, and only
+    // where the reference's `DefinerResolution` answers `Known`.
+    let (parent_class, parent_vis) = source.override_parent(index, qualified_class, method)?;
     // Gate 3 (the keystone): the parent visibility must be KNOWN — NEVER
     // synthesize Public from a missing entry.
     let parent_vis = parent_vis?;
