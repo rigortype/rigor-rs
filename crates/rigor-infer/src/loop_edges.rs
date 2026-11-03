@@ -125,12 +125,10 @@ impl<'i> Typer<'i> {
         env: &mut crate::TypeEnv,
         interner: &mut Interner,
     ) {
-        let loops: Vec<NodeId> = ast
-            .iter()
-            .filter(|(_, n)| {
-                matches!(n, Node::Loop { span: s, .. } if span.0 <= s.0 && s.1 <= span.1)
-            })
-            .map(|(id, _)| id)
+        let idx = self.reach_index(ast);
+        let loops: Vec<NodeId> = idx
+            .nodes_within(ast, span)
+            .filter(|&id| matches!(ast.get(id), Node::Loop { .. }))
             .collect();
         for id in loops {
             self.widen_loop_exit(ast, id, env, interner);
@@ -262,6 +260,16 @@ impl<'i> Typer<'i> {
             self.subject_edge(ast, n, subject, ty, e, respond_only, interner)
         };
         let atom = |e: Edge| if respond_only { Edge::Keep } else { e };
+        // Any other expression that merely READS the subject: a local may be
+        // narrowed by shapes this allow-list does not decide (`h.empty?`), so
+        // it declines; a constant is narrowed ONLY by the guard shapes above
+        // (`1be2fd0b`), so `Hash === x`, `C.critical = v` or `n < LIMIT` keep
+        // it (rspec-mocks `Hash.ruby2_keywords_hash?` under `Hash === x`
+        // fires on the oracle).
+        let unknown = match subject {
+            Subject::Const(..) => Edge::Keep,
+            Subject::Local(_) => atom(Edge::Other),
+        };
         match ast.get(pred) {
             Node::Statements { body, kind: StatementsKind::Sequence, .. } if body.len() == 1 => {
                 eff(body[0], edge)
@@ -318,10 +326,10 @@ impl<'i> Typer<'i> {
                             None => Edge::Other,
                         }
                     }
-                    _ => atom(Edge::Other),
+                    _ => unknown,
                 }
             }
-            _ => atom(Edge::Other),
+            _ => unknown,
         }
     }
 
