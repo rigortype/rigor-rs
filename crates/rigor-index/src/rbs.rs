@@ -906,11 +906,47 @@ impl CoreData {
         sig_dirs: &[PathBuf],
         collection_dirs: &[PathBuf],
     ) -> Self {
+        Self::load_for_project_core(plugins, sig_dirs, collection_dirs, None)
+    }
+
+    /// [`Self::load_for_project_parts`] with upstream v0.4.7's `core_root:`
+    /// (#2517): when `core_root` is set, every `**/*.rbs` under it (sorted)
+    /// is ingested IN PLACE OF the embedded `core/` — the reference hands the
+    /// directory to `RBS::EnvironmentLoader.new(core_root:)`, so the default
+    /// core is never loaded beside it — while the stdlib closure and the
+    /// rigor-owned overlay still come from the embedded set, as the
+    /// reference's library repository and `core_overlay/` do. The caller has
+    /// validated the directory.
+    pub fn load_for_project_core(
+        plugins: &[&crate::plugins::BundledPlugin],
+        sig_dirs: &[PathBuf],
+        collection_dirs: &[PathBuf],
+        core_root: Option<&std::path::Path>,
+    ) -> Self {
         // 1) Resolve the core source (override dir, else embedded), folding into a
         //    fresh builder — the SAME logic [`Self::load`] previously inlined.
         let mut builder = Builder::default();
         let mut source = RbsSource::Embedded;
-        if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
+        if let Some(dir) = core_root {
+            let mut found = Vec::new();
+            glob_rbs(dir, &mut found);
+            found.sort();
+            for f in &found {
+                if let Ok(code) = std::fs::read_to_string(f) {
+                    ingest_rbs_source(&mut builder, &f.to_string_lossy(), &code);
+                }
+            }
+            for (name, contents) in EMBEDDED_RBS
+                .iter()
+                .filter(|(n, _)| !is_overlay(n) && !n.starts_with("core/"))
+            {
+                ingest_rbs_source(&mut builder, name, contents);
+            }
+            for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)) {
+                ingest_rbs_source(&mut builder, name, contents);
+            }
+            source = RbsSource::Override(dir.display().to_string());
+        } else if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
             let dir = PathBuf::from(dir);
             if Self::ingest_dir_into(&mut builder, &dir) {
                 source = RbsSource::Override(dir.display().to_string());

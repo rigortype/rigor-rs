@@ -842,6 +842,13 @@ fn cmd_check(args: &[String]) -> ExitCode {
             Vec::new(),
         ),
         None => {
+            // Upstream v0.4.7 (#2517): a `core_root:` that cannot serve as a
+            // core stops the run as a configuration error (`rigor: <msg>`,
+            // exit 64) instead of analysing against the embedded core.
+            if let Err(message) = cfg.validate_core_root() {
+                eprintln!("rigor: {message}");
+                return ExitCode::from(64);
+            }
             // Expand roots into their `**/*.rb` files and collect bad-path
             // errors, matching the reference's `expand_paths`:
             // directory-expanded entries matching `BUILTIN_EXCLUDES +
@@ -1415,10 +1422,12 @@ fn analyze_files(
     let effective_plugins = cfg.effective_plugins(root);
     // The rbs-collection gem dirs ride apart from `signature_paths:` so the
     // `conforms-to` scan can tell them apart (issue #129); every rule reads both.
-    let index = CoreIndex::for_project_parts(
+    let core_root = cfg.validate_core_root().ok().flatten();
+    let index = CoreIndex::for_project_core(
         &effective_plugins,
         &cfg.signature_dirs(),
         &cfg.collection_signature_dirs(root),
+        core_root.as_deref(),
     );
     let t_index = std::time::Instant::now();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).

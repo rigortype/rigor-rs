@@ -167,6 +167,12 @@ pub struct Config {
     /// only by [`Config::target_ruby_supported`].
     #[serde(default)]
     target_ruby: serde_yaml::Value,
+    /// Upstream v0.4.7 (#2517) `core_root:` — a core signature directory
+    /// loaded IN PLACE OF the embedded core. A String resolved against its
+    /// config file's directory at load (`SCALAR_PATH_KEYS`); a non-String is
+    /// a load error ([`coerce_core_root`]). Read through [`Config::core_root`].
+    #[serde(default)]
+    core_root: serde_yaml::Value,
     /// The ABSOLUTE directory of the top-level config file actually read
     /// (`File.dirname(File.expand_path(path))` — the reference's `base_dir`).
     /// Path-bearing keys are resolved at LOAD time, so this is kept only for
@@ -270,6 +276,7 @@ impl Default for Config {
             present_keys: std::collections::BTreeSet::new(),
             signature_paths_null: false,
             target_ruby: serde_yaml::Value::Null,
+            core_root: serde_yaml::Value::Null,
             base_dir: None,
             parity_text_ok: false,
         }
@@ -705,8 +712,9 @@ impl Config {
     /// the did-you-mean dictionary. `rigor_rs` is the reserved namespace (ADR-99
     /// / ADR-0036) — known by construction, so the reserved-namespace exemption
     /// is inherent.
-    pub const KNOWN_KEYS: [&'static str; 24] = [
+    pub const KNOWN_KEYS: [&'static str; 25] = [
         "target_ruby",
+        "core_root",
         "paths",
         "exclude",
         "plugins",
@@ -935,6 +943,67 @@ impl Config {
             .iter()
             .map(std::path::PathBuf::from)
             .collect()
+    }
+
+    /// The configured `core_root:` directory (already absolute), or `None`.
+    #[must_use]
+    pub fn core_root(&self) -> Option<&str> {
+        self.core_root.as_str()
+    }
+
+    /// `Environment::CoreRoot.validate!` (upstream v0.4.7, #2517): the
+    /// configured core must exist, be a readable directory and hold at least
+    /// one `**/*.rbs`; otherwise the run stops with `rigor: <message>` and
+    /// exit 64 rather than analysing against a different core.
+    pub fn validate_core_root(&self) -> Result<Option<std::path::PathBuf>, String> {
+        let Some(raw) = self.core_root() else {
+            return Ok(None);
+        };
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("/"));
+        let abs = lexical_absolute(Path::new(raw), &cwd);
+        let reason = if !abs.exists() {
+            Some("does not exist")
+        } else if !abs.is_dir() {
+            Some("is not a directory")
+        } else if std::fs::read_dir(&abs).is_err() {
+            Some("is not readable")
+        } else if !has_rbs(&abs) {
+            Some("contains no .rbs signature file")
+        } else {
+            None
+        };
+        let shown = ruby_inspect(&serde_yaml::Value::String(abs.to_string_lossy().into_owned()));
+        if let Some(r) = reason {
+            return Err(format!("core_root: {shown} {r}"));
+        }
+        // `CoreRoot.reject_overlap!`: a core inside a signature root (or one
+        // containing it) would load twice. The roots are the configured
+        // `signature_paths:`, else `<cwd>/sig` when it is a directory.
+        let roots: Vec<String> = if self.present_keys.contains("signature_paths")
+            && !self.signature_paths_null
+        {
+            self.signature_paths.clone()
+        } else {
+            let sig = cwd.join("sig");
+            if sig.is_dir() {
+                vec![sig.to_string_lossy().into_owned()]
+            } else {
+                Vec::new()
+            }
+        };
+        let with_slash = |p: &Path| format!("{}/", core_root_real_path(p).to_string_lossy());
+        let core = with_slash(&abs);
+        for path in roots {
+            let root = with_slash(&lexical_absolute(Path::new(&path), &cwd));
+            if core.starts_with(&root) || root.starts_with(&core) {
+                return Err(format!(
+                    "core_root: {shown} overlaps the signature path {}, so its signatures would \
+                     load twice; move the core outside the project's signature paths",
+                    ruby_inspect(&serde_yaml::Value::String(path))
+                ));
+            }
+        }
+        Ok(Some(abs))
     }
 
     /// The `rbs collection` gem dirs discovered under `rbs_collection.lock.yaml`
@@ -2685,6 +2754,24 @@ fn coerce_parallel(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
     }
 }
 
+/// `Configuration#coerce_core_root` (upstream v0.4.7, #2517): nil is "the
+/// default core"; anything but a non-blank String is a `ConfigurationError`.
+/// The directory itself is checked where the index is built
+/// ([`Config::validate_core_root`]), not here.
+fn coerce_core_root(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure> {
+    match merged.get("core_root") {
+        None | Some(serde_yaml::Value::Null) => Ok(()),
+        Some(serde_yaml::Value::String(s)) if s.trim().is_empty() => {
+            Err(usage_failure("core_root must not be empty".to_string()))
+        }
+        Some(serde_yaml::Value::String(_)) => Ok(()),
+        Some(v) => Err(usage_failure(format!(
+            "core_root must be a directory path, got {}",
+            ruby_inspect(v)
+        ))),
+    }
+}
+
 /// The ordered `initialize` pass — the first bad value wins upstream, so the
 /// checks run in `Configuration#initialize`'s own order
 /// (configuration.rb:498-561).
@@ -2693,6 +2780,7 @@ fn validate_config_values(merged: &serde_yaml::Mapping) -> Result<(), LoadFailur
     check_hash_merge(merged, "plugins_io")?;
     coerce_target_ruby(merged)?;
     coerce_plugin_entries(merged)?;
+    coerce_core_root(merged)?;
     coerce_bleeding_edge_value(merged)?;
     coerce_effects_value(merged)?;
     coerce_cache_max_bytes(merged)?;
@@ -2928,6 +3016,14 @@ fn resolve_paths_in(
         out.insert(
             serde_yaml::Value::String(key.to_string()),
             serde_yaml::Value::Sequence(resolved),
+        );
+    }
+    // `SCALAR_PATH_KEYS` (v0.4.7): `core_root:` when it is a String.
+    if let Some(serde_yaml::Value::String(cr)) = out.get("core_root") {
+        let abs = expand_config_entry(cr, base_dir)?.to_string_lossy().into_owned();
+        out.insert(
+            serde_yaml::Value::String("core_root".to_string()),
+            serde_yaml::Value::String(abs),
         );
     }
     // `resolve_plugins_io_paths!` — `plugins_io:` is a Hash upstream; a
@@ -3185,6 +3281,50 @@ fn strip_dot_slashes(pattern: &str) -> &str {
         rest = tail.trim_start_matches('/');
     }
     rest
+}
+
+/// `CoreRoot.real_path`: the realpath of the nearest existing ancestor, with
+/// the missing tail re-appended.
+fn core_root_real_path(path: &Path) -> std::path::PathBuf {
+    let mut existing = path.to_path_buf();
+    let mut missing = Vec::new();
+    while !existing.exists() {
+        let Some(name) = existing.file_name().map(std::ffi::OsStr::to_os_string) else {
+            break;
+        };
+        missing.push(name);
+        if !existing.pop() {
+            break;
+        }
+    }
+    let mut out = std::fs::canonicalize(&existing).unwrap_or(existing);
+    for m in missing.into_iter().rev() {
+        out.push(m);
+    }
+    out
+}
+
+/// Whether `dir` holds a `**/*.rbs` (`RootedGlob`: hidden entries skipped,
+/// symlinked directories not followed).
+fn has_rbs(dir: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.flatten().any(|e| {
+        let name = e.file_name();
+        let name = name.to_string_lossy();
+        if name.starts_with('.') {
+            return false;
+        }
+        let Ok(ft) = e.file_type() else {
+            return false;
+        };
+        if ft.is_dir() {
+            has_rbs(&e.path())
+        } else {
+            name.ends_with(".rbs") && e.path().is_file()
+        }
+    })
 }
 
 /// `File.absolute_path(path, dir)`: joined onto `dir` when relative, then
