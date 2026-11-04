@@ -185,20 +185,38 @@ pub(crate) fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
 /// recorded slot as one.
 pub(crate) fn discover_visibilities_and_includes(
     body: &PrismNode<'_>,
-) -> (Vec<(String, Visibility)>, Vec<String>) {
+) -> (Vec<(String, Visibility)>, Vec<String>, Vec<(String, Visibility)>) {
+    let (vis, includes) = discover_table(body, false);
+    // Upstream v0.4.5 (#2055, #1569): the reference's method-visibility table
+    // applies a `module_function` call as a `private` one, bare or named —
+    // the instance copy is private. The port's own table keeps reading it as
+    // no toggle (sig-gen and the override side read it, and the reference's
+    // override lint skips a module function's own def), so the slots the
+    // `private` reading writes differently ride separately, for the override
+    // lint's PARENT read only.
+    let (mf_vis, _) = discover_table(body, true);
+    let module_function = mf_vis
+        .into_iter()
+        .filter(|(n, v)| !vis.iter().any(|(m, w)| m == n && w == v))
+        .collect();
+    (vis, includes, module_function)
+}
+
+fn discover_table(body: &PrismNode<'_>, module_function_private: bool) -> (Vec<(String, Visibility)>, Vec<String>) {
     let mut vis: Vec<(String, Visibility)> = Vec::new();
     let mut includes: Vec<String> = Vec::new();
     let mut current = Visibility::Public;
+    let mf = module_function_private;
 
     // A class/module body is a `StatementsNode` (or absent). Walk its direct
     // statements left-to-right; the order is what makes the running-default flow
     // correct. A bare (non-Statements) single-statement body is handled as one.
     if let Some(stmts) = body.as_statements_node() {
         for stmt in stmts.body().iter() {
-            process_visibility_stmt(&stmt, &mut current, &mut vis, &mut includes);
+            process_visibility_stmt(&stmt, &mut current, &mut vis, &mut includes, mf);
         }
     } else {
-        process_visibility_stmt(body, &mut current, &mut vis, &mut includes);
+        process_visibility_stmt(body, &mut current, &mut vis, &mut includes, mf);
     }
     (vis, includes)
 }
@@ -262,6 +280,7 @@ fn process_visibility_stmt(
     current: &mut Visibility,
     vis: &mut Vec<(String, Visibility)>,
     includes: &mut Vec<String>,
+    module_function_private: bool,
 ) {
     // A receiver-less `def name` records at the running default.
     if let Some(def) = stmt.as_def_node() {
@@ -274,7 +293,11 @@ fn process_visibility_stmt(
         return;
     };
     if let Some((name, args)) = visibility_call_parts(&call) {
-        if let Some(modifier) = visibility_of_modifier(&name) {
+        let modifier = match name.as_str() {
+            "module_function" if module_function_private => Some(Visibility::Private),
+            _ => visibility_of_modifier(&name),
+        };
+        if let Some(modifier) = modifier {
             if args.is_empty() {
                 // Bare modifier ⇒ flip the running default.
                 *current = modifier;

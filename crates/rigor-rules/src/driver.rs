@@ -367,6 +367,31 @@ pub fn analyze_with_source_and_folder(
             if reopened_touches(class_id, qualified, method) {
                 continue;
             }
+            // Upstream #1569 (`module_function_def?`): a module function's
+            // instance copy is private because `module_function` made it so,
+            // and the reference does not report that reduction. A bare
+            // `module_function` anywhere earlier in the body (resets
+            // ignored — the decline side), one wrapping this def, or a
+            // later one naming it, declines.
+            let def_start = ast.get(child_id).span().0;
+            let class_span = node.span();
+            let module_function_def = ast.iter().any(|(_, n)| {
+                let Node::Call { receiver: None, method: m, args, span, .. } = n else {
+                    return false;
+                };
+                if m != "module_function" || !crate::span_within(*span, class_span) {
+                    return false;
+                }
+                (args.is_empty() && span.0 < def_start)
+                    || args.contains(&child_id)
+                    || (span.0 > def_start
+                        && args.iter().any(|&a| matches!(ast.get(a),
+                            Node::SymbolLit { value, .. } | Node::StringLit { value, .. }
+                                if value == method)))
+            });
+            if module_function_def {
+                continue;
+            }
             if let Some(diag) =
                 check_override_visibility(source, index, qualified, method, override_vis, *name_span)
             {
