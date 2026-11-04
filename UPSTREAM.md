@@ -15,8 +15,17 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.2`** (2026-10-11) |
-| Commit | `3d29b126` |
+| **Pinned ref** | **`v0.4.3`** (2026-10-15) |
+| Commit | `8ad37954` |
+
+> **`v0.4.2 → v0.4.3` (2026-11-04): 221 commits, step four.** Nothing vendored
+> moved. Raw: 0 fixture FPs and 2 sweep FPs. Both were `unless flag` in an
+> `ensure` where the body writes the flag (#1837: rescue/ensure clauses read
+> body-written locals as untyped). The fragment probe added three gate-invisible
+> families, all ported: refinements of `Object`/`Module`/`Kernel` reaching
+> class-object calls (#1836), relative `exclude:` globs applying to configured
+> `paths:` (#1858, a rewrite of every subcommand's file set), and `disable:`
+> covering `pre-eval.*` (#1892). See the [note](docs/notes/20261104-repin-v043.md).
 
 > **`v0.4.1 → v0.4.2` (2026-11-04): 498 commits, step three.** `core_overlay/`
 > gained 13 unconditional Ruby 4.1 files, and the effects `string` mutators went
