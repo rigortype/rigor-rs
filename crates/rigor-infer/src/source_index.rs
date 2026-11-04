@@ -635,6 +635,11 @@ pub struct SourceIndex {
     /// `if` arms), or when a bodiless macro defines it. Read only to DECLINE
     /// `call.unresolved-toplevel`.
     rebind_names: HashSet<String>,
+    /// Upstream v0.4.6 (#2237 / issue #2013) — `(owner's last constant
+    /// segment, method)` → every `(file index, settled)` replacer
+    /// (`define_method` / `alias_method` / `alias`) of that instance method.
+    /// See [`Self::visibility_replaced`].
+    visibility_replacers: HashMap<(String, String), Vec<(usize, bool)>>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see

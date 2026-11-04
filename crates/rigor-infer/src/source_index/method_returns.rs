@@ -191,6 +191,10 @@ pub(crate) fn infer_method_returns(
 /// recognition is generous (any receiverless or `self.` call, the `send`
 /// family with a literal macro name, String or Symbol names): an extra key
 /// only declines.
+/// The event name of an unreadable `alias_method`: it supersedes every name
+/// its class wrote a `def` of before it. Not a Ruby method name.
+const WILDCARD_NAME: &str = "\0*";
+
 fn superseded_defs(ast: &LoweredAst) -> HashSet<(String, String)> {
     use rigor_parse::Span;
     let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
@@ -251,6 +255,17 @@ fn superseded_defs(ast: &LoweredAst) -> HashSet<(String, String)> {
                         _ => (method.clone(), &args[..]),
                     };
                     let names: Vec<String> = rest.iter().filter_map(|&a| literal(a)).collect();
+                    // Upstream v0.4.6 (#2225, `unread_alias_method?`): an
+                    // `alias_method` whose two names `AliasNames` cannot read
+                    // (`alias_method n, :to_s`, `self.alias_method :x, :y`, a
+                    // splat) still replaces a method: every name the class
+                    // wrote before it is contested (`AliasMap#copy_into`).
+                    if macro_name == "alias_method"
+                        && (receiver.is_some() || rest.len() != 2 || names.len() != 2)
+                    {
+                        events.push((name.clone(), nspan.0, WILDCARD_NAME.to_string(), false));
+                        continue;
+                    }
                     let members: Vec<String> = match macro_name.as_str() {
                         "attr_reader" => names,
                         "attr_writer" => names.iter().map(|b| format!("{b}=")).collect(),
@@ -273,6 +288,14 @@ fn superseded_defs(ast: &LoweredAst) -> HashSet<(String, String)> {
     // (class, method) -> (a def seen, the last event was a definer).
     let mut state: HashMap<(String, String), (bool, bool)> = HashMap::new();
     for (class, _, method, is_def) in events {
+        if method == WILDCARD_NAME {
+            for ((c, _), slot) in state.iter_mut() {
+                if *c == class && slot.0 {
+                    slot.1 = true;
+                }
+            }
+            continue;
+        }
         let slot = state.entry((class, method)).or_insert((false, false));
         if is_def {
             *slot = (true, false);

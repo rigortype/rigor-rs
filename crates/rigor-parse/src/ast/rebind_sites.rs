@@ -81,6 +81,13 @@ pub struct RebindFacts {
     pub defs: Vec<RebindDef>,
     /// Names a bodiless macro defines.
     pub bodiless: Vec<String>,
+    /// Upstream v0.4.6 (#2237 / issue #2013) — every instance-side
+    /// `define_method(:x)` / `alias_method :x, …` / `alias x y` that replaces
+    /// a method of a class body: `(owner's last constant segment, x,
+    /// settled)`. `settled` holds only for a direct body statement that a
+    /// later direct `private :x` / `protected :x` / `public :x` of the same
+    /// body writes again (the reference's walk clears the contest there).
+    pub replacers: Vec<(String, String, bool)>,
 }
 
 impl RebindFacts {
@@ -276,6 +283,8 @@ struct Frame {
     singleton: bool,
     /// A bare `module_function` was seen in this body.
     module_function: bool,
+    /// The class whose instance side a `define_method` / alias here replaces.
+    vis_owner: Option<String>,
 }
 
 struct Walk {
@@ -298,6 +307,8 @@ struct Walk {
     /// The direct statements (program statements and statements of direct
     /// class bodies) and the def arguments of a direct visibility modifier.
     direct: HashSet<Key>,
+    /// Replacer statements a later direct visibility call settles.
+    settled: HashSet<Key>,
 }
 
 impl Walk {
@@ -331,7 +342,19 @@ impl Walk {
         if direct && owner.is_some() {
             self.mark_direct_body(body.as_ref());
         }
-        self.frames.push(Frame { owner, singleton, module_function: false });
+        if !singleton && direct {
+            if let Some(stmts) = body.as_ref().and_then(|b| b.as_statements_node()) {
+                let list: Vec<PrismNode<'_>> = stmts.body().iter().collect();
+                for (i, stmt) in list.iter().enumerate() {
+                    let Some(x) = replaced_name(stmt) else { continue };
+                    if list[i + 1..].iter().any(|later| visibility_names(later).is_some_and(|ns| ns.contains(&x))) {
+                        self.settled.insert(span_of_node(stmt));
+                    }
+                }
+            }
+        }
+        let vis_owner = if singleton { None } else { owner.clone() };
+        self.frames.push(Frame { owner, singleton, module_function: false, vis_owner });
         if let Some(b) = &body {
             self.visit(b);
         }
@@ -381,6 +404,13 @@ impl Walk {
                 self.out.bodiless.push(base);
             }
         }
+    }
+
+    fn record_replacer(&mut self, n: &PrismNode<'_>) {
+        let Some(x) = replaced_name(n) else { return };
+        let Some(owner) = self.frames.last().and_then(|f| f.vis_owner.clone()) else { return };
+        let settled = self.settled.contains(&span_of_node(n));
+        self.out.replacers.push((owner, x, settled));
     }
 
     fn def_slot(&self, n: &PrismNode<'_>, def: &ruby_prism::DefNode<'_>) -> Option<(String, bool)> {
@@ -463,7 +493,8 @@ impl<'pr> Visit<'pr> for Walk {
         // A `def` opens a new local-variable scope, and nothing in its body
         // is a direct statement.
         let saved = std::mem::replace(&mut self.scope, n.location().start_offset());
-        self.frames.push(Frame { owner: None, singleton: false, module_function: false });
+        let vis_owner = self.frames.last().and_then(|f| f.vis_owner.clone());
+        self.frames.push(Frame { owner: None, singleton: false, module_function: false, vis_owner });
         ruby_prism::visit_def_node(self, node);
         self.frames.pop();
         self.scope = saved;
@@ -482,6 +513,7 @@ impl<'pr> Visit<'pr> for Walk {
             }
         }
         self.record_bodiless(node);
+        self.record_replacer(&node.as_node());
         // `note_call`.
         let block = node.block();
         let body = match &block {
@@ -580,6 +612,7 @@ impl<'pr> Visit<'pr> for Walk {
         if let Some(name) = literal_name(Some(&node.new_name())) {
             self.out.bodiless.push(name);
         }
+        self.record_replacer(&node.as_node());
         ruby_prism::visit_alias_method_node(self, node);
     }
 
@@ -618,6 +651,42 @@ impl<'pr> Visit<'pr> for Walk {
         }
         ruby_prism::visit_interpolated_x_string_node(self, node);
     }
+}
+
+/// The name a `define_method(:x)` / `alias_method :x, :y` / `alias x y`
+/// (on no receiver or `self`, also through a literal `send`) replaces.
+/// Widened from the reference's `replaced_by_call`: an extra name declines.
+fn replaced_name(n: &PrismNode<'_>) -> Option<String> {
+    if let Some(a) = n.as_alias_method_node() {
+        return literal_name(Some(&a.new_name()));
+    }
+    let call = n.as_call_node()?;
+    if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+        return None;
+    }
+    let mut args: Vec<PrismNode<'_>> =
+        call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    let mut name = name_of(&call);
+    if SEND_CALLS.contains(&name.as_str()) {
+        name = literal_name(args.first())?;
+        args.remove(0);
+    }
+    if name == "define_method" || name == "alias_method" {
+        literal_name(args.first())
+    } else {
+        None
+    }
+}
+
+/// The literal names a receiverless `private :x, :y` (or `protected` /
+/// `public`) writes; `None` for any other statement or a computed argument.
+fn visibility_names(n: &PrismNode<'_>) -> Option<Vec<String>> {
+    let call = n.as_call_node()?;
+    if call.receiver().is_some() || !VISIBILITY_MODIFIERS.contains(&name_of(&call).as_str()) {
+        return None;
+    }
+    let args: Vec<PrismNode<'_>> = call.arguments()?.arguments().iter().collect();
+    args.iter().map(|a| literal_name(Some(a))).collect()
 }
 
 fn last_segment(path: &PrismNode<'_>) -> Option<String> {
@@ -728,8 +797,14 @@ pub(crate) fn collect(root: &PrismNode<'_>) -> RebindFacts {
         block_arg_exprs: HashSet::new(),
         lvw_values: HashMap::new(),
         scope: usize::MAX,
-        frames: vec![Frame { owner: Some("<toplevel>".to_string()), singleton: false, module_function: false }],
+        frames: vec![Frame {
+            owner: Some("<toplevel>".to_string()),
+            singleton: false,
+            module_function: false,
+            vis_owner: None,
+        }],
         direct: HashSet::new(),
+        settled: HashSet::new(),
     };
     w.visit(root);
     // `value_targets`: a proc value assigned to a local reaches the calls

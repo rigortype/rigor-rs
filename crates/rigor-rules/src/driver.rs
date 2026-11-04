@@ -378,6 +378,13 @@ pub fn analyze_with_source_and_folder(
             if reopened_touches(class_id, qualified, method) {
                 continue;
             }
+            // Upstream v0.4.6 (#2237 / issue #2013): a `define_method` or an
+            // alias of the name (later, conditional, or in a sibling file)
+            // contests the slot, which proves no reduction.
+            let owner_segment = qualified.rsplit("::").next().unwrap_or(qualified);
+            if source.visibility_replaced(owner_segment, method, ast.file_key()) {
+                continue;
+            }
             // Upstream #1569 (`module_function_def?`): a module function's
             // instance copy is private because `module_function` made it so,
             // and the reference does not report that reduction. A bare

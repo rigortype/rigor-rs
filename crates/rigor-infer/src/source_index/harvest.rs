@@ -378,8 +378,14 @@ impl SourceIndex {
         // the def tables cannot read, so the count is cross-file.
         {
             let mut slots: HashMap<(String, String, bool), u32> = HashMap::new();
-            for (_, ast) in files {
+            for (i, (_, ast)) in files.iter().enumerate() {
                 let facts = &ast.ancestry_facts().rebind;
+                for (owner, name, settled) in &facts.replacers {
+                    idx.visibility_replacers
+                        .entry((owner.clone(), name.clone()))
+                        .or_default()
+                        .push((i, *settled));
+                }
                 for d in &facts.defs {
                     match &d.slot {
                         Some((owner, side)) if !d.escapes => {

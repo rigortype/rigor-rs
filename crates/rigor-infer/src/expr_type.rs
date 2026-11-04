@@ -1614,6 +1614,16 @@ impl<'i> Typer<'i> {
         // there either — its literal-string lift / RBS envelope still types
         // `format("%d", "abc")` String and `Integer("abc")` Integer (fixture 53).
         if let Some(scalars) = self.pin_arg_scalars(ast, args, env, interner) {
+            // Upstream v0.4.6 (#2125 / #2247): a `format` whose widths blow
+            // the byte limit answers the reference's `literal-string`, which
+            // the port does not model — untyped, not a drifting `String`.
+            if matches!(method, "format" | "sprintf") {
+                if let Some((Scalar::Str(tmpl), rest)) = scalars.split_first() {
+                    if crate::folding::format_blows_up(tmpl, rest) {
+                        return Some(interner.untyped());
+                    }
+                }
+            }
             let folded: Option<Scalar> = match method {
                 "format" | "sprintf" => {
                     // Template = first arg (a Constant string); the rest are the

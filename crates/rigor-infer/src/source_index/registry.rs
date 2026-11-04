@@ -91,6 +91,19 @@ impl SourceIndex {
         self.rebind_names.contains(method)
     }
 
+    /// Upstream v0.4.6 (#2237 / issue #2013) — whether a `define_method` /
+    /// `alias_method` / `alias` of `method` in a body of the class whose last
+    /// constant segment is `owner` may give the name another visibility than
+    /// the `def` in `file` records: any replacer in another file, or one in
+    /// this file no later direct `private :x` settles. Coarse by owner
+    /// segment, so it only declines more.
+    pub fn visibility_replaced(&self, owner: &str, method: &str, file: &FileKey) -> bool {
+        let here = self.file_index.get(file).copied();
+        self.visibility_replacers
+            .get(&(owner.to_string(), method.to_string()))
+            .is_some_and(|rows| rows.iter().any(|&(i, settled)| !settled || Some(i) != here))
+    }
+
     /// Register a name in the id registry (idempotent), returning nothing.
     pub(crate) fn register(&mut self, name: &str) {
         if !self.name_to_id.contains_key(name) {
