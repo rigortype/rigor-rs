@@ -35,6 +35,13 @@
       "column": 7,
       "severity": "warning",
       "message": "visibility of `foo' reduced from protected to private (overrides B3#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 148,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides B14#foo); breaks substitutability"
     }
   ]
 }

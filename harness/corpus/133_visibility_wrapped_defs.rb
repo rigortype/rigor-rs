@@ -127,3 +127,26 @@ class S12 < B12
   private
   def foo = 3
 end
+
+# A same-file reopening that re-marks the child's visibility is silent on the
+# reference; the per-body table cannot see it, so the port declines.
+class B13
+  def foo = 1
+end
+class S13 < B13
+  private def foo = 2
+end
+class S13
+  public :foo
+end
+
+# Control: a reopening that leaves `foo` alone still fires.
+class B14
+  def foo = 1
+end
+class S14 < B14
+  private def foo = 2
+end
+class S14
+  def bar = 1
+end

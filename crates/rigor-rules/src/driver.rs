@@ -299,6 +299,28 @@ pub fn analyze_with_source_and_folder(
     // override index resolves its ancestors precisely — the zero-FP keystone).
     // See `check_override_visibility` for the full gate.
     let qualified_names = qualified_class_names(ast);
+    // A same-file reopening of the overriding class can re-mark a method's
+    // visibility (`class S; public :foo; end`), and the per-body table does not
+    // see it. The reference is silent there, so a method that another body of the
+    // same class records, or any body that runs a visibility modifier, declines.
+    let reopened_touches = |class_id, qualified: &String, method: &str| {
+        ast.iter().any(|(other_id, other)| {
+            if other_id == class_id || qualified_names.get(&other_id) != Some(qualified) {
+                return false;
+            }
+            let (Node::ClassDef { body, method_visibilities, .. }
+            | Node::ModuleDef { body, method_visibilities, .. }) = other
+            else {
+                return false;
+            };
+            method_visibilities.iter().any(|(m, _)| m == method)
+                || body.iter().any(|&c| {
+                    matches!(ast.get(c), Node::Call { receiver: None, method, .. }
+                        if matches!(method.as_str(),
+                            "private" | "protected" | "public" | "module_function"))
+                })
+        })
+    };
     for (class_id, node) in ast.iter() {
         let (body, method_visibilities) = match node {
             Node::ClassDef { name, body, method_visibilities, .. }
@@ -342,6 +364,9 @@ pub fn analyze_with_source_and_folder(
             else {
                 continue; // not in the table (singleton / untracked) ⇒ silent.
             };
+            if reopened_touches(class_id, qualified, method) {
+                continue;
+            }
             if let Some(diag) =
                 check_override_visibility(source, index, qualified, method, override_vis, *name_span)
             {
