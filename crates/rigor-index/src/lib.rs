@@ -125,12 +125,28 @@ impl CoreIndex {
         sig_dirs: &[std::path::PathBuf],
         collection_dirs: &[std::path::PathBuf],
     ) -> Self {
+        Self::for_project_core(enabled, sig_dirs, collection_dirs, None)
+    }
+
+    /// [`Self::for_project_parts`] with a validated `core_root:` directory
+    /// (upstream v0.4.7, #2517) replacing the embedded core RBS.
+    pub fn for_project_core(
+        enabled: &[String],
+        sig_dirs: &[std::path::PathBuf],
+        collection_dirs: &[std::path::PathBuf],
+        core_root: Option<&std::path::Path>,
+    ) -> Self {
         let resolved: Vec<&'static plugins::BundledPlugin> = enabled
             .iter()
             .filter_map(|id| plugins::bundled_plugin(id))
             .collect();
         Self {
-            data: rbs::CoreData::load_for_project_parts(&resolved, sig_dirs, collection_dirs),
+            data: rbs::CoreData::load_for_project_core(
+                &resolved,
+                sig_dirs,
+                collection_dirs,
+                core_root,
+            ),
         }
     }
 

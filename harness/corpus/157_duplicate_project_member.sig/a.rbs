@@ -1,0 +1,12 @@
+class Foo
+  def a: () -> Integer
+end
+class Bar
+  def b: () -> Integer
+end
+class Ovl
+  def o: () -> Integer
+end
+class Attr
+  attr_reader x: Integer
+end

@@ -149,40 +149,43 @@ fn mark_unbuildable_definitions(
     classes: &mut HashMap<&'static str, ClassEntry>,
     qualified: &mut HashMap<&'static str, ClassEntry>,
 ) {
-    fn blank(entry: &mut ClassEntry, instance: bool, singleton: bool) {
-        if instance {
-            entry.instance_unbuildable = true;
-            entry.methods.clear();
-            entry.tuple_returns.clear();
-            entry.method_overloads.clear();
-            entry.overloading_method_overloads.clear();
-            entry.block_returns.clear();
-            entry.block_free_returns.clear();
-            entry.void_methods.clear();
-            entry.aliases.clear();
-        }
-        if singleton {
-            entry.singleton_unbuildable = true;
-            entry.singleton_methods.clear();
-            entry.singleton_tuple_returns.clear();
-            entry.singleton_method_overloads.clear();
-            entry.overloading_singleton_overloads.clear();
-            entry.singleton_block_free_returns.clear();
-            entry.void_singleton_methods.clear();
-            entry.singleton_aliases.clear();
-        }
-    }
     for &(name, instance, singleton) in UNBUILDABLE_DEFINITIONS {
         if let Some(entry) = qualified.get_mut(name) {
-            blank(entry, instance, singleton);
+            blank_unbuildable(entry, instance, singleton);
         }
         // Short-key map: only for a genuinely top-level name (see the constant's
         // doc — a nested name's short key is a merge of unrelated classes).
         if !name.contains("::") {
             if let Some(entry) = classes.get_mut(name) {
-                blank(entry, instance, singleton);
+                blank_unbuildable(entry, instance, singleton);
             }
         }
+    }
+}
+
+/// Empty one entry's instance and/or singleton surface and flag it
+/// unbuildable — see [`mark_unbuildable_definitions`].
+fn blank_unbuildable(entry: &mut ClassEntry, instance: bool, singleton: bool) {
+    if instance {
+        entry.instance_unbuildable = true;
+        entry.methods.clear();
+        entry.tuple_returns.clear();
+        entry.method_overloads.clear();
+        entry.overloading_method_overloads.clear();
+        entry.block_returns.clear();
+        entry.block_free_returns.clear();
+        entry.void_methods.clear();
+        entry.aliases.clear();
+    }
+    if singleton {
+        entry.singleton_unbuildable = true;
+        entry.singleton_methods.clear();
+        entry.singleton_tuple_returns.clear();
+        entry.singleton_method_overloads.clear();
+        entry.overloading_singleton_overloads.clear();
+        entry.singleton_block_free_returns.clear();
+        entry.void_singleton_methods.clear();
+        entry.singleton_aliases.clear();
     }
 }
 
@@ -903,11 +906,47 @@ impl CoreData {
         sig_dirs: &[PathBuf],
         collection_dirs: &[PathBuf],
     ) -> Self {
+        Self::load_for_project_core(plugins, sig_dirs, collection_dirs, None)
+    }
+
+    /// [`Self::load_for_project_parts`] with upstream v0.4.7's `core_root:`
+    /// (#2517): when `core_root` is set, every `**/*.rbs` under it (sorted)
+    /// is ingested IN PLACE OF the embedded `core/` — the reference hands the
+    /// directory to `RBS::EnvironmentLoader.new(core_root:)`, so the default
+    /// core is never loaded beside it — while the stdlib closure and the
+    /// rigor-owned overlay still come from the embedded set, as the
+    /// reference's library repository and `core_overlay/` do. The caller has
+    /// validated the directory.
+    pub fn load_for_project_core(
+        plugins: &[&crate::plugins::BundledPlugin],
+        sig_dirs: &[PathBuf],
+        collection_dirs: &[PathBuf],
+        core_root: Option<&std::path::Path>,
+    ) -> Self {
         // 1) Resolve the core source (override dir, else embedded), folding into a
         //    fresh builder — the SAME logic [`Self::load`] previously inlined.
         let mut builder = Builder::default();
         let mut source = RbsSource::Embedded;
-        if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
+        if let Some(dir) = core_root {
+            let mut found = Vec::new();
+            glob_rbs(dir, &mut found);
+            found.sort();
+            for f in &found {
+                if let Ok(code) = std::fs::read_to_string(f) {
+                    ingest_rbs_source(&mut builder, &f.to_string_lossy(), &code);
+                }
+            }
+            for (name, contents) in EMBEDDED_RBS
+                .iter()
+                .filter(|(n, _)| !is_overlay(n) && !n.starts_with("core/"))
+            {
+                ingest_rbs_source(&mut builder, name, contents);
+            }
+            for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)) {
+                ingest_rbs_source(&mut builder, name, contents);
+            }
+            source = RbsSource::Override(dir.display().to_string());
+        } else if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
             let dir = PathBuf::from(dir);
             if Self::ingest_dir_into(&mut builder, &dir) {
                 source = RbsSource::Override(dir.display().to_string());
@@ -921,6 +960,15 @@ impl CoreData {
 
         // 2) Ingest each bundled plugin's RBS on top of whichever core source was
         //    used. The reopen-union merge handles classes already present.
+        //    Upstream v0.4.7 (#2424): a plugin member the project's own sig
+        //    declares stands down — collect those keys from a scratch ingest
+        //    of `sig_dirs` (collection dirs are not the project's own).
+        if !plugins.is_empty() && !sig_dirs.is_empty() {
+            let mut scratch = Builder { member_phase: MemberPhase::Project, ..Builder::default() };
+            ingest_project_dirs(&mut scratch, sig_dirs, &[]);
+            builder.plugin_standdowns = scratch.project_member_keys;
+        }
+        builder.member_phase = MemberPhase::Plugin;
         for plugin in plugins {
             for (name, contents) in plugin.rbs {
                 let key = intern(&format!("plugin:{}:{name}", plugin.id));
@@ -938,7 +986,10 @@ impl CoreData {
         let pre_sig: HashSet<&'static str> = builder.classes.keys().copied().collect();
         let pre_sig_qualified: HashSet<&'static str> =
             builder.qualified.keys().copied().collect();
+        builder.member_phase = MemberPhase::Project;
         ingest_project_dirs(&mut builder, sig_dirs, collection_dirs);
+        builder.member_phase = MemberPhase::Bundled;
+        let dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
         // Issue #129: the capability-role catalogue goes in AFTER the project's
         // own signatures, per declaration (conformance table only).
         builder.conformance.ingest_capability_roles();
@@ -980,6 +1031,19 @@ impl CoreData {
         //    a project reopening one of these classes does not repair the build
         //    there either — it still resolves `Dynamic[Top]`.
         mark_unbuildable_definitions(&mut classes, &mut qualified);
+        // A project-phase member that redeclares another declaration's key
+        // fails that side's build (`DuplicatedMethodDefinitionError`); the
+        // class reads `Dynamic[top]` in the reference. Same neutralisation.
+        for (name, singleton) in dup_unbuildable {
+            if let Some(entry) = qualified.get_mut(name) {
+                blank_unbuildable(entry, !singleton, singleton);
+            }
+            if !name.contains("::") {
+                if let Some(entry) = classes.get_mut(name) {
+                    blank_unbuildable(entry, !singleton, singleton);
+                }
+            }
+        }
         if !classes.is_empty() {
             return Self {
                 source,
@@ -2436,19 +2500,31 @@ impl CoreData {
             return (order, false);
         };
         let mut seen: HashSet<&'static str> = HashSet::new();
+        let mut on_stack: HashSet<&'static str> = HashSet::new();
         let mut ok = true;
-        self.collect_qualified(start, &mut order, &mut seen, &mut ok);
+        self.collect_qualified(start, &mut order, &mut seen, &mut on_stack, &mut ok);
         (order, ok)
     }
 
+    /// `on_stack` holds the entries whose walk is still open: revisiting one
+    /// is a BACK edge — a cyclic superclass or mixin chain (`class A < B` /
+    /// `class B < A`, `M1 ⇄ M2`) — which the reference's ancestor builder
+    /// rejects with `RBS::RecursiveAncestorError` (upstream v0.4.7 #2573:
+    /// the class reads `Dynamic[top]`), so the chain is incomplete. A plain
+    /// revisit (`seen`, not on the stack) is a diamond and stays legal.
     fn collect_qualified(
         &self,
         key: &'static str,
         order: &mut Vec<&'static str>,
         seen: &mut HashSet<&'static str>,
+        on_stack: &mut HashSet<&'static str>,
         ok: &mut bool,
     ) {
         if !*ok {
+            return;
+        }
+        if on_stack.contains(key) {
+            *ok = false;
             return;
         }
         let Some(entry) = self.qualified.get(key) else {
@@ -2464,10 +2540,24 @@ impl CoreData {
         if !seen.insert(key) {
             return;
         }
+        on_stack.insert(key);
+        self.collect_qualified_edges(key, entry, order, seen, on_stack, ok);
+        on_stack.remove(key);
+    }
+
+    fn collect_qualified_edges(
+        &self,
+        key: &'static str,
+        entry: &ClassEntry,
+        order: &mut Vec<&'static str>,
+        seen: &mut HashSet<&'static str>,
+        on_stack: &mut HashSet<&'static str>,
+        ok: &mut bool,
+    ) {
         // See `collect`: a PREPENDED module precedes the prepending class.
         for (w, ctx) in &entry.prepends_written {
             match self.resolve_written_ref(w, ctx) {
-                Some(m) => self.collect_qualified(m, order, seen, ok),
+                Some(m) => self.collect_qualified(m, order, seen, on_stack, ok),
                 None => {
                     *ok = false;
                     return;
@@ -2480,7 +2570,7 @@ impl CoreData {
         order.push(key);
         for (w, ctx) in &entry.includes_written {
             match self.resolve_written_ref(w, ctx) {
-                Some(m) => self.collect_qualified(m, order, seen, ok),
+                Some(m) => self.collect_qualified(m, order, seen, on_stack, ok),
                 None => {
                     *ok = false;
                     return;
@@ -2510,7 +2600,7 @@ impl CoreData {
                 *ok = false;
                 return;
             }
-            self.collect_qualified(s, order, seen, ok);
+            self.collect_qualified(s, order, seen, on_stack, ok);
         }
     }
 
@@ -4073,9 +4163,120 @@ struct Builder {
     /// a receiver typed by one as `Dynamic[top]` — the dispatch gates need it
     /// to keep a stub from ever witnessing a diagnostic.
     synthesized_type_names: HashSet<&'static str>,
+    /// Which load phase the members being ingested belong to — the
+    /// duplicate-member and plugin stand-down bookkeeping below keys on it.
+    member_phase: MemberPhase,
+    /// Upstream v0.4.7 (#2424): the `(class, method, singleton?)` keys the
+    /// project's own `signature_paths:` files declare. A bundled plugin's
+    /// member with one of these keys STANDS DOWN (is not ingested): the
+    /// project's declaration binds.
+    plugin_standdowns: HashSet<MemberKey>,
+    /// The member keys project-phase (`sig/` + collection) declarations have
+    /// declared so far, for the duplicate test of [`Self::member_keys_of`].
+    project_member_keys: HashSet<MemberKey>,
+    /// `(class, singleton?)` sides whose definition the reference cannot build
+    /// because a project-phase member REDECLARES a key another declaration of
+    /// the same class already made (`RBS::DuplicatedMethodDefinitionError`):
+    /// two `sig/` files both `def a`, or a `sig/` `def upcase` on `String`.
+    dup_unbuildable: HashSet<(&'static str, bool)>,
+}
+
+/// `(qualified class, member name, singleton side?)` — one method key an RBS
+/// member contributes to a definition build (the reference's
+/// `MemberConsistency.member_method_keys`).
+type MemberKey = (&'static str, &'static str, bool);
+
+#[derive(Default, Clone, Copy, PartialEq, Eq)]
+enum MemberPhase {
+    #[default]
+    Bundled,
+    Plugin,
+    Project,
 }
 
 impl Builder {
+    /// The method keys `member` contributes on class `qual`: a non-overloading
+    /// `def` (both sides for `self?`), an attribute's reader/writer names and
+    /// an alias's new name. An overloading `def m: ... | ...` contributes none
+    /// (rbs files it under `overloads`, composing with an existing `def`).
+    fn member_keys_of(qual: &'static str, member: &Node<'_>) -> Vec<MemberKey> {
+        let attr = |name: &str, kind: AttributeKind, r: bool, w: bool| {
+            let single = kind == AttributeKind::Singleton;
+            let mut v = Vec::new();
+            if r {
+                v.push((qual, intern(name), single));
+            }
+            if w {
+                v.push((qual, intern(&format!("{name}=")), single));
+            }
+            v
+        };
+        match member {
+            Node::MethodDefinition(md) if !md.overloading() => {
+                let n = intern(md.name().as_str());
+                match md.kind() {
+                    MethodDefinitionKind::Instance => vec![(qual, n, false)],
+                    MethodDefinitionKind::Singleton => vec![(qual, n, true)],
+                    MethodDefinitionKind::SingletonInstance => {
+                        vec![(qual, n, false), (qual, n, true)]
+                    }
+                }
+            }
+            Node::AttrReader(a) => attr(a.name().as_str(), a.kind(), true, false),
+            Node::AttrWriter(a) => attr(a.name().as_str(), a.kind(), false, true),
+            Node::AttrAccessor(a) => attr(a.name().as_str(), a.kind(), true, true),
+            Node::Alias(a) => vec![(
+                qual,
+                intern(a.new_name().as_str()),
+                matches!(a.kind(), AliasKind::Singleton),
+            )],
+            _ => Vec::new(),
+        }
+    }
+
+    /// Phase bookkeeping for one class-body member, BEFORE it is ingested.
+    /// Returns `false` when the member must be skipped (a plugin member the
+    /// project's own sig declares — #2424). In the project phase it records a
+    /// redeclared key as a duplicate (see [`Self::dup_unbuildable`]); `entry`
+    /// is irrelevant there because every earlier member of this declaration
+    /// is already in `project_member_keys`.
+    fn admit_member(&mut self, qual: Option<&'static str>, member: &Node<'_>) -> bool {
+        let Some(qual) = qual else {
+            return true;
+        };
+        match self.member_phase {
+            MemberPhase::Bundled => true,
+            MemberPhase::Plugin => {
+                let keys = Self::member_keys_of(qual, member);
+                // Every key must stand down; a half-taken `self?`/accessor keeps
+                // the plugin member (the status quo).
+                keys.is_empty() || !keys.iter().all(|k| self.plugin_standdowns.contains(k))
+            }
+            MemberPhase::Project => {
+                for key in Self::member_keys_of(qual, member) {
+                    let (_, name, single) = key;
+                    let prior = self.project_member_keys.contains(&key)
+                        || self.qualified.get(qual).is_some_and(|e| {
+                            if single {
+                                e.singleton_methods.contains_key(name)
+                                    || e.singleton_attr_methods.contains(name)
+                                    || e.singleton_aliases.contains_key(name)
+                            } else {
+                                e.methods.contains_key(name)
+                                    || e.attr_methods.contains(name)
+                                    || e.aliases.contains_key(name)
+                            }
+                        });
+                    if prior {
+                        self.dup_unbuildable.insert((qual, single));
+                    }
+                    self.project_member_keys.insert(key);
+                }
+                true
+            }
+        }
+    }
+
     /// Parse one RBS source and fold its top-level class/module declarations in.
     fn ingest(&mut self, code: &str) {
         let Ok(sig) = parse(code) else {
@@ -4403,7 +4604,11 @@ impl Builder {
         // visibility. Body-local by construction — a nested class/module recurses
         // through `ingest_class`/`ingest_module`, which start a fresh loop.
         let mut section_private = false;
+        let qual = enclosing.last().copied();
         for member in members {
+            if !self.admit_member(qual, &member) {
+                continue;
+            }
             match member {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());

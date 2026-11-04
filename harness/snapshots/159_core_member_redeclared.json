@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/159_core_member_redeclared.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 9,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zork' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 10,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `zork' for [1]"
+    }
+  ]
+}
