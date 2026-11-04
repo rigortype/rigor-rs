@@ -705,6 +705,10 @@ fn multi_overload_mismatch(
 ///   second arg against the scope the first left, while the first arg still
 ///   sees the call's entry scope.
 #[allow(clippy::too_many_arguments)]
+fn strip_root(name: &str) -> &str {
+    name.strip_prefix("::").unwrap_or(name)
+}
+
 pub(crate) fn check_argument_type_mismatch(
     ast: &LoweredAst,
     receiver: rigor_parse::NodeId,
@@ -738,11 +742,25 @@ pub(crate) fn check_argument_type_mismatch(
         if let Type::Singleton(class) = interner.get(recv_ty) {
             let class = *class;
             let name = source.class_name_for_id(class)?;
+            // Upstream #1456 `unauthoritative_inherited_signature?`: on an open
+            // receiver only a signature the class DECLARES itself is trusted.
+            if crate::call_receiver::core_overlay_open_receiver(name)
+                && !index.singleton_declared_own(name, method)
+            {
+                return None;
+            }
             let ov = index.singleton_method_overloads(name, method)?;
             (name.to_string(), ov.to_vec())
         } else {
             let name = concrete_class_name(interner, index, source, recv_ty)?;
             if !index.knows_class(&name) {
+                return None;
+            }
+            if crate::call_receiver::core_overlay_open_receiver(&name)
+                && index
+                    .declaring_ancestor(&name, method)
+                    .is_none_or(|owner| strip_root(owner) != strip_root(&name))
+            {
                 return None;
             }
             let ov = index.method_overloads(&name, method)?;

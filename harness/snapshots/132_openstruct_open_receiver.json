@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/132_openstruct_open_receiver.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 34,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zzz' for 1"
+    }
+  ]
+}
