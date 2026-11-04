@@ -392,6 +392,9 @@ struct NamespaceInfo {
     /// qualified name → generic header spelling (`[unchecked out E]`), the
     /// run's `stamp_generic_reopenings` (#2436/#2473).
     params: HashMap<String, String>,
+    /// The core-subclass shells (#2224) — written only beside a written
+    /// method of their file, never as a shell-only target.
+    core_shells: HashSet<String>,
 }
 
 impl NamespaceInfo {
@@ -403,6 +406,7 @@ impl NamespaceInfo {
         self.headers.extend(other.headers);
         self.shell_files.extend(other.shell_files);
         self.params.extend(other.params);
+        self.core_shells.extend(other.core_shells);
     }
 }
 
@@ -751,6 +755,7 @@ fn generate_file_with_info(
             }
         }
         info.shells.push(h.full.clone());
+        info.core_shells.insert(h.full.clone());
         info.kinds.entry(h.full.clone()).or_insert("class");
     }
     info.shell_files = info.shells.iter().map(|s| (path.to_string(), s.clone())).collect();
@@ -1273,12 +1278,15 @@ fn method_candidate(
             return None;
         }
         let params = render_initialize_params(sig.param_shape);
+        // `block_signature_suffix`: a `&block` belongs AFTER the parens —
+        // inside them (`(…, ?{ (?) -> void })`) RBS rejects the whole file.
+        let block = if sig.param_shape.has_block { " ?{ (*untyped) -> untyped }" } else { "" };
         return Some(Candidate {
             file: path.to_string(),
             class_name: class_name.to_string(),
             method_name: "initialize".to_string(),
             kind: "instance",
-            rbs: format!("def initialize: ({params}) -> void"),
+            rbs: format!("def initialize: ({params}){block} -> void"),
             // The reference stub's `inferred_return` is `untyped` (the rbs is
             // `-> void`, but the candidate carries the fallback type).
             inferred_return: "untyped".to_string(),
@@ -1648,8 +1656,8 @@ fn is_bare_generic_name(erased: &str) -> bool {
 /// (params-observed typing is a later slice), in the reference's
 /// `render_initialize_param_list` order: requireds → optionals (`?untyped`) →
 /// rest (`*untyped`) → keywords (`name: untyped` / `?name: untyped`) → keyword-
-/// rest (`**untyped`) → block (`?{ (?) -> void }`). Posts are omitted (as the
-/// reference does).
+/// rest (`**untyped`). The block is the caller's suffix (`block_signature_suffix`);
+/// posts are not carried by [`ParamShape`] and are omitted.
 fn render_initialize_params(shape: &ParamShape) -> String {
     let mut parts: Vec<String> = Vec::new();
     for _ in 0..shape.required {
@@ -1667,9 +1675,6 @@ fn render_initialize_params(shape: &ParamShape) -> String {
     }
     if shape.has_kwrest {
         parts.push("**untyped".to_string());
-    }
-    if shape.has_block {
-        parts.push("?{ (?) -> void }".to_string());
     }
     parts.join(", ")
 }
@@ -1958,7 +1963,14 @@ fn cmd_write(
     }
     {
         let info = &run_info;
+        // A core-subclass shell rides on its file's written methods; a file
+        // with none writes nothing (reference `declared_by_run`).
+        let files_with_methods: HashSet<&str> =
+            tagged.iter().filter(|(_, c)| writes(c)).map(|(_, c)| c.file.as_str()).collect();
         for (f, shell) in &info.shell_files {
+            if info.core_shells.contains(shell) && !files_with_methods.contains(f.as_str()) {
+                continue;
+            }
             // Route a shell to its ENCLOSING class's target (a shell rides in the
             // same file as the class it is nested in — e.g. `Rigor::Triage::Selector`
             // routes with `Rigor::Triage`), so a consolidated layout keeps the
