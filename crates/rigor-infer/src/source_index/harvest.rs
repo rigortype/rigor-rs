@@ -333,7 +333,21 @@ impl SourceIndex {
     /// on every dispatch — which is exactly the cost the held table removes. No
     /// behaviour rides on this: `H` is erased before the first read.
     pub fn merge<H: Borrow<Harvest>>(files: &[(H, &LoweredAst)], core: &CoreIndex) -> Self {
+        Self::merge_with_pre_eval(files, core, None)
+    }
+
+    /// [`Self::merge`] with the run's `pre_eval:` registry installed BEFORE
+    /// the passes run, so the build-time return inference (the literal-tail
+    /// fold and tier-4b's `method_returns`) already declines a method a patch
+    /// may replace, exactly as the query-time readers do (ADR-17: the
+    /// reference's patched tier answers ahead of the project's own `def`).
+    pub fn merge_with_pre_eval<H: Borrow<Harvest>>(
+        files: &[(H, &LoweredAst)],
+        core: &CoreIndex,
+        pre_eval: Option<std::sync::Arc<super::PreEvalPatches>>,
+    ) -> Self {
         let mut idx = SourceIndex::default();
+        idx.set_pre_eval_patches(pre_eval);
 
         // === M1: ordered replay ============================================
 

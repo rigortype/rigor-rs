@@ -143,6 +143,52 @@ fn core_instance_may_answer(
         || (!exact && source.project_subclass_may_define(class_name, method))
 }
 
+/// ADR-17 `pre_eval:` — whether a patch the project's `pre_eval:` files
+/// declare may answer `method` on a receiver of `class_name` (`singleton`:
+/// the class object): the reference's `source_declared_method?` patch half
+/// (before the RBS gates) together with `last_resort_surface_answers?`'s
+/// `project_patched_through_ancestors?`. A private patch, or a protected one
+/// called from the top level, answers nothing on an explicit receiver
+/// (`patch_callable?`), so the undefined-method row stands there as it does on
+/// the reference. A `self` receiver is not explicit.
+#[allow(clippy::too_many_arguments)]
+fn pre_eval_answers(
+    ast: &LoweredAst,
+    receiver: rigor_parse::NodeId,
+    message_span: (usize, usize),
+    typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    method: &str,
+    singleton: bool,
+) -> bool {
+    let source = typer.source();
+    if !source.pre_eval_defines_name(method) {
+        return false;
+    }
+    let call = if matches!(ast.get(receiver), rigor_parse::Node::SelfExpr { .. }) {
+        rigor_infer::PatchCall::Implicit
+    } else {
+        rigor_infer::PatchCall::Explicit { toplevel: main_self_at(ast, message_span) }
+    };
+    source.pre_eval_may_answer(index, class_name, method, singleton, call)
+}
+
+/// Whether `self` at `span` is certainly `main` (an `Object`): no class,
+/// module, `class <<`, method, block or lambda body encloses it. Anywhere
+/// else `self` may be something else, which a protected patch may answer.
+fn main_self_at(ast: &LoweredAst, span: (usize, usize)) -> bool {
+    let inside = |s: (usize, usize)| s.0 <= span.0 && span.1 <= s.1;
+    !ast.iter().any(|(_, n)| match n {
+        rigor_parse::Node::ClassDef { .. }
+        | rigor_parse::Node::ModuleDef { .. }
+        | rigor_parse::Node::Definition { .. }
+        | rigor_parse::Node::Lambda { .. } => inside(n.span()),
+        rigor_parse::Node::Call { block_span: Some(b), .. } => inside(*b),
+        _ => false,
+    })
+}
+
 /// Apply `call.undefined-method` to a single call with a receiver.
 ///
 /// Zero-false-positive gate (ADR-0023): emit *only* when the receiver's concrete
@@ -217,6 +263,10 @@ pub(crate) fn check_call(
         }
         // Upstream v0.4.6 (#2269 / #2094) — `singleton_mixin_may_answer?`.
         if typer.source().core_singleton_mixin_may_answer(index, name, method) {
+            return None;
+        }
+        // ADR-17 — a `pre_eval:` patch on the class object's walk.
+        if pre_eval_answers(ast, receiver, message_span, typer, index, name, method, true) {
             return None;
         }
         let receiver_render = format!("singleton({name})");
@@ -368,6 +418,8 @@ pub(crate) fn check_call(
                     method,
                     exact_literal_receiver(interner, recv_ty) || literal_receiver_node(ast, receiver),
                 )
+                // ADR-17 — a `pre_eval:` patch on the receiver's walk.
+                && !pre_eval_answers(ast, receiver, message_span, typer, index, name, method, false)
             {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
@@ -433,6 +485,10 @@ pub(crate) fn check_call(
         method,
         exact_literal_receiver(interner, recv_ty) || literal_receiver_node(ast, receiver),
     ) {
+        return None;
+    }
+    // ADR-17 — a `pre_eval:` patch on the receiver's walk.
+    if pre_eval_answers(ast, receiver, message_span, typer, index, class_name, method, false) {
         return None;
     }
 
@@ -573,6 +629,18 @@ fn check_union_call(
                     {
                         return None;
                     }
+                }
+                // ADR-17 — `method_present_anywhere?`'s
+                // `project_patched_through_ancestors?`, asked with no call
+                // node, so any patch on the arm's walk answers.
+                if typer.source().pre_eval_may_answer(
+                    index,
+                    &class_name,
+                    method,
+                    false,
+                    rigor_infer::PatchCall::Implicit,
+                ) {
+                    return None;
                 }
                 // Upstream v0.4.5 (#2086, `arm_surface_may_answer?`).
                 if core_instance_may_answer(
@@ -720,6 +788,10 @@ pub(crate) fn check_narrowed_call(
     if core_instance_may_answer(typer.source(), index, class_name, method, false) {
         return None;
     }
+    // ADR-17 — a `pre_eval:` patch on the receiver's walk.
+    if pre_eval_answers(ast, receiver, message_span, typer, index, class_name, method, false) {
+        return None;
+    }
     // Render the narrowed receiver as the reference does — the FULL resolved
     // path ("undefined method `frobnicate_zzz' for URI::HTTP", probes §1/§3),
     // which for a core name is the same plain class name `Nominal[C]` rendered
@@ -800,6 +872,10 @@ pub(crate) fn check_collection_call(
     // Upstream v0.4.5 (#2086) — the carrier's exactness is not read here, so
     // the subclass half is asked too (declines more).
     if core_instance_may_answer(typer.source(), index, class_name, method, false) {
+        return None;
+    }
+    // ADR-17 — a `pre_eval:` patch on the receiver's walk.
+    if pre_eval_answers(ast, receiver, message_span, typer, index, class_name, method, false) {
         return None;
     }
     let class = index.class_id(class_name)?;
