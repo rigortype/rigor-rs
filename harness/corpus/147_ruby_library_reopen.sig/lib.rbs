@@ -1,0 +1,14 @@
+class Matrix
+  def self.mine: () -> Integer
+  def own: (Integer) -> Integer
+end
+module Digest
+  class MakerZzz
+  end
+end
+module Other
+  class K
+  end
+end
+class Mine
+end

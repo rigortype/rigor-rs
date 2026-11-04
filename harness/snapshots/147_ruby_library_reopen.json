@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/147_ruby_library_reopen.rb",
+  "diagnostics": [
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 22,
+      "column": 16,
+      "severity": "error",
+      "message": "argument type mismatch at `own' on Matrix: expected Integer, got \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `zzz' for Mine"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `zzz' for Other::K"
+    }
+  ]
+}
