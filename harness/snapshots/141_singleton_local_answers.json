@@ -1,0 +1,47 @@
+{
+  "fixture": "../../../../../../private/tmp/claude-501/-Users-megurine-repo-rust-rigor-rs/eae17166-00a5-4d29-9dc0-bf6d57ffce0b/scratchpad/v045/b/fx/141_singleton_local_answers.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 49,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `m' for \"o\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `vx' for \"v\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `m' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 55,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zz' for \"f\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 56,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `db' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 60,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `m' for \"n\""
+    }
+  ]
+}

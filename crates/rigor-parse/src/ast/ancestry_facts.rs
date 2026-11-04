@@ -101,14 +101,14 @@ pub struct AncestryFacts {
     pub required_features: Vec<String>,
     /// Upstream v0.4.5 (#2086 / issue #1722) — every RECEIVER-form instance
     /// mixin `X.include(M)` / `X.prepend(M)` / `X.send(:include, M)`, wherever
-    /// it is written: `(owner candidates, from, names)`, with `from` the call's
-    /// lexical nesting plus one placeholder segment (the shape
-    /// `resolve_override_ancestor` reads) and a non-constant argument as
+    /// it is written: `(owner candidates, names)`, a non-constant argument as
     /// [`WILDCARD`]. The reference records such an edge (unpositioned) under
-    /// the class the receiver names; the port keeps its wildcard taint for the
-    /// order readers and lists the names here for the set-shaped
-    /// `call.undefined-method` decline only.
-    pub receiver_mixins: Vec<(Vec<String>, String, Vec<String>)>,
+    /// the class the receiver names and resolves the names from that OWNER,
+    /// not from the call site (probed: `Integer.include(Ext)` inside `module
+    /// Foo` with `Foo::Ext` reads as an unknown mixin and silences `1.nope`).
+    /// The port keeps its wildcard taint for the order readers and lists the
+    /// names here for the set-shaped `call.undefined-method` decline only.
+    pub receiver_mixins: Vec<(Vec<String>, Vec<String>)>,
     /// Upstream v0.4.5 (#2086 / issue #1722) — the reference's
     /// `LexicalMethodSites` singleton-local table for this file.
     pub singleton_locals: super::singleton_locals::SingletonLocals,
@@ -436,9 +436,7 @@ impl Census {
                 if !complete {
                     listed.push(WILDCARD.to_string());
                 }
-                let mut from = self.prefix.clone();
-                from.push("_".to_string());
-                self.out.receiver_mixins.push((owners.clone(), from.join("::"), listed));
+                self.out.receiver_mixins.push((owners.clone(), listed));
             }
             self.wildcard(owners, side);
             return;

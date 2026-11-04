@@ -55,8 +55,8 @@ pub(crate) struct AncestryIndex {
     /// file requires ([`AncestryFacts::required_features`]).
     required_features: HashSet<String>,
     /// Upstream v0.4.5 (#2086): per owner candidate, its receiver-form
-    /// instance mixins `(from, raw)` ([`AncestryFacts::receiver_mixins`]).
-    receiver_listed: HashMap<String, Vec<(String, String)>>,
+    /// instance mixins ([`AncestryFacts::receiver_mixins`]).
+    receiver_listed: HashMap<String, Vec<String>>,
 }
 
 impl AncestryIndex {
@@ -89,13 +89,12 @@ impl AncestryIndex {
                 self.toplevel_includes.push(raw.clone());
             }
         }
-        for (owners, from, names) in &facts.receiver_mixins {
+        for (owners, names) in &facts.receiver_mixins {
             for o in owners {
                 let list = self.receiver_listed.entry(o.clone()).or_default();
                 for n in names {
-                    let edge = (from.clone(), n.clone());
-                    if !list.contains(&edge) {
-                        list.push(edge);
+                    if !list.contains(n) {
+                        list.push(n.clone());
                     }
                 }
             }
@@ -729,7 +728,7 @@ impl SourceIndex {
             edges.extend(names.iter().map(|r| (q.to_string(), r.clone())));
         }
         if let Some(listed) = self.ancestry.receiver_listed.get(q) {
-            edges.extend(listed.iter().cloned());
+            edges.extend(listed.iter().map(|r| (q.to_string(), r.clone())));
         }
         edges
     }
