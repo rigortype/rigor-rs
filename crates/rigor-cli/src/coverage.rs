@@ -424,6 +424,10 @@ fn determine_exit(report: &Report, options: &Options) -> ExitCode {
 fn build_index(cfg: &Config) -> CoreIndex {
     let root = Path::new(".");
     let sig_dirs = cfg.all_signature_dirs(root);
+    // Upstream v0.4.7 (#2517): a valid `core_root:` replaces the embedded core.
+    if let Some(core) = cfg.validate_core_root().ok().flatten() {
+        return CoreIndex::for_project_core(&[], &sig_dirs, &[], Some(&core));
+    }
     if sig_dirs.is_empty() {
         CoreIndex::new()
     } else {

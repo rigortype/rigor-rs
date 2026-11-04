@@ -256,6 +256,7 @@ fn run_stdio() -> Result<(), String> {
         stamp: SeverityStamp::from_config(&cfg),
         exclude: ExcludeMatcher::from_config(&root, &cfg),
         pre_eval_declared: !cfg.pre_eval.is_empty(),
+        core_root_invalid: cfg.validate_core_root().is_err(),
         overlay,
     });
 
@@ -559,6 +560,10 @@ struct ProjectContext {
     /// `SourceIndex::set_pre_eval_declared`). Config-derived like
     /// [`Self::disable`].
     pre_eval_declared: bool,
+    /// Upstream v0.4.7 (#2517): a configured `core_root:` that cannot serve
+    /// as a core. `check` stops with exit 64 there; the reference's language
+    /// server publishes nothing, so every dispatch returns an empty set.
+    core_root_invalid: bool,
 }
 
 /// The ADR-8 SeverityStamp inputs (reference `severity_stamp.rb`), carried on the
@@ -1168,7 +1173,14 @@ fn lower_one(path: &str) -> Option<LoweredAst> {
 /// 'blank?' for "s"` where `rigor check` was silent. A per-keystroke false
 /// positive, and a direct contradiction of S4b's parity headline.
 fn build_core_index(root: &Path, cfg: &Config) -> CoreIndex {
-    CoreIndex::for_project(&cfg.effective_plugins(root), &cfg.all_signature_dirs(root))
+    // Upstream v0.4.7 (#2517): a valid `core_root:` replaces the embedded
+    // core here exactly as in `check`.
+    CoreIndex::for_project_core(
+        &cfg.effective_plugins(root),
+        &cfg.signature_dirs(),
+        &cfg.collection_signature_dirs(root),
+        cfg.validate_core_root().ok().flatten().as_deref(),
+    )
 }
 
 /// The project's analysable `.rb` files, in bare-`check` order (ADR-0040) —
@@ -2014,6 +2026,7 @@ fn swap_project(
         // takes effect on the next publish.
         exclude: ExcludeMatcher::from_config(&ctx.project_root, &st.cfg),
         pre_eval_declared: !st.cfg.pre_eval.is_empty(),
+        core_root_invalid: st.cfg.validate_core_root().is_err(),
         overlay,
     });
     // Every cross-file cache entry was built against the context just superseded
@@ -2931,7 +2944,7 @@ fn compute_diagnostics(
     // skip. An excluded buffer yields an EMPTY set rather than no publish at
     // all, so the caller's publish CLEARS any markers the editor is already
     // showing for it (the same empty-publish `didClose` uses).
-    if project.exclude.excludes(buf, project.overlay.as_ref()) {
+    if project.core_root_invalid || project.exclude.excludes(buf, project.overlay.as_ref()) {
         return (Vec::new(), None, None);
     }
     let bytes = text.as_bytes().to_vec();
