@@ -14,6 +14,7 @@
 //! listed gem dir not on disk) degrades to an empty list — the run proceeds with
 //! no gem RBS, never crashes (ADR-0016).
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// The default collection directory, relative to the lockfile, when the lockfile
@@ -36,7 +37,20 @@ fn is_skipped_source_type(source_type: &str) -> bool {
 ///
 /// `lockfile` is an explicit path (from config); when `None` and `auto_detect`
 /// is true, `<project_root>/rbs_collection.lock.yaml` is used if it exists.
+#[cfg(test)]
 pub fn discover(lockfile: Option<&Path>, project_root: &Path, auto_detect: bool) -> Vec<PathBuf> {
+    discover_skipping(lockfile, project_root, auto_detect, &BTreeSet::new())
+}
+
+/// [`discover`] minus the gems named in `skip` — upstream v0.4.7 (#2441):
+/// the project's own `path:` gems ([`project_path_gems`]), whose collection
+/// copy would double-declare the project's `sig/`.
+pub fn discover_skipping(
+    lockfile: Option<&Path>,
+    project_root: &Path,
+    auto_detect: bool,
+    skip: &BTreeSet<String>,
+) -> Vec<PathBuf> {
     let Some(lock) = resolve_lockfile_path(lockfile, project_root, auto_detect) else {
         return Vec::new();
     };
@@ -53,7 +67,7 @@ pub fn discover(lockfile: Option<&Path>, project_root: &Path, auto_detect: bool)
     if !collection_root.is_dir() {
         return Vec::new();
     }
-    gem_paths_from(&collection_root, &data)
+    gem_paths_from(&collection_root, &data, skip)
 }
 
 /// The resolved lockfile path, or `None`. An explicit `lockfile` is resolved
@@ -95,7 +109,11 @@ fn resolve_collection_root(lockfile: &Path, data: &serde_yaml::Value) -> PathBuf
 /// Every `<collection_root>/<name>/<version>/` directory listed under `gems:`
 /// whose source type is not skipped, whose `name`/`version` are present, and
 /// whose directory exists on disk.
-fn gem_paths_from(collection_root: &Path, data: &serde_yaml::Value) -> Vec<PathBuf> {
+fn gem_paths_from(
+    collection_root: &Path,
+    data: &serde_yaml::Value,
+    skip: &BTreeSet<String>,
+) -> Vec<PathBuf> {
     let Some(gems) = data.get("gems").and_then(serde_yaml::Value::as_sequence) else {
         return Vec::new();
     };
@@ -111,11 +129,145 @@ fn gem_paths_from(collection_root: &Path, data: &serde_yaml::Value) -> Vec<PathB
                 return None;
             }
             let name = scalar_to_string(entry.get("name")?)?;
+            if skip.contains(&name) {
+                return None;
+            }
             let version = scalar_to_string(entry.get("version")?)?;
             let gem_root = collection_root.join(&name).join(&version);
             gem_root.is_dir().then_some(gem_root)
         })
         .collect()
+}
+
+/// Upstream v0.4.7 (#2441/#2592, `environment/project_path_gems.rb`): the
+/// gems a `Gemfile.lock` `PATH` stanza locks from a directory the run analyses
+/// as project source — the gem directory is at or under a `paths:` entry, or
+/// contains one, and the file walker keeps at least one `.rb` of the covered
+/// part after `exclude:`.
+///
+/// Only the auto-detected `<root>/Gemfile.lock` is read, and only when
+/// `<root>/Gemfile` exists (the reference's Bundler parser raises
+/// `GemfileNotFound` without one and reads NO lockfile) and every top-level
+/// section is one this line parser understands. Anything else is the empty
+/// set: the collection copy stays, which is the pre-#2441 behaviour.
+pub fn project_path_gems(
+    root: &Path,
+    paths: &[String],
+    excludes: &crate::config::ExcludeSet,
+) -> BTreeSet<String> {
+    let mut out = BTreeSet::new();
+    if !root.join("Gemfile").is_file() {
+        return out;
+    }
+    let lock = root.join("Gemfile.lock");
+    let Ok(text) = std::fs::read_to_string(&lock) else {
+        return out;
+    };
+    let Some(gems) = path_stanza_gems(&text) else {
+        return out;
+    };
+    let abs_root = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let entries: Vec<(PathBuf, PathBuf)> = paths
+        .iter()
+        .map(|p| {
+            let logical = fold(&abs_root.join(p));
+            let r = real(&logical);
+            (logical, r)
+        })
+        .collect();
+    if entries.is_empty() {
+        return out;
+    }
+    for (name, remote) in gems {
+        let dir = real(&fold(&abs_root.join(&remote)));
+        let reached = entries.iter().any(|(logical, real_entry)| {
+            let part = if real_entry.starts_with(&dir) {
+                logical.clone()
+            } else if let Ok(rest) = dir.strip_prefix(real_entry) {
+                logical.join(rest)
+            } else {
+                return false;
+            };
+            analysed_ruby(&part, excludes)
+        });
+        if reached {
+            out.insert(name);
+        }
+    }
+    out
+}
+
+/// `File.expand_path`'s lexical `.`/`..` fold of an absolute path.
+fn fold(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::from("/");
+    for c in path.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Whether the walker would analyse some `.rb` of `part`: the file itself, or
+/// a `**/*.rb` under the directory, that `exclude:` keeps.
+fn analysed_ruby(part: &Path, excludes: &crate::config::ExcludeSet) -> bool {
+    let mut files = Vec::new();
+    if part.is_file() {
+        files.push(part.to_string_lossy().into_owned());
+    } else if part.is_dir() {
+        crate::collect_rb_files(part, &mut files);
+    }
+    files.retain(|f| f.ends_with(".rb"));
+    excludes.retain_unexcluded(&mut files);
+    !files.is_empty()
+}
+
+/// `(name, remote)` for every spec a `PATH` stanza locks, or `None` when the
+/// lockfile has a top-level section this parser does not model (Bundler may
+/// read it differently). A `GIT` stanza is not a path source.
+fn path_stanza_gems(text: &str) -> Option<Vec<(String, String)>> {
+    let mut out = Vec::new();
+    let mut section = "";
+    let mut remote: Option<String> = None;
+    for line in text.lines() {
+        let line = line.trim_end_matches('\r');
+        if line.is_empty() {
+            continue;
+        }
+        if !line.starts_with(' ') {
+            if !matches!(
+                line,
+                "GEM" | "PATH" | "GIT" | "PLATFORMS" | "DEPENDENCIES" | "RUBY VERSION" | "BUNDLED WITH" | "CHECKSUMS"
+            ) {
+                return None;
+            }
+            section = if line == "PATH" { "PATH" } else { "" };
+            remote = None;
+            continue;
+        }
+        if section != "PATH" {
+            continue;
+        }
+        if let Some(r) = line.strip_prefix("  remote: ") {
+            remote = Some(r.trim().to_string());
+        } else if let Some(rest) = line.strip_prefix("    ") {
+            if rest.starts_with(' ') {
+                continue;
+            }
+            let name = rest.split(' ').next().unwrap_or("");
+            match &remote {
+                Some(r) if !name.is_empty() => out.push((name.to_string(), r.clone())),
+                _ => {}
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Coerce a YAML scalar (`name`/`version`) to a string. YAML types an unquoted

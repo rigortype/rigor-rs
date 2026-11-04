@@ -215,6 +215,10 @@ impl Default for RbsCollectionConfig {
 #[serde(default)]
 pub struct BundlerConfig {
     pub auto_detect: bool,
+    /// Whether `bundler.lockfile:` names an explicit `Gemfile.lock` (which
+    /// then replaces the auto-detected one upstream). Only gates the #2441
+    /// path-gem skip, which reads the auto-detected file alone.
+    pub lockfile_set: bool,
 }
 
 /// ADR-50 WD2 — the resolved bleeding-edge adoption (config `bleeding_edge:`,
@@ -243,7 +247,7 @@ impl BleedingEdgeSelector {
 
 impl Default for BundlerConfig {
     fn default() -> Self {
-        BundlerConfig { auto_detect: true }
+        BundlerConfig { auto_detect: true, lockfile_set: false }
     }
 }
 
@@ -408,6 +412,7 @@ where
     match value {
         serde_yaml::Value::Mapping(map) => Ok(BundlerConfig {
             auto_detect: map.get("auto_detect") == Some(&serde_yaml::Value::Bool(true)),
+            lockfile_set: map.get("lockfile").is_some_and(|v| !v.is_null()),
         }),
         serde_yaml::Value::Null => Ok(BundlerConfig::default()),
         other => Err(serde::de::Error::custom(format!(
@@ -936,10 +941,22 @@ impl Config {
     /// (ADR-0034) for a project rooted at `project_root`.
     #[must_use]
     pub fn collection_signature_dirs(&self, project_root: &Path) -> Vec<std::path::PathBuf> {
-        crate::rbs_collection::discover(
+        // Upstream v0.4.7 (#2441): the project's own `path:` gems skip their
+        // collection copy.
+        let skip = if self.bundler.auto_detect && !self.bundler.lockfile_set {
+            crate::rbs_collection::project_path_gems(
+                project_root,
+                &self.paths,
+                &crate::exclude_set_at(self, project_root),
+            )
+        } else {
+            std::collections::BTreeSet::new()
+        };
+        crate::rbs_collection::discover_skipping(
             self.rbs_collection.lockfile.as_deref().map(Path::new),
             project_root,
             self.rbs_collection.auto_detect,
+            &skip,
         )
     }
 
@@ -3594,7 +3611,7 @@ mod tests {
         };
         assert_eq!(explicit.effective_plugins(&dir), vec!["activesupport-core-ext".to_string()]);
         // auto_detect off → only the explicit list.
-        let off = Config { bundler: BundlerConfig { auto_detect: false }, ..Default::default() };
+        let off = Config { bundler: BundlerConfig { auto_detect: false, lockfile_set: false }, ..Default::default() };
         assert!(off.effective_plugins(&dir).is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
