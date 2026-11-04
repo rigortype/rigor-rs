@@ -168,7 +168,6 @@ pub fn required_vendored_features(source: &[u8]) -> Vec<String> {
     out
 }
 
-const TOGGLES: [&str; 4] = ["private", "protected", "public", "module_function"];
 const MODIFIERS: [&str; 3] = ["private", "protected", "public"];
 const MIXIN_KINDS: [&str; 3] = ["include", "prepend", "extend"];
 const SEND_NAMES: [&str; 3] = ["send", "public_send", "__send__"];
@@ -542,27 +541,77 @@ impl<'pr> Visit<'pr> for Census {
         let recv = node.receiver();
         let direct = self.is_direct(&n);
         let mut direct_modifier = false;
-        if recv.is_none() && self.in_def == 0 && TOGGLES.contains(&name.as_str()) {
-            if args.is_empty() && node.block().is_none() {
+        // Reference v0.4.4 `visibility_call_parts` (#1633): receiverless, on
+        // `self`, or `send(:private, …)`; a block is ignored.
+        let parts = if self.in_def == 0 {
+            super::definitions::visibility_call_parts(node)
+        } else {
+            None
+        };
+        if let Some((vname, vargs)) = &parts {
+            let modifier = MODIFIERS.contains(&vname.as_str()) && !self.frame().singleton;
+            let splat = vargs.iter().any(|a| a.as_splat_node().is_some());
+            if vargs.is_empty() {
                 // A bare toggle: only a direct one settles the running default.
                 if let Some(f) = self.frames.last_mut() {
                     f.uncertain = !direct;
                 }
-            } else if !args.is_empty() {
-                if direct {
-                    direct_modifier = MODIFIERS.contains(&name.as_str());
-                } else if let Some(owner) = self.owner() {
-                    for a in &args {
-                        let lit = if let Some(s) = a.as_symbol_node() {
-                            Some(String::from_utf8_lossy(s.unescaped()).into_owned())
-                        } else {
-                            a.as_string_node()
-                                .map(|s| String::from_utf8_lossy(s.unescaped()).into_owned())
-                        };
-                        if let Some(lit) = lit {
-                            for o in &owner {
-                                self.out.contested_visibilities.push((o.clone(), lit.clone()));
+            } else if splat {
+                // `private(*names)` may be a bare toggle (`private(*[])`), so
+                // the default after it is uncertain, and it may name any slot
+                // recorded so far (`contest_class`): the wildcard slot.
+                if let Some(f) = self.frames.last_mut() {
+                    f.uncertain = true;
+                }
+                if modifier {
+                    if let Some(owner) = self.owner() {
+                        for o in &owner {
+                            self.out.contested_visibilities.push((o.clone(), WILDCARD.to_string()));
+                        }
+                    }
+                }
+            }
+            if modifier && !vargs.is_empty() {
+                direct_modifier = direct;
+                if let Some(owner) = self.owner() {
+                    let mut contested: Vec<String> = Vec::new();
+                    for a in vargs {
+                        if let Some(def) = a.as_def_node() {
+                            // `private def self.x` reaches an instance `x`, if one
+                            // exists, in a way the walk cannot read.
+                            if def.receiver().is_some() {
+                                contested.push(constant_string(def.name().as_slice()));
                             }
+                        } else if !direct {
+                            if let Some(arr) = a.as_array_node() {
+                                contested.extend(arr.elements().iter().filter_map(|e| {
+                                    super::definitions::literal_symbol_or_string_name(&e)
+                                }));
+                            } else if let Some(lit) =
+                                super::definitions::literal_symbol_or_string_name(a)
+                            {
+                                contested.push(lit);
+                            }
+                        }
+                    }
+                    for o in &owner {
+                        for c in &contested {
+                            self.out.contested_visibilities.push((o.clone(), c.clone()));
+                        }
+                    }
+                }
+            }
+        } else if recv.is_none() && self.in_def == 0 && !direct && !self.frame().singleton {
+            // An `attr_*` member written anywhere but a direct statement (or the
+            // argument of a direct visibility call) holds a slot the port's
+            // table does not record.
+            let key = span_key(&n);
+            if !self.recorded_arg_defs.contains(&key) {
+                let members = super::definitions::attr_macro_members(node);
+                if let Some(owner) = self.owner() {
+                    for o in &owner {
+                        for m in &members {
+                            self.out.contested_visibilities.push((o.clone(), m.clone()));
                         }
                     }
                 }
@@ -593,8 +642,10 @@ impl<'pr> Visit<'pr> for Census {
         }
         if let Some(arguments) = node.arguments() {
             if direct_modifier {
+                // The harvest records a direct visibility call's `def` and
+                // `attr_*` arguments (`send(:private, …)`'s too).
                 for a in &args {
-                    if a.as_def_node().is_some() {
+                    if a.as_def_node().is_some() || a.as_call_node().is_some() {
                         self.recorded_arg_defs.insert(span_key(a));
                     }
                 }

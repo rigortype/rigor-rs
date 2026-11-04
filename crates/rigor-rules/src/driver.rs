@@ -173,6 +173,19 @@ pub fn analyze_with_source_and_folder(
             let recv_ty = typer.type_of(ast, recv, env, interner);
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
+        // Upstream #1961 — a receiver reading a local an unentered `case`'s
+        // `when` condition wrote reads `Dynamic[top]` on the reference
+        // (`ScopedEnv::case_widened_names`). The snapshot rules below witness
+        // from passes that never saw that widening (a Dynamic carrier OPENS
+        // their gates), so they stand down on such a receiver.
+        let case_widened = scoped.case_widened_names(message_span);
+        let snap_skip = !case_widened.is_empty() && {
+            let rspan = ast.get(recv).span();
+            ast.iter().any(|(_, n)| {
+                matches!(n, Node::LocalVariableRead { name, span }
+                    if crate::span_within(*span, rspan) && case_widened.contains(&name.as_str()))
+            })
+        };
         let diag = (!nil_skip)
             .then(|| {
                 check_call(
@@ -181,6 +194,9 @@ pub fn analyze_with_source_and_folder(
             })
             .flatten()
             .or_else(|| {
+                if snap_skip {
+                    return None;
+                }
                 check_narrowed_call(
                     call_id, ast, recv, &method, message_span, safe_nav, gate_env, &typer,
                     interner, index, &class_snaps,
@@ -195,6 +211,9 @@ pub fn analyze_with_source_and_folder(
                 // union-then-rejoin on both edges (rigor-rs#139). `gate_env`'s
                 // unwidened bindings stay for the narrowing rule, whose snaps
                 // replace a Dynamic carrier rather than witness a concrete one.
+                if snap_skip {
+                    return None;
+                }
                 check_collection_call(
                     call_id, ast, recv, &method, message_span, safe_nav, env, &typer,
                     interner, index, &coll_snaps,
@@ -207,6 +226,9 @@ pub fn analyze_with_source_and_folder(
                 )
             })
             .or_else(|| {
+                if snap_skip {
+                    return None;
+                }
                 check_nil_receiver(call_id, &method, message_span, safe_nav, &nil_snaps, index)
             })
             .or_else(|| {
@@ -277,6 +299,28 @@ pub fn analyze_with_source_and_folder(
     // override index resolves its ancestors precisely — the zero-FP keystone).
     // See `check_override_visibility` for the full gate.
     let qualified_names = qualified_class_names(ast);
+    // A same-file reopening of the overriding class can re-mark a method's
+    // visibility (`class S; public :foo; end`), and the per-body table does not
+    // see it. The reference is silent there, so a method that another body of the
+    // same class records, or any body that runs a visibility modifier, declines.
+    let reopened_touches = |class_id, qualified: &String, method: &str| {
+        ast.iter().any(|(other_id, other)| {
+            if other_id == class_id || qualified_names.get(&other_id) != Some(qualified) {
+                return false;
+            }
+            let (Node::ClassDef { body, method_visibilities, .. }
+            | Node::ModuleDef { body, method_visibilities, .. }) = other
+            else {
+                return false;
+            };
+            method_visibilities.iter().any(|(m, _)| m == method)
+                || body.iter().any(|&c| {
+                    matches!(ast.get(c), Node::Call { receiver: None, method, .. }
+                        if matches!(method.as_str(),
+                            "private" | "protected" | "public" | "module_function"))
+                })
+        })
+    };
     for (class_id, node) in ast.iter() {
         let (body, method_visibilities) = match node {
             Node::ClassDef { name, body, method_visibilities, .. }
@@ -291,12 +335,20 @@ pub fn analyze_with_source_and_folder(
             continue; // un-namable ⇒ skip.
         };
         // Iterate the class body's DIRECT named `Definition` children (the
-        // overriding defs), anchoring on each one's name token. A def's recorded
-        // visibility comes from the per-node table (by name); a method-name with
-        // no direct Definition child (e.g. the untracked `private def foo` form,
-        // whose def is a call argument, not a body statement) is simply not seen
-        // here — which is correct (that form is silent anyway).
-        for &child_id in body {
+        // overriding defs), anchoring on each one's name token, plus the defs a
+        // direct receiverless `private` / `protected` / `public` call wraps
+        // (`private def foo`, which the table records at the call's visibility
+        // since v0.4.4, #1819). A def's recorded visibility comes from the
+        // per-node table (by name).
+        let defs = body.iter().flat_map(|&child_id| match ast.get(child_id) {
+            Node::Call { receiver: None, method, args, .. }
+                if matches!(method.as_str(), "private" | "protected" | "public") =>
+            {
+                args.clone()
+            }
+            _ => vec![child_id],
+        });
+        for child_id in defs {
             let Node::Definition {
                 name: Some(method),
                 name_span: Some(name_span),
@@ -312,6 +364,9 @@ pub fn analyze_with_source_and_folder(
             else {
                 continue; // not in the table (singleton / untracked) ⇒ silent.
             };
+            if reopened_touches(class_id, qualified, method) {
+                continue;
+            }
             if let Some(diag) =
                 check_override_visibility(source, index, qualified, method, override_vis, *name_span)
             {

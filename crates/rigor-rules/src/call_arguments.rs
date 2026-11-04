@@ -738,11 +738,25 @@ pub(crate) fn check_argument_type_mismatch(
         if let Type::Singleton(class) = interner.get(recv_ty) {
             let class = *class;
             let name = source.class_name_for_id(class)?;
+            // Upstream #1456 `unauthoritative_inherited_signature?`: on an open
+            // receiver only a signature the class DECLARES itself is trusted.
+            if crate::call_receiver::core_overlay_open_receiver(name)
+                && !index.singleton_declared_own(name, method)
+            {
+                return None;
+            }
             let ov = index.singleton_method_overloads(name, method)?;
             (name.to_string(), ov.to_vec())
         } else {
             let name = concrete_class_name(interner, index, source, recv_ty)?;
             if !index.knows_class(&name) {
+                return None;
+            }
+            if crate::call_receiver::core_overlay_open_receiver(&name)
+                && index
+                    .declaring_ancestor(&name, method)
+                    .is_none_or(|owner| strip_root(owner) != strip_root(&name))
+            {
                 return None;
             }
             let ov = index.method_overloads(&name, method)?;
@@ -788,4 +802,9 @@ pub(crate) fn check_argument_type_mismatch(
         receiver_type: Some(class_name),
         method_name: Some(method.to_string()),
     })
+}
+
+/// A class name without its root `::` (reference `strip_root`).
+fn strip_root(name: &str) -> &str {
+    name.strip_prefix("::").unwrap_or(name)
 }

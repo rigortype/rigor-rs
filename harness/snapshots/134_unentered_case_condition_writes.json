@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/134_unentered_case_condition_writes.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 43,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 48,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 54,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    }
+  ]
+}

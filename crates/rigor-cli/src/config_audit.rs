@@ -305,20 +305,65 @@ fn count_rbs_files(dir: &Path) -> usize {
     count
 }
 
-/// `disable:` tokens that name no rule under a built-in family — a likely typo
-/// whose suppression has no effect. Restricted to inert built-in-family tokens so
-/// a plugin / legacy-alias id is never mis-flagged (see
-/// [`rigor_rules::is_inert_builtin_token`]).
+/// `disable:` tokens that reach no row (reference v0.4.4
+/// `ConfigAudit.rule_token_warnings` / `disable_token_warning`, #1953).
 fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
+    let plugin_ids = cfg.configured_plugin_ids();
     for token in cfg.disable_tokens() {
-        if rigor_rules::is_inert_builtin_token(token) {
+        if let Some(reason) = disable_token_problem(token, plugin_ids.as_deref()) {
             out.push(ConfigWarning {
                 kind: "disabled_rule",
-                message: format!(
-                    "disable: {token:?} is not a recognized rule id; the suppression has no effect"
-                ),
+                message: format!("disable: {token:?} {reason}"),
             });
         }
+    }
+}
+
+/// The run-level rows the reference keeps on `severity_overrides:` and the
+/// baseline; `disable:` reaches none of them by any spelling (reference
+/// `RESERVED_RUN_LEVEL_FAMILIES` / `RESERVED_RUN_LEVEL_IDS`).
+const RESERVED_RUN_LEVEL_FAMILIES: &[&str] =
+    &["plugin_loader", "plugin_trust", "rbs.coverage", "dynamic.dependency-source"];
+const RESERVED_RUN_LEVEL_IDS: &[&str] = &["load-error", "runtime-error", "pool-degraded"];
+
+/// Why a `disable:` token reaches no row, or `None` (reference
+/// `disable_token_warning` + `disable_token_problem`). Under-warning is the
+/// FP-safe direction: a token under a non-check engine family stays silent.
+fn disable_token_problem(token: &str, plugin_ids: Option<&[String]>) -> Option<&'static str> {
+    if rigor_rules::is_effective_disable_token(token) {
+        return None;
+    }
+    let reserved = RESERVED_RUN_LEVEL_IDS.contains(&token)
+        || RESERVED_RUN_LEVEL_FAMILIES
+            .iter()
+            .any(|f| token == *f || token.strip_prefix(f).is_some_and(|r| r.starts_with('.')));
+    if reserved {
+        Some(
+            "names a run-level row, which `disable:` does not reach; use `severity_overrides:` or a baseline",
+        )
+    } else if let Some(rest) = token.strip_prefix("plugin.") {
+        // `plausible_plugin_token?`: a manifest id may itself hold a dot, so
+        // the token is matched against each id rather than split.
+        let plausible = |ids: &[String]| {
+            ids.iter().any(|id| {
+                rest == id || rest.strip_prefix(id.as_str()).is_some_and(|r| r.starts_with('.'))
+            })
+        };
+        match plugin_ids {
+            Some(ids) if !plausible(ids) => {
+                Some("names no plugin `plugins:` configures; the suppression has no effect")
+            }
+            _ => None,
+        }
+    } else if rigor_rules::is_inert_builtin_token(token) {
+        Some("is not a recognized rule id; the suppression has no effect")
+    } else if !rigor_rules::is_non_check_engine_token(token) {
+        Some(
+            "is not a recognized rule id; the suppression has no effect \
+             (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)",
+        )
+    } else {
+        None
     }
 }
 
@@ -366,6 +411,58 @@ mod tests {
                     .to_string()
             ]
         );
+    }
+
+    // v0.4.4 (#1953), oracle-probed: a reserved run-level id, a bare unknown
+    // id, and a `plugin.` token naming no configured plugin warn; a working
+    // qualified token, `all`, families, aliases, `pre-eval` and non-check
+    // engine families stay silent.
+    #[test]
+    fn unreachable_disable_tokens_warn() {
+        let cfg: Config = serde_yaml::from_str(
+            "plugins:\n  - rigor-rails-routes\n  - gem: x\n    id: my.plug\n\
+             disable:\n  - load-error\n  - rbs.coverage.foo\n  - rbs.coveragex\n  - foo\n\
+             \x20 - plugin.rails\n  - plugin.rails-routes\n  - plugin.my.plug.r\n  - all\n\
+             \x20 - global\n  - pre-eval\n  - rbs_extended.x\n  - undefined-method\n",
+        )
+        .unwrap();
+        assert_eq!(
+            messages(&cfg, Path::new(".")),
+            vec![
+                "disable: \"load-error\" names a run-level row, which `disable:` does not reach; \
+                 use `severity_overrides:` or a baseline",
+                "disable: \"rbs.coverage.foo\" names a run-level row, which `disable:` does not \
+                 reach; use `severity_overrides:` or a baseline",
+                "disable: \"foo\" is not a recognized rule id; the suppression has no effect \
+                 (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)",
+                "disable: \"plugin.rails\" names no plugin `plugins:` configures; the \
+                 suppression has no effect",
+            ]
+        );
+    }
+
+    // A third-party gem without `id:` makes the configured ids unknowable, so
+    // the plugin-token check stays off.
+    #[test]
+    fn unknown_plugin_id_turns_the_plugin_check_off() {
+        let cfg: Config =
+            serde_yaml::from_str("plugins:\n  - some-gem\ndisable:\n  - plugin.nope\n").unwrap();
+        assert!(messages(&cfg, Path::new(".")).is_empty());
+    }
+
+    #[test]
+    fn bundled_plugin_gems_match_the_pin() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../reference/rigor/plugins");
+        let Ok(entries) = std::fs::read_dir(&root) else {
+            return; // submodule not populated
+        };
+        let mut gems: Vec<String> = entries
+            .flatten()
+            .filter_map(|e| e.file_name().into_string().ok())
+            .filter(|g| root.join(g).join("lib").join(format!("{g}.rb")).is_file())
+            .collect();
+        gems.sort();
+        assert_eq!(gems, crate::config::BUNDLED_PLUGIN_GEMS);
     }
 
     #[test]

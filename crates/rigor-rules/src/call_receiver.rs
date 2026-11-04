@@ -39,6 +39,27 @@ fn unenumerable_metaclass_receiver(class_name: &str) -> bool {
     METACLASS_ARMS.contains(&class_name.strip_prefix("::").unwrap_or(class_name))
 }
 
+/// Upstream #1456/#1982 `CORE_OVERLAY_OPEN_RECEIVERS` (v0.4.4): the classes a
+/// `data/core_overlay/` declaration knows to be partial. `OpenStruct` answers
+/// every field through `method_missing`, so no signature enumerates its surface.
+/// The reference's `unbounded_receiver_surface?` names it by the BARE class name
+/// on both the instance and the singleton side, with no load gate (the core
+/// overlay loads into every environment). A subclass (`class Cfg < OpenStruct`)
+/// is NOT named and keeps firing. Read by `call.undefined-method`,
+/// `call.raise-non-exception` and, for inherited signatures,
+/// `call.argument-type-mismatch`.
+const CORE_OVERLAY_OPEN_RECEIVERS: &[&str] = &["OpenStruct"];
+
+pub(crate) fn core_overlay_open_receiver(class_name: &str) -> bool {
+    CORE_OVERLAY_OPEN_RECEIVERS.contains(&class_name.strip_prefix("::").unwrap_or(class_name))
+}
+
+/// The receiver classes `call.undefined-method` declines on BOTH sides: the
+/// generic metaclasses and the core-overlay open receivers.
+fn unenumerable_receiver_class(class_name: &str) -> bool {
+    unenumerable_metaclass_receiver(class_name) || core_overlay_open_receiver(class_name)
+}
+
 /// Whether `call.undefined-method` must DECLINE on an INSTANCE-side receiver whose
 /// resolved class is `class_name`.
 ///
@@ -73,7 +94,7 @@ fn unenumerable_metaclass_receiver(class_name: &str) -> bool {
 /// silent there on both engines (row c6), because `.class` on a Dynamic receiver
 /// yields no witnessable carrier.
 fn unenumerable_instance_receiver(index: &CoreIndex, class_name: &str) -> bool {
-    unenumerable_metaclass_receiver(class_name) || index.is_qualified_module(class_name)
+    unenumerable_receiver_class(class_name) || index.is_qualified_module(class_name)
 }
 
 /// Apply `call.undefined-method` to a single call with a receiver.
@@ -130,7 +151,7 @@ pub(crate) fn check_call(
         // the retraction deliberately does NOT reach this branch: a named module's
         // singleton surface is real and enumerable, and `Comparable.typo` /
         // `Digest::Instance.typo` keep firing (rows c4/c5).
-        if unenumerable_metaclass_receiver(name) {
+        if unenumerable_receiver_class(name) {
             return None;
         }
         // `class_has_singleton_method` is conservative: `false` only when the

@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/133_visibility_wrapped_defs.rb",
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 22,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides BaseC#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 29,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides BaseW#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 38,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides B6#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 46,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides B7#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 71,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from protected to private (overrides B3#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 148,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to private (overrides B14#foo); breaks substitutability"
+    }
+  ]
+}

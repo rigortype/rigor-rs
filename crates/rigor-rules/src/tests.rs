@@ -2613,11 +2613,17 @@ fn override_vis_silent_on_singleton_def() {
 }
 
 #[test]
-fn override_vis_silent_on_private_def_form() {
-    // `private def foo` records `foo` at the running default (Public),
-    // mirroring the reference gap ⇒ Public-vs-Public is no reduction ⇒ silent.
+fn override_vis_fires_on_private_def_form() {
+    // v0.4.4 (#1819): `private def foo` records `foo` at the call's visibility,
+    // so it reduces a public parent's `foo` (oracle-probed, anchored on the
+    // wrapped def's name).
     let src = b"class A\n  def foo; end\nend\nclass B < A\n  private def foo; end\nend\n";
-    assert!(override_vis(src).is_empty());
+    let diags = override_vis(src);
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "visibility of `foo' reduced from public to private (overrides A#foo); breaks substitutability"
+    );
 }
 
 #[test]

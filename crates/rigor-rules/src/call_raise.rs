@@ -159,6 +159,10 @@ fn raise_class_operand_verdict(
     if source.knows_class(class_name) {
         return RaiseVerdict::Unknown;
     }
+    // Upstream #1456 — `unbounded_receiver_surface?` answers `:unknown`.
+    if crate::call_receiver::core_overlay_open_receiver(class_name) {
+        return RaiseVerdict::Unknown;
+    }
     if !index.knows_class(class_name) {
         return RaiseVerdict::Unknown;
     }
@@ -193,7 +197,9 @@ fn raise_instance_operand_verdict(
     let Some(class_name) = concrete_class_name(interner, index, source, ty) else {
         return RaiseVerdict::Unknown;
     };
-    if RAISE_UNEXACT_INSTANCE_CLASSES.contains(&class_name.as_str()) {
+    if RAISE_UNEXACT_INSTANCE_CLASSES.contains(&class_name.as_str())
+        || crate::call_receiver::core_overlay_open_receiver(&class_name)
+    {
         return RaiseVerdict::Unknown;
     }
     if source.knows_class(&class_name) {

@@ -1,4 +1,12 @@
 {
   "fixture": "harness/corpus/25_override_visibility_negatives.rb",
-  "diagnostics": []
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 35,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `base' reduced from public to private (overrides ModifierForm#base); breaks substitutability"
+    }
+  ]
 }
