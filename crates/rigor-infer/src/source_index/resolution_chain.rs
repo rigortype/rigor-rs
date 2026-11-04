@@ -54,6 +54,9 @@ pub(crate) struct AncestryIndex {
     /// Upstream v0.4.2 (#1701): the gated vendored features some analysed
     /// file requires ([`AncestryFacts::required_features`]).
     required_features: HashSet<String>,
+    /// Upstream v0.4.5 (#2086): per owner candidate, its receiver-form
+    /// instance mixins ([`AncestryFacts::receiver_mixins`]).
+    receiver_listed: HashMap<String, Vec<String>>,
 }
 
 impl AncestryIndex {
@@ -84,6 +87,16 @@ impl AncestryIndex {
         for raw in &facts.toplevel_includes {
             if !self.toplevel_includes.contains(raw) {
                 self.toplevel_includes.push(raw.clone());
+            }
+        }
+        for (owners, names) in &facts.receiver_mixins {
+            for o in owners {
+                let list = self.receiver_listed.entry(o.clone()).or_default();
+                for n in names {
+                    if !list.contains(n) {
+                        list.push(n.clone());
+                    }
+                }
             }
         }
         for (owner, prepend, names) in &facts.direct_mixins {
@@ -647,4 +660,241 @@ fn external_lacks(core: &CoreIndex, from: &str, raw: &str, method: &str) -> bool
         }
     }
     false
+}
+
+/// `RbsReceiverSurface::MISSING_HOOK`.
+const MISSING_HOOK: &str = "method_missing";
+/// `RbsReceiverSurface::OBJECT_ROOTS` — the roots where only a module that
+/// defines the name answers (#1697's reading), never an open-surface one.
+const OBJECT_ROOTS: &[&str] = &["Object", "Kernel", "BasicObject"];
+/// The instance roots every class object is an instance of (the reference's
+/// `singleton_ancestors_for` tail).
+const CLASS_OBJECT_INSTANCE_ROOTS: &[&str] = &["Class", "Module", "Object", "Kernel", "BasicObject"];
+/// `SingletonHookDecline::CONCERN`.
+const CONCERN: &str = "ActiveSupport::Concern";
+
+/// The RBS ancestors of `class_name`, the class itself first; an incomplete
+/// chain reads as the class alone, as the reference's empty answer does.
+fn rbs_ancestors(core: &CoreIndex, class_name: &str) -> Vec<String> {
+    let mut names: Vec<String> = core
+        .ancestor_names(class_name)
+        .map(|v| v.into_iter().map(str::to_string).collect())
+        .unwrap_or_default();
+    if !names.iter().any(|n| n == class_name) {
+        names.insert(0, class_name.to_string());
+    }
+    names
+}
+
+/// Whether some lexical candidate of `raw` (written from `from`) is a class or
+/// module the bundled RBS declares.
+fn rbs_knows_candidate(core: &CoreIndex, from: &str, raw: &str) -> bool {
+    let raw = raw.strip_prefix("::").unwrap_or(raw);
+    let segments: Vec<&str> = from.split("::").collect();
+    (0..segments.len()).rev().any(|i| {
+        let cand = if i == 0 {
+            raw.to_string()
+        } else {
+            format!("{}::{}", segments[..i].join("::"), raw)
+        };
+        core.knows_qualified_class(&cand) || (!cand.contains("::") && core.knows_toplevel_class(&cand))
+    })
+}
+
+impl SourceIndex {
+    /// The reference's `project_defines?` for the instance side, read from
+    /// every table the port holds, across files: a `def` (recorded or
+    /// `possible`), a visibility slot, or a discovered method.
+    fn instance_records(&self, q: &str, method: &str) -> bool {
+        let key = (q.to_string(), method.to_string());
+        self.override_classes.get(q).is_some_and(|e| {
+            e.methods.contains(method) || e.method_visibilities.contains_key(method)
+        }) || self.ancestry.possible.contains(&key)
+            || self.owner_defines(q, method, DefKind::Instance)
+            || self.project_declares_method(None, q, method)
+    }
+
+    /// Every instance mixin edge of `q` the port holds, as `(from, raw)`:
+    /// direct statements, listed (unpositioned) edges and receiver-form ones.
+    fn instance_mixin_edges(&self, q: &str) -> Vec<(String, String)> {
+        let mut edges: Vec<(String, String)> = Vec::new();
+        if let Some(e) = self.override_classes.get(q) {
+            edges.extend(e.includes.iter().map(|r| (q.to_string(), r.clone())));
+        }
+        if let Some(listed) = self.ancestry.include_listed.get(q) {
+            edges.extend(listed.iter().map(|r| (q.to_string(), r.clone())));
+        }
+        for (_, names) in self.ancestry.groups.get(q).into_iter().flatten() {
+            edges.extend(names.iter().map(|r| (q.to_string(), r.clone())));
+        }
+        if let Some(listed) = self.ancestry.receiver_listed.get(q) {
+            edges.extend(listed.iter().map(|r| (q.to_string(), r.clone())));
+        }
+        edges
+    }
+
+    /// `SingletonHookDecline.entry_hook_capable?` for a project module: it
+    /// records a hook (or a `method_missing`), lists the wildcard on either
+    /// side, or extends `ActiveSupport::Concern`.
+    fn hook_capable(&self, q: &str) -> bool {
+        self.ancestry.dirty.contains(q)
+            || self.ancestry.wildcard_include(q)
+            || self
+                .ancestry
+                .extend_listed
+                .get(q)
+                .is_some_and(|l| l.iter().any(|n| n == MIXIN_WILDCARD))
+            || self.override_classes.get(q).is_some_and(|e| {
+                e.extends.iter().any(|x| x.strip_prefix("::").unwrap_or(x) == CONCERN)
+            })
+    }
+
+    /// `chain_answers?` over the mixin closure of the RBS ancestor `a` (its
+    /// own wildcard taint is no entry of the reference's chain): a project
+    /// module that defines `method` or a `method_missing`, an open-surface
+    /// module when `open`, or an external RBS declares `method` on (or, when
+    /// `open`, one RBS does not know). `hook_only` is `hook_on_chain?`: only
+    /// a project `method_missing` answers. The closure is walked as a union,
+    /// so an order the port cannot vouch for does not matter.
+    fn mixin_closure_may_answer(
+        &self,
+        core: &CoreIndex,
+        a: &str,
+        method: &str,
+        open: bool,
+        hook_only: bool,
+    ) -> bool {
+        let mut queue: Vec<(String, String)> = self
+            .instance_mixin_edges(a)
+            .into_iter()
+            .filter(|(_, raw)| raw != MIXIN_WILDCARD)
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((from, raw)) = queue.pop() {
+            if raw == MIXIN_WILDCARD {
+                if open && !hook_only {
+                    return true;
+                }
+                continue;
+            }
+            match self.resolve_override_ancestor(&from, &raw) {
+                Some(q) if self.known_user(&q) => {
+                    if !seen.insert(q.clone()) {
+                        continue;
+                    }
+                    if seen.len() > CHAIN_LIMIT {
+                        return true;
+                    }
+                    if self.instance_records(&q, MISSING_HOOK) {
+                        return true;
+                    }
+                    if !hook_only {
+                        let rbs_known = core.knows_qualified_class(&q)
+                            || (!q.contains("::") && core.knows_toplevel_class(&q));
+                        let answers = if rbs_known {
+                            // ADR-17: a cross-file `def` on an RBS-declared
+                            // module stays the monkey-patch report.
+                            self.discovered_methods.get(&q).is_some_and(|m| m.contains(method))
+                                || core.qualified_class_has_method(&q, method)
+                        } else {
+                            self.instance_records(&q, method) || (open && self.hook_capable(&q))
+                        };
+                        if answers {
+                            return true;
+                        }
+                    }
+                    queue.extend(self.instance_mixin_edges(&q));
+                }
+                // A module the project declares with nothing in it answers
+                // only through RBS.
+                Some(q) => {
+                    if !hook_only
+                        && (core.knows_qualified_class(&q) || core.knows_toplevel_class(&q))
+                        && core.qualified_class_has_method(&q, method)
+                    {
+                        return true;
+                    }
+                }
+                None => {
+                    if !hook_only
+                        && (external_may_define(core, &from, &raw, method, true)
+                            || (open && !rbs_knows_candidate(core, &from, &raw)))
+                    {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// Upstream v0.4.5 (#2086 / issue #1722, `RbsReceiverSurface.ancestor_may_answer?`)
+    /// — whether the project may answer `method` on an instance of the RBS
+    /// class `class_name` through one of its RBS ancestors: a `method_missing`
+    /// on the ancestor, or a project mixin of it (`Integer.include(Ext)`
+    /// wherever written, `module Comparable; include Ext`). A pure SILENCER.
+    pub fn core_ancestor_may_answer(&self, core: &CoreIndex, class_name: &str, method: &str) -> bool {
+        rbs_ancestors(core, class_name).iter().any(|a| {
+            self.instance_records(a, MISSING_HOOK)
+                || self.mixin_closure_may_answer(core, a, method, !OBJECT_ROOTS.contains(&a.as_str()), false)
+        })
+    }
+
+    /// Upstream v0.4.5 (#2086, `RbsReceiverSurface.singleton_hook?`) — whether
+    /// the class object `class_name` may reach a project `method_missing`: a
+    /// `def self.method_missing` on the class or an RBS ancestor, or an
+    /// instance `method_missing` on `Class`, `Module`, `Object`, `Kernel` or
+    /// `BasicObject` (or a project module mixed into one). A superset: every
+    /// RBS ancestor's singleton side is read, modules included.
+    pub fn core_singleton_hook(&self, core: &CoreIndex, class_name: &str) -> bool {
+        rbs_ancestors(core, class_name)
+            .iter()
+            .any(|a| self.owner_defines(a, MISSING_HOOK, DefKind::Singleton))
+            || CLASS_OBJECT_INSTANCE_ROOTS.iter().any(|r| {
+                self.instance_records(r, MISSING_HOOK)
+                    || self.mixin_closure_may_answer(core, r, MISSING_HOOK, false, true)
+            })
+    }
+
+    /// Upstream v0.4.5 (#2086, `RbsReceiverSurface.subclass_may_define?`) —
+    /// whether a project subclass of `class_name`, at any depth, defines
+    /// `method` (through its own ancestry) or a `method_missing`. A parent is
+    /// read as written and resolved the way the class header resolves it:
+    /// the first project class the spelling can denote, else the top-level
+    /// name.
+    pub fn project_subclass_may_define(&self, class_name: &str, method: &str) -> bool {
+        let mut children: HashMap<String, Vec<&str>> = HashMap::new();
+        for (child, entry) in &self.override_classes {
+            let Some(raw) = entry.superclass.as_deref() else { continue };
+            let raw = raw.strip_prefix("::").unwrap_or(raw);
+            let segments: Vec<&str> = child.split("::").collect();
+            let parent = (0..segments.len())
+                .rev()
+                .map(|i| {
+                    if i == 0 {
+                        raw.to_string()
+                    } else {
+                        format!("{}::{}", segments[..i].join("::"), raw)
+                    }
+                })
+                .find(|c| self.known_user(c))
+                .unwrap_or_else(|| raw.to_string());
+            children.entry(parent).or_default().push(child.as_str());
+        }
+        let mut queue: Vec<&str> = children.get(class_name).cloned().unwrap_or_default();
+        let mut seen: HashSet<&str> = HashSet::new();
+        while let Some(sub) = queue.pop() {
+            if !seen.insert(sub) {
+                continue;
+            }
+            if self.instance_records(sub, method)
+                || self.instance_records(sub, MISSING_HOOK)
+                || self.project_declares_method_through_ancestors(None, sub, method)
+            {
+                return true;
+            }
+            queue.extend(children.get(sub).into_iter().flatten().copied());
+        }
+        false
+    }
 }

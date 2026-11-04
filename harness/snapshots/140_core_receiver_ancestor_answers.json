@@ -1,0 +1,40 @@
+{
+  "fixture": "../../../../../../private/tmp/claude-501/-Users-megurine-repo-rust-rigor-rs/eae17166-00a5-4d29-9dc0-bf6d57ffce0b/scratchpad/v045/b/fx/140_core_receiver_ancestor_answers.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 46,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `zzz' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 47,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `nope' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 48,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `zzz_arr' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 49,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `hsub' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `nope' for { a: 1 }"
+    }
+  ]
+}
