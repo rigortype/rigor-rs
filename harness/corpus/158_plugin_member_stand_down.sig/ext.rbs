@@ -1,0 +1,6 @@
+class String
+  def titlecase: () -> Integer
+end
+class Hash[unchecked out K, unchecked out V]
+  def deep_merge: (untyped) -> Integer
+end

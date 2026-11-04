@@ -1,0 +1,9 @@
+class Foo
+  def a: () -> String
+end
+class Ovl
+  def o: (Integer) -> Integer | ...
+end
+class Attr
+  def x: () -> Integer
+end

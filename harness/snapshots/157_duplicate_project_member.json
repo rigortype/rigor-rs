@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/157_duplicate_project_member.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `zork' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `zork' for Bar"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 22,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `zork' for Ovl"
+    }
+  ]
+}

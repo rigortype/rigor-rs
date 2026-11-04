@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/156_cyclic_project_sig.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `zork' for C"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `zork' for Both"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zork' for 1"
+    }
+  ]
+}
