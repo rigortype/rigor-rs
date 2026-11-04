@@ -426,24 +426,25 @@ fn cmd_unused(args: &[String]) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// `PluginCommand::USAGE` — verbatim; `--help`/`help` print it on stdout.
-const PLUGIN_USAGE: &str = r#"Usage: rigor plugin <subcommand> [args]
+/// `PluginCommand::USAGE` (v0.4.7, ADR-126 WD4 grammar) — verbatim;
+/// `--help`/`help` print it on stdout.
+const PLUGIN_USAGE: &str = r#"Usage: rigor plugin [<name>] [--path <name>] [--list] [--root]
 
 Browse the plugins bundled in the rigortype toolchain (worked
 examples for authoring your own). For the activation status of
 the plugins in your .rigor.yml, use `rigor plugins` (plural).
 
-Subcommands:
-  list                  List bundled + example plugins (default)
-  path  <name>          Print the absolute directory path of <name>
-  print <name>          Print <name>'s main lib source, with a header
-  root                  Print the gem root + key subdirectories
+  rigor plugin                List bundled + example plugins
+  rigor plugin <name>         Print <name>'s main lib source, with a header
+  rigor plugin --path <name>  Print the absolute directory path of <name>
+  rigor plugin --list         List bundled + example plugins
+  rigor plugin --root         Print the gem root + key subdirectories
 
 Examples:
-  rigor plugin list
-  rigor plugin path  rigor-activerecord
-  rigor plugin print rigor-activesupport-core-ext
-  rigor plugin root
+  rigor plugin
+  rigor plugin rigor-activesupport-core-ext
+  rigor plugin --path rigor-activerecord
+  rigor plugin --root
 "#;
 
 /// `SkillCommand::USAGE` — verbatim; `--help`/`help` print it on stdout.
@@ -472,47 +473,99 @@ Examples:
   rigor skill describe --deep   (also: rigor describe --deep)
 "#;
 
-/// `rigor plugin` — deferred. `PluginCommand#run` is manual dispatch: argv[0]
-/// is always a subcommand (default `list`), so an unrecognised one is
-/// "Unknown subcommand: X" + USAGE on stderr, exit 64 — not an option error.
-/// `path`/`print` then shift argv[1] as the plugin *name* — dashed tokens
-/// included: a missing name is `usage_error` (exit 64), an unresolved one is
-/// `name_error` (exit 1). The resolved bodies stay deferred (no bundled
-/// plugin tree).
+/// `rigor plugin` (v0.4.7 `PluginCommand#run`) — deferred bodies, faithful
+/// grammar. `-h`/`--help` anywhere prints USAGE; the pre-ADR-126 verbs
+/// (`list`, `path <name>`, `print <name>`, `root`) print a deprecation notice
+/// on stderr and then behave as before; otherwise the flags `--path NAME`,
+/// `--list`, `--root` parse (a parse error is the message + USAGE, exit 64)
+/// and the positional slot is always a plugin name.
 fn cmd_plugin_deferred(args: &[String]) -> ExitCode {
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    match sub {
-        "list" | "root" => {
-            eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
-            ExitCode::from(2)
-        }
-        "path" | "print" => match args.get(1).map(String::as_str) {
-            // `usage_error` — the message names the verb, then USAGE.
+    const DEFERRED: &str = "rigor-rs: `plugin` is recognized but not yet implemented in this phase";
+    const PLUGIN_PARSER: optparse::OptParser = optparse::OptParser::new(
+        "Usage: rigor plugin [<name>] [--path <name>] [--list] [--root]",
+        &[
+            optparse::Switch::new("path", &[("path", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--path", " NAME", &["Print the absolute directory path of a plugin"]),
+            optparse::Switch::new("list", &[("list", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--list", "", &["List bundled + example plugins"]),
+            optparse::Switch::new("root", &[("root", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--root", "", &["Print the gem root + key subdirectories"]),
+        ],
+    );
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{PLUGIN_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    // `run_path` / `run_print` once the name slot is resolved.
+    let named = |verb: &str, name: Option<&str>| -> ExitCode {
+        match name {
             None => {
-                eprintln!("`{sub}` requires a plugin name");
+                eprintln!("`{verb}` requires a plugin name");
                 eprint!("{PLUGIN_USAGE}");
                 ExitCode::from(64)
             }
             Some(name) if plugin_name_known(name) => {
-                eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
+                eprintln!("{DEFERRED}");
                 ExitCode::from(2)
             }
-            // `name_error` — "Unknown plugin: X" + the list pointer.
+            // `name_error` — "Unknown plugin: X" + the list pointer, exit 1.
             Some(name) => {
                 eprintln!("Unknown plugin: {name}");
-                eprintln!("Run `rigor plugin list` to see the bundled plugins.");
+                eprintln!("Run `rigor plugin --list` to see the bundled plugins.");
                 ExitCode::from(1)
             }
-        },
-        "-h" | "--help" | "help" => {
-            print!("{PLUGIN_USAGE}");
-            ExitCode::SUCCESS
         }
-        other => {
-            eprintln!("Unknown subcommand: {other}");
-            eprint!("{PLUGIN_USAGE}");
-            ExitCode::from(64)
+    };
+    let verb = args.first().map(String::as_str);
+    if let Some(v @ ("list" | "path" | "print" | "root")) = verb {
+        let replacement = match v {
+            "list" => "rigor plugin --list",
+            "path" => "rigor plugin --path <name>",
+            "print" => "rigor plugin <name>",
+            _ => "rigor plugin --root",
+        };
+        eprintln!(
+            "rigor: `rigor plugin {v}` is deprecated and will be removed in the next minor release; \
+             use `{replacement}`."
+        );
+        return match v {
+            "path" | "print" => named(v, args.get(1).map(String::as_str)),
+            _ => {
+                eprintln!("{DEFERRED}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if verb == Some("help") {
+        print!("{PLUGIN_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let items = match PLUGIN_PARSER.parse(args).items_or_exit_usage(PLUGIN_USAGE) {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut path: Option<String> = None;
+    let (mut list, mut root) = (false, false);
+    let mut names: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            Item::Positional(p) => names.push(p),
+            Item::Opt { key: "path", value, .. } => path = value.map(|v| v.as_str().to_string()),
+            Item::Opt { key: "list", .. } => list = true,
+            Item::Opt { key: "root", .. } => root = true,
+            Item::Opt { .. } => unreachable!("the switch table is closed"),
         }
+    }
+    if let Some(p) = path {
+        return named("path", Some(&p));
+    }
+    if root || list {
+        eprintln!("{DEFERRED}");
+        return ExitCode::from(2);
+    }
+    match names.first() {
+        None => {
+            eprintln!("{DEFERRED}");
+            ExitCode::from(2)
+        }
+        Some(name) => named("print", Some(name)),
     }
 }
 
@@ -530,6 +583,7 @@ fn plugin_name_known(name: &str) -> bool {
 /// `discover(PLUGINS_ROOT) + discover(EXAMPLES_ROOT)` at the pinned ref —
 /// production plugins first, then the tutorial examples.
 const BUNDLED_PLUGIN_NAMES: &[&str] = &[
+    "rigor-ac-library-rb",
     "rigor-actioncable",
     "rigor-actionmailer",
     "rigor-actionpack",
@@ -538,6 +592,7 @@ const BUNDLED_PLUGIN_NAMES: &[&str] = &[
     "rigor-activerecord",
     "rigor-activestorage",
     "rigor-activesupport-core-ext",
+    "rigor-alba",
     "rigor-devise",
     "rigor-dry-monads",
     "rigor-dry-schema",
@@ -568,6 +623,7 @@ const BUNDLED_PLUGIN_NAMES: &[&str] = &[
     "rigor-sinatra",
     "rigor-sorbet",
     "rigor-statesman",
+    "rigor-typelizer",
     "rigor-typescript-utility-types",
     "rigor-deprecations",
     "rigor-lisp-eval",

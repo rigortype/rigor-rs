@@ -235,7 +235,12 @@ impl Parsed {
                     eprint!("{stderr}");
                 }
                 if code == 64 {
-                    eprintln!("{usage}");
+                    // `puts`: no second newline after a heredoc USAGE.
+                    if usage.ends_with('\n') {
+                        eprint!("{usage}");
+                    } else {
+                        eprintln!("{usage}");
+                    }
                 }
                 Err(ExitCode::from(code))
             }
