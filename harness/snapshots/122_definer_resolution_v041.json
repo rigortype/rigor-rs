@@ -59,13 +59,6 @@
     },
     {
       "rule": "def.override-visibility-reduced",
-      "line": 88,
-      "column": 7,
-      "severity": "warning",
-      "message": "visibility of `m4b' reduced from public to private (overrides OvMf4b#m4b); breaks substitutability"
-    },
-    {
-      "rule": "def.override-visibility-reduced",
       "line": 157,
       "column": 7,
       "severity": "warning",
