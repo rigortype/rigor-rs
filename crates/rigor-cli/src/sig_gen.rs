@@ -90,6 +90,7 @@ use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId, ParamShape, Vi
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod meta_class;
+mod rbs_parse_error;
 mod sig_env;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -1570,13 +1571,17 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
 struct WriteResult {
     source: String,
     target: String,
-    /// `"created"` | `"updated"` | `"noop"` | `"skipped_outside_sig_root"`.
+    /// `"created"` | `"updated"` | `"noop"` | `"skipped_outside_sig_root"` |
+    /// `"skipped_invalid_encoding"` | `"skipped_unparseable"`.
     action: &'static str,
     applied: Vec<Candidate>,
     /// Candidates the merge declined because a user-authored member of the same
     /// `(name, kind)` already exists with a DIFFERENT declared return (reference
     /// `merge_into_existing_class`'s `skipped` accumulator). Empty on create.
     skipped: Vec<SkipEntry>,
+    /// The refusal detail (reference `WriteResult#error`), on
+    /// `skipped_invalid_encoding` / `skipped_unparseable` only.
+    error: Option<String>,
 }
 
 /// One skipped (user-authored-conflict) candidate + the classification metadata
@@ -1701,6 +1706,7 @@ fn cmd_write(
                 action: "skipped_outside_sig_root",
                 applied: Vec::new(),
                 skipped: Vec::new(),
+                error: None,
             });
             continue;
         }
@@ -1730,12 +1736,18 @@ fn cmd_write(
             action: "created",
             applied: group,
             skipped: Vec::new(),
+            error: None,
         });
     }
 
     match format {
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
+    }
+    // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
+    // write and did not get one — exit 1.
+    if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
@@ -1910,7 +1922,7 @@ fn node_keyword(node: &TreeNode, info: &NamespaceInfo, qualified: &str) -> &'sta
 /// EVERY result is `noop`, else one line per created / updated / outside-sig-root
 /// target (a `noop` result prints nothing).
 fn render_write_text(results: &[WriteResult]) {
-    if results.iter().all(|r| r.action == "noop") {
+    if results.iter().all(|r| r.action == "noop" && r.skipped.is_empty()) {
         println!("No changes");
         return;
     }
@@ -1925,6 +1937,21 @@ fn render_write_text(results: &[WriteResult]) {
             ),
             "skipped_outside_sig_root" => {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target)
+            }
+            "skipped_invalid_encoding" => {
+                println!(
+                    "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
+                    r.target
+                );
+                println!(
+                    "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
+                     read faithfully."
+                );
+            }
+            "skipped_unparseable" => {
+                println!("REFUSED {} — the existing file was not updated", r.target);
+                println!("  {}", r.error.as_deref().unwrap_or_default());
+                println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
             }
             _ => {}
         }
@@ -1959,10 +1986,14 @@ fn render_write_json(results: &[WriteResult]) {
                     obj
                 })
                 .collect();
-            json!({
+            let mut row = json!({
                 "source": r.source, "target": r.target, "action": r.action,
                 "applied": applied, "skipped": skipped,
-            })
+            });
+            if let Some(e) = &r.error {
+                row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            row
         })
         .collect();
     println!(
@@ -2134,15 +2165,36 @@ fn update_existing(
     supers: &HashMap<String, String>,
     overwrite: bool,
 ) -> WriteResult {
-    let Ok(source) = std::fs::read_to_string(target) else {
+    let Ok(bytes) = std::fs::read(target) else {
         return WriteResult {
             source: source_path,
             target: target_str,
             action: "noop",
             applied: Vec::new(),
             skipped: Vec::new(),
+            error: None,
         };
     };
+    // v0.4.7 (#2480/#2587): an existing target that is not UTF-8, or does not
+    // parse as RBS, is REFUSED (left untouched, the run exits 1), not a
+    // silent `noop`.
+    let refused = |action: &'static str, error: String| WriteResult {
+        source: source_path.clone(),
+        target: target_str.clone(),
+        action,
+        applied: Vec::new(),
+        skipped: Vec::new(),
+        error: Some(error),
+    };
+    let Ok(source) = String::from_utf8(bytes) else {
+        return refused("skipped_invalid_encoding", format!("{target_str} is not valid UTF-8"));
+    };
+    if let Some(detail) = rbs_parse_error::parsing_error_message(&target_str, &source) {
+        return refused(
+            "skipped_unparseable",
+            format!("{target_str} does not parse as RBS: {detail}"),
+        );
+    }
 
     // Shell injection on the MERGE path is deferred: when a file already exists,
     // any shell it needs was written on the CREATE run (`render_new_file`), so a
@@ -2155,7 +2207,7 @@ fn update_existing(
     if action == "updated" {
         let _ = std::fs::write(target, &merged);
     }
-    WriteResult { source: source_path, target: target_str, action, applied, skipped }
+    WriteResult { source: source_path, target: target_str, action, applied, skipped, error: None }
 }
 
 /// The pure result of merging a candidate group into an existing `.rbs` source
