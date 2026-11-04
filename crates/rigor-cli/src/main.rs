@@ -2025,8 +2025,8 @@ fn analyze_files(
         // entry earns ONE row upstream, not one per mention.
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for entry in &cfg.pre_eval {
-            // v0.4.3 (#1892): the `disable:` list now reaches these rows —
-            // the exact id or the `pre-eval` family token, never `all`
+            // #1892/#1948: the `disable:` list reaches these rows — the exact
+            // id, the `pre-eval` family token, or (since v0.4.4) `all`
             // (`config_disables_pre_eval`).
             if !seen.insert(entry.as_str())
                 || entry.contains(['*', '?', '['])
@@ -2077,7 +2077,12 @@ fn analyze_files(
     // `plugin_run_emission_diagnostics` upstream — the plugins' own
     // run-scoped rows land AFTER the per-file stream (and before the
     // `conforms-to` rows): `plugin.<id>.load-error` file-probe disclosures.
-    for row in &plugin_resolution.emitted {
+    // v0.4.4 (#1953): `SeverityStamp` drops a plugin row whose qualified id
+    // or `plugin.<id>` family is in `disable:` — never a bare id or `all`
+    // (`rigor_rules::config_disables_plugin_row`).
+    for row in plugin_resolution.emitted.iter().filter(|row| {
+        !rigor_rules::config_disables_plugin_row(&cfg.disable, row.source_family, row.rule_id)
+    }) {
         findings.push((
             0usize,
             ".rigor.yml".to_string(),

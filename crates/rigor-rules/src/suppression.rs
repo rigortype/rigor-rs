@@ -24,11 +24,11 @@ pub(crate) const INTERNAL_ERROR_RULE: &str = "internal-error";
 
 /// Family-wildcard tokens (`call`, `flow`, …). A token in this set expands to
 /// every canonical rule whose id starts with `<token>.` (reference
-/// `RULE_FAMILIES`, `check_rules/rule_ids.rb`). `assert`, `dump` and `effect`
-/// match no rule rigor-rs emits yet; they are carried so the tokens stay known
-/// vocabulary, as in the reference.
+/// `RULE_FAMILIES`, `check_rules/rule_ids.rb`). `assert`, `dump`, `effect` and
+/// `global` match no rule rigor-rs emits yet; they are carried so the tokens
+/// stay known vocabulary, as in the reference.
 const RULE_FAMILIES: &[&str] =
-    &["call", "flow", "assert", "dump", "def", "suppression", "static", "effect"];
+    &["call", "flow", "assert", "dump", "def", "global", "suppression", "static", "effect"];
 
 /// The canonical rule ids rigor-rs can actually emit. Family expansion is
 /// checked against this set (`all` is the separate `SuppressSet::all` flag), so a
@@ -66,7 +66,7 @@ pub fn implemented_rules() -> &'static [&'static str] {
     IMPLEMENTED_RULES
 }
 
-/// The reference's FULL `ALL_RULES` canonical catalogue (31 ids,
+/// The reference's FULL `ALL_RULES` canonical catalogue (35 ids,
 /// `check_rules/rule_ids.rb`). Deliberately BROADER than [`IMPLEMENTED_RULES`]:
 /// the config audit ([`is_inert_builtin_token`]) uses it to decide whether a
 /// `disable:`/`severity_overrides:` token names a real rule, so it must never
@@ -108,6 +108,12 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "effect.liskov-widened",
     "effect.unknown-label",
     "effect.annotations-unchecked",
+    // Catalogue ids rigor-rs emits none of; without them a `# rigor:disable`
+    // naming one fired a spurious `suppression.unknown-rule`.
+    "rbs.contradicting-signature",
+    "global.write-type-mismatch",
+    "global.readonly-write",
+    "call.deprecated-ruby2-keywords",
 ];
 
 /// True when `token` looks like a built-in-family rule id but matches none — its
@@ -166,20 +172,41 @@ const PRE_EVAL_RULES: &[&str] =
     &["pre-eval.parse-error", "pre-eval.file-not-found", "pre-eval.duplicate-declaration"];
 
 /// Whether the `.rigor.yml` `disable:` list drops a run-level `pre-eval.*` row
-/// (reference v0.4.3 `DiagnosticAggregator#suppress_pre_eval`, #1892). The
-/// reference runs these rows through `CheckRules.filter_suppressed` with
+/// (reference `DiagnosticAggregator#suppress_pre_eval`, #1892). The reference
+/// runs these rows through `CheckRules.filter_suppressed` with
 /// `disabled_rules:` and no comments (the row is positioned at `.rigor.yml`).
-/// There, `expand_token("all")` yields the bare `"all"` sentinel, and the
-/// `disabled.include?(rule)` test never matches it, so `disable: [all]` leaves
-/// the row standing. Only the exact id and the `pre-eval` family token match.
-/// This is why the shared [`SuppressSet`] (whose `all` flag matches every rule)
-/// is not used here.
+/// Since v0.4.4 (#1948) that filter tests `CheckRules.config_disabled?`, where
+/// the `all` sentinel drops every rule-bearing row, so `disable: [all]` drops
+/// the row too (at v0.4.3 it did not). Otherwise only the exact id and the
+/// `pre-eval` family token match: the `pre-eval` rows sit outside every other
+/// family expansion.
 #[must_use]
 pub fn config_disables_pre_eval<S: AsRef<str>>(disable: &[S], rule: &str) -> bool {
     disable.iter().any(|token| {
         let token = token.as_ref();
-        token == rule || (token == "pre-eval" && PRE_EVAL_RULES.contains(&rule))
+        token == "all" || token == rule || (token == "pre-eval" && PRE_EVAL_RULES.contains(&rule))
     })
+}
+
+/// Whether a suppression token list drops a plugin's own row (reference
+/// v0.4.4 `CheckRules.plugin_row_disabled?`, #1953). Such a row answers only
+/// to its qualified id (`plugin.<id>.<rule>`, `rule_id` here) or to the whole
+/// plugin's `plugin.<id>` (`source_family`), compared as whole strings. A bare
+/// rule and `all` never reach it, and a row whose family is not `plugin.`
+/// (`plugin_loader`, `plugin_trust`, built-in) answers false. Family tokens
+/// expand only to catalogue ids, so comparing the raw tokens is the same test
+/// as comparing the reference's expanded set.
+#[must_use]
+pub fn config_disables_plugin_row<S: AsRef<str>>(
+    disable: &[S],
+    source_family: &str,
+    rule_id: &str,
+) -> bool {
+    source_family.starts_with("plugin.")
+        && disable.iter().any(|token| {
+            let token = token.as_ref();
+            token == source_family || token == rule_id
+        })
 }
 
 /// Families of diagnostics the engine emits OUTSIDE the check-rule catalogue
@@ -203,6 +230,27 @@ const NON_CHECK_DIAGNOSTIC_IDS: &[&str] = &[
     "source-rbs-synthesis-failed",
     "source-rbs-annotation-not-honoured",
 ];
+
+/// Reference v0.4.4 `ConfigAudit.effective_disable_token?`: `all`, or a token
+/// `resolve_rule_token` expands to at least one id of the FULL catalogue (a
+/// legacy alias, the `pre-eval` family, a family wildcard, a canonical id).
+/// Every [`RULE_FAMILIES`] entry names at least one catalogue id.
+#[must_use]
+pub fn is_effective_disable_token(token: &str) -> bool {
+    token == "all"
+        || token == "pre-eval"
+        || legacy_alias(token).is_some()
+        || RULE_FAMILIES.contains(&token)
+        || ALL_CANONICAL_RULES.contains(&token)
+}
+
+/// Reference `ConfigAudit.non_check_engine_token?`: a bare non-catalogue
+/// engine id, or a token whose first `.`-segment is a non-check family.
+#[must_use]
+pub fn is_non_check_engine_token(token: &str) -> bool {
+    NON_CHECK_DIAGNOSTIC_IDS.contains(&token)
+        || token.split('.').next().is_some_and(|f| NON_CHECK_DIAGNOSTIC_FAMILIES.contains(&f))
+}
 
 /// True when a suppression token resolves to a diagnostic identifier some producer
 /// can emit: the `all` wildcard, a canonical check-rule id (the FULL
@@ -390,23 +438,55 @@ fn absorb_tokens(tail: &str, target: &mut SuppressSet) {
 }
 
 #[cfg(test)]
+mod plugin_row_disable_tests {
+    use super::config_disables_plugin_row;
+
+    const FAMILY: &str = "plugin.rails-routes";
+    const ROW: &str = "plugin.rails-routes.load-error";
+
+    #[test]
+    fn qualified_id_and_plugin_family_drop_the_row() {
+        assert!(config_disables_plugin_row(&["plugin.rails-routes.load-error"], FAMILY, ROW));
+        assert!(config_disables_plugin_row(&["call", "plugin.rails-routes"], FAMILY, ROW));
+    }
+
+    // Must-still-fire controls (oracle v0.4.4): `all`, a bare id, the bare
+    // `plugin` prefix, another plugin, and a prefix of a dotted id.
+    #[test]
+    fn bare_all_and_other_plugins_leave_the_row() {
+        assert!(!config_disables_plugin_row::<&str>(&[], FAMILY, ROW));
+        assert!(!config_disables_plugin_row(&["all"], FAMILY, ROW));
+        assert!(!config_disables_plugin_row(&["load-error"], FAMILY, ROW));
+        assert!(!config_disables_plugin_row(&["plugin"], FAMILY, ROW));
+        assert!(!config_disables_plugin_row(&["plugin.activerecord"], FAMILY, ROW));
+        assert!(!config_disables_plugin_row(&["plugin.rails"], FAMILY, ROW));
+        assert!(!config_disables_plugin_row(
+            &["plugin_loader.load-error", "plugin_loader"],
+            "plugin_loader",
+            "plugin_loader.load-error"
+        ));
+    }
+}
+
+#[cfg(test)]
 mod pre_eval_disable_tests {
     use super::config_disables_pre_eval;
 
     const ROW: &str = "pre-eval.file-not-found";
 
     #[test]
-    fn exact_id_and_family_token_drop_the_row() {
+    fn exact_id_family_token_and_all_drop_the_row() {
         assert!(config_disables_pre_eval(&["pre-eval.file-not-found"], ROW));
         assert!(config_disables_pre_eval(&["call", "pre-eval"], ROW));
+        // v0.4.4 (#1948): `all` now reaches the row.
+        assert!(config_disables_pre_eval(&["all"], ROW));
     }
 
-    // Must-still-fire controls (oracle v0.4.3): no `disable:`, `all`, a
-    // sibling id and an unrelated family leave the row standing.
+    // Must-still-fire controls (oracle v0.4.4): no `disable:`, a sibling id
+    // and an unrelated family leave the row standing.
     #[test]
-    fn all_and_unrelated_tokens_leave_the_row() {
+    fn unrelated_tokens_leave_the_row() {
         assert!(!config_disables_pre_eval::<&str>(&[], ROW));
-        assert!(!config_disables_pre_eval(&["all"], ROW));
         assert!(!config_disables_pre_eval(&["pre-eval.parse-error"], ROW));
         assert!(!config_disables_pre_eval(&["flow", "pre"], ROW));
     }

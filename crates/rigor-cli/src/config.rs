@@ -1061,6 +1061,44 @@ impl Config {
             .collect()
     }
 
+    /// Reference v0.4.4 `ConfigAudit.configured_plugin_ids` (#1953): the
+    /// manifest id of every `plugins:` entry, or `None` when one cannot be
+    /// known without loading it. An explicit truthy `id:` is the id; a
+    /// bundled gem's id is its name minus `rigor-`; any other entry (a
+    /// third-party gem without `id:`) turns the check off. An
+    /// `enabled: false` entry still counts.
+    #[must_use]
+    pub fn configured_plugin_ids(&self) -> Option<Vec<String>> {
+        let mut ids: Vec<String> = Vec::new();
+        for raw in &self.plugins {
+            let (id, gem) = match untag(raw) {
+                serde_yaml::Value::Mapping(m) => {
+                    let get = |key: &str| {
+                        m.iter()
+                            .find(|(k, _)| ruby_to_s(k) == key)
+                            .map(|(_, v)| untag(v).clone())
+                    };
+                    let id = get("id").filter(|v| {
+                        !matches!(v, serde_yaml::Value::Null | serde_yaml::Value::Bool(false))
+                    });
+                    (id, get("gem").map(|v| ruby_to_s(&v)).unwrap_or_default())
+                }
+                other => (None, ruby_to_s(other)),
+            };
+            let resolved = if let Some(id) = id {
+                ruby_to_s(&id)
+            } else if BUNDLED_PLUGIN_GEMS.contains(&gem.as_str()) {
+                gem.strip_prefix("rigor-").unwrap_or(&gem).to_string()
+            } else {
+                return None;
+            };
+            if !ids.contains(&resolved) {
+                ids.push(resolved);
+            }
+        }
+        Some(ids)
+    }
+
     /// `Plugin::Loader.load` for the port's plugin universe
     /// (issue #157, `loader.rb`): every `plugins:` entry names a GEM —
     /// `require_gem!` resolves `bundled_plugin_path(gem) || require(gem)`, so
@@ -1214,6 +1252,54 @@ impl Config {
 
 }
 
+/// Every gem `bundled_plugin_gem?` (reference `ConfigAudit`) accepts: the pin's
+/// `plugins/<gem>/lib/<gem>.rb` files. A pin surface — the
+/// `bundled_plugin_gems_match_the_pin` test diffs it against the submodule.
+pub const BUNDLED_PLUGIN_GEMS: &[&str] = &[
+    "rigor-ac-library-rb",
+    "rigor-actioncable",
+    "rigor-actionmailer",
+    "rigor-actionpack",
+    "rigor-active-model-serializers",
+    "rigor-activejob",
+    "rigor-activerecord",
+    "rigor-activestorage",
+    "rigor-activesupport-core-ext",
+    "rigor-alba",
+    "rigor-devise",
+    "rigor-dry-monads",
+    "rigor-dry-schema",
+    "rigor-dry-struct",
+    "rigor-dry-types",
+    "rigor-dry-validation",
+    "rigor-ethon",
+    "rigor-factorybot",
+    "rigor-ffi",
+    "rigor-ffi-rzmq",
+    "rigor-grape",
+    "rigor-graphql",
+    "rigor-hanami",
+    "rigor-mangrove",
+    "rigor-minitest",
+    "rigor-pundit",
+    "rigor-rails",
+    "rigor-rails-i18n",
+    "rigor-rails-routes",
+    "rigor-railties",
+    "rigor-rbnacl",
+    "rigor-rbs-inline",
+    "rigor-rspec",
+    "rigor-rspec-rails",
+    "rigor-sassc",
+    "rigor-shoulda-matchers",
+    "rigor-sidekiq",
+    "rigor-sinatra",
+    "rigor-sorbet",
+    "rigor-statesman",
+    "rigor-typelizer",
+    "rigor-typescript-utility-types",
+];
+
 /// One normalized `plugins:` entry — [`Config::plugin_entries`]' output, the
 /// loader's `{gem:, id:, config:, enabled:}` shape.
 #[derive(Debug)]
@@ -1245,9 +1331,10 @@ impl PluginEntry {
 /// A run-level row the reference's plugin machinery emits —
 /// `plugin_loader.load-error` (entries that fail to resolve) or a plugin's
 /// own `plugin.<id>.load-error` file-missing row. These bypass
-/// `severity_overrides`/`severity_profile`/`disable:` upstream (oracle:
+/// `severity_overrides`/`severity_profile` upstream (oracle:
 /// `plugin_loader: "off"` leaves the row at error), so the severity is fixed
-/// here and callers must not re-stamp it.
+/// here and callers must not re-stamp it. `disable:` reaches only a plugin's
+/// own row, by its qualified id or `plugin.<id>` (v0.4.4, #1953).
 #[derive(Debug)]
 pub struct PluginLoadRow {
     /// The qualified rule id text output prints (`[plugin_loader.load-error]`).
