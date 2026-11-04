@@ -1222,6 +1222,20 @@ pub(crate) fn toplevel_argument_floor(
     out
 }
 
+/// rigor-rs#363, re-measured at v0.4.7: whether a mutation at `span` inside
+/// a lexical loop's `break` argument stays off the post-loop scope (the
+/// locals-only `join_break_scopes`). At v0.4.7 only a compound ATTRIBUTE
+/// write (`break h.default ||= 0`, a `Node::AttrWrite`) keeps the indexed
+/// record there; a mutator CALL — `break h.merge!(…)`, `h.clear`,
+/// `h.delete(:a)`, `h.compare_by_identity`, `(h.default = 0)`, `h[:a] << 2`,
+/// `for …; break h.store(:a, 9)`, a block's `h[:a] = 9` — drops it on both
+/// v0.4.6 and v0.4.7 (scratch `frag/brk/t05`–`t16`, `brk3/w1`–`w7`).
+/// Answering `false` only keeps a drop, so it can never add a diagnostic.
+pub(crate) fn break_join_suppresses(ast: &LoweredAst, span: rigor_parse::Span, method: &str) -> bool {
+    ast.locals_only_suppresses(span, is_content_mutator(method))
+        && ast.iter().any(|(_, n)| matches!(n, Node::AttrWrite { span: s, .. } if *s == span))
+}
+
 /// Receiver methods whose result is never the receiver nor one of its
 /// elements, and which write nothing: a parameter read only through these is
 /// read-only for [`readonly_positions`]. `to_s` / `to_a` / `to_h` are out

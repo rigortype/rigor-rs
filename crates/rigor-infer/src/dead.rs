@@ -164,6 +164,12 @@ pub(crate) struct DeadPositions {
     /// the record (`break (h[:a] ||= 9; h[:a].m)` fires `"s" | 1`
     /// in-argument, declines post-loop — rigor-rs#363 review).
     locals_only: Vec<Span>,
+    /// The spans of the compound attribute writes (`Node::AttrWrite`,
+    /// `h.default ||= 0`) inside a `locals_only` argument. At v0.4.7 only
+    /// these keep their drop off the post-join scope; a mutator CALL there
+    /// (`break h.merge!(…)`, `h.clear`) reaches it like a scanned one
+    /// (`flow_writes::break_join_suppresses`).
+    locals_only_attr_writes: Vec<Span>,
     /// The `scanned_inert` carriers — `END { }`/`BEGIN { }`/`super(…)`/
     /// `yield(…)` operands inside an iterated body: never evaluated (the
     /// write's own position lands nothing) but covered by the body's
@@ -273,7 +279,7 @@ impl DeadPositions {
         // post-loop — rigor-rs#363 review). A non-scanned write's drop
         // lands nowhere at all.
         if self.locals_only.iter().any(|&l| contains(l, write)) {
-            return scanned
+            return (scanned || !self.locals_only_attr_writes.contains(&write))
                 && self
                     .iterated
                     .iter()
@@ -412,6 +418,19 @@ impl<'i> Typer<'i> {
             next_args: ast.next_arg_spans().to_vec(),
             ..Default::default()
         };
+        if !dead.locals_only.is_empty() {
+            dead.locals_only_attr_writes = ast
+                .iter()
+                .filter_map(|(_, n)| match n {
+                    Node::AttrWrite { span, .. }
+                        if dead.locals_only.iter().any(|&l| contains(l, *span)) =>
+                    {
+                        Some(*span)
+                    }
+                    _ => None,
+                })
+                .collect();
+        }
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());
         // Publish the accumulator to re-entrant callers only where a recursion
         // point follows AND it changed — the publish clones the recorded arms,

@@ -1003,7 +1003,10 @@ impl<'i> Typer<'i> {
                 && flow.dead.write_reaches(*wspan, site)
                 // A block body's `break` argument lands on the locals-only
                 // break join — its drop applies nowhere (rigor-rs#363).
-                && !ast.in_locals_only_carrier(*wspan)
+                && !(ast.in_locals_only_carrier(*wspan)
+                    && ast.iter().any(|(_, n)| {
+                        matches!(n, Node::AttrWrite { span: s, .. } if s == wspan)
+                    }))
             {
                 drop_indexed_narrowings(env, name);
             }
@@ -1061,7 +1064,7 @@ impl<'i> Typer<'i> {
         // `for` (no writeback) or any non-scanned mutator — `break
         // h.merge!(…)`, `break a.pop` — the record survives and fires,
         // exactly as the oracle reports.
-        if !ast.locals_only_suppresses(wspan, is_content_mutator(method)) {
+        if !crate::flow_writes::break_join_suppresses(ast, wspan, method) {
             self.drop_indexed_mutation(name, method, drop_key, env);
         }
         // A `[]=` replayed through a content write-back boundary drops
@@ -1111,7 +1114,7 @@ impl<'i> Typer<'i> {
         // a post-loop `h[:a]` read serve stale `1` evidence the oracle
         // does not emit.
         if MUTATOR_METHODS.contains(&method)
-            && !ast.locals_only_suppresses(wspan, is_content_mutator(method))
+            && !crate::flow_writes::break_join_suppresses(ast, wspan, method)
         {
             if let Some(&pre) = env.get(name) {
                 if evaluated {
@@ -1146,9 +1149,6 @@ impl<'i> Typer<'i> {
         // locals-only break join — its record widening or drop never
         // propagates: `break h[:a] << 2` keeps `h[:a]`'s `"s" | 1`
         // (rigor-rs#363).
-        if ast.in_locals_only_carrier(m.span) {
-            return;
-        }
         let lookup = indexed_narrowing_key(&m.name, &m.key);
         let Some(&recorded) = env.get(&lookup) else {
             return;
@@ -1823,7 +1823,7 @@ impl<'i> Typer<'i> {
                     // applies nowhere — except an iterated-body
                     // content-scan call, whose writeback-joined rebind
                     // declines the read anyway.
-                    if !ast.locals_only_suppresses(*wspan, is_content_mutator(method)) {
+                    if !crate::flow_writes::break_join_suppresses(ast, *wspan, method) {
                         self.drop_indexed_mutation(name, method, drop_key.as_ref(), env);
                     }
                 }

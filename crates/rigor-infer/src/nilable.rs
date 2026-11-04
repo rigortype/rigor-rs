@@ -14,7 +14,6 @@ use crate::{
     is_shape_mutator, local_rebinds, multi_target_binder, rebound_within, widen_flow_writes,
     widen_penv_writes, TypeEnv, Typer,
 };
-use crate::flow_writes::is_content_mutator;
 
 /// The reference's `Array.new(n)` tuple-lift cap (`ARRAY_NEW_TUPLE_LIMIT`,
 /// `method_dispatcher.rb`): a constant size `n ≤ 16` lifts to a `Tuple`; a size
@@ -479,8 +478,7 @@ impl<'i> Typer<'i> {
                         // binding on its scan, so the read declines anyway
                         // and the port keeps the drop.
                         if is_shape_mutator(&method)
-                            && !ast
-                                .locals_only_suppresses(call_span, is_content_mutator(&method))
+                            && !crate::flow_writes::break_join_suppresses(ast, call_span, &method)
                         {
                             // `IndexedNarrowing.invalidate_after_call` rides
                             // first: a stable-key `s[k] = v` drops that slot's
