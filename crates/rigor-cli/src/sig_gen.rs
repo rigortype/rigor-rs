@@ -94,6 +94,7 @@ mod generics;
 mod rbs_parse_error;
 mod superclasses;
 mod sig_env;
+mod top_level;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
 
@@ -146,6 +147,12 @@ struct Candidate {
     /// renderer can take the group's first (reference `declaration_header`, which
     /// reads the same per-file maps off `methods.first`).
     decl_header: String,
+    /// The `sig.skipped.*` reason of a `"skipped"` row (reference
+    /// `MethodCandidate#skip_reason`), counted by [`report_skipped`]. Rows the
+    /// generator built but does not emit for a reason the reference does not
+    /// share (an equivalent declaration, a port-only confidence skip) are
+    /// `"dropped"` with no reason. Neither kind leaves [`generate_run`].
+    skip_reason: Option<&'static str>,
 }
 
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
@@ -297,7 +304,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // declaration during merge); on a print/diff run it is inert, exactly like the
     // reference (the flag lives on the Writer).
 
-    let (candidates, _info, unresolvable) =
+    let Generated { candidates, unresolvable, skips, .. } =
         generate_run(&files, include_private, &sig_env, &writes);
 
     // `--format json` renders the candidate table regardless of print/diff mode
@@ -327,6 +334,9 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         ("json", _) => render_json(&candidates),
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
+    }
+    if format == "text" {
+        report_skipped(&skips);
     }
     report_unresolvable_superclasses(&unresolvable);
     path_status
@@ -445,7 +455,7 @@ fn generate_run(
     include_private: bool,
     sig_env: &SigEnv,
     written: &dyn Fn(&Candidate) -> bool,
-) -> (Vec<Candidate>, NamespaceInfo, Vec<UnresolvableSuperclass>) {
+) -> Generated {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut info = NamespaceInfo::default();
     for f in files {
@@ -453,8 +463,62 @@ fn generate_run(
         candidates.extend(cs);
         info.absorb(i);
     }
-    let (candidates, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
-    (candidates, info, report)
+    let (candidates, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
+    Generated { candidates, info, unresolvable: report, skips }
+}
+
+/// One run's output: the emittable candidates (`new_method` / `tighter_return`),
+/// the run's namespace metadata, the unresolvable-superclass report, and the
+/// skip reason of every `"skipped"` row in candidate order (for
+/// [`report_skipped`]).
+struct Generated {
+    candidates: Vec<Candidate>,
+    info: NamespaceInfo,
+    unresolvable: Vec<UnresolvableSuperclass>,
+    skips: Vec<&'static str>,
+}
+
+/// Whether a row produces a line (reference `Classification::EMITTABLE`).
+fn emittable(c: &Candidate) -> bool {
+    matches!(c.classification, "new_method" | "tighter_return")
+}
+
+/// The skip reasons the stderr summary counts (reference
+/// `SUMMARISED_SKIP_REASONS`): every `sig.skipped.*` id except the four with a
+/// report of their own (`unrenderable-rbs`, `unresolvable-superclass`,
+/// `inline-declared`, `inline-differs`).
+const SUMMARISED_SKIP_REASONS: &[&str] = &[
+    "sig.skipped.complex-shape",
+    "sig.skipped.user-authored",
+    "sig.skipped.untyped-return",
+    "sig.skipped.overridden-by-unsigned-subclass",
+    "sig.skipped.inline-generic-class",
+    "sig.skipped.generic-reopening",
+    "sig.skipped.top-level-def",
+    "sig.skipped.uncertain-module-function",
+];
+
+/// Reference `SigGenCommand#report_skipped` (#778): one stderr line counting
+/// the methods the generator declined and why, in text mode only. The
+/// breakdown keeps the order each reason first appears in.
+fn report_skipped(skips: &[&'static str]) {
+    let mut counts: Vec<(&str, usize)> = Vec::new();
+    for reason in skips.iter().filter(|r| SUMMARISED_SKIP_REASONS.contains(r)) {
+        match counts.iter_mut().find(|(r, _)| r == reason) {
+            Some((_, n)) => *n += 1,
+            None => counts.push((reason, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return;
+    }
+    let total: usize = counts.iter().map(|(_, n)| n).sum();
+    let breakdown: Vec<String> = counts.iter().map(|(r, n)| format!("{r}: {n}")).collect();
+    eprintln!(
+        "rigor sig-gen: skipped {total} method(s) it could not type or would not overwrite ({}). \
+         Run with --format=json to see each one with its skip_reason.",
+        breakdown.join(", ")
+    );
 }
 
 /// One class dropped because its superclass chain resolves nowhere.
@@ -483,10 +547,16 @@ fn finalize_superclasses(
     info: &mut NamespaceInfo,
     sig_env: &SigEnv,
     written: &dyn Fn(&Candidate) -> bool,
-) -> (Vec<Candidate>, Vec<UnresolvableSuperclass>) {
+) -> (Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
     let index = CoreIndex::new();
     let rbs_known = |name: &str| sig_env.class_known(&index, name);
-    let mut known: HashSet<String> = candidates.iter().map(|c| c.class_name.clone()).collect();
+    // Every row counts, emitted or not (`candidates.each_with_object`): the
+    // question is which class Ruby means by a token, not what reaches disk.
+    let mut known: HashSet<String> = candidates
+        .iter()
+        .filter(|c| !c.class_name.is_empty())
+        .map(|c| c.class_name.clone())
+        .collect();
     known.extend(info.shells.iter().cloned());
     known.extend(info.kinds.keys().cloned());
     let headers = std::mem::take(&mut info.headers);
@@ -504,9 +574,14 @@ fn finalize_superclasses(
     let generics = sig_env.generics();
     let candidates: Vec<Candidate> = candidates
         .into_iter()
-        .filter(|c| {
-            sig_env.declares_class(&c.class_name)
+        .map(|c| {
+            if !emittable(&c)
+                || sig_env.declares_class(&c.class_name)
                 || !generics::namespace_prefixes(&c.class_name).iter().any(|n| generics.bounded(n))
+            {
+                return c;
+            }
+            demoted(c, "sig.skipped.generic-reopening")
         })
         .collect();
 
@@ -527,6 +602,9 @@ fn finalize_superclasses(
         declared
     };
     let owner_of = |class_name: &str, unresolvable: &HashMap<String, String>| -> Option<(String, String)> {
+        if class_name.is_empty() {
+            return None;
+        }
         if let Some(root) = unresolvable.get(class_name) {
             return Some((class_name.to_string(), root.clone()));
         }
@@ -557,9 +635,11 @@ fn finalize_superclasses(
 
     // `stamp_generic_reopenings` / `header_type_params`: every generic class
     // (plain parameters only) the run may open a header for — each
-    // candidate's class, the classes it is nested in, and the shells.
+    // candidate's class (a skipped one's too, #2580), the classes it is
+    // nested in, and the shells.
     let mut names: Vec<String> = candidates
         .iter()
+        .filter(|c| !c.class_name.is_empty())
         .map(|c| c.class_name.clone())
         .chain(info.shells.iter().cloned())
         .flat_map(|n| generics::namespace_prefixes(&n))
@@ -572,9 +652,12 @@ fn finalize_superclasses(
         }
     }
 
-    // `@unresolvable_superclasses[class_name] ||= root`, in candidate order.
+    // `@unresolvable_superclasses[class_name] ||= root`, in candidate order,
+    // over every row: a skipped row of an unresolvable class becomes an
+    // `unresolvable-superclass` skip, which the summary does not count.
     let mut owners: Vec<(String, String)> = Vec::new();
     let mut out: Vec<Candidate> = Vec::new();
+    let mut skips: Vec<&'static str> = Vec::new();
     for mut c in candidates {
         match owner_of(&c.class_name, &unresolvable) {
             Some(owner) => {
@@ -582,10 +665,11 @@ fn finalize_superclasses(
                     owners.push(owner);
                 }
             }
-            None => {
+            None if emittable(&c) => {
                 c.decl_header = declaration_header(info, &c.class_name);
                 out.push(c);
             }
+            None => skips.extend(c.skip_reason),
         }
     }
 
@@ -616,7 +700,14 @@ fn finalize_superclasses(
             UnresolvableSuperclass { class_name, superclass: if project { token } else { root }, project }
         })
         .collect();
-    (out, report)
+    (out, skips, report)
+}
+
+/// Reference `demoted_candidate`: an emittable row turned into a skip.
+fn demoted(mut c: Candidate, reason: &'static str) -> Candidate {
+    c.classification = "skipped";
+    c.skip_reason = Some(reason);
+    c
 }
 
 /// Reference `SigGenCommand#report_unresolvable_superclasses`.
@@ -714,8 +805,16 @@ fn generate_file_with_info(
     // block body or its `class ... end` body defines.
     let mut out = collect_meta_candidates(path, &layouts, sig_env);
     let mut info = NamespaceInfo::default();
+    // Top-level `def`s join the walk in source order, as `sig.skipped.top-level-def`
+    // rows (#1676). None sits inside a namespace the walk enters, so each one
+    // goes in ahead of the first top-level statement that ends after it.
+    let mut top_level = top_level::collect(&parsed).into_iter().peekable();
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
+            let end = ast.get(child).span().1;
+            while let Some((name, _)) = top_level.next_if(|(_, start)| *start < end) {
+                out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
+            }
             walk_namespace(
                 &ast,
                 child,
@@ -733,6 +832,9 @@ fn generate_file_with_info(
             );
             collect_namespace_info(&ast, child, &[], &mut info);
         }
+    }
+    for (name, _) in top_level {
+        out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
     }
     register_meta_classes(&layouts, &mut info);
     info.headers = superclasses::collect(&parsed);
@@ -825,6 +927,7 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         classification: "new_method",
         declared_return_rbs: None,
         decl_header: String::new(),
+        skip_reason: None,
     }
 }
 
@@ -1300,13 +1403,20 @@ fn method_candidate(
             classification: "new_method",
             declared_return_rbs: None,
             decl_header: String::new(),
+            skip_reason: None,
         });
     }
+
+    let kind = if sig.singleton { "singleton" } else { "instance" };
+    // A row the reference writes a candidate for but this port does not emit:
+    // `reason` is the reference's own skip reason where both engines skip for
+    // it, `None` (a `"dropped"` row) where the port declines on its own.
+    let row = |reason: Option<&'static str>| Some(non_emitted(path, class_name, sig.name, kind, reason));
 
     // Simple parameter shape: rigor-rs sets `params = None` for exactly the
     // splat/post/kwargs/block/optional forms the reference's
     // `simple_parameter_shape?` rejects. Only plain requireds qualify.
-    let arity = sig.params.as_ref()?.len();
+    let Some(arity) = sig.params.as_ref().map(Vec::len) else { return row(None) };
 
     // Explicit-return union (reference `DefReturnTyper#union_with_explicit_returns`,
     // oracle-probed 2026-07-10): the return type is `union(tail, every collectible
@@ -1318,12 +1428,12 @@ fn method_candidate(
     // their `describe(:short)` string (reference `Combinator#sort_members`) and
     // dedup; any `untyped`-erasing member skips the method (`dynamic_top?` on the
     // erased union).
-    let returns = collect_explicit_returns(ast, sig)?;
+    let Some(returns) = collect_explicit_returns(ast, sig) else { return row(None) };
 
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).
-    let tail_ty = def_return_type(ast, typer, sig.body, env, interner)?;
+    let Some(tail_ty) = def_return_type(ast, typer, sig.body, env, interner) else { return row(None) };
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -1355,7 +1465,7 @@ fn method_candidate(
         .iter()
         .any(|&m| matches!(interner.get(m), Type::Top | Type::Dynamic(_)))
     {
-        return None;
+        return row(Some("sig.skipped.untyped-return"));
     }
 
     // Sort by the DESCRIBE string (reference `sort_members` — `describe(:short)`,
@@ -1374,15 +1484,20 @@ fn method_candidate(
         // (sweep-proven: `Baseline#filter` emitted `[untyped, untyped]` vs the
         // reference's `[Array[untyped], 0 | Integer]` — a shared-method byte
         // mismatch). The sound-superset excess applies only to CONFIDENT types.
+        if e == "untyped" {
+            // The whole member erases to `untyped`, so the reference's union
+            // does too (`dynamic_top?` reads the erased form).
+            return row(Some("sig.skipped.untyped-return"));
+        }
         if e.contains("untyped") {
-            return None;
+            return row(None);
         }
         // A bare GENERIC nominal member (`Array` / `Hash` / …) would be
         // `Array[untyped]` after the reference's `TypeElaborator` fill (deferred
         // here), so its presence skips the method rather than emit an
         // under-elaborated form that would byte-diverge on a shared method.
         if is_bare_generic_name(&e) {
-            return None;
+            return row(None);
         }
         if !erased_members.contains(&e) {
             erased_members.push(e);
@@ -1413,20 +1528,49 @@ fn method_candidate(
     // drop against an unresolvable / incomplete-chain declaration) — the same
     // observable output as the reference building an EQUIVALENT candidate and the
     // renderer's `EMITTABLE` filter discarding it.
-    let (classification, declared_return_rbs) =
-        classify(sig, class_name, &erased, &members, ast, index, sig_env, interner)?;
+    let Some((classification, declared_return_rbs)) =
+        classify(sig, class_name, &erased, &members, ast, index, sig_env, interner)
+    else {
+        return row(None);
+    };
 
     Some(Candidate {
         file: path.to_string(),
         class_name: class_name.to_string(),
         method_name: sig.name.to_string(),
-        kind: if sig.singleton { "singleton" } else { "instance" },
+        kind,
         rbs,
         inferred_return: erased,
         classification,
         declared_return_rbs,
         decl_header: String::new(),
+        skip_reason: None,
     })
+}
+
+/// A row for a method the generator considered and does not emit: `"skipped"`
+/// with the reference's `sig.skipped.*` reason, or `"dropped"` (no reason) for a
+/// port-only decline or an equivalent declaration. A top-level `def` has an
+/// empty `class_name` (the reference's `nil`).
+fn non_emitted(
+    path: &str,
+    class_name: &str,
+    method_name: &str,
+    kind: &'static str,
+    reason: Option<&'static str>,
+) -> Candidate {
+    Candidate {
+        file: path.to_string(),
+        class_name: class_name.to_string(),
+        method_name: method_name.to_string(),
+        kind,
+        rbs: String::new(),
+        inferred_return: String::new(),
+        classification: if reason.is_some() { "skipped" } else { "dropped" },
+        declared_return_rbs: None,
+        decl_header: String::new(),
+        skip_reason: reason,
+    }
 }
 
 /// Classify one already-inferred candidate against the project's own RBS
@@ -1833,8 +1977,7 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
-    let (candidates, _info, _unresolvable) = generate_run(&files, false, &sig_env, &writes);
-    candidates_json_string(&candidates)
+    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).candidates)
 }
 
 /// One candidate's JSON object (reference `MethodCandidate#to_h`): the per-
@@ -1958,7 +2101,7 @@ fn cmd_write(
         writes(c)
             && accepts(&target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout))
     };
-    let (all_candidates, run_info, unresolvable) =
+    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips } =
         generate_run(files, include_private, sig_env, &written);
     for c in all_candidates {
         let target =
@@ -2070,6 +2213,9 @@ fn cmd_write(
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
     }
+    if format == "text" {
+        report_skipped(&skips);
+    }
     report_unresolvable_superclasses(&unresolvable);
     // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
     // write and did not get one — exit 1.
@@ -2091,6 +2237,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         classification: c.classification,
         declared_return_rbs: c.declared_return_rbs.clone(),
         decl_header: c.decl_header.clone(),
+        skip_reason: c.skip_reason,
     }
 }
 

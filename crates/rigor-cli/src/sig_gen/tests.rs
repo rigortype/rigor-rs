@@ -575,6 +575,7 @@ fn diff_string_emits_header_and_plus_line_per_candidate() {
         classification: "new_method",
         declared_return_rbs: None,
         decl_header: String::new(),
+        skip_reason: None,
     };
     let cands = [
         c("Foo", "greeting", "def greeting: () -> \"h\""),
@@ -628,6 +629,7 @@ fn render_new_file_wraps_nested_namespaces_with_kinds_and_super() {
         classification: "new_method",
         declared_return_rbs: None,
         decl_header: String::new(),
+        skip_reason: None,
     };
     let mut info = NamespaceInfo::default();
     info.kinds.insert("Outer".into(), "module");
@@ -651,6 +653,7 @@ fn render_new_file_appends_data_struct_shells_after_real_children() {
         classification: "new_method",
         declared_return_rbs: None,
         decl_header: String::new(),
+        skip_reason: None,
     };
     let mut info = NamespaceInfo::default();
     info.kinds.insert("Host".into(), "class");
@@ -689,6 +692,7 @@ fn render_new_file_leaf_class_defaults_to_class_keyword() {
         classification: "new_method",
         declared_return_rbs: None,
         decl_header: String::new(),
+        skip_reason: None,
     };
     // No kinds recorded → a leaf with methods defaults to `class`.
     let out = render_new_file(&[cand], &[], &NamespaceInfo::default());
@@ -793,6 +797,7 @@ fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
         classification: "new_method",
         declared_return_rbs: None,
         decl_header: String::new(),
+        skip_reason: None,
     }
 }
 
