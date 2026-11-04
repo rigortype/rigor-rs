@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/138_module_function_private_copy.rb",
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 38,
+      "column": 49,
+      "severity": "warning",
+      "message": "visibility of `fmt' reduced from public to private (overrides MfPlain#fmt); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 44,
+      "column": 57,
+      "severity": "warning",
+      "message": "visibility of `fmt' reduced from public to private (overrides MfPublicDef#fmt); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 51,
+      "column": 51,
+      "severity": "warning",
+      "message": "visibility of `fmt' reduced from public to protected (overrides MfReset#fmt); breaks substitutability"
+    }
+  ]
+}

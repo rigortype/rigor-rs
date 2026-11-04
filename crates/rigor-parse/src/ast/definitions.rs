@@ -185,7 +185,7 @@ pub(crate) fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
 /// recorded slot as one.
 pub(crate) fn discover_visibilities_and_includes(
     body: &PrismNode<'_>,
-) -> (Vec<(String, Visibility)>, Vec<String>, Vec<(String, Visibility)>) {
+) -> (VisibilityTable, Vec<String>, VisibilityTable) {
     let (vis, includes) = discover_table(body, false);
     // Upstream v0.4.5 (#2055, #1569): the reference's method-visibility table
     // applies a `module_function` call as a `private` one, bare or named —
@@ -202,7 +202,10 @@ pub(crate) fn discover_visibilities_and_includes(
     (vis, includes, module_function)
 }
 
-fn discover_table(body: &PrismNode<'_>, module_function_private: bool) -> (Vec<(String, Visibility)>, Vec<String>) {
+/// `(method name, visibility)` per recorded slot, in source order.
+pub(crate) type VisibilityTable = Vec<(String, Visibility)>;
+
+fn discover_table(body: &PrismNode<'_>, module_function_private: bool) -> (VisibilityTable, Vec<String>) {
     let mut vis: Vec<(String, Visibility)> = Vec::new();
     let mut includes: Vec<String> = Vec::new();
     let mut current = Visibility::Public;

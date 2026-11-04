@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/137_def_superseded_by_definer.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 70,
+      "column": 19,
+      "severity": "error",
+      "message": "undefined method `upcase' for 2"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 76,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 83,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 89,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    }
+  ]
+}
