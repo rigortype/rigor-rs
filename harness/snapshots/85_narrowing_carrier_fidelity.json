@@ -94,6 +94,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 145,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for {}"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 218,
       "column": 23,
       "severity": "error",
