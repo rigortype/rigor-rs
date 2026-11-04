@@ -705,6 +705,88 @@ impl<'i> Typer<'i> {
     /// (b) **Certain nilable RBS return** on a KNOWN core receiver
     ///     (`String#byteslice -> String?`). A `Constant` receiver is declined for
     ///     the same folding-parity reason — the keystone.
+    /// Upstream v0.4.7 (#2468, `match_rebinding/yielding_match.rb`): `true`
+    /// when `site` lies lexically inside the LITERAL block of a
+    /// `recv.scan|gsub|gsub!|sub|sub!` call (explicit receiver, not a `&blk`
+    /// pass), with no `def` between the two, whose receiver is not provably
+    /// a non-String class. The reference binds `$~` to `MatchData` on that
+    /// block's entry, so a zero-arg `Regexp.last_match` read there is
+    /// non-nil — and nested blocks and lambdas inherit the binding.
+    ///
+    /// One carve-out keeps coverage the reference keeps: a `=~` that is a
+    /// DIRECT statement of that block body, ahead of the statement holding
+    /// `site`, rebinds `$~` to `MatchData?` through the statement rules.
+    /// Anything less direct (a `=~` in a branch or a nested block) declines.
+    fn in_yielding_match_block(
+        &self,
+        ast: &LoweredAst,
+        site: NodeId,
+        tenv: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        let (s0, s1) = ast.get(site).span();
+        let within = |sp: (usize, usize)| sp.0 <= s0 && s1 <= sp.1;
+        for (_, node) in ast.iter() {
+            let Node::Call {
+                receiver: Some(recv),
+                method,
+                block_span: Some(bspan),
+                block_body,
+                ..
+            } = node
+            else {
+                continue;
+            };
+            if !matches!(method.as_str(), "scan" | "gsub" | "gsub!" | "sub" | "sub!")
+                || !within(*bspan)
+            {
+                continue;
+            }
+            // A `def` between the block and the site opens a fresh frame.
+            let def_between = ast.iter().any(|(_, n)| {
+                matches!(n, Node::Definition { .. }) && {
+                    let sp = n.span();
+                    within(sp) && bspan.0 <= sp.0 && sp.1 <= bspan.1
+                }
+            });
+            if def_between {
+                continue;
+            }
+            // Receiver gate: keep firing only on a receiver the port proves is
+            // a known class outside the String family (a project `#gsub`).
+            let rty = self.type_of(ast, *recv, tenv, interner);
+            let non_string = matches!(interner.get(rty), Type::Nominal { .. })
+                && self.index.class_name_of(interner, rty).is_some_and(|c| {
+                    c != "String"
+                        && self.index.knows_class(c)
+                        && self
+                            .index
+                            .ancestor_names(c)
+                            .is_some_and(|a| !a.contains(&"String"))
+                });
+            if non_string {
+                continue;
+            }
+            // `=~` carve-out (direct statement before the site's statement).
+            let mut rebound = false;
+            for &stmt in block_body {
+                let sp = ast.get(stmt).span();
+                if within(sp) {
+                    break;
+                }
+                if sp.1 <= s0
+                    && matches!(ast.get(stmt), Node::Call { method, block_span: None, .. } if method == "=~")
+                {
+                    rebound = true;
+                }
+            }
+            if !rebound {
+                return true;
+            }
+        }
+        false
+    }
+
     fn nilable_source_class(
         &self,
         ast: &LoweredAst,
@@ -763,6 +845,11 @@ impl<'i> Typer<'i> {
             if let Node::ConstantRead { name, .. } = ast.get(recv) {
                 if name == "Regexp" {
                     return match args.as_slice() {
+                        // Upstream v0.4.7 (#2468): inside a `scan`/`gsub`/…
+                        // block on a String-or-untyped receiver the reference
+                        // binds `$~` to `MatchData` on block entry, so the
+                        // zero-arg form is non-nil there. Decline.
+                        [] if self.in_yielding_match_block(ast, value_id, tenv, interner) => None,
                         [] => Some("MatchData"),
                         // A splat lowers to `Statements` (receiver-call args) or
                         // `Other` (`...` forwarding) — arity unknown, decline.
