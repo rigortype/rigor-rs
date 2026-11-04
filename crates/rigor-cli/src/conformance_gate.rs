@@ -788,10 +788,17 @@ pub(crate) fn reference_has_ruby_files(
     } else {
         vec!["lib".to_string()]
     };
-    roots.iter().any(|r| root_has_ruby_file(r, excludes))
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let patterns: Vec<String> = BUILTIN_EXCLUDES
+        .iter()
+        .map(|p| (*p).to_string())
+        .chain(excludes.iter().cloned())
+        .collect();
+    let excludes = crate::config::ExcludeSet::new(&patterns, base.unwrap_or(&cwd), &cwd);
+    roots.iter().any(|r| root_has_ruby_file(r, &excludes))
 }
 
-fn root_has_ruby_file(root: &str, excludes: &[String]) -> bool {
+fn root_has_ruby_file(root: &str, excludes: &crate::config::ExcludeSet) -> bool {
     let path = Path::new(root);
     if path.is_dir() {
         // `Dir.glob(File.join(root, "**/*.rb"))`, then `reject_excluded`.
@@ -800,16 +807,8 @@ fn root_has_ruby_file(root: &str, excludes: &[String]) -> bool {
         }
         let mut files = Vec::new();
         crate::collect_rb_files(path, &mut files);
-        let patterns: Vec<Vec<char>> = BUILTIN_EXCLUDES
-            .iter()
-            .copied()
-            .chain(excludes.iter().map(String::as_str))
-            .map(|p| p.chars().collect())
-            .collect();
-        files.iter().any(|f| {
-            let f: Vec<char> = f.chars().collect();
-            !patterns.iter().any(|p| fnmatch_chars(p, &f))
-        })
+        // `reject_excluded` against the exclude base (v0.4.3, #1576).
+        files.iter().any(|f| !excludes.excludes(f))
     } else {
         // An explicit file: `File.file?(path) && path.end_with?(".rb")`,
         // never filtered by `exclude:`.

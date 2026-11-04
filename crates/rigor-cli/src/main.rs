@@ -846,7 +846,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
             // with no flags); explicit `.rb` file roots are kept verbatim
             // even when they match `exclude:` (issue #201 — the analyzed set
             // IS the rejected expansion; there is no second per-file gate).
-            let excludes = exclude_patterns(&cfg);
+            let excludes = exclude_set(&cfg);
             let (expanded_owned, path_errors) =
                 expand_check_paths_excluding(roots, &excludes);
             let expanded: Vec<&str> =
@@ -1162,11 +1162,10 @@ struct PathError {
 /// actually stores (`resolve_path_key!`): a DECLARED entry was
 /// `File.expand_path(entry, config_dir)`'d at load time (issue #158) — an
 /// ABSOLUTE string with `.`/`..` folded lexically (a cwd `.rigor.yml`
-/// expands against the cwd itself). The absolute spelling is load-bearing
-/// upstream, not cosmetic: `exclude:` is `File.fnmatch?`'d against the
-/// expanded file list, so a project-relative pattern like `lib/ext.rb`
-/// NEVER matches a declared `paths:` file there — a relative spelling would
-/// over-exclude and manufacture FPs. The `["lib"]` DEFAULT is not in the
+/// expands against the cwd itself). Since v0.4.3 (#1576) `exclude:` sees a
+/// relative pattern against the path relative to the config directory
+/// ([`config::ExcludeSet`]), so `lib/ext.rb` excludes a declared `paths:`
+/// file as it does a relative argument. The `["lib"]` DEFAULT is not in the
 /// file, so it stays exactly as written (cwd-relative).
 pub(crate) fn effective_config_paths(cfg: &Config) -> Vec<String> {
     cfg.paths.clone()
@@ -1186,30 +1185,27 @@ pub(crate) fn effective_config_paths(cfg: &Config) -> Vec<String> {
 /// - a missing path → a `PathError { not_found: true }`.
 ///
 /// `excludes` is `Configuration#exclude_patterns` (`BUILTIN_EXCLUDES +
-/// exclude:`) matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
+/// exclude:`) bound to the exclude base ([`config::ExcludeSet`]: since v0.4.3
+/// a relative pattern sees the path relative to the config directory, so the
+/// absolute configured `paths:` and a relative argument exclude alike),
+/// matched with `File.fnmatch?` and NO flags — `*` spans `/`, so
 /// `*zz.rb` matches `lib/zz.rb`, but consecutive `*`s collapse so
 /// `a/**/b` does NOT match `a/b` (unlike the retired `glob::Pattern` per-file
 /// gate — see issue #201). There is no second exclusion stage: this
 /// expansion IS the analyzed set.
 pub(crate) fn expand_check_paths_excluding(
     raw: &[&str],
-    excludes: &[String],
+    excludes: &config::ExcludeSet,
 ) -> (Vec<String>, Vec<PathError>) {
     let mut files = Vec::new();
     let mut errors = Vec::new();
-    // Decode the patterns once per expansion (not per root) — `reject_excluded`
-    // runs patterns × files; `exclude_fnmatch` decodes each file path once.
-    let mut compiled_excludes: Option<Vec<Vec<char>>> = None;
     for &p in raw {
         let path = Path::new(p);
         if path.is_dir() {
             let mut in_dir = Vec::new();
             collect_rb_files(path, &mut in_dir);
             in_dir.sort();
-            let compiled = compiled_excludes.get_or_insert_with(|| {
-                excludes.iter().map(|p| p.chars().collect()).collect()
-            });
-            in_dir.retain(|f| !exclude_fnmatch(compiled, f));
+            excludes.retain_unexcluded(&mut in_dir);
             files.extend(in_dir);
         } else if path.is_file() && p.ends_with(".rb") {
             files.push(p.to_string());
@@ -1233,17 +1229,21 @@ pub(crate) fn exclude_patterns(cfg: &Config) -> Vec<String> {
         .collect()
 }
 
-/// `File.fnmatch?(pattern, path)`-with-no-flags exclusion for one expanded
-/// path — the exact matcher [`conformance_gate::fnmatch_chars`] ports from
-/// MRI `dir.c`, including the leading-period rule: a `*`/`?`/`[` at pattern
-/// position 0 never matches a `.` at path position 0 (`./app/gen.rb` is NOT
-/// excluded by `*gen.rb`). Patterns arrive pre-decoded — the caller converts
-/// them once per expansion, not once per file.
-pub(crate) fn exclude_fnmatch(patterns: &[Vec<char>], path: &str) -> bool {
-    let path: Vec<char> = path.chars().collect();
-    patterns
-        .iter()
-        .any(|p| conformance_gate::fnmatch_chars(p, &path))
+/// [`exclude_patterns`] bound to `Configuration#exclude_base` (v0.4.3,
+/// #1576): the config file's directory, or the working directory when no
+/// config file was read. Relative path arguments are spelled from the
+/// working directory.
+pub(crate) fn exclude_set(cfg: &Config) -> config::ExcludeSet {
+    exclude_set_at(cfg, Path::new("."))
+}
+
+/// [`exclude_set`] for paths spelled from `root` (the LSP's project root: `.`
+/// in production, an absolute directory in tests).
+pub(crate) fn exclude_set_at(cfg: &Config, root: &Path) -> config::ExcludeSet {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    let spelled_from = cwd.join(root);
+    let base = cfg.config_base_dir().map_or_else(|| spelled_from.clone(), Path::to_path_buf);
+    config::ExcludeSet::new(&exclude_patterns(cfg), &base, &spelled_from)
 }
 
 /// Recursively collect `*.rb` files under `dir`, mirroring Ruby's
@@ -1598,7 +1598,7 @@ fn analyze_files(
         // because exclusion needs the dir-vs-file provenance only the roots
         // carry. Expansion errors on the discovery side are dropped, exactly
         // as `project_discovery_expansion` only reads `widened[:files]`.
-        let excludes = exclude_patterns(cfg);
+        let excludes = exclude_set(cfg);
         let widened_files =
             expand_check_paths_excluding(&union_root_refs, &excludes).0;
         let expanded_files =
@@ -1983,9 +1983,9 @@ fn analyze_files(
     // `File.file?` — a directory earns the row too). Run-level, not per-file:
     // upstream these lead `pre_file_diagnostics` — AHEAD of the
     // `expansion.errors` rows `prepend_path_errors` splices in (which is why
-    // that fn skips leading `pre-eval.*` entries) — and the `disable:` filter
-    // never reaches them (oracle: `disable: [pre-eval.file-not-found]` leaves
-    // the row standing), while `severity_overrides:` / `severity_profile:`
+    // that fn skips leading `pre-eval.*` entries) — and since v0.4.3 (#1892)
+    // the `disable:` list reaches them through `filter_suppressed` (exact id
+    // or `pre-eval` token; `disable: [all]` leaves the row standing), while `severity_overrides:` / `severity_profile:`
     // DO re-stamp them (`SeverityStamp.apply` covers the whole stream). The
     // `path:` is the literal ".rigor.yml" upstream even under `--config` or a
     // `.rigor.dist.yml` discovery — the aggregator hard-codes it. Glob-meta
@@ -2025,9 +2025,13 @@ fn analyze_files(
         // entry earns ONE row upstream, not one per mention.
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for entry in &cfg.pre_eval {
+            // v0.4.3 (#1892): the `disable:` list now reaches these rows —
+            // the exact id or the `pre-eval` family token, never `all`
+            // (`config_disables_pre_eval`).
             if !seen.insert(entry.as_str())
                 || entry.contains(['*', '?', '['])
                 || std::path::Path::new(entry).is_file()
+                || rigor_rules::config_disables_pre_eval(&cfg.disable, "pre-eval.file-not-found")
             {
                 continue;
             }
@@ -2422,7 +2426,7 @@ fn baseline_analysis(
     // expands through the same `PathExpansion` as `check` —
     // `reject_excluded` on directory entries, `.rb` file roots verbatim.
     let (expanded_owned, path_errors) =
-        expand_check_paths_excluding(roots, &exclude_patterns(&cfg));
+        expand_check_paths_excluding(roots, &exclude_set(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _had_io_error) = analyze_files(
         &expanded,

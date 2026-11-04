@@ -358,6 +358,7 @@ impl SourceIndex {
                     &oc.includes,
                     &oc.extends,
                     oc.is_module,
+                    &oc.refines,
                 );
             }
         }

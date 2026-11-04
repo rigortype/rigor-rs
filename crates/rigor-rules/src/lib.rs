@@ -65,8 +65,8 @@ pub use rule_catalog::{
 };
 pub use shadowed_rescue::shadowed_rescue_diagnostics;
 pub use suppression::{
-    filter_suppressed, implemented_rules, is_inert_builtin_token, known_suppression_token,
-    SuppressSet,
+    config_disables_pre_eval, filter_suppressed, implemented_rules, is_inert_builtin_token,
+    known_suppression_token, SuppressSet,
 };
 pub use suppression_markers::suppression_marker_diagnostics;
 pub use void_value_use::void_value_use_diagnostics;

@@ -289,7 +289,7 @@ fn help() -> String {
 /// differential describe one project.
 fn resolve_paths(raw: &[&str], cfg: &crate::Config) -> Vec<String> {
     let (mut out, _path_errors) =
-        crate::expand_check_paths_excluding(raw, &crate::exclude_patterns(cfg));
+        crate::expand_check_paths_excluding(raw, &crate::exclude_set(cfg));
     out.dedup();
     out
 }

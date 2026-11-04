@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/130_rescue_ensure_clause_widening.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 150,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 151,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `cw_nope' for ArgumentError"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 97,
+      "column": 21,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 110,
+      "column": 15,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 123,
+      "column": 15,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 135,
+      "column": 15,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 137,
+      "column": 15,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

@@ -222,17 +222,41 @@ impl SourceIndex {
     /// prefix first). A `false` reads as "a module whose refinements nothing
     /// here can read", the declining side.
     pub fn declares_constant_at(&self, prefix: &[String], raw: &str) -> bool {
+        self.resolve_declared_constant_at(prefix, raw).is_some()
+    }
+
+    /// The QUALIFIED name of the project class or module the constant `raw`
+    /// names when read in the lexical scope `prefix` (longest prefix first),
+    /// or `None` when the project declares none — the lookup
+    /// [`Self::declares_constant_at`] answers.
+    pub fn resolve_declared_constant_at(&self, prefix: &[String], raw: &str) -> Option<String> {
         if let Some(rooted) = raw.strip_prefix("::") {
-            return self.override_classes.contains_key(rooted);
+            return self.override_classes.contains_key(rooted).then(|| rooted.to_string());
         }
-        (0..=prefix.len()).rev().any(|i| {
+        (0..=prefix.len()).rev().find_map(|i| {
             let candidate = if i == 0 {
                 raw.to_string()
             } else {
                 format!("{}::{}", prefix[..i].join("::"), raw)
             };
-            self.override_classes.contains_key(&candidate)
+            self.override_classes.contains_key(&candidate).then_some(candidate)
         })
+    }
+
+    /// Upstream v0.4.3 (#1836): the `refine(T) { def … }` rows of the project
+    /// module `module` (qualified), as `(target as written, method names)`.
+    /// Empty for a name the project does not declare or that refines nothing.
+    pub fn refinements_of(&self, module: &str) -> Vec<(Option<&str>, &[String])> {
+        self.override_classes
+            .get(module)
+            .map(|e| e.refines.iter().map(|r| (r.target.as_deref(), r.names.as_slice())).collect())
+            .unwrap_or_default()
+    }
+
+    /// Whether the project's FIRST declaration of `qualified` was a `module`
+    /// (`None` when the project declares no such class or module).
+    pub fn project_declares_module(&self, qualified: &str) -> Option<bool> {
+        self.override_classes.get(qualified).map(|e| e.is_module)
     }
 
     pub(crate) fn resolve_override_ancestor(&self, subclass: &str, raw: &str) -> Option<String> {
@@ -267,6 +291,7 @@ impl SourceIndex {
         includes: &[String],
         extends: &[String],
         is_module: bool,
+        refines: &[super::Refinement],
     ) {
         // `or_insert_with` (not `or_default`) so `is_module` is FIRST-WRITE-WINS
         // like `superclass`: a reopen never re-decides the kind.
@@ -294,6 +319,7 @@ impl SourceIndex {
                 entry.extends.push(ext.clone());
             }
         }
+        entry.refines.extend(refines.iter().cloned());
     }
 }
 
@@ -342,6 +368,7 @@ pub(crate) fn collect_override_classes(
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: false,
+                refines: Vec::new(),
             });
             let child_prefix = split_qualified(&qualified);
             for &child in body {
@@ -361,6 +388,7 @@ pub(crate) fn collect_override_classes(
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: true,
+                refines: collect_body_refines(ast, body),
             });
             let child_prefix = split_qualified(&qualified);
             for &child in body {
@@ -380,6 +408,44 @@ pub(crate) fn collect_override_classes(
 /// take — the `extend` half of the singleton ancestor surface the reference's
 /// ScopeIndexer folds into the extender's own singleton entries. Same
 /// direct-statement discipline as the parser's `include`/`prepend` capture.
+/// The `refine(T) { def … }` / `refine T do … end` statements of a module
+/// body: the target constant as written (`None` when it is not a plain
+/// constant) and every `def` name inside the block, nested statements
+/// included.
+fn collect_body_refines(ast: &LoweredAst, body: &[NodeId]) -> Vec<super::Refinement> {
+    let mut out = Vec::new();
+    for &child in body {
+        let Node::Call { receiver: None, method, args, block_span: Some(block), .. } =
+            ast.get(child)
+        else {
+            continue;
+        };
+        if method != "refine" || args.len() != 1 {
+            continue;
+        }
+        let target = match ast.get(args[0]) {
+            Node::ConstantRead { name, dynamic_base: false, self_anchored: false, .. }
+                if !name.is_empty() =>
+            {
+                Some(name.strip_prefix("::").unwrap_or(name).to_string())
+            }
+            _ => None,
+        };
+        let names = ast
+            .iter()
+            .filter(|(_, n)| {
+                matches!(n, Node::Definition { .. }) && {
+                    let s = n.span();
+                    block.0 <= s.0 && s.1 <= block.1
+                }
+            })
+            .flat_map(|(_, n)| super::harvest::def_names(n))
+            .collect();
+        out.push(super::Refinement { target, names });
+    }
+    out
+}
+
 fn collect_body_extends(ast: &LoweredAst, body: &[NodeId]) -> Vec<String> {
     let mut out = Vec::new();
     for &child in body {

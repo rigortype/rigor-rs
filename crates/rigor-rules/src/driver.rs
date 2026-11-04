@@ -415,6 +415,23 @@ pub fn analyze_with_source_and_folder(
         });
     }
 
+    // Upstream v0.4.3 (#1836, rigor #1752): under a `using M` of a PROJECT
+    // module, a refinement of `Object`, `Module`, `Class` (a class receiver
+    // only), `Kernel` or `BasicObject`, or of a module a class may extend,
+    // reaches a call on a class or module object, which then types `Dynamic`.
+    // The port reads the module's `refine(T) { def … }` names but models no
+    // refined dispatch, so it withholds `call.undefined-method` for such a
+    // name on a class-object receiver — and, as a superset for an instance
+    // receiver, for any name the module refines on any target (the reference
+    // answers those through the refinement too).
+    let refined = refined_using_regions(ast, source, &scopes);
+    if !refined.is_empty() {
+        out.retain(|d| {
+            d.rule_id != crate::CALL_UNDEFINED_METHOD
+                || !refinement_reaches(index, source, &refined, d)
+        });
+    }
+
     // Upstream v0.4.2 (#1700/#1701): a `require "prime"` in any analysed file
     // loads the vendored prime signatures, which declare `Integer#prime?`,
     // `#prime_division`, `Integer.each_prime` and `.from_prime_division`. The
@@ -463,6 +480,99 @@ const REFINEMENT_DECLINED_RULES: &[&str] = &[
     crate::CALL_ARGUMENT_TYPE_MISMATCH,
     crate::FLOW_ALWAYS_RAISES,
 ];
+
+/// The roots every class object's lookup reaches (the reference's
+/// `ClassObject::TAIL_CLASSES`, `Class` handled apart: a module object is no
+/// `Class`).
+const CLASS_OBJECT_ROOTS: &[&str] = &["Object", "Module", "Kernel", "BasicObject"];
+
+/// Whether a refinement in effect at `d` (one of `regions`: `(start, end,
+/// qualified module)`) may answer its `call.undefined-method` — see the
+/// v0.4.3 decline above. Every unreadable term answers `true` (decline).
+fn refinement_reaches(
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    regions: &[(usize, usize, String)],
+    d: &Diagnostic,
+) -> bool {
+    let Some(method) = d.method_name.as_deref() else {
+        return false;
+    };
+    // `singleton(X)` — a lone class or module object; anything else (an
+    // instance, a union) takes the any-target superset.
+    let object = d
+        .receiver_type
+        .as_deref()
+        .and_then(|r| r.strip_prefix("singleton(")?.strip_suffix(')'))
+        .filter(|x| !x.contains(['|', '(', ')']));
+    let is_module = |prefix: &[String], name: &str| -> Option<bool> {
+        match source.resolve_declared_constant_at(prefix, name) {
+            Some(q) => source.project_declares_module(&q),
+            None if index.is_module(name) || index.is_qualified_module(name) => Some(true),
+            None if index.knows_class(name) || index.knows_qualified_class(name) => Some(false),
+            None => None,
+        }
+    };
+    regions
+        .iter()
+        .filter(|(start, end, _)| *start <= d.start_offset && d.start_offset < *end)
+        .any(|(_, _, module)| {
+            let prefix: Vec<String> = module.split("::").map(str::to_string).collect();
+            source.refinements_of(module).into_iter().any(|(target, names)| {
+                if !names.iter().any(|n| n == method) {
+                    return false;
+                }
+                let Some(x) = object else { return true };
+                match target {
+                    None => true,
+                    Some(t) if CLASS_OBJECT_ROOTS.contains(&t) => true,
+                    Some("Class") => is_module(&[], x) != Some(true),
+                    // A module the class object may extend; an unknown
+                    // constant may be one.
+                    Some(t) => is_module(&prefix, t) != Some(false),
+                }
+            })
+        })
+}
+
+/// The byte regions a PROJECT module's `using` is in effect over, with the
+/// module's qualified name — the declared half of [`opaque_using_regions`]'s
+/// scan (same lexical extent).
+fn refined_using_regions(
+    ast: &LoweredAst,
+    source: &rigor_infer::SourceIndex,
+    scopes: &[(rigor_parse::Span, Vec<String>)],
+) -> Vec<(usize, usize, String)> {
+    let file_end = ast.iter().map(|(_, n)| n.span().1).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for (_, n) in ast.iter() {
+        let Node::Call { receiver: None, method, args, .. } = n else {
+            continue;
+        };
+        if method != "using" || args.len() != 1 {
+            continue;
+        }
+        let Node::ConstantRead { name, dynamic_base: false, self_anchored: false, rooted, .. } =
+            ast.get(args[0])
+        else {
+            continue;
+        };
+        let span = n.span();
+        let enclosing = scopes
+            .iter()
+            .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+            .min_by_key(|(s, _)| s.1 - s.0);
+        let (end, prefix): (usize, &[String]) = match enclosing {
+            Some((s, p)) => (s.1, p.as_slice()),
+            None => (file_end, &[]),
+        };
+        let raw = if *rooted { format!("::{name}") } else { name.clone() };
+        if let Some(module) = source.resolve_declared_constant_at(prefix, &raw) {
+            out.push((span.1, end, module));
+        }
+    }
+    out
+}
 
 /// The byte regions an OPAQUE `using` is in effect over: from the end of a
 /// receiverless `using C` whose constant `C` the project does not declare

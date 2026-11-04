@@ -160,6 +160,28 @@ fn legacy_alias(token: &str) -> Option<&'static str> {
     }
 }
 
+/// The `pre-eval.*` ids (reference `PRE_EVAL_RULES`), the expansion of the
+/// `pre-eval` family token.
+const PRE_EVAL_RULES: &[&str] =
+    &["pre-eval.parse-error", "pre-eval.file-not-found", "pre-eval.duplicate-declaration"];
+
+/// Whether the `.rigor.yml` `disable:` list drops a run-level `pre-eval.*` row
+/// (reference v0.4.3 `DiagnosticAggregator#suppress_pre_eval`, #1892). The
+/// reference runs these rows through `CheckRules.filter_suppressed` with
+/// `disabled_rules:` and no comments (the row is positioned at `.rigor.yml`).
+/// There, `expand_token("all")` yields the bare `"all"` sentinel, and the
+/// `disabled.include?(rule)` test never matches it, so `disable: [all]` leaves
+/// the row standing. Only the exact id and the `pre-eval` family token match.
+/// This is why the shared [`SuppressSet`] (whose `all` flag matches every rule)
+/// is not used here.
+#[must_use]
+pub fn config_disables_pre_eval<S: AsRef<str>>(disable: &[S], rule: &str) -> bool {
+    disable.iter().any(|token| {
+        let token = token.as_ref();
+        token == rule || (token == "pre-eval" && PRE_EVAL_RULES.contains(&rule))
+    })
+}
+
 /// Families of diagnostics the engine emits OUTSIDE the check-rule catalogue
 /// (aggregator/reporter-level: `rbs_extended.*`, `dynamic.*`, `rbs.*`,
 /// `pre-eval.*`), plus the `plugin.` prefix reserved for plugin-produced ids. A
@@ -364,5 +386,28 @@ fn absorb_tokens(tail: &str, target: &mut SuppressSet) {
         if !token.is_empty() {
             target.absorb_token(token);
         }
+    }
+}
+
+#[cfg(test)]
+mod pre_eval_disable_tests {
+    use super::config_disables_pre_eval;
+
+    const ROW: &str = "pre-eval.file-not-found";
+
+    #[test]
+    fn exact_id_and_family_token_drop_the_row() {
+        assert!(config_disables_pre_eval(&["pre-eval.file-not-found"], ROW));
+        assert!(config_disables_pre_eval(&["call", "pre-eval"], ROW));
+    }
+
+    // Must-still-fire controls (oracle v0.4.3): no `disable:`, `all`, a
+    // sibling id and an unrelated family leave the row standing.
+    #[test]
+    fn all_and_unrelated_tokens_leave_the_row() {
+        assert!(!config_disables_pre_eval::<&str>(&[], ROW));
+        assert!(!config_disables_pre_eval(&["all"], ROW));
+        assert!(!config_disables_pre_eval(&["pre-eval.parse-error"], ROW));
+        assert!(!config_disables_pre_eval(&["flow", "pre"], ROW));
     }
 }

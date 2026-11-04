@@ -1036,6 +1036,41 @@ pub(crate) fn widen_flow_writes(
     }
 }
 
+/// Upstream #1837 (rigor #1231 / #1457, `widen_clause_entry`): a `rescue`
+/// arm runs after the `begin` body raised from any point in it, and an
+/// `ensure` clause after the body, its `else` or a rescue arm raised or
+/// finished, so the clause reads each local those wrote as `Dynamic[top]`.
+/// `region` is the span of the writing statements (the protected body for a
+/// rescue arm; everything before the `ensure` statements for an `ensure`).
+/// A write inside a `def` / `class` / `module` nested in the region belongs to
+/// another scope and does not count; a block's write does (it may rebind an
+/// outer local). Only a name `env` already binds, to something other than
+/// `Dynamic[top]`, is rebound. `writes` may over-approximate the reference's
+/// rebind set (it carries in-place mutations): every extra name only widens,
+/// which can take a diagnostic away and never adds one.
+pub(crate) fn widen_clause_entry(
+    writes: &[(rigor_parse::Span, String)],
+    region: rigor_parse::Span,
+    scope_spans: &[rigor_parse::Span],
+    env: &mut TypeEnv,
+    interner: &mut Interner,
+) {
+    let u = interner.untyped();
+    let inside = |outer: rigor_parse::Span, inner: rigor_parse::Span| {
+        outer.0 <= inner.0 && inner.1 <= outer.1
+    };
+    for (wspan, name) in writes {
+        if !inside(region, *wspan)
+            || scope_spans.iter().any(|s| inside(region, *s) && inside(*s, *wspan))
+        {
+            continue;
+        }
+        if let Some(ty) = env.get_mut(name) {
+            *ty = u;
+        }
+    }
+}
+
 /// Drop the `Array.new`-provenance of every local whose write span is contained
 /// in `span` — the `penv` counterpart of [`widen_flow_writes`] (a reassignment
 /// inside `span` invalidates the "still bound to `Array.new(nominal)`" fact).
@@ -1198,6 +1233,10 @@ pub(crate) struct IndexedFlow {
     pub operand_spans: HashSet<rigor_parse::Span>,
     /// Element-mutator calls on a recorded slot.
     pub slot_mutations: Vec<SlotMutation>,
+    /// The span of every `def` / `class` / `module` / `class <<` node — the
+    /// reference's `SCOPE_BODY_NODES`, whose writes are another scope's
+    /// ([`widen_clause_entry`], upstream #1837).
+    pub scope_spans: Vec<rigor_parse::Span>,
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
@@ -1285,6 +1324,9 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                     });
                 }
             }
+            Node::Definition { span, .. }
+            | Node::ClassDef { span, .. }
+            | Node::ModuleDef { span, .. } => flow.scope_spans.push(*span),
             _ => {}
         }
     }
