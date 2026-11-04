@@ -3255,26 +3255,6 @@ impl CoreData {
         }
     }
 
-    /// Does this RBS parameter type accept a (non-nil) argument of class
-    /// `arg_class`? A faithful port of the reference `rbs_type_accepts_arg?`
-    /// (`check_rules.rb:2157-2213`): conservative-TRUE by default, so the caller
-    /// (the non-nil channel) fires only on a param that PROVABLY rejects the
-    /// argument's class.
-    ///
-    /// - `ClassInstance(name)` ⇒ decided by [`Self::class_ordering`]`(arg_class,
-    ///   name)`: `Equal`/`Subclass` (the arg is the param class or a descendant)
-    ///   and `Unknown` (either class unloaded) accept; `Disjoint`/`Superclass`
-    ///   reject — BUT only when the argument class resolves in the reference's
-    ///   host process (`resolve_class` inside `class_subtype_result`, #382): a
-    ///   sig-only, project-source or vendored-but-unloaded class is a `maybe`,
-    ///   so [`host_resolvable_class`] gates the proven `no`.
-    /// - `Alias` ⇒ bounded expansion; an unresolvable alias accepts.
-    /// - `Interface` ⇒ accepted iff `arg_class` implements every required method
-    ///   (mirror of [`Self::interface_admits_nil`], asking the arg class); an
-    ///   unresolvable / empty interface, or an arg class not RBS-known, accepts.
-    /// - `Union` ⇒ ANY member accepting accepts.
-    /// - `Optional` / `Variable` / `Tuple` / `Other` ⇒ accept conservatively
-    ///   (the reference `else`).
     /// Upstream v0.4.2 (#1662): the RBS-declared type of instance variable
     /// `ivar` on `class_name` — an `@x: T` member or an `attr_*` slot, own
     /// (qualified entry first) or on an ancestor. An attribute whose `(@ivar)`
@@ -3297,6 +3277,26 @@ impl CoreData {
         chain.iter().find_map(|a| self.classes.get(a).and_then(pick))
     }
 
+    /// Does this RBS parameter type accept a (non-nil) argument of class
+    /// `arg_class`? A faithful port of the reference `rbs_type_accepts_arg?`
+    /// (`check_rules.rb:2157-2213`): conservative-TRUE by default, so the caller
+    /// (the non-nil channel) fires only on a param that PROVABLY rejects the
+    /// argument's class.
+    ///
+    /// - `ClassInstance(name)` ⇒ decided by [`Self::class_ordering`]`(arg_class,
+    ///   name)`: `Equal`/`Subclass` (the arg is the param class or a descendant)
+    ///   and `Unknown` (either class unloaded) accept; `Disjoint`/`Superclass`
+    ///   reject — BUT only when the argument class resolves in the reference's
+    ///   host process (`resolve_class` inside `class_subtype_result`, #382): a
+    ///   sig-only, project-source or vendored-but-unloaded class is a `maybe`,
+    ///   so [`host_resolvable_class`] gates the proven `no`.
+    /// - `Alias` ⇒ bounded expansion; an unresolvable alias accepts.
+    /// - `Interface` ⇒ accepted iff `arg_class` implements every required method
+    ///   (mirror of [`Self::interface_admits_nil`], asking the arg class); an
+    ///   unresolvable / empty interface, or an arg class not RBS-known, accepts.
+    /// - `Union` ⇒ ANY member accepting accepts.
+    /// - `Optional` / `Variable` / `Tuple` / `Other` ⇒ accept conservatively
+    ///   (the reference `else`).
     pub fn param_accepts_arg_class(&self, t: &RetainedParamType, arg_class: &str) -> bool {
         self.param_accepts_arg_class_depth(t, arg_class, 0)
     }

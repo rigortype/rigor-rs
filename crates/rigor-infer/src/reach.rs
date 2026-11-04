@@ -202,8 +202,8 @@ impl<'i> Typer<'i> {
                 // member fold still collapses to `Constant[1]`). That is
                 // [`Typer::expr_scalar`]; a hit here is exactly `pinned`
                 // (rigor-rs#332).
-                if let Some(scalar) = self.expr_scalar(ast, id, seen) {
-                    return pinned_scalar_reach(&scalar);
+                if self.expr_scalar(ast, id, seen).is_some() {
+                    return Reach::LITERAL;
                 }
                 let mut reach = self.chain_reach(ast, id, seen);
                 // The operands of a call COMPOSE into its result rather than
@@ -1629,17 +1629,6 @@ fn literal_scalar(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
         Node::FalseLit { .. } => Some(Scalar::Bool(false)),
         Node::NilLit { .. } => Some(Scalar::Nil),
         _ => None,
-    }
-}
-
-/// The [`Reach`] of a folded literal call — `precise` + `pinned`, with the
-/// `rand` opacity of the scalar it landed on (`0` keeps `(?0) -> Float`
-/// alive).
-fn pinned_scalar_reach(scalar: &Scalar) -> Reach {
-    if matches!(scalar, Scalar::Int(0)) {
-        Reach::LITERAL
-    } else {
-        Reach::LITERAL
     }
 }
 
