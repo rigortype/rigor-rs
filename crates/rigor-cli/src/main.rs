@@ -2443,6 +2443,11 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
             // `run`'s else: `subcommand.inspect` — the Ruby double-quoted
             // spelling Rust's `{:?}` reproduces for ordinary words.
             eprintln!("Unknown baseline subcommand: {other:?}");
+            // v0.4.7 (#2512): the nearest subcommand, when there is one.
+            let subs = ["generate", "regenerate", "dump", "drift", "prune"];
+            if let Some(nearest) = optparse::spell_checker_correct(&subs, other).first() {
+                eprintln!("Did you mean `rigor baseline {nearest}`?");
+            }
             eprint!("{BASELINE_HELP}");
             ExitCode::from(64)
         }
@@ -2512,20 +2517,19 @@ const BASELINE_PRUNE_PARSER: optparse::OptParser =
 /// (which would silently misjudge every out-of-`lib` bucket as cleared);
 /// generate/regenerate ignore it (writing a `lib`-scoped baseline is fine).
 ///
-/// The returned `usize` is the count of bad-path expansion diagnostics —
-/// `expand_paths` errors the reference puts in the run's `diagnostics` list
-/// (`rule: nil`, severity warn-or-error). They never carry a rule, so they
-/// are not in `findings` and never land in a baseline bucket, but the
-/// reference's `generate`/`regenerate` summary counts them
-/// (`diagnostics.size` covers them): `covering 1 diagnostic(s)` for a
-/// missing default `lib/` even when the baseline it writes is empty.
+/// The returned `Vec<String>` is the paths of the bad-path expansion
+/// diagnostics — `expand_paths` errors the reference puts in the run's
+/// `diagnostics` list (`rule: nil`). They never carry a rule, so they are not
+/// in `findings` and never land in a baseline bucket; v0.4.7's
+/// `report_unbaselineable` (#2442/#2463) lists them with the other ruleless
+/// diagnostics.
 ///
 /// Returns `Err(code)` if the sidecar folder fails to build.
 fn baseline_analysis(
     explicit_config: Option<&str>,
     roots: &[&str],
     verb: &'static str,
-) -> Result<(Config, Findings, bool, usize), ExitCode> {
+) -> Result<(Config, Findings, bool, Vec<String>), ExitCode> {
     let cfg = Config::load(explicit_config.map(Path::new)).map_err(|f| f.report())?;
     let sidecar_folder = build_sidecar_folder(&cfg, None)?;
     let folder_ref =
@@ -2566,7 +2570,7 @@ fn baseline_analysis(
         &cfg.bleeding_edge_selector(),
         ref_has_files,
     );
-    Ok((cfg, findings, scope_undeclared, path_errors.len()))
+    Ok((cfg, findings, scope_undeclared, path_errors.into_iter().map(|e| e.path).collect()))
 }
 
 /// Relativize findings against cwd, as the baseline matcher keys on
@@ -2609,8 +2613,8 @@ fn baseline_generate(args: &[String]) -> ExitCode {
     let mut explicit_config: Option<String> = None;
     for item in items {
         match item {
-            // A rigor-rs generate-parity extension: positional roots override
-            // config `paths:`. The reference accepts no positionals here.
+            // Refused below (v0.4.7 #2575): the baseline always covers the
+            // configured `paths:`.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
                 "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
@@ -2630,6 +2634,9 @@ fn baseline_generate(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !files.is_empty() {
+        return baseline_positional_error("generate", &files);
     }
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
@@ -2678,9 +2685,61 @@ fn baseline_regenerate(args: &[String]) -> ExitCode {
             },
         }
     }
+    if !files.is_empty() {
+        return baseline_positional_error("regenerate", &files);
+    }
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
     write_baseline(explicit_config.as_deref(), &file_refs, &output, mode, "regenerated baseline")
+}
+
+/// v0.4.7 `positional_paths_error` (#2466/#2577/#2575): the baseline covers
+/// the configured `paths:`, never positional arguments — every subcommand
+/// refuses them after option parsing, exit 64.
+fn baseline_positional_error(subcommand: &str, args: &[String]) -> ExitCode {
+    let hint = match subcommand {
+        "dump" => "dump reads the baseline file, so pass none: use --file=GLOB to filter rows or \
+                   --baseline=PATH to pick a file"
+            .to_string(),
+        "drift" | "prune" => format!("{subcommand} audits the configured `paths:`, so pass none"),
+        _ => "the baseline is generated from the configured `paths:`, so pass none".to_string(),
+    };
+    let quoted: Vec<String> = args.iter().map(|a| format!("{a:?}")).collect();
+    eprintln!(
+        "rigor baseline {subcommand}: unexpected argument(s) {}; {hint}",
+        quoted.join(" ")
+    );
+    ExitCode::from(64)
+}
+
+/// v0.4.7 `MAX_UNBASELINEABLE_FILES`.
+const MAX_UNBASELINEABLE_FILES: usize = 10;
+
+/// v0.4.7 `report_unbaselineable` (#2442/#2463): the diagnostics with no rule
+/// (parse, path or internal errors) never enter the file; say how many and
+/// list their files (relative to cwd, unique, sorted, at most 10).
+fn report_unbaselineable(no_rule_paths: &[String]) {
+    if no_rule_paths.is_empty() {
+        return;
+    }
+    let cwd = std::env::current_dir().ok();
+    let mut files: Vec<String> =
+        no_rule_paths.iter().map(|p| relative_path(p, cwd.as_deref())).collect();
+    files.sort();
+    files.dedup();
+    let listing = if files.is_empty() { "" } else { ":" };
+    eprintln!(
+        "rigor: {} diagnostic(s) have no rule (parse, path or internal errors) in {} file(s) and \
+         cannot be baselined; fix them, or remove or exclude the files{listing}",
+        no_rule_paths.len(),
+        files.len()
+    );
+    for f in files.iter().take(MAX_UNBASELINEABLE_FILES) {
+        eprintln!("  {f}");
+    }
+    if files.len() > MAX_UNBASELINEABLE_FILES {
+        eprintln!("  ... and {} more file(s)", files.len() - MAX_UNBASELINEABLE_FILES);
+    }
 }
 
 /// Shared generate/regenerate writer: analyze, build the baseline, write it, and
@@ -2700,7 +2759,7 @@ fn write_baseline(
     // (empty) surface.
     // generate/regenerate ignore `analysis_set_empty`: an empty resolved set
     // legitimately writes an empty baseline (nothing to record).
-    let (cfg, findings, _analysis_set_empty, path_error_count) =
+    let (cfg, findings, _analysis_set_empty, path_error_paths) =
         match baseline_analysis(explicit_config, files, "baseline") {
             Ok(v) => v,
             Err(code) => return code,
@@ -2715,15 +2774,19 @@ fn write_baseline(
         MatchMode::Rule => "rule",
         MatchMode::Message => "message",
     };
-    // The reference's `diagnostics.size` counts every run diagnostic —
-    // `rule: nil` path-expansion errors included — while the baseline FILE
-    // buckets only ruled findings (`entries`), so the summary counts the
-    // union even when the file stays empty (issue #201's `covering 0` row).
-    eprintln!(
-        "rigor: {verb} {output} ({} bucket(s) covering {} diagnostic(s); match-mode: {mode_str})",
-        baseline.size(),
-        entries.len() + path_error_count
+    // v0.4.7 (#2442/#2463): `covering` sums the buckets' counts — the keyed
+    // diagnostics only; the ruleless ones (path-expansion errors, parse
+    // errors) are reported separately by `report_unbaselineable`.
+    let mut no_rule_paths: Vec<String> = path_error_paths;
+    no_rule_paths.extend(
+        findings.iter().filter(|(_, _, _, d)| d.qualified_rule().is_none()).map(|(_, p, _, _)| p.clone()),
     );
+    let covered = entries.len() - findings.iter().filter(|(_, _, _, d)| d.qualified_rule().is_none()).count();
+    eprintln!(
+        "rigor: {verb} {output} ({} bucket(s) covering {covered} diagnostic(s); match-mode: {mode_str})",
+        baseline.size(),
+    );
+    report_unbaselineable(&no_rule_paths);
     if cfg.baseline_path().is_none() {
         // The reference names the config file actually read — the explicit
         // `--config` path when given, else `Configuration.discover`'s winner
@@ -2752,9 +2815,10 @@ fn baseline_dump(args: &[String]) -> ExitCode {
     let mut format = String::from("text");
     let mut rule: Option<String> = None;
     let mut file_glob: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
     for item in items {
         match item {
-            Item::Positional(_) => {} // upstream leaves them in argv, unused
+            Item::Positional(p) => positionals.push(p),
             Item::Opt { key, value, .. } => match key {
                 "baseline" => path = value.unwrap().as_str().to_string(),
                 "format" => format = value.unwrap().as_str().to_string(),
@@ -2763,6 +2827,9 @@ fn baseline_dump(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !positionals.is_empty() {
+        return baseline_positional_error("dump", &positionals);
     }
     let baseline = match load_baseline_strict(&path) {
         Ok(b) => b,
@@ -2874,8 +2941,8 @@ fn baseline_drift(args: &[String]) -> ExitCode {
     let mut files: Vec<String> = Vec::new();
     for item in items {
         match item {
-            // A rigor-rs generate-parity extension: positional roots override
-            // config `paths:`. The reference accepts no positionals here.
+            // Refused below (v0.4.7 #2575): the baseline always covers the
+            // configured `paths:`.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
                 "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
@@ -2895,6 +2962,9 @@ fn baseline_drift(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !files.is_empty() {
+        return baseline_positional_error("drift", &files);
     }
     let explicit_config = explicit_config.as_deref();
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
@@ -2988,8 +3058,8 @@ fn baseline_prune(args: &[String]) -> ExitCode {
     let mut files: Vec<String> = Vec::new();
     for item in items {
         match item {
-            // A rigor-rs generate-parity extension: positional roots override
-            // config `paths:`. The reference accepts no positionals here.
+            // Refused below (v0.4.7 #2575): the baseline always covers the
+            // configured `paths:`.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
                 "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
@@ -3001,6 +3071,9 @@ fn baseline_prune(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !files.is_empty() {
+        return baseline_positional_error("prune", &files);
     }
     let explicit_config = explicit_config.as_deref();
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
