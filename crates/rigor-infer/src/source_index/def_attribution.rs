@@ -740,13 +740,27 @@ fn file_call_methods(
         }
         return;
     }
-    if receiver.is_some() {
-        return; // `attr_*` / module-attr / `alias_method` are implicit-self macros.
-    }
-    if matches!(method, "attr_reader" | "attr_writer" | "attr_accessor") {
-        let reader = method != "attr_writer";
-        let writer = method != "attr_reader";
-        for &arg in args {
+    // Upstream v0.4.5 (#2120, `attr_macro`): an `attr_*` call on the body's
+    // self — implicit or `self.` — naming the macro directly or as the literal
+    // first argument of `send` / `public_send` / `__send__` declares its
+    // members exactly as the receiverless macro does.
+    let self_receiver =
+        receiver.is_none_or(|r| matches!(ast.get(r), Node::SelfExpr { .. }));
+    let attr = match method {
+        "attr_reader" | "attr_writer" | "attr_accessor" if self_receiver => {
+            Some((method.to_string(), args))
+        }
+        "send" | "public_send" | "__send__" if self_receiver => args
+            .first()
+            .and_then(|&a| literal_method_name(ast, a))
+            .filter(|m| matches!(m.as_str(), "attr_reader" | "attr_writer" | "attr_accessor"))
+            .map(|m| (m, &args[1..])),
+        _ => None,
+    };
+    if let Some((macro_name, attr_args)) = attr {
+        let reader = macro_name != "attr_writer";
+        let writer = macro_name != "attr_reader";
+        for &arg in attr_args {
             let Some(base) = literal_method_name(ast, arg) else {
                 continue;
             };
@@ -758,6 +772,9 @@ fn file_call_methods(
             }
         }
         return;
+    }
+    if receiver.is_some() {
+        return; // module-attr / `alias_method` are implicit-self macros.
     }
     if let Some((reader, writer, predicate)) = module_attr_shape(method) {
         for &arg in args {

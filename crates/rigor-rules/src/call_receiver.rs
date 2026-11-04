@@ -290,6 +290,16 @@ pub(crate) fn check_call(
                 || (index.knows_qualified_class(name)
                     && typer.source().is_declaration_only_class(name)))
                 && !index.qualified_class_has_method(name, method)
+                // The reference's `source_declared_method?` runs before the
+                // RBS surface here too: a method the project's source declares
+                // on the class — a `def` in any file, an `attr_*` member,
+                // `define_method` or alias (upstream #2120 extended the macro
+                // spellings) — answers. Read over every file (`None`): the
+                // reference is silent on a sibling file's `def` as well.
+                && !typer.source().project_declares_method(None, name, method)
+                && !typer
+                    .source()
+                    .project_declares_method_through_ancestors(None, name, method)
             {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
