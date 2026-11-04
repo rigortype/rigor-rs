@@ -588,9 +588,9 @@ mod tests {
     fn erases_string_keyed_hash_shape_to_hash_bound() {
         // A non-symbol (string) key cannot be an RBS record key, so the shape
         // generalizes to `Hash[String, V]` (reference `hash_erasure`), while
-        // `type:` keeps the value-pinned `{ "k": 2 }`.
+        // `type:` keeps the value-pinned `{ "k" => 2 }` (#2449 spelling).
         let (_kind, ty, erased) = probe_full("i = { \"k\" => 2 }\n", 1, 5);
-        assert_eq!(ty, "{ \"k\": 2 }");
+        assert_eq!(ty, "{ \"k\" => 2 }");
         assert_eq!(erased, "Hash[String, 2]");
     }
 

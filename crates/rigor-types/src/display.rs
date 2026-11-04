@@ -67,16 +67,9 @@ pub fn describe_named(
                 let inner: Vec<String> = members
                     .iter()
                     .map(|m| {
-                        let key = named_key(&m.key);
-                        let key = if m.optional { format!("?{key}") } else { key };
-                        // Reference `key_separator`: Symbol/String keys keep the
-                        // colon form (`a: 1`, `"k": 2`); every other scalar key
-                        // uses the hashrocket (`1 => 2`, `nil => 0`).
-                        let sep = match m.key {
-                            ShapeKey::Sym(_) | ShapeKey::Str(_) => ":",
-                            _ => " =>",
-                        };
-                        format!("{key}{sep} {}", describe_named(i, m.value, resolve))
+                        let opt = if m.optional { "?" } else { "" };
+                        let key = named_key_prefix(&m.key);
+                        format!("{opt}{key} {}", describe_named(i, m.value, resolve))
                     })
                     .collect();
                 format!("{{ {} }}", inner.join(", "))
@@ -559,16 +552,38 @@ pub fn ruby_float_to_s(f: f64) -> String {
 
 /// A HashShape key as the reference `render_key` renders it: a symbol bare
 /// (keyword style `name:`), a string quoted.
-fn named_key(k: &ShapeKey) -> String {
+fn named_key_prefix(k: &ShapeKey) -> String {
+    // Reference `HashShape#key_prefix` (v0.4.7, #2449): an identifier
+    // Symbol (`BARE_RECORD_KEY = /\A[A-Za-z_][A-Za-z0-9_]*[?!]?\z/`) is a bare
+    // key with a colon (`a:`); any other Symbol is a quoted Symbol literal with
+    // a fat arrow (`:"a-b" =>`); every other key, a String included, is its
+    // `inspect` literal with a fat arrow (`"k" =>`, `1 =>`, `nil =>`).
     match k {
-        ShapeKey::Sym(s) => s.clone(),
-        ShapeKey::Str(s) => ruby_inspect_dq(s),
-        ShapeKey::Int(v) => v.to_string(),
-        ShapeKey::Float(bits) => named_float(f64::from_bits(*bits)),
-        ShapeKey::Bool(b) => b.to_string(),
-        ShapeKey::Nil => "nil".to_string(),
-        ShapeKey::Other => "_".to_string(),
+        ShapeKey::Sym(s) if is_bare_record_key(s) => format!("{s}:"),
+        ShapeKey::Sym(s) => format!(":{} =>", ruby_inspect_dq(s)),
+        ShapeKey::Str(s) => format!("{} =>", ruby_inspect_dq(s)),
+        ShapeKey::Int(v) => format!("{v} =>"),
+        ShapeKey::Float(bits) => format!("{} =>", named_float(f64::from_bits(*bits))),
+        ShapeKey::Bool(b) => format!("{b} =>"),
+        ShapeKey::Nil => "nil =>".to_string(),
+        ShapeKey::Other => "_ =>".to_string(),
     }
+}
+
+/// Reference `HashShape::BARE_RECORD_KEY`.
+fn is_bare_record_key(s: &str) -> bool {
+    let b = s.as_bytes();
+    let Some((&first, rest)) = b.split_first() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == b'_') {
+        return false;
+    }
+    let rest = match rest.split_last() {
+        Some((&last, init)) if last == b'?' || last == b'!' => init,
+        _ => rest,
+    };
+    rest.iter().all(|&c| c.is_ascii_alphanumeric() || c == b'_')
 }
 
 /// An `IntegerRange` as the reference renders it: a named alias for the five
@@ -990,8 +1005,10 @@ mod named_tests {
 
     #[test]
     fn hash_shape_scalar_keys_use_hashrocket() {
-        // Symbol / String keys keep the colon form; Integer / Float / true /
-        // false / nil keys render with the hashrocket (reference `key_separator`).
+        // An identifier Symbol keeps the colon form; a String or any other
+        // scalar key renders its literal with the hashrocket, and a
+        // non-identifier Symbol is a quoted Symbol literal (reference
+        // `key_prefix`, #2449).
         let mut i = Interner::new();
         let (one, two, three) = (i.int(1), i.int(2), i.int(3));
         let sym = i.intern(Type::Constant(Scalar::Sym("v".to_string())));
@@ -1006,10 +1023,12 @@ mod named_tests {
             },
             ShapeMember { key: ShapeKey::Bool(true), value: one, optional: false },
             ShapeMember { key: ShapeKey::Nil, value: two, optional: false },
+            ShapeMember { key: ShapeKey::Sym("a-b".to_string()), value: one, optional: true },
+            ShapeMember { key: ShapeKey::Sym("ok?".to_string()), value: one, optional: false },
         ]));
         assert_eq!(
             describe_named(&i, shape, &resolver),
-            "{ a: 1, \"k\": 2, 3 => 3, 1.5 => :v, true => 1, nil => 2 }"
+            "{ a: 1, \"k\" => 2, 3 => 3, 1.5 => :v, true => 1, nil => 2, ?:\"a-b\" => 1, ok?: 1 }"
         );
     }
 }
