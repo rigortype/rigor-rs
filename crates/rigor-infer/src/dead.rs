@@ -1419,3 +1419,54 @@ impl<'i> Typer<'i> {
         }
     }
 }
+
+impl<'i> Typer<'i> {
+    /// rigor-rs#482 — the arm hulls the reference elides but the port's
+    /// syntax fold keeps live: an `if`/`unless`/ternary whose predicate the
+    /// flow snapshot ([`Typer::always_truthy_snapshots`]) types as a
+    /// `Type::Constant` while [`Typer::dead_positions`] records no folded arm
+    /// for it (`h = {format: "text"}; if h[:format] == "json"`, `a = [1]; if
+    /// a.empty?`).
+    ///
+    /// The reference never evaluates such an arm (`live_branch_for_if` on
+    /// `branch_certainty`): its nodes read the predicate's edge scope, so the
+    /// arm's own writes are invisible even to reads inside it and the
+    /// predicate's subjects may narrow. The port evaluates it as live, so a
+    /// row inside it can fire where the reference is silent (`z = nil;
+    /// z.upcase`, `k = 1; puts if k == 2`). The rules layer declines every row
+    /// inside these hulls — a decline only, so the port's liveness (and with
+    /// it every row outside the arm) is unchanged (#442).
+    ///
+    /// A snapshot is a strict under-approximation of the reference's folder,
+    /// so over-matching here only withholds rows the reference may also
+    /// emit (a coverage loss, never a false positive).
+    pub fn typed_only_dead_arms(
+        &self,
+        ast: &LoweredAst,
+        snapshots: &std::collections::HashMap<NodeId, rigor_types::TypeId>,
+        interner: &rigor_types::Interner,
+    ) -> Vec<Span> {
+        if snapshots.is_empty() {
+            return Vec::new();
+        }
+        let dead = self.dead_positions(ast, &mut Vec::new());
+        let mut out = Vec::new();
+        for (id, n) in ast.iter() {
+            let Node::If { then_body, else_body, is_unless, .. } = n else {
+                continue;
+            };
+            let Some(&ty) = snapshots.get(&id) else { continue };
+            let truthy = match interner.get(ty) {
+                rigor_types::Type::Constant(Scalar::Nil | Scalar::Bool(false)) => false,
+                rigor_types::Type::Constant(_) => true,
+                _ => continue,
+            };
+            let dead_body = if truthy != *is_unless { else_body } else { then_body };
+            let Some(hull) = body_hull(ast, dead_body) else { continue };
+            if !dead.arm_dead(Some(hull)) {
+                out.push(hull);
+            }
+        }
+        out
+    }
+}
