@@ -84,6 +84,13 @@ impl SourceIndex {
         self.defined_method_names.contains(method)
     }
 
+    /// Upstream v0.4.6 (#1817 / #2183) — whether some project definition of
+    /// `method` may run a block it receives under another `self` (the
+    /// reference's `project_may_rebind?`). See [`Self::rebind_names`].
+    pub fn block_callee_may_rebind(&self, method: &str) -> bool {
+        self.rebind_names.contains(method)
+    }
+
     /// Register a name in the id registry (idempotent), returning nothing.
     pub(crate) fn register(&mut self, name: &str) {
         if !self.name_to_id.contains_key(name) {

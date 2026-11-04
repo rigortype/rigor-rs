@@ -373,6 +373,32 @@ impl SourceIndex {
             );
         }
 
+        // Upstream v0.4.6 (#1817 / #2183): the rebinding-callee census,
+        // joined project-wide — a slot two files (or two arms) define is one
+        // the def tables cannot read, so the count is cross-file.
+        {
+            let mut slots: HashMap<(String, String, bool), u32> = HashMap::new();
+            for (_, ast) in files {
+                let facts = &ast.ancestry_facts().rebind;
+                for d in &facts.defs {
+                    match &d.slot {
+                        Some((owner, side)) if !d.escapes => {
+                            *slots.entry((d.name.clone(), owner.clone(), *side)).or_default() += 1;
+                        }
+                        _ => {
+                            idx.rebind_names.insert(d.name.clone());
+                        }
+                    }
+                }
+                idx.rebind_names.extend(facts.bodiless.iter().cloned());
+            }
+            for ((name, _, _), count) in slots {
+                if count > 1 {
+                    idx.rebind_names.insert(name);
+                }
+            }
+        }
+
         // Passes 1c / 1d / 1e + stage 2b's bare-name set: unions — the two
         // def-attribution halves need the COMPLETE project census before the
         // `subtract_def_methods` barrier, so the union collects both tables

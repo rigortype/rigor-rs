@@ -112,6 +112,11 @@ pub struct AncestryFacts {
     /// Upstream v0.4.5 (#2086 / issue #1722) — the reference's
     /// `LexicalMethodSites` singleton-local table for this file.
     pub singleton_locals: super::singleton_locals::SingletonLocals,
+    /// Upstream v0.4.6 (#1817 / #2183) — this file's block sites and
+    /// definition census for `call.unresolved-toplevel`'s rebinding-block
+    /// decline ([`super::rebind_sites`]). Carried here so the AST keeps one
+    /// boxed side table.
+    pub rebind: super::rebind_sites::RebindFacts,
 }
 
 /// `RequiredFeatures::VENDORED_DIRS`' keys: the features whose vendored gem

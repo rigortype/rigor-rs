@@ -626,6 +626,15 @@ pub struct SourceIndex {
     /// `self` ancestry buys nothing for names this rare. Read only to DECLINE
     /// (keep the pre-proof answer), never to witness.
     defined_method_names: HashSet<String>,
+    /// Upstream v0.4.6 (#1817 / #2183 / #2184) — every method name some
+    /// project definition may run a block under another `self` through: the
+    /// reference's `RebindingBlockCallees.project_may_rebind?`, read BY NAME
+    /// across every owner and side. A name is here when a `def` of it hands
+    /// its block on (`escapes?`), when a `def` of it sits where the def
+    /// tables cannot hold it, when two `def`s share one slot (sibling files,
+    /// `if` arms), or when a bodiless macro defines it. Read only to DECLINE
+    /// `call.unresolved-toplevel`.
+    rebind_names: HashSet<String>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
