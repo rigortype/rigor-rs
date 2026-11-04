@@ -519,7 +519,7 @@ mod tests {
 
     // v0.4.5 (#1985/#2000), oracle-probed: `all`, a bare unknown or plugin
     // rule, an unknown `plugin_loader.` row, an unconfigured `plugin.` id and
-    // a typo under a built-in family warn; run-level rows, families, aliases,
+    // a typo under a built-in family warn; run-level rows, families,
     // severity-only ids and a configured plugin's qualified id stay silent.
     #[test]
     fn unreachable_override_keys_warn() {
@@ -555,6 +555,11 @@ mod tests {
                     .to_string(),
                 "severity_overrides: \"call.nope\" is not a recognized rule id; the override has \
                  no effect"
+                    .to_string(),
+                // v0.4.6 (#2005 / #2223): a legacy alias key warns too.
+                "severity_overrides: \"undefined-method\" is a legacy alias of \
+                 `call.undefined-method`; the override has no effect, so write \
+                 `call.undefined-method`"
                     .to_string(),
             ]
         );

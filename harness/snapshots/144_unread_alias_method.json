@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/144_unread_alias_method.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `upcase' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    }
+  ]
+}

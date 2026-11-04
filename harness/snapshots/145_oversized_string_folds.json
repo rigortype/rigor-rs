@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/145_oversized_string_folds.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 16,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `zzz' for literal-string"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 18,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `zzz' for literal-string"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `zzz' for \"ababab\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `zzz' for \"00001\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `zzz' for \"  a  \""
+    }
+  ]
+}

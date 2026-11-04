@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/143_override_visibility_replaced.rb",
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 35,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `x' reduced from public to private (overrides Parent#x); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 39,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `x' reduced from public to private (overrides Parent#x); breaks substitutability"
+    }
+  ]
+}
