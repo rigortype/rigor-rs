@@ -969,8 +969,8 @@ impl SourceIndex {
     /// (an unrecordable spelling, e.g. `IO.singleton_class.send(:define_method,
     /// …)`, which silences `File.zzz`) outside `Object` / `Kernel` /
     /// `BasicObject`, its chain was cut, or an extended module defines the
-    /// name, macro-names it, or is open. Every extended module's include
-    /// closure is not read past the cut test: the reference reads level 0.
+    /// name, macro-names it, or is open, or a module of its include/prepend
+    /// closure (level 0 of the reference's singleton chain) may answer.
     /// A pure SILENCER.
     pub fn core_singleton_mixin_may_answer(&self, core: &CoreIndex, class_name: &str, method: &str) -> bool {
         rbs_ancestors(core, class_name)
@@ -983,6 +983,15 @@ impl SourceIndex {
                     return true;
                 }
                 raws.iter().filter(|r| *r != MIXIN_WILDCARD).any(|raw| {
+                    // v0.4.6 review: level 0 of the reference's singleton
+                    // chain holds the extended module's own include/prepend
+                    // closure too (`module Ext; include Inner`), read as the
+                    // instance-side closure is. A union, so a superset.
+                    if let Some(q) = self.resolve_override_ancestor(n, raw) {
+                        if &q != n && self.mixin_closure_may_answer(core, &q, method, open, false) {
+                            return true;
+                        }
+                    }
                     match self.resolve_override_ancestor(n, raw) {
                         Some(q) if self.known_user(&q) => {
                             if &q == n {
