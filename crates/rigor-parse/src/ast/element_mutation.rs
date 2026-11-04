@@ -317,7 +317,7 @@ impl<'pr> Visit<'pr> for Walk {
             if let Some(read) = element_read_root(node.receiver()) {
                 let name = constant_string(read.name().as_slice());
                 let local = read.depth() > 0 || self.closures == 0;
-                let untyped_param = read.depth() as u32 == self.closures && self.params.contains(&name);
+                let untyped_param = read.depth() == self.closures && self.params.contains(&name);
                 if local && !untyped_param {
                     self.out.push((span_of(&node.as_node()), vec![name]));
                 }
