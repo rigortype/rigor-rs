@@ -15,8 +15,20 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.1`** (2026-10-08) |
-| Commit | `8a5d6e2c` |
+| **Pinned ref** | **`v0.4.2`** (2026-10-11) |
+| Commit | `3d29b126` |
+
+> **`v0.4.1 → v0.4.2` (2026-11-04): 498 commits, step three.** `core_overlay/`
+> gained 13 unconditional Ruby 4.1 files, and the effects `string` mutators went
+> 35 → 42 (bit ops). **`vendored_gem_sigs/prime/` is not vendored**: upstream
+> loads it only on `require "prime"`, so the port mirrors that as a
+> require-gated decline (see `PROVENANCE.md`). The raw sweep was **9,334 FPs**,
+> all `call.unresolved-toplevel`, from two changes. Upstream stopped flagging
+> `main`'s private methods (`include`, `private`, …) (#1683). A top-level
+> `include` of an unresolvable module also silences every bare top-level call
+> project-wide (#1706). **When MATCHED collapses (concurrent-ruby 5,699 → 10),
+> check that every lost row is a reference retraction before trusting a
+> 0-FP sweep.** See the [note](docs/notes/20261104-repin-v042.md).
 
 > **`v0.4.0 → v0.4.1` (2026-11-04): 439 commits, step two of the walk to
 > `v0.4.7`.** No vendored surface moved. The raw bump measured 0 fixture FPs
