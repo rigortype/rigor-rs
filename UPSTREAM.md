@@ -15,8 +15,15 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.6`** (2026-10-23) |
-| Commit | `25e63773` |
+| **Pinned ref** | **`v0.4.7`** (2026-11-03) |
+| Commit | `f7595e28` |
+
+> **`v0.4.6 → v0.4.7` (2026-11-05): 909 commits, step eight (last).** Re-vendored
+> `vendored_gem_sigs/{bundler,rubygems}` and the ActiveSupport plugin sig. The raw bump
+> left 4 fixture FPs and 6 sweep FPs (`Regexp.last_match` in `scan`/`gsub` blocks, #2468;
+> a callee-mutated hash, ADR-127). Investigators found 11 more families. All were ported,
+> with three implementers working in parallel, to 0 FP. See the
+> [note](docs/notes/20261105-repin-v047.md).
 
 > **`v0.4.5 → v0.4.6` (2026-11-05): 459 commits, step seven.** Nothing vendored
 > moved. The raw bump left 1 fixture FP (#2264) and 179,407 sweep FPs: mail and

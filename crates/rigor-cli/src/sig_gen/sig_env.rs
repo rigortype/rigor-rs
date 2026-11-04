@@ -108,6 +108,8 @@ struct RawRef {
 /// The sig-gen-local FQN-keyed declaration env.
 pub struct SigEnv {
     decls: HashMap<String, Decl>,
+    /// Declared class type parameters (core/stdlib, then these dirs).
+    generics: super::generics::Generics,
 }
 
 impl SigEnv {
@@ -158,7 +160,18 @@ impl SigEnv {
             }
         }
 
-        SigEnv { decls }
+        SigEnv { decls, generics: super::generics::Generics::build(signature_dirs) }
+    }
+
+    /// The loaded declarations' class type parameters.
+    pub fn generics(&self) -> &super::generics::Generics {
+        &self.generics
+    }
+
+    /// Whether the project's own RBS declares `class_fqn` (reference
+    /// `LayoutIndex#file_for` asked as a yes/no).
+    pub fn declares_class(&self, class_fqn: &str) -> bool {
+        self.decls.contains_key(class_fqn)
     }
 
     /// Whether `class_fqn` is present in the env (a project decl OR a core
@@ -168,6 +181,15 @@ impl SigEnv {
     /// `env.class_decls.key?`).
     fn class_present(&self, core: &CoreIndex, class_fqn: &str) -> bool {
         self.decls.contains_key(class_fqn) || core.knows_toplevel_class(class_fqn)
+    }
+
+    /// `Reflection.rbs_class_known?` for sig-gen's superclass checks: the
+    /// project's own RBS declares `class_fqn`, or the core/stdlib index does
+    /// (a genuine top-level declaration, or an unambiguous qualified one).
+    pub fn class_known(&self, core: &CoreIndex, class_fqn: &str) -> bool {
+        self.decls.contains_key(class_fqn)
+            || core.knows_toplevel_class(class_fqn)
+            || (class_fqn.contains("::") && core.knows_qualified_class(class_fqn))
     }
 
     /// Whether the project's own RBS declares `method` DIRECTLY on `class_fqn` —

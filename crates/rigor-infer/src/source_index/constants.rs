@@ -235,7 +235,8 @@ pub(crate) fn collect_literal_constants(
                     // second pass over the accumulator — the census is a pure
                     // function of the same file, so the result is identical and
                     // the merge stays untouched.
-                    let lit = const_lit_of(ast, *value)
+                    let lit = empty_seed_lit(ast, *value)
+                        .unwrap_or_else(|| const_lit_of(ast, *value))
                         .map(|l| widen_if_mutated(&qualified, l, mutated));
                     seen.insert(qualified.clone(), out.len());
                     out.push(HarvestedConstWrite {
@@ -248,6 +249,26 @@ pub(crate) fn collect_literal_constants(
             }
         }
         _ => {}
+    }
+}
+
+/// Upstream v0.4.7 (#2500, `ScopeIndexer::EmptySeed.erase`): a constant
+/// seeded with an empty literal is the accumulator idiom — filled later,
+/// often from another file — so the census records it without its
+/// emptiness: `[]` as `Array[untyped]`, `{}` as `Hash[untyped, untyped]`,
+/// `""` as `String`. `Some(None)` answers an empty seed, which is not
+/// harvested and declines: a bare `Array` / `Hash` nominal would render
+/// `for Array` where the reference says `for Array[Dynamic[top]]` (PR #481
+/// review, a matched row with a different message). `None` is no empty
+/// seed. A `.freeze`d empty literal is no seed (`EMPTY = [].freeze` keeps
+/// folding).
+pub(crate) fn empty_seed_lit(ast: &LoweredAst, node: NodeId) -> Option<Option<ConstLit>> {
+    match ast.get(node) {
+        Node::StringLit { value, .. } if value.is_empty() => Some(None),
+        Node::ArrayLit { elements, .. } if elements.is_empty() => Some(None),
+        Node::HashLit { elements, .. } if elements.is_empty() => Some(None),
+        // `+""` and `X.dup` of a seed: neither harvests as a literal today.
+        _ => None,
     }
 }
 

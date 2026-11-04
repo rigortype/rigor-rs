@@ -26,6 +26,7 @@ fn project_with_config_rooted(cfg: &Config, root: &Path) -> ProjectContext {
         stamp: SeverityStamp::from_config(cfg),
         exclude: ExcludeMatcher::from_config(root, cfg),
         pre_eval_declared: false,
+        core_root_invalid: false,
         overlay: None,
     }
 }
@@ -62,6 +63,16 @@ fn diagnostics_flag_a_typo() {
     assert_eq!(d.severity, Some(DiagnosticSeverity::ERROR));
     assert_eq!(d.code, Some(NumberOrString::String("call.undefined-method".to_string())));
     assert_eq!(d.range.start.line, 1); // 0-based: line 2 in the file
+}
+
+/// Upstream v0.4.7 (#2517): with a `core_root:` that cannot serve as a core
+/// the reference's language server publishes nothing (`check` exits 64), so
+/// every dispatch clears instead of analysing against the embedded core.
+#[test]
+fn invalid_core_root_publishes_nothing() {
+    let project = ProjectContext { core_root_invalid: true, ..project() };
+    let (diags, _, _) = compute_diagnostics(&project, &BufferPaths::default(), "x = \"hi\"\nx.lenght\n");
+    assert!(diags.is_empty());
 }
 
 #[test]
@@ -658,6 +669,7 @@ impl Harness {
                 stamp: SeverityStamp::from_config(&cfg),
                 exclude: ExcludeMatcher::from_config(&root, &cfg),
                 pre_eval_declared: false,
+                core_root_invalid: false,
                 overlay,
             });
             main_loop(&server_conn, &ctx, project, cfg, guard, config_broken).unwrap();
@@ -2210,6 +2222,7 @@ fn held_harvest_dispatch_index_equals_the_pre_slice_rebuild() {
         stamp: SeverityStamp::from_config(&Config::default()),
         exclude: ExcludeMatcher::from_config(&p.root, &Config::default()),
         pre_eval_declared: false,
+        core_root_invalid: false,
         overlay: None,
     };
     let ast = lower(&parse(SUB_RB.as_bytes()));
@@ -2384,6 +2397,7 @@ fn session_for(root: &Path, cfg: Config, budget: Duration) -> (ServerContext, Se
             stamp: SeverityStamp::from_config(&cfg),
             exclude: ExcludeMatcher::from_config(root, &cfg),
             pre_eval_declared: false,
+            core_root_invalid: false,
             overlay: Some(build.files),
         }),
         cfg,

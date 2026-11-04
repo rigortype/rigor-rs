@@ -839,21 +839,22 @@ fn blocked_position_attr_write_keeps_indexed_narrowing() {
 }
 
 /// rigor-rs#363 — `break`'s argument scope lands on `join_break_scopes`,
-/// a LOCALS-only union: a scope effect there (an indexed-record drop or
-/// a slot mutation) never propagates — not to the post-loop scope, not
-/// to a later in-body read, not even to a read inside the argument
-/// itself. `eval_for` joins break scopes the same way. The exception is
-/// the `CONTENT_MUTATORS` family (`CONTENT_ADDERS` — `[]=`/`store`/
-/// `replace`/`<<`/`push` … — plus the String-only mutators such as
-/// `upcase!`/`gsub!`): the reference joins their stored arguments into
-/// the continuation binding as element evidence, so a later element
-/// read declines even though the record survives — the port emulates
-/// that by keeping the drop. Every other row keeps `h[:a]` = `"s" | 1`.
+/// a LOCALS-only union. Re-measured at v0.4.7 (rigor-rs#480; 3-way probes
+/// port / v0.4.6 / v0.4.7, scratch `frag/brk/t00`–`t17`): only a compound
+/// ATTRIBUTE write (`break h.default ||= 0`) keeps its indexed-record drop
+/// off the post-loop scope, under `while` / `until` / `for` alike. A
+/// mutator CALL in the argument — a slot mutation (`h[:a] << 2`),
+/// `merge!` / `update` / `clear` / `delete` / `delete_if` / `keep_if` /
+/// `transform_values!`, and under `for` the `[]=` / `store` / `replace`
+/// adders and a nested block's `h[:a] = 9` — drops the record on both
+/// v0.4.6 and v0.4.7, so the post-loop read is silent there
+/// (`flow_writes::break_join_suppresses`).
 #[test]
 fn break_arg_attr_write_keeps_indexed_narrowing() {
     let prelude =
         "def c; rand(2).even?; end\ndef d; rand(2).odd?; end\nh = {a: 1}\nh[:a] ||= \"s\"\n";
-    // One `"s" | 1` diagnostic each — the post-loop read.
+    // One `"s" | 1` diagnostic each — the post-loop read. All [XXX]
+    // (port, v0.4.6 and v0.4.7 fire): t00–t04, t17.
     for tail in [
         // The issue rows: lexical while / until / for.
         "while c; break h.default ||= 0; end\n",
@@ -862,24 +863,6 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         // Nested under an arm still targets the loop.
         "while c; if d; break h.default ||= 0; end; end\n",
         "while c; case d; when 1; break h.default ||= 0; end; end\n",
-        // A slot mutation joins the same way.
-        "while c; break (h[:a] << 2); end\n",
-        // Non-content-adder mutators join the same way: their drops are
-        // scope effects the locals-only union never carries.
-        "while c; break h.merge!({b: 2}); end\n",
-        "while c; break h.update({b: 2}); end\n",
-        "while c; break h.clear; end\n",
-        "while c; break h.delete(:a); end\n",
-        "while c; break h.delete_if { |k, _| k == :a }; end\n",
-        "while c; break h.keep_if { |k, _| k == :a }; end\n",
-        "while c; break h.transform_values! { |v| v }; end\n",
-        // `for` runs `join_break_scopes` with no `loop_content_writeback`
-        // — even the adder family keeps its record, and so does a
-        // content write nested in a block inside the argument.
-        "for i in [1]; break h[:a] = 9; end\n",
-        "for i in [1]; break h.store(:a, 9); end\n",
-        "for i in [1]; break h.replace({b: 2}); end\n",
-        "for i in [1]; break ([1].each { h[:a] = 9 }); end\n",
         // `break` inside a block targets the yielding call, whose scope
         // the flat env models as dropped — but the block body's own
         // write is a closure mutation, so the record survives anyway.
@@ -895,6 +878,32 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
             errors.len(),
             1,
             "expected the post-loop read to keep `\"s\" | 1` for {tail:?}, got {diags:?}"
+        );
+    }
+    // Retracted: a mutator call in the argument drops the record. Both
+    // references are silent on every row (t05–t16; before v0.4.7 the port
+    // fired on t06–t16, an FP).
+    for tail in [
+        "while c; break (h[:a] << 2); end\n",
+        "while c; break h.merge!({b: 2}); end\n",
+        "while c; break h.update({b: 2}); end\n",
+        "while c; break h.clear; end\n",
+        "while c; break h.delete(:a); end\n",
+        "while c; break h.delete_if { |k, _| k == :a }; end\n",
+        "while c; break h.keep_if { |k, _| k == :a }; end\n",
+        "while c; break h.transform_values! { |v| v }; end\n",
+        "for i in [1]; break h[:a] = 9; end\n",
+        "for i in [1]; break h.store(:a, 9); end\n",
+        "for i in [1]; break h.replace({b: 2}); end\n",
+        "for i in [1]; break ([1].each { h[:a] = 9 }); end\n",
+    ] {
+        let src = format!("{prelude}{tail}h[:a].frobnicate\n");
+        let diags = check(src.as_bytes());
+        assert!(
+            !diags
+                .iter()
+                .any(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message.contains("\"s\" | 1")),
+            "expected the mutator call to drop the record for {tail:?}, got {diags:?}"
         );
     }
     // The suppression is positional, not post-loop only: a read after

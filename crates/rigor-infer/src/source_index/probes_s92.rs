@@ -777,8 +777,9 @@ fn legacy_collect_literal_constants(
         }
         Node::ConstantWrite { name, value, .. } => {
             let qualified = qualify(prefix, name);
-            let lit =
-                const_lit_of(ast, *value).map(|l| widen_if_mutated(&qualified, l, mutated));
+            let lit = super::constants::empty_seed_lit(ast, *value)
+                .unwrap_or_else(|| const_lit_of(ast, *value))
+                .map(|l| widen_if_mutated(&qualified, l, mutated));
             match first.entry(qualified) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     multi.insert(e.key().clone());

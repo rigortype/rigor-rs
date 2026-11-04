@@ -571,6 +571,30 @@ pub fn analyze_with_source_and_folder(
                 .is_some_and(|m| source.object_mixin_may_define(index, m, true))
     });
 
+    // Upstream v0.4.7 (ADR-127), PR #481 review: the port's callee floor
+    // over-approximates the reference's, so a local it floors may keep a
+    // precise binding on the reference. A value-dependent row whose
+    // expression reads such a local (or one derived from it) could carry a
+    // different receiver or fold than the reference's, so it declines
+    // (`rigor_infer::floor_tainted_reads`).
+    let tainted = rigor_infer::floor_tainted_reads(ast, source);
+    if !tainted.is_empty() {
+        out.retain(|d| {
+            use rigor_infer::TaintAnchor;
+            let anchor = match d.rule_id {
+                crate::CALL_UNDEFINED_METHOD
+                | crate::CALL_WRONG_ARITY
+                | crate::CALL_POSSIBLE_NIL_RECEIVER => TaintAnchor::Receiver,
+                crate::CALL_ARGUMENT_TYPE_MISMATCH | crate::CALL_RAISE_NON_EXCEPTION => {
+                    TaintAnchor::ReceiverAndArguments
+                }
+                crate::FLOW_ALWAYS_TRUTHY_CONDITION => TaintAnchor::Expression,
+                _ => return true,
+            };
+            !rigor_infer::diagnostic_reads_floor_taint(ast, d.start_offset, anchor, &tainted)
+        });
+    }
+
     out
 }
 

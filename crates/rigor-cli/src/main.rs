@@ -42,6 +42,7 @@ mod doctor;
 mod effects;
 mod explain;
 mod init;
+mod json_document;
 mod lsp;
 mod mcp;
 mod outline;
@@ -59,44 +60,47 @@ const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
     "mcp", "skill", "docs", "init", "doctor", "version", "show-bleedingedge",
-    "effects", "unused", "describe", "playground", "upgrade",
+    "effects", "unused", "describe", "playground", "upgrade", "lens",
 ];
 
-/// The reference's `CLI#help` heredoc (`lib/rigor/cli.rb`), verbatim — the
+/// The reference's `Catalogue.help_text` (v0.4.7 `lib/rigor/cli/catalogue.rb`), verbatim — the
 /// text `rigor`, `rigor help`, `rigor -h` and `rigor --help` print to stdout
 /// and the tail of the `Unknown command:` stderr surface.
 const TOP_HELP: &str = "\
 Usage: rigor <command> [options]
 
 Commands:
-  check      Analyze Ruby source files
-  init       Create a starter .rigor.yml
-  annotate   Print FILE with each line's last-expression type
-  type-of    Print inferred types at FILE:LINE[:COL] positions
-  trace      Replay how the engine typed FILE as a terminal animation
-  type-scan  Report Scope#type_of coverage across PATHs
-  effects    Report each method's effect labels, and the committed effect snapshot
-             (opt-in; effects update/check/diff/explain)
-  explain    Print the description of one or all CheckRules
-  diff       Compare current diagnostics to a saved baseline JSON
-  baseline   Manage the baseline file (baseline generate/regenerate/dump/drift/prune)
-  sig-gen    Emit RBS skeletons inferred from .rb sources
-  lsp        Run the Rigor Language Server (LSP) over stdio
-  mcp        Run the Rigor MCP server over stdio
-  triage     Summarise diagnostics: distribution, hotspots, hints
-  coverage   Report type-precision coverage (precise vs Dynamic ratio)
-  unused     Report unreferenced classes, modules and constants as removal candidates
-  plugins    Report activation status of every configured plugin
-  plugin     Browse bundled plugin source as worked examples (list/path/print/root)
-  playground Start the browser playground (requires rigor-playground gem)
-  describe   Recommend the next skill for this project (alias for `skill describe`)
-  skill      Recommend the next skill + list/print bundled Agent Skills (skill describe, skill <name>)
-  docs       Print the bundled docs offline (docs <name>, docs --list)
+  check              Analyze Ruby source files
+  init               Create a starter .rigor.yml
+  annotate           Print FILE with each line's last-expression type
+  type-of            Print inferred types at FILE:LINE[:COL] positions
+  lens               Map a file's declarations with their types and provenance (experimental)
+  trace              Replay how the engine typed FILE as a terminal animation
+  type-scan          Report Scope#type_of coverage across PATHs
+  effects            Report each method's effect labels, and the committed effect snapshot (opt-in; effects update/check/diff/explain)
+  explain            Print the description of one or all CheckRules
+  diff               Compare current diagnostics to a saved `rigor check --format=json` result
+  baseline           Manage the baseline file (baseline generate/regenerate/dump/drift/prune)
+  sig-gen            Emit RBS skeletons inferred from .rb sources
+  lsp                Run the Rigor Language Server (LSP) over stdio
+  mcp                Run the Rigor MCP server over stdio
+  triage             Summarise diagnostics: distribution, hotspots, hints
+  coverage           Report type-precision coverage (precise vs Dynamic ratio)
+  unused             Report unreferenced classes, modules and constants as removal candidates
+  plugins            Report activation status of every configured plugin
+  plugin             Browse bundled plugin source as worked examples (plugin <name>, plugin --list)
+  playground         Start the browser playground (requires rigor-playground gem)
+  describe           Recommend the next skill for this project (alias for `skill describe`)
+  skill              Recommend the next skill + list/print bundled Agent Skills (skill describe, skill <name>)
+  docs               Print the bundled docs offline (docs <name>, docs --list)
   show-bleedingedge  Show the bleeding-edge overlay + what your config adopts
-  doctor     Classify setup problems vs clean run with routed next actions
-  upgrade    Migration command skeleton (queued)
-  version    Print the Rigor version
-  help       Print this help
+  doctor             Classify setup problems vs clean run with routed next actions
+  upgrade            Migration command skeleton (queued)
+  help               Print this help, or a command's help (help <command>, help --format=json)
+  version            Print the Rigor version
+
+Run `rigor help <command>` (or `rigor <command> --help`) for a command's options.
+Run `rigor describe` for the next step on this project, or `rigor help --format=json` for the full surface.
 ";
 
 fn main() -> ExitCode {
@@ -113,18 +117,31 @@ fn main() -> ExitCode {
 /// The command dispatch, on the thread [`main`] starts.
 fn run_command() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    dispatch(&args)
+}
+
+/// `CLI#run` + `CLI#dispatch` over the full argv (`help <command>` re-enters
+/// with `[command, "--help"]`).
+fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         // `CLI#run`: no command, `help`, `-h`, `--help` → the command list on
         // STDOUT, exit 0.
-        None | Some("help" | "-h" | "--help") => {
+        None | Some("-h" | "--help") => {
             print!("{TOP_HELP}");
             ExitCode::SUCCESS
         }
+        Some("help") => cmd_help(&args[1..]),
         // `version` / `-v` / `--version` — print `rigor <version>` and exit 0
-        // (`rigor #{Rigor::VERSION}` upstream). `-V` is the conventional Rust
-        // short flag; accepted alongside the reference's `-v`.
+        // (`rigor #{Rigor::VERSION}` upstream); `-h`/`--help` anywhere after
+        // it prints `Usage: rigor version` instead (v0.4.7 `run_version`).
+        // `-V` is the conventional Rust short flag; accepted alongside the
+        // reference's `-v`.
         Some("version" | "--version" | "-v" | "-V") => {
-            println!("rigor {}", env!("CARGO_PKG_VERSION"));
+            if args[1..].iter().any(|a| a == "-h" || a == "--help") {
+                println!("Usage: rigor version");
+            } else {
+                println!("rigor {}", env!("CARGO_PKG_VERSION"));
+            }
             ExitCode::SUCCESS
         }
         Some("check") => cmd_check(&args[1..]),
@@ -156,6 +173,11 @@ fn run_command() -> ExitCode {
         // `run_upgrade`: ignores argv entirely — prints the queued notice and
         // exits 0 upstream.
         Some("upgrade") => {
+            // v0.4.7 `UpgradeCommand::USAGE` on `-h`/`--help` anywhere.
+            if args[1..].iter().any(|a| a == "-h" || a == "--help") {
+                println!("Usage: rigor upgrade [options]");
+                return ExitCode::SUCCESS;
+            }
             println!("rigor upgrade: No migration target available yet (ADR-50 WD7, queued).");
             println!("Current version: {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -181,6 +203,95 @@ fn run_command() -> ExitCode {
         // text on STDERR, exit 64 (`EXIT_USAGE`).
         Some(other) => {
             eprintln!("Unknown command: {other}");
+            // v0.4.7 (#2512): the nearest catalogue name, when there is one.
+            if let Some(nearest) = optparse::spell_checker_correct(CATALOGUE_NAMES, other).first() {
+                eprintln!("Did you mean `rigor {nearest}`?");
+            }
+            eprint!("{TOP_HELP}");
+            ExitCode::from(64)
+        }
+    }
+}
+
+/// `Catalogue.names` — every dispatched command in `rigor help` order
+/// (`SUMMARIES.keys - BUILTINS + BUILTINS`), the `Did you mean` dictionary.
+const CATALOGUE_NAMES: &[&str] = &[
+    "check", "init", "annotate", "type-of", "lens", "trace", "type-scan", "effects", "explain",
+    "diff", "baseline", "sig-gen", "lsp", "mcp", "triage", "coverage", "unused", "plugins",
+    "plugin", "playground", "describe", "skill", "docs", "show-bleedingedge", "doctor",
+    "upgrade", "help", "version",
+];
+
+const HELP_PARSER: optparse::OptParser = optparse::OptParser::new(
+    "Usage: rigor help [--format=text|json] [<command>]",
+    &[optparse::Switch::new(
+        "format",
+        &[("format", false)],
+        optparse::ArgStyle::Required,
+        optparse::ValueKind::Exact(&["text", "json"]),
+        "--format",
+        "=FORMAT",
+        &["Output format: text (default) or json"],
+    )],
+);
+
+/// v0.4.7 `CLI#run_help`: `rigor help [--format=text|json] [<command>]`.
+/// `-h`/`--help` anywhere prints the command list; the options parse with
+/// `order!` (the asked-about command's flags are never parsed here);
+/// `help <command>` behaves as `rigor <command> --help`; a second word, or an
+/// unknown command, is a usage error (exit 64).
+fn cmd_help(args: &[String]) -> ExitCode {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{TOP_HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let items = match HELP_PARSER.parse_order(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut json = false;
+    let mut topics: Vec<&str> = Vec::new();
+    for item in &items {
+        match item {
+            Item::Opt { key: "format", value: Some(v), .. } => json = v.as_str() == "json",
+            Item::Positional(p) => topics.push(p.as_str()),
+            _ => {}
+        }
+    }
+    if json {
+        if !topics.is_empty() {
+            eprintln!("rigor help --format=json takes no command; it prints every command");
+            return ExitCode::from(64);
+        }
+        // The `Catalogue.document` is built by reading every command's
+        // OptionParser; the port does not carry it.
+        eprintln!("rigor: help --format=json is not supported by rigor-rs");
+        return ExitCode::from(64);
+    }
+    let Some((&topic, rest)) = topics.split_first() else {
+        print!("{TOP_HELP}");
+        return ExitCode::SUCCESS;
+    };
+    let extra: Vec<&str> = rest.iter().copied().filter(|w| !w.starts_with('-')).collect();
+    if !extra.is_empty() {
+        eprintln!("rigor help takes one command, got: {topic} {}", extra.join(" "));
+        return ExitCode::from(64);
+    }
+    match topic {
+        "help" => {
+            print!("{}", HELP_PARSER.help());
+            ExitCode::SUCCESS
+        }
+        "version" => {
+            println!("Usage: rigor version");
+            ExitCode::SUCCESS
+        }
+        t if CATALOGUE_NAMES.contains(&t) => {
+            let argv = vec![t.to_string(), "--help".to_string()];
+            dispatch(&argv)
+        }
+        other => {
+            eprintln!("Unknown command: {other}");
             eprint!("{TOP_HELP}");
             ExitCode::from(64)
         }
@@ -199,12 +310,12 @@ fn run_command() -> ExitCode {
 /// parsing (`--ruby=MODE` and `--ruby MODE`).
 const CHECK_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
-    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text, json, sarif, github, gitlab, checkstyle, junit, teamcity"]),
+    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json", "sarif", "github", "gitlab", "checkstyle", "junit", "teamcity"]), "--format", "=FORMAT", &["Output format: text, json, sarif, github, gitlab, checkstyle, junit, teamcity"]),
     optparse::Switch::new("explain", &[("explain", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--explain", "", &["Surface fail-soft fallback events as :info diagnostics"]),
     optparse::Switch::new("cache-stats", &[("cache-stats", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--cache-stats", "", &["Print on-disk cache inventory at end of run"]),
     optparse::Switch::new("coverage", &[("coverage", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--coverage", "", &["Add a type-precision coverage block (an extra precision pass over the analyzed files)"]),
     optparse::Switch::new("clear-cache", &[("clear-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--clear-cache", "", &["Remove the .rigor/cache directory before running"]),
-    optparse::Switch::new("no-cache", &[("no-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-cache", "", &["Disable the persistent cache for this run"]),
+    optparse::Switch::new("no-cache", &[("no-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-cache", "", &["Disable the persistent cache for this run (with --incremental: no snapshot is read or written)"]),
     optparse::Switch::new("stats", &[("stats", false), ("no-stats", true)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--[no-]stats", "", &["Print run summary (files, classes, memory, wall time) to stderr (default: on)"]),
     optparse::Switch::new("workers", &[("workers", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--workers", "=N", &["Dispatch per-file analysis across N Ractor workers (default: 0; sequential)"]),
     optparse::Switch::new("tmp-file", &[("tmp-file", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--tmp-file", "=PATH", &["Editor mode: read source bytes from PATH instead of --instead-of (paired)"]),
@@ -215,6 +326,7 @@ const CHECK_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("fail-on", &[("fail-on", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--fail-on", "=SEVERITY", &["exit non-zero on a diagnostic at or above SEVERITY: error (default), warning, or info"]),
     optparse::Switch::new("treat-all-as-inline-rbs", &[("treat-all-as-inline-rbs", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--treat-all-as-inline-rbs", "", &["force-load rigor-rbs-inline with require_magic_comment: false"]),
     optparse::Switch::new("verify-incremental", &[("verify-incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--verify-incremental", "", &["assert incremental analysis matches a full run, then exit"]),
+    optparse::Switch::new("verify-incremental-edits", &[("verify-incremental-edits", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--verify-incremental-edits", "=N", &["with --verify-incremental, also replay edits (empty, class/module skeleton, up to 2 one-statement drops) on N files"]),
     optparse::Switch::new("incremental", &[("incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--incremental", "", &["re-analyze only files changed since the last run (cross-process cache)"]),
     optparse::Switch::new("no-ci-detect", &[("no-ci-detect", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-ci-detect", "", &["do not auto-emit CI-native output when a CI environment is detected"]),
     optparse::Switch::new("bleeding-edge", &[("bleeding-edge", false)], optparse::ArgStyle::Optional, optparse::ValueKind::Raw, "--bleeding-edge", "=[LIST]", &["adopt the bleeding-edge overlay for this run (all features, or a comma-separated feature-id list)"]),
@@ -247,7 +359,7 @@ fn check_unsupported(flag: &str) -> ExitCode {
 const TRACE_PARSER: optparse::OptParser = optparse::OptParser::new(
     "Usage: rigor trace [options] FILE",
     &[
-        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (animation) or json (raw event stream)"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (animation) or json (raw event stream)"]),
         optparse::Switch::new("delay", &[("delay", false)], optparse::ArgStyle::Required, optparse::ValueKind::Float, "--delay", "=SECONDS", &["Autoplay with SECONDS between frames (default: step on key press)"]),
         optparse::Switch::new("line", &[("line", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--line", "=N", &["Only replay events whose source range starts on line N"]),
         optparse::Switch::new("verbose", &[("verbose", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--verbose", "", &["Include every expression enter/result frame"]),
@@ -258,7 +370,7 @@ const TRACE_PARSER: optparse::OptParser = optparse::OptParser::new(
 const TYPE_SCAN_PARSER: optparse::OptParser = optparse::OptParser::new(
     "Usage: rigor type-scan [options] PATH...",
     &[
-        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text or json"]),
         optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
         optparse::Switch::new("limit", &[("limit", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--limit", "=N", &["Max example events to print (text only)"]),
         optparse::Switch::new("show-recognized", &[("show-recognized", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--show-recognized", "", &["Include classes with 0 unrecognized in the table"]),
@@ -270,7 +382,7 @@ const UNUSED_PARSER: optparse::OptParser = optparse::OptParser::new(
     "Usage: rigor unused [options] [paths]",
     &[
         optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
-        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (default) or json"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
         optparse::Switch::new("entry-point", &[("entry-point", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--entry-point", "=GLOB", &["Treat declarations in files matching GLOB as roots (repeatable)"]),
         optparse::Switch::new("limit", &[("limit", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--limit", "=N", &["Print at most N candidates (default: all)"]),
         optparse::Switch::new("incremental", &[("incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--incremental", "", &["(unsupported)"]),
@@ -315,24 +427,25 @@ fn cmd_unused(args: &[String]) -> ExitCode {
     ExitCode::from(2)
 }
 
-/// `PluginCommand::USAGE` — verbatim; `--help`/`help` print it on stdout.
-const PLUGIN_USAGE: &str = r#"Usage: rigor plugin <subcommand> [args]
+/// `PluginCommand::USAGE` (v0.4.7, ADR-126 WD4 grammar) — verbatim;
+/// `--help`/`help` print it on stdout.
+const PLUGIN_USAGE: &str = r#"Usage: rigor plugin [<name>] [--path <name>] [--list] [--root]
 
 Browse the plugins bundled in the rigortype toolchain (worked
 examples for authoring your own). For the activation status of
 the plugins in your .rigor.yml, use `rigor plugins` (plural).
 
-Subcommands:
-  list                  List bundled + example plugins (default)
-  path  <name>          Print the absolute directory path of <name>
-  print <name>          Print <name>'s main lib source, with a header
-  root                  Print the gem root + key subdirectories
+  rigor plugin                List bundled + example plugins
+  rigor plugin <name>         Print <name>'s main lib source, with a header
+  rigor plugin --path <name>  Print the absolute directory path of <name>
+  rigor plugin --list         List bundled + example plugins
+  rigor plugin --root         Print the gem root + key subdirectories
 
 Examples:
-  rigor plugin list
-  rigor plugin path  rigor-activerecord
-  rigor plugin print rigor-activesupport-core-ext
-  rigor plugin root
+  rigor plugin
+  rigor plugin rigor-activesupport-core-ext
+  rigor plugin --path rigor-activerecord
+  rigor plugin --root
 "#;
 
 /// `SkillCommand::USAGE` — verbatim; `--help`/`help` print it on stdout.
@@ -361,47 +474,99 @@ Examples:
   rigor skill describe --deep   (also: rigor describe --deep)
 "#;
 
-/// `rigor plugin` — deferred. `PluginCommand#run` is manual dispatch: argv[0]
-/// is always a subcommand (default `list`), so an unrecognised one is
-/// "Unknown subcommand: X" + USAGE on stderr, exit 64 — not an option error.
-/// `path`/`print` then shift argv[1] as the plugin *name* — dashed tokens
-/// included: a missing name is `usage_error` (exit 64), an unresolved one is
-/// `name_error` (exit 1). The resolved bodies stay deferred (no bundled
-/// plugin tree).
+/// `rigor plugin` (v0.4.7 `PluginCommand#run`) — deferred bodies, faithful
+/// grammar. `-h`/`--help` anywhere prints USAGE; the pre-ADR-126 verbs
+/// (`list`, `path <name>`, `print <name>`, `root`) print a deprecation notice
+/// on stderr and then behave as before; otherwise the flags `--path NAME`,
+/// `--list`, `--root` parse (a parse error is the message + USAGE, exit 64)
+/// and the positional slot is always a plugin name.
 fn cmd_plugin_deferred(args: &[String]) -> ExitCode {
-    let sub = args.first().map(String::as_str).unwrap_or("list");
-    match sub {
-        "list" | "root" => {
-            eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
-            ExitCode::from(2)
-        }
-        "path" | "print" => match args.get(1).map(String::as_str) {
-            // `usage_error` — the message names the verb, then USAGE.
+    const DEFERRED: &str = "rigor-rs: `plugin` is recognized but not yet implemented in this phase";
+    const PLUGIN_PARSER: optparse::OptParser = optparse::OptParser::new(
+        "Usage: rigor plugin [<name>] [--path <name>] [--list] [--root]",
+        &[
+            optparse::Switch::new("path", &[("path", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--path", " NAME", &["Print the absolute directory path of a plugin"]),
+            optparse::Switch::new("list", &[("list", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--list", "", &["List bundled + example plugins"]),
+            optparse::Switch::new("root", &[("root", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--root", "", &["Print the gem root + key subdirectories"]),
+        ],
+    );
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{PLUGIN_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    // `run_path` / `run_print` once the name slot is resolved.
+    let named = |verb: &str, name: Option<&str>| -> ExitCode {
+        match name {
             None => {
-                eprintln!("`{sub}` requires a plugin name");
+                eprintln!("`{verb}` requires a plugin name");
                 eprint!("{PLUGIN_USAGE}");
                 ExitCode::from(64)
             }
             Some(name) if plugin_name_known(name) => {
-                eprintln!("rigor-rs: `plugin` is recognized but not yet implemented in this phase");
+                eprintln!("{DEFERRED}");
                 ExitCode::from(2)
             }
-            // `name_error` — "Unknown plugin: X" + the list pointer.
+            // `name_error` — "Unknown plugin: X" + the list pointer, exit 1.
             Some(name) => {
                 eprintln!("Unknown plugin: {name}");
-                eprintln!("Run `rigor plugin list` to see the bundled plugins.");
+                eprintln!("Run `rigor plugin --list` to see the bundled plugins.");
                 ExitCode::from(1)
             }
-        },
-        "-h" | "--help" | "help" => {
-            print!("{PLUGIN_USAGE}");
-            ExitCode::SUCCESS
         }
-        other => {
-            eprintln!("Unknown subcommand: {other}");
-            eprint!("{PLUGIN_USAGE}");
-            ExitCode::from(64)
+    };
+    let verb = args.first().map(String::as_str);
+    if let Some(v @ ("list" | "path" | "print" | "root")) = verb {
+        let replacement = match v {
+            "list" => "rigor plugin --list",
+            "path" => "rigor plugin --path <name>",
+            "print" => "rigor plugin <name>",
+            _ => "rigor plugin --root",
+        };
+        eprintln!(
+            "rigor: `rigor plugin {v}` is deprecated and will be removed in the next minor release; \
+             use `{replacement}`."
+        );
+        return match v {
+            "path" | "print" => named(v, args.get(1).map(String::as_str)),
+            _ => {
+                eprintln!("{DEFERRED}");
+                ExitCode::from(2)
+            }
+        };
+    }
+    if verb == Some("help") {
+        print!("{PLUGIN_USAGE}");
+        return ExitCode::SUCCESS;
+    }
+    let items = match PLUGIN_PARSER.parse(args).items_or_exit_usage(PLUGIN_USAGE) {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut path: Option<String> = None;
+    let (mut list, mut root) = (false, false);
+    let mut names: Vec<String> = Vec::new();
+    for item in items {
+        match item {
+            Item::Positional(p) => names.push(p),
+            Item::Opt { key: "path", value, .. } => path = value.map(|v| v.as_str().to_string()),
+            Item::Opt { key: "list", .. } => list = true,
+            Item::Opt { key: "root", .. } => root = true,
+            Item::Opt { .. } => unreachable!("the switch table is closed"),
         }
+    }
+    if let Some(p) = path {
+        return named("path", Some(&p));
+    }
+    if root || list {
+        eprintln!("{DEFERRED}");
+        return ExitCode::from(2);
+    }
+    match names.first() {
+        None => {
+            eprintln!("{DEFERRED}");
+            ExitCode::from(2)
+        }
+        Some(name) => named("print", Some(name)),
     }
 }
 
@@ -419,6 +584,7 @@ fn plugin_name_known(name: &str) -> bool {
 /// `discover(PLUGINS_ROOT) + discover(EXAMPLES_ROOT)` at the pinned ref —
 /// production plugins first, then the tutorial examples.
 const BUNDLED_PLUGIN_NAMES: &[&str] = &[
+    "rigor-ac-library-rb",
     "rigor-actioncable",
     "rigor-actionmailer",
     "rigor-actionpack",
@@ -427,6 +593,7 @@ const BUNDLED_PLUGIN_NAMES: &[&str] = &[
     "rigor-activerecord",
     "rigor-activestorage",
     "rigor-activesupport-core-ext",
+    "rigor-alba",
     "rigor-devise",
     "rigor-dry-monads",
     "rigor-dry-schema",
@@ -457,6 +624,7 @@ const BUNDLED_PLUGIN_NAMES: &[&str] = &[
     "rigor-sinatra",
     "rigor-sorbet",
     "rigor-statesman",
+    "rigor-typelizer",
     "rigor-typescript-utility-types",
     "rigor-deprecations",
     "rigor-lisp-eval",
@@ -484,7 +652,9 @@ fn cmd_skill_deferred(args: &[String]) -> ExitCode {
             print!("{SKILL_USAGE}");
             ExitCode::SUCCESS
         }
-        Some("describe" | "--describe") => cmd_describe_args(&args[1..]),
+        Some("describe" | "--describe") => {
+            cmd_describe_args(&args[1..], "Usage: rigor skill describe [--deep]")
+        }
         Some(flag @ ("--full" | "--path" | "--print")) => {
             // `usage_error` — each flag names itself except `--print`, which
             // shares `run_print`'s positional-slot message.
@@ -554,13 +724,19 @@ const BUNDLED_SKILL_NAMES: &[&str] = &[
 /// `rigor describe` — `run_describe` upstream wraps `skill describe`: argv
 /// becomes `["describe", *argv]`.
 fn cmd_describe_deferred(args: &[String]) -> ExitCode {
-    cmd_describe_args(args)
+    cmd_describe_args(args, "Usage: rigor describe [--deep]")
 }
 
 /// `SkillCommand#run_describe` argument handling: `--deep` tokens are deleted,
 /// then any remaining argv is a usage error; an empty remainder is the
 /// (unported) describe run itself.
-fn cmd_describe_args(args: &[String]) -> ExitCode {
+fn cmd_describe_args(args: &[String], usage: &str) -> ExitCode {
+    // v0.4.7 `run_describe(usage)` / `print_describe_usage`: `-h`/`--help`
+    // anywhere prints the usage line, exit 0.
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{usage}");
+        return ExitCode::SUCCESS;
+    }
     let rest: Vec<&String> = args.iter().filter(|a| a.as_str() != "--deep").collect();
     if let Some(unknown) = rest.first() {
         eprintln!("unknown option for `describe`: {unknown}");
@@ -581,9 +757,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    // `--format` stays a raw string until output time — the reference stores
-    // it verbatim and only raises `invalid argument: unsupported format: X`
-    // inside `write_result`, AFTER the analysis ran.
+    // `--format` is validated at parse time (`Options.add_format`, #2502):
+    // only the exact members of the switch's list reach here.
     let mut format = String::from("text");
     let mut files: Vec<String> = Vec::new();
     let mut explicit_config: Option<String> = None;
@@ -648,7 +823,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 // Reference-only features the port cannot reproduce — rejected
                 // below, after the validations the reference runs first.
                 "explain" | "cache-stats" | "coverage" | "treat-all-as-inline-rbs"
-                | "verify-incremental" | "incremental" | "no-tolerated-effects" => {
+                | "verify-incremental" | "verify-incremental-edits" | "incremental"
+                | "no-tolerated-effects" => {
                     if unsupported.is_none() {
                         unsupported = Some(*key);
                     }
@@ -842,6 +1018,13 @@ fn cmd_check(args: &[String]) -> ExitCode {
             Vec::new(),
         ),
         None => {
+            // Upstream v0.4.7 (#2517): a `core_root:` that cannot serve as a
+            // core stops the run as a configuration error (`rigor: <msg>`,
+            // exit 64) instead of analysing against the embedded core.
+            if let Err(message) = cfg.validate_core_root() {
+                eprintln!("rigor: {message}");
+                return ExitCode::from(64);
+            }
             // Expand roots into their `**/*.rb` files and collect bad-path
             // errors, matching the reference's `expand_paths`:
             // directory-expanded entries matching `BUILTIN_EXCLUDES +
@@ -1415,10 +1598,12 @@ fn analyze_files(
     let effective_plugins = cfg.effective_plugins(root);
     // The rbs-collection gem dirs ride apart from `signature_paths:` so the
     // `conforms-to` scan can tell them apart (issue #129); every rule reads both.
-    let index = CoreIndex::for_project_parts(
+    let core_root = cfg.validate_core_root().ok().flatten();
+    let index = CoreIndex::for_project_core(
         &effective_plugins,
         &cfg.signature_dirs(),
         &cfg.collection_signature_dirs(root),
+        core_root.as_deref(),
     );
     let t_index = std::time::Instant::now();
     // Each entry: (input_order_key, path, source_or_empty, diagnostic).
@@ -2325,6 +2510,11 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
             // `run`'s else: `subcommand.inspect` — the Ruby double-quoted
             // spelling Rust's `{:?}` reproduces for ordinary words.
             eprintln!("Unknown baseline subcommand: {other:?}");
+            // v0.4.7 (#2512): the nearest subcommand, when there is one.
+            let subs = ["generate", "regenerate", "dump", "drift", "prune"];
+            if let Some(nearest) = optparse::spell_checker_correct(&subs, other).first() {
+                eprintln!("Did you mean `rigor baseline {nearest}`?");
+            }
             eprint!("{BASELINE_HELP}");
             ExitCode::from(64)
         }
@@ -2351,7 +2541,7 @@ const BASELINE_REGENERATE_SWITCHES: &[optparse::Switch] = &[
 ];
 const BASELINE_DUMP_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("baseline", &[("baseline", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--baseline", "=PATH", &["Path to the baseline file (default: .rigor-baseline.yml)"]),
-    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Choice(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
+    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
     optparse::Switch::new("rule", &[("rule", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--rule", "=RULE", &["Filter rows by exact rule id"]),
     optparse::Switch::new("file", &[("file", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--file", "=GLOB", &["Filter rows by File.fnmatch? glob"]),
 ];
@@ -2394,20 +2584,19 @@ const BASELINE_PRUNE_PARSER: optparse::OptParser =
 /// (which would silently misjudge every out-of-`lib` bucket as cleared);
 /// generate/regenerate ignore it (writing a `lib`-scoped baseline is fine).
 ///
-/// The returned `usize` is the count of bad-path expansion diagnostics —
-/// `expand_paths` errors the reference puts in the run's `diagnostics` list
-/// (`rule: nil`, severity warn-or-error). They never carry a rule, so they
-/// are not in `findings` and never land in a baseline bucket, but the
-/// reference's `generate`/`regenerate` summary counts them
-/// (`diagnostics.size` covers them): `covering 1 diagnostic(s)` for a
-/// missing default `lib/` even when the baseline it writes is empty.
+/// The returned `Vec<String>` is the paths of the bad-path expansion
+/// diagnostics — `expand_paths` errors the reference puts in the run's
+/// `diagnostics` list (`rule: nil`). They never carry a rule, so they are not
+/// in `findings` and never land in a baseline bucket; v0.4.7's
+/// `report_unbaselineable` (#2442/#2463) lists them with the other ruleless
+/// diagnostics.
 ///
 /// Returns `Err(code)` if the sidecar folder fails to build.
 fn baseline_analysis(
     explicit_config: Option<&str>,
     roots: &[&str],
     verb: &'static str,
-) -> Result<(Config, Findings, bool, usize), ExitCode> {
+) -> Result<(Config, Findings, bool, Vec<String>), ExitCode> {
     let cfg = Config::load(explicit_config.map(Path::new)).map_err(|f| f.report())?;
     let sidecar_folder = build_sidecar_folder(&cfg, None)?;
     let folder_ref =
@@ -2448,7 +2637,7 @@ fn baseline_analysis(
         &cfg.bleeding_edge_selector(),
         ref_has_files,
     );
-    Ok((cfg, findings, scope_undeclared, path_errors.len()))
+    Ok((cfg, findings, scope_undeclared, path_errors.into_iter().map(|e| e.path).collect()))
 }
 
 /// Relativize findings against cwd, as the baseline matcher keys on
@@ -2491,8 +2680,8 @@ fn baseline_generate(args: &[String]) -> ExitCode {
     let mut explicit_config: Option<String> = None;
     for item in items {
         match item {
-            // A rigor-rs generate-parity extension: positional roots override
-            // config `paths:`. The reference accepts no positionals here.
+            // Refused below (v0.4.7 #2575): the baseline always covers the
+            // configured `paths:`.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
                 "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
@@ -2512,6 +2701,9 @@ fn baseline_generate(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !files.is_empty() {
+        return baseline_positional_error("generate", &files);
     }
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
@@ -2560,9 +2752,61 @@ fn baseline_regenerate(args: &[String]) -> ExitCode {
             },
         }
     }
+    if !files.is_empty() {
+        return baseline_positional_error("regenerate", &files);
+    }
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
 
     write_baseline(explicit_config.as_deref(), &file_refs, &output, mode, "regenerated baseline")
+}
+
+/// v0.4.7 `positional_paths_error` (#2466/#2577/#2575): the baseline covers
+/// the configured `paths:`, never positional arguments — every subcommand
+/// refuses them after option parsing, exit 64.
+fn baseline_positional_error(subcommand: &str, args: &[String]) -> ExitCode {
+    let hint = match subcommand {
+        "dump" => "dump reads the baseline file, so pass none: use --file=GLOB to filter rows or \
+                   --baseline=PATH to pick a file"
+            .to_string(),
+        "drift" | "prune" => format!("{subcommand} audits the configured `paths:`, so pass none"),
+        _ => "the baseline is generated from the configured `paths:`, so pass none".to_string(),
+    };
+    let quoted: Vec<String> = args.iter().map(|a| format!("{a:?}")).collect();
+    eprintln!(
+        "rigor baseline {subcommand}: unexpected argument(s) {}; {hint}",
+        quoted.join(" ")
+    );
+    ExitCode::from(64)
+}
+
+/// v0.4.7 `MAX_UNBASELINEABLE_FILES`.
+const MAX_UNBASELINEABLE_FILES: usize = 10;
+
+/// v0.4.7 `report_unbaselineable` (#2442/#2463): the diagnostics with no rule
+/// (parse, path or internal errors) never enter the file; say how many and
+/// list their files (relative to cwd, unique, sorted, at most 10).
+fn report_unbaselineable(no_rule_paths: &[String]) {
+    if no_rule_paths.is_empty() {
+        return;
+    }
+    let cwd = std::env::current_dir().ok();
+    let mut files: Vec<String> =
+        no_rule_paths.iter().map(|p| relative_path(p, cwd.as_deref())).collect();
+    files.sort();
+    files.dedup();
+    let listing = if files.is_empty() { "" } else { ":" };
+    eprintln!(
+        "rigor: {} diagnostic(s) have no rule (parse, path or internal errors) in {} file(s) and \
+         cannot be baselined; fix them, or remove or exclude the files{listing}",
+        no_rule_paths.len(),
+        files.len()
+    );
+    for f in files.iter().take(MAX_UNBASELINEABLE_FILES) {
+        eprintln!("  {f}");
+    }
+    if files.len() > MAX_UNBASELINEABLE_FILES {
+        eprintln!("  ... and {} more file(s)", files.len() - MAX_UNBASELINEABLE_FILES);
+    }
 }
 
 /// Shared generate/regenerate writer: analyze, build the baseline, write it, and
@@ -2582,7 +2826,7 @@ fn write_baseline(
     // (empty) surface.
     // generate/regenerate ignore `analysis_set_empty`: an empty resolved set
     // legitimately writes an empty baseline (nothing to record).
-    let (cfg, findings, _analysis_set_empty, path_error_count) =
+    let (cfg, findings, _analysis_set_empty, path_error_paths) =
         match baseline_analysis(explicit_config, files, "baseline") {
             Ok(v) => v,
             Err(code) => return code,
@@ -2597,15 +2841,19 @@ fn write_baseline(
         MatchMode::Rule => "rule",
         MatchMode::Message => "message",
     };
-    // The reference's `diagnostics.size` counts every run diagnostic —
-    // `rule: nil` path-expansion errors included — while the baseline FILE
-    // buckets only ruled findings (`entries`), so the summary counts the
-    // union even when the file stays empty (issue #201's `covering 0` row).
-    eprintln!(
-        "rigor: {verb} {output} ({} bucket(s) covering {} diagnostic(s); match-mode: {mode_str})",
-        baseline.size(),
-        entries.len() + path_error_count
+    // v0.4.7 (#2442/#2463): `covering` sums the buckets' counts — the keyed
+    // diagnostics only; the ruleless ones (path-expansion errors, parse
+    // errors) are reported separately by `report_unbaselineable`.
+    let mut no_rule_paths: Vec<String> = path_error_paths;
+    no_rule_paths.extend(
+        findings.iter().filter(|(_, _, _, d)| d.qualified_rule().is_none()).map(|(_, p, _, _)| p.clone()),
     );
+    let covered = entries.len() - findings.iter().filter(|(_, _, _, d)| d.qualified_rule().is_none()).count();
+    eprintln!(
+        "rigor: {verb} {output} ({} bucket(s) covering {covered} diagnostic(s); match-mode: {mode_str})",
+        baseline.size(),
+    );
+    report_unbaselineable(&no_rule_paths);
     if cfg.baseline_path().is_none() {
         // The reference names the config file actually read — the explicit
         // `--config` path when given, else `Configuration.discover`'s winner
@@ -2634,9 +2882,10 @@ fn baseline_dump(args: &[String]) -> ExitCode {
     let mut format = String::from("text");
     let mut rule: Option<String> = None;
     let mut file_glob: Option<String> = None;
+    let mut positionals: Vec<String> = Vec::new();
     for item in items {
         match item {
-            Item::Positional(_) => {} // upstream leaves them in argv, unused
+            Item::Positional(p) => positionals.push(p),
             Item::Opt { key, value, .. } => match key {
                 "baseline" => path = value.unwrap().as_str().to_string(),
                 "format" => format = value.unwrap().as_str().to_string(),
@@ -2645,6 +2894,9 @@ fn baseline_dump(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !positionals.is_empty() {
+        return baseline_positional_error("dump", &positionals);
     }
     let baseline = match load_baseline_strict(&path) {
         Ok(b) => b,
@@ -2756,8 +3008,8 @@ fn baseline_drift(args: &[String]) -> ExitCode {
     let mut files: Vec<String> = Vec::new();
     for item in items {
         match item {
-            // A rigor-rs generate-parity extension: positional roots override
-            // config `paths:`. The reference accepts no positionals here.
+            // Refused below (v0.4.7 #2575): the baseline always covers the
+            // configured `paths:`.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
                 "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
@@ -2777,6 +3029,9 @@ fn baseline_drift(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !files.is_empty() {
+        return baseline_positional_error("drift", &files);
     }
     let explicit_config = explicit_config.as_deref();
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();
@@ -2870,8 +3125,8 @@ fn baseline_prune(args: &[String]) -> ExitCode {
     let mut files: Vec<String> = Vec::new();
     for item in items {
         match item {
-            // A rigor-rs generate-parity extension: positional roots override
-            // config `paths:`. The reference accepts no positionals here.
+            // Refused below (v0.4.7 #2575): the baseline always covers the
+            // configured `paths:`.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
                 "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
@@ -2883,6 +3138,9 @@ fn baseline_prune(args: &[String]) -> ExitCode {
                 _ => unreachable!("the switch table is closed"),
             },
         }
+    }
+    if !files.is_empty() {
+        return baseline_positional_error("prune", &files);
     }
     let explicit_config = explicit_config.as_deref();
     let file_refs: Vec<&str> = files.iter().map(String::as_str).collect();

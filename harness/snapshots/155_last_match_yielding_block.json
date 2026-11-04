@@ -1,0 +1,61 @@
+{
+  "fixture": "harness/corpus/155_last_match_yielding_block.rb",
+  "diagnostics": [
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 36,
+      "column": 7,
+      "severity": "error",
+      "message": "possible nil receiver: `upcase' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 52,
+      "column": 6,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 60,
+      "column": 6,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 66,
+      "column": 4,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 87,
+      "column": 8,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 105,
+      "column": 8,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 116,
+      "column": 6,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
+      "line": 123,
+      "column": 6,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    }
+  ]
+}

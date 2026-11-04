@@ -46,7 +46,7 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
             "format",
             &[("format", false)],
             crate::optparse::ArgStyle::Required,
-            crate::optparse::ValueKind::Raw,
+            crate::optparse::ValueKind::Exact(&["text", "json"]),
             "--format",
             "=FORMAT",
             &["Output format: text (default) or json"],
@@ -105,9 +105,11 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
     // --- RBS source (audit-R1) ----------------------------------------------
     // The keystone: surface whether coverage comes from the embedded vendored
     // set (the standalone default), a RIGOR_RBS_CORE_DIR override, or the stub.
-    let index = CoreIndex::for_project(
+    let index = CoreIndex::for_project_core(
         &cfg.effective_plugins(std::path::Path::new(".")),
-        &cfg.all_signature_dirs(std::path::Path::new(".")),
+        &cfg.signature_dirs(),
+        &cfg.collection_signature_dirs(std::path::Path::new(".")),
+        cfg.validate_core_root().ok().flatten().as_deref(),
     );
     let count = index.class_count();
     match index.rbs_source() {

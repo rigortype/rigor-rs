@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, ShapeKey};
 
 use crate::{SourceIndex, TypeEnv};
@@ -1003,20 +1003,7 @@ pub(crate) fn indexed_flow_writes(
     ast: &LoweredAst,
     source: &SourceIndex,
 ) -> Vec<(rigor_parse::Span, String)> {
-    let mut out = Vec::new();
-
-    for (_, n) in ast.iter() {
-        if let Node::Call { method, args, span, .. } = n {
-            for (i, &arg) in args.iter().enumerate() {
-                if !source.method_mutates_param(method, i) {
-                    continue;
-                }
-                if let Node::LocalVariableRead { name, .. } = ast.get(arg) {
-                    out.push((*span, name.clone()));
-                }
-            }
-        }
-    }
+    let mut out = argument_floor_writes(ast, source);
 
     // Spans of every call that carries a block, innermost-first per clause.
     let block_calls: Vec<rigor_parse::Span> = ast
@@ -1046,6 +1033,740 @@ pub(crate) fn indexed_flow_writes(
 
     drop_inert_writes(ast, &mut out);
     out
+}
+
+/// Upstream v0.4.7 (ADR-127, #2515 and its follow-ups) — the callee
+/// mutation floor, as an FP-safe over-approximation. The reference floors a
+/// mutable local a call passes when the callee's write census (aliases,
+/// `tap`, keyword / rest / kwrest parameters, hand-offs, returns, blocks;
+/// `callee_write_census.rb`, `callee_mutation_chain.rb`) says the body may
+/// write it, and outright (`FLOOR_ALL` / `FLOOR_EVERY` / `OPAQUE_CALLEES`)
+/// for an inherited or ambiguous def, a `method_missing`, a literal
+/// definer and an opaque sink. The port does not resolve receivers, so it
+/// floors every local a call passes when the call MAY reach a project body:
+///
+/// - the call's name has a project body in any form
+///   ([`SourceIndex::call_may_mutate_arguments`]), or the project defines
+///   `method_missing`;
+/// - an opaque sink: `call` / `instance_exec` / `class_exec` / `module_exec`
+///   on an explicit receiver, or a `send` / `__send__` / `public_send`
+///   whose target is no literal (a literal target is read as that name).
+///
+/// A local is passed when its bare read is an argument value — positional,
+/// a keyword value, `*splat` / `**splat`, nested in a literal, an arm of a
+/// conditional, or the receiver of `tap` / `itself` — or when it was stored
+/// into a passed local (`args = [p, o]; add(*args)`, `args << o`,
+/// `y = o`), transitively. A local whose every write in the file is an
+/// immutable literal (Integer, Float, Symbol, `nil`, `true`, `false`) is
+/// skipped: the reference gates its floor on a mutable carrier, so `n = 1;
+/// go(n); n == 1` keeps folding there.
+///
+/// Every entry only widens, so an extra one costs coverage and never adds a
+/// diagnostic. Keyed by the call's span, like the receiver-side mutator
+/// entry: a call inside a block widens at the enclosing block call (#2400).
+pub(crate) fn argument_floor_writes(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+) -> Vec<(rigor_parse::Span, String)> {
+    use std::collections::HashMap;
+    let mut out = Vec::new();
+    // Which locals each local may hold: `y = <expr>` and the content
+    // mutators `y << x` / `y.push(x)` / `y[k] = x` / ….
+    let mut holds: HashMap<String, HashSet<String>> = HashMap::new();
+    // Names with a write whose value is not an immutable literal (or that
+    // is not a plain write at all).
+    let mut mutable_names: HashSet<String> = HashSet::new();
+    for (_, n) in ast.iter() {
+        match n {
+            Node::LocalVariableWrite { name, value, .. } => {
+                let mut held = Vec::new();
+                passed_locals(ast, *value, &mut held);
+                holds.entry(name.clone()).or_default().extend(held);
+                if !matches!(
+                    ast.get(*value),
+                    Node::IntegerLit { .. }
+                        | Node::FloatLit { .. }
+                        | Node::SymbolLit { .. }
+                        | Node::NilLit { .. }
+                        | Node::TrueLit { .. }
+                        | Node::FalseLit { .. }
+                ) {
+                    mutable_names.insert(name.clone());
+                }
+            }
+            Node::LocalVariableOpWrite { name, .. } => {
+                mutable_names.insert(name.clone());
+            }
+            Node::MultiWrite { targets, .. } => {
+                for (name, _) in targets.bound_names() {
+                    mutable_names.insert(name);
+                }
+            }
+            Node::Call { receiver: Some(r), method, args, .. }
+                if FLOOR_STORE_METHODS.contains(&method.as_str()) =>
+            {
+                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    let mut held = Vec::new();
+                    for &a in args {
+                        passed_locals(ast, a, &mut held);
+                    }
+                    holds.entry(name.clone()).or_default().extend(held);
+                }
+            }
+            Node::IndexWrite { receiver: Some(r), value, .. } => {
+                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    let mut held = Vec::new();
+                    passed_locals(ast, *value, &mut held);
+                    holds.entry(name.clone()).or_default().extend(held);
+                }
+            }
+            _ => {}
+        }
+    }
+    // A name never plainly written (a parameter, a block or pattern binding)
+    // may hold anything.
+    let written: HashSet<&str> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::LocalVariableWrite { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let immutable = |name: &str| written.contains(name) && !mutable_names.contains(name);
+    let def_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| matches!(n, Node::Definition { .. }).then(|| n.span()))
+        .collect();
+    let inside = |o: rigor_parse::Span, i: rigor_parse::Span| o.0 <= i.0 && i.1 <= o.1;
+    for (_, n) in ast.iter() {
+        let Node::Call { receiver, method, args, span, .. } = n else {
+            continue;
+        };
+        if args.is_empty() || !call_may_floor(ast, source, receiver.is_some(), method, args) {
+            continue;
+        }
+        let exempt = readonly_positions(ast, source, n);
+        let mut passed = Vec::new();
+        for (i, &a) in args.iter().enumerate() {
+            if !exempt.contains(&i) {
+                passed_locals(ast, a, &mut passed);
+            }
+        }
+        // The transitive closure over `holds`.
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(name) = passed.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(h) = holds.get(&name) {
+                passed.extend(h.iter().cloned());
+            }
+        }
+        // A local holding a floored one changed too (`alias_args = args`).
+        loop {
+            let grown: Vec<String> = holds
+                .iter()
+                .filter(|(z, held)| !seen.contains(*z) && held.iter().any(|h| seen.contains(h)))
+                .map(|(z, _)| z.clone())
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            seen.extend(grown);
+        }
+        // `floor_splat_arguments`' documented limit: only the type says which
+        // local a splatted element is, so an equal literal another local
+        // holds floors too. Over-approximated as every local of the scope.
+        let splat = args.iter().any(|&a| {
+            matches!(ast.get(a), Node::Statements { kind: StatementsKind::Recovered, .. })
+        });
+        if splat && !seen.is_empty() {
+            let scope = def_spans
+                .iter()
+                .filter(|d| inside(**d, *span))
+                .min_by_key(|d| d.1 - d.0)
+                .copied();
+            for (_, w) in ast.iter() {
+                let Node::LocalVariableWrite { name, span: ws, .. } = w else {
+                    continue;
+                };
+                let innermost = def_spans
+                    .iter()
+                    .filter(|d| inside(**d, *ws))
+                    .min_by_key(|d| d.1 - d.0)
+                    .copied();
+                if innermost == scope {
+                    seen.insert(name.clone());
+                }
+            }
+        }
+        let mut names: Vec<String> = seen.into_iter().filter(|n| !immutable(n)).collect();
+        names.sort();
+        out.extend(names.into_iter().map(|name| (*span, name)));
+    }
+    out
+}
+
+/// [`argument_floor_writes`] for the TOP-LEVEL scope: a call inside a
+/// `def` / `class` / `module` body floors that scope's locals, not the
+/// top-level ones. A block's call still counts (it may name a captured
+/// top-level local; a name the block binds itself only over-widens).
+pub(crate) fn toplevel_argument_floor(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+) -> Vec<(rigor_parse::Span, String)> {
+    let (scopes, _) = toplevel_scope_filters(ast);
+    let mut out = argument_floor_writes(ast, source);
+    out.retain(|(w, _)| !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1));
+    drop_inert_writes(ast, &mut out);
+    out
+}
+
+/// The nodes whose value an OVER-APPROXIMATED callee floor may have made
+/// less precise than the reference's (PR #481 review, scratch
+/// `review/f/e03.rb`). [`argument_floor_writes`] floors a local the
+/// reference may keep precise (its write census proves the callee
+/// read-only). A floored local reads `Dynamic`, which fires nothing itself,
+/// but a JOIN whose predicate the reference folds through that local keeps
+/// both arms here: `go(h); w = h[:f] == "json" ? 1 : "s"; w.foo` reads
+/// `"s" | 1` where the reference reads `"s"` — a matched row with another
+/// message, or a `nil` arm the reference never has. The rules decline a
+/// diagnostic whose judged value reaches one of these nodes
+/// ([`diagnostic_reads_floor_taint`]).
+///
+/// Floored: a `(call, local)` entry the Pass-1e census does not prove (it
+/// proves what the reference floors too), for a local some write of which
+/// in its scope (the innermost `def`, or the top level) is a literal or
+/// constant carrier the reference could fold through. Tainted: a join
+/// (`if` / ternary / `case` / loop / `&&` / `||`) whose predicate's value
+/// reaches a floored or tainted local; a local written inside a tainted
+/// join's region, or from a value reaching a tainted join or local; to a
+/// fixpoint. The result holds the tainted joins and every read of a
+/// tainted local.
+pub fn floor_tainted_reads(ast: &LoweredAst, source: &SourceIndex) -> HashSet<NodeId> {
+    let floors = argument_floor_writes(ast, source);
+    if floors.is_empty() {
+        return HashSet::new();
+    }
+    // Proven floors: the old positional census.
+    let mut proven: HashSet<(rigor_parse::Span, String)> = HashSet::new();
+    for (_, n) in ast.iter() {
+        if let Node::Call { method, args, span, .. } = n {
+            for (i, &a) in args.iter().enumerate() {
+                if let Node::LocalVariableRead { name, .. } = ast.get(a) {
+                    if source.method_mutates_param(method, i) {
+                        proven.insert((*span, name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let def_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| matches!(n, Node::Definition { .. }).then(|| n.span()))
+        .collect();
+    let scope_of = |s: rigor_parse::Span| {
+        def_spans
+            .iter()
+            .filter(|d| d.0 <= s.0 && s.1 <= d.1)
+            .min_by_key(|d| d.1 - d.0)
+            .copied()
+    };
+    type Key = (Option<rigor_parse::Span>, String);
+    // Locals with a literal / constant carrier write.
+    let mut carriers: HashSet<Key> = HashSet::new();
+    for (_, n) in ast.iter() {
+        if let Node::LocalVariableWrite { name, value, span, .. } = n {
+            let mut root = *value;
+            while let Node::Call { receiver: Some(r), .. } = ast.get(root) {
+                root = *r;
+            }
+            if matches!(
+                ast.get(root),
+                Node::ArrayLit { .. }
+                    | Node::HashLit { .. }
+                    | Node::StringLit { .. }
+                    | Node::ConstantRead { .. }
+            ) {
+                carriers.insert((scope_of(*span), name.clone()));
+            }
+        }
+    }
+    let floored: HashSet<Key> = floors
+        .into_iter()
+        .filter(|f| !proven.contains(f))
+        .map(|(s, name)| (scope_of(s), name))
+        .filter(|k| carriers.contains(k))
+        .collect();
+    if floored.is_empty() {
+        return HashSet::new();
+    }
+    let key_of = |id: NodeId| match ast.get(id) {
+        Node::LocalVariableRead { name, span } => Some((scope_of(*span), name.clone())),
+        _ => None,
+    };
+    // Every join: its node, the value roots of its predicate, its span.
+    let mut conds: Vec<(NodeId, Vec<NodeId>, rigor_parse::Span)> = Vec::new();
+    for (id, n) in ast.iter() {
+        let preds: Vec<NodeId> = match n {
+            Node::If { predicate, .. } => vec![*predicate],
+            Node::Case { predicate, branches, .. } => {
+                let mut p: Vec<NodeId> = predicate.iter().copied().collect();
+                for &b in branches {
+                    if let Node::When { conditions, .. } = ast.get(b) {
+                        p.extend_from_slice(conditions);
+                    }
+                }
+                p
+            }
+            Node::Loop { predicate: Some(p), .. } => vec![*p],
+            Node::Logical { left, .. } => vec![*left],
+            _ => continue,
+        };
+        let mut roots = Vec::new();
+        for p in preds {
+            value_roots(ast, p, &mut roots);
+        }
+        if !roots.is_empty() {
+            conds.push((id, roots, n.span()));
+        }
+    }
+    // Each plain local write: its target, the joins around it, and its
+    // value's roots.
+    let mut writes: Vec<(Key, Vec<NodeId>, Vec<NodeId>)> = Vec::new();
+    for (_, n) in ast.iter() {
+        let (Node::LocalVariableWrite { name, value, span, .. }
+        | Node::LocalVariableOpWrite { name, value, span, .. }) = n
+        else {
+            continue;
+        };
+        let around: Vec<NodeId> = conds
+            .iter()
+            .filter(|(_, _, r)| r.0 <= span.0 && span.1 <= r.1)
+            .map(|(c, _, _)| *c)
+            .collect();
+        let mut roots = Vec::new();
+        value_roots(ast, *value, &mut roots);
+        writes.push(((scope_of(*span), name.clone()), around, roots));
+    }
+    let mut tainted: HashSet<Key> = floored.clone();
+    let mut tainted_joins: HashSet<NodeId> = HashSet::new();
+    loop {
+        let mut grown = false;
+        for (cid, roots, _) in &conds {
+            if !tainted_joins.contains(cid)
+                && roots.iter().any(|&r| key_of(r).is_some_and(|k| tainted.contains(&k)))
+            {
+                tainted_joins.insert(*cid);
+                grown = true;
+            }
+        }
+        for (target, around, roots) in &writes {
+            if tainted.contains(target) {
+                continue;
+            }
+            let hit = around.iter().any(|c| tainted_joins.contains(c))
+                || roots.iter().any(|&r| {
+                    tainted_joins.contains(&r) || key_of(r).is_some_and(|k| tainted.contains(&k))
+                });
+            if hit {
+                tainted.insert(target.clone());
+                grown = true;
+            }
+        }
+        if !grown {
+            break;
+        }
+    }
+    let mut out: HashSet<NodeId> = tainted_joins;
+    for (id, _) in ast.iter() {
+        if let Some(k) = key_of(id) {
+            // A floored local alone reads `Dynamic` and fires nothing; only
+            // a local a tainted join wrote carries a wider-than-reference
+            // value.
+            if tainted.contains(&k) && !floored.contains(&k) {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
+/// The nodes an expression's VALUE may come from: a local read, a join
+/// (and its arms), a literal container's elements, a call's receiver (and
+/// a receiverless call's arguments, which a parameter-bound return may
+/// hand back). An interpolation, an explicit-receiver call's arguments, a
+/// splat and a predicate are not value sources.
+fn value_roots(ast: &LoweredAst, id: NodeId, out: &mut Vec<NodeId>) {
+    match ast.get(id) {
+        Node::LocalVariableRead { .. } => out.push(id),
+        Node::If { then_body, else_body, .. } => {
+            out.push(id);
+            for &e in then_body.iter().chain(else_body) {
+                value_roots(ast, e, out);
+            }
+        }
+        Node::Case { branches, else_body, .. } => {
+            out.push(id);
+            for &b in branches {
+                if let Node::When { body, .. } = ast.get(b) {
+                    for &e in body {
+                        value_roots(ast, e, out);
+                    }
+                }
+            }
+            for &e in else_body {
+                value_roots(ast, e, out);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            out.push(id);
+            value_roots(ast, *left, out);
+            value_roots(ast, *right, out);
+        }
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            if let Some(&last) = body.last() {
+                value_roots(ast, last, out);
+            }
+        }
+        Node::BeginRescue { body, .. } => {
+            if let Some(&last) = body.last() {
+                value_roots(ast, last, out);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &e in elements {
+                value_roots(ast, e, out);
+            }
+        }
+        Node::LocalVariableWrite { value, .. } | Node::LocalVariableOpWrite { value, .. } => {
+            value_roots(ast, *value, out);
+        }
+        Node::Call { receiver: Some(r), .. } => value_roots(ast, *r, out),
+        Node::Call { receiver: None, args, .. } => {
+            for &a in args {
+                value_roots(ast, a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Which part of the expression a diagnostic judges, for
+/// [`diagnostic_reads_floor_taint`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaintAnchor {
+    /// The receiver of the call whose method name starts at the anchor
+    /// (`call.undefined-method`, `call.wrong-arity`,
+    /// `call.possible-nil-receiver`).
+    Receiver,
+    /// Its receiver and arguments (`call.argument-type-mismatch`,
+    /// `call.raise-non-exception`).
+    ReceiverAndArguments,
+    /// Every node starting at the anchor (a flow rule's predicate).
+    Expression,
+}
+
+/// Whether the value a diagnostic anchored at `start` judges may come from
+/// a [`floor_tainted_reads`] node ([`value_roots`]). Over-matching only
+/// declines more.
+pub fn diagnostic_reads_floor_taint(
+    ast: &LoweredAst,
+    start: usize,
+    anchor: TaintAnchor,
+    tainted: &HashSet<NodeId>,
+) -> bool {
+    let mut roots: Vec<NodeId> = Vec::new();
+    for (id, n) in ast.iter() {
+        match anchor {
+            TaintAnchor::Expression => {
+                if n.span().0 == start {
+                    value_roots(ast, id, &mut roots);
+                    // A predicate's fold reads every operand.
+                    if let Node::Call { args, .. } = n {
+                        for &a in args {
+                            value_roots(ast, a, &mut roots);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Node::Call { receiver, args, message_span, .. } = n {
+                    if message_span.0 == start {
+                        if let Some(r) = receiver {
+                            value_roots(ast, *r, &mut roots);
+                        }
+                        if anchor == TaintAnchor::ReceiverAndArguments {
+                            for &a in args {
+                                value_roots(ast, a, &mut roots);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    roots.iter().any(|r| tainted.contains(r))
+}
+
+/// rigor-rs#363, re-measured at v0.4.7: whether a mutation at `span` inside
+/// a lexical loop's `break` argument stays off the post-loop scope (the
+/// locals-only `join_break_scopes`). At v0.4.7 only a compound ATTRIBUTE
+/// write (`break h.default ||= 0`, a `Node::AttrWrite`) keeps the indexed
+/// record there; a mutator CALL — `break h.merge!(…)`, `h.clear`,
+/// `h.delete(:a)`, `h.compare_by_identity`, `(h.default = 0)`, `h[:a] << 2`,
+/// `for …; break h.store(:a, 9)`, a block's `h[:a] = 9` — drops it on both
+/// v0.4.6 and v0.4.7 (scratch `frag/brk/t05`–`t16`, `brk3/w1`–`w7`).
+/// Answering `false` only keeps a drop, so it can never add a diagnostic.
+pub(crate) fn break_join_suppresses(ast: &LoweredAst, span: rigor_parse::Span, method: &str) -> bool {
+    ast.locals_only_suppresses(span, is_content_mutator(method))
+        && ast.iter().any(|(_, n)| matches!(n, Node::AttrWrite { span: s, .. } if *s == span))
+}
+
+/// Receiver methods whose result is never the receiver nor one of its
+/// elements, and which write nothing: a parameter read only through these is
+/// read-only for [`readonly_positions`]. `to_s` / `to_a` / `to_h` are out
+/// (they may return the receiver: `CalleeWriteCensus::SELF_RETURNERS`).
+const READONLY_METHODS: &[&str] = &[
+    "size", "length", "count", "empty?", "any?", "none?", "nil?", "key?", "has_key?",
+    "include?", "member?", "is_a?", "kind_of?", "instance_of?", "respond_to?", "frozen?",
+    "hash", "==", "!=", "eql?", "equal?", "inspect",
+];
+
+/// Store methods whose result is their receiver: a parameter handed to one
+/// on another parameter is held, not written (`acc.push(flag)`).
+const HOLDING_STORES: &[&str] = &["push", "<<", "append", "unshift", "add"];
+
+/// The argument positions of `call` the reference keeps reading precisely
+/// after it: a receiverless call of a name exactly one project body answers
+/// (a plain top-level `def` of this file with plain positional parameters,
+/// no `method_missing` anywhere), made at the top level or in a top-level
+/// `def` outside any block, whose parameter at that position the def only
+/// reads ([`READONLY_METHODS`] receivers, or a [`HOLDING_STORES`] argument
+/// on another parameter the def only stores into or reads). The reference's
+/// write census finds no write there, so its floor leaves the local alone
+/// (`def ro(h) = h.size; ro(h7); h7[:a].upcase` still fires). Everything
+/// else is empty: an allow-list, so a shape it does not name floors.
+fn readonly_positions(ast: &LoweredAst, source: &SourceIndex, call: &Node) -> HashSet<usize> {
+    let none = HashSet::new();
+    let Node::Call { receiver: None, method, args, span, args_plain_positional: true, .. } = call
+    else {
+        return none;
+    };
+    if !source.unique_project_body(method) {
+        return none;
+    }
+    let inside = |o: rigor_parse::Span, i: rigor_parse::Span| o.0 <= i.0 && i.1 <= o.1;
+    // The call's context: no class/module body, block, lambda or
+    // non-top-level def around it.
+    let mut def_node: Option<NodeId> = None;
+    for (id, n) in ast.iter() {
+        let s = n.span();
+        match n {
+            Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Lambda { .. }
+                if inside(s, *span) =>
+            {
+                return none;
+            }
+            Node::Call { block_body, .. } if !block_body.is_empty() => {
+                if let Some(h) = span_hull(ast, block_body) {
+                    if inside(h, *span) {
+                        return none;
+                    }
+                }
+            }
+            Node::Definition { name, .. } if name.as_deref() == Some(method.as_str()) => {
+                if def_node.is_some() {
+                    return none;
+                }
+                def_node = Some(id);
+            }
+            Node::Definition { name: None, .. } if inside(s, *span) => return none,
+            _ => {}
+        }
+    }
+    let Some(def_id) = def_node else { return none };
+    let Node::Definition { params: Some(names), span: dspan, .. } = ast.get(def_id) else {
+        return none;
+    };
+    if names.len() != args.len() {
+        return none;
+    }
+    // The def itself sits at the top level: no scope node encloses it.
+    let top_level = !ast.iter().any(|(id, n)| {
+        id != def_id
+            && matches!(n, Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Definition { .. }
+                | Node::Lambda { .. } | Node::Call { .. })
+            && n.span() != *dspan
+            && inside(n.span(), *dspan)
+    });
+    if !top_level {
+        return none;
+    }
+    // Parent links over the def's subtree.
+    let mut parent: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    let mut stack = vec![def_id];
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let mut kids = Vec::new();
+        node_child_ids(ast.get(id), &mut kids);
+        for k in kids {
+            parent.entry(k).or_insert(id);
+            stack.push(k);
+        }
+    }
+    // Every node inside the def's span must be linked: an unlinked read
+    // could be anywhere.
+    let in_def: Vec<(NodeId, &Node)> = ast
+        .iter()
+        .filter(|(id, n)| *id != def_id && inside(*dspan, n.span()))
+        .collect();
+    if in_def.iter().any(|(id, _)| !seen.contains(id)) {
+        return none;
+    }
+    let rebound = |p: &str| {
+        in_def.iter().any(|(_, n)| match n {
+            Node::LocalVariableWrite { name, .. } | Node::LocalVariableOpWrite { name, .. } => {
+                name == p
+            }
+            Node::MultiWrite { targets, .. } => targets.bound_names().iter().any(|(b, _)| b == p),
+            Node::UnmodeledWrite { names, .. } => names.iter().any(|b| b == p),
+            _ => false,
+        })
+    };
+    let reads = |p: &str| -> Vec<NodeId> {
+        in_def
+            .iter()
+            .filter(|(_, n)| matches!(n, Node::LocalVariableRead { name, .. } if name == p))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    let read_only_receiver = |id: NodeId| match parent.get(&id).map(|&p| ast.get(p)) {
+        Some(Node::Call { receiver: Some(r), method, block_body, .. }) => {
+            *r == id && block_body.is_empty() && READONLY_METHODS.contains(&method.as_str())
+        }
+        _ => false,
+    };
+    let store_receiver = |id: NodeId| match parent.get(&id).map(|&p| ast.get(p)) {
+        Some(Node::Call { receiver: Some(r), method, block_body, .. }) => {
+            *r == id && block_body.is_empty() && HOLDING_STORES.contains(&method.as_str())
+        }
+        _ => false,
+    };
+    // A parameter the def only stores into or reads: nothing takes an
+    // element back out of it.
+    let store_only = |q: &str| {
+        !rebound(q) && reads(q).into_iter().all(|id| read_only_receiver(id) || store_receiver(id))
+    };
+    let held_by_store = |id: NodeId, p: &str| match parent.get(&id).map(|&x| ast.get(x)) {
+        Some(Node::Call { receiver: Some(r), method, args, block_body, .. })
+            if block_body.is_empty()
+                && HOLDING_STORES.contains(&method.as_str())
+                && args.contains(&id) =>
+        {
+            matches!(ast.get(*r), Node::LocalVariableRead { name, .. }
+                if name != p && names.contains(name) && store_only(name))
+        }
+        _ => false,
+    };
+    let mut out = HashSet::new();
+    for (i, p) in names.iter().enumerate() {
+        if !matches!(ast.get(args[i]), Node::LocalVariableRead { .. }) || rebound(p) {
+            continue;
+        }
+        if reads(p).into_iter().all(|id| read_only_receiver(id) || held_by_store(id, p)) {
+            out.insert(i);
+        }
+    }
+    out
+}
+
+/// The methods whose argument a receiver local holds afterwards (the
+/// `holds` table of [`argument_floor_writes`]).
+const FLOOR_STORE_METHODS: &[&str] = &[
+    "<<", "push", "append", "unshift", "prepend", "insert", "[]=", "store", "concat", "add",
+    "merge!", "update", "replace",
+];
+
+/// Whether a call of `method` may run a project body (or code no def shows)
+/// against its arguments. See [`argument_floor_writes`].
+fn call_may_floor(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+    has_receiver: bool,
+    method: &str,
+    args: &[NodeId],
+) -> bool {
+    if source.call_may_mutate_arguments(method) {
+        return true;
+    }
+    match method {
+        // A receiverless `call` is a self-call to a def of that name;
+        // `instance_exec` and the rest run their block on any receiver.
+        "call" => has_receiver,
+        "instance_exec" | "class_exec" | "module_exec" => true,
+        "send" | "__send__" | "public_send" => match ast.get(args[0]) {
+            Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => {
+                source.call_may_mutate_arguments(value)
+            }
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// The locals whose object `id`'s value may be: a bare read, through a
+/// literal container, a splat carrier, a conditional arm, an assignment's
+/// value or a `tap` / `itself` receiver. See [`argument_floor_writes`].
+fn passed_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. } => out.push(name.clone()),
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &e in elements {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::Statements { body, .. } => {
+            for &e in body {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::If { then_body, else_body, .. } => {
+            for &e in then_body.iter().chain(else_body) {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            passed_locals(ast, *left, out);
+            passed_locals(ast, *right, out);
+        }
+        // An `else` arm lowers as a `BeginRescue` carrier.
+        Node::BeginRescue { body, clauses, .. } => {
+            for &e in body.iter().chain(clauses.iter().flat_map(|c| c.body.iter())) {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &e in branches.iter().chain(else_body) {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::When { body, .. } => {
+            for &e in body {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::LocalVariableWrite { value, .. } | Node::LocalVariableOpWrite { value, .. } => {
+            passed_locals(ast, *value, out);
+        }
+        Node::Call { receiver: Some(r), method, .. } if method == "tap" || method == "itself" => {
+            passed_locals(ast, *r, out);
+        }
+        _ => {}
+    }
 }
 
 /// Extend a lexical self-qualified name with a nested class/module `name`,

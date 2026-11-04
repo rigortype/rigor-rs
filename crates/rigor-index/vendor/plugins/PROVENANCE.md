@@ -22,7 +22,11 @@ embedded core RBS, is the zero-false-positive keystone of plugin parity.
   `activesupport-core-ext`).
 - **Source path:** `reference/rigor/plugins/rigor-activesupport-core-ext/sig/active_support/core_ext.rbs`
   — **the PINNED submodule**, not a local checkout.
-- **Vendored:** 2026-09-25 at the upstream-master pin (`e59b7b89`), `shasum`
+- **Vendored:** 2026-11-05 at the `v0.4.7` pin (`f7595e28`), `shasum`
+  `81d212e6a41aaa33f16b81c7a768208f6c3acbd9`. `v0.4.7` (#2424, #2433) widens
+  `symbolize_keys` / `to_options` keys to `untyped`, gives the bang re-keyers and
+  `deep_merge` their result hash instead of `self`, and lets `deep_transform_keys`
+  take the block's key type. Was 2026-09-25 at the upstream-master pin (`e59b7b89`), `shasum`
   `66865f00802ddcd8316f3cca4658dec7842910d7`, 2,006 lines — the copy had 23
   selectors firing on rigor-rs and silent on the oracle (`presence_in`, `with`,
   `with_options`, `Object#class_eval`, `downcase_first`, `acts_like_string?`,

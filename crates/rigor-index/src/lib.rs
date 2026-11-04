@@ -32,6 +32,9 @@ pub mod plugins;
 mod rbs;
 
 pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
+/// The build-time-embedded vendored RBS `(path, contents)` table — sig-gen
+/// reads the declared type parameters of a reopened generic class from it.
+pub use rbs::EMBEDDED_RBS;
 pub use rbs::{
     parse_conforms_to, ConformanceFinding, ConformanceKind, RBS_EXTENDED_UNRESOLVED,
     UNSATISFIED_CONFORMANCE,
@@ -125,12 +128,28 @@ impl CoreIndex {
         sig_dirs: &[std::path::PathBuf],
         collection_dirs: &[std::path::PathBuf],
     ) -> Self {
+        Self::for_project_core(enabled, sig_dirs, collection_dirs, None)
+    }
+
+    /// [`Self::for_project_parts`] with a validated `core_root:` directory
+    /// (upstream v0.4.7, #2517) replacing the embedded core RBS.
+    pub fn for_project_core(
+        enabled: &[String],
+        sig_dirs: &[std::path::PathBuf],
+        collection_dirs: &[std::path::PathBuf],
+        core_root: Option<&std::path::Path>,
+    ) -> Self {
         let resolved: Vec<&'static plugins::BundledPlugin> = enabled
             .iter()
             .filter_map(|id| plugins::bundled_plugin(id))
             .collect();
         Self {
-            data: rbs::CoreData::load_for_project_parts(&resolved, sig_dirs, collection_dirs),
+            data: rbs::CoreData::load_for_project_core(
+                &resolved,
+                sig_dirs,
+                collection_dirs,
+                core_root,
+            ),
         }
     }
 
@@ -1605,5 +1624,68 @@ mod tuple_return_tests {
         sorted.sort_unstable();
         sorted.dedup();
         assert_eq!(names, sorted, "must be sorted + deduped");
+    }
+}
+
+#[cfg(test)]
+mod core_root_tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    /// A fresh copy of the vendored `core/` under the temp dir.
+    fn core_copy(tag: &str) -> PathBuf {
+        fn copy(src: &Path, dst: &Path) {
+            std::fs::create_dir_all(dst).unwrap();
+            for e in std::fs::read_dir(src).unwrap().flatten() {
+                let to = dst.join(e.file_name());
+                if e.file_type().unwrap().is_dir() {
+                    copy(&e.path(), &to);
+                } else {
+                    std::fs::copy(e.path(), &to).unwrap();
+                }
+            }
+        }
+        let dir = std::env::temp_dir()
+            .join(format!("rigor_core_root_{tag}_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        copy(&Path::new(env!("CARGO_MANIFEST_DIR")).join("vendor/rbs/core"), &dir);
+        dir
+    }
+
+    fn index(core: &Path) -> CoreIndex {
+        CoreIndex::for_project_core(&[], &[], &[], Some(core))
+    }
+
+    /// Upstream v0.4.7 (#2517): a complete supplied core replaces the embedded
+    /// one — its extra member is known, absence is still witnessed.
+    #[test]
+    fn complete_core_is_loaded_and_witnesses() {
+        let core = core_copy("full");
+        std::fs::write(core.join("zz.rbs"), "class Integer\n  def zzq: () -> Integer\nend\n")
+            .unwrap();
+        let idx = index(&core);
+        assert!(idx.class_has_method("Integer", "zzq"));
+        assert!(!idx.class_has_method("Integer", "zork_absent"));
+        assert!(!idx.class_has_method("String", "zork_absent"));
+        let _ = std::fs::remove_dir_all(&core);
+    }
+
+    /// Review of #481: a partial core leaves classes the reference cannot
+    /// build (`rbs.coverage.definition-build-failed`); the port declines them
+    /// instead of witnessing absence over its surface.
+    #[test]
+    fn partial_core_declines() {
+        for removed in ["string.rbs", "integer.rbs", "kernel.rbs", "class.rbs", "regexp.rbs"] {
+            let core = core_copy(removed.trim_end_matches(".rbs"));
+            std::fs::remove_file(core.join(removed)).unwrap();
+            let idx = index(&core);
+            for class in ["String", "Integer"] {
+                assert!(
+                    !idx.knows_class(class) || idx.class_has_method(class, "zork_absent"),
+                    "{class} still witnessed without {removed}"
+                );
+            }
+            let _ = std::fs::remove_dir_all(&core);
+        }
     }
 }

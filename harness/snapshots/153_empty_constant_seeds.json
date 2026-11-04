@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/153_empty_constant_seeds.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `zzz' for 1"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 23,
+      "column": 15,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 24,
+      "column": 15,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 33,
+      "column": 12,
+      "severity": "warning",
+      "message": "condition is always truthy (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

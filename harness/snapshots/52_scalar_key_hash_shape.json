@@ -20,7 +20,7 @@
       "line": 20,
       "column": 3,
       "severity": "error",
-      "message": "undefined method `frobnicate' for { a: 1, \"k\": 2, 7 => 3 }"
+      "message": "undefined method `frobnicate' for { a: 1, \"k\" => 2, 7 => 3 }"
     },
     {
       "rule": "call.undefined-method",

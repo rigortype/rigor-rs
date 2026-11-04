@@ -104,10 +104,16 @@ fn run_stdio(config_path: Option<&str>) -> Result<(), String> {
     // `--config` (auto-discovery when absent).
     let cfg = Config::load(config_path.map(std::path::Path::new))
         .map_err(|f| format!("rigor: {}", f.message))?;
+    // Upstream v0.4.7 (#2517): a `core_root:` that cannot serve as a core is a
+    // configuration error, as in `check`; a valid one replaces the embedded core.
+    let core_root = cfg.validate_core_root().map_err(|m| format!("rigor: {m}"))?;
+    let root = std::path::Path::new(".");
     let ctx = ServerContext {
-        index: CoreIndex::for_project(
-            &cfg.effective_plugins(std::path::Path::new(".")),
-            &cfg.all_signature_dirs(std::path::Path::new(".")),
+        index: CoreIndex::for_project_core(
+            &cfg.effective_plugins(root),
+            &cfg.signature_dirs(),
+            &cfg.collection_signature_dirs(root),
+            core_root.as_deref(),
         ),
         disable: cfg.disable_matcher(),
     };
@@ -788,6 +794,6 @@ mod tests {
         assert!(out["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not a file or directory"));
+            .contains("/nonexistent/xyz.rb:1:1: error: no such file or directory"));
     }
 }

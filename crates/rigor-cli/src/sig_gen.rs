@@ -78,7 +78,7 @@
 //!   with a core RBS name; otherwise it stays `Dynamic` and the method is skipped
 //!   (an under-emit — a pre-existing inference gap, not a naming defect).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -90,6 +90,9 @@ use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId, ParamShape, Vi
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod meta_class;
+mod generics;
+mod rbs_parse_error;
+mod superclasses;
 mod sig_env;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -157,13 +160,14 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         Switch::new("print", &[("print", false)], ArgStyle::Flag, ValueKind::Raw, "--print", "", &["Write RBS skeletons to stdout (default)"]),
         Switch::new("diff", &[("diff", false)], ArgStyle::Flag, ValueKind::Raw, "--diff", "", &["Write a unified diff against existing RBS"]),
         Switch::new("write", &[("write", false)], ArgStyle::Flag, ValueKind::Raw, "--write", "", &["Write generated RBS to sig/<path>.rbs files"]),
-        Switch::new("overwrite", &[("overwrite", false)], ArgStyle::Flag, ValueKind::Raw, "--overwrite", "", &["Allow tighter-return updates to replace user-authored RBS"]),
+        Switch::new("check", &[("check", false)], ArgStyle::Flag, ValueKind::Raw, "--check", "", &["Exit 1 when --write would change sig/; write nothing"]),
+        Switch::new("overwrite", &[("overwrite", false)], ArgStyle::Flag, ValueKind::Raw, "--overwrite", "", &["Allow tighter-return updates, and inline declarations that disagree with sig/, to replace user-authored RBS"]),
         Switch::new("include-private", &[("include-private", false)], ArgStyle::Flag, ValueKind::Raw, "--include-private", "", &["Emit private / protected instance methods (default: public only)"]),
         Switch::new("effect-envelopes", &[("effect-envelopes", false)], ArgStyle::Flag, ValueKind::Raw, "--effect-envelopes", "", &["Also emit %a{rigor:v1:effect ...} for effectful methods (requires the effects: opt-in)"]),
         Switch::new("no-cache", &[("no-cache", false)], ArgStyle::Flag, ValueKind::Raw, "--no-cache", "", &["Do not read or write the analysis cache (effect collection only)"]),
-        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text or json"]),
         Switch::new("params", &[("params", false)], ArgStyle::Required, ValueKind::Raw, "--params", "=POLICY", &["Parameter policy: untyped (default), observed, observed-strict"]),
-        Switch::new("observe", &[("observe", false)], ArgStyle::Required, ValueKind::Raw, "--observe", "=PATH", &["Directory / file to scan for call-site observations (repeatable)"]),
+        Switch::new("observe", &[("observe", false)], ArgStyle::Required, ValueKind::Raw, "--observe", "=PATH", &["Directory / file to scan for call-site observations (repeatable; default: the configured test_paths)"]),
         Switch::new("new-files", &[("new-files", false)], ArgStyle::Flag, ValueKind::Raw, "--new-files", "", &["Emit only new-file classifications"]),
         Switch::new("new-methods", &[("new-methods", false)], ArgStyle::Flag, ValueKind::Raw, "--new-methods", "", &["Emit only new-method classifications"]),
         Switch::new("tighter-returns", &[("tighter-returns", false)], ArgStyle::Flag, ValueKind::Raw, "--tighter-returns", "", &["Emit only tighter-return classifications"]),
@@ -205,6 +209,9 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 "format" => format = value.unwrap().as_str().to_string(),
                 "params" => params = value.unwrap().as_str().to_string(),
                 "observe" => defer("--observe", &mut deferred),
+                // ADR-112 WD4's dry-run gate — the writer's compare mode is
+                // not ported.
+                "check" => defer("--check", &mut deferred),
                 "effect-envelopes" => defer("--effect-envelopes", &mut deferred),
                 "new-files" => defer("--new-files", &mut deferred),
                 "new-methods" => defer("--new-methods", &mut deferred),
@@ -290,8 +297,8 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // declaration during merge); on a print/diff run it is inert, exactly like the
     // reference (the flag lives on the Writer).
 
-    let candidates: Vec<Candidate> =
-        files.iter().flat_map(|p| generate_file(p, include_private, &sig_env)).collect();
+    let (candidates, _info, unresolvable) =
+        generate_run(&files, include_private, &sig_env, &writes);
 
     // `--format json` renders the candidate table regardless of print/diff mode
     // (reference `Renderer#render`); text picks the diff or print layout.
@@ -321,6 +328,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
     }
+    report_unresolvable_superclasses(&unresolvable);
     path_status
 }
 
@@ -379,36 +387,282 @@ struct NamespaceInfo {
     /// class exists even when every member candidate is suppressed as
     /// already-declared (reference `@class_shells`).
     shells: Vec<String>,
+    /// Every class header with a plain-constant superclass (whole-run once
+    /// merged); resolved into `supers` by [`finalize_superclasses`].
+    headers: Vec<superclasses::Header>,
+    /// `(source file, shell FQN)` — which file carries each shell, for the
+    /// written-set computation (a shell rides on its file's written candidates).
+    shell_files: Vec<(String, String)>,
+    /// qualified name → generic header spelling (`[unchecked out E]`), the
+    /// run's `stamp_generic_reopenings` (#2436/#2473).
+    params: HashMap<String, String>,
+    /// The core-subclass shells (#2224) — written only beside a written
+    /// method of their file, never as a shell-only target.
+    core_shells: HashSet<String>,
+}
+
+impl NamespaceInfo {
+    /// Fold one file's metadata into a whole-run one.
+    fn absorb(&mut self, other: NamespaceInfo) {
+        self.kinds.extend(other.kinds);
+        self.supers.extend(other.supers);
+        self.shells.extend(other.shells);
+        self.headers.extend(other.headers);
+        self.shell_files.extend(other.shell_files);
+        self.params.extend(other.params);
+        self.core_shells.extend(other.core_shells);
+    }
 }
 
 /// Record each class/module declaration's keyword + superclass into `info`,
 /// keyed by qualified name (reference `build_namespace_kinds` /
 /// `build_superclasses`).
 fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
-    let (name, body, kind, superclass): (&String, &[NodeId], &'static str, Option<&String>) =
+    let (name, rooted, body, kind, superclass): (&String, bool, &[NodeId], &'static str, Option<&String>) =
         match ast.get(id) {
-            Node::ClassDef { name, body, superclass_path, .. } => {
-                (name, body, "class", superclass_path.as_ref())
+            Node::ClassDef { name, rooted, body, superclass_path, .. } => {
+                (name, *rooted, body, "class", superclass_path.as_ref())
             }
-            Node::ModuleDef { name, body, .. } => (name, body, "module", None),
+            Node::ModuleDef { name, rooted, body, .. } => (name, *rooted, body, "module", None),
             _ => return,
         };
-    let mut qualified = prefix.to_vec();
-    qualified.push(name.clone());
+    let qualified = declaration_prefix(prefix, name, rooted);
     let q = qualified.join("::");
     info.kinds.insert(q.clone(), kind);
-    if let Some(sp) = superclass {
-        info.supers.insert(q, sp.clone());
-    }
+    // A plain-constant superclass is recorded from the Prism tree
+    // ([`superclasses::collect`], rooted-aware) and resolved whole-run.
+    let _ = superclass;
     for &child in body {
         collect_namespace_info(ast, child, &qualified, info);
     }
 }
 
-/// Produce the printable candidates for one source file (drops the write-only
-/// [`NamespaceInfo`]).
-fn generate_file(path: &str, include_private: bool, sig_env: &SigEnv) -> Vec<Candidate> {
-    generate_file_with_info(path, include_private, sig_env).0
+/// Generate every file's candidates and finalize the run's superclasses
+/// ([`finalize_superclasses`]); the unresolvable-superclass report goes to
+/// stderr after the output, via [`report_unresolvable_superclasses`].
+fn generate_run(
+    files: &[String],
+    include_private: bool,
+    sig_env: &SigEnv,
+    written: &dyn Fn(&Candidate) -> bool,
+) -> (Vec<Candidate>, NamespaceInfo, Vec<UnresolvableSuperclass>) {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut info = NamespaceInfo::default();
+    for f in files {
+        let (cs, i) = generate_file_with_info(f, include_private, sig_env);
+        candidates.extend(cs);
+        info.absorb(i);
+    }
+    let (candidates, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
+    (candidates, info, report)
+}
+
+/// One class dropped because its superclass chain resolves nowhere.
+struct UnresolvableSuperclass {
+    class_name: String,
+    /// The token the report names (`Base`, or the external root).
+    superclass: String,
+    /// `true` for a project superclass this run wrote nothing for.
+    project: bool,
+}
+
+/// Reference `Generator#resolve_superclass_spellings` +
+/// `#demote_unresolvable_superclasses` (+ `unresolvable_superclass_report`):
+///
+/// 1. each recorded superclass token is resolved against its header's nesting
+///    (innermost first, the class being opened excluded — #722/#2661) to a
+///    class this run declares or the RBS environment knows (the renderers
+///    write it rooted, `< ::Base`);
+/// 2. a class whose superclass chain does not end in an RBS-known class or a
+///    class this run writes (`written`) is DROPPED with every class nested in
+///    it — its header would fail the next build (`RBS::NoSuperclassFoundError`,
+///    #735/#2437/#2478) — repeating until nothing more drops;
+/// 3. every surviving candidate's `--print` header is re-stamped.
+fn finalize_superclasses(
+    candidates: Vec<Candidate>,
+    info: &mut NamespaceInfo,
+    sig_env: &SigEnv,
+    written: &dyn Fn(&Candidate) -> bool,
+) -> (Vec<Candidate>, Vec<UnresolvableSuperclass>) {
+    let index = CoreIndex::new();
+    let rbs_known = |name: &str| sig_env.class_known(&index, name);
+    let mut known: HashSet<String> = candidates.iter().map(|c| c.class_name.clone()).collect();
+    known.extend(info.shells.iter().cloned());
+    known.extend(info.kinds.keys().cloned());
+    let headers = std::mem::take(&mut info.headers);
+    for h in &headers {
+        let declared = |c: &str| known.contains(c) || rbs_known(c);
+        let resolved = superclasses::resolve_token(&h.token, &h.nesting, &h.full, &declared);
+        info.supers.insert(h.full.clone(), sig_env.generics().superclass_spelling(&resolved));
+    }
+    let supers = info.supers.clone();
+
+    // `demote_generic_reopenings` (#2436): a method of a class (or a class
+    // nested in one) the loaded RBS declares generic with a bounded or
+    // defaulted parameter is not emitted, unless the project's `sig/` already
+    // declares the class (the writer then writes into that header).
+    let generics = sig_env.generics();
+    let candidates: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| {
+            sig_env.declares_class(&c.class_name)
+                || !generics::namespace_prefixes(&c.class_name).iter().any(|n| generics.bounded(n))
+        })
+        .collect();
+
+    let shell_files = info.shell_files.clone();
+    let declared_by_run = |kept: &[&Candidate]| -> HashSet<String> {
+        let written_cands: Vec<&&Candidate> = kept.iter().filter(|c| written(c)).collect();
+        let paths: HashSet<&str> = written_cands.iter().map(|c| c.file.as_str()).collect();
+        let mut declared: HashSet<String> =
+            written_cands.iter().map(|c| c.class_name.clone()).collect();
+        for (file, shell) in &shell_files {
+            if paths.contains(file.as_str()) {
+                declared.insert(shell.clone());
+            }
+        }
+        let wrappers: Vec<String> =
+            declared.iter().flat_map(|n| superclasses::wrapper_names(n)).collect();
+        declared.extend(wrappers);
+        declared
+    };
+    let owner_of = |class_name: &str, unresolvable: &HashMap<String, String>| -> Option<(String, String)> {
+        if let Some(root) = unresolvable.get(class_name) {
+            return Some((class_name.to_string(), root.clone()));
+        }
+        let mut names: Vec<&String> = unresolvable.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .find(|n| class_name.starts_with(&format!("{n}::")))
+            .map(|n| (n.clone(), unresolvable[n].clone()))
+    };
+    let mut unresolvable: HashMap<String, String> = HashMap::new();
+    loop {
+        let kept: Vec<&Candidate> =
+            candidates.iter().filter(|c| owner_of(&c.class_name, &unresolvable).is_none()).collect();
+        let emitted = declared_by_run(&kept);
+        let found: HashMap<String, String> = supers
+            .keys()
+            .filter_map(|name| {
+                superclasses::unresolved_root(name, &supers, &emitted, &rbs_known)
+                    .map(|root| (name.clone(), root))
+            })
+            .collect();
+        if found.len() == unresolvable.len() {
+            break;
+        }
+        unresolvable = found;
+    }
+
+    // `stamp_generic_reopenings` / `header_type_params`: every generic class
+    // (plain parameters only) the run may open a header for — each
+    // candidate's class, the classes it is nested in, and the shells.
+    let mut names: Vec<String> = candidates
+        .iter()
+        .map(|c| c.class_name.clone())
+        .chain(info.shells.iter().cloned())
+        .flat_map(|n| generics::namespace_prefixes(&n))
+        .collect();
+    names.sort();
+    names.dedup();
+    for n in names {
+        if let Some(spelling) = generics.header_spelling(&n) {
+            info.params.insert(n, spelling);
+        }
+    }
+
+    // `@unresolvable_superclasses[class_name] ||= root`, in candidate order.
+    let mut owners: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<Candidate> = Vec::new();
+    for mut c in candidates {
+        match owner_of(&c.class_name, &unresolvable) {
+            Some(owner) => {
+                if !owners.iter().any(|(n, _)| *n == owner.0) {
+                    owners.push(owner);
+                }
+            }
+            None => {
+                c.decl_header = declaration_header(info, &c.class_name);
+                out.push(c);
+            }
+        }
+    }
+
+    // `unresolvable_superclass_report`: a project superclass when the chain
+    // closes through source classes.
+    let source_classes: HashSet<&str> =
+        info.kinds.iter().filter(|(_, k)| **k == "class").map(|(n, _)| n.as_str()).collect();
+    let report = owners
+        .into_iter()
+        .map(|(class_name, token)| {
+            let mut name = superclasses::bare_superclass_name(&token);
+            let mut root = token.clone();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut project = false;
+            while source_classes.contains(name.as_str()) && seen.insert(name.clone()) {
+                let Some(h) = headers.iter().find(|h| h.full == name) else {
+                    project = true;
+                    break;
+                };
+                let declared = |c: &str| source_classes.contains(c) || rbs_known(c);
+                root = superclasses::resolve_token(&h.token, &h.nesting, &name, &declared);
+                name = superclasses::bare_superclass_name(&root);
+                if rbs_known(&name) {
+                    project = true;
+                    break;
+                }
+            }
+            UnresolvableSuperclass { class_name, superclass: if project { token } else { root }, project }
+        })
+        .collect();
+    (out, report)
+}
+
+/// Reference `SigGenCommand#report_unresolvable_superclasses`.
+fn report_unresolvable_superclasses(report: &[UnresolvableSuperclass]) {
+    let mut project: Vec<(&str, &str)> = report
+        .iter()
+        .filter(|r| r.project)
+        .map(|r| (r.class_name.as_str(), r.superclass.as_str()))
+        .collect();
+    let mut external: Vec<(&str, &str)> = report
+        .iter()
+        .filter(|r| !r.project)
+        .map(|r| (r.class_name.as_str(), r.superclass.as_str()))
+        .collect();
+    project.sort();
+    external.sort();
+    if !project.is_empty() {
+        eprintln!(
+            "rigor sig-gen: skipped {} class(es) whose superclass this run wrote no signature for. \
+             The superclass is declared in the project's source, but its own methods could not be typed, or its \
+             `sig/` file could not be written, so a signature for these subclasses would fail to build \
+             (`RBS::NoSuperclassFoundError`). Annotate or type the superclass's methods, fix its `sig/` file, or \
+             hand-write its declaration, and re-run.",
+            project.len()
+        );
+        for (c, s) in &project {
+            eprintln!("  {c} < {s}");
+        }
+    }
+    if !external.is_empty() {
+        eprintln!(
+            "rigor sig-gen: skipped {} class(es) whose superclass no loaded RBS declares. \
+             A signature for them would fail to build (`RBS::NoSuperclassFoundError`) and would leave the \
+             class LESS typed than it is now. Provide RBS for the superclass — `rbs collection install`, the \
+             gem's own `sig/`, or a `signature_paths:` entry — and re-run.",
+            external.len()
+        );
+        for (c, s) in &external {
+            eprintln!("  {c} < {s}");
+        }
+    }
+}
+
+/// `Writer.writes?`: only a `new_method` candidate is sure to be written.
+fn writes(c: &Candidate) -> bool {
+    c.classification == "new_method"
 }
 
 /// Produce candidates + the `--write` namespace metadata for one source file. A
@@ -481,8 +735,37 @@ fn generate_file_with_info(
         }
     }
     register_meta_classes(&layouts, &mut info);
+    info.headers = superclasses::collect(&parsed);
+    // `register_core_subclass_shell` (#2224): a subclass of a core or stdlib
+    // class is declared as a class shell (`class MyHash < ::Hash[untyped,
+    // untyped]`) so a method returning one never names an undeclared class —
+    // unless the RBS environment already declares it, or the header's nesting
+    // declares a constant of the superclass's first segment (`Foo::Hash`),
+    // which then is the project's class, not core's.
+    for h in &info.headers {
+        if sig_env.class_known(&index, &h.full) || info.shells.contains(&h.full) {
+            continue;
+        }
+        let bare = superclasses::bare_superclass_name(&h.token);
+        if !index.knows_toplevel_class(&bare) {
+            continue;
+        }
+        if !h.token.starts_with("::") {
+            let first = bare.split("::").next().unwrap_or(&bare);
+            let shadowed = (1..=h.nesting.len())
+                .any(|i| fqns.contains(&format!("{}::{first}", h.nesting[..i].join("::"))));
+            if shadowed {
+                continue;
+            }
+        }
+        info.shells.push(h.full.clone());
+        info.core_shells.insert(h.full.clone());
+        info.kinds.entry(h.full.clone()).or_insert("class");
+    }
+    info.shell_files = info.shells.iter().map(|s| (path.to_string(), s.clone())).collect();
     // The print header depends on the WHOLE file's namespace metadata, so it is
-    // stamped once the walks are done rather than at construction.
+    // stamped once the walks are done rather than at construction (and again,
+    // whole-run, by [`finalize_superclasses`]).
     for c in &mut out {
         c.decl_header = declaration_header(&info, &c.class_name);
     }
@@ -552,12 +835,16 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
 /// declared anywhere else (rigor#227). Defaulting to `class` when the map has no
 /// entry keeps the pre-existing spelling for a leaf class.
 fn declaration_header(info: &NamespaceInfo, class_name: &str) -> String {
+    let params = info.params.get(class_name).map_or("", String::as_str);
     if info.kinds.get(class_name) == Some(&"module") {
-        return format!("module {class_name}");
+        return format!("module {class_name}{params}");
     }
     match info.supers.get(class_name) {
-        Some(superclass) => format!("class {class_name} < {superclass}"),
-        None => format!("class {class_name}"),
+        // `SuperclassSpelling.absolute` (#2661): written rooted.
+        Some(superclass) => {
+            format!("class {class_name}{params} < {}", superclasses::absolute(superclass))
+        }
+        None => format!("class {class_name}{params}"),
     }
 }
 
@@ -574,8 +861,8 @@ fn collect_source_fqns(
     out: &mut std::collections::HashSet<String>,
 ) {
     match ast.get(id) {
-        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
-            let fqn = qualify_join(prefix, name);
+        Node::ClassDef { name, rooted, body, .. } | Node::ModuleDef { name, rooted, body, .. } => {
+            let fqn = declaration_prefix(prefix, name, *rooted).join("::");
             out.insert(fqn.clone());
             // The child prefix is the full path split (`A::B` nested under `M`
             // becomes prefix `["M", "A", "B"]` for its own body).
@@ -610,6 +897,16 @@ fn is_class_defining_call(ast: &LoweredAst, value: NodeId) -> bool {
         (recv_name.as_str(), method.as_str()),
         ("Data", "define") | ("Struct", "new")
     )
+}
+
+/// `Source::ConstantPath.declaration_prefix`: the namespace a `class`/`module`
+/// header declares — the enclosing `prefix` plus the written `name`, or, for a
+/// `::`-rooted header (`class ::Box` inside `module A`), the name alone
+/// (reference #722 residue 3: a rooted header re-anchors at the top level).
+fn declaration_prefix(prefix: &[String], name: &str, rooted: bool) -> Vec<String> {
+    let mut out: Vec<String> = if rooted { Vec::new() } else { prefix.to_vec() };
+    out.extend(name.split("::").filter(|s| !s.is_empty()).map(str::to_string));
+    out
 }
 
 /// Join a lexical `prefix` and a (possibly already-namespaced) `name` with `::`.
@@ -722,12 +1019,12 @@ fn walk_namespace(
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
-    let (name, visibilities, body) = match ast.get(id) {
-        Node::ClassDef { name, method_visibilities, body, .. } => {
-            (name, method_visibilities.clone(), body.as_slice())
+    let (name, rooted, visibilities, body) = match ast.get(id) {
+        Node::ClassDef { name, rooted, method_visibilities, body, .. } => {
+            (name, *rooted, method_visibilities.clone(), body.as_slice())
         }
-        Node::ModuleDef { name, method_visibilities, body, .. } => {
-            (name, method_visibilities.clone(), body.as_slice())
+        Node::ModuleDef { name, rooted, method_visibilities, body, .. } => {
+            (name, *rooted, method_visibilities.clone(), body.as_slice())
         }
         // A `Const = Data.define(...) do ... end` block is the new class's own
         // body: the runtime `class_eval`s it into the anonymous class it just
@@ -740,13 +1037,12 @@ fn walk_namespace(
             if layouts.get(&qualify_join(prefix, name)).is_some() =>
         {
             let Node::Call { block_body, .. } = ast.get(*value) else { return };
-            (name, block_visibilities(ast, block_body), block_body.as_slice())
+            (name, false, block_visibilities(ast, block_body), block_body.as_slice())
         }
         _ => return,
     };
 
-    let mut qualified = prefix.to_vec();
-    qualified.push(name.clone());
+    let qualified = declaration_prefix(prefix, name, rooted);
     let class_name = qualified.join("::");
 
     // Collect instance + singleton methods in ONE pass over the class body so
@@ -986,12 +1282,15 @@ fn method_candidate(
             return None;
         }
         let params = render_initialize_params(sig.param_shape);
+        // `block_signature_suffix`: a `&block` belongs AFTER the parens —
+        // inside them (`(…, ?{ (?) -> void })`) RBS rejects the whole file.
+        let block = if sig.param_shape.has_block { " ?{ (*untyped) -> untyped }" } else { "" };
         return Some(Candidate {
             file: path.to_string(),
             class_name: class_name.to_string(),
             method_name: "initialize".to_string(),
             kind: "instance",
-            rbs: format!("def initialize: ({params}) -> void"),
+            rbs: format!("def initialize: ({params}){block} -> void"),
             // The reference stub's `inferred_return` is `untyped` (the rbs is
             // `-> void`, but the candidate carries the fallback type).
             inferred_return: "untyped".to_string(),
@@ -1361,8 +1660,8 @@ fn is_bare_generic_name(erased: &str) -> bool {
 /// (params-observed typing is a later slice), in the reference's
 /// `render_initialize_param_list` order: requireds → optionals (`?untyped`) →
 /// rest (`*untyped`) → keywords (`name: untyped` / `?name: untyped`) → keyword-
-/// rest (`**untyped`) → block (`?{ (?) -> void }`). Posts are omitted (as the
-/// reference does).
+/// rest (`**untyped`). The block is the caller's suffix (`block_signature_suffix`);
+/// posts are not carried by [`ParamShape`] and are omitted.
 fn render_initialize_params(shape: &ParamShape) -> String {
     let mut parts: Vec<String> = Vec::new();
     for _ in 0..shape.required {
@@ -1380,9 +1679,6 @@ fn render_initialize_params(shape: &ParamShape) -> String {
     }
     if shape.has_kwrest {
         parts.push("**untyped".to_string());
-    }
-    if shape.has_block {
-        parts.push("?{ (?) -> void }".to_string());
     }
     parts.join(", ")
 }
@@ -1510,7 +1806,7 @@ fn render_json(candidates: &[Candidate]) {
 fn candidates_json_string(candidates: &[Candidate]) -> String {
     use serde_json::json;
     let rows: Vec<_> = candidates.iter().map(candidate_json).collect();
-    serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap()
+    crate::json_document::stamp_pretty(&serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap(), None)
 }
 
 /// MCP `sig_gen` tool seam (reference `rigor_sig_gen`, a READ-ONLY
@@ -1537,8 +1833,7 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
-    let candidates: Vec<Candidate> =
-        files.iter().flat_map(|p| generate_file(p, false, &sig_env)).collect();
+    let (candidates, _info, _unresolvable) = generate_run(&files, false, &sig_env, &writes);
     candidates_json_string(&candidates)
 }
 
@@ -1570,13 +1865,19 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
 struct WriteResult {
     source: String,
     target: String,
-    /// `"created"` | `"updated"` | `"noop"` | `"skipped_outside_sig_root"`.
+    /// `"created"` | `"updated"` | `"noop"` | `"skipped_outside_sig_root"` |
+    /// `"skipped_invalid_encoding"` | `"skipped_unparseable"`.
     action: &'static str,
     applied: Vec<Candidate>,
     /// Candidates the merge declined because a user-authored member of the same
     /// `(name, kind)` already exists with a DIFFERENT declared return (reference
     /// `merge_into_existing_class`'s `skipped` accumulator). Empty on create.
     skipped: Vec<SkipEntry>,
+    /// The refusal detail (reference `WriteResult#error`), on
+    /// `skipped_invalid_encoding` / `skipped_unparseable` only.
+    error: Option<String>,
+    /// `repaired_headers` (#2580): `Name[params]` per bare header repaired.
+    repaired: Vec<String>,
 }
 
 /// One skipped (user-authored-conflict) candidate + the classification metadata
@@ -1637,14 +1938,43 @@ fn cmd_write(
     // target as its enclosing class (a shell lives in the source file with its
     // constant). Preserves source order per file for stable shell rendering.
     let mut tagged_shells: Vec<(PathBuf, String)> = Vec::new();
-    for f in files {
-        let (candidates, info) = generate_file_with_info(f, include_private, sig_env);
-        for c in candidates {
-            let target =
-                target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout);
-            tagged.push((target, c));
+    // `Generator#written?` under a target writer (#2461): a `new_method`
+    // candidate aimed at a target the writer will write — inside the sig root,
+    // and either missing or an existing UTF-8 file that parses.
+    let sig_root_dir_w = project_root.join(&sig_root);
+    let accepts = |target: &Path| -> bool {
+        if !target.starts_with(&sig_root_dir_w) {
+            return false;
         }
-        for shell in &info.shells {
+        if !target.exists() {
+            return true;
+        }
+        std::fs::read(target)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .is_some_and(|src| ruby_rbs::node::parse(&src).is_ok())
+    };
+    let written = |c: &Candidate| -> bool {
+        writes(c)
+            && accepts(&target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout))
+    };
+    let (all_candidates, run_info, unresolvable) =
+        generate_run(files, include_private, sig_env, &written);
+    for c in all_candidates {
+        let target =
+            target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout);
+        tagged.push((target, c));
+    }
+    {
+        let info = &run_info;
+        // A core-subclass shell rides on its file's written methods; a file
+        // with none writes nothing (reference `declared_by_run`).
+        let files_with_methods: HashSet<&str> =
+            tagged.iter().filter(|(_, c)| writes(c)).map(|(_, c)| c.file.as_str()).collect();
+        for (f, shell) in &info.shell_files {
+            if info.core_shells.contains(shell) && !files_with_methods.contains(f.as_str()) {
+                continue;
+            }
             // Route a shell to its ENCLOSING class's target (a shell rides in the
             // same file as the class it is nested in — e.g. `Rigor::Triage::Selector`
             // routes with `Rigor::Triage`), so a consolidated layout keeps the
@@ -1654,10 +1984,8 @@ fn cmd_write(
                 target_for(f, route_name, &source_root, &sig_root, &project_root, &layout);
             tagged_shells.push((target, shell.clone()));
         }
-        merged.kinds.extend(info.kinds);
-        merged.supers.extend(info.supers);
-        merged.shells.extend(info.shells);
     }
+    merged.absorb(run_info);
 
     // Group by target, preserving first-seen order (reference groups by target).
     // A shell-only target (a file with a `Data.define` but no methods) still gets
@@ -1701,6 +2029,8 @@ fn cmd_write(
                 action: "skipped_outside_sig_root",
                 applied: Vec::new(),
                 skipped: Vec::new(),
+                error: None,
+                repaired: Vec::new(),
             });
             continue;
         }
@@ -1712,6 +2042,7 @@ fn cmd_write(
                 group,
                 &shells,
                 &merged.supers,
+                &merged.params,
                 overwrite,
             ));
             continue;
@@ -1730,12 +2061,20 @@ fn cmd_write(
             action: "created",
             applied: group,
             skipped: Vec::new(),
+            error: None,
+            repaired: Vec::new(),
         });
     }
 
     match format {
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
+    }
+    report_unresolvable_superclasses(&unresolvable);
+    // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
+    // write and did not get one — exit 1.
+    if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
+        return ExitCode::from(1);
     }
     ExitCode::SUCCESS
 }
@@ -1878,7 +2217,10 @@ fn render_tree_node(node: &TreeNode, info: &NamespaceInfo, depth: usize, prefix:
     let qualified = qual.join("::");
     let keyword = node_keyword(node, info, &qualified);
     let superclass = if keyword == "class" {
-        info.supers.get(&qualified).map(|s| format!(" < {s}")).unwrap_or_default()
+        info.supers
+            .get(&qualified)
+            .map(|s| format!(" < {}", superclasses::absolute(s)))
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -1890,7 +2232,8 @@ fn render_tree_node(node: &TreeNode, info: &NamespaceInfo, depth: usize, prefix:
     for child in &node.children {
         body.push_str(&render_tree_node(child, info, depth + 1, &qual));
     }
-    format!("{indent}{keyword} {}{superclass}\n{body}{indent}end\n", node.name)
+    let params = info.params.get(&qualified).map_or("", String::as_str);
+    format!("{indent}{keyword} {}{params}{superclass}\n{body}{indent}end\n", node.name)
 }
 
 /// The declaration keyword for a node (reference `node_keyword`): the recorded
@@ -1910,21 +2253,42 @@ fn node_keyword(node: &TreeNode, info: &NamespaceInfo, qualified: &str) -> &'sta
 /// EVERY result is `noop`, else one line per created / updated / outside-sig-root
 /// target (a `noop` result prints nothing).
 fn render_write_text(results: &[WriteResult]) {
-    if results.iter().all(|r| r.action == "noop") {
+    if results.iter().all(|r| r.action == "noop" && r.skipped.is_empty()) {
         println!("No changes");
         return;
     }
     for r in results {
         match r.action {
             "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
-            "updated" => println!(
-                "updated {} (+{}, skipped {} user-authored)",
-                r.target,
-                r.applied.len(),
-                r.skipped.len()
-            ),
+            "updated" => {
+                // `applied_counts`: `+N`, then the repaired generic headers.
+                let mut counts = format!("+{}", r.applied.len());
+                if !r.repaired.is_empty() {
+                    counts.push_str(&format!(
+                        ", repaired {} generic header(s): {}",
+                        r.repaired.len(),
+                        r.repaired.join(", ")
+                    ));
+                }
+                println!("updated {} ({counts}, skipped {} user-authored)", r.target, r.skipped.len());
+            }
             "skipped_outside_sig_root" => {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target)
+            }
+            "skipped_invalid_encoding" => {
+                println!(
+                    "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
+                    r.target
+                );
+                println!(
+                    "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
+                     read faithfully."
+                );
+            }
+            "skipped_unparseable" => {
+                println!("REFUSED {} — the existing file was not updated", r.target);
+                println!("  {}", r.error.as_deref().unwrap_or_default());
+                println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
             }
             _ => {}
         }
@@ -1959,13 +2323,23 @@ fn render_write_json(results: &[WriteResult]) {
                     obj
                 })
                 .collect();
-            json!({
+            let mut row = json!({
                 "source": r.source, "target": r.target, "action": r.action,
                 "applied": applied, "skipped": skipped,
-            })
+            });
+            if let Some(e) = &r.error {
+                row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            if !r.repaired.is_empty() {
+                row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
+            }
+            row
         })
         .collect();
-    println!("{}", serde_json::to_string_pretty(&json!({ "results": rows })).unwrap());
+    println!(
+        "{}",
+        crate::json_document::stamp_pretty(&serde_json::to_string_pretty(&json!({ "results": rows })).unwrap(), None)
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -2122,6 +2496,7 @@ struct ClassDeclInfo {
 /// order) the class is found (→ merge) or not (→ append), re-parsing fresh from
 /// the current source before each so byte offsets are never stale. The file is
 /// written only when at least one method was applied (`updated`).
+#[allow(clippy::too_many_arguments)]
 fn update_existing(
     source_path: String,
     target: &Path,
@@ -2129,17 +2504,41 @@ fn update_existing(
     candidates: Vec<Candidate>,
     shells: &[String],
     supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     overwrite: bool,
 ) -> WriteResult {
-    let Ok(source) = std::fs::read_to_string(target) else {
+    let Ok(bytes) = std::fs::read(target) else {
         return WriteResult {
             source: source_path,
             target: target_str,
             action: "noop",
             applied: Vec::new(),
             skipped: Vec::new(),
+            error: None,
+            repaired: Vec::new(),
         };
     };
+    // v0.4.7 (#2480/#2587): an existing target that is not UTF-8, or does not
+    // parse as RBS, is REFUSED (left untouched, the run exits 1), not a
+    // silent `noop`.
+    let refused = |action: &'static str, error: String| WriteResult {
+        source: source_path.clone(),
+        target: target_str.clone(),
+        action,
+        applied: Vec::new(),
+        skipped: Vec::new(),
+        error: Some(error),
+        repaired: Vec::new(),
+    };
+    let Ok(source) = String::from_utf8(bytes) else {
+        return refused("skipped_invalid_encoding", format!("{target_str} is not valid UTF-8"));
+    };
+    if let Some(detail) = rbs_parse_error::parsing_error_message(&target_str, &source) {
+        return refused(
+            "skipped_unparseable",
+            format!("{target_str} does not parse as RBS: {detail}"),
+        );
+    }
 
     // Shell injection on the MERGE path is deferred: when a file already exists,
     // any shell it needs was written on the CREATE run (`render_new_file`), so a
@@ -2147,12 +2546,20 @@ fn update_existing(
     // only uncovered case is merging into a USER-authored sig that lacks a shell
     // for a `Data.define` return — a documented follow-up, not a regression.
     let _ = shells;
-    let MergeOutcome { source: merged, action, applied, skipped } =
-        apply_merge(source, candidates, supers, overwrite);
+    let MergeOutcome { source: merged, action, applied, skipped, repaired } =
+        apply_merge_with(source, candidates, supers, params, overwrite);
     if action == "updated" {
         let _ = std::fs::write(target, &merged);
     }
-    WriteResult { source: source_path, target: target_str, action, applied, skipped }
+    WriteResult {
+        source: source_path,
+        target: target_str,
+        action,
+        applied,
+        skipped,
+        error: None,
+        repaired,
+    }
 }
 
 /// The pure result of merging a candidate group into an existing `.rbs` source
@@ -2162,30 +2569,161 @@ struct MergeOutcome {
     action: &'static str,
     applied: Vec<Candidate>,
     skipped: Vec<SkipEntry>,
+    /// `repaired_headers`: one `Name[params]` per bare generic header given
+    /// its parameters (#2580/#2602).
+    repaired: Vec<String>,
 }
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
 /// `action: "noop"`; otherwise each class group (first-seen order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
+#[cfg(test)]
 fn apply_merge(
+    source: String,
+    candidates: Vec<Candidate>,
+    supers: &HashMap<String, String>,
+    overwrite: bool,
+) -> MergeOutcome {
+    apply_merge_with(source, candidates, supers, &HashMap::new(), overwrite)
+}
+
+/// [`apply_merge`] with the run's generic header spellings (`params`): new
+/// headers carry them, and — last — every bare header in the file for a class
+/// in `params` is repaired (reference `repair_generic_headers`).
+fn apply_merge_with(
     mut source: String,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     overwrite: bool,
 ) -> MergeOutcome {
     // Parse-failure gate: a malformed target is left byte-untouched (reference
     // `parse_signature` → nil → `:noop`).
     if ruby_rbs::node::parse(&source).is_err() {
-        return MergeOutcome { source, action: "noop", applied: Vec::new(), skipped: Vec::new() };
+        return MergeOutcome {
+            source,
+            action: "noop",
+            applied: Vec::new(),
+            skipped: Vec::new(),
+            repaired: Vec::new(),
+        };
     }
     let mut applied: Vec<Candidate> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
-        merge_class(&mut source, &class_name, group, supers, overwrite, &mut applied, &mut skipped);
+        merge_class(&mut source, &class_name, group, supers, params, overwrite, &mut applied, &mut skipped);
     }
-    let action = if applied.is_empty() { "noop" } else { "updated" };
-    MergeOutcome { source, action, applied, skipped }
+    let repaired = repair_generic_headers(&mut source, params);
+    // `state_changed?`: a repaired header is a change too.
+    let action = if applied.is_empty() && repaired.is_empty() { "noop" } else { "updated" };
+    MergeOutcome { source, action, applied, skipped, repaired }
+}
+
+/// Reference `Writer#repair_generic_headers` (#2580/#2602): a declaration in
+/// this file for a class the run stamps generic, opened with no type
+/// parameters, is a guaranteed `GenericParameterMismatchError`; it gets the
+/// stamp's spelling. A declaration whose body names one of the parameters
+/// (as a word not preceded by `::` or `:`) is left bare — under the
+/// parameters that name would bind to the parameter. Returns one
+/// `Name[params]` entry per declaration repaired.
+fn repair_generic_headers(source: &mut String, params: &HashMap<String, String>) -> Vec<String> {
+    let mut names: Vec<&String> = params.keys().collect();
+    names.sort();
+    let mut repaired: Vec<String> = Vec::new();
+    for name in names {
+        let spelling = &params[name];
+        let param_names: Vec<String> = spelling
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .filter_map(|p| p.split_whitespace().last().map(str::to_string))
+            .collect();
+        // (name end, body) of every bare opening, from a fresh parse.
+        let bare: Vec<(usize, usize)> = match ruby_rbs::node::parse(source) {
+            Ok(sig) => {
+                let mut out = Vec::new();
+                bare_openings(source, sig.declarations().iter(), &[], name, &mut out);
+                out
+            }
+            Err(_) => continue,
+        };
+        if bare.is_empty() {
+            continue;
+        }
+        let shadowed = bare.iter().any(|&(start, end)| {
+            let body = &source[start..end];
+            param_names.iter().any(|p| names_word(body, p))
+        });
+        if shadowed {
+            continue;
+        }
+        let mut positions: Vec<usize> = bare.iter().map(|&(start, _)| start).collect();
+        positions.sort_unstable();
+        for &pos in positions.iter().rev() {
+            source.insert_str(pos, spelling);
+        }
+        for _ in &bare {
+            repaired.push(format!("{name}{spelling}"));
+        }
+    }
+    repaired
+}
+
+/// Every declaration of `target` in `decls` with no type parameters, as
+/// `(name end offset, declaration end offset)`.
+fn bare_openings<'a>(
+    source: &str,
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    target: &str,
+    out: &mut Vec<(usize, usize)>,
+) {
+    for decl in decls {
+        let (local, members, bare, name_end, decl_end) = match &decl {
+            RbsNode::Class(c) => (
+                decl_full_name(&c.name()),
+                c.members(),
+                c.type_params().iter().next().is_none(),
+                c.name_location().end(),
+                c.location().end(),
+            ),
+            RbsNode::Module(m) => (
+                decl_full_name(&m.name()),
+                m.members(),
+                m.type_params().iter().next().is_none(),
+                m.name_location().end(),
+                m.location().end(),
+            ),
+            _ => continue,
+        };
+        let full = if prefix.is_empty() { local.clone() } else { format!("{}::{}", prefix.join("::"), local) };
+        if full == target && bare {
+            let start = clamp_offset(name_end, source.len());
+            out.push((start, clamp_offset(decl_end, source.len()).max(start)));
+        }
+        let mut child = prefix.to_vec();
+        child.push(local);
+        bare_openings(source, members.iter(), &child, target, out);
+    }
+}
+
+/// `/(?<![\w:])NAME(?!\w)/` over `text`.
+fn names_word(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(i) = text[from..].find(name) {
+        let at = from + i;
+        let end = at + name.len();
+        let before_ok = at == 0 || !(is_word(bytes[at - 1]) || bytes[at - 1] == b':');
+        let after_ok = end >= bytes.len() || !is_word(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 /// Group candidates by `class_name`, preserving first-seen class order
@@ -2205,11 +2743,13 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
 /// Merge one class group: find the class by FQN (re-parsing fresh so offsets are
 /// current), then merge into it or append a new class block (reference
 /// `merge_class`).
+#[allow(clippy::too_many_arguments)]
 fn merge_class(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
     skipped: &mut Vec<SkipEntry>,
@@ -2221,7 +2761,14 @@ fn merge_class(
     };
     match found {
         Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
-        None => append_new_class(source, class_name, candidates, supers.get(class_name), applied),
+        None => append_new_class(
+            source,
+            class_name,
+            candidates,
+            supers.get(class_name),
+            params.get(class_name).map_or("", String::as_str),
+            applied,
+        ),
     }
 }
 
@@ -2499,6 +3046,7 @@ fn append_new_class(
     class_name: &str,
     candidates: Vec<Candidate>,
     superclass: Option<&String>,
+    params: &str,
     applied: &mut Vec<Candidate>,
 ) {
     let body = candidates
@@ -2507,8 +3055,8 @@ fn append_new_class(
         .collect::<Vec<_>>()
         .join("\n");
     let header = match superclass {
-        Some(s) => format!("class {class_name} < {s}"),
-        None => format!("class {class_name}"),
+        Some(s) => format!("class {class_name}{params} < {}", superclasses::absolute(s)),
+        None => format!("class {class_name}{params}"),
     };
     if !source.ends_with('\n') {
         source.push('\n');

@@ -24,9 +24,9 @@ use std::process::ExitCode;
 /// when both are present).
 const DEFAULT_PATH: &str = ".rigor.dist.yml";
 
-/// `rigor init [--force] [--path PATH]` — write a starter config. Exit 0 on
-/// success, 1 if the destination exists and `--force` was not given, 64 on a
-/// usage error.
+/// `rigor init [--force] [--path PATH] [--no-plugins]` — write a starter
+/// config. Exit 0 on success, 1 if the destination exists and `--force` was
+/// not given, 64 on a usage error or an unwritable destination.
 pub fn cmd_init(args: &[String]) -> ExitCode {
     // Reference `run_init`'s table, `opts.on` order.
     const SWITCHES: &[crate::optparse::Switch] = &[
@@ -48,6 +48,17 @@ pub fn cmd_init(args: &[String]) -> ExitCode {
             "=PATH",
             &["Configuration file path"],
         ),
+        // v0.4.7 (#2557). The port's template detects no plugins from
+        // Gemfile.lock, so the switch is accepted and inert.
+        crate::optparse::Switch::new(
+            "no-plugins",
+            &[("no-plugins", false)],
+            crate::optparse::ArgStyle::Flag,
+            crate::optparse::ValueKind::Raw,
+            "--no-plugins",
+            "",
+            &["Write no commented plugin suggestions from Gemfile.lock"],
+        ),
     ];
     const PARSER: crate::optparse::OptParser =
         crate::optparse::OptParser::new("Usage: rigor init [options]", SWITCHES);
@@ -67,6 +78,7 @@ pub fn cmd_init(args: &[String]) -> ExitCode {
         match key {
             "force" => force = true,
             "path" => path = value.unwrap().as_str().to_string(),
+            "no-plugins" => {}
             _ => unreachable!("the switch table is closed"),
         }
     }
@@ -78,8 +90,16 @@ pub fn cmd_init(args: &[String]) -> ExitCode {
     }
 
     if let Err(e) = std::fs::write(&path, INIT_TEMPLATE) {
-        eprintln!("rigor init: cannot write {path}: {e}");
-        return ExitCode::from(1);
+        // v0.4.7 (#2574): a destination that cannot be written is a bad path
+        // argument — usage exit 64, with the bare errno text (Ruby's
+        // `e.message.sub(/ @ .*\z/m, "")`; Rust's ` (os error N)` dropped).
+        let reason = e.to_string();
+        let reason = match reason.rfind(" (os error ") {
+            Some(i) => reason[..i].to_string(),
+            None => reason,
+        };
+        eprintln!("rigor init: cannot write {path}: {reason}");
+        return ExitCode::from(64);
     }
 
     println!("Created {path}");

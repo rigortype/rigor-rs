@@ -29,13 +29,77 @@ type Span = (usize, usize);
 /// `(span of the block call or the `for` node, locals its receiver or
 /// collection may evaluate to)`, one entry per mutating construct.
 pub(crate) fn collect(root: &PrismNode<'_>) -> Vec<(Span, Vec<String>)> {
-    let mut w = Walk { out: Vec::new() };
+    let mut w = Walk { out: Vec::new(), closures: 0, params: Vec::new() };
     w.visit(root);
     w.out
 }
 
 struct Walk {
     out: Vec<(Span, Vec<String>)>,
+    /// How many blocks / lambdas of the current local scope enclose the
+    /// visit: a depth-0 local read inside one is block-local.
+    closures: u32,
+    /// The innermost `def`'s parameters its body never writes: a
+    /// `Dynamic[top]` root an element widening leaves as it is (the
+    /// reference widens nothing there, so a chain narrowing on `h.last`
+    /// survives `h.last << g`).
+    params: Vec<String>,
+}
+
+/// Upstream v0.4.7 (#2395, `ReceiverAlias::ELEMENT_EXPOSING_CALLS`): calls
+/// whose result hands its caller the receiver's own element objects.
+const ELEMENT_EXPOSING_CALLS: [&str; 7] =
+    ["values", "dup", "clone", "each", "map", "each_with_index", "with_index"];
+
+/// `ReceiverAlias.element_sources`: peel every blockless
+/// [`ELEMENT_EXPOSING_CALLS`] call off `receiver` (`h.values.each`,
+/// `a.dup.each`, `a.each_with_index.map`), depth-capped like `candidates`.
+fn element_sources<'pr>(receiver: Option<PrismNode<'pr>>) -> Option<PrismNode<'pr>> {
+    const WALK_DEPTH_CAP: u32 = 6;
+    let mut node = receiver?;
+    let mut depth = 0;
+    while let Some(c) = node.as_call_node() {
+        let name = constant_string(c.name().as_slice());
+        if c.block().is_some() || !ELEMENT_EXPOSING_CALLS.contains(&name.as_str()) {
+            break;
+        }
+        depth += 1;
+        if depth > WALK_DEPTH_CAP {
+            return None;
+        }
+        node = c.receiver()?;
+    }
+    Some(node)
+}
+
+/// Upstream v0.4.7 (#2395, `ElementReadWidening.element_read_path`): the
+/// local read an element-read chain (`a[i]`, `a.first`, `a.last`,
+/// `a.dig(…)`, blockless, `[]` with one argument) is rooted at, or `None`
+/// when `node` is no such chain.
+fn element_read_root<'pr>(node: Option<PrismNode<'pr>>) -> Option<crate::ruby_prism::LocalVariableReadNode<'pr>> {
+    let mut cursor = node?;
+    let mut steps = 0;
+    while let Some(c) = cursor.as_call_node() {
+        if c.block().is_some() {
+            return None;
+        }
+        let argc = c.arguments().map_or(0, |a| a.arguments().iter().count());
+        let ok = match constant_string(c.name().as_slice()).as_str() {
+            "[]" => argc == 1,
+            "first" | "last" => argc == 0,
+            "dig" => argc > 0,
+            _ => false,
+        };
+        if !ok {
+            return None;
+        }
+        steps += 1;
+        cursor = c.receiver()?;
+    }
+    if steps == 0 {
+        return None;
+    }
+    cursor.as_local_variable_read_node()
 }
 
 fn span_of(n: &PrismNode<'_>) -> Span {
@@ -215,7 +279,7 @@ fn candidates(node: Option<PrismNode<'_>>, depth: u32, out: &mut Vec<String>) {
 impl Walk {
     fn record(&mut self, span: Span, receiver: Option<PrismNode<'_>>) {
         let mut names = Vec::new();
-        candidates(receiver, 0, &mut names);
+        candidates(element_sources(receiver), 0, &mut names);
         if !names.is_empty() {
             self.out.push((span, names));
         }
@@ -242,7 +306,66 @@ impl<'pr> Visit<'pr> for Walk {
                 self.record(span_of(&node.as_node()), node.receiver());
             }
         }
+        // Upstream v0.4.7 (#2395, `widen_outer_element_read`, and the
+        // straight-line `ElementReadWidening.widen_element_read`): a mutator
+        // whose receiver is an element read rooted at a local that is not
+        // block-local (`[0].each { |i| a[i] << 2 }`, `loop { b[0] << 2 }`,
+        // `c[0] << 2`) changes an element that local's binding carries.
+        // Keyed by the mutator call's own span, so the enclosing block call
+        // or loop widens the local, as a straight-line statement does.
+        if is_shape_mutator(&constant_string(node.name().as_slice())) {
+            if let Some(read) = element_read_root(node.receiver()) {
+                let name = constant_string(read.name().as_slice());
+                let local = read.depth() > 0 || self.closures == 0;
+                let untyped_param = read.depth() == self.closures && self.params.contains(&name);
+                if local && !untyped_param {
+                    self.out.push((span_of(&node.as_node()), vec![name]));
+                }
+            }
+        }
         crate::ruby_prism::visit_call_node(self, node);
+    }
+
+    fn visit_block_node(&mut self, node: &crate::ruby_prism::BlockNode<'pr>) {
+        self.closures += 1;
+        crate::ruby_prism::visit_block_node(self, node);
+        self.closures -= 1;
+    }
+
+    fn visit_lambda_node(&mut self, node: &crate::ruby_prism::LambdaNode<'pr>) {
+        self.closures += 1;
+        crate::ruby_prism::visit_lambda_node(self, node);
+        self.closures -= 1;
+    }
+
+    fn visit_def_node(&mut self, node: &crate::ruby_prism::DefNode<'pr>) {
+        let saved = std::mem::replace(&mut self.closures, 0);
+        let mut params = Vec::new();
+        parameter_names(node.parameters().map(|p| p.as_node()), &mut params);
+        if let Some(body) = node.body() {
+            let written: Vec<String> = descendants(&body)
+                .iter()
+                .filter_map(|n| {
+                    if let Some(w) = n.as_local_variable_write_node() {
+                        Some(w.name())
+                    } else if let Some(w) = n.as_local_variable_or_write_node() {
+                        Some(w.name())
+                    } else if let Some(w) = n.as_local_variable_and_write_node() {
+                        Some(w.name())
+                    } else if let Some(w) = n.as_local_variable_operator_write_node() {
+                        Some(w.name())
+                    } else {
+                        n.as_local_variable_target_node().map(|t| t.name())
+                    }
+                })
+                .map(|id| constant_string(id.as_slice()))
+                .collect();
+            params.retain(|p| !written.contains(p));
+        }
+        let saved_params = std::mem::replace(&mut self.params, params);
+        crate::ruby_prism::visit_def_node(self, node);
+        self.closures = saved;
+        self.params = saved_params;
     }
 
     fn visit_for_node(&mut self, node: &crate::ruby_prism::ForNode<'pr>) {
