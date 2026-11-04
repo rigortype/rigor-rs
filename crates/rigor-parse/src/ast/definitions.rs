@@ -151,28 +151,38 @@ pub(crate) fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
 
 /// ADR-35 slice 1 (`def.override-visibility-reduced`): discover a class/module
 /// body's instance-method VISIBILITY table + its `include`/`prepend` ancestor
-/// names, reading the Prism body BEFORE lowering. Mirrors
-/// `scope_indexer.rb#build_discovered_method_visibilities` /
-/// `collect_includes` EXACTLY (the witness set must stay ⊆ the reference's):
+/// names, reading the Prism body BEFORE lowering. Mirrors the DIRECT-statement
+/// half of the reference's `scope_indexer.rb#build_method_visibility_tables`
+/// (v0.4.4, #1911/#1819/#1633) and `collect_includes` (the witness set must
+/// stay ⊆ the reference's; everything the direct walk cannot vouch for is
+/// contested or possible in [`super::ancestry_facts`]):
 ///
 ///   * the body is walked left-to-right with a running default that starts
 ///     [`Visibility::Public`];
-///   * a bare `private` / `protected` / `public` call (receiver-less, NO args)
-///     FLIPS the running default for subsequent `def`s;
-///   * `private :foo, :bar` / `private "foo"` (literal symbol/string args ONLY)
-///     BACK-PATCHES those named methods to that visibility WITHOUT changing the
-///     running default; a non-literal arg in the list is ignored;
-///   * a plain `def foo` (receiver-less) records `foo` at the running default;
-///   * a `def foo` nested as an ARGUMENT to a modifier call (`private def foo`)
-///     is recorded at the (unchanged) running default — NOT at the modifier's
-///     visibility — exactly mirroring the reference's tracking gap;
-///   * `include X` / `prepend X` collect `X`'s last path component (mirroring how
-///     `superclass` is captured) for the MRO ancestor walk;
+///   * a visibility call ([`visibility_call_parts`]: receiverless or on
+///     `self`, or `send(:private, …)`; a block is ignored) with NO arguments
+///     FLIPS the running default for subsequent `def`s and `attr_*` members;
+///   * with arguments it leaves the default alone and, per argument: a
+///     receiverless `def` (`private def foo`) records at the CALL's visibility;
+///     a literal name (`private :foo`, `private "foo"`, each literal element of
+///     `private %i[foo bar]`) back-patches that name; an `attr_*` call
+///     (`private attr_reader :x`) back-patches its members to the call's
+///     visibility;
+///     anything else records nothing (`private def self.x` and a splat are
+///     contested by the census);
+///   * a plain `def foo` (receiver-less) records `foo` at the running default,
+///     and a receiverless `attr_reader` / `attr_writer` / `attr_accessor`
+///     back-patches its literal members (`x`, `x=`) to it;
+///   * `include X` / `prepend X` collect `X`'s written path for the MRO walk;
 ///   * a singleton def (`def self.x`) is EXCLUDED from the visibility table.
 ///
-/// Back-patches are applied to the LAST recorded entry for a name (a reopened
-/// `def` then `private :name` re-marks it), matching the reference's
-/// last-write-wins accumulator.
+/// The table is LAST-WRITE-WINS per name, as the reference's hash is: a write
+/// to a recorded name replaces its value in place. An `attr_*` member or a
+/// named target only ever re-marks a recorded name: the reference records
+/// those slots too, but a slot no `def` wrote does not make its owner a
+/// definer there (oracle: an `attr_reader`-only parent never answers
+/// `def.override-visibility-reduced`), and the port's override walk reads any
+/// recorded slot as one.
 pub(crate) fn discover_visibilities_and_includes(
     body: &PrismNode<'_>,
 ) -> (Vec<(String, Visibility)>, Vec<String>) {
@@ -193,6 +203,58 @@ pub(crate) fn discover_visibilities_and_includes(
     (vis, includes)
 }
 
+/// The bare calls that set the running default (reference `VISIBILITY_TOGGLES`):
+/// the three modifiers and `module_function`, which the walk does not track as
+/// a value.
+pub(crate) const VISIBILITY_TOGGLES: [&str; 4] = ["private", "protected", "public", "module_function"];
+
+/// Reference v0.4.4 `visibility_call_parts` (#1633): `(name, arguments)` for a
+/// call Ruby runs as one of [`VISIBILITY_TOGGLES`] on the body's self — written
+/// receiverless or on `self` (`self.private`), or sent with a literal name
+/// (`send(:private, :x)`, `__send__(:private)`). A block is ignored, as
+/// `Module#private` ignores it. `None` for any other call.
+pub(crate) fn visibility_call_parts<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+) -> Option<(String, Vec<PrismNode<'pr>>)> {
+    if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+        return None;
+    }
+    let mut name = constant_string(call.name().as_slice());
+    let mut args = collect_call_args(call);
+    if name == "send" || name == "__send__" {
+        name = args.first().and_then(literal_symbol_or_string_name)?;
+        args.remove(0);
+    }
+    VISIBILITY_TOGGLES.contains(&name.as_str()).then_some((name, args))
+}
+
+/// The reference's `ATTR_MACROS`.
+const ATTR_MACROS: [&str; 3] = ["attr_reader", "attr_writer", "attr_accessor"];
+
+/// The members a receiverless `attr_reader` / `attr_writer` / `attr_accessor`
+/// call defines (`x`, `x=`), one per literal name argument; empty for any other
+/// call (reference `attr_visibility_call?` + `each_attr_macro_name`).
+pub(crate) fn attr_macro_members(call: &ruby_prism::CallNode<'_>) -> Vec<String> {
+    if call.receiver().is_some() {
+        return Vec::new();
+    }
+    let macro_name = constant_string(call.name().as_slice());
+    if !ATTR_MACROS.contains(&macro_name.as_str()) {
+        return Vec::new();
+    }
+    let mut members = Vec::new();
+    for arg in collect_call_args(call) {
+        let Some(base) = literal_symbol_or_string_name(&arg) else { continue };
+        if macro_name != "attr_writer" {
+            members.push(base.clone());
+        }
+        if macro_name != "attr_reader" {
+            members.push(format!("{base}="));
+        }
+    }
+    members
+}
+
 /// Apply one direct body statement to the running visibility default + the
 /// discovered tables. See [`discover_visibilities_and_includes`] for the rules.
 fn process_visibility_stmt(
@@ -204,37 +266,31 @@ fn process_visibility_stmt(
     // A receiver-less `def name` records at the running default.
     if let Some(def) = stmt.as_def_node() {
         if def.receiver().is_none() {
-            vis.push((constant_string(def.name().as_slice()), *current));
+            record_visibility(vis, constant_string(def.name().as_slice()), *current);
         }
         return;
     }
     let Some(call) = stmt.as_call_node() else {
         return;
     };
+    if let Some((name, args)) = visibility_call_parts(&call) {
+        if let Some(modifier) = visibility_of_modifier(&name) {
+            if args.is_empty() {
+                // Bare modifier ⇒ flip the running default.
+                *current = modifier;
+            } else {
+                for arg in &args {
+                    apply_visibility_argument(arg, modifier, vis);
+                }
+            }
+        }
+        return;
+    }
     // Modifier / mixin calls only ever have an implicit-self receiver.
     if call.receiver().is_some() {
         return;
     }
     let name = constant_string(call.name().as_slice());
-    if let Some(modifier) = visibility_of_modifier(&name) {
-        let args = collect_call_args(&call);
-        if args.is_empty() {
-            // Bare modifier ⇒ flip the running default.
-            *current = modifier;
-        } else {
-            // `private :foo, …` ⇒ back-patch the named methods (running default
-            // unchanged for this form).
-            for arg in &args {
-                if let Some(target) = literal_symbol_or_string_name(arg) {
-                    back_patch_visibility(vis, &target, modifier);
-                }
-            }
-            // A `private def foo` arg records the nested def at the UNCHANGED
-            // running default (the reference's tracking gap).
-            record_nested_defs(&args, *current, vis);
-        }
-        return;
-    }
     if name == "include" || name == "prepend" {
         for arg in &collect_call_args(&call) {
             // Capture the FULL written constant path (`Foo::Bar`, not just `Bar`)
@@ -246,6 +302,43 @@ fn process_visibility_stmt(
             if !path.is_empty() {
                 includes.push(path);
             }
+        }
+        return;
+    }
+    for member in attr_macro_members(&call) {
+        back_patch_visibility(vis, &member, *current);
+    }
+}
+
+/// One argument of a direct `private` / `protected` / `public` call (reference
+/// `apply_visibility_argument`): the members it defines or names take the
+/// call's visibility.
+fn apply_visibility_argument(
+    arg: &PrismNode<'_>,
+    modifier: Visibility,
+    vis: &mut Vec<(String, Visibility)>,
+) {
+    if let Some(def) = arg.as_def_node() {
+        if def.receiver().is_none() {
+            record_visibility(vis, constant_string(def.name().as_slice()), modifier);
+        }
+        return;
+    }
+    if let Some(array) = arg.as_array_node() {
+        for element in array.elements().iter() {
+            if let Some(target) = literal_symbol_or_string_name(&element) {
+                back_patch_visibility(vis, &target, modifier);
+            }
+        }
+        return;
+    }
+    if let Some(target) = literal_symbol_or_string_name(arg) {
+        back_patch_visibility(vis, &target, modifier);
+        return;
+    }
+    if let Some(call) = arg.as_call_node() {
+        for member in attr_macro_members(&call) {
+            back_patch_visibility(vis, &member, modifier);
         }
     }
 }
@@ -270,7 +363,7 @@ fn collect_call_args<'pr>(call: &ruby_prism::CallNode<'pr>) -> Vec<PrismNode<'pr
 
 /// The literal method name a `private :foo` / `private "foo"` argument names, or
 /// `None` for any non-literal (dynamic) argument — which the reference ignores.
-fn literal_symbol_or_string_name(arg: &PrismNode<'_>) -> Option<String> {
+pub(crate) fn literal_symbol_or_string_name(arg: &PrismNode<'_>) -> Option<String> {
     if let Some(sym) = arg.as_symbol_node() {
         return Some(String::from_utf8_lossy(sym.unescaped()).into_owned());
     }
@@ -280,28 +373,22 @@ fn literal_symbol_or_string_name(arg: &PrismNode<'_>) -> Option<String> {
     None
 }
 
-/// Re-mark the LAST recorded entry for `name` to `visibility` (last-write-wins,
-/// matching the reference accumulator). No-op if the name was never recorded.
-fn back_patch_visibility(vis: &mut [(String, Visibility)], name: &str, visibility: Visibility) {
-    if let Some(slot) = vis.iter_mut().rev().find(|(n, _)| n == name) {
+/// Write `name`'s slot: replace a recorded value in place, else append
+/// (last-write-wins, the reference's hash).
+fn record_visibility(vis: &mut Vec<(String, Visibility)>, name: String, visibility: Visibility) {
+    if let Some(slot) = vis.iter_mut().find(|(n, _)| *n == name) {
         slot.1 = visibility;
+    } else {
+        vis.push((name, visibility));
     }
 }
 
-/// Record any `def`s nested directly inside a modifier call's argument list
-/// (`private def foo`) at the supplied running default. Mirrors the reference's
-/// full-subtree recursion landing the inner def at the unchanged default.
-fn record_nested_defs(
-    args: &[PrismNode<'_>],
-    current: Visibility,
-    vis: &mut Vec<(String, Visibility)>,
-) {
-    for arg in args {
-        if let Some(def) = arg.as_def_node() {
-            if def.receiver().is_none() {
-                vis.push((constant_string(def.name().as_slice()), current));
-            }
-        }
+/// Re-mark the recorded entry for `name` to `visibility`. No-op if the name was
+/// never recorded (the reference creates the slot; the port declines on a name
+/// its tables do not hold).
+fn back_patch_visibility(vis: &mut [(String, Visibility)], name: &str, visibility: Visibility) {
+    if let Some(slot) = vis.iter_mut().find(|(n, _)| n == name) {
+        slot.1 = visibility;
     }
 }
 

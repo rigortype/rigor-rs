@@ -376,7 +376,7 @@ impl SourceIndex {
         self.override_classes.get(q).is_some_and(|e| {
             e.methods.contains(method) || e.method_visibilities.contains_key(method)
         }) || self.ancestry.possible.contains(&key)
-            || self.ancestry.contested.contains(&key)
+            || self.contested_slot(q, method)
             || self.owner_defines(q, method, DefKind::Instance)
             || self.owner_defines(q, method, DefKind::Singleton)
             || self.discovered_methods.get(q).is_some_and(|m| m.contains(method))
@@ -386,7 +386,16 @@ impl SourceIndex {
     /// a `possible` def or a contested visibility slot.
     fn uncertain_definer(&self, owner: &str, method: &str) -> bool {
         let key = (owner.to_string(), method.to_string());
-        self.ancestry.possible.contains(&key) || self.ancestry.contested.contains(&key)
+        self.ancestry.possible.contains(&key) || self.contested_slot(owner, method)
+    }
+
+    /// Whether `owner`'s `method` slot is contested, by name or by the
+    /// wildcard a `private(*names)` call writes (v0.4.4 `contest_class`).
+    fn contested_slot(&self, owner: &str, method: &str) -> bool {
+        let contested = |name: &str| {
+            self.ancestry.contested.contains(&(owner.to_string(), name.to_string()))
+        };
+        contested(method) || contested(MIXIN_WILDCARD)
     }
 
     /// Upstream v0.4.1 (#1594, ADR-119 C2-b1): whether a call of `method` on

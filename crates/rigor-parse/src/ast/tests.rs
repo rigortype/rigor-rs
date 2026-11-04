@@ -1739,14 +1739,42 @@ fn discovers_string_arg_back_patch() {
 }
 
 #[test]
-fn private_def_modifier_records_at_default_not_private() {
-    // `private def foo; end` — the wrap-around form is NOT tracked as a
-    // visibility change: `foo` records at the running default (Public),
-    // mirroring the reference gap (keeps the witness set ⊆ reference's).
-    let src = b"class C\n  private def foo\n  end\nend\n";
+fn private_def_modifier_records_at_the_calls_visibility() {
+    // v0.4.4 (#1819/#1911): `private def foo` records `foo` at the CALL's
+    // visibility, whatever the running default (`private; public def bar` is
+    // public), and leaves the default alone (`baz` stays private).
+    let src = b"class C\n  private def foo\n  end\n  private\n  public def bar = 1\n  def baz = 1\nend\n";
     let ast = lower(&crate::parse(src));
     let (vis, _) = class_vis_includes(&ast);
-    assert_eq!(vis, vec![("foo".to_string(), Visibility::Public)]);
+    assert_eq!(
+        vis,
+        vec![
+            ("foo".to_string(), Visibility::Private),
+            ("bar".to_string(), Visibility::Public),
+            ("baz".to_string(), Visibility::Private),
+        ]
+    );
+}
+
+#[test]
+fn self_send_array_and_attr_visibility_forms() {
+    // v0.4.4 (#1633): `self.private` and `send(:protected)` toggle; `private
+    // %i[..]` back-patches each literal; an `attr_*` member re-marks a
+    // recorded name (never creates one); the table is last-write-wins.
+    let src = b"class C\n  def a = 1\n  def b = 1\n  def x = 1\n  self.private\n  def c = 1\n  \
+send(:protected)\n  def d = 1\n  public %i[a c]\n  attr_reader :x, :y\n  def b = 2\nend\n";
+    let ast = lower(&crate::parse(src));
+    let (vis, _) = class_vis_includes(&ast);
+    assert_eq!(
+        vis,
+        vec![
+            ("a".to_string(), Visibility::Public),
+            ("b".to_string(), Visibility::Protected),
+            ("x".to_string(), Visibility::Protected),
+            ("c".to_string(), Visibility::Public),
+            ("d".to_string(), Visibility::Protected),
+        ]
+    );
 }
 
 #[test]
