@@ -1983,9 +1983,9 @@ fn analyze_files(
     // `File.file?` — a directory earns the row too). Run-level, not per-file:
     // upstream these lead `pre_file_diagnostics` — AHEAD of the
     // `expansion.errors` rows `prepend_path_errors` splices in (which is why
-    // that fn skips leading `pre-eval.*` entries) — and the `disable:` filter
-    // never reaches them (oracle: `disable: [pre-eval.file-not-found]` leaves
-    // the row standing), while `severity_overrides:` / `severity_profile:`
+    // that fn skips leading `pre-eval.*` entries) — and since v0.4.3 (#1892)
+    // the `disable:` list reaches them through `filter_suppressed` (exact id
+    // or `pre-eval` token; `disable: [all]` leaves the row standing), while `severity_overrides:` / `severity_profile:`
     // DO re-stamp them (`SeverityStamp.apply` covers the whole stream). The
     // `path:` is the literal ".rigor.yml" upstream even under `--config` or a
     // `.rigor.dist.yml` discovery — the aggregator hard-codes it. Glob-meta
@@ -2025,9 +2025,13 @@ fn analyze_files(
         // entry earns ONE row upstream, not one per mention.
         let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for entry in &cfg.pre_eval {
+            // v0.4.3 (#1892): the `disable:` list now reaches these rows —
+            // the exact id or the `pre-eval` family token, never `all`
+            // (`config_disables_pre_eval`).
             if !seen.insert(entry.as_str())
                 || entry.contains(['*', '?', '['])
                 || std::path::Path::new(entry).is_file()
+                || rigor_rules::config_disables_pre_eval(&cfg.disable, "pre-eval.file-not-found")
             {
                 continue;
             }
