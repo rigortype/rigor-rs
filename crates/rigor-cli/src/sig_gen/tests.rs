@@ -1126,3 +1126,46 @@ fn layout_index_first_found_wins_and_skips_parse_failures() {
     assert_eq!(layout.file_for("Baz"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn generic_reopen_headers_and_core_subclass_shell() {
+    // #2436/#2473: a core generic class is reopened with its declared
+    // parameters; #2224/#735: a core subclass is a shell with `untyped` args.
+    let dir = std::env::temp_dir().join(format!("rigor_siggen_generic_{}", std::process::id()));
+    let _ = std::fs::create_dir_all(&dir);
+    let file = dir.join("t.rb");
+    std::fs::write(&file, "class Hash\n  def hk = :k\nend\nclass MyHash < Hash; end\nclass M\n  def m = 1\nend\n")
+        .unwrap();
+    let env = SigEnv::build(&[]);
+    let (cs, info, _) = generate_run(&[file.to_str().unwrap().to_string()], false, &env, &writes);
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(cs[0].decl_header, "class Hash[unchecked out K, unchecked out V]");
+    assert!(info.shells.contains(&"MyHash".to_string()));
+    assert_eq!(info.supers.get("MyHash").map(String::as_str), Some("Hash[untyped, untyped]"));
+}
+
+#[test]
+fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
+    // #2580/#2602: the bare `class Array` gets the run's spelling.
+    let params: HashMap<String, String> =
+        [("Array".to_string(), "[unchecked out E]".to_string())].into_iter().collect();
+    let out = apply_merge_with(
+        "class Array\n  def old: () -> Integer\nend\n".to_string(),
+        vec![mc("Array", "second_elem", "instance", "def second_elem: () -> 1")],
+        &HashMap::new(),
+        &params,
+        false,
+    );
+    assert_eq!(out.source, "class Array[unchecked out E]\n  def old: () -> Integer\n  def second_elem: () -> 1\nend\n");
+    assert_eq!(out.repaired, vec!["Array[unchecked out E]".to_string()]);
+    // A body naming `E` would bind to the parameter: left bare.
+    let out = apply_merge_with(
+        "class Array\n  def old: () -> E\nend\n".to_string(),
+        Vec::new(),
+        &HashMap::new(),
+        &params,
+        false,
+    );
+    assert!(out.repaired.is_empty());
+    assert_eq!(out.action, "noop");
+}

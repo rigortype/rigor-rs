@@ -90,6 +90,7 @@ use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId, ParamShape, Vi
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod meta_class;
+mod generics;
 mod rbs_parse_error;
 mod superclasses;
 mod sig_env;
@@ -388,6 +389,9 @@ struct NamespaceInfo {
     /// `(source file, shell FQN)` — which file carries each shell, for the
     /// written-set computation (a shell rides on its file's written candidates).
     shell_files: Vec<(String, String)>,
+    /// qualified name → generic header spelling (`[unchecked out E]`), the
+    /// run's `stamp_generic_reopenings` (#2436/#2473).
+    params: HashMap<String, String>,
 }
 
 impl NamespaceInfo {
@@ -398,6 +402,7 @@ impl NamespaceInfo {
         self.shells.extend(other.shells);
         self.headers.extend(other.headers);
         self.shell_files.extend(other.shell_files);
+        self.params.extend(other.params);
     }
 }
 
@@ -480,9 +485,22 @@ fn finalize_superclasses(
     for h in &headers {
         let declared = |c: &str| known.contains(c) || rbs_known(c);
         let resolved = superclasses::resolve_token(&h.token, &h.nesting, &h.full, &declared);
-        info.supers.insert(h.full.clone(), resolved);
+        info.supers.insert(h.full.clone(), sig_env.generics().superclass_spelling(&resolved));
     }
     let supers = info.supers.clone();
+
+    // `demote_generic_reopenings` (#2436): a method of a class (or a class
+    // nested in one) the loaded RBS declares generic with a bounded or
+    // defaulted parameter is not emitted, unless the project's `sig/` already
+    // declares the class (the writer then writes into that header).
+    let generics = sig_env.generics();
+    let candidates: Vec<Candidate> = candidates
+        .into_iter()
+        .filter(|c| {
+            sig_env.declares_class(&c.class_name)
+                || !generics::namespace_prefixes(&c.class_name).iter().any(|n| generics.bounded(n))
+        })
+        .collect();
 
     let shell_files = info.shell_files.clone();
     let declared_by_run = |kept: &[&Candidate]| -> HashSet<String> {
@@ -527,6 +545,23 @@ fn finalize_superclasses(
             break;
         }
         unresolvable = found;
+    }
+
+    // `stamp_generic_reopenings` / `header_type_params`: every generic class
+    // (plain parameters only) the run may open a header for — each
+    // candidate's class, the classes it is nested in, and the shells.
+    let mut names: Vec<String> = candidates
+        .iter()
+        .map(|c| c.class_name.clone())
+        .chain(info.shells.iter().cloned())
+        .flat_map(|n| generics::namespace_prefixes(&n))
+        .collect();
+    names.sort();
+    names.dedup();
+    for n in names {
+        if let Some(spelling) = generics.header_spelling(&n) {
+            info.params.insert(n, spelling);
+        }
     }
 
     // `@unresolvable_superclasses[class_name] ||= root`, in candidate order.
@@ -693,6 +728,31 @@ fn generate_file_with_info(
     }
     register_meta_classes(&layouts, &mut info);
     info.headers = superclasses::collect(&parsed);
+    // `register_core_subclass_shell` (#2224): a subclass of a core or stdlib
+    // class is declared as a class shell (`class MyHash < ::Hash[untyped,
+    // untyped]`) so a method returning one never names an undeclared class —
+    // unless the RBS environment already declares it, or the header's nesting
+    // declares a constant of the superclass's first segment (`Foo::Hash`),
+    // which then is the project's class, not core's.
+    for h in &info.headers {
+        if sig_env.class_known(&index, &h.full) || info.shells.contains(&h.full) {
+            continue;
+        }
+        let bare = superclasses::bare_superclass_name(&h.token);
+        if !index.knows_toplevel_class(&bare) {
+            continue;
+        }
+        if !h.token.starts_with("::") {
+            let first = bare.split("::").next().unwrap_or(&bare);
+            let shadowed = (1..=h.nesting.len())
+                .any(|i| fqns.contains(&format!("{}::{first}", h.nesting[..i].join("::"))));
+            if shadowed {
+                continue;
+            }
+        }
+        info.shells.push(h.full.clone());
+        info.kinds.entry(h.full.clone()).or_insert("class");
+    }
     info.shell_files = info.shells.iter().map(|s| (path.to_string(), s.clone())).collect();
     // The print header depends on the WHOLE file's namespace metadata, so it is
     // stamped once the walks are done rather than at construction (and again,
@@ -766,13 +826,16 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
 /// declared anywhere else (rigor#227). Defaulting to `class` when the map has no
 /// entry keeps the pre-existing spelling for a leaf class.
 fn declaration_header(info: &NamespaceInfo, class_name: &str) -> String {
+    let params = info.params.get(class_name).map_or("", String::as_str);
     if info.kinds.get(class_name) == Some(&"module") {
-        return format!("module {class_name}");
+        return format!("module {class_name}{params}");
     }
     match info.supers.get(class_name) {
         // `SuperclassSpelling.absolute` (#2661): written rooted.
-        Some(superclass) => format!("class {class_name} < {}", superclasses::absolute(superclass)),
-        None => format!("class {class_name}"),
+        Some(superclass) => {
+            format!("class {class_name}{params} < {}", superclasses::absolute(superclass))
+        }
+        None => format!("class {class_name}{params}"),
     }
 }
 
@@ -1804,6 +1867,8 @@ struct WriteResult {
     /// The refusal detail (reference `WriteResult#error`), on
     /// `skipped_invalid_encoding` / `skipped_unparseable` only.
     error: Option<String>,
+    /// `repaired_headers` (#2580): `Name[params]` per bare header repaired.
+    repaired: Vec<String>,
 }
 
 /// One skipped (user-authored-conflict) candidate + the classification metadata
@@ -1949,6 +2014,7 @@ fn cmd_write(
                 applied: Vec::new(),
                 skipped: Vec::new(),
                 error: None,
+                repaired: Vec::new(),
             });
             continue;
         }
@@ -1960,6 +2026,7 @@ fn cmd_write(
                 group,
                 &shells,
                 &merged.supers,
+                &merged.params,
                 overwrite,
             ));
             continue;
@@ -1979,6 +2046,7 @@ fn cmd_write(
             applied: group,
             skipped: Vec::new(),
             error: None,
+            repaired: Vec::new(),
         });
     }
 
@@ -2148,7 +2216,8 @@ fn render_tree_node(node: &TreeNode, info: &NamespaceInfo, depth: usize, prefix:
     for child in &node.children {
         body.push_str(&render_tree_node(child, info, depth + 1, &qual));
     }
-    format!("{indent}{keyword} {}{superclass}\n{body}{indent}end\n", node.name)
+    let params = info.params.get(&qualified).map_or("", String::as_str);
+    format!("{indent}{keyword} {}{params}{superclass}\n{body}{indent}end\n", node.name)
 }
 
 /// The declaration keyword for a node (reference `node_keyword`): the recorded
@@ -2175,12 +2244,18 @@ fn render_write_text(results: &[WriteResult]) {
     for r in results {
         match r.action {
             "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
-            "updated" => println!(
-                "updated {} (+{}, skipped {} user-authored)",
-                r.target,
-                r.applied.len(),
-                r.skipped.len()
-            ),
+            "updated" => {
+                // `applied_counts`: `+N`, then the repaired generic headers.
+                let mut counts = format!("+{}", r.applied.len());
+                if !r.repaired.is_empty() {
+                    counts.push_str(&format!(
+                        ", repaired {} generic header(s): {}",
+                        r.repaired.len(),
+                        r.repaired.join(", ")
+                    ));
+                }
+                println!("updated {} ({counts}, skipped {} user-authored)", r.target, r.skipped.len());
+            }
             "skipped_outside_sig_root" => {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target)
             }
@@ -2238,6 +2313,9 @@ fn render_write_json(results: &[WriteResult]) {
             });
             if let Some(e) = &r.error {
                 row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            if !r.repaired.is_empty() {
+                row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
             }
             row
         })
@@ -2409,6 +2487,7 @@ fn update_existing(
     candidates: Vec<Candidate>,
     shells: &[String],
     supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     overwrite: bool,
 ) -> WriteResult {
     let Ok(bytes) = std::fs::read(target) else {
@@ -2419,6 +2498,7 @@ fn update_existing(
             applied: Vec::new(),
             skipped: Vec::new(),
             error: None,
+            repaired: Vec::new(),
         };
     };
     // v0.4.7 (#2480/#2587): an existing target that is not UTF-8, or does not
@@ -2431,6 +2511,7 @@ fn update_existing(
         applied: Vec::new(),
         skipped: Vec::new(),
         error: Some(error),
+        repaired: Vec::new(),
     };
     let Ok(source) = String::from_utf8(bytes) else {
         return refused("skipped_invalid_encoding", format!("{target_str} is not valid UTF-8"));
@@ -2448,12 +2529,20 @@ fn update_existing(
     // only uncovered case is merging into a USER-authored sig that lacks a shell
     // for a `Data.define` return — a documented follow-up, not a regression.
     let _ = shells;
-    let MergeOutcome { source: merged, action, applied, skipped } =
-        apply_merge(source, candidates, supers, overwrite);
+    let MergeOutcome { source: merged, action, applied, skipped, repaired } =
+        apply_merge_with(source, candidates, supers, params, overwrite);
     if action == "updated" {
         let _ = std::fs::write(target, &merged);
     }
-    WriteResult { source: source_path, target: target_str, action, applied, skipped, error: None }
+    WriteResult {
+        source: source_path,
+        target: target_str,
+        action,
+        applied,
+        skipped,
+        error: None,
+        repaired,
+    }
 }
 
 /// The pure result of merging a candidate group into an existing `.rbs` source
@@ -2463,30 +2552,161 @@ struct MergeOutcome {
     action: &'static str,
     applied: Vec<Candidate>,
     skipped: Vec<SkipEntry>,
+    /// `repaired_headers`: one `Name[params]` per bare generic header given
+    /// its parameters (#2580/#2602).
+    repaired: Vec<String>,
 }
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
 /// `action: "noop"`; otherwise each class group (first-seen order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
+#[cfg(test)]
 fn apply_merge(
+    source: String,
+    candidates: Vec<Candidate>,
+    supers: &HashMap<String, String>,
+    overwrite: bool,
+) -> MergeOutcome {
+    apply_merge_with(source, candidates, supers, &HashMap::new(), overwrite)
+}
+
+/// [`apply_merge`] with the run's generic header spellings (`params`): new
+/// headers carry them, and — last — every bare header in the file for a class
+/// in `params` is repaired (reference `repair_generic_headers`).
+fn apply_merge_with(
     mut source: String,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     overwrite: bool,
 ) -> MergeOutcome {
     // Parse-failure gate: a malformed target is left byte-untouched (reference
     // `parse_signature` → nil → `:noop`).
     if ruby_rbs::node::parse(&source).is_err() {
-        return MergeOutcome { source, action: "noop", applied: Vec::new(), skipped: Vec::new() };
+        return MergeOutcome {
+            source,
+            action: "noop",
+            applied: Vec::new(),
+            skipped: Vec::new(),
+            repaired: Vec::new(),
+        };
     }
     let mut applied: Vec<Candidate> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
-        merge_class(&mut source, &class_name, group, supers, overwrite, &mut applied, &mut skipped);
+        merge_class(&mut source, &class_name, group, supers, params, overwrite, &mut applied, &mut skipped);
     }
-    let action = if applied.is_empty() { "noop" } else { "updated" };
-    MergeOutcome { source, action, applied, skipped }
+    let repaired = repair_generic_headers(&mut source, params);
+    // `state_changed?`: a repaired header is a change too.
+    let action = if applied.is_empty() && repaired.is_empty() { "noop" } else { "updated" };
+    MergeOutcome { source, action, applied, skipped, repaired }
+}
+
+/// Reference `Writer#repair_generic_headers` (#2580/#2602): a declaration in
+/// this file for a class the run stamps generic, opened with no type
+/// parameters, is a guaranteed `GenericParameterMismatchError`; it gets the
+/// stamp's spelling. A declaration whose body names one of the parameters
+/// (as a word not preceded by `::` or `:`) is left bare — under the
+/// parameters that name would bind to the parameter. Returns one
+/// `Name[params]` entry per declaration repaired.
+fn repair_generic_headers(source: &mut String, params: &HashMap<String, String>) -> Vec<String> {
+    let mut names: Vec<&String> = params.keys().collect();
+    names.sort();
+    let mut repaired: Vec<String> = Vec::new();
+    for name in names {
+        let spelling = &params[name];
+        let param_names: Vec<String> = spelling
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .split(',')
+            .filter_map(|p| p.split_whitespace().last().map(str::to_string))
+            .collect();
+        // (name end, body) of every bare opening, from a fresh parse.
+        let bare: Vec<(usize, usize)> = match ruby_rbs::node::parse(source) {
+            Ok(sig) => {
+                let mut out = Vec::new();
+                bare_openings(source, sig.declarations().iter(), &[], name, &mut out);
+                out
+            }
+            Err(_) => continue,
+        };
+        if bare.is_empty() {
+            continue;
+        }
+        let shadowed = bare.iter().any(|&(start, end)| {
+            let body = &source[start..end];
+            param_names.iter().any(|p| names_word(body, p))
+        });
+        if shadowed {
+            continue;
+        }
+        let mut positions: Vec<usize> = bare.iter().map(|&(start, _)| start).collect();
+        positions.sort_unstable();
+        for &pos in positions.iter().rev() {
+            source.insert_str(pos, spelling);
+        }
+        for _ in &bare {
+            repaired.push(format!("{name}{spelling}"));
+        }
+    }
+    repaired
+}
+
+/// Every declaration of `target` in `decls` with no type parameters, as
+/// `(name end offset, declaration end offset)`.
+fn bare_openings<'a>(
+    source: &str,
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    target: &str,
+    out: &mut Vec<(usize, usize)>,
+) {
+    for decl in decls {
+        let (local, members, bare, name_end, decl_end) = match &decl {
+            RbsNode::Class(c) => (
+                decl_full_name(&c.name()),
+                c.members(),
+                c.type_params().iter().next().is_none(),
+                c.name_location().end(),
+                c.location().end(),
+            ),
+            RbsNode::Module(m) => (
+                decl_full_name(&m.name()),
+                m.members(),
+                m.type_params().iter().next().is_none(),
+                m.name_location().end(),
+                m.location().end(),
+            ),
+            _ => continue,
+        };
+        let full = if prefix.is_empty() { local.clone() } else { format!("{}::{}", prefix.join("::"), local) };
+        if full == target && bare {
+            let start = clamp_offset(name_end, source.len());
+            out.push((start, clamp_offset(decl_end, source.len()).max(start)));
+        }
+        let mut child = prefix.to_vec();
+        child.push(local);
+        bare_openings(source, members.iter(), &child, target, out);
+    }
+}
+
+/// `/(?<![\w:])NAME(?!\w)/` over `text`.
+fn names_word(text: &str, name: &str) -> bool {
+    let bytes = text.as_bytes();
+    let is_word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let mut from = 0;
+    while let Some(i) = text[from..].find(name) {
+        let at = from + i;
+        let end = at + name.len();
+        let before_ok = at == 0 || !(is_word(bytes[at - 1]) || bytes[at - 1] == b':');
+        let after_ok = end >= bytes.len() || !is_word(bytes[end]);
+        if before_ok && after_ok {
+            return true;
+        }
+        from = at + 1;
+    }
+    false
 }
 
 /// Group candidates by `class_name`, preserving first-seen class order
@@ -2506,11 +2726,13 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
 /// Merge one class group: find the class by FQN (re-parsing fresh so offsets are
 /// current), then merge into it or append a new class block (reference
 /// `merge_class`).
+#[allow(clippy::too_many_arguments)]
 fn merge_class(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
     supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
     skipped: &mut Vec<SkipEntry>,
@@ -2522,7 +2744,14 @@ fn merge_class(
     };
     match found {
         Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
-        None => append_new_class(source, class_name, candidates, supers.get(class_name), applied),
+        None => append_new_class(
+            source,
+            class_name,
+            candidates,
+            supers.get(class_name),
+            params.get(class_name).map_or("", String::as_str),
+            applied,
+        ),
     }
 }
 
@@ -2800,6 +3029,7 @@ fn append_new_class(
     class_name: &str,
     candidates: Vec<Candidate>,
     superclass: Option<&String>,
+    params: &str,
     applied: &mut Vec<Candidate>,
 ) {
     let body = candidates
@@ -2808,8 +3038,8 @@ fn append_new_class(
         .collect::<Vec<_>>()
         .join("\n");
     let header = match superclass {
-        Some(s) => format!("class {class_name} < {}", superclasses::absolute(s)),
-        None => format!("class {class_name}"),
+        Some(s) => format!("class {class_name}{params} < {}", superclasses::absolute(s)),
+        None => format!("class {class_name}{params}"),
     };
     if !source.ends_with('\n') {
         source.push('\n');

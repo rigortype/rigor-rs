@@ -32,6 +32,9 @@ pub mod plugins;
 mod rbs;
 
 pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
+/// The build-time-embedded vendored RBS `(path, contents)` table — sig-gen
+/// reads the declared type parameters of a reopened generic class from it.
+pub use rbs::EMBEDDED_RBS;
 pub use rbs::{
     parse_conforms_to, ConformanceFinding, ConformanceKind, RBS_EXTENDED_UNRESOLVED,
     UNSATISFIED_CONFORMANCE,
