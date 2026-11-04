@@ -116,6 +116,9 @@ const STRING_EVAL_CALLS: [&str; 3] = ["instance_eval", "class_eval", "module_eva
 pub const METHOD_OBJECT_CALLS: [&str; 5] = ["call", "yield", "===", "[]", "bind_call"];
 const METHOD_READERS: [&str; 5] =
     ["method", "public_method", "singleton_method", "instance_method", "public_instance_method"];
+/// `class_eval` and the calls that rebind `self` to the receiver's class
+/// (the reference's `SELF_REBINDING_EVAL_CALLS`).
+const SELF_REBINDING_EVAL_CALLS: [&str; 4] = ["class_eval", "module_eval", "class_exec", "module_exec"];
 const BOUND_METHOD_READERS: [&str; 3] = ["method", "public_method", "singleton_method"];
 const METHOD_WRAPPERS: [&str; 4] = ["bind", "unbind", "to_proc", "curry"];
 const VISIBILITY_MODIFIERS: [&str; 3] = ["private", "protected", "public"];
@@ -552,7 +555,30 @@ impl<'pr> Visit<'pr> for Walk {
         if target.as_deref().is_none_or(|t| BINDING_CALLS.contains(&t)) {
             self.scopes_reading_locals.insert(self.scope);
         }
-        ruby_prism::visit_call_node(self, node);
+        // `walk_eval_visibilities`: a `K.class_eval { … }`-family block
+        // outside a `def` re-anchors its replacers on the receiver (`A::K`
+        // by its last segment), wherever the call is written.
+        let eval_owner = if self.scope == usize::MAX
+            && SELF_REBINDING_EVAL_CALLS.contains(&name.as_str())
+            && node.block().is_some_and(|b| b.as_block_node().is_some())
+        {
+            node.receiver().and_then(|r| {
+                if r.as_constant_read_node().is_some() || r.as_constant_path_node().is_some() {
+                    last_segment(&r)
+                } else {
+                    None
+                }
+            })
+        } else {
+            None
+        };
+        if let Some(owner) = eval_owner {
+            self.frames.push(Frame { owner: None, singleton: false, module_function: false, vis_owner: Some(owner) });
+            ruby_prism::visit_call_node(self, node);
+            self.frames.pop();
+        } else {
+            ruby_prism::visit_call_node(self, node);
+        }
     }
 
     fn visit_lambda_node(&mut self, node: &ruby_prism::LambdaNode<'pr>) {
