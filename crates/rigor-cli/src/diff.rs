@@ -33,7 +33,7 @@ use serde_json::{json, Value};
 
 use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
 
-const USAGE: &str = "Usage: rigor diff [options] <baseline.json> [paths...]";
+const USAGE: &str = "Usage: rigor diff [options] <rigor-check.json> [paths...]";
 
 /// `parse_options`' table, `opts.on` order (issue #155): `--format` is a
 /// `%w[text json]` list — prefix completion (`--format=j` → json) and a

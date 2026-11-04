@@ -315,7 +315,7 @@ const CHECK_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("cache-stats", &[("cache-stats", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--cache-stats", "", &["Print on-disk cache inventory at end of run"]),
     optparse::Switch::new("coverage", &[("coverage", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--coverage", "", &["Add a type-precision coverage block (an extra precision pass over the analyzed files)"]),
     optparse::Switch::new("clear-cache", &[("clear-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--clear-cache", "", &["Remove the .rigor/cache directory before running"]),
-    optparse::Switch::new("no-cache", &[("no-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-cache", "", &["Disable the persistent cache for this run"]),
+    optparse::Switch::new("no-cache", &[("no-cache", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-cache", "", &["Disable the persistent cache for this run (with --incremental: no snapshot is read or written)"]),
     optparse::Switch::new("stats", &[("stats", false), ("no-stats", true)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--[no-]stats", "", &["Print run summary (files, classes, memory, wall time) to stderr (default: on)"]),
     optparse::Switch::new("workers", &[("workers", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--workers", "=N", &["Dispatch per-file analysis across N Ractor workers (default: 0; sequential)"]),
     optparse::Switch::new("tmp-file", &[("tmp-file", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--tmp-file", "=PATH", &["Editor mode: read source bytes from PATH instead of --instead-of (paired)"]),
@@ -326,6 +326,7 @@ const CHECK_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("fail-on", &[("fail-on", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--fail-on", "=SEVERITY", &["exit non-zero on a diagnostic at or above SEVERITY: error (default), warning, or info"]),
     optparse::Switch::new("treat-all-as-inline-rbs", &[("treat-all-as-inline-rbs", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--treat-all-as-inline-rbs", "", &["force-load rigor-rbs-inline with require_magic_comment: false"]),
     optparse::Switch::new("verify-incremental", &[("verify-incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--verify-incremental", "", &["assert incremental analysis matches a full run, then exit"]),
+    optparse::Switch::new("verify-incremental-edits", &[("verify-incremental-edits", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--verify-incremental-edits", "=N", &["with --verify-incremental, also replay edits (empty, class/module skeleton, up to 2 one-statement drops) on N files"]),
     optparse::Switch::new("incremental", &[("incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--incremental", "", &["re-analyze only files changed since the last run (cross-process cache)"]),
     optparse::Switch::new("no-ci-detect", &[("no-ci-detect", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--no-ci-detect", "", &["do not auto-emit CI-native output when a CI environment is detected"]),
     optparse::Switch::new("bleeding-edge", &[("bleeding-edge", false)], optparse::ArgStyle::Optional, optparse::ValueKind::Raw, "--bleeding-edge", "=[LIST]", &["adopt the bleeding-edge overlay for this run (all features, or a comma-separated feature-id list)"]),
@@ -822,7 +823,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 // Reference-only features the port cannot reproduce — rejected
                 // below, after the validations the reference runs first.
                 "explain" | "cache-stats" | "coverage" | "treat-all-as-inline-rbs"
-                | "verify-incremental" | "incremental" | "no-tolerated-effects" => {
+                | "verify-incremental" | "verify-incremental-edits" | "incremental"
+                | "no-tolerated-effects" => {
                     if unsupported.is_none() {
                         unsupported = Some(*key);
                     }
