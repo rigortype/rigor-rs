@@ -705,10 +705,6 @@ fn multi_overload_mismatch(
 ///   second arg against the scope the first left, while the first arg still
 ///   sees the call's entry scope.
 #[allow(clippy::too_many_arguments)]
-fn strip_root(name: &str) -> &str {
-    name.strip_prefix("::").unwrap_or(name)
-}
-
 pub(crate) fn check_argument_type_mismatch(
     ast: &LoweredAst,
     receiver: rigor_parse::NodeId,
@@ -806,4 +802,9 @@ pub(crate) fn check_argument_type_mismatch(
         receiver_type: Some(class_name),
         method_name: Some(method.to_string()),
     })
+}
+
+/// A class name without its root `::` (reference `strip_root`).
+fn strip_root(name: &str) -> &str {
+    name.strip_prefix("::").unwrap_or(name)
 }
