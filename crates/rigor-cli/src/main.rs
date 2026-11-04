@@ -60,44 +60,47 @@ const COMMANDS: &[&str] = &[
     "check", "annotate", "type-of", "trace", "type-scan", "explain", "diff",
     "sig-gen", "baseline", "triage", "coverage", "plugins", "plugin", "lsp",
     "mcp", "skill", "docs", "init", "doctor", "version", "show-bleedingedge",
-    "effects", "unused", "describe", "playground", "upgrade",
+    "effects", "unused", "describe", "playground", "upgrade", "lens",
 ];
 
-/// The reference's `CLI#help` heredoc (`lib/rigor/cli.rb`), verbatim — the
+/// The reference's `Catalogue.help_text` (v0.4.7 `lib/rigor/cli/catalogue.rb`), verbatim — the
 /// text `rigor`, `rigor help`, `rigor -h` and `rigor --help` print to stdout
 /// and the tail of the `Unknown command:` stderr surface.
 const TOP_HELP: &str = "\
 Usage: rigor <command> [options]
 
 Commands:
-  check      Analyze Ruby source files
-  init       Create a starter .rigor.yml
-  annotate   Print FILE with each line's last-expression type
-  type-of    Print inferred types at FILE:LINE[:COL] positions
-  trace      Replay how the engine typed FILE as a terminal animation
-  type-scan  Report Scope#type_of coverage across PATHs
-  effects    Report each method's effect labels, and the committed effect snapshot
-             (opt-in; effects update/check/diff/explain)
-  explain    Print the description of one or all CheckRules
-  diff       Compare current diagnostics to a saved baseline JSON
-  baseline   Manage the baseline file (baseline generate/regenerate/dump/drift/prune)
-  sig-gen    Emit RBS skeletons inferred from .rb sources
-  lsp        Run the Rigor Language Server (LSP) over stdio
-  mcp        Run the Rigor MCP server over stdio
-  triage     Summarise diagnostics: distribution, hotspots, hints
-  coverage   Report type-precision coverage (precise vs Dynamic ratio)
-  unused     Report unreferenced classes, modules and constants as removal candidates
-  plugins    Report activation status of every configured plugin
-  plugin     Browse bundled plugin source as worked examples (list/path/print/root)
-  playground Start the browser playground (requires rigor-playground gem)
-  describe   Recommend the next skill for this project (alias for `skill describe`)
-  skill      Recommend the next skill + list/print bundled Agent Skills (skill describe, skill <name>)
-  docs       Print the bundled docs offline (docs <name>, docs --list)
+  check              Analyze Ruby source files
+  init               Create a starter .rigor.yml
+  annotate           Print FILE with each line's last-expression type
+  type-of            Print inferred types at FILE:LINE[:COL] positions
+  lens               Map a file's declarations with their types and provenance (experimental)
+  trace              Replay how the engine typed FILE as a terminal animation
+  type-scan          Report Scope#type_of coverage across PATHs
+  effects            Report each method's effect labels, and the committed effect snapshot (opt-in; effects update/check/diff/explain)
+  explain            Print the description of one or all CheckRules
+  diff               Compare current diagnostics to a saved `rigor check --format=json` result
+  baseline           Manage the baseline file (baseline generate/regenerate/dump/drift/prune)
+  sig-gen            Emit RBS skeletons inferred from .rb sources
+  lsp                Run the Rigor Language Server (LSP) over stdio
+  mcp                Run the Rigor MCP server over stdio
+  triage             Summarise diagnostics: distribution, hotspots, hints
+  coverage           Report type-precision coverage (precise vs Dynamic ratio)
+  unused             Report unreferenced classes, modules and constants as removal candidates
+  plugins            Report activation status of every configured plugin
+  plugin             Browse bundled plugin source as worked examples (plugin <name>, plugin --list)
+  playground         Start the browser playground (requires rigor-playground gem)
+  describe           Recommend the next skill for this project (alias for `skill describe`)
+  skill              Recommend the next skill + list/print bundled Agent Skills (skill describe, skill <name>)
+  docs               Print the bundled docs offline (docs <name>, docs --list)
   show-bleedingedge  Show the bleeding-edge overlay + what your config adopts
-  doctor     Classify setup problems vs clean run with routed next actions
-  upgrade    Migration command skeleton (queued)
-  version    Print the Rigor version
-  help       Print this help
+  doctor             Classify setup problems vs clean run with routed next actions
+  upgrade            Migration command skeleton (queued)
+  help               Print this help, or a command's help (help <command>, help --format=json)
+  version            Print the Rigor version
+
+Run `rigor help <command>` (or `rigor <command> --help`) for a command's options.
+Run `rigor describe` for the next step on this project, or `rigor help --format=json` for the full surface.
 ";
 
 fn main() -> ExitCode {
@@ -114,18 +117,31 @@ fn main() -> ExitCode {
 /// The command dispatch, on the thread [`main`] starts.
 fn run_command() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    dispatch(&args)
+}
+
+/// `CLI#run` + `CLI#dispatch` over the full argv (`help <command>` re-enters
+/// with `[command, "--help"]`).
+fn dispatch(args: &[String]) -> ExitCode {
     match args.first().map(String::as_str) {
         // `CLI#run`: no command, `help`, `-h`, `--help` → the command list on
         // STDOUT, exit 0.
-        None | Some("help" | "-h" | "--help") => {
+        None | Some("-h" | "--help") => {
             print!("{TOP_HELP}");
             ExitCode::SUCCESS
         }
+        Some("help") => cmd_help(&args[1..]),
         // `version` / `-v` / `--version` — print `rigor <version>` and exit 0
-        // (`rigor #{Rigor::VERSION}` upstream). `-V` is the conventional Rust
-        // short flag; accepted alongside the reference's `-v`.
+        // (`rigor #{Rigor::VERSION}` upstream); `-h`/`--help` anywhere after
+        // it prints `Usage: rigor version` instead (v0.4.7 `run_version`).
+        // `-V` is the conventional Rust short flag; accepted alongside the
+        // reference's `-v`.
         Some("version" | "--version" | "-v" | "-V") => {
-            println!("rigor {}", env!("CARGO_PKG_VERSION"));
+            if args[1..].iter().any(|a| a == "-h" || a == "--help") {
+                println!("Usage: rigor version");
+            } else {
+                println!("rigor {}", env!("CARGO_PKG_VERSION"));
+            }
             ExitCode::SUCCESS
         }
         Some("check") => cmd_check(&args[1..]),
@@ -157,6 +173,11 @@ fn run_command() -> ExitCode {
         // `run_upgrade`: ignores argv entirely — prints the queued notice and
         // exits 0 upstream.
         Some("upgrade") => {
+            // v0.4.7 `UpgradeCommand::USAGE` on `-h`/`--help` anywhere.
+            if args[1..].iter().any(|a| a == "-h" || a == "--help") {
+                println!("Usage: rigor upgrade [options]");
+                return ExitCode::SUCCESS;
+            }
             println!("rigor upgrade: No migration target available yet (ADR-50 WD7, queued).");
             println!("Current version: {}", env!("CARGO_PKG_VERSION"));
             ExitCode::SUCCESS
@@ -181,6 +202,95 @@ fn run_command() -> ExitCode {
         // `CLI#dispatch`'s unknown-command path: the message and the full help
         // text on STDERR, exit 64 (`EXIT_USAGE`).
         Some(other) => {
+            eprintln!("Unknown command: {other}");
+            // v0.4.7 (#2512): the nearest catalogue name, when there is one.
+            if let Some(nearest) = optparse::spell_checker_correct(CATALOGUE_NAMES, other).first() {
+                eprintln!("Did you mean `rigor {nearest}`?");
+            }
+            eprint!("{TOP_HELP}");
+            ExitCode::from(64)
+        }
+    }
+}
+
+/// `Catalogue.names` — every dispatched command in `rigor help` order
+/// (`SUMMARIES.keys - BUILTINS + BUILTINS`), the `Did you mean` dictionary.
+const CATALOGUE_NAMES: &[&str] = &[
+    "check", "init", "annotate", "type-of", "lens", "trace", "type-scan", "effects", "explain",
+    "diff", "baseline", "sig-gen", "lsp", "mcp", "triage", "coverage", "unused", "plugins",
+    "plugin", "playground", "describe", "skill", "docs", "show-bleedingedge", "doctor",
+    "upgrade", "help", "version",
+];
+
+const HELP_PARSER: optparse::OptParser = optparse::OptParser::new(
+    "Usage: rigor help [--format=text|json] [<command>]",
+    &[optparse::Switch::new(
+        "format",
+        &[("format", false)],
+        optparse::ArgStyle::Required,
+        optparse::ValueKind::Exact(&["text", "json"]),
+        "--format",
+        "=FORMAT",
+        &["Output format: text (default) or json"],
+    )],
+);
+
+/// v0.4.7 `CLI#run_help`: `rigor help [--format=text|json] [<command>]`.
+/// `-h`/`--help` anywhere prints the command list; the options parse with
+/// `order!` (the asked-about command's flags are never parsed here);
+/// `help <command>` behaves as `rigor <command> --help`; a second word, or an
+/// unknown command, is a usage error (exit 64).
+fn cmd_help(args: &[String]) -> ExitCode {
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        print!("{TOP_HELP}");
+        return ExitCode::SUCCESS;
+    }
+    let items = match HELP_PARSER.parse_order(args).items_or_exit() {
+        Ok(items) => items,
+        Err(code) => return code,
+    };
+    let mut json = false;
+    let mut topics: Vec<&str> = Vec::new();
+    for item in &items {
+        match item {
+            Item::Opt { key: "format", value: Some(v), .. } => json = v.as_str() == "json",
+            Item::Positional(p) => topics.push(p.as_str()),
+            _ => {}
+        }
+    }
+    if json {
+        if !topics.is_empty() {
+            eprintln!("rigor help --format=json takes no command; it prints every command");
+            return ExitCode::from(64);
+        }
+        // The `Catalogue.document` is built by reading every command's
+        // OptionParser; the port does not carry it.
+        eprintln!("rigor: help --format=json is not supported by rigor-rs");
+        return ExitCode::from(64);
+    }
+    let Some((&topic, rest)) = topics.split_first() else {
+        print!("{TOP_HELP}");
+        return ExitCode::SUCCESS;
+    };
+    let extra: Vec<&str> = rest.iter().copied().filter(|w| !w.starts_with('-')).collect();
+    if !extra.is_empty() {
+        eprintln!("rigor help takes one command, got: {topic} {}", extra.join(" "));
+        return ExitCode::from(64);
+    }
+    match topic {
+        "help" => {
+            print!("{}", HELP_PARSER.help());
+            ExitCode::SUCCESS
+        }
+        "version" => {
+            println!("Usage: rigor version");
+            ExitCode::SUCCESS
+        }
+        t if CATALOGUE_NAMES.contains(&t) => {
+            let argv = vec![t.to_string(), "--help".to_string()];
+            dispatch(&argv)
+        }
+        other => {
             eprintln!("Unknown command: {other}");
             eprint!("{TOP_HELP}");
             ExitCode::from(64)
@@ -485,7 +595,9 @@ fn cmd_skill_deferred(args: &[String]) -> ExitCode {
             print!("{SKILL_USAGE}");
             ExitCode::SUCCESS
         }
-        Some("describe" | "--describe") => cmd_describe_args(&args[1..]),
+        Some("describe" | "--describe") => {
+            cmd_describe_args(&args[1..], "Usage: rigor skill describe [--deep]")
+        }
         Some(flag @ ("--full" | "--path" | "--print")) => {
             // `usage_error` — each flag names itself except `--print`, which
             // shares `run_print`'s positional-slot message.
@@ -555,13 +667,19 @@ const BUNDLED_SKILL_NAMES: &[&str] = &[
 /// `rigor describe` — `run_describe` upstream wraps `skill describe`: argv
 /// becomes `["describe", *argv]`.
 fn cmd_describe_deferred(args: &[String]) -> ExitCode {
-    cmd_describe_args(args)
+    cmd_describe_args(args, "Usage: rigor describe [--deep]")
 }
 
 /// `SkillCommand#run_describe` argument handling: `--deep` tokens are deleted,
 /// then any remaining argv is a usage error; an empty remainder is the
 /// (unported) describe run itself.
-fn cmd_describe_args(args: &[String]) -> ExitCode {
+fn cmd_describe_args(args: &[String], usage: &str) -> ExitCode {
+    // v0.4.7 `run_describe(usage)` / `print_describe_usage`: `-h`/`--help`
+    // anywhere prints the usage line, exit 0.
+    if args.iter().any(|a| a == "-h" || a == "--help") {
+        println!("{usage}");
+        return ExitCode::SUCCESS;
+    }
     let rest: Vec<&String> = args.iter().filter(|a| a.as_str() != "--deep").collect();
     if let Some(unknown) = rest.first() {
         eprintln!("unknown option for `describe`: {unknown}");
@@ -582,9 +700,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
         Err(code) => return code,
     };
 
-    // `--format` stays a raw string until output time — the reference stores
-    // it verbatim and only raises `invalid argument: unsupported format: X`
-    // inside `write_result`, AFTER the analysis ran.
+    // `--format` is validated at parse time (`Options.add_format`, #2502):
+    // only the exact members of the switch's list reach here.
     let mut format = String::from("text");
     let mut files: Vec<String> = Vec::new();
     let mut explicit_config: Option<String> = None;

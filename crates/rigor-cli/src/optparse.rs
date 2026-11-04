@@ -379,7 +379,21 @@ impl OptParser {
     /// `parser.parse!(argv)` — `order!` when `POSIXLY_CORRECT` is present
     /// (even empty), `permute!` otherwise.
     pub fn parse(&self, argv: &[String]) -> Parsed {
-        let posix = std::env::var_os("POSIXLY_CORRECT").is_some();
+        self.parse_mode(argv, std::env::var_os("POSIXLY_CORRECT").is_some())
+    }
+
+    /// `parser.order!(argv)` — stops at the first positional regardless of
+    /// `POSIXLY_CORRECT` (reference `rigor help`'s `parse_help_options`).
+    pub fn parse_order(&self, argv: &[String]) -> Parsed {
+        self.parse_mode(argv, true)
+    }
+
+    /// `pub(crate)` for completeness: the banner + switch summary `--help` prints.
+    pub fn help(&self) -> String {
+        self.help_text()
+    }
+
+    fn parse_mode(&self, argv: &[String], posix: bool) -> Parsed {
         let mut rest: VecDeque<String> = argv.iter().cloned().collect();
         let mut items: Vec<Item> = Vec::new();
         let mut nonopts: Vec<String> = Vec::new();
@@ -1273,6 +1287,22 @@ fn dym_levenshtein(a: &str, b: &str) -> usize {
 /// in dictionary order (the `all_candidates & correct` in
 /// `OptionParser#additional_message`).
 fn spell_correct(dict: &[String], input: &str) -> Vec<String> {
+    let corrections = spell_checker_correct(dict, input);
+    let mut out: Vec<String> = Vec::new();
+    for cand in dict {
+        if corrections.iter().any(|c| c == cand) && !out.iter().any(|c| c == cand) {
+            out.push(cand.clone());
+        }
+    }
+    out
+}
+
+/// `DidYouMean::SpellChecker.new(dictionary:).correct(input)` — the
+/// corrections in the checker's own (score) order. The CLI's
+/// ``Did you mean `rigor X`?`` lines take its `.first`.
+pub fn spell_checker_correct<S: AsRef<str>>(dict: &[S], input: &str) -> Vec<String> {
+    let dict: Vec<String> = dict.iter().map(|w| w.as_ref().to_string()).collect();
+    let dict = &dict;
     let norm = |s: &str| s.to_lowercase().replace('@', "");
     let ni = norm(input);
     let threshold = if ni.chars().count() > 3 { 0.834 } else { 0.77 };
@@ -1302,13 +1332,7 @@ fn spell_correct(dict: &[String], input: &str) -> Vec<String> {
             }
         }
     }
-    let mut out: Vec<String> = Vec::new();
-    for cand in dict {
-        if corrections.iter().any(|c| c == cand) && !out.iter().any(|c| c == cand) {
-            out.push(cand.clone());
-        }
-    }
-    out
+    corrections
 }
 
 #[cfg(test)]
