@@ -222,6 +222,16 @@ impl SigEnv {
         if !self.class_present(core, class_fqn) {
             return Lookup::NotDeclared;
         }
+        // A class whose declarations disagree on type parameters fails its
+        // definition build in the reference (`GenericParameterMismatchError`:
+        // a project `class Hash` reopening core's `Hash[K, V]` bare), and
+        // `Reflection.instance_method_definition` then answers nil for every
+        // method: each one is new, and the writer meets an existing member as
+        // a user-authored one (#482). Only the class itself is read here; a
+        // class that merely inherits from it keeps its lookup, the drop side.
+        if self.generics.mismatched(class_fqn) {
+            return Lookup::NotDeclared;
+        }
         let res = if singleton {
             self.resolve_singleton(core, class_fqn, method)
         } else {

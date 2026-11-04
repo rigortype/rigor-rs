@@ -1715,6 +1715,19 @@ fn classify(
             if index.class_name_of(interner, inferred_ty) != Some(decl.as_str()) {
                 return None;
             }
+            // `pins_literal_over_declaration?` (#837): a proposal that erases to
+            // an RBS literal (`"hi"`, `1`, `:a`, `true`, `nil`) never tightens a
+            // declaration; the declared nominal is the author's abstraction over
+            // the body. A constant erasing to its class name (a Float) still
+            // may; a Range's and a Set's erasure carries a type argument, so
+            // they are excluded by class. (The inferred value's class is `decl`
+            // here: the check above returned otherwise.)
+            if matches!(interner.get(inferred_ty), Type::Constant(_))
+                && !matches!(decl.as_str(), "Range" | "Set")
+                && inferred_erased != decl
+            {
+                return None;
+            }
             // Collection→shape lenience loss: declared bare `Array`/`Hash`/… vs an
             // inferred `Tuple`/`HashShape` (`narrows_collection_to_shape?`).
             if narrows_collection_to_shape(&decl, interner, inferred_ty) {
@@ -2121,15 +2134,13 @@ struct WriteResult {
 }
 
 /// One skipped (user-authored-conflict) candidate + the classification metadata
-/// the JSON report surfaces (design-note refinement 2). `reason` is always
-/// `user_authored` so it is hardcoded in the renderer.
+/// the JSON report surfaces. `reason` is always `user_authored` so it is
+/// hardcoded in the renderer.
 struct SkipEntry {
     candidate: Candidate,
-    /// `"tighter_return"` when the existing return text was extractable and
-    /// differs; `"new_method"` when extraction failed (residual — see the note).
+    /// The candidate's own classification (`new_method` / `tighter_return`).
     classification: &'static str,
-    /// The existing member's extracted return text (trimmed), present only for
-    /// `tighter_return`.
+    /// The declared return generation compared against, on a `tighter_return`.
     declared_return_rbs: Option<String>,
 }
 
@@ -2496,6 +2507,16 @@ fn node_keyword(node: &TreeNode, info: &NamespaceInfo, qualified: &str) -> &'sta
 /// `--write` text report (reference `render_write_text`): `No changes` when
 /// EVERY result is `noop`, else one line per created / updated / outside-sig-root
 /// target (a `noop` result prints nothing).
+/// `render_write_skips`: one line per proposal the writer declined, so a change
+/// `--diff` or `--print` showed is never dropped without a reason.
+fn render_write_skips(r: &WriteResult) {
+    for entry in &r.skipped {
+        let c = &entry.candidate;
+        let separator = if c.kind == "singleton" { "." } else { "#" };
+        println!("  skipped {}{separator}{} (user-authored): {}", c.class_name, c.method_name, c.rbs);
+    }
+}
+
 fn render_write_text(results: &[WriteResult]) {
     if results.iter().all(|r| r.action == "noop" && r.skipped.is_empty()) {
         println!("No changes");
@@ -2515,9 +2536,17 @@ fn render_write_text(results: &[WriteResult]) {
                     ));
                 }
                 println!("updated {} ({counts}, skipped {} user-authored)", r.target, r.skipped.len());
+                render_write_skips(r);
+            }
+            // `render_write_unchanged` (#1975): a target every proposal for
+            // which the project already declares.
+            "noop" if !r.skipped.is_empty() => {
+                println!("unchanged {} (skipped {} user-authored)", r.target, r.skipped.len());
+                render_write_skips(r);
             }
             "skipped_outside_sig_root" => {
-                println!("skipped {} -> {} (outside sig root)", r.source, r.target)
+                println!("skipped {} -> {} (outside sig root)", r.source, r.target);
+                render_write_skips(r);
             }
             "skipped_invalid_encoding" => {
                 println!(
@@ -3209,50 +3238,29 @@ fn merge_into_existing(
             source.replace_range(start..end, &c.rbs);
             applied.push(c);
         }
-        for (c, existing_rt) in rest {
-            skip_conflict(c, existing_rt, skipped);
+        for (c, _) in rest {
+            skip_conflict(c, skipped);
         }
         return;
     }
 
     // No `--overwrite`: every conflict is preserved as user-authored.
-    for (c, m) in conflicting {
-        let existing_rt = m.return_text;
-        skip_conflict(c, existing_rt, skipped);
+    for (c, _) in conflicting {
+        skip_conflict(c, skipped);
     }
 }
 
 /// Record one preserved (user-authored) conflict as a [`SkipEntry`] (reference
-/// `merge_into_existing_class`'s `skipped` accumulator). A candidate GENERATION
-/// already classified `tighter_return` carries its own `declared_return_rbs`
-/// resolved from the [`SigEnv`] — trust it, do NOT re-derive from the target text
-/// (amendment: no double-divergence). Only a `new_method` conflict (the class
-/// escaped env classification — e.g. a consolidated target whose class the
-/// generation env did not see) falls back to the write-time return extraction:
-/// an equal return drops silently, a differing one skips as `tighter_return`,
-/// an unextractable one as `new_method`.
-fn skip_conflict(c: Candidate, existing_rt: Option<String>, skipped: &mut Vec<SkipEntry>) {
-    if c.classification == "tighter_return" {
-        let declared_return_rbs = c.declared_return_rbs.clone();
-        skipped.push(SkipEntry { candidate: c, classification: "tighter_return", declared_return_rbs });
-        return;
-    }
-    let cand_rt = extract_method_return_text(&c.rbs);
-    match (existing_rt, cand_rt) {
-        (Some(er), Some(cr)) if er.trim() == cr.trim() => {
-            // Equivalent → drop silently (not applied, not skipped).
-        }
-        (Some(er), Some(_)) => skipped.push(SkipEntry {
-            candidate: c,
-            classification: "tighter_return",
-            declared_return_rbs: Some(er.trim().to_string()),
-        }),
-        _ => skipped.push(SkipEntry {
-            candidate: c,
-            classification: "new_method",
-            declared_return_rbs: None,
-        }),
-    }
+/// `merge_into_existing_class`'s `skipped` accumulator): every conflicting
+/// candidate, with the classification and declared return generation gave it.
+/// The reference does not compare the member's text here; an equal return was
+/// already dropped as equivalent by the generator, and one the generator could
+/// not compare (a class whose definition does not build, #482) is reported as
+/// a skip.
+fn skip_conflict(c: Candidate, skipped: &mut Vec<SkipEntry>) {
+    let classification = c.classification;
+    let declared_return_rbs = c.declared_return_rbs.clone();
+    skipped.push(SkipEntry { candidate: c, classification, declared_return_rbs });
 }
 
 /// Count bare `untyped` type tokens in an RBS fragment (reference

@@ -18,6 +18,11 @@ use super::{collect_rbs_files, decl_full_name};
 struct Param {
     text: String,
     plain: bool,
+    /// The parameter with its name erased: variance, `unchecked`, and which
+    /// of upper bound / lower bound / default it carries. Two declarations
+    /// agree on a parameter list only when these agree position by position
+    /// (`ClassEntry#validate_type_params` compares after renaming).
+    shape: (bool, u8, bool, bool, bool),
 }
 
 /// FQN → the first loaded declaration's type parameters (core and stdlib
@@ -25,6 +30,10 @@ struct Param {
 #[derive(Default)]
 pub struct Generics {
     params: HashMap<String, Vec<Param>>,
+    /// Classes whose declarations disagree on their type parameters: RBS
+    /// raises `GenericParameterMismatchError` building them, so the
+    /// reference's definition lookup answers nothing for any of their methods.
+    mismatched: std::collections::HashSet<String>,
 }
 
 impl Generics {
@@ -74,23 +83,47 @@ impl Generics {
                         if tp.unchecked() {
                             text.push_str("unchecked ");
                         }
-                        match tp.variance() {
-                            TypeParamVariance::Covariant => text.push_str("out "),
-                            TypeParamVariance::Contravariant => text.push_str("in "),
-                            TypeParamVariance::Invariant => {}
-                        }
+                        let variance = match tp.variance() {
+                            TypeParamVariance::Covariant => {
+                                text.push_str("out ");
+                                1
+                            }
+                            TypeParamVariance::Contravariant => {
+                                text.push_str("in ");
+                                2
+                            }
+                            TypeParamVariance::Invariant => 0,
+                        };
                         text.push_str(tp.name().as_str());
-                        let plain = tp.upper_bound().is_none()
-                            && tp.lower_bound().is_none()
-                            && tp.default_type().is_none();
-                        Some(Param { text, plain })
+                        let (upper, lower, default) = (
+                            tp.upper_bound().is_some(),
+                            tp.lower_bound().is_some(),
+                            tp.default_type().is_some(),
+                        );
+                        let plain = !upper && !lower && !default;
+                        let shape = (tp.unchecked(), variance, upper, lower, default);
+                        Some(Param { text, plain, shape })
                     }
                     _ => None,
                 })
                 .collect();
             // `entry_declarations(entry).first`: the first declaration loaded
-            // decides, generic or not.
-            self.params.entry(fqn).or_insert(params);
+            // decides, generic or not. A later one with another parameter
+            // count or shape fails `validate_type_params`. (Two bounded
+            // parameters whose bound TEXT differs also fail there; that is not
+            // read, so such a class keeps its declarations, the drop side.)
+            match self.params.get(&fqn) {
+                Some(first) => {
+                    let agree = first.len() == params.len()
+                        && first.iter().zip(&params).all(|(a, b)| a.shape == b.shape);
+                    if !agree {
+                        self.mismatched.insert(fqn.clone());
+                    }
+                }
+                None => {
+                    self.params.insert(fqn.clone(), params);
+                }
+            }
             self.walk(members.iter().collect(), &path);
         }
     }
@@ -122,6 +155,13 @@ impl Generics {
         format!("{token}[{}]", vec!["untyped"; n].join(", "))
     }
 
+    /// Whether the class's declarations disagree on their type parameters
+    /// (`RBS::GenericParameterMismatchError`), so its definition does not
+    /// build.
+    pub fn mismatched(&self, class_name: &str) -> bool {
+        self.mismatched.contains(class_name.strip_prefix("::").unwrap_or(class_name))
+    }
+
     /// `bounded_generic?`: generic with a bounded or defaulted parameter.
     pub fn bounded(&self, class_name: &str) -> bool {
         self.params
@@ -147,5 +187,35 @@ mod tests {
         assert_eq!(g.header_spelling("Array").as_deref(), Some("[unchecked out E]"));
         assert_eq!(g.header_spelling("String"), None);
         assert_eq!(namespace_prefixes("A::B"), vec!["A".to_string(), "A::B".to_string()]);
+    }
+
+    /// The bundled declarations agree with each other: no core or stdlib
+    /// class reads as unbuildable before the project adds anything.
+    #[test]
+    fn bundled_declarations_agree() {
+        let g = Generics::build(&[]);
+        let mut bad: Vec<&String> = g.mismatched.iter().collect();
+        bad.sort();
+        assert!(bad.is_empty(), "{bad:?}");
+    }
+
+    /// A project `class Hash` without parameters disagrees with core's
+    /// `Hash[unchecked out K, unchecked out V]`; one with the same
+    /// parameters renamed agrees.
+    #[test]
+    fn bare_core_reopening_mismatches() {
+        let dir = std::env::temp_dir().join(format!("rigor-generics-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("a.rbs"),
+            "class Hash\nend\nclass Array[unchecked out T]\nend\nclass Range[E]\nend\n",
+        )
+        .unwrap();
+        let g = Generics::build(std::slice::from_ref(&dir));
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(g.mismatched("Hash"));
+        assert!(!g.mismatched("Array"));
+        assert!(g.mismatched("Range"), "invariant against core's `out E`");
+        assert!(!g.mismatched("String"));
     }
 }

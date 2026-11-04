@@ -11,7 +11,7 @@ fn candidates_tagged(tag: &str, src: &str, include_private: bool) -> Vec<Candida
     // (these tests exercise inference/rendering, not env classification —
     // that has its own `sig_env` unit tests + the oracle E2E gate).
     let env = SigEnv::build(&[]);
-    let out = generate_run(&[file.to_str().unwrap().to_string()], include_private, &env, &writes).0;
+    let out = generate_run(&[file.to_str().unwrap().to_string()], include_private, &env, &writes).candidates;
     let _ = std::fs::remove_file(&file);
     out
 }
@@ -28,7 +28,7 @@ fn candidates_with_sig(tag: &str, rb_src: &str, rbs_src: &str) -> Vec<Candidate>
     std::fs::write(&rb, rb_src).unwrap();
     std::fs::write(dir.join("sig/foo.rbs"), rbs_src).unwrap();
     let env = SigEnv::build(&[dir.join("sig")]);
-    let out = generate_run(&[rb.to_str().unwrap().to_string()], false, &env, &writes).0;
+    let out = generate_run(&[rb.to_str().unwrap().to_string()], false, &env, &writes).candidates;
     let _ = std::fs::remove_dir_all(&dir);
     out
 }
@@ -900,8 +900,11 @@ fn merge_inserts_new_method_nested_reproduces_indent_quirk() {
 }
 
 #[test]
-fn merge_equivalent_conflict_drops_silently() {
-    // Same declared return → dropped: not applied, not skipped → noop.
+fn merge_equivalent_conflict_skips_user_authored() {
+    // A conflict reaching the writer is skipped whatever its text (reference
+    // `merge_into_existing_class`): an equal return was already dropped as
+    // equivalent at generation, so one arriving here is one generation could
+    // not compare (#482). Not applied → noop, byte-untouched.
     let src = "class Foo\n  def greeting: () -> \"hi\"\nend\n".to_string();
     let out = apply_merge(
         src.clone(),
@@ -910,12 +913,14 @@ fn merge_equivalent_conflict_drops_silently() {
         false,
     );
     assert_eq!(out.action, "noop");
-    assert!(out.applied.is_empty() && out.skipped.is_empty());
-    assert_eq!(out.source, src, "byte-untouched when everything drops");
+    assert!(out.applied.is_empty());
+    assert_eq!(out.skipped.len(), 1);
+    assert_eq!(out.skipped[0].classification, "new_method");
+    assert_eq!(out.source, src, "byte-untouched when nothing applies");
 }
 
 #[test]
-fn merge_different_conflict_skips_user_authored_with_declared_return() {
+fn merge_conflict_keeps_the_candidate_classification() {
     let src = "class Foo\n  def greeting: () -> String\nend\n".to_string();
     let out = apply_merge(
         src.clone(),
@@ -925,8 +930,8 @@ fn merge_different_conflict_skips_user_authored_with_declared_return() {
     );
     assert_eq!(out.action, "noop"); // nothing applied
     assert_eq!(out.skipped.len(), 1);
-    assert_eq!(out.skipped[0].classification, "tighter_return");
-    assert_eq!(out.skipped[0].declared_return_rbs.as_deref(), Some("String"));
+    assert_eq!(out.skipped[0].classification, "new_method");
+    assert_eq!(out.skipped[0].declared_return_rbs, None);
     assert_eq!(out.source, src);
 }
 
@@ -1142,7 +1147,8 @@ fn generic_reopen_headers_and_core_subclass_shell() {
     std::fs::write(&file, "class Hash\n  def hk = :k\nend\nclass MyHash < Hash; end\nclass M\n  def m = 1\nend\n")
         .unwrap();
     let env = SigEnv::build(&[]);
-    let (cs, info, _) = generate_run(&[file.to_str().unwrap().to_string()], false, &env, &writes);
+    let Generated { candidates: cs, info, .. } =
+        generate_run(&[file.to_str().unwrap().to_string()], false, &env, &writes);
     let _ = std::fs::remove_dir_all(&dir);
     assert_eq!(cs[0].decl_header, "class Hash[unchecked out K, unchecked out V]");
     assert!(info.shells.contains(&"MyHash".to_string()));
