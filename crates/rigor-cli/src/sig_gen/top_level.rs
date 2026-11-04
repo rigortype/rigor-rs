@@ -10,8 +10,7 @@
 //! `def self.x` and a block-body `def` stay unreported.
 
 use rigor_parse::ruby_prism::{
-    self, BlockNode, ClassNode, DefNode, LambdaNode, ModuleNode, Node as PrismNode, ParseResult,
-    SingletonClassNode, Visit,
+    BlockNode, ClassNode, DefNode, LambdaNode, ModuleNode, ParseResult, SingletonClassNode, Visit,
 };
 
 /// Every reported top-level `def` in the file: `(name, start offset)`, in
@@ -26,23 +25,6 @@ struct Walker {
     out: Vec<(String, usize)>,
 }
 
-/// Whether a `class` / `module` header names a namespace the walk enters with
-/// a non-empty prefix (`descend_into_namespace?`). A `self::X` header is
-/// declined outright, and its body is not walked either. A header whose base
-/// is an expression (`foo::X`) names nothing: the reference walks its
-/// children at the enclosing (here: empty) prefix.
-fn opens_namespace(path: &PrismNode<'_>) -> Option<bool> {
-    if path.as_constant_read_node().is_some() {
-        return Some(true);
-    }
-    let cp = path.as_constant_path_node()?;
-    match cp.parent() {
-        None => Some(true),
-        Some(parent) if parent.as_self_node().is_some() => Some(true),
-        Some(parent) => opens_namespace(&parent),
-    }
-}
-
 impl<'pr> Visit<'pr> for Walker {
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
         if node.receiver().is_none() {
@@ -51,17 +33,12 @@ impl<'pr> Visit<'pr> for Walker {
         }
     }
 
-    fn visit_class_node(&mut self, node: &ClassNode<'pr>) {
-        if opens_namespace(&node.constant_path()) != Some(true) {
-            ruby_prism::visit_class_node(self, node);
-        }
-    }
+    // A `class` / `module` body is walked at a non-empty prefix: a header
+    // with an expression base (`class foo::X`) still declares `X`
+    // (`declaration_prefix`), and a declined `self::X` body is not walked.
+    fn visit_class_node(&mut self, _node: &ClassNode<'pr>) {}
 
-    fn visit_module_node(&mut self, node: &ModuleNode<'pr>) {
-        if opens_namespace(&node.constant_path()) != Some(true) {
-            ruby_prism::visit_module_node(self, node);
-        }
-    }
+    fn visit_module_node(&mut self, _node: &ModuleNode<'pr>) {}
 
     // Every `def` below these is in a singleton-class body or at a non-zero
     // block depth, so none is reported.

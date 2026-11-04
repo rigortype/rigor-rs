@@ -94,6 +94,7 @@ mod generics;
 mod rbs_parse_error;
 mod superclasses;
 mod sig_env;
+mod module_function;
 mod top_level;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -615,23 +616,39 @@ fn finalize_superclasses(
             .find(|n| class_name.starts_with(&format!("{n}::")))
             .map(|n| (n.clone(), unresolvable[n].clone()))
     };
-    let mut unresolvable: HashMap<String, String> = HashMap::new();
-    loop {
-        let kept: Vec<&Candidate> =
-            candidates.iter().filter(|c| owner_of(&c.class_name, &unresolvable).is_none()).collect();
-        let emitted = declared_by_run(&kept);
-        let found: HashMap<String, String> = supers
-            .keys()
-            .filter_map(|name| {
-                superclasses::unresolved_root(name, &supers, &emitted, &rbs_known)
-                    .map(|root| (name.clone(), root))
-            })
-            .collect();
-        if found.len() == unresolvable.len() {
-            break;
+    let fixpoint = |rows: &[Candidate], mut unresolvable: HashMap<String, String>| {
+        loop {
+            let kept: Vec<&Candidate> =
+                rows.iter().filter(|c| owner_of(&c.class_name, &unresolvable).is_none()).collect();
+            let emitted = declared_by_run(&kept);
+            let found: HashMap<String, String> = supers
+                .keys()
+                .filter_map(|name| {
+                    superclasses::unresolved_root(name, &supers, &emitted, &rbs_known)
+                        .map(|root| (name.clone(), root))
+                })
+                .collect();
+            if found.len() == unresolvable.len() {
+                return unresolvable;
+            }
+            unresolvable = found;
         }
-        unresolvable = found;
-    }
+    };
+    let unresolvable = fixpoint(&candidates, HashMap::new());
+    // `demote_unresolvable_superclasses` turns every row of such a class into a
+    // skip, which the override demotion below then reads as unsigned.
+    let candidates: Vec<Candidate> = candidates
+        .into_iter()
+        .map(|c| match owner_of(&c.class_name, &unresolvable) {
+            Some(_) => demoted(c, "sig.skipped.unresolvable-superclass"),
+            None => c,
+        })
+        .collect();
+    let candidates = demote_overridden_base_methods(candidates, &supers);
+    // Again after the override demotion: a demoted method can leave its file
+    // with nothing to write, and a class shell riding on that file then
+    // declares nothing a subclass elsewhere could rest on.
+    let unresolvable = fixpoint(&candidates, unresolvable);
 
     // `stamp_generic_reopenings` / `header_type_params`: every generic class
     // (plain parameters only) the run may open a header for — each
@@ -701,6 +718,54 @@ fn finalize_superclasses(
         })
         .collect();
     (out, skips, report)
+}
+
+/// Reference `Generator#demote_overridden_base_methods` (#744): a base
+/// class's method is not emitted when a project subclass overrides it and the
+/// override is not emitted itself. RBS would resolve the subclass's call
+/// through the base's declaration, a type describing the base's body rather
+/// than the override the subclass runs.
+///
+/// An override counts as unsigned when its row is not emittable, whatever the
+/// reason, kind aside (the reference pairs class and method name only). A row
+/// the port drops on its own counts too: the port does not write that
+/// override, so the base's declaration would be the subclass's answer.
+fn demote_overridden_base_methods(
+    candidates: Vec<Candidate>,
+    supers: &HashMap<String, String>,
+) -> Vec<Candidate> {
+    let superclasses: HashMap<&str, String> = supers
+        .iter()
+        .map(|(name, sup)| (name.as_str(), superclasses::bare_superclass_name(sup)))
+        .collect();
+    if superclasses.is_empty() {
+        return candidates;
+    }
+    let mut overridden: HashSet<(String, String)> = HashSet::new();
+    for c in candidates.iter().filter(|c| !emittable(c) && !c.class_name.is_empty()) {
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut current = c.class_name.as_str();
+        while let Some(parent) = superclasses.get(current) {
+            if !seen.insert(parent.as_str()) {
+                break;
+            }
+            overridden.insert((parent.clone(), c.method_name.clone()));
+            current = parent.as_str();
+        }
+    }
+    if overridden.is_empty() {
+        return candidates;
+    }
+    candidates
+        .into_iter()
+        .map(|c| {
+            if emittable(&c) && overridden.contains(&(c.class_name.clone(), c.method_name.clone())) {
+                demoted(c, "sig.skipped.overridden-by-unsigned-subclass")
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// Reference `demoted_candidate`: an emittable row turned into a skip.
@@ -809,6 +874,7 @@ fn generate_file_with_info(
     // rows (#1676). None sits inside a namespace the walk enters, so each one
     // goes in ahead of the first top-level statement that ends after it.
     let mut top_level = top_level::collect(&parsed).into_iter().peekable();
+    let modes = module_function::def_modes(&parsed);
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
             let end = ast.get(child).span().1;
@@ -827,6 +893,7 @@ fn generate_file_with_info(
                 &fqns,
                 sig_env,
                 &layouts,
+                &modes,
                 &mut interner,
                 &mut out,
             );
@@ -1119,6 +1186,7 @@ fn walk_namespace(
     fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     layouts: &MetaLayouts,
+    modes: &HashMap<usize, module_function::Mode>,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
@@ -1155,31 +1223,48 @@ fn walk_namespace(
     // `Definition{name:Some}` set, so walking the body for them is equivalent AND
     // recovers each def's span for the ordering (the sort key).
     //
-    // `mf_active` tracks a bare `module_function` (no args) seen EARLIER in this
-    // body — it makes every SUBSEQUENT instance def dual, rendered `def self?.name`
-    // (reference `@module_function_methods`). Position matters: a def BEFORE the
-    // call stays a plain instance method. The `module_function :sym` ARGS form does
-    // NOT flip the mode (oracle-probed) and is ignored. It applies in a CLASS body
-    // too (rule_catalog.rb), not just a module.
-    let mut mf_active = false;
+    // A bare `module_function` (no args) seen EARLIER in this body makes every
+    // SUBSEQUENT instance def dual, rendered `def self?.name` (reference
+    // `@module_function_methods`), until a bare `public` / `private` /
+    // `protected` ends it. After a reset that may not run, the def's kind is
+    // unknown and it is skipped (`sig.skipped.uncertain-module-function`,
+    // #1968). [`module_function::def_modes`] reads the body; the `:sym` ARGS
+    // form does not flip the mode. It applies in a CLASS body too.
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
+    let mut uncertain: Vec<(&str, usize)> = Vec::new();
     for &child in body {
         match ast.get(child) {
-            // A BARE `module_function` (no args) flips the mode for later defs.
-            Node::Call { method, receiver: None, args, .. }
-                if method == "module_function" && args.is_empty() =>
-            {
-                mf_active = true;
-            }
             Node::Definition {
                 name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
-                let vis = visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v);
+                let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                if mode == module_function::Mode::Uncertain {
+                    uncertain.push((n.as_str(), span.0));
+                    continue;
+                }
+                let mf = mode == module_function::Mode::On;
+                let vis = if mode == module_function::Mode::OffPrivate {
+                    Some(Visibility::Private)
+                } else {
+                    visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v)
+                };
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf_active),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf),
                     vis,
                     span.0,
                 ));
+            }
+            // `private def x` after an uncertain reset: reported like a direct
+            // def (the reference skips it before reading its visibility). In
+            // any other mode the port does not walk a def passed to a call.
+            Node::Call { receiver: None, args, .. } => {
+                for &arg in args {
+                    if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
+                        if modes.get(&span.0) == Some(&module_function::Mode::Uncertain) {
+                            uncertain.push((n.as_str(), span.0));
+                        }
+                    }
+                }
             }
             Node::Definition {
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
@@ -1215,11 +1300,15 @@ fn walk_namespace(
     // class groups for that shape.
     enum Emit<'a> {
         Method(&'a MethodSig<'a>, Option<Visibility>),
+        Uncertain(&'a str),
         Nested(NodeId),
     }
     let mut items: Vec<(usize, Emit)> = Vec::new();
     for (sig, vis, span) in &sigs {
         items.push((*span, Emit::Method(sig, *vis)));
+    }
+    for (name, span) in &uncertain {
+        items.push((*span, Emit::Uncertain(name)));
     }
     for &child in body {
         if is_namespace_node(ast, child, &qualified, layouts) {
@@ -1247,6 +1336,13 @@ fn walk_namespace(
                     out.push(candidate);
                 }
             }
+            Emit::Uncertain(name) => out.push(non_emitted(
+                path,
+                &class_name,
+                name,
+                "instance",
+                Some("sig.skipped.uncertain-module-function"),
+            )),
             Emit::Nested(child) => walk_namespace(
                 ast,
                 child,
@@ -1259,6 +1355,7 @@ fn walk_namespace(
                 fqns,
                 sig_env,
                 layouts,
+                modes,
                 interner,
                 out,
             ),
