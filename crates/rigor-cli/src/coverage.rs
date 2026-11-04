@@ -289,33 +289,36 @@ pub fn cmd_coverage(args: &[String]) -> ExitCode {
         Err(f) => return f.report(),
     };
 
-    // `--protection` (ADR-63 Tier 1) dispatches after config load upstream —
-    // `run_protection`. Deferred track → exit 2.
+    // Resolve paths: explicit args, else config `paths:` (reference
+    // `@argv.empty? ? configuration.paths : @argv`).
+    let no_args = positional.is_empty();
+    let args_for_paths: Vec<String> = if no_args { cfg.paths.clone() } else { positional };
+    let (paths, lines, fatal) = collect_paths_reporting(&args_for_paths);
+    for line in &lines {
+        eprintln!("{line}");
+    }
+    if fatal {
+        return ExitCode::from(64);
+    }
+    if paths.is_empty() {
+        // `no_ruby_files_error` (#2206): no path given or configured is the
+        // bare usage error; named paths with no Ruby file say so.
+        if no_args && cfg.paths.is_empty() {
+            eprintln!("coverage: at least one path is required");
+        } else {
+            eprintln!("coverage: no Ruby files under the given paths");
+        }
+        eprintln!("{USAGE}");
+        return ExitCode::from(64);
+    }
+
+    // `--protection` (ADR-63 Tier 1) dispatches after path resolution
+    // upstream — `run_protection`. Deferred track → exit 2.
     if options.protection {
         eprintln!(
             "coverage: --protection (type-protection coverage) is not yet implemented in this port"
         );
         return ExitCode::from(2);
-    }
-
-    // Resolve paths: explicit args, else config `paths:` (reference
-    // `@argv.empty? ? configuration.paths : @argv`).
-    let args_for_paths: Vec<String> = if positional.is_empty() {
-        cfg.paths.clone()
-    } else {
-        positional
-    };
-    let paths = match collect_paths(&args_for_paths) {
-        Err(msg) => {
-            eprintln!("{msg}");
-            return ExitCode::from(64);
-        }
-        Ok(p) => p,
-    };
-    if paths.is_empty() {
-        eprintln!("coverage: at least one path is required");
-        eprintln!("{USAGE}");
-        return ExitCode::from(64);
     }
 
     let index = build_index(&cfg);
@@ -456,21 +459,43 @@ pub fn mcp_coverage_json(
 /// the reference's error message (→ EXIT_USAGE at the CLI). The final list is
 /// de-duplicated preserving first-seen order (`paths.uniq`).
 fn collect_paths(args: &[String]) -> Result<Vec<String>, String> {
+    let (paths, lines, fatal) = collect_paths_reporting(args);
+    if fatal {
+        return Err(lines.join("\n"));
+    }
+    Ok(paths)
+}
+
+/// v0.4.7 `Command#collect_paths_reporting` over `PathExpansion` (#2662):
+/// a directory expands to its `**/*.rb`, a `.rb` file is taken as is, and
+/// anything else (missing, or not a Ruby file) is a `path:1:1:` diagnostic —
+/// an `error` when no Ruby file was found at all (the caller exits 64), else
+/// a `warning: … (skipped)` and the scan goes on. Returns the deduplicated
+/// files, the diagnostic lines (for stderr), and whether one is an error.
+fn collect_paths_reporting(args: &[String]) -> (Vec<String>, Vec<String>, bool) {
     let mut paths: Vec<String> = Vec::new();
+    let mut bad: Vec<(&str, &str)> = Vec::new();
     for arg in args {
         let p = Path::new(arg);
         if p.is_dir() {
             paths.extend(glob_rb(arg));
-        } else if p.is_file() {
+        } else if p.is_file() && arg.ends_with(".rb") {
             paths.push(arg.clone());
+        } else if p.exists() {
+            bad.push((arg, "not a Ruby file (expected `.rb` or a directory)"));
         } else {
-            return Err(format!("coverage: not a file or directory: {arg}"));
+            bad.push((arg, "no such file or directory"));
         }
     }
+    let any_files = !paths.is_empty();
+    let (severity, suffix) = if any_files { ("warning", " (skipped)") } else { ("error", "") };
+    let lines: Vec<String> =
+        bad.iter().map(|(path, msg)| format!("{path}:1:1: {severity}: {msg}{suffix}")).collect();
+    let fatal = !any_files && !bad.is_empty();
     // Dedup preserving first-seen order.
     let mut seen = std::collections::HashSet::new();
     paths.retain(|p| seen.insert(p.clone()));
-    Ok(paths)
+    (paths, lines, fatal)
 }
 
 /// Collect `<dir>/**/*.rb` in Ruby `Dir.glob("**/*.rb")` order (skipping hidden
