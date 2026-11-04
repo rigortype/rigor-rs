@@ -50,9 +50,13 @@ impl SourceIndex {
     /// `None` when `class` is not in the override index or does not record
     /// `method`.
     pub fn method_visibility(&self, class: &str, method: &str) -> Option<Visibility> {
-        self.override_classes
-            .get(class)
-            .and_then(|c| c.method_visibilities.get(method).copied())
+        let entry = self.override_classes.get(class)?;
+        entry.method_visibilities.get(method)?;
+        // Issue #473: one answer only when every file that writes the slot
+        // ends on the same value.
+        let mut values = entry.file_visibilities.get(method)?.iter().map(|&(_, v)| v);
+        let first = values.next()?;
+        values.all(|v| v == first).then_some(first)
     }
 
     /// ADR-35 slice 1: the NEAREST project ancestor of the QUALIFIED class
@@ -109,7 +113,7 @@ impl SourceIndex {
                 if defines {
                     // Stop at the nearest defining ancestor; its visibility may be
                     // None (unknown) — the caller treats unknown as "cannot prove".
-                    return Some((current.clone(), entry.method_visibilities.get(method).copied()));
+                    return Some((current.clone(), self.method_visibility(&current, method)));
                 }
                 // Not defined here ⇒ enqueue this ancestor's own ancestors.
                 for next in self.override_ancestor_names(&current) {
@@ -284,10 +288,12 @@ impl SourceIndex {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn ingest_override_class(
         &mut self,
+        file: usize,
         qualified: &str,
         superclass: Option<String>,
         methods: &[String],
         method_visibilities: &[(String, Visibility)],
+        visibility_remarks: &[(String, Visibility)],
         includes: &[String],
         extends: &[String],
         is_module: bool,
@@ -305,9 +311,25 @@ impl SourceIndex {
         for m in methods {
             entry.methods.insert(m.clone());
         }
-        // First-write-wins per method name (stable cross-file view).
+        // Issue #473: the body's re-marks of names it does not record come
+        // first (each precedes any write the body makes to that name), then
+        // its own table. Within one file the later write wins; a re-mark only
+        // re-marks, it never makes the class a definer.
+        let mut write = |m: &String, vis: Visibility, defines: bool| {
+            let per_file = entry.file_visibilities.entry(m.clone()).or_default();
+            match per_file.iter_mut().find(|(f, _)| *f == file) {
+                Some(slot) => slot.1 = vis,
+                None => per_file.push((file, vis)),
+            }
+            if defines || entry.method_visibilities.contains_key(m) {
+                entry.method_visibilities.insert(m.clone(), vis);
+            }
+        };
+        for (m, vis) in visibility_remarks {
+            write(m, *vis, false);
+        }
         for (m, vis) in method_visibilities {
-            entry.method_visibilities.entry(m.clone()).or_insert(*vis);
+            write(m, *vis, true);
         }
         for inc in includes {
             if !entry.includes.contains(inc) {
@@ -372,6 +394,7 @@ pub(crate) fn collect_override_classes(
             methods,
             method_visibilities,
             module_function_visibilities,
+            visibility_remarks,
             includes,
             body,
             ..
@@ -385,6 +408,7 @@ pub(crate) fn collect_override_classes(
                 superclass: superclass_path.clone(),
                 methods: methods.to_vec(),
                 method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
+                visibility_remarks: visibility_remarks.to_vec(),
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: false,
@@ -396,7 +420,14 @@ pub(crate) fn collect_override_classes(
             }
         }
         Node::ModuleDef {
-            name, methods, method_visibilities, module_function_visibilities, includes, body, ..
+            name,
+            methods,
+            method_visibilities,
+            module_function_visibilities,
+            visibility_remarks,
+            includes,
+            body,
+            ..
         } => {
             if name.is_empty() {
                 return;
@@ -407,6 +438,7 @@ pub(crate) fn collect_override_classes(
                 superclass: None,
                 methods: methods.to_vec(),
                 method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
+                visibility_remarks: visibility_remarks.to_vec(),
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: true,

@@ -335,6 +335,7 @@ fn nearest_ancestor_returns_unknown_visibility_for_methods_only_entry() {
             methods: ["foo".to_string()].into_iter().collect(),
             is_module: false,
             refines: Vec::new(),
+            ..OverrideClass::default()
         },
     );
     assert_eq!(

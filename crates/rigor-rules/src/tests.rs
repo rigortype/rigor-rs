@@ -2652,27 +2652,44 @@ fn override_vis_fires_cross_file() {
     );
 }
 
-/// Issue #92 invariant 1, example 1 — FILE ORDER IS NORMATIVE. The project
-/// index records `method_visibilities` first-write-wins, so which file
-/// declares `Base#m` FIRST decides whether the override fires. `a,b` sees
-/// `m` public on Base ⇒ `Sub#m` private reduces it ⇒ warns; `b,a` sees it
-/// already private ⇒ silent.
-///
-/// This is a property of the pre-existing accumulator, not of any refactor —
-/// which is exactly why it is pinned here: `SourceIndex::merge` replays the
-/// per-file harvests in the caller's file order and must never sort them.
+/// Issue #92 invariant 1, example 1 — two FILES that give `Base#m`
+/// different visibilities. The project index used to record
+/// `method_visibilities` first-write-wins, so `a,b` warned "public to
+/// private" where the reference is silent. The reference's answer there rests
+/// on load order and on the file being checked, so since issue #473 the port
+/// reads the slot as unknown and declines in BOTH orders (oracle-probed at the
+/// v0.4.7 pin: silent either way for these two files).
 #[test]
 fn override_vis_project_order_is_normative() {
     let a = b"class Base\n  def m\n    1\n  end\nend\n" as &[u8];
     let b = b"class Base\n  private\n  def m\n    2\n  end\nend\n\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\n" as &[u8];
     let forward = override_vis_project(&[a, b], 1);
-    assert_eq!(forward.len(), 1, "a,b must fire, got {forward:?}");
-    assert_eq!(
-        forward[0].message,
-        "visibility of `m' reduced from public to private (overrides Base#m); breaks substitutability"
-    );
+    assert!(forward.is_empty(), "a,b must stay silent, got {forward:?}");
     let reversed = override_vis_project(&[b, a], 0);
     assert!(reversed.is_empty(), "b,a must stay silent, got {reversed:?}");
+}
+
+/// Issue #473 — within ONE file a later reopening's visibility wins, as the
+/// reference's per-file table does: a public `B#foo` reopened as `private`
+/// is private (silent), and the reverse order is public (fires). A reopening
+/// that only re-marks the name (`private :foo`) re-marks the earlier slot.
+#[test]
+fn override_vis_same_file_reopening_is_last_write_wins() {
+    let child = "class S < B\n  protected\n  def foo = 3\nend\n";
+    let run = |parent: &str| override_vis_project(&[format!("{parent}{child}").as_bytes()], 0);
+    assert!(run("class B; def foo = 1; end\nclass B; private def foo = 2; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; private; def foo = 2; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; private :foo; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; private attr_reader :foo; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; module_function :foo; end\n").is_empty());
+    let fires = run("class B; private def foo = 1; end\nclass B; def foo = 2; end\n");
+    assert_eq!(fires.len(), 1, "a later public reopening must fire, got {fires:?}");
+    assert_eq!(
+        fires[0].message,
+        "visibility of `foo' reduced from public to protected (overrides B#foo); breaks substitutability"
+    );
+    let remarked = run("class B; private; def foo = 1; end\nclass B; public :foo; end\n");
+    assert_eq!(remarked.len(), 1, "`public :foo` in a reopening must fire, got {remarked:?}");
 }
 
 /// Issue #92 invariant 1, example 2 — the same for `include` ACCUMULATION

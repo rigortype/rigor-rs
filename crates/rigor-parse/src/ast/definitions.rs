@@ -183,10 +183,8 @@ pub(crate) fn direct_method_names(body: &PrismNode<'_>) -> Vec<String> {
 /// definer there (oracle: an `attr_reader`-only parent never answers
 /// `def.override-visibility-reduced`), and the port's override walk reads any
 /// recorded slot as one.
-pub(crate) fn discover_visibilities_and_includes(
-    body: &PrismNode<'_>,
-) -> (VisibilityTable, Vec<String>, VisibilityTable) {
-    let (vis, includes) = discover_table(body, false);
+pub(crate) fn discover_visibilities_and_includes(body: &PrismNode<'_>) -> DiscoveredVisibilities {
+    let (vis, includes, _) = discover_table(body, false);
     // Upstream v0.4.5 (#2055, #1569): the reference's method-visibility table
     // applies a `module_function` call as a `private` one, bare or named —
     // the instance copy is private. The port's own table keeps reading it as
@@ -194,19 +192,42 @@ pub(crate) fn discover_visibilities_and_includes(
     // override lint skips a module function's own def), so the slots the
     // `private` reading writes differently ride separately, for the override
     // lint's PARENT read only.
-    let (mf_vis, _) = discover_table(body, true);
+    //
+    // Issue #473: the same `private` reading's re-marks of names this body
+    // does not record (`private :foo`, `private attr_reader :foo`,
+    // `module_function :foo` naming a `def` of another body) also ride along
+    // for the parent read only: the reference keeps one table per FILE, so a
+    // later reopening re-marks an earlier body's slot.
+    let (mf_vis, _, remarks) = discover_table(body, true);
     let module_function = mf_vis
         .into_iter()
         .filter(|(n, v)| !vis.iter().any(|(m, w)| m == n && w == v))
         .collect();
-    (vis, includes, module_function)
+    DiscoveredVisibilities { table: vis, includes, module_function, remarks }
 }
 
 /// `(method name, visibility)` per recorded slot, in source order.
 pub(crate) type VisibilityTable = Vec<(String, Visibility)>;
 
-fn discover_table(body: &PrismNode<'_>, module_function_private: bool) -> (VisibilityTable, Vec<String>) {
+/// What [`discover_visibilities_and_includes`] reads off one class/module body.
+#[derive(Default)]
+pub(crate) struct DiscoveredVisibilities {
+    /// The body's own visibility table (`ClassDef::method_visibilities`).
+    pub(crate) table: VisibilityTable,
+    /// The `include` / `prepend` paths, in source order.
+    pub(crate) includes: Vec<String>,
+    /// `ClassDef::module_function_visibilities`.
+    pub(crate) module_function: VisibilityTable,
+    /// `ClassDef::visibility_remarks`.
+    pub(crate) remarks: VisibilityTable,
+}
+
+fn discover_table(
+    body: &PrismNode<'_>,
+    module_function_private: bool,
+) -> (VisibilityTable, Vec<String>, VisibilityTable) {
     let mut vis: Vec<(String, Visibility)> = Vec::new();
+    let mut remarks: VisibilityTable = Vec::new();
     let mut includes: Vec<String> = Vec::new();
     let mut current = Visibility::Public;
     let mf = module_function_private;
@@ -216,13 +237,17 @@ fn discover_table(body: &PrismNode<'_>, module_function_private: bool) -> (Visib
     // correct. A bare (non-Statements) single-statement body is handled as one.
     if let Some(stmts) = body.as_statements_node() {
         for stmt in stmts.body().iter() {
-            process_visibility_stmt(&stmt, &mut current, &mut vis, &mut includes, mf);
+            let sink = (&mut vis, &mut remarks);
+            process_visibility_stmt(&stmt, &mut current, sink, &mut includes, mf);
         }
     } else {
-        process_visibility_stmt(body, &mut current, &mut vis, &mut includes, mf);
+        process_visibility_stmt(body, &mut current, (&mut vis, &mut remarks), &mut includes, mf);
     }
-    (vis, includes)
+    (vis, includes, remarks)
 }
+
+/// The body's table and its unresolved re-marks ([`back_patch_visibility`]).
+type TableSink<'a> = (&'a mut VisibilityTable, &'a mut VisibilityTable);
 
 /// The bare calls that set the running default (reference `VISIBILITY_TOGGLES`):
 /// the three modifiers and `module_function`, which the walk does not track as
@@ -281,7 +306,7 @@ pub(crate) fn attr_macro_members(call: &ruby_prism::CallNode<'_>) -> Vec<String>
 fn process_visibility_stmt(
     stmt: &PrismNode<'_>,
     current: &mut Visibility,
-    vis: &mut Vec<(String, Visibility)>,
+    (vis, remarks): TableSink<'_>,
     includes: &mut Vec<String>,
     module_function_private: bool,
 ) {
@@ -306,7 +331,7 @@ fn process_visibility_stmt(
                 *current = modifier;
             } else {
                 for arg in &args {
-                    apply_visibility_argument(arg, modifier, vis);
+                    apply_visibility_argument(arg, modifier, (&mut *vis, &mut *remarks));
                 }
             }
         }
@@ -332,7 +357,7 @@ fn process_visibility_stmt(
         return;
     }
     for member in attr_macro_members(&call) {
-        back_patch_visibility(vis, &member, *current);
+        back_patch_visibility((&mut *vis, &mut *remarks), &member, *current);
     }
 }
 
@@ -342,7 +367,7 @@ fn process_visibility_stmt(
 fn apply_visibility_argument(
     arg: &PrismNode<'_>,
     modifier: Visibility,
-    vis: &mut Vec<(String, Visibility)>,
+    (vis, remarks): TableSink<'_>,
 ) {
     if let Some(def) = arg.as_def_node() {
         if def.receiver().is_none() {
@@ -353,18 +378,18 @@ fn apply_visibility_argument(
     if let Some(array) = arg.as_array_node() {
         for element in array.elements().iter() {
             if let Some(target) = literal_symbol_or_string_name(&element) {
-                back_patch_visibility(vis, &target, modifier);
+                back_patch_visibility((&mut *vis, &mut *remarks), &target, modifier);
             }
         }
         return;
     }
     if let Some(target) = literal_symbol_or_string_name(arg) {
-        back_patch_visibility(vis, &target, modifier);
+        back_patch_visibility((vis, remarks), &target, modifier);
         return;
     }
     if let Some(call) = arg.as_call_node() {
         for member in attr_macro_members(&call) {
-            back_patch_visibility(vis, &member, modifier);
+            back_patch_visibility((&mut *vis, &mut *remarks), &member, modifier);
         }
     }
 }
@@ -409,12 +434,16 @@ fn record_visibility(vis: &mut Vec<(String, Visibility)>, name: String, visibili
     }
 }
 
-/// Re-mark the recorded entry for `name` to `visibility`. No-op if the name was
-/// never recorded (the reference creates the slot; the port declines on a name
-/// its tables do not hold).
-fn back_patch_visibility(vis: &mut [(String, Visibility)], name: &str, visibility: Visibility) {
+/// Re-mark the recorded entry for `name` to `visibility`. A name this body has
+/// not recorded (yet) goes to the re-marks instead (the reference writes the
+/// slot of its per-FILE table, which an earlier reopening may hold, issue
+/// #473); the body's own table never gains a slot from it, since the port's
+/// override walk reads any recorded slot as a definer.
+fn back_patch_visibility((vis, remarks): TableSink<'_>, name: &str, visibility: Visibility) {
     if let Some(slot) = vis.iter_mut().find(|(n, _)| n == name) {
         slot.1 = visibility;
+    } else {
+        remarks.push((name.to_string(), visibility));
     }
 }
 
