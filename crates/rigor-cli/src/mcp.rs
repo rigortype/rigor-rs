@@ -788,6 +788,6 @@ mod tests {
         assert!(out["content"][0]["text"]
             .as_str()
             .unwrap()
-            .contains("not a file or directory"));
+            .contains("/nonexistent/xyz.rb:1:1: error: no such file or directory"));
     }
 }
