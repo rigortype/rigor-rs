@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/139_singleton_rewrites.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `even?' for \"later\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 34,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    }
+  ]
+}

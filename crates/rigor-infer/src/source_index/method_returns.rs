@@ -120,6 +120,16 @@ pub(crate) fn infer_method_returns(
     let mut param_bound: HashMap<(String, String), ParamBoundReturn> = HashMap::new();
     let mut pb_disagreed: HashSet<(String, String)> = HashSet::new();
 
+    // Upstream v0.4.5 (#2003): a same-file non-`def` definer written after a
+    // `def` replaces it, so the `def` body no longer types the call. Both maps
+    // start with those keys blacklisted.
+    for ast in asts {
+        for key in superseded_defs(ast) {
+            disagreed.insert(key.clone());
+            pb_disagreed.insert(key);
+        }
+    }
+
     for ast in asts {
         for (_, node) in ast.iter() {
             let (class_name, method_bodies) = match node {
@@ -166,6 +176,115 @@ pub(crate) fn infer_method_returns(
         }
     }
     (returns, param_bound)
+}
+
+/// Upstream v0.4.5 (#2003, `scope_indexer.rb` `call_superseded_names` /
+/// `supersede_def_nodes`): the `(class, method)` keys whose `def` a later
+/// non-`def` definer in the same file replaces — each reader / writer an
+/// `attr_*` call declares (`attr_writer` only `x=`), a literal
+/// `define_method(:x)`, the new name of `alias_method :x, :y` or `alias x y`.
+/// The reference contests the slot, so the readers that re-type the `def` body
+/// decline. Events are read per class name across the file's bodies (a
+/// same-file reopening counts, another file does not) in source order; a `def`
+/// written after the definer wins again. A definer inside a method body, a
+/// `class << self` body or a nested class belongs to another scope. The
+/// recognition is generous (any receiverless or `self.` call, the `send`
+/// family with a literal macro name, String or Symbol names): an extra key
+/// only declines.
+fn superseded_defs(ast: &LoweredAst) -> HashSet<(String, String)> {
+    use rigor_parse::Span;
+    let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
+    let literal = |id: rigor_parse::NodeId| match ast.get(id) {
+        Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => Some(value.clone()),
+        _ => None,
+    };
+    // (class name, offset, method, is_def)
+    let mut events: Vec<(String, usize, String, bool)> = Vec::new();
+    let scopes: Vec<(rigor_parse::NodeId, Span)> = ast
+        .iter()
+        .filter(|(_, n)| {
+            matches!(n, Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Definition { .. })
+        })
+        .map(|(id, n)| (id, n.span()))
+        .collect();
+    for (class_id, node) in ast.iter() {
+        let (Node::ClassDef { name, span, .. } | Node::ModuleDef { name, span, .. }) = node else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        let class_span = *span;
+        // The scopes nested in this body: a node inside one is not this
+        // body's statement (a named `def` itself still is).
+        let nested: Vec<(rigor_parse::NodeId, Span)> = scopes
+            .iter()
+            .filter(|(id, s)| *id != class_id && within(*s, class_span))
+            .copied()
+            .collect();
+        for (id, n) in ast.iter() {
+            let nspan = n.span();
+            if id == class_id || !within(nspan, class_span) {
+                continue;
+            }
+            if nested.iter().any(|(sid, s)| *sid != id && within(nspan, *s)) {
+                continue;
+            }
+            match n {
+                Node::Definition { name: Some(m), .. } => {
+                    events.push((name.clone(), nspan.0, m.clone(), true));
+                }
+                Node::Alias { new_name, .. } => {
+                    if let Some(m) = literal(*new_name) {
+                        events.push((name.clone(), nspan.0, m, false));
+                    }
+                }
+                Node::Call { receiver, method, args, .. } => {
+                    if receiver.is_some_and(|r| !matches!(ast.get(r), Node::SelfExpr { .. })) {
+                        continue;
+                    }
+                    let (macro_name, rest) = match method.as_str() {
+                        "send" | "public_send" | "__send__" => {
+                            let Some(m) = args.first().and_then(|&a| literal(a)) else { continue };
+                            (m, &args[1..])
+                        }
+                        _ => (method.clone(), &args[..]),
+                    };
+                    let names: Vec<String> = rest.iter().filter_map(|&a| literal(a)).collect();
+                    let members: Vec<String> = match macro_name.as_str() {
+                        "attr_reader" => names,
+                        "attr_writer" => names.iter().map(|b| format!("{b}=")).collect(),
+                        "attr_accessor" => names
+                            .iter()
+                            .flat_map(|b| [b.clone(), format!("{b}=")])
+                            .collect(),
+                        "define_method" | "alias_method" => names.into_iter().take(1).collect(),
+                        _ => continue,
+                    };
+                    for m in members {
+                        events.push((name.clone(), nspan.0, m, false));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    events.sort_by_key(|(_, off, _, _)| *off);
+    // (class, method) -> (a def seen, the last event was a definer).
+    let mut state: HashMap<(String, String), (bool, bool)> = HashMap::new();
+    for (class, _, method, is_def) in events {
+        let slot = state.entry((class, method)).or_insert((false, false));
+        if is_def {
+            *slot = (true, false);
+        } else if slot.0 {
+            slot.1 = true;
+        }
+    }
+    state
+        .into_iter()
+        .filter(|(_, (_, superseded))| *superseded)
+        .map(|(key, _)| key)
+        .collect()
 }
 
 /// Run gates 2–5 for one method body and return the inferred CORE class NAME, or

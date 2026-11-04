@@ -147,7 +147,7 @@ impl<'src> Builder<'src> {
             // table + include/prepend names, read from the Prism body BEFORE
             // lowering (lowering erases the modifier-call/`def`-name structure
             // the discovery needs). Mirrors `scope_indexer.rb` exactly.
-            let (method_visibilities, includes) = class
+            let (method_visibilities, includes, module_function_visibilities) = class
                 .body()
                 .as_ref()
                 .map(discover_visibilities_and_includes)
@@ -161,6 +161,7 @@ impl<'src> Builder<'src> {
                 methods,
                 method_bodies,
                 method_visibilities,
+                module_function_visibilities,
                 includes,
                 body,
                 span: span_of(&class.location()),
@@ -176,7 +177,7 @@ impl<'src> Builder<'src> {
                 .unwrap_or_default();
             let body = self.lower_optional_body(module.body().as_ref());
             let method_bodies = self.harvest_method_bodies(&body);
-            let (method_visibilities, includes) = module
+            let (method_visibilities, includes, module_function_visibilities) = module
                 .body()
                 .as_ref()
                 .map(discover_visibilities_and_includes)
@@ -188,6 +189,7 @@ impl<'src> Builder<'src> {
                 methods,
                 method_bodies,
                 method_visibilities,
+                module_function_visibilities,
                 includes,
                 body,
                 span: span_of(&module.location()),

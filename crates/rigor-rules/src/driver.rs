@@ -173,8 +173,8 @@ pub fn analyze_with_source_and_folder(
             let recv_ty = typer.type_of(ast, recv, env, interner);
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
-        // Upstream #1961 — a receiver reading a local an unentered `case`'s
-        // `when` condition wrote reads `Dynamic[top]` on the reference
+        // Upstream #1961/#2036 — a receiver reading a local a `when` test
+        // wrote reads `Dynamic[top]` in the port
         // (`ScopedEnv::case_widened_names`). The snapshot rules below witness
         // from passes that never saw that widening (a Dynamic carrier OPENS
         // their gates), so they stand down on such a receiver.
@@ -186,7 +186,18 @@ pub fn analyze_with_source_and_folder(
                     if crate::span_within(*span, rspan) && case_widened.contains(&name.as_str()))
             })
         };
-        let diag = (!nil_skip)
+        // Upstream v0.4.5 (#2086 / issue #1722, `singleton_local_def?`): a
+        // local whose object this scope gives singleton methods (`def o.m`,
+        // `o.extend(M)`, `class << o`, …) declines `call.undefined-method`.
+        let singleton_local = match ast.get(recv) {
+            Node::LocalVariableRead { name, .. } => ast.ancestry_facts().singleton_locals.holds(
+                name,
+                &method,
+                ast.get(call_id).span().0,
+            ),
+            _ => false,
+        };
+        let diag = (!nil_skip && !singleton_local)
             .then(|| {
                 check_call(
                     ast, recv, &method, message_span, safe_nav, env, &typer, interner, index,
@@ -194,7 +205,7 @@ pub fn analyze_with_source_and_folder(
             })
             .flatten()
             .or_else(|| {
-                if snap_skip {
+                if snap_skip || singleton_local {
                     return None;
                 }
                 check_narrowed_call(
@@ -211,7 +222,7 @@ pub fn analyze_with_source_and_folder(
                 // union-then-rejoin on both edges (rigor-rs#139). `gate_env`'s
                 // unwidened bindings stay for the narrowing rule, whose snaps
                 // replace a Dynamic carrier rather than witness a concrete one.
-                if snap_skip {
+                if snap_skip || singleton_local {
                     return None;
                 }
                 check_collection_call(
@@ -367,6 +378,31 @@ pub fn analyze_with_source_and_folder(
             if reopened_touches(class_id, qualified, method) {
                 continue;
             }
+            // Upstream #1569 (`module_function_def?`): a module function's
+            // instance copy is private because `module_function` made it so,
+            // and the reference does not report that reduction. A bare
+            // `module_function` anywhere earlier in the body (resets
+            // ignored — the decline side), one wrapping this def, or a
+            // later one naming it, declines.
+            let def_start = ast.get(child_id).span().0;
+            let class_span = node.span();
+            let module_function_def = ast.iter().any(|(_, n)| {
+                let Node::Call { receiver: None, method: m, args, span, .. } = n else {
+                    return false;
+                };
+                if m != "module_function" || !crate::span_within(*span, class_span) {
+                    return false;
+                }
+                (args.is_empty() && span.0 < def_start)
+                    || args.contains(&child_id)
+                    || (span.0 > def_start
+                        && args.iter().any(|&a| matches!(ast.get(a),
+                            Node::SymbolLit { value, .. } | Node::StringLit { value, .. }
+                                if value == method)))
+            });
+            if module_function_def {
+                continue;
+            }
             if let Some(diag) =
                 check_override_visibility(source, index, qualified, method, override_vis, *name_span)
             {
@@ -414,6 +450,19 @@ pub fn analyze_with_source_and_folder(
     let truthy_snapshots = typer.always_truthy_snapshots(ast, interner);
     for (id, node) in ast.iter() {
         if let Node::If { predicate, .. } = node {
+            // Upstream #2036: a `when` test that writes a local is evaluated in
+            // order, so the snapshot's pre-`case` binding is stale for a
+            // predicate after it. Decline on a predicate that reads such a local.
+            let pspan = ast.get(*predicate).span();
+            let widened = env.case_widened_names(pspan);
+            if !widened.is_empty()
+                && ast.iter().any(|(_, n)| {
+                    matches!(n, Node::LocalVariableRead { name, span }
+                        if crate::span_within(*span, pspan) && widened.contains(&name.as_str()))
+                })
+            {
+                continue;
+            }
             if let Some(diag) =
                 check_always_truthy(ast, id, *predicate, &truthy_snapshots, interner)
             {

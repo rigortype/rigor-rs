@@ -306,7 +306,9 @@ fn count_rbs_files(dir: &Path) -> usize {
 }
 
 /// `disable:` tokens that reach no row (reference v0.4.4
-/// `ConfigAudit.rule_token_warnings` / `disable_token_warning`, #1953).
+/// `ConfigAudit.rule_token_warnings` / `disable_token_warning`, #1953), then
+/// `severity_overrides:` keys that reach none (v0.4.5
+/// `override_key_warning`, #1985/#2000).
 fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
     let plugin_ids = cfg.configured_plugin_ids();
     for token in cfg.disable_tokens() {
@@ -316,6 +318,64 @@ fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
                 message: format!("disable: {token:?} {reason}"),
             });
         }
+    }
+    for (key, _) in cfg.severity_overrides() {
+        if let Some(reason) = override_key_problem(&key, plugin_ids.as_deref()) {
+            out.push(ConfigWarning {
+                kind: "severity_override",
+                message: format!("severity_overrides: {key:?} {reason}"),
+            });
+        }
+    }
+}
+
+/// The plugin loader's own rows, which a `severity_overrides:` key names by
+/// their qualified id (reference `PLUGIN_LOADER_ROWS`, #1985).
+const PLUGIN_LOADER_ROWS: &[&str] = &["plugin_loader.load-error", "plugin_loader.runtime-error"];
+
+/// Bare ids a `severity_overrides:` key re-stamps but `disable:` cannot reach:
+/// the `fallback` row and the `contribution_merge` conflict reasons (reference
+/// `SEVERITY_ONLY_IDS`, `FlowContribution::CONFLICT_VALID_REASONS`
+/// kebab-cased).
+const SEVERITY_ONLY_IDS: &[&str] =
+    &["fallback", "return-type-collapse", "exceptional-disagreement", "lower-tier-contradiction"];
+
+/// Why a `severity_overrides:` key reaches no row, or `None` (reference
+/// v0.4.5 `override_key_problem`, #1985). A plugin's row answers only to its
+/// qualified `plugin.<id>.<rule>` or `plugin.<id>`; `all` is no family
+/// wildcard here; a reserved run-level row is this map's home, so naming one
+/// is never flagged.
+fn override_key_problem(key: &str, plugin_ids: Option<&[String]>) -> Option<&'static str> {
+    if key == "all" {
+        return Some("is not a recognized rule id; the override has no effect");
+    }
+    if rigor_rules::is_effective_disable_token(key) {
+        return None;
+    }
+    if let Some(rest) = key.strip_prefix("plugin.") {
+        let plausible = |ids: &[String]| {
+            ids.iter().any(|id| {
+                rest == id || rest.strip_prefix(id.as_str()).is_some_and(|r| r.starts_with('.'))
+            })
+        };
+        match plugin_ids {
+            Some(ids) if !plausible(ids) => {
+                Some("names no plugin `plugins:` configures; the override has no effect")
+            }
+            _ => None,
+        }
+    } else if key.starts_with("plugin_loader.") {
+        (!PLUGIN_LOADER_ROWS.contains(&key))
+            .then_some("is not a recognized rule id; the override has no effect")
+    } else if rigor_rules::is_inert_builtin_token(key) {
+        Some("is not a recognized rule id; the override has no effect")
+    } else if !rigor_rules::is_non_check_engine_token(key) && !SEVERITY_ONLY_IDS.contains(&key) {
+        Some(
+            "is not a recognized rule id; the override has no effect \
+             (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)",
+        )
+    } else {
+        None
     }
 }
 
@@ -437,6 +497,49 @@ mod tests {
                  (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)",
                 "disable: \"plugin.rails\" names no plugin `plugins:` configures; the \
                  suppression has no effect",
+            ]
+        );
+    }
+
+    // v0.4.5 (#1985/#2000), oracle-probed: `all`, a bare unknown or plugin
+    // rule, an unknown `plugin_loader.` row, an unconfigured `plugin.` id and
+    // a typo under a built-in family warn; run-level rows, families, aliases,
+    // severity-only ids and a configured plugin's qualified id stay silent.
+    #[test]
+    fn unreachable_override_keys_warn() {
+        let cfg: Config = serde_yaml::from_str(
+            "plugins:\n  - rigor-rails-routes\nseverity_overrides:\n  all: warning\n\
+             \x20 plugin_loader: \"off\"\n  plugin_loader.bogus: \"off\"\n\
+             \x20 plugin_loader.load-error: \"off\"\n  rspec: warning\n\
+             \x20 plugin.rails: \"off\"\n  plugin.rails-routes.x: \"off\"\n  call.nope: \"off\"\n\
+             \x20 call: warning\n  undefined-method: warning\n  load-error: \"off\"\n\
+             \x20 pool-degraded: \"off\"\n  rbs.coverage: \"off\"\n  fallback: \"off\"\n\
+             \x20 return-type-collapse: \"off\"\n  pre-eval: \"off\"\n",
+        )
+        .unwrap();
+        let hint = " (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)";
+        assert_eq!(
+            messages(&cfg, Path::new(".")),
+            vec![
+                "severity_overrides: \"all\" is not a recognized rule id; the override has no effect"
+                    .to_string(),
+                format!(
+                    "severity_overrides: \"plugin_loader\" is not a recognized rule id; the \
+                     override has no effect{hint}"
+                ),
+                "severity_overrides: \"plugin_loader.bogus\" is not a recognized rule id; the \
+                 override has no effect"
+                    .to_string(),
+                format!(
+                    "severity_overrides: \"rspec\" is not a recognized rule id; the override has \
+                     no effect{hint}"
+                ),
+                "severity_overrides: \"plugin.rails\" names no plugin `plugins:` configures; the \
+                 override has no effect"
+                    .to_string(),
+                "severity_overrides: \"call.nope\" is not a recognized rule id; the override has \
+                 no effect"
+                    .to_string(),
             ]
         );
     }

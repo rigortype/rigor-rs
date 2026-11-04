@@ -323,6 +323,25 @@ impl SourceIndex {
     }
 }
 
+/// The visibility table the override lint reads a PARENT from: the body's own
+/// table with the slots the reference writes `private` for a `module_function`
+/// call applied (upstream v0.4.5 #2055, `ModuleFunctionState.
+/// instance_visibility`). The overriding side keeps the plain table (the
+/// reference skips a module function's own def there, #1569).
+fn parent_visibilities(
+    table: &[(String, Visibility)],
+    module_function: &[(String, Visibility)],
+) -> Vec<(String, Visibility)> {
+    let mut out = table.to_vec();
+    for (name, vis) in module_function {
+        match out.iter_mut().find(|(n, _)| n == name) {
+            Some(slot) => slot.1 = *vis,
+            None => out.push((name.clone(), *vis)),
+        }
+    }
+    out
+}
+
 /// ADR-35 slice 1: recursively collect the LEXICALLY-QUALIFIED override classes
 /// from `ast`, starting at `node` under the lexical `prefix` (the enclosing
 /// class/module name segments). A `ClassDef`/`ModuleDef` appends a
@@ -352,6 +371,7 @@ pub(crate) fn collect_override_classes(
             superclass_path,
             methods,
             method_visibilities,
+            module_function_visibilities,
             includes,
             body,
             ..
@@ -364,7 +384,7 @@ pub(crate) fn collect_override_classes(
                 qualified: qualified.clone(),
                 superclass: superclass_path.clone(),
                 methods: methods.to_vec(),
-                method_visibilities: method_visibilities.to_vec(),
+                method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: false,
@@ -375,7 +395,9 @@ pub(crate) fn collect_override_classes(
                 collect_override_classes(ast, child, &child_prefix, out);
             }
         }
-        Node::ModuleDef { name, methods, method_visibilities, includes, body, .. } => {
+        Node::ModuleDef {
+            name, methods, method_visibilities, module_function_visibilities, includes, body, ..
+        } => {
             if name.is_empty() {
                 return;
             }
@@ -384,7 +406,7 @@ pub(crate) fn collect_override_classes(
                 qualified: qualified.clone(),
                 superclass: None,
                 methods: methods.to_vec(),
-                method_visibilities: method_visibilities.to_vec(),
+                method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: true,

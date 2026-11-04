@@ -269,6 +269,7 @@ impl SourceIndex {
         // `Gitlab::Database.read_only?` receiver). FILE-RELATIVE: the merge
         // stamps the slice position on to build each `FoldSite`.
         walk_fold_defs(ast, ast.root(), &[], &mut h.fold_defs);
+        super::literal_fold::decline_superseded_singletons(ast, &mut h.fold_defs);
         // A def-backed `alias`/`alias_method` folds the TARGET's tail (the
         // reference hands the new name the same DefNode): clone `old`'s
         // captured site under `new`. The site clone is per-file — a reopen

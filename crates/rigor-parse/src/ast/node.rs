@@ -500,6 +500,11 @@ pub enum Node {
         /// [`Visibility`] semantics. Singleton defs excluded; `private def foo`
         /// records as the running default (untracked, mirroring the reference).
         method_visibilities: Vec<(String, Visibility)>,
+        /// Upstream v0.4.5 (#2055): the slots the reference's visibility
+        /// table writes differently from `method_visibilities` because it
+        /// reads a `module_function` call as `private` (the instance copy is
+        /// private). Only the override lint's PARENT read applies them.
+        module_function_visibilities: Vec<(String, Visibility)>,
         /// ADR-35 slice 1: the `include X` / `prepend X` constant names (last
         /// path component, mirroring how `superclass` is captured) in source
         /// order. The override-visibility ancestor walk resolves these FIRST,
@@ -526,6 +531,8 @@ pub enum Node {
         method_bodies: Vec<MethodBody>,
         /// ADR-35 slice 1 visibility table. See [`Node::ClassDef::method_visibilities`].
         method_visibilities: Vec<(String, Visibility)>,
+        /// See [`Node::ClassDef::module_function_visibilities`].
+        module_function_visibilities: Vec<(String, Visibility)>,
         /// ADR-35 slice 1 include/prepend names. See [`Node::ClassDef::includes`].
         includes: Vec<String>,
         body: Vec<NodeId>,

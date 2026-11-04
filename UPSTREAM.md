@@ -15,8 +15,16 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.4`** (2026-10-16) |
-| Commit | `c9f6388d` |
+| **Pinned ref** | **`v0.4.5`** (2026-10-19) |
+| Commit | `56cbfce6` |
+
+> **`v0.4.4 → v0.4.5` (2026-11-04): 402 commits, step six.** Nothing vendored
+> moved. The raw bump left 4 fixture FPs (#2055 module_function private copy, #2036
+> `when`-test writes) and 0 sweep FPs. The fragment probe found five more families,
+> all ported: core receivers the program may answer (#2086), definers that replace a
+> `def` (#2003), `self.attr_*` / `send(:attr_*)` (#2120), singleton rewrites (#2045), and
+> the `severity_overrides` warnings (#2000). The `pre_eval:` reach is in #472. See the
+> [note](docs/notes/20261104-repin-v045.md).
 
 > **`v0.4.3 → v0.4.4` (2026-11-04): 248 commits, step five.** `core_overlay/ostruct.rbs`
 > is vendored. Raw: 0 fixture FPs and 0 sweep FPs, MATCHED unchanged. The fragment
