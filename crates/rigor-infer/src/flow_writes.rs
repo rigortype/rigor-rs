@@ -1222,6 +1222,293 @@ pub(crate) fn toplevel_argument_floor(
     out
 }
 
+/// The nodes whose value an OVER-APPROXIMATED callee floor may have made
+/// less precise than the reference's (PR #481 review, scratch
+/// `review/f/e03.rb`). [`argument_floor_writes`] floors a local the
+/// reference may keep precise (its write census proves the callee
+/// read-only). A floored local reads `Dynamic`, which fires nothing itself,
+/// but a JOIN whose predicate the reference folds through that local keeps
+/// both arms here: `go(h); w = h[:f] == "json" ? 1 : "s"; w.foo` reads
+/// `"s" | 1` where the reference reads `"s"` — a matched row with another
+/// message, or a `nil` arm the reference never has. The rules decline a
+/// diagnostic whose judged value reaches one of these nodes
+/// ([`diagnostic_reads_floor_taint`]).
+///
+/// Floored: a `(call, local)` entry the Pass-1e census does not prove (it
+/// proves what the reference floors too), for a local some write of which
+/// in its scope (the innermost `def`, or the top level) is a literal or
+/// constant carrier the reference could fold through. Tainted: a join
+/// (`if` / ternary / `case` / loop / `&&` / `||`) whose predicate's value
+/// reaches a floored or tainted local; a local written inside a tainted
+/// join's region, or from a value reaching a tainted join or local; to a
+/// fixpoint. The result holds the tainted joins and every read of a
+/// tainted local.
+pub fn floor_tainted_reads(ast: &LoweredAst, source: &SourceIndex) -> HashSet<NodeId> {
+    let floors = argument_floor_writes(ast, source);
+    if floors.is_empty() {
+        return HashSet::new();
+    }
+    // Proven floors: the old positional census.
+    let mut proven: HashSet<(rigor_parse::Span, String)> = HashSet::new();
+    for (_, n) in ast.iter() {
+        if let Node::Call { method, args, span, .. } = n {
+            for (i, &a) in args.iter().enumerate() {
+                if let Node::LocalVariableRead { name, .. } = ast.get(a) {
+                    if source.method_mutates_param(method, i) {
+                        proven.insert((*span, name.clone()));
+                    }
+                }
+            }
+        }
+    }
+    let def_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| matches!(n, Node::Definition { .. }).then(|| n.span()))
+        .collect();
+    let scope_of = |s: rigor_parse::Span| {
+        def_spans
+            .iter()
+            .filter(|d| d.0 <= s.0 && s.1 <= d.1)
+            .min_by_key(|d| d.1 - d.0)
+            .copied()
+    };
+    type Key = (Option<rigor_parse::Span>, String);
+    // Locals with a literal / constant carrier write.
+    let mut carriers: HashSet<Key> = HashSet::new();
+    for (_, n) in ast.iter() {
+        if let Node::LocalVariableWrite { name, value, span, .. } = n {
+            let mut root = *value;
+            while let Node::Call { receiver: Some(r), .. } = ast.get(root) {
+                root = *r;
+            }
+            if matches!(
+                ast.get(root),
+                Node::ArrayLit { .. }
+                    | Node::HashLit { .. }
+                    | Node::StringLit { .. }
+                    | Node::ConstantRead { .. }
+            ) {
+                carriers.insert((scope_of(*span), name.clone()));
+            }
+        }
+    }
+    let floored: HashSet<Key> = floors
+        .into_iter()
+        .filter(|f| !proven.contains(f))
+        .map(|(s, name)| (scope_of(s), name))
+        .filter(|k| carriers.contains(k))
+        .collect();
+    if floored.is_empty() {
+        return HashSet::new();
+    }
+    let key_of = |id: NodeId| match ast.get(id) {
+        Node::LocalVariableRead { name, span } => Some((scope_of(*span), name.clone())),
+        _ => None,
+    };
+    // Every join: its node, the value roots of its predicate, its span.
+    let mut conds: Vec<(NodeId, Vec<NodeId>, rigor_parse::Span)> = Vec::new();
+    for (id, n) in ast.iter() {
+        let preds: Vec<NodeId> = match n {
+            Node::If { predicate, .. } => vec![*predicate],
+            Node::Case { predicate, branches, .. } => {
+                let mut p: Vec<NodeId> = predicate.iter().copied().collect();
+                for &b in branches {
+                    if let Node::When { conditions, .. } = ast.get(b) {
+                        p.extend_from_slice(conditions);
+                    }
+                }
+                p
+            }
+            Node::Loop { predicate: Some(p), .. } => vec![*p],
+            Node::Logical { left, .. } => vec![*left],
+            _ => continue,
+        };
+        let mut roots = Vec::new();
+        for p in preds {
+            value_roots(ast, p, &mut roots);
+        }
+        if !roots.is_empty() {
+            conds.push((id, roots, n.span()));
+        }
+    }
+    // Each plain local write: its target, the joins around it, and its
+    // value's roots.
+    let mut writes: Vec<(Key, Vec<NodeId>, Vec<NodeId>)> = Vec::new();
+    for (_, n) in ast.iter() {
+        let (Node::LocalVariableWrite { name, value, span, .. }
+        | Node::LocalVariableOpWrite { name, value, span, .. }) = n
+        else {
+            continue;
+        };
+        let around: Vec<NodeId> = conds
+            .iter()
+            .filter(|(_, _, r)| r.0 <= span.0 && span.1 <= r.1)
+            .map(|(c, _, _)| *c)
+            .collect();
+        let mut roots = Vec::new();
+        value_roots(ast, *value, &mut roots);
+        writes.push(((scope_of(*span), name.clone()), around, roots));
+    }
+    let mut tainted: HashSet<Key> = floored.clone();
+    let mut tainted_joins: HashSet<NodeId> = HashSet::new();
+    loop {
+        let mut grown = false;
+        for (cid, roots, _) in &conds {
+            if !tainted_joins.contains(cid)
+                && roots.iter().any(|&r| key_of(r).is_some_and(|k| tainted.contains(&k)))
+            {
+                tainted_joins.insert(*cid);
+                grown = true;
+            }
+        }
+        for (target, around, roots) in &writes {
+            if tainted.contains(target) {
+                continue;
+            }
+            let hit = around.iter().any(|c| tainted_joins.contains(c))
+                || roots.iter().any(|&r| {
+                    tainted_joins.contains(&r) || key_of(r).is_some_and(|k| tainted.contains(&k))
+                });
+            if hit {
+                tainted.insert(target.clone());
+                grown = true;
+            }
+        }
+        if !grown {
+            break;
+        }
+    }
+    let mut out: HashSet<NodeId> = tainted_joins;
+    for (id, _) in ast.iter() {
+        if let Some(k) = key_of(id) {
+            // A floored local alone reads `Dynamic` and fires nothing; only
+            // a local a tainted join wrote carries a wider-than-reference
+            // value.
+            if tainted.contains(&k) && !floored.contains(&k) {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
+/// The nodes an expression's VALUE may come from: a local read, a join
+/// (and its arms), a literal container's elements, a call's receiver (and
+/// a receiverless call's arguments, which a parameter-bound return may
+/// hand back). An interpolation, an explicit-receiver call's arguments, a
+/// splat and a predicate are not value sources.
+fn value_roots(ast: &LoweredAst, id: NodeId, out: &mut Vec<NodeId>) {
+    match ast.get(id) {
+        Node::LocalVariableRead { .. } => out.push(id),
+        Node::If { then_body, else_body, .. } => {
+            out.push(id);
+            for &e in then_body.iter().chain(else_body) {
+                value_roots(ast, e, out);
+            }
+        }
+        Node::Case { branches, else_body, .. } => {
+            out.push(id);
+            for &b in branches {
+                if let Node::When { body, .. } = ast.get(b) {
+                    for &e in body {
+                        value_roots(ast, e, out);
+                    }
+                }
+            }
+            for &e in else_body {
+                value_roots(ast, e, out);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            out.push(id);
+            value_roots(ast, *left, out);
+            value_roots(ast, *right, out);
+        }
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            if let Some(&last) = body.last() {
+                value_roots(ast, last, out);
+            }
+        }
+        Node::BeginRescue { body, .. } => {
+            if let Some(&last) = body.last() {
+                value_roots(ast, last, out);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &e in elements {
+                value_roots(ast, e, out);
+            }
+        }
+        Node::LocalVariableWrite { value, .. } | Node::LocalVariableOpWrite { value, .. } => {
+            value_roots(ast, *value, out);
+        }
+        Node::Call { receiver: Some(r), .. } => value_roots(ast, *r, out),
+        Node::Call { receiver: None, args, .. } => {
+            for &a in args {
+                value_roots(ast, a, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Which part of the expression a diagnostic judges, for
+/// [`diagnostic_reads_floor_taint`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum TaintAnchor {
+    /// The receiver of the call whose method name starts at the anchor
+    /// (`call.undefined-method`, `call.wrong-arity`,
+    /// `call.possible-nil-receiver`).
+    Receiver,
+    /// Its receiver and arguments (`call.argument-type-mismatch`,
+    /// `call.raise-non-exception`).
+    ReceiverAndArguments,
+    /// Every node starting at the anchor (a flow rule's predicate).
+    Expression,
+}
+
+/// Whether the value a diagnostic anchored at `start` judges may come from
+/// a [`floor_tainted_reads`] node ([`value_roots`]). Over-matching only
+/// declines more.
+pub fn diagnostic_reads_floor_taint(
+    ast: &LoweredAst,
+    start: usize,
+    anchor: TaintAnchor,
+    tainted: &HashSet<NodeId>,
+) -> bool {
+    let mut roots: Vec<NodeId> = Vec::new();
+    for (id, n) in ast.iter() {
+        match anchor {
+            TaintAnchor::Expression => {
+                if n.span().0 == start {
+                    value_roots(ast, id, &mut roots);
+                    // A predicate's fold reads every operand.
+                    if let Node::Call { args, .. } = n {
+                        for &a in args {
+                            value_roots(ast, a, &mut roots);
+                        }
+                    }
+                }
+            }
+            _ => {
+                if let Node::Call { receiver, args, message_span, .. } = n {
+                    if message_span.0 == start {
+                        if let Some(r) = receiver {
+                            value_roots(ast, *r, &mut roots);
+                        }
+                        if anchor == TaintAnchor::ReceiverAndArguments {
+                            for &a in args {
+                                value_roots(ast, a, &mut roots);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    roots.iter().any(|r| tainted.contains(r))
+}
+
 /// rigor-rs#363, re-measured at v0.4.7: whether a mutation at `span` inside
 /// a lexical loop's `break` argument stays off the post-loop scope (the
 /// locals-only `join_break_scopes`). At v0.4.7 only a compound ATTRIBUTE

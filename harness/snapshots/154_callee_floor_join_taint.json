@@ -1,0 +1,89 @@
+{
+  "fixture": "harness/corpus/154_callee_floor_join_taint.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `foo' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `foo' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `foo' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `foo' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zork' for \"text\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 34,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `foo' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `foo' for \"s\""
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 14,
+      "column": 5,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 16,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 24,
+      "column": 5,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 31,
+      "column": 9,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 36,
+      "column": 5,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

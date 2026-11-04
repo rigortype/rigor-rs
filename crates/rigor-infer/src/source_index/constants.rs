@@ -256,15 +256,17 @@ pub(crate) fn collect_literal_constants(
 /// seeded with an empty literal is the accumulator idiom — filled later,
 /// often from another file — so the census records it without its
 /// emptiness: `[]` as `Array[untyped]`, `{}` as `Hash[untyped, untyped]`,
-/// `""` as `String`. `Some(lit)` answers an empty seed (the bare nominal for
-/// a container; `None`, no harvest, for a String, which has no bare
-/// carrier here and declines instead); `None` is no empty seed. A
-/// `.freeze`d empty literal is no seed (`EMPTY = [].freeze` keeps folding).
+/// `""` as `String`. `Some(None)` answers an empty seed, which is not
+/// harvested and declines: a bare `Array` / `Hash` nominal would render
+/// `for Array` where the reference says `for Array[Dynamic[top]]` (PR #481
+/// review, a matched row with a different message). `None` is no empty
+/// seed. A `.freeze`d empty literal is no seed (`EMPTY = [].freeze` keeps
+/// folding).
 pub(crate) fn empty_seed_lit(ast: &LoweredAst, node: NodeId) -> Option<Option<ConstLit>> {
     match ast.get(node) {
         Node::StringLit { value, .. } if value.is_empty() => Some(None),
-        Node::ArrayLit { elements, .. } if elements.is_empty() => Some(Some(ConstLit::BareArray)),
-        Node::HashLit { elements, .. } if elements.is_empty() => Some(Some(ConstLit::BareHash)),
+        Node::ArrayLit { elements, .. } if elements.is_empty() => Some(None),
+        Node::HashLit { elements, .. } if elements.is_empty() => Some(None),
         // `+""` and `X.dup` of a seed: neither harvests as a literal today.
         _ => None,
     }
