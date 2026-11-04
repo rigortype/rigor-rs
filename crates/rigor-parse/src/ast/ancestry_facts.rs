@@ -899,7 +899,9 @@ impl<'pr> Visit<'pr> for Census {
         }
         self.record_mixin(&n, node);
         self.record_singleton_class_rewrite(&n, node);
-        if self.in_def == 0 && !self.frame().singleton {
+        // `record_method_envelope_opaque` files the name on both sides even
+        // inside `class << self`, so the macro table is side-agnostic here.
+        if self.in_def == 0 {
             self.record_macro_names(node);
         }
 
