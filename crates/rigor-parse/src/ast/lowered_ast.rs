@@ -76,6 +76,10 @@ pub struct LoweredAst {
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
     const_mutations: Vec<ConstMutation>,
+    /// Upstream v0.4.6 (#2285) — every block call / `for` whose body mutates
+    /// an element in place, with the locals its receiver may read. See
+    /// [`LoweredAst::element_mutations`].
+    element_mutations: Vec<(Span, Vec<String>)>,
     /// Sorted start offsets of every `LocalVariableRead`, so
     /// [`LoweredAst::reads_local_within`] is a binary search, not an arena scan.
     local_read_starts: Vec<usize>,
@@ -205,6 +209,15 @@ impl LoweredAst {
     /// [`ConstMutation`].
     pub fn const_mutations(&self) -> &[ConstMutation] {
         &self.const_mutations
+    }
+
+    /// Upstream v0.4.6 (#2285 / issue #2262, `DeepErasure`): `(span of a
+    /// block call or `for` node, locals its receiver / collection may
+    /// evaluate to)` for each one whose body mutates an element in place
+    /// (`a.each { |x| x << 2 }`, `for x in a; x[0] << 2; end`,
+    /// `a.each(&:strip!)`). The flow passes widen those locals there.
+    pub fn element_mutations(&self) -> &[(Span, Vec<String>)] {
+        &self.element_mutations
     }
 
     /// Whether some `LocalVariableRead` starts inside `span`. A read is a leaf,
@@ -497,9 +510,11 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
+    let element_mutations = super::element_mutation::collect(&root_prism);
     let mut ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
     ancestry_facts.required_features = super::ancestry_facts::required_vendored_features(source);
     ancestry_facts.rebind = super::rebind_sites::collect(&root_prism);
+    ancestry_facts.required_segments = super::ancestry_facts::required_feature_segments(source);
     let mut local_read_starts: Vec<usize> = builder
         .nodes
         .iter()
@@ -539,6 +554,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         root,
         file_key,
         const_mutations,
+        element_mutations,
         local_read_starts,
         carrier_spans,
         paren_unwrapped,

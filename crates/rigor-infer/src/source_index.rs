@@ -48,6 +48,7 @@ mod literal_fold;
 mod def_attribution;
 mod override_index;
 mod resolution_chain;
+mod ruby_library_roots;
 pub(crate) use resolution_chain::AncestryIndex;
 mod harvest;
 

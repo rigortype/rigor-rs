@@ -37,6 +37,7 @@ mod constants;
 mod ancestry_facts;
 mod singleton_locals;
 mod rebind_sites;
+mod element_mutation;
 mod lowered_ast;
 mod node;
 mod builder;

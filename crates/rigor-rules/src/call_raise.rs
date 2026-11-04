@@ -159,8 +159,11 @@ fn raise_class_operand_verdict(
     if source.knows_class(class_name) {
         return RaiseVerdict::Unknown;
     }
-    // Upstream #1456 — `unbounded_receiver_surface?` answers `:unknown`.
-    if crate::call_receiver::core_overlay_open_receiver(class_name) {
+    // Upstream #1456 — `unbounded_receiver_surface?` answers `:unknown`; its
+    // v0.4.6 `ruby_library_reopen?` arm (#2264) too.
+    if crate::call_receiver::core_overlay_open_receiver(class_name)
+        || source.ruby_library_reopen(index, class_name)
+    {
         return RaiseVerdict::Unknown;
     }
     if !index.knows_class(class_name) {
@@ -199,6 +202,7 @@ fn raise_instance_operand_verdict(
     };
     if RAISE_UNEXACT_INSTANCE_CLASSES.contains(&class_name.as_str())
         || crate::call_receiver::core_overlay_open_receiver(&class_name)
+        || source.ruby_library_reopen(index, &class_name)
     {
         return RaiseVerdict::Unknown;
     }

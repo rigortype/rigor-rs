@@ -99,6 +99,10 @@ pub struct AncestryFacts {
     /// scanned exactly as the reference's `PATTERN` + `commented?` do — see
     /// [`required_vendored_features`].
     pub required_features: Vec<String>,
+    /// Upstream v0.4.6 (#2264 / issue #2174, `RequiredFeatures.features_of`'s
+    /// `ANY_FEATURE` scan): the FIRST path segment of every feature this
+    /// file's text requires — see [`required_feature_segments`].
+    pub required_segments: Vec<String>,
     /// Upstream v0.4.5 (#2086 / issue #1722) — every RECEIVER-form instance
     /// mixin `X.include(M)` / `X.prepend(M)` / `X.send(:include, M)`, wherever
     /// it is written: `(owner candidates, names)`, a non-constant argument as
@@ -109,6 +113,24 @@ pub struct AncestryFacts {
     /// The port keeps its wildcard taint for the order readers and lists the
     /// names here for the set-shaped `call.undefined-method` decline only.
     pub receiver_mixins: Vec<(Vec<String>, Vec<String>)>,
+    /// Upstream v0.4.6 (#2094 / #2269) — every SINGLETON-side mixin of an
+    /// owner, wherever written: `(owner candidates, names)`, where a
+    /// spelling the reference cannot record is [`WILDCARD`] (its
+    /// `taint(owner, :extend)`). Named: `X.extend(M)` and
+    /// `X.singleton_class.include(M)` with constant arguments, a class-body
+    /// `extend M`. Wildcard: a `send` spelling, a non-constant or `self`
+    /// argument, any `send` / `*_eval` / computed-name naming call on
+    /// `X.singleton_class` (or a literal-named one that is not a direct
+    /// statement), and `singleton_class.include` inside `class << self`.
+    /// Read only by the set-shaped `call.undefined-method` singleton decline,
+    /// so the order readers keep their own taints.
+    pub singleton_mixins: Vec<(Vec<String>, Vec<String>)>,
+    /// Upstream v0.4.6 (#2094, `ObjectMixins.macro_named?`) — `(owner,
+    /// name)` for each literal method name (a Symbol / String argument, or a
+    /// `def` handed as one) a receiverless or `self.` class-body call that is
+    /// not name-neutral passes (`dsl_method :x`, `def_delegators :@t, :x`):
+    /// the opaque instance envelope the reference files for it.
+    pub macro_names: Vec<(String, String)>,
     /// Upstream v0.4.5 (#2086 / issue #1722) — the reference's
     /// `LexicalMethodSites` singleton-local table for this file.
     pub singleton_locals: super::singleton_locals::SingletonLocals,
@@ -184,6 +206,137 @@ pub fn required_vendored_features(source: &[u8]) -> Vec<String> {
         }
     }
     out
+}
+
+/// Upstream v0.4.6 (#2264 / issue #2174) — the reference's
+/// `RequiredFeatures.features_of` `ANY_FEATURE` scan, reduced to each match's
+/// first path segment (`"digest/sha2"` → `"digest"`): `require "x"` /
+/// `require('x/y')` / `Kernel.require "x"`, the name `[\w-]+(?:/[\w-]+)*`
+/// between matching quotes, skipping a match on a whole-line comment. The
+/// regex runs over the source's BYTES, so `\w` is ASCII only and a non-ASCII
+/// byte before `require` does not block it. The reference then keeps only a
+/// segment Ruby ships (`SHIPPED_SEGMENTS`); the reader of this list
+/// intersects with a table that already holds only shipped segments.
+pub fn required_feature_segments(source: &[u8]) -> Vec<String> {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let name = |b: u8| word(b) || b == b'-';
+    let kw = b"require";
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + kw.len() <= source.len() {
+        if &source[i..i + kw.len()] != kw {
+            i += 1;
+            continue;
+        }
+        let at = i;
+        // `(?:(?<![\w.$@])|(?<=Kernel\.))`
+        let ok_prefix = at == 0 || {
+            let b = source[at - 1];
+            !(word(b) || b == b'.' || b == b'$' || b == b'@') || source[..at].ends_with(b"Kernel.")
+        };
+        if !ok_prefix {
+            i += 1;
+            continue;
+        }
+        let mut j = at + kw.len();
+        while j < source.len() && (source[j] == b' ' || source[j] == b'\t') {
+            j += 1;
+        }
+        if j < source.len() && source[j] == b'(' {
+            j += 1;
+            while j < source.len() && (source[j] == b' ' || source[j] == b'\t') {
+                j += 1;
+            }
+        }
+        let Some(&q) = source.get(j) else { break };
+        if q != b'"' && q != b'\'' {
+            i += 1;
+            continue;
+        }
+        let start = j + 1;
+        let mut k = start;
+        while k < source.len() && name(source[k]) {
+            k += 1;
+        }
+        let first_end = k;
+        let mut matched = k > start;
+        while matched && source.get(k) == Some(&b'/') {
+            let seg = k + 1;
+            let mut m = seg;
+            while m < source.len() && name(source[m]) {
+                m += 1;
+            }
+            if m == seg {
+                matched = false;
+            } else {
+                k = m;
+            }
+        }
+        if !matched || source.get(k) != Some(&q) {
+            i += 1;
+            continue;
+        }
+        // `commented?`: the line's first non-blank byte is `#`.
+        let line_start = source[..at].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let first = source[line_start..at].iter().find(|b| !b.is_ascii_whitespace());
+        if first != Some(&b'#') {
+            let seg = String::from_utf8_lossy(&source[start..first_end]).into_owned();
+            if !out.contains(&seg) {
+                out.push(seg);
+            }
+        }
+        i = k + 1;
+    }
+    out
+}
+
+/// `ScopeIndexer::NAME_NEUTRAL_MACROS`.
+const NAME_NEUTRAL_MACROS: [&str; 13] = [
+    "private",
+    "public",
+    "protected",
+    "module_function",
+    "private_class_method",
+    "public_class_method",
+    "private_constant",
+    "public_constant",
+    "require",
+    "require_relative",
+    "autoload",
+    "autoload_relative",
+    // `include` / `prepend` / `extend` take constants, never literal names.
+    "include",
+];
+
+/// `surface_rewriting_call?`: `SURFACE_EVAL_CALLS`, `SURFACE_NAMING_CALLS`,
+/// `SURFACE_SEND_CALLS`, `ATTR_MACROS`, `SURFACE_MIXIN_CALLS` and the
+/// `(?:\A|_)(?:include|prepend|extend)(?:_|\z)` helper pattern.
+fn surface_rewriting_call(name: &str) -> bool {
+    const NAMING: [&str; 5] =
+        ["define_method", "define_singleton_method", "alias_method", "remove_method", "undef_method"];
+    const ATTR: [&str; 3] = ["attr_reader", "attr_writer", "attr_accessor"];
+    EVAL_CALLS.contains(&name)
+        || NAMING.contains(&name)
+        || SEND_NAMES.contains(&name)
+        || ATTR.contains(&name)
+        || name.split('_').any(|seg| MIXIN_KINDS.contains(&seg))
+}
+
+/// `singleton_class_named_call?`: `alias_method` / `define_method` (first
+/// argument), `remove_method` / `attr_*` (every argument), every rewritten
+/// argument a literal Symbol or String (a `define_method` body argument
+/// aside).
+fn singleton_class_named_call(name: &str, args: &[PrismNode<'_>]) -> bool {
+    let naming = matches!(
+        name,
+        "alias_method" | "define_method" | "remove_method" | "attr_reader" | "attr_writer" | "attr_accessor"
+    );
+    naming
+        && !args.is_empty()
+        && args.iter().enumerate().all(|(i, a)| {
+            (name == "define_method" && i > 0)
+                || super::definitions::literal_symbol_or_string_name(a).is_some()
+        })
 }
 
 const MODIFIERS: [&str; 3] = ["private", "protected", "public"];
@@ -397,6 +550,27 @@ impl Census {
                 (true, _) | (false, "extend") => MixinSide::Extend,
                 _ => MixinSide::Include,
             };
+            if side == MixinSide::Extend {
+                // `self` as an argument names the owner itself.
+                let all_named = !args.is_empty()
+                    && args.iter().all(|a| {
+                        strict_constant_path_string(a).is_some() || a.as_self_node().is_some()
+                    });
+                let mut listed: Vec<String> = args
+                    .iter()
+                    .filter_map(|a| {
+                        if a.as_self_node().is_some() {
+                            Some(owner[0].clone())
+                        } else {
+                            strict_constant_path_string(a)
+                        }
+                    })
+                    .collect();
+                if via_send || !all_named {
+                    listed.push(WILDCARD.to_string());
+                }
+                self.out.singleton_mixins.push((owner.clone(), listed));
+            }
             if recv.is_none() && !via_send && complete {
                 if self.is_direct(n) && !singleton {
                     if kind != "extend" {
@@ -436,6 +610,15 @@ impl Census {
         if let Some(raw) = strict_constant_path_string(&recv) {
             let side = if kind == "extend" { MixinSide::Extend } else { MixinSide::Include };
             let owners = self.candidates(&raw);
+            if kind == "extend" {
+                // `receiver_extend_recorded?`: constant arguments name edges;
+                // a `self` or other argument, or a `send`, taints.
+                let mut listed = names.clone();
+                if via_send || !complete || args.iter().any(|a| a.as_self_node().is_some()) {
+                    listed.push(WILDCARD.to_string());
+                }
+                self.out.singleton_mixins.push((owners.clone(), listed));
+            }
             if kind != "extend" && !args.is_empty() {
                 let mut listed = names.clone();
                 if !complete {
@@ -450,6 +633,78 @@ impl Census {
             if let Some(owner) = self.owner() {
                 self.wildcard(owner.clone(), MixinSide::Include);
                 self.wildcard(owner, MixinSide::Extend);
+            }
+        }
+    }
+
+    /// Upstream v0.4.6 (#2269, `singleton_class_rewrite_tainted?` +
+    /// `singleton_class_include_recorded?`): a surface-rewriting call on
+    /// `singleton_class` (bare, `self.` or a constant's) records the owner's
+    /// singleton side — named for a constant-argument `include` / `prepend`,
+    /// nothing for a literal-named naming call written as a direct statement,
+    /// the wildcard otherwise.
+    fn record_singleton_class_rewrite(&mut self, n: &PrismNode<'_>, call: &ruby_prism::CallNode<'_>) {
+        let Some(recv) = call.receiver() else { return };
+        let Some(sc) = recv.as_call_node() else { return };
+        if constant_string(sc.name().as_slice()) != "singleton_class" || sc.arguments().is_some() {
+            return;
+        }
+        let name = constant_string(call.name().as_slice());
+        if !surface_rewriting_call(&name) {
+            return;
+        }
+        let object = sc.receiver();
+        let lexical_self = object.as_ref().is_none_or(|o| o.as_self_node().is_some());
+        let owner = if lexical_self {
+            self.owner()
+        } else {
+            object.as_ref().and_then(strict_constant_path_string).map(|raw| self.candidates(&raw))
+        };
+        let Some(owner) = owner else { return };
+        let args: Vec<PrismNode<'_>> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if self.is_direct(n) && singleton_class_named_call(&name, &args) {
+            return;
+        }
+        let up_level = self.frame().singleton && lexical_self;
+        let consts: Vec<Option<String>> = args.iter().map(strict_constant_path_string).collect();
+        if !up_level
+            && (name == "include" || name == "prepend")
+            && !consts.is_empty()
+            && consts.iter().all(Option::is_some)
+        {
+            self.out.singleton_mixins.push((owner, consts.into_iter().flatten().collect()));
+            return;
+        }
+        self.out.singleton_mixins.push((owner, vec![WILDCARD.to_string()]));
+    }
+
+    /// Upstream v0.4.6 (#2094, `record_named_arguments_opaque`): the literal
+    /// names a non-neutral receiverless (or `self.`) class-body call passes.
+    /// Dynamic surface calls are included: a superset that only declines more.
+    fn record_macro_names(&mut self, call: &ruby_prism::CallNode<'_>) {
+        if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+            return;
+        }
+        let name = constant_string(call.name().as_slice());
+        if NAME_NEUTRAL_MACROS.contains(&name.as_str()) {
+            return;
+        }
+        let Some(owner) = self.owner() else { return };
+        let Some(arguments) = call.arguments() else { return };
+        for a in arguments.arguments().iter() {
+            let lit = if let Some(d) = a.as_def_node() {
+                Some(constant_string(d.name().as_slice()))
+            } else {
+                super::definitions::literal_symbol_or_string_name(&a)
+            };
+            if let Some(lit) = lit {
+                for o in &owner {
+                    let pair = (o.clone(), lit.clone());
+                    if !self.out.macro_names.contains(&pair) {
+                        self.out.macro_names.push(pair);
+                    }
+                }
             }
         }
     }
@@ -643,6 +898,10 @@ impl<'pr> Visit<'pr> for Census {
             }
         }
         self.record_mixin(&n, node);
+        self.record_singleton_class_rewrite(&n, node);
+        if self.in_def == 0 && !self.frame().singleton {
+            self.record_macro_names(node);
+        }
 
         // An eval block on an object the walk cannot name: in a hook, or
         // holding a mixin call, it reshapes the enclosing class.
@@ -735,6 +994,30 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
 #[cfg(test)]
 mod tests {
     use super::required_vendored_features as scan;
+
+    /// The reference's `ANY_FEATURE` + `commented?`, probed row by row
+    /// against `RequiredFeatures.features_of` (v0.4.6), reduced to first
+    /// segments.
+    #[test]
+    fn required_segment_scan_matches_the_reference_any_feature() {
+        use super::required_feature_segments as seg;
+        let rows: &[(&[u8], &[&str])] = &[
+            (b"require \"digest\"", &["digest"]),
+            (b"require \"digest/sha2\"", &["digest"]),
+            (b"\xc3\xa9require \"digest\"", &["digest"]),
+            (b"require \"digest/\"", &[]),
+            (b"x.require \"digest\"", &[]),
+            (b"require \"set\"; require \"matrix\"", &["set", "matrix"]),
+            (b"  # require 'digest'", &[]),
+            (b"Kernel.require('digest')", &["digest"]),
+            (b"require_relative 'digest'", &[]),
+            (b"require 'digest\"", &[]),
+        ];
+        for (src, want) in rows {
+            let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(seg(src), want, "{}", String::from_utf8_lossy(src));
+        }
+    }
 
     /// The reference's `RequiredFeatures::PATTERN` + `commented?`, row by row.
     #[test]
