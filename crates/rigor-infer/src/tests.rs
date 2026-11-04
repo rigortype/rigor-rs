@@ -8,14 +8,15 @@ fn lower_src(src: &[u8]) -> LoweredAst {
 
 #[test]
 fn mutator_tables_match_the_pinned_reference() {
-    // Sizes at pin `e59b7b89` (`mutation_widening.rb`, `string_mutation.rb`,
+    // Sizes at pin `v0.4.2` (`mutation_widening.rb`, `string_mutation.rb`,
     // `hash_lookup_mutation.rb`) — the same sets the effect catalogue's
     // `mutators.yml` is extracted from, so a drift here and a
     // `vendor_effects.py --check` failure arrive together.
     assert_eq!(ARRAY_MUTATORS.len(), 31);
     assert_eq!(HASH_MUTATORS.len(), 16);
     assert!(HASH_MUTATORS.contains(&"shift"));
-    assert_eq!(STRING_MUTATORS.len(), 35);
+    // 35 at `e59b7b89`; v0.4.2 added Ruby 4.1's seven bit operations (#1691).
+    assert_eq!(STRING_MUTATORS.len(), 42);
     assert_eq!(HASH_LOOKUP_MUTATORS.len(), 3);
     // The local-widening set is exactly Array ∪ Hash ∪ String — the
     // `HashLookupMutation` names stay out (see `MUTATOR_METHODS`).

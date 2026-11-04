@@ -35,6 +35,13 @@
       "column": 10,
       "severity": "error",
       "message": "undefined method `frobdays' for 7"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 65,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobmulti' for 1 | 2"
     }
   ]
 }

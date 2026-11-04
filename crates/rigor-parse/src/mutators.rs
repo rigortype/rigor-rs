@@ -34,7 +34,7 @@ pub const HASH_MUTATORS: &[&str] = &[
 pub const HASH_LOOKUP_MUTATORS: &[&str] = &["default=", "default_proc=", "compare_by_identity"];
 
 /// `reference/rigor/lib/rigor/inference/string_mutation.rb:25` verbatim — the
-/// one String table (upstream `4a6b43f6`, pin `e59b7b89`, which grew it to 35
+/// one String table (upstream `4a6b43f6`, pin `e59b7b89`, which grew it to 35; v0.4.2 to 42
 /// and retired the effect classifier's drifted copy). Upstream's
 /// `StringMutation.widen_constant` widens a `Constant["ab"]` local to the bare
 /// `String` nominal under any of these; the port widens the binding to
@@ -46,6 +46,10 @@ pub const STRING_MUTATORS: &[&str] = &[
     "delete!", "squeeze!", "succ!", "next!", "upcase!", "downcase!", "capitalize!", "swapcase!",
     "reverse!", "strip!", "lstrip!", "rstrip!", "chomp!", "chop!", "delete_prefix!",
     "delete_suffix!", "encode!", "scrub!", "unicode_normalize!",
+    // Upstream v0.4.2 (#1691): Ruby 4.1's bit operations, declared by the
+    // vendored `core_overlay/string.rbs` whatever Ruby runs the analysis.
+    "bit_set", "bit_clear", "bit_flip", "bitwise_not!", "bitwise_and!", "bitwise_or!",
+    "bitwise_xor!",
 ];
 
 /// Upstream's `MutationWidening::SHAPE_MUTATORS` (`mutation_widening.rb:110`):

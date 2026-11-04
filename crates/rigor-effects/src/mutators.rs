@@ -103,7 +103,7 @@ mod tests {
     fn the_three_sets_are_the_sizes_the_probe_measured() {
         // Measured through the PINNED Ruby loader
         // (`Rigor::Effects::Catalog::MUTATOR_SETS`, pin `e59b7b89`):
-        //   ARRAY=31 HASH=20 STRING=35
+        //   ARRAY=31 HASH=20 STRING=42
         // (was 31 / 15 / 26 through `v0.3.9`: `495a7458` lists `Hash#shift`,
         // `c6aba2c9` makes `hash` the classifier's union with
         // `HashLookupMutation::MUTATORS` + `rehash`, and `4a6b43f6` makes
@@ -113,7 +113,7 @@ mod tests {
         // write one silently and this fails without the submodule populated.
         assert_eq!(mutators().set(Some("array")).len(), 31);
         assert_eq!(mutators().set(Some("hash")).len(), 20);
-        assert_eq!(mutators().set(Some("string")).len(), 35);
+        assert_eq!(mutators().set(Some("string")).len(), 42);
         assert_eq!(mutators().names(), ["array", "hash", "string"]);
         assert_eq!(mutators().schema(), 1);
     }

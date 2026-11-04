@@ -99,7 +99,7 @@ CATALOG_REFS = {
 # A set that changes SIZE under a re-pin is a semantic change to what counts as
 # a receiver mutation, so it is refused here rather than written and noticed
 # later.
-EXPECTED_COUNTS = {"array": 31, "hash": 20, "string": 35}
+EXPECTED_COUNTS = {"array": 31, "hash": 20, "string": 42}
 
 # Authored, not generated — carried across a regeneration (the `vendor_rbs.py`
 # precedent for `PROVENANCE.md` + `overlay/`).

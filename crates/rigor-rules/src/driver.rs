@@ -400,5 +400,107 @@ pub fn analyze_with_source_and_folder(
     // `type_of` transparently here.
     ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut out);
 
+    // Upstream v0.4.2 (ADR-121 WD7, rigor#1796): after a `using M` whose
+    // module the project does not declare (a gem's, or one from outside the
+    // analysed paths), its refinements are unreadable and may redefine any
+    // method of any class, so every rule that asks `refined_method_in_effect?`
+    // / `refined_redefinition_in_effect?` declines in the rest of that lexical
+    // scope. The port models no refinement, so it declines on every such
+    // `using` and on nothing else.
+    let opaque = opaque_using_regions(ast, source, &scopes);
+    if !opaque.is_empty() {
+        out.retain(|d| {
+            !(REFINEMENT_DECLINED_RULES.contains(&d.rule_id)
+                && opaque.iter().any(|r| r.0 <= d.start_offset && d.start_offset < r.1))
+        });
+    }
+
+    // Upstream v0.4.2 (#1700/#1701): a `require "prime"` in any analysed file
+    // loads the vendored prime signatures, which declare `Integer#prime?`,
+    // `#prime_division`, `Integer.each_prime` and `.from_prime_division`. The
+    // port does not vendor them (loading them unconditionally would fire where
+    // the reference, without the require, stays lenient), so it declines
+    // `call.undefined-method` on those names wherever the require exists.
+    if source.requires_vendored_feature("prime") {
+        out.retain(|d| {
+            d.rule_id != crate::CALL_UNDEFINED_METHOD
+                || !d.method_name.as_deref().is_some_and(|m| PRIME_INTEGER_METHODS.contains(&m))
+        });
+    }
+
+    // Upstream v0.4.2 (#1706 / issue #1697): a module the project mixes into
+    // `Object` gives every object its instance methods, so no receiver's
+    // `call.undefined-method` can witness a name such a module declares (the
+    // reference's `object_mixin_may_define?`, asked last in both the scalar and
+    // the union rule). Applied once here over every undefined-method path; the
+    // reference's "the receiver reaches `Object`" gate is not modelled, so a
+    // `BasicObject` receiver declines too (a superset).
+    out.retain(|d| {
+        d.rule_id != crate::CALL_UNDEFINED_METHOD
+            || !d
+                .method_name
+                .as_deref()
+                .is_some_and(|m| source.object_mixin_may_define(index, m, true))
+    });
+
+    out
+}
+
+/// The `Integer` methods the vendored prime signatures (`integer-extension.rbs`)
+/// declare, instance and singleton.
+const PRIME_INTEGER_METHODS: &[&str] =
+    &["prime?", "prime_division", "each_prime", "from_prime_division"];
+
+/// The rules the reference withholds where an unreadable refinement is in
+/// effect (ADR-121 WD7): every reader of `refined_method_in_effect?` /
+/// `refined_redefinition_in_effect?` / `opaque_refinement_in_effect?` the port
+/// carries.
+const REFINEMENT_DECLINED_RULES: &[&str] = &[
+    crate::CALL_UNDEFINED_METHOD,
+    crate::CALL_UNRESOLVED_TOPLEVEL,
+    crate::CALL_POSSIBLE_NIL_RECEIVER,
+    crate::CALL_WRONG_ARITY,
+    crate::CALL_ARGUMENT_TYPE_MISMATCH,
+    crate::FLOW_ALWAYS_RAISES,
+];
+
+/// The byte regions an OPAQUE `using` is in effect over: from the end of a
+/// receiverless `using C` whose constant `C` the project does not declare
+/// (read in the call's lexical scope) to the end of the innermost enclosing
+/// class/module body, or of the file. A non-constant argument is opaque too.
+fn opaque_using_regions(
+    ast: &LoweredAst,
+    source: &rigor_infer::SourceIndex,
+    scopes: &[(rigor_parse::Span, Vec<String>)],
+) -> Vec<(usize, usize)> {
+    let file_end = ast.iter().map(|(_, n)| n.span().1).max().unwrap_or(0);
+    let mut out = Vec::new();
+    for (_, n) in ast.iter() {
+        let Node::Call { receiver: None, method, args, .. } = n else {
+            continue;
+        };
+        if method != "using" || args.len() != 1 {
+            continue;
+        }
+        let span = n.span();
+        let enclosing = scopes
+            .iter()
+            .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+            .min_by_key(|(s, _)| s.1 - s.0);
+        let (end, prefix): (usize, &[String]) = match enclosing {
+            Some((s, p)) => (s.1, p.as_slice()),
+            None => (file_end, &[]),
+        };
+        let declared = match ast.get(args[0]) {
+            Node::ConstantRead { name, dynamic_base: false, self_anchored: false, rooted, .. } => {
+                let raw = if *rooted { format!("::{name}") } else { name.clone() };
+                source.declares_constant_at(prefix, &raw)
+            }
+            _ => false,
+        };
+        if !declared {
+            out.push((span.1, end));
+        }
+    }
     out
 }

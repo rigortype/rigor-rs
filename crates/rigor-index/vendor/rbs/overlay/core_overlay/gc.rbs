@@ -1,0 +1,50 @@
+# Rigor core overlay — supplemental core signatures.
+#
+# --- GC.start / GC#garbage_collect `global:` and GC.stat `scope:` (Ruby 4.1) ---
+#
+# Issue #1718. Ruby 4.1's `gc.rb` adds a `global:` keyword to the collection
+# entry points and a `scope:` keyword to `GC.stat`:
+#
+#   def self.start full_mark: true, immediate_mark: true, immediate_sweep: true, global: true
+#   def garbage_collect full_mark: true, immediate_mark: true, immediate_sweep: true, global: true
+#   def self.stat hash_or_key = nil, scope: :ractor
+#
+# `scope:` is `:ractor`, `:local` or `:global` and raises `ArgumentError`
+# otherwise; it is declared `Symbol` so that a scope held in a variable is
+# not reported. No rbs release through 4.2 declares either keyword. Rigor
+# does not check keyword names today, so these entries make the signatures
+# correct for when it does.
+# `ObjectSpace.garbage_collect` takes `global:` too (`object_space.rbs`).
+#
+# TEMPORARY: delete this file once the rbs release Rigor bundles declares
+# the keywords upstream.
+#
+# `GC.stat` with `scope:` has one arm per form, each answering what the
+# upstream arm of that form does. The overload selector matches a call's
+# keyword hash against an overload's keywords (#1727), so
+# `GC.stat(:count, scope: :global)` takes the `Integer` arm and
+# `GC.stat({}, scope: :global)` the `Hash` one.
+#
+# Declared unconditionally, not gated on `target_ruby` (ADR-121 § Rejected
+# alternatives; false positives outrank). Each entry is an `| ...`
+# continuation of the upstream declaration, which every supported rbs
+# release carries; a later release that declares the keyword only repeats
+# an overload. `global:` is optional in its arm: the upstream arms take no
+# positional argument and answer the same type, so the arm changes no
+# selected return, and an arm with a REQUIRED keyword would switch
+# `call.wrong-arity` off for the whole method (`compute_arity_envelope`
+# declines any method with one), losing `GC.start(1)`. `GC.stat`'s `scope:`
+# arm does require its keyword, so that a call without it still selects
+# the upstream `(Symbol) -> Integer` / `(?Hash) -> Hash` arms; the cost is
+# that `GC.stat` is not arity-checked.
+module GC
+  def self.start: (?immediate_sweep: boolish, ?immediate_mark: boolish, ?full_mark: boolish, ?global: boolish) -> nil
+                | ...
+
+  def self.stat: (Symbol key, scope: Symbol) -> Integer
+               | (?Hash[Symbol, untyped]? hash, scope: Symbol) -> Hash[Symbol, untyped]
+               | ...
+
+  def garbage_collect: (?immediate_sweep: boolish, ?immediate_mark: boolish, ?full_mark: boolish, ?global: boolish) -> nil
+                     | ...
+end

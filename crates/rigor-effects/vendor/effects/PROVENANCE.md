@@ -102,8 +102,8 @@ assertions below, and a drift against the pin fails
   `setbyte`, `bytesplice`, `append_as_bytes`, `force_encoding`, `delete_prefix!`,
   `delete_suffix!`, `encode!`, `scrub!`, `unicode_normalize!`). Every set was
   cross-checked member-for-member and in order against the pinned Ruby loader's
-  `Catalog::MUTATOR_SETS`. Was sha256 `5bd8091d…` from `v0.3.4` to `v0.3.9`.
-- **`sha256`** `dc7d009df9ccbbb092c98867814aae08252fcfd6807b2e2be49ae1b8996b631f`.
+  `Catalog::MUTATOR_SETS`. Was sha256 `5bd8091d…` from `v0.3.4` to `v0.3.9`, and `dc7d009d…` from `e59b7b89` to `v0.4.1`. At `v0.4.2`, `string` went 35 → **42**: Ruby 4.1's bit operations `bit_set`, `bit_clear`, `bit_flip` and `bitwise_{not,and,or,xor}!` (#1691), which rewrite bytes in place.
+- **`sha256`** `05f648d90176a31d03a476f812dcf546294357c2e417daa4e4cf8492dc694812`.
   This digests the GENERATOR'S OUTPUT, not an upstream file: `--check`
   regenerates the document in memory from the pinned Ruby and compares bytes, so
   a `%i[…]` literal that moves upstream fails the gate exactly as an edited copy

@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/126_opaque_refinement_using.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `ou_nope_before' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `ou_nope_m1' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `ou_nope_m5' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 43,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `ou_nope_after_project' for \"s\""
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 22,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `ou_toplevel_before`. If a project file defines `ou_toplevel_before` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 21,
+      "column": 3,
+      "severity": "error",
+      "message": "wrong number of arguments to `succ' on Integer (given 1, expected 0)"
+    },
+    {
+      "rule": "call.wrong-arity",
+      "line": 44,
+      "column": 3,
+      "severity": "error",
+      "message": "wrong number of arguments to `succ' on Integer (given 1, expected 0)"
+    }
+  ]
+}

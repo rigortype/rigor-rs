@@ -175,27 +175,17 @@ impl<'i> Typer<'i> {
             | Node::InterpolatedSymbol { .. }
             | Node::ArrayLit { .. }
             | Node::HashLit { .. } => Reach::PINLESS,
-            // `rand`'s `(?0) -> Float` overload accepts the literal `0`: it
-            // stays `opaque` for `declines_rand`, but `0` is still a
-            // `Type::Constant` on the reference — `"abc"[0]` folds to `"a"`
-            // — so it is `pinned` too.
-            Node::IntegerLit { value, .. } => {
-                if *value == Some(0) {
-                    Reach::PINNED_OPAQUE
-                } else {
-                    Reach::LITERAL
-                }
-            }
+            // `0` is a `Type::Constant` on the reference like any other
+            // integer literal — `"abc"[0]` folds to `"a"`.
+            Node::IntegerLit { .. } => Reach::LITERAL,
             // A range literal pins to `Constant[Range]` on the reference only
             // when every endpoint is static — a literal or an expression it
             // types `Type::Constant` (`static_range_endpoint`). A non-static
-            // endpoint leaves `Nominal[Range]` — still precise, still `opaque`
-            // for `rand`, but no `Constant`-receiver call folds through it:
+            // endpoint leaves `Nominal[Range]` — still precise, but no `Constant`-receiver call folds through it:
             // `"abc"[v..]` keeps `String | nil` (#332).
             Node::Range { left, right, .. } => Reach {
                 untyped: false,
                 precise: true,
-                opaque: true,
                 multi: false,
                 pinned: [left, right].iter().all(|e| match e {
                     Some(e) => self.expr_reach(ast, *e, seen).pins_one_constant(),
@@ -212,8 +202,8 @@ impl<'i> Typer<'i> {
                 // member fold still collapses to `Constant[1]`). That is
                 // [`Typer::expr_scalar`]; a hit here is exactly `pinned`
                 // (rigor-rs#332).
-                if let Some(scalar) = self.expr_scalar(ast, id, seen) {
-                    return pinned_scalar_reach(&scalar);
+                if self.expr_scalar(ast, id, seen).is_some() {
+                    return Reach::LITERAL;
                 }
                 let mut reach = self.chain_reach(ast, id, seen);
                 // The operands of a call COMPOSE into its result rather than
@@ -404,7 +394,6 @@ impl<'i> Typer<'i> {
             Reach {
                 untyped: reach.untyped,
                 precise: reach.precise,
-                opaque: reach.precise,
                 multi: reach.multi,
                 // A call over even a pinned literal is only `pinned` on the
                 // reference when the call itself folds to a `Constant`
@@ -890,7 +879,6 @@ impl<'i> Typer<'i> {
                     Reach {
                         untyped: r.untyped,
                         precise: true,
-                        opaque: true,
                         multi: r.multi,
                         pinned: false,
                     }
@@ -1162,16 +1150,12 @@ impl<'i> Typer<'i> {
 /// union's precise members are, two overloads with different returns survive
 /// and the join is `Dynamic[union]` (grid G1, eleven member kinds, all silent).
 ///
-/// `rand` is the exception, and what `precise` / `opaque` are for. Its
-/// overloads are `(?0) -> Float`, `(int) -> Integer` and two Range ones, and a
-/// union argument must be accepted member-wise: a string, `nil`, a non-zero
-/// Integer, a Float, a Symbol, an Array or Hash literal, `true` rules out
-/// every overload but `(int)` (whose `_ToInt` arm accepts leniently), so the
-/// join is `Integer` and the reference FIRES (grid G1 row R); only a Range or
-/// the literal `0` member keeps a second overload alive. So `rand` declines
-/// only when the argument is BARE untyped (`!precise`) or a member might be
-/// one of those (`opaque` — also any precise value this analysis cannot see
-/// into, the conservative side).
+/// `rand` used to be the exception: before upstream v0.4.2 a union
+/// argument's precise members could pin its `(int) -> Integer` overload, so
+/// it declined only on a BARE untyped carrier or a Range / `0` member. #1798
+/// (with #1677 / #1781 / #1782) joins EVERY overload an imprecise argument's
+/// untyped part may reach, so `rand(Dynamic | "x")` is `Dynamic[Float |
+/// Integer]` and silent; `rand` now declines exactly where the other three do.
 ///
 /// `multi` answers a different question — whether TWO OR MORE distinct precise
 /// values may reach, the shape an unconditional-then-conditional rebind leaves
@@ -1201,9 +1185,6 @@ pub(crate) struct Reach {
     pub(crate) untyped: bool,
     /// A precisely-typed value may reach.
     pub(crate) precise: bool,
-    /// A precise value that is not known to be a `rand`-pinning literal may
-    /// reach (a Range, the literal `0`, or anything not a literal).
-    opaque: bool,
     /// More than one distinct precise value may reach — a member-wise folded
     /// receiver call answers a union, not one value (issue #146).
     pub(crate) multi: bool,
@@ -1217,34 +1198,28 @@ impl Reach {
     /// `pinned` is `true` as the `&&` identity — a join still reports the
     /// other side's pinning.
     const NONE: Reach =
-        Reach { untyped: false, precise: false, opaque: false, multi: false, pinned: true };
+        Reach { untyped: false, precise: false, multi: false, pinned: true };
     /// Only the untyped carrier reaches.
     const UNTYPED: Reach =
-        Reach { untyped: true, precise: false, opaque: false, multi: false, pinned: false };
+        Reach { untyped: true, precise: false, multi: false, pinned: false };
     /// A precise literal `rand` would pin on.
     const LITERAL: Reach =
-        Reach { untyped: false, precise: true, opaque: false, multi: false, pinned: true };
+        Reach { untyped: false, precise: true, multi: false, pinned: true };
     /// A precise literal the reference does NOT carry as `Type::Constant` —
     /// an interpolated string/symbol, a Tuple literal, a HashShape.
     const PINLESS: Reach =
-        Reach { untyped: false, precise: true, opaque: false, multi: false, pinned: false };
-    /// A precise value that is `opaque` for `rand` but still a
-    /// `Type::Constant` on the reference — the literal `0` and a
-    /// fully-static range literal.
-    const PINNED_OPAQUE: Reach =
-        Reach { untyped: false, precise: true, opaque: true, multi: false, pinned: true };
+        Reach { untyped: false, precise: true, multi: false, pinned: false };
     /// A precise value of unknown shape.
     const OPAQUE: Reach =
-        Reach { untyped: false, precise: true, opaque: true, multi: false, pinned: false };
+        Reach { untyped: false, precise: true, multi: false, pinned: false };
     /// Anything at all — the decline side of every gate.
     const UNKNOWN: Reach =
-        Reach { untyped: true, precise: true, opaque: true, multi: true, pinned: false };
+        Reach { untyped: true, precise: true, multi: true, pinned: false };
 
     fn join(self, other: Reach) -> Reach {
         Reach {
             untyped: self.untyped || other.untyped,
             precise: self.precise || other.precise,
-            opaque: self.opaque || other.opaque,
             // Two precise sources meeting is exactly what makes the carrier a
             // union of distinct values rather than one pinned value.
             multi: self.multi || other.multi || (self.precise && other.precise),
@@ -1266,7 +1241,6 @@ impl Reach {
         Reach {
             untyped: self.untyped || other.untyped,
             precise: self.precise || other.precise,
-            opaque: self.opaque || other.opaque,
             multi: self.multi || other.multi,
             pinned: self.pinned && other.pinned,
         }
@@ -1280,10 +1254,6 @@ impl Reach {
         self.precise && self.pinned && !self.untyped && !self.multi
     }
 
-    /// Whether `rand(arg)` declines: see the type's doc.
-    pub(crate) fn declines_rand(self) -> bool {
-        self.untyped && (!self.precise || self.opaque)
-    }
 }
 
 /// The span of the LAST statement on `use_span`'s statement path that
@@ -1659,17 +1629,6 @@ fn literal_scalar(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
         Node::FalseLit { .. } => Some(Scalar::Bool(false)),
         Node::NilLit { .. } => Some(Scalar::Nil),
         _ => None,
-    }
-}
-
-/// The [`Reach`] of a folded literal call — `precise` + `pinned`, with the
-/// `rand` opacity of the scalar it landed on (`0` keeps `(?0) -> Float`
-/// alive).
-fn pinned_scalar_reach(scalar: &Scalar) -> Reach {
-    if matches!(scalar, Scalar::Int(0)) {
-        Reach::PINNED_OPAQUE
-    } else {
-        Reach::LITERAL
     }
 }
 

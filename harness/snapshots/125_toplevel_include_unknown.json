@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/125_toplevel_include_unknown.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 16,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `tu_int' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `tu_str' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 18,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `tu_sym' for :sym"
+    }
+  ]
+}

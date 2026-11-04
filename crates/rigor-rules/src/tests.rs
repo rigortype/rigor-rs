@@ -4430,3 +4430,92 @@ fn issue_436_reaching_write_cap_boundary() {
     );
     assert_eq!(undefined(&guard), ["undefined method `zz' for Float"]);
 }
+
+/// Cross-file: every diagnostic of `files[focus]` against a PROJECT source
+/// built over all `files`, as `(rule, method)` pairs.
+fn project_rule_methods(files: &[&[u8]], focus: usize) -> Vec<(&'static str, String)> {
+    let asts: Vec<_> = files.iter().map(|s| lower(&parse(s))).collect();
+    let refs: Vec<&LoweredAst> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut interner = Interner::new();
+    analyze_with_source(&asts[focus], &mut interner, &index, &source)
+        .into_iter()
+        .map(|d| (d.rule_id, d.method_name.unwrap_or_default()))
+        .collect()
+}
+
+/// Upstream v0.4.2 (#1706 / issue #1697), oracle-measured on a two-file
+/// project: a top-level `include` in ONE file reaches every other file. An
+/// unknown module silences each bare top-level call there but no explicit
+/// receiver; a known module silences only the names it defines.
+#[test]
+fn toplevel_include_reaches_other_files() {
+    let other: &[u8] = b"frob_b\n1.frob_int\nmine_x\n1.mine_x\n";
+    // Unknown module: the bare call declines, the receiver call still fires.
+    let got = project_rule_methods(&[b"include SomeGem::Helpers\n", other], 1);
+    assert!(!got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(!got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "mine_x".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "mine_x".into())), "{got:?}");
+    // Known module: its method declines on both forms, other names fire.
+    let got =
+        project_rule_methods(&[b"module Mine; def mine_x = 1; end\ninclude Mine\n", other], 1);
+    assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(!got.iter().any(|(_, m)| m == "mine_x"), "{got:?}");
+    // MUST STILL FIRE: a receiver call is not silenced by an unnameable
+    // `include(…)` (a spec matcher) inside the included module's body — the
+    // concurrent-ruby shape that silenced `Benchmark.ips` project-wide.
+    let got = project_rule_methods(
+        &[
+            b"module Wm\n  describe('x') { expect(1).to include(2) }\n  def mine_x = 1\nend\ninclude Wm\n",
+            other,
+        ],
+        1,
+    );
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(!got.iter().any(|(_, m)| m == "mine_x"), "{got:?}");
+    // MUST STILL FIRE: no top-level include anywhere (the include is in a block).
+    let got = project_rule_methods(&[b"[1].each { include SomeGem::Helpers }\n", other], 1);
+    assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "mine_x".into())), "{got:?}");
+}
+
+/// Upstream v0.4.2 (#1662), oracle-measured with a project `sig/`: an RBS
+/// declaration of the ivar (`@x: T` or an `attr_*` slot, own or inherited)
+/// that admits both writes withholds `def.ivar-write-mismatch`; a narrower
+/// declaration or none keeps it.
+#[test]
+fn ivar_write_mismatch_withheld_by_admitting_rbs_declaration() {
+    let dir = std::env::temp_dir().join(format!("rigor-rules-ivar-sig-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp sig dir");
+    std::fs::write(
+        dir.join("n.rbs"),
+        "class Node\n  attr_reader label: String | Integer\nend\n\
+         class Ivar\n  @v: String | Integer\nend\n\
+         class Narrow\n  @w: String\nend\n\
+         class Sub < Node\nend\n",
+    )
+    .expect("write sig");
+    let index = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
+    let pair = |c: &str, iv: &str| {
+        format!("class {c}\n  def initialize\n    @{iv} = \"a\"\n  end\n  def reset\n    @{iv} = 1\n  end\nend\n")
+    };
+    let src = [pair("Node", "label"), pair("Ivar", "v"), pair("Narrow", "w"), pair("Plain", "p"), pair("Sub", "label")]
+        .concat();
+    let ast = lower(&parse(src.as_bytes()));
+    let refs = [&ast];
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut interner = Interner::new();
+    let fired: Vec<String> = analyze_with_source(&ast, &mut interner, &index, &source)
+        .into_iter()
+        .filter(|d| d.rule_id == DEF_IVAR_WRITE_MISMATCH)
+        .map(|d| d.message)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert_eq!(fired.len(), 2, "{fired:?}");
+    assert!(fired[0].contains("`@w' on Narrow"), "{fired:?}");
+    assert!(fired[1].contains("`@p' on Plain"), "{fired:?}");
+}

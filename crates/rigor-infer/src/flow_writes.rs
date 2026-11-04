@@ -159,7 +159,8 @@ fn drop_blocked_writes(ast: &LoweredAst, writes: &mut Vec<(rigor_parse::Span, St
 /// had never carried: `s = "ab"; s.upcase!; if s == "ab"` folded here and fired
 /// `flow.always-truthy-condition` where the oracle widens `s` to `String`. Pin
 /// `e59b7b89` grew the String table 26 -> 35 (`delete_prefix!`, `encode!`,
-/// `scrub!`, …), which turned more of the same shape into oracle silence.
+/// `scrub!`, …), and v0.4.2 35 -> 42 (Ruby 4.1 bit operations, #1691), which
+/// turned more of the same shape into oracle silence.
 ///
 /// `HashLookupMutation::MUTATORS` (`default=` / `default_proc=` /
 /// `compare_by_identity`) is deliberately NOT here: upstream keeps a local's
@@ -179,6 +180,10 @@ pub(crate) const MUTATOR_METHODS: &[&str] = &[
     "tr_s!", "delete!", "squeeze!", "succ!", "next!", "upcase!", "downcase!", "capitalize!",
     "swapcase!", "strip!", "lstrip!", "rstrip!", "chomp!", "chop!", "delete_prefix!",
     "delete_suffix!", "encode!", "scrub!", "unicode_normalize!",
+    // Upstream v0.4.2 (#1691): Ruby 4.1's bit operations, declared by the
+    // vendored `core_overlay/string.rbs` whatever Ruby runs the analysis.
+    "bit_set", "bit_clear", "bit_flip", "bitwise_not!", "bitwise_and!", "bitwise_or!",
+    "bitwise_xor!",
 ];
 
 /// Collect every flow-write `(span, name)` in the arena, once, for
