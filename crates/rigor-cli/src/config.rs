@@ -4268,3 +4268,28 @@ mod severity_config_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 }
+
+/// Upstream v0.4.6 (#1992 / #2204, `CLI::Options.config_path`): the
+/// `--config` value, checked where the flag is read. A named file that is not
+/// there is a usage error (`rigor: …`, exit 64), never a request for the
+/// defaults. Auto-discovery, with no `--config` given, is not affected.
+pub(crate) fn checked_config_path(value: &str) -> Result<String, std::process::ExitCode> {
+    let fail = |msg: String| {
+        eprintln!("rigor: {msg}");
+        Err(std::process::ExitCode::from(64))
+    };
+    let path = Path::new(value);
+    if value.trim_matches(|c: char| c.is_ascii_whitespace() || c == '\0').is_empty() {
+        return fail("empty config path".to_string());
+    }
+    if path.is_dir() {
+        return fail(format!("config path is a directory: {value}"));
+    }
+    if !path.exists() {
+        return fail(format!("config file not found: {value}"));
+    }
+    if std::fs::File::open(path).is_err() {
+        return fail(format!("config file not readable: {value}"));
+    }
+    Ok(value.to_string())
+}

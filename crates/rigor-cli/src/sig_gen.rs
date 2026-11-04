@@ -209,7 +209,10 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 "new-files" => defer("--new-files", &mut deferred),
                 "new-methods" => defer("--new-methods", &mut deferred),
                 "tighter-returns" => defer("--tighter-returns", &mut deferred),
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 _ => unreachable!("the switch table is closed"),
             },
         }
@@ -251,6 +254,23 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         positional.iter().map(String::as_str).collect()
     };
     let files = resolve_paths(&raw);
+    // Upstream v0.4.6 (#1991 / #2204, `path_diagnostics`): a path that names
+    // neither a directory nor a `.rb` file is reported as `rigor check`
+    // reports it — a warning `(skipped)` beside files that will be read, an
+    // error (exit 1) when nothing will be. JSON print/diff carries them in the
+    // payload; every other form says them on stderr.
+    let path_errors = path_diagnostics(&raw, !files.is_empty());
+    let errors_in_payload = format == "json" && mode != "write";
+    if !errors_in_payload {
+        for (path, severity, message) in &path_errors {
+            eprintln!("{path}:1:1: {severity}: {message}");
+        }
+    }
+    let path_status = if path_errors.iter().any(|(_, sev, _)| *sev == "error") {
+        ExitCode::from(1)
+    } else {
+        ExitCode::SUCCESS
+    };
 
     // The sig-gen-local, FQN-keyed declaration env, built ONCE from the project's
     // own `.rbs` under the configured signature dirs (ADR-14 slice 10). Drives
@@ -262,7 +282,8 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
 
     if mode == "write" {
-        return cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env);
+        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env);
+        return if path_status != ExitCode::SUCCESS { path_status } else { status };
     }
 
     // `--overwrite` only affects the write path (it governs replacing an existing
@@ -275,11 +296,52 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // `--format json` renders the candidate table regardless of print/diff mode
     // (reference `Renderer#render`); text picks the diff or print layout.
     match (format.as_str(), mode == "diff") {
+        ("json", _) if !path_errors.is_empty() => {
+            // The reference's key order (`Diagnostic#to_h`), which a
+            // `serde_json::Value` map would sort.
+            let head = candidates_json_string(&candidates);
+            let head = head.strip_suffix("\n}").unwrap_or(&head);
+            let q = |v: &str| serde_json::to_string(v).unwrap();
+            let rows: Vec<String> = path_errors
+                .iter()
+                .map(|(path, severity, message)| {
+                    format!(
+                        "    {{\n      \"path\": {},\n      \"line\": 1,\n      \"column\": 1,\n      \
+                         \"severity\": {},\n      \"rule\": null,\n      \"source_family\": \"builtin\",\n      \
+                         \"message\": {}\n    }}",
+                        q(path),
+                        q(severity),
+                        q(message)
+                    )
+                })
+                .collect();
+            println!("{head},\n  \"diagnostics\": [\n{}\n  ]\n}}", rows.join(",\n"));
+        }
         ("json", _) => render_json(&candidates),
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
     }
-    ExitCode::SUCCESS
+    path_status
+}
+
+/// `PathExpansion.unusable` + `diagnostics`: `(path, severity, message)` for
+/// each path that names neither a directory nor a `.rb` file.
+fn path_diagnostics(raw: &[&str], any_files: bool) -> Vec<(String, &'static str, String)> {
+    let (severity, suffix) = if any_files { ("warning", " (skipped)") } else { ("error", "") };
+    raw.iter()
+        .filter(|p| {
+            let path = Path::new(p);
+            !(path.is_dir() || (path.is_file() && p.ends_with(".rb")))
+        })
+        .map(|p| {
+            let message = if Path::new(p).exists() {
+                "not a Ruby file (expected `.rb` or a directory)"
+            } else {
+                "no such file or directory"
+            };
+            (p.to_string(), severity, format!("{message}{suffix}"))
+        })
+        .collect()
 }
 
 /// Resolve path args to `.rb` files (reference `Generator#resolve_paths`): a

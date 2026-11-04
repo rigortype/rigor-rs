@@ -89,6 +89,11 @@ pub fn cmd_lsp(args: &[String]) -> ExitCode {
             // honour it — rejected rather than silently ignored.
             "log" => {}
             "config" => {
+                // #2204 — the shared `--config` check runs where the flag is
+                // read, before the port's own rejection.
+                if let Err(code) = crate::config::checked_config_path(value.unwrap().as_str()) {
+                    return code;
+                }
                 eprintln!("rigor: lsp --config is not supported by rigor-rs");
                 return ExitCode::from(64);
             }

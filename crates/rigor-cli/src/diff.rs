@@ -93,7 +93,10 @@ pub fn cmd_diff(args: &[String]) -> ExitCode {
             Item::Opt { key, value, .. } => match key {
                 "format" => format = value.unwrap().as_str().to_string(),
                 "current" => current_path = Some(value.unwrap().as_str().to_string()),
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 _ => unreachable!("the switch table is closed"),
             },
         }

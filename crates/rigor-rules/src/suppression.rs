@@ -142,7 +142,7 @@ pub fn is_inert_builtin_token(token: &str) -> bool {
 /// Only the three implemented ids can ever match a real diagnostic; the remaining
 /// aliases are included for forward-compat (they expand to ids no rigor-rs
 /// diagnostic carries, so they are inert).
-fn legacy_alias(token: &str) -> Option<&'static str> {
+pub fn legacy_alias(token: &str) -> Option<&'static str> {
     match token {
         "undefined-method" => Some(CALL_UNDEFINED_METHOD),
         "self-undefined-method" => Some("call.self-undefined-method"),

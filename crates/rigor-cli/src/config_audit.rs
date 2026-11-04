@@ -319,8 +319,24 @@ fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
             });
         }
     }
-    for (key, _) in cfg.severity_overrides() {
-        if let Some(reason) = override_key_problem(&key, plugin_ids.as_deref()) {
+    let overrides = cfg.severity_overrides();
+    let present: Vec<&str> = overrides.iter().map(|(k, _)| k.as_str()).collect();
+    for (key, _) in &overrides {
+        // Upstream v0.4.6 (#2005 / #2223, `legacy_alias_problem`): `disable:`
+        // expands a legacy alias, but the severity resolver matches canonical
+        // ids only, so an alias key reaches no row.
+        let reason = match rigor_rules::legacy_rule_alias(key) {
+            Some(canonical) => {
+                let reason = format!("is a legacy alias of `{canonical}`; the override has no effect");
+                Some(if present.contains(&canonical) {
+                    reason
+                } else {
+                    format!("{reason}, so write `{canonical}`")
+                })
+            }
+            None => override_key_problem(key, plugin_ids.as_deref()).map(str::to_string),
+        };
+        if let Some(reason) = reason {
             out.push(ConfigWarning {
                 kind: "severity_override",
                 message: format!("severity_overrides: {key:?} {reason}"),
