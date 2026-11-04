@@ -511,47 +511,51 @@ fn lsp_analyses_a_symlink_whose_target_spelling_is_excluded() {
 
 /// B3 — OVERLAPPING `paths:` roots. DECLARED `paths:` entries resolve to
 /// absolute strings (`Configuration.resolve_paths_in`), so both roots spell
-/// the file `<abs>/lib/a.rb` — `./lib/**` prunes NEITHER spelling and `check`
-/// analyses it (twice: `expand_paths` does not dedupe — verified against the
-/// reference, which emits two identical rows). The first cut returned on the
-/// first containing root, making the answer depend on config order — so both
-/// orders are driven.
+/// the file `<abs>/lib/a.rb`. Since v0.4.3 (#1576) a relative pattern sees
+/// that path relative to the config directory (`lib/a.rb`; a leading `./` of
+/// the pattern is dropped), so `./lib/**` prunes BOTH spellings and `check`
+/// reports nothing (oracle-probed); a pattern that misses the file is the
+/// control, analysed under both roots (twice: `expand_paths` does not
+/// dedupe). The first cut returned on the first containing root, making the
+/// answer depend on config order — so both orders are driven.
 #[test]
 fn lsp_analyses_a_file_kept_by_one_of_two_overlapping_roots() {
     for (tag, order) in [
         ("lsp-exclude-b3a", "paths:\n  - \".\"\n  - lib\n"),
         ("lsp-exclude-b3b", "paths:\n  - lib\n  - \".\"\n"),
     ] {
-        let dir = TempDir::new(tag);
-        fs::write(dir.path().join("lib/a.rb"), TYPO_RB).unwrap();
-        fs::write(
-            dir.path().join(".rigor.yml"),
-            format!("{order}exclude:\n  - \"./lib/**\"\n"),
-        )
-        .unwrap();
+        for (pattern, kept) in [("./lib/**", false), ("lib/b/**", true)] {
+            let dir = TempDir::new(&format!("{tag}-{kept}"));
+            fs::write(dir.path().join("lib/a.rb"), TYPO_RB).unwrap();
+            fs::write(
+                dir.path().join(".rigor.yml"),
+                format!("{order}exclude:\n  - \"{pattern}\"\n"),
+            )
+            .unwrap();
 
-        // Bare `check` (no path args) — the invocation `paths:` governs, and
-        // its rows carry the ABSOLUTE path spelling a declared `paths:` root
-        // produces.
-        let abs = dir.path().join("lib/a.rb");
-        let mut expected = check_findings(dir.path(), &[], abs.to_str().unwrap());
-        assert_eq!(
-            expected.len(),
-            2,
-            "[{order:?}] the control: `./lib/**` matches neither absolute \
-             spelling, so `check` analyses the file under both roots: {expected:?}"
-        );
-        // The LSP publishes one row per buffer; `check` reports the file once
-        // per containing root. The parity claim is the CONTENT, so compare the
-        // de-duplicated row set.
-        expected.sort();
-        expected.dedup();
-        assert_eq!(
-            lsp_findings(dir.path(), "lib/a.rb", TYPO_RB),
-            expected,
-            "[{order:?}] B3: one surviving root spelling is enough — and the answer \
-             must not depend on `paths:` order"
-        );
+            // Bare `check` (no path args) — the invocation `paths:` governs, and
+            // its rows carry the ABSOLUTE path spelling a declared `paths:` root
+            // produces.
+            let abs = dir.path().join("lib/a.rb");
+            let mut expected = check_findings(dir.path(), &[], abs.to_str().unwrap());
+            assert_eq!(
+                expected.len(),
+                if kept { 2 } else { 0 },
+                "[{order:?} / {pattern}] `check` analyses the file under both roots \
+                 or neither: {expected:?}"
+            );
+            // The LSP publishes one row per buffer; `check` reports the file once
+            // per containing root. The parity claim is the CONTENT, so compare the
+            // de-duplicated row set.
+            expected.sort();
+            expected.dedup();
+            assert_eq!(
+                lsp_findings(dir.path(), "lib/a.rb", TYPO_RB),
+                expected,
+                "[{order:?} / {pattern}] B3: the gate agrees with discovery, and the \
+                 answer must not depend on `paths:` order"
+            );
+        }
     }
 }
 

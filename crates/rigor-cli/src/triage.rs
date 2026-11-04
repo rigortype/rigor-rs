@@ -199,7 +199,7 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
     // Same exclusion-aware expansion `check` runs (upstream triage goes
     // through `runner.run` → `expand_paths` → `reject_excluded` too).
     let (expanded_owned, _errs) =
-        crate::expand_check_paths_excluding(roots, &crate::exclude_patterns(&cfg));
+        crate::expand_check_paths_excluding(roots, &crate::exclude_set(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     let (findings, _io) = crate::analyze_files(
         &expanded,

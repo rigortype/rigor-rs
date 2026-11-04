@@ -32,6 +32,7 @@
 //! strings the reference's `Configuration` stores, while keys the file never
 //! wrote keep their cwd-relative defaults (`["lib"]`, `["sig"]`).
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use rigor_rules::SuppressSet;
@@ -2938,11 +2939,12 @@ fn passwd_entry(pred: impl Fn(&[&str]) -> bool) -> Option<String> {
 /// `[…]` is a character class, `\` escapes, and the leading-period rule
 /// applies at path position 0.
 ///
-/// The single matcher authority: `check`'s expansion filter
-/// (`expand_check_paths_excluding`) and the LSP's per-buffer gate both reach
-/// the same `dir.c` port — a second implementation of the glob rule is
-/// exactly the drift the retired `glob::Pattern` stage-1 gate was (a
-/// `glob::Pattern` `a/**/b` matches `a/b`; `File.fnmatch?` does not).
+/// The raw pattern-vs-string match [`ExcludeSet`] applies to each spelling
+/// it derives; kept for the matcher-level tests. `check`'s expansion filter
+/// and the LSP's per-buffer gate both go through [`ExcludeSet`], which
+/// reaches the same `dir.c` port — a second implementation of the glob rule
+/// is exactly the drift the retired `glob::Pattern` stage-1 gate was.
+#[cfg(test)]
 #[must_use]
 pub fn matches_exclude(patterns: &[String], path: &str) -> bool {
     let path: Vec<char> = path.chars().collect();
@@ -2950,6 +2952,176 @@ pub fn matches_exclude(patterns: &[String], path: &str) -> bool {
         let pat: Vec<char> = pat.chars().collect();
         crate::conformance_gate::fnmatch_chars(&pat, &path)
     })
+}
+
+/// `Configuration#exclude_patterns` bound to the directory relative patterns
+/// are matched against — a port of the reference's v0.4.3
+/// `PathExpansion.reject_excluded` / `excluded?` (#1576, upstream #1858).
+///
+/// - An ABSOLUTE pattern (leading `/`) is matched against the file's logical
+///   absolute path (`File.absolute_path(path, Dir.pwd)`), then its real path.
+/// - A RELATIVE pattern (a leading run of `./` dropped) is matched against the
+///   path relative to `base`, the config file's directory (the working
+///   directory with no config), and against `/` + that relative path (so the
+///   unanchored `**/tmp/**` reaches a top-level `tmp/x.rb`). The LOGICAL
+///   relative path counts only for a file inside `base`; otherwise the REAL
+///   path relative to the real base (a `../…` spelling) is used. No directory
+///   name above `base` is ever shown to a pattern, so `**/tmp/**` cannot
+///   exclude a project that merely lives under a `tmp/`.
+///
+/// Every match is `File.fnmatch?` with no flags
+/// ([`crate::conformance_gate::fnmatch_chars`]).
+pub struct ExcludeSet {
+    absolute: Vec<Vec<char>>,
+    relative: Vec<Vec<char>>,
+    cwd: std::path::PathBuf,
+    /// `File.absolute_path(base)`.
+    base: String,
+    /// `File.realpath(base)`, or `base` when it cannot be resolved.
+    real_base: String,
+}
+
+impl ExcludeSet {
+    /// `base` is the config file's directory (or the working directory) and
+    /// `cwd` the directory relative path arguments are spelled from.
+    #[must_use]
+    pub fn new(patterns: &[String], base: &Path, cwd: &Path) -> Self {
+        let mut absolute = Vec::new();
+        let mut relative = Vec::new();
+        for pattern in patterns {
+            if pattern.starts_with('/') {
+                absolute.push(pattern.chars().collect());
+            } else {
+                relative.push(strip_dot_slashes(pattern).chars().collect());
+            }
+        }
+        let cwd = lexical_absolute(cwd, Path::new("/"));
+        let base_path = lexical_absolute(base, &cwd);
+        let real_base = real_directory(&base_path);
+        Self {
+            absolute,
+            relative,
+            cwd,
+            base: base_path.to_string_lossy().into_owned(),
+            real_base: real_base.to_string_lossy().into_owned(),
+        }
+    }
+
+    /// Whether `path` (spelled from `cwd`) is excluded.
+    #[must_use]
+    pub fn excludes(&self, path: &str) -> bool {
+        self.excludes_cached(path, &mut HashMap::new())
+    }
+
+    /// Drop the excluded paths, keeping order (`reject_excluded`).
+    pub fn retain_unexcluded(&self, files: &mut Vec<String>) {
+        if self.absolute.is_empty() && self.relative.is_empty() {
+            return;
+        }
+        let mut real_dirs = HashMap::new();
+        files.retain(|f| !self.excludes_cached(f, &mut real_dirs));
+    }
+
+    fn excludes_cached(
+        &self,
+        path: &str,
+        real_dirs: &mut HashMap<std::path::PathBuf, std::path::PathBuf>,
+    ) -> bool {
+        let logical_path = lexical_absolute(Path::new(path), &self.cwd);
+        let logical = logical_path.to_string_lossy().into_owned();
+        let prefix = format!("{}/", self.base);
+        let inside = logical.starts_with(&prefix);
+        if inside && self.matches_relative(&logical[prefix.len()..]) {
+            return true;
+        }
+        if self.matches_absolute(&logical) {
+            return true;
+        }
+        let real = match (logical_path.parent(), logical_path.file_name()) {
+            (Some(dir), Some(name)) => real_dirs
+                .entry(dir.to_path_buf())
+                .or_insert_with(|| real_directory(dir))
+                .join(name)
+                .to_string_lossy()
+                .into_owned(),
+            _ => logical.clone(),
+        };
+        if real == logical && inside && self.real_base == self.base {
+            return false;
+        }
+        self.matches_relative(&relative_path(&real, &self.real_base))
+            || (real != logical && self.matches_absolute(&real))
+    }
+
+    fn matches_absolute(&self, path: &str) -> bool {
+        if self.absolute.is_empty() {
+            return false;
+        }
+        let path: Vec<char> = path.chars().collect();
+        self.absolute.iter().any(|p| crate::conformance_gate::fnmatch_chars(p, &path))
+    }
+
+    fn matches_relative(&self, relative: &str) -> bool {
+        if self.relative.is_empty() {
+            return false;
+        }
+        let plain: Vec<char> = relative.chars().collect();
+        let rooted: Vec<char> = std::iter::once('/').chain(relative.chars()).collect();
+        self.relative.iter().any(|p| {
+            crate::conformance_gate::fnmatch_chars(p, &plain)
+                || crate::conformance_gate::fnmatch_chars(p, &rooted)
+        })
+    }
+}
+
+/// `pattern.sub(%r{\A(?:\./+)+}, "")`.
+fn strip_dot_slashes(pattern: &str) -> &str {
+    let mut rest = pattern;
+    while let Some(tail) = rest.strip_prefix("./") {
+        rest = tail.trim_start_matches('/');
+    }
+    rest
+}
+
+/// `File.absolute_path(path, dir)`: joined onto `dir` when relative, then
+/// `.`/`..` folded lexically (no filesystem access).
+fn lexical_absolute(path: &Path, dir: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let joined = if path.is_absolute() { path.to_path_buf() } else { dir.join(path) };
+    let mut out = std::path::PathBuf::from("/");
+    for c in joined.components() {
+        match c {
+            Component::CurDir | Component::RootDir | Component::Prefix(_) => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::Normal(n) => out.push(n),
+        }
+    }
+    out
+}
+
+/// `File.realpath(dir) rescue File.absolute_path(dir)`.
+fn real_directory(dir: &Path) -> std::path::PathBuf {
+    std::fs::canonicalize(dir).unwrap_or_else(|_| dir.to_path_buf())
+}
+
+/// The reference's `relative_path`: a byte strip inside `base`, else
+/// `Pathname#relative_path_from` (both sides absolute and folded).
+fn relative_path(absolute: &str, base: &str) -> String {
+    if let Some(rest) = absolute.strip_prefix(&format!("{base}/")) {
+        return rest.to_string();
+    }
+    let a: Vec<&str> = absolute.split('/').filter(|s| !s.is_empty()).collect();
+    let b: Vec<&str> = base.split('/').filter(|s| !s.is_empty()).collect();
+    let common = a.iter().zip(&b).take_while(|(x, y)| x == y).count();
+    let mut parts: Vec<&str> = std::iter::repeat_n("..", b.len() - common).collect();
+    parts.extend(&a[common..]);
+    if parts.is_empty() {
+        ".".to_string()
+    } else {
+        parts.join("/")
+    }
 }
 
 #[cfg(test)]

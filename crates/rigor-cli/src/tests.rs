@@ -308,7 +308,7 @@ fn expand_check_paths_dir_recursion_and_errors() {
     std::fs::write(root.join("n.txt"), b"nope\n").unwrap();
 
     let root_s = root.to_string_lossy().into_owned();
-    let (files, errs) = expand_check_paths_excluding(&[root_s.as_str()], &[]);
+    let (files, errs) = expand_check_paths_excluding(&[root_s.as_str()], &no_excludes());
     let names: Vec<String> = files
         .iter()
         .map(|f| Path::new(f).file_name().unwrap().to_string_lossy().into_owned())
@@ -322,7 +322,7 @@ fn expand_check_paths_dir_recursion_and_errors() {
     // A missing path and an existing non-.rb file → the two PathError kinds.
     let txt = root.join("n.txt").to_string_lossy().into_owned();
     let missing = root.join("gone.rb").to_string_lossy().into_owned();
-    let (f2, e2) = expand_check_paths_excluding(&[missing.as_str(), txt.as_str()], &[]);
+    let (f2, e2) = expand_check_paths_excluding(&[missing.as_str(), txt.as_str()], &no_excludes());
     assert!(f2.is_empty());
     assert_eq!(e2.len(), 2);
     assert!(e2[0].not_found, "missing path is not_found");
@@ -363,6 +363,7 @@ fn expand_check_paths_excluding_dir_filtered_file_verbatim() {
         ext.clone(),
         format!("{a}/**/b.rb"),
     ];
+    let excludes = cwd_excludes(&excludes);
 
     // Directory roots: builtin + user patterns prune the expanded hits.
     let (files, errs) = expand_check_paths_excluding(&[lib.as_str()], &excludes);
@@ -964,11 +965,12 @@ fn analyze_files_repeated_paths_dedup_in_union() {
 
 /// Issue #201 — a `[`/`\\` `exclude:` pattern is decided EXACTLY now, not
 /// declined: `fnmatch` is the full `dir.c` port, so the widened expansion
-/// answers `File.fnmatch?("lib/[f]oo.rb", "<abs>/lib/foo.rb")` itself. The
-/// declared `paths: [lib]` expands to an ABSOLUTE root, so the relative
-/// pattern cannot match the widened hit — `foo.rb` stays, widening runs,
-/// and `Foo.new.bar.upcase` fires exactly as the reference's does
-/// (probe-measured; `"s".nope` is the still-analysed control).
+/// answers the class pattern itself. Since v0.4.3 (#1576) the relative
+/// pattern sees the widened hit relative to the config directory
+/// (`lib/foo.rb`), so `foo.rb` is excluded from discovery, `Foo` is
+/// unknown and `Foo.new.bar.upcase` stays silent exactly as the reference's
+/// does (probe-measured, `frag/pclass`; v0.4.2 fired it). `"s".nope` is the
+/// still-analysed control.
 #[test]
 fn analyze_files_class_pattern_decided_exactly() {
     let root = std::env::temp_dir().join(format!("rigor_widen_und_{}", std::process::id()));
@@ -1000,8 +1002,8 @@ fn analyze_files_class_pattern_decided_exactly() {
     let messages: Vec<&str> =
         findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
     assert!(
-        messages.iter().any(|m| m.contains("`upcase'")),
-        "exact `fnmatch` decides the class pattern — widening must run; got {messages:?}"
+        !messages.iter().any(|m| m.contains("`upcase'")),
+        "exact `fnmatch` decides the class pattern — foo.rb is excluded; got {messages:?}"
     );
     assert!(
         messages.iter().any(|m| m.contains("`nope'")),
@@ -1063,17 +1065,58 @@ fn analyze_files_class_pattern_no_match_on_dup_argv() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
-/// The leading-period half of the fnmatch fix is exercised at the
-/// matcher level (`conformance_gate::fnmatch_matches_ruby_no_flags`);
-/// the e2e `check ./app ./app` row is probe-verified because a
-/// `./`-spelled root needs a controlled cwd.
+fn cwd_excludes(patterns: &[String]) -> crate::config::ExcludeSet {
+    let cwd = std::env::current_dir().unwrap();
+    crate::config::ExcludeSet::new(patterns, &cwd, &cwd)
+}
+
+fn no_excludes() -> crate::config::ExcludeSet {
+    cwd_excludes(&[])
+}
+
+/// v0.4.3 (#1576, upstream #1858): a RELATIVE `exclude:` pattern sees the
+/// path relative to the exclude base, whichever spelling named the file, and
+/// never a directory above the base.
 #[test]
-fn exclude_fnmatch_leading_period_rule() {
-    let excludes: Vec<Vec<char>> = vec!["*gen.rb".chars().collect()];
-    // `File.fnmatch?("*gen.rb", "./app/gen.rb")` is false — `./app/gen.rb`
-    // must NOT be excluded from the widened/expansion counts.
-    assert!(!exclude_fnmatch(&excludes, "./app/gen.rb"));
-    assert!(exclude_fnmatch(&excludes, "app/gen.rb"));
+fn exclude_set_relative_patterns_see_the_base_relative_path() {
+    let root = std::env::temp_dir().join(format!("rigor_excl_base_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let proj = root.join("tmp/proj");
+    std::fs::create_dir_all(proj.join("lib/gen")).unwrap();
+    std::fs::create_dir_all(proj.join("tmp")).unwrap();
+    std::fs::write(proj.join("lib/ok.rb"), b"x = 1\n").unwrap();
+    std::fs::write(proj.join("lib/gen/x.rb"), b"x = 1\n").unwrap();
+    std::fs::write(proj.join("tmp/t.rb"), b"x = 1\n").unwrap();
+    let pats = |p: &[&str]| p.iter().map(|s| (*s).to_string()).collect::<Vec<_>>();
+    let s = |p: &str| proj.join(p).to_string_lossy().into_owned();
+    let lib = s("lib");
+
+    // The absolute configured root is excluded like the relative argument.
+    let set = crate::config::ExcludeSet::new(&pats(&["lib/gen/**"]), &proj, &proj);
+    let (files, _) = expand_check_paths_excluding(&[lib.as_str()], &set);
+    assert_eq!(files, vec![s("lib/ok.rb")], "lib/gen/x.rb excluded; lib/ok.rb kept");
+    assert!(set.excludes("lib/gen/x.rb"));
+    assert!(set.excludes("./lib/gen/x.rb"), "a leading ./ of the path is folded");
+    let dotted = crate::config::ExcludeSet::new(&pats(&["./lib/gen/**"]), &proj, &proj);
+    assert!(dotted.excludes(&s("lib/gen/x.rb")), "a leading ./ of the pattern is dropped");
+
+    // Never above the base: the project lives under a `tmp/`, which
+    // `**/tmp/**` must not see; the project's own `tmp/` is still excluded.
+    let tmp = crate::config::ExcludeSet::new(&pats(&["**/tmp/**"]), &proj, &proj);
+    assert!(!tmp.excludes(&s("lib/ok.rb")));
+    assert!(tmp.excludes(&s("tmp/t.rb")));
+
+    // A file outside the base is matched by its `../` spelling.
+    let other = crate::config::ExcludeSet::new(&pats(&["**/tmp/**"]), &proj.join("lib"), &proj);
+    assert!(other.excludes(&s("tmp/t.rb")));
+    assert!(!other.excludes(&s("lib/ok.rb")));
+
+    // An absolute pattern matches the absolute path only.
+    let abs = crate::config::ExcludeSet::new(&[s("lib/gen/*")], &proj, &proj);
+    assert!(abs.excludes("lib/gen/x.rb"));
+    assert!(!abs.excludes("lib/ok.rb"));
+
+    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// rigor-rs#412 must-still-fire control for the depth refusal's own wording:

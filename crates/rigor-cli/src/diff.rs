@@ -203,7 +203,7 @@ fn run_current(
     // `expand_paths` → `reject_excluded` upstream): directory entries past
     // `BUILTIN_EXCLUDES + exclude:`, explicit `.rb` roots verbatim.
     let (expanded_owned, _path_errors) =
-        crate::expand_check_paths_excluding(roots, &crate::exclude_patterns(&cfg));
+        crate::expand_check_paths_excluding(roots, &crate::exclude_set(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     // Sound subset (folder = None): diagnostic-identical to full fidelity per
     // ADR-0037, and keeps `diff` Ruby-free / hard-error-free.

@@ -697,12 +697,11 @@ struct ExcludeMatcher {
     /// `paths:` — the discovery roots, needed to reproduce discovery's spelling of
     /// a buffer's path.
     paths: Vec<String>,
-    /// `Configuration#exclude_patterns` verbatim — `BUILTIN_EXCLUDES +
-    /// exclude:`, the one list `check`'s `reject_excluded` applies. Matched by
-    /// [`crate::config::matches_exclude`], which reaches the same `dir.c`
-    /// `File.fnmatch?`-no-flags port `check` expands with — never a second
-    /// implementation of the glob rule.
-    patterns: Vec<String>,
+    /// `Configuration#exclude_patterns` — `BUILTIN_EXCLUDES + exclude:`, the
+    /// one list `check`'s `reject_excluded` applies — bound to the same
+    /// exclude base `check` uses ([`crate::config::ExcludeSet`]), never a
+    /// second implementation of the glob rule.
+    patterns: crate::config::ExcludeSet,
 }
 
 /// The three ways one open buffer's file can be NAMED, all of which `check` may
@@ -742,7 +741,7 @@ impl ExcludeMatcher {
         Self {
             root: root.to_path_buf(),
             paths: crate::effective_config_paths(cfg),
-            patterns: crate::exclude_patterns(cfg),
+            patterns: crate::exclude_set_at(cfg, root),
         }
     }
 
@@ -765,7 +764,7 @@ impl ExcludeMatcher {
         if spellings.is_empty()
             || !spellings
                 .iter()
-                .all(|s| crate::config::matches_exclude(&self.patterns, s))
+                .all(|s| self.patterns.excludes(s))
         {
             return false;
         }
@@ -813,7 +812,7 @@ impl ExcludeMatcher {
         file_root_hit
             || discovery_spellings(&self.root, &self.paths)
                 .iter()
-                .filter(|f| !crate::config::matches_exclude(&self.patterns, f))
+                .filter(|f| !self.patterns.excludes(f))
                 .any(|f| {
                     std::fs::symlink_metadata(f).is_ok_and(|m| m.file_type().is_symlink())
                         && std::fs::canonicalize(f).is_ok_and(|c| c == canonical)
@@ -1172,7 +1171,7 @@ fn build_core_index(root: &Path, cfg: &Config) -> CoreIndex {
 /// tests, which is what makes the overlay testable without mutating the process
 /// cwd.
 fn project_files(root: &Path, cfg: &Config) -> Vec<String> {
-    let excludes = crate::exclude_patterns(cfg);
+    let excludes = crate::exclude_set_at(cfg, root);
     // `configuration.paths` as `check` sees them — declared entries
     // absolutized (`resolve_paths_in`), so the `exclude:` match runs on the
     // same spelling (a `.`-spelled config root would otherwise defeat
