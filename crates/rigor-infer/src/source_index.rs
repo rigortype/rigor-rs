@@ -641,6 +641,17 @@ pub struct SourceIndex {
     /// (`define_method` / `alias_method` / `alias`) of that instance method.
     /// See [`Self::visibility_replaced`].
     visibility_replacers: HashMap<(String, String), Vec<(usize, bool)>>,
+    /// Upstream v0.4.7 (ADR-127, #2515 and follow-ups) — every method name
+    /// the project gives a body in any form: a `def` of any kind, a literal
+    /// `define_method` / `alias_method` / `alias` / `attr_*` / delegation
+    /// macro (the #2183 census's `defs` + `bodiless`). A mutable local
+    /// passed to a call of one of these names is floored after the call
+    /// (see `flow_writes::argument_floor_writes`). Read only to WIDEN.
+    floor_callee_names: HashSet<String>,
+    /// Upstream v0.4.7 (#2521) — some project `def` is named
+    /// `method_missing`, so a call no def answers may still run a body
+    /// against its arguments. Read only to WIDEN.
+    floor_method_missing: bool,
     /// The project config lists `pre_eval:` files. The port does not load
     /// them, so a definition there (#2183: a block callee that may rebind)
     /// is invisible; read only to DECLINE. See [`Self::pre_eval_declared`].

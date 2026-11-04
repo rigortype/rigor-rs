@@ -12,8 +12,8 @@ use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
     closure_mutations, collect_flow_writes, indexed_flow_writes, join_flow_envs,
-    multi_target_binder, qualify_self, toplevel_mutations, toplevel_rebinds, widen_clause_entry,
-    widen_flow_writes,
+    multi_target_binder, qualify_self, toplevel_argument_floor, toplevel_mutations, toplevel_rebinds,
+    widen_clause_entry, widen_flow_writes,
     DefKind, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
 };
 use crate::dead::DeadOp;
@@ -98,6 +98,11 @@ impl<'i> Typer<'i> {
         // `seen` starts empty — the predicate fold is a fresh walk).
         let dead = self.dead_positions(ast, &mut Vec::new());
         let mut rebinds = toplevel_rebinds(ast);
+        // Upstream v0.4.7 (ADR-127): a mutable local a call may hand to a
+        // project body is floored after the call — read as a rebind here,
+        // which widens it (the receiver typing behind `call.*` reads this
+        // env, not the condition walkers' indexed writes).
+        rebinds.extend(toplevel_argument_floor(ast, self.source));
         let mut mutations = toplevel_mutations(ast);
         let mut closure_muts = closure_mutations(ast);
         // A write or mutation inside a folded-dead arm never lands — it must

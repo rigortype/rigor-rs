@@ -1003,20 +1003,7 @@ pub(crate) fn indexed_flow_writes(
     ast: &LoweredAst,
     source: &SourceIndex,
 ) -> Vec<(rigor_parse::Span, String)> {
-    let mut out = Vec::new();
-
-    for (_, n) in ast.iter() {
-        if let Node::Call { method, args, span, .. } = n {
-            for (i, &arg) in args.iter().enumerate() {
-                if !source.method_mutates_param(method, i) {
-                    continue;
-                }
-                if let Node::LocalVariableRead { name, .. } = ast.get(arg) {
-                    out.push((*span, name.clone()));
-                }
-            }
-        }
-    }
+    let mut out = argument_floor_writes(ast, source);
 
     // Spans of every call that carries a block, innermost-first per clause.
     let block_calls: Vec<rigor_parse::Span> = ast
@@ -1046,6 +1033,213 @@ pub(crate) fn indexed_flow_writes(
 
     drop_inert_writes(ast, &mut out);
     out
+}
+
+/// Upstream v0.4.7 (ADR-127, #2515 and its follow-ups) — the callee
+/// mutation floor, as an FP-safe over-approximation. The reference floors a
+/// mutable local a call passes when the callee's write census (aliases,
+/// `tap`, keyword / rest / kwrest parameters, hand-offs, returns, blocks;
+/// `callee_write_census.rb`, `callee_mutation_chain.rb`) says the body may
+/// write it, and outright (`FLOOR_ALL` / `FLOOR_EVERY` / `OPAQUE_CALLEES`)
+/// for an inherited or ambiguous def, a `method_missing`, a literal
+/// definer and an opaque sink. The port does not resolve receivers, so it
+/// floors every local a call passes when the call MAY reach a project body:
+///
+/// - the call's name has a project body in any form
+///   ([`SourceIndex::call_may_mutate_arguments`]), or the project defines
+///   `method_missing`;
+/// - an opaque sink: `call` / `instance_exec` / `class_exec` / `module_exec`
+///   on an explicit receiver, or a `send` / `__send__` / `public_send`
+///   whose target is no literal (a literal target is read as that name).
+///
+/// A local is passed when its bare read is an argument value — positional,
+/// a keyword value, `*splat` / `**splat`, nested in a literal, an arm of a
+/// conditional, or the receiver of `tap` / `itself` — or when it was stored
+/// into a passed local (`args = [p, o]; add(*args)`, `args << o`,
+/// `y = o`), transitively. A local whose every write in the file is an
+/// immutable literal (Integer, Float, Symbol, `nil`, `true`, `false`) is
+/// skipped: the reference gates its floor on a mutable carrier, so `n = 1;
+/// go(n); n == 1` keeps folding there.
+///
+/// Every entry only widens, so an extra one costs coverage and never adds a
+/// diagnostic. Keyed by the call's span, like the receiver-side mutator
+/// entry: a call inside a block widens at the enclosing block call (#2400).
+pub(crate) fn argument_floor_writes(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+) -> Vec<(rigor_parse::Span, String)> {
+    use std::collections::HashMap;
+    let mut out = Vec::new();
+    // Which locals each local may hold: `y = <expr>` and the content
+    // mutators `y << x` / `y.push(x)` / `y[k] = x` / ….
+    let mut holds: HashMap<String, HashSet<String>> = HashMap::new();
+    // Names with a write whose value is not an immutable literal (or that
+    // is not a plain write at all).
+    let mut mutable_names: HashSet<String> = HashSet::new();
+    for (_, n) in ast.iter() {
+        match n {
+            Node::LocalVariableWrite { name, value, .. } => {
+                let mut held = Vec::new();
+                passed_locals(ast, *value, &mut held);
+                holds.entry(name.clone()).or_default().extend(held);
+                if !matches!(
+                    ast.get(*value),
+                    Node::IntegerLit { .. }
+                        | Node::FloatLit { .. }
+                        | Node::SymbolLit { .. }
+                        | Node::NilLit { .. }
+                        | Node::TrueLit { .. }
+                        | Node::FalseLit { .. }
+                ) {
+                    mutable_names.insert(name.clone());
+                }
+            }
+            Node::LocalVariableOpWrite { name, .. } => {
+                mutable_names.insert(name.clone());
+            }
+            Node::MultiWrite { targets, .. } => {
+                for (name, _) in targets.bound_names() {
+                    mutable_names.insert(name);
+                }
+            }
+            Node::Call { receiver: Some(r), method, args, .. }
+                if FLOOR_STORE_METHODS.contains(&method.as_str()) =>
+            {
+                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    let mut held = Vec::new();
+                    for &a in args {
+                        passed_locals(ast, a, &mut held);
+                    }
+                    holds.entry(name.clone()).or_default().extend(held);
+                }
+            }
+            Node::IndexWrite { receiver: Some(r), value, .. } => {
+                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    let mut held = Vec::new();
+                    passed_locals(ast, *value, &mut held);
+                    holds.entry(name.clone()).or_default().extend(held);
+                }
+            }
+            _ => {}
+        }
+    }
+    // A name never plainly written (a parameter, a block or pattern binding)
+    // may hold anything.
+    let written: HashSet<&str> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::LocalVariableWrite { name, .. } => Some(name.as_str()),
+            _ => None,
+        })
+        .collect();
+    let immutable = |name: &str| written.contains(name) && !mutable_names.contains(name);
+    for (_, n) in ast.iter() {
+        let Node::Call { receiver, method, args, span, .. } = n else {
+            continue;
+        };
+        if args.is_empty() || !call_may_floor(ast, source, receiver.is_some(), method, args) {
+            continue;
+        }
+        let mut passed = Vec::new();
+        for &a in args {
+            passed_locals(ast, a, &mut passed);
+        }
+        // The transitive closure over `holds`.
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(name) = passed.pop() {
+            if !seen.insert(name.clone()) {
+                continue;
+            }
+            if let Some(h) = holds.get(&name) {
+                passed.extend(h.iter().cloned());
+            }
+        }
+        let mut names: Vec<String> = seen.into_iter().filter(|n| !immutable(n)).collect();
+        names.sort();
+        out.extend(names.into_iter().map(|name| (*span, name)));
+    }
+    out
+}
+
+/// [`argument_floor_writes`] for the TOP-LEVEL scope: a call inside a
+/// `def` / `class` / `module` body floors that scope's locals, not the
+/// top-level ones. A block's call still counts (it may name a captured
+/// top-level local; a name the block binds itself only over-widens).
+pub(crate) fn toplevel_argument_floor(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+) -> Vec<(rigor_parse::Span, String)> {
+    let (scopes, _) = toplevel_scope_filters(ast);
+    let mut out = argument_floor_writes(ast, source);
+    out.retain(|(w, _)| !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1));
+    drop_inert_writes(ast, &mut out);
+    out
+}
+
+/// The methods whose argument a receiver local holds afterwards (the
+/// `holds` table of [`argument_floor_writes`]).
+const FLOOR_STORE_METHODS: &[&str] = &[
+    "<<", "push", "append", "unshift", "prepend", "insert", "[]=", "store", "concat", "add",
+    "merge!", "update", "replace",
+];
+
+/// Whether a call of `method` may run a project body (or code no def shows)
+/// against its arguments. See [`argument_floor_writes`].
+fn call_may_floor(
+    ast: &LoweredAst,
+    source: &SourceIndex,
+    has_receiver: bool,
+    method: &str,
+    args: &[NodeId],
+) -> bool {
+    if source.call_may_mutate_arguments(method) {
+        return true;
+    }
+    match method {
+        "call" | "instance_exec" | "class_exec" | "module_exec" => has_receiver,
+        "send" | "__send__" | "public_send" => match ast.get(args[0]) {
+            Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => {
+                source.call_may_mutate_arguments(value)
+            }
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
+/// The locals whose object `id`'s value may be: a bare read, through a
+/// literal container, a splat carrier, a conditional arm, an assignment's
+/// value or a `tap` / `itself` receiver. See [`argument_floor_writes`].
+fn passed_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. } => out.push(name.clone()),
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &e in elements {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::Statements { body, .. } => {
+            for &e in body {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::If { then_body, else_body, .. } => {
+            for &e in then_body.iter().chain(else_body) {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            passed_locals(ast, *left, out);
+            passed_locals(ast, *right, out);
+        }
+        Node::LocalVariableWrite { value, .. } | Node::LocalVariableOpWrite { value, .. } => {
+            passed_locals(ast, *value, out);
+        }
+        Node::Call { receiver: Some(r), method, .. } if method == "tap" || method == "itself" => {
+            passed_locals(ast, *r, out);
+        }
+        _ => {}
+    }
 }
 
 /// Extend a lexical self-qualified name with a nested class/module `name`,

@@ -84,6 +84,14 @@ impl SourceIndex {
         self.defined_method_names.contains(method)
     }
 
+    /// Upstream v0.4.7 (ADR-127) — whether a call of `method` may run a
+    /// project body against the arguments it passes: some project
+    /// definition gives the name a body, or the project defines
+    /// `method_missing`. See [`Self::floor_callee_names`].
+    pub fn call_may_mutate_arguments(&self, method: &str) -> bool {
+        self.floor_method_missing || self.floor_callee_names.contains(method)
+    }
+
     /// Upstream v0.4.6 (#1817 / #2183) — whether some project definition of
     /// `method` may run a block it receives under another `self` (the
     /// reference's `project_may_rebind?`). See [`Self::rebind_names`].

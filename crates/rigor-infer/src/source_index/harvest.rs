@@ -397,6 +397,14 @@ impl SourceIndex {
                     }
                 }
                 idx.rebind_names.extend(facts.bodiless.iter().cloned());
+                // Upstream v0.4.7 (ADR-127): the callee-floor name census.
+                for d in &facts.defs {
+                    if d.name == "method_missing" {
+                        idx.floor_method_missing = true;
+                    }
+                    idx.floor_callee_names.insert(d.name.clone());
+                }
+                idx.floor_callee_names.extend(facts.bodiless.iter().cloned());
             }
             for ((name, _, _), count) in slots {
                 if count > 1 {
