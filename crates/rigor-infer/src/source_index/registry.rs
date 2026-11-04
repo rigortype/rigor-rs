@@ -104,6 +104,17 @@ impl SourceIndex {
             .is_some_and(|rows| rows.iter().any(|&(i, settled)| !settled || Some(i) != here))
     }
 
+    /// Record whether the project config lists `pre_eval:` files.
+    pub fn set_pre_eval_declared(&mut self, declared: bool) {
+        self.pre_eval_declared = declared;
+    }
+
+    /// Whether the project config lists `pre_eval:` files the port does not
+    /// load (upstream v0.4.6 #2183 reads their definitions as project ones).
+    pub fn pre_eval_declared(&self) -> bool {
+        self.pre_eval_declared
+    }
+
     /// Register a name in the id registry (idempotent), returning nothing.
     pub(crate) fn register(&mut self, name: &str) {
         if !self.name_to_id.contains_key(name) {

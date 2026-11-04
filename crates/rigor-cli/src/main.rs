@@ -1853,7 +1853,8 @@ fn analyze_files(
             (harvest, ast)
         })
         .collect();
-    let project_source = rigor_infer::SourceIndex::merge(&files, &index);
+    let mut project_source = rigor_infer::SourceIndex::merge(&files, &index);
+    project_source.set_pre_eval_declared(!cfg.pre_eval.is_empty());
     let t_stage2 = std::time::Instant::now();
 
     // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen

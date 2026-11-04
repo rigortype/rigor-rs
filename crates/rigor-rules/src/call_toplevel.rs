@@ -168,6 +168,10 @@ fn inside_rebound_block(
     let facts = &ast.ancestry_facts().rebind;
     facts.enclosing(span.0, span.1).into_iter().any(|site| match site {
         None => true,
+        // Upstream v0.4.6 (#2183): a `pre_eval:` file's definition of the
+        // callee may rebind; the port does not load those files, so any
+        // enclosing block declines while the config lists one.
+        Some(_) if source.pre_eval_declared() => true,
         Some(site) => callee_may_rebind(index, source, site),
     })
 }

@@ -641,6 +641,10 @@ pub struct SourceIndex {
     /// (`define_method` / `alias_method` / `alias`) of that instance method.
     /// See [`Self::visibility_replaced`].
     visibility_replacers: HashMap<(String, String), Vec<(usize, bool)>>,
+    /// The project config lists `pre_eval:` files. The port does not load
+    /// them, so a definition there (#2183: a block callee that may rebind)
+    /// is invisible; read only to DECLINE. See [`Self::pre_eval_declared`].
+    pre_eval_declared: bool,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see
