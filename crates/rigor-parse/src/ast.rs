@@ -36,6 +36,7 @@ mod operand_effects;
 mod constants;
 mod ancestry_facts;
 mod singleton_locals;
+mod element_mutation;
 mod lowered_ast;
 mod node;
 mod builder;
