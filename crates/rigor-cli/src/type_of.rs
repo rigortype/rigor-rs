@@ -119,7 +119,10 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
             Item::Opt { key, value, .. } => match key {
                 "format" => format = value.unwrap().as_str().to_string(),
                 "trace" => trace = true,
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "tmp-file" => tmp_file = Some(value.unwrap().as_str().to_string()),
                 "instead-of" => instead_of = Some(value.unwrap().as_str().to_string()),
                 _ => unreachable!("the switch table is closed"),

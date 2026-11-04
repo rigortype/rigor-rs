@@ -54,6 +54,15 @@ pub(crate) struct AncestryIndex {
     /// Upstream v0.4.2 (#1701): the gated vendored features some analysed
     /// file requires ([`AncestryFacts::required_features`]).
     required_features: HashSet<String>,
+    /// Upstream v0.4.6 (#2264): the first segment of every feature some
+    /// analysed file requires ([`AncestryFacts::required_segments`]).
+    required_segments: HashSet<String>,
+    /// Upstream v0.4.6 (#2269): per owner candidate, its singleton-side
+    /// mixins ([`AncestryFacts::singleton_mixins`]), the wildcard included.
+    singleton_listed: HashMap<String, Vec<String>>,
+    /// Upstream v0.4.6 (#2094): `(owner, name)` macro-named slots
+    /// ([`AncestryFacts::macro_names`]).
+    macro_names: HashSet<(String, String)>,
     /// Upstream v0.4.5 (#2086): per owner candidate, its receiver-form
     /// instance mixins ([`AncestryFacts::receiver_mixins`]).
     receiver_listed: HashMap<String, Vec<String>>,
@@ -84,6 +93,18 @@ impl AncestryIndex {
         self.dirty.extend(facts.dirty_owners.iter().cloned());
         self.def_owners.extend(facts.def_owners.iter().cloned());
         self.required_features.extend(facts.required_features.iter().cloned());
+        self.required_segments.extend(facts.required_segments.iter().cloned());
+        self.macro_names.extend(facts.macro_names.iter().cloned());
+        for (owners, names) in &facts.singleton_mixins {
+            for o in owners {
+                let list = self.singleton_listed.entry(o.clone()).or_default();
+                for n in names {
+                    if !list.contains(n) {
+                        list.push(n.clone());
+                    }
+                }
+            }
+        }
         for raw in &facts.toplevel_includes {
             if !self.toplevel_includes.contains(raw) {
                 self.toplevel_includes.push(raw.clone());
@@ -544,6 +565,30 @@ impl SourceIndex {
         self.ancestry.required_features.contains(feature)
     }
 
+    /// Upstream v0.4.6 (#2264 / issue #2174, `RbsLoader#ruby_library_reopen?`)
+    /// — whether `class_name`'s every RBS declaration is the project's own,
+    /// its first `::` segment is the root of a library Ruby ships, and some
+    /// analysed file requires a feature that loads that root. Such a project
+    /// declaration reopens a library class and lists only the methods the
+    /// project added, so the reference treats the class's surface as open.
+    /// It does NOT ask whether the library's own signatures loaded: a
+    /// project-only `Digest::MakerZzz` declines beside `require "digest"`
+    /// while `Digest::SHA256` (bundled RBS) keeps firing.
+    ///
+    /// "Every declaration is the project's own" is read as "introduced by
+    /// project `sig/` ingestion" (`is_qualified_project_sig_class`), which also
+    /// counts an rbs-collection-only class: a superset, so it only declines
+    /// more.
+    pub fn ruby_library_reopen(&self, core: &CoreIndex, class_name: &str) -> bool {
+        let name = class_name.strip_prefix("::").unwrap_or(class_name);
+        if self.ancestry.required_segments.is_empty() || !core.is_qualified_project_sig_class(name) {
+            return false;
+        }
+        let root = name.split("::").next().unwrap_or(name);
+        super::ruby_library_roots::segments_of(root)
+            .is_some_and(|segs| segs.iter().any(|s| self.ancestry.required_segments.contains(*s)))
+    }
+
     /// Upstream v0.4.2 (#1706 / issue #1697; `Inference::ObjectMixins.may_define?`)
     /// — whether a module the project mixes into `Object` may define `method`:
     /// a top-level `include M` in any analysed file (`main.include`, i.e.
@@ -615,6 +660,7 @@ impl SourceIndex {
                     if (!explicit
                         && (self.ancestry.wildcard_include(&q) || self.ancestry.dirty.contains(&q)))
                         || self.records_name(&q, method)
+                        || self.macro_named(&q, method)
                     {
                         return true;
                     }
@@ -633,8 +679,11 @@ impl SourceIndex {
                         queue.push((q.clone(), e));
                     }
                 }
-                _ => {
-                    if external_may_define(core, &from, &raw, method, explicit) {
+                other => {
+                    // #2094: a declared module's class-body macro may name it.
+                    if other.is_some_and(|q| self.macro_named(&q, method))
+                        || external_may_define(core, &from, &raw, method, explicit)
+                    {
                         return true;
                     }
                 }
@@ -797,7 +846,9 @@ impl SourceIndex {
                             self.discovered_methods.get(&q).is_some_and(|m| m.contains(method))
                                 || core.qualified_class_has_method(&q, method)
                         } else {
-                            self.instance_records(&q, method) || (open && self.hook_capable(&q))
+                            self.instance_records(&q, method)
+                                || self.macro_named(&q, method)
+                                || (open && (self.hook_capable(&q) || self.open_extend(core, &q)))
                         };
                         if answers {
                             return true;
@@ -809,8 +860,12 @@ impl SourceIndex {
                 // only through RBS.
                 Some(q) => {
                     if !hook_only
-                        && (core.knows_qualified_class(&q) || core.knows_toplevel_class(&q))
-                        && core.qualified_class_has_method(&q, method)
+                        && (((core.knows_qualified_class(&q) || core.knows_toplevel_class(&q))
+                            && core.qualified_class_has_method(&q, method))
+                            // #2094: `external_may_answer?`'s `macro_names?` /
+                            // `open_extend?` arms for a declared candidate.
+                            || self.macro_named(&q, method)
+                            || (open && self.open_extend(core, &q)))
                     {
                         return true;
                     }
@@ -826,6 +881,137 @@ impl SourceIndex {
             }
         }
         false
+    }
+
+    /// Upstream v0.4.6 (#2094, `ObjectMixins.macro_named?`).
+    fn macro_named(&self, q: &str, method: &str) -> bool {
+        self.ancestry.macro_names.contains(&(q.to_string(), method.to_string()))
+    }
+
+    /// Every singleton-side mixin spelling of `q` the port holds: the
+    /// singleton table (wildcard included), the listed `extend`s and the
+    /// harvested class-body `extend`s.
+    fn singleton_raws(&self, q: &str) -> Vec<String> {
+        let mut out: Vec<String> = self.ancestry.singleton_listed.get(q).cloned().unwrap_or_default();
+        let listed = self.ancestry.extend_listed.get(q).into_iter().flatten();
+        let harvested = self.override_classes.get(q).into_iter().flat_map(|e| e.extends.iter());
+        for raw in listed.chain(harvested) {
+            if raw != MIXIN_WILDCARD && !out.contains(raw) {
+                out.push(raw.clone());
+            }
+        }
+        out
+    }
+
+    /// `chain.truncated?` of `q`'s singleton chain: its extended modules and
+    /// their include closures hold more than [`CHAIN_LIMIT`] project modules.
+    fn singleton_truncated(&self, q: &str) -> bool {
+        let mut queue: Vec<(String, String)> = self
+            .singleton_raws(q)
+            .into_iter()
+            .filter(|r| r != MIXIN_WILDCARD)
+            .map(|r| (q.to_string(), r))
+            .collect();
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((from, raw)) = queue.pop() {
+            if raw == MIXIN_WILDCARD {
+                continue;
+            }
+            if let Some(m) = self.resolve_override_ancestor(&from, &raw) {
+                if !seen.insert(m.clone()) {
+                    continue;
+                }
+                if seen.len() > CHAIN_LIMIT {
+                    return true;
+                }
+                queue.extend(self.instance_mixin_edges(&m));
+            }
+        }
+        false
+    }
+
+    /// `SingletonHookDecline.entry_hook_capable?` for an entry written `raw`
+    /// from `from`: a declared project module by [`Self::hook_capable`], an
+    /// undeclared one when no candidate is a class RBS knows.
+    fn entry_hook_capable(&self, core: &CoreIndex, from: &str, raw: &str) -> bool {
+        match self.resolve_override_ancestor(from, raw) {
+            Some(q) => self.hook_capable(&q),
+            None => !rbs_knows_candidate(core, from, raw),
+        }
+    }
+
+    /// Upstream v0.4.6 (#2094, `RbsReceiverSurface.open_extend?`) — `owner`
+    /// extends a module whose surface is open (hook-capable, or one neither
+    /// RBS nor the project declares), or its singleton chain was cut.
+    fn open_extend(&self, core: &CoreIndex, owner: &str) -> bool {
+        self.singleton_truncated(owner)
+            || self
+                .singleton_raws(owner)
+                .iter()
+                .filter(|r| *r != MIXIN_WILDCARD)
+                .any(|raw| self.entry_hook_capable(core, owner, raw))
+    }
+
+    /// `external_may_answer?` for an entry written `raw` from `from`.
+    fn external_may_answer(&self, core: &CoreIndex, from: &str, raw: &str, method: &str, open: bool) -> bool {
+        if external_may_define(core, from, raw, method, true) {
+            return true;
+        }
+        if let Some(q) = self.resolve_override_ancestor(from, raw) {
+            return self.macro_named(&q, method) || (open && self.open_extend(core, &q));
+        }
+        open && !rbs_knows_candidate(core, from, raw)
+    }
+
+    /// Upstream v0.4.6 (#2269 / #2094, `RbsReceiverSurface.singleton_mixin_may_answer?`)
+    /// — whether a singleton-side mixin of the class object `class_name` or
+    /// of an RBS superclass may answer `method`: the side carries a wildcard
+    /// (an unrecordable spelling, e.g. `IO.singleton_class.send(:define_method,
+    /// …)`, which silences `File.zzz`) outside `Object` / `Kernel` /
+    /// `BasicObject`, its chain was cut, or an extended module defines the
+    /// name, macro-names it, or is open, or a module of its include/prepend
+    /// closure (level 0 of the reference's singleton chain) may answer.
+    /// A pure SILENCER.
+    pub fn core_singleton_mixin_may_answer(&self, core: &CoreIndex, class_name: &str, method: &str) -> bool {
+        rbs_ancestors(core, class_name)
+            .iter()
+            .filter(|a| a.as_str() == class_name || !core.is_module(a))
+            .any(|n| {
+                let open = !OBJECT_ROOTS.contains(&n.as_str());
+                let raws = self.singleton_raws(n);
+                if self.singleton_truncated(n) || (open && raws.iter().any(|r| r == MIXIN_WILDCARD)) {
+                    return true;
+                }
+                raws.iter().filter(|r| *r != MIXIN_WILDCARD).any(|raw| {
+                    // v0.4.6 review: level 0 of the reference's singleton
+                    // chain holds the extended module's own include/prepend
+                    // closure too (`module Ext; include Inner`), read as the
+                    // instance-side closure is. A union, so a superset.
+                    if let Some(q) = self.resolve_override_ancestor(n, raw) {
+                        if &q != n && self.mixin_closure_may_answer(core, &q, method, open, false) {
+                            return true;
+                        }
+                    }
+                    match self.resolve_override_ancestor(n, raw) {
+                        Some(q) if self.known_user(&q) => {
+                            if &q == n {
+                                return false;
+                            }
+                            let rbs_known = core.knows_qualified_class(&q)
+                                || (!q.contains("::") && core.knows_toplevel_class(&q));
+                            if rbs_known {
+                                self.discovered_methods.get(&q).is_some_and(|m| m.contains(method))
+                                    || core.qualified_class_has_method(&q, method)
+                            } else {
+                                self.instance_records(&q, method)
+                                    || self.macro_named(&q, method)
+                                    || (open && (self.hook_capable(&q) || self.open_extend(core, &q)))
+                            }
+                        }
+                        _ => self.external_may_answer(core, n, raw, method, open),
+                    }
+                })
+            })
     }
 
     /// Upstream v0.4.5 (#2086 / issue #1722, `RbsReceiverSurface.ancestor_may_answer?`)

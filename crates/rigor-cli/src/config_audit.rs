@@ -319,8 +319,24 @@ fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
             });
         }
     }
-    for (key, _) in cfg.severity_overrides() {
-        if let Some(reason) = override_key_problem(&key, plugin_ids.as_deref()) {
+    let overrides = cfg.severity_overrides();
+    let present: Vec<&str> = overrides.iter().map(|(k, _)| k.as_str()).collect();
+    for (key, _) in &overrides {
+        // Upstream v0.4.6 (#2005 / #2223, `legacy_alias_problem`): `disable:`
+        // expands a legacy alias, but the severity resolver matches canonical
+        // ids only, so an alias key reaches no row.
+        let reason = match rigor_rules::legacy_rule_alias(key) {
+            Some(canonical) => {
+                let reason = format!("is a legacy alias of `{canonical}`; the override has no effect");
+                Some(if present.contains(&canonical) {
+                    reason
+                } else {
+                    format!("{reason}, so write `{canonical}`")
+                })
+            }
+            None => override_key_problem(key, plugin_ids.as_deref()).map(str::to_string),
+        };
+        if let Some(reason) = reason {
             out.push(ConfigWarning {
                 kind: "severity_override",
                 message: format!("severity_overrides: {key:?} {reason}"),
@@ -503,7 +519,7 @@ mod tests {
 
     // v0.4.5 (#1985/#2000), oracle-probed: `all`, a bare unknown or plugin
     // rule, an unknown `plugin_loader.` row, an unconfigured `plugin.` id and
-    // a typo under a built-in family warn; run-level rows, families, aliases,
+    // a typo under a built-in family warn; run-level rows, families,
     // severity-only ids and a configured plugin's qualified id stay silent.
     #[test]
     fn unreachable_override_keys_warn() {
@@ -539,6 +555,11 @@ mod tests {
                     .to_string(),
                 "severity_overrides: \"call.nope\" is not a recognized rule id; the override has \
                  no effect"
+                    .to_string(),
+                // v0.4.6 (#2005 / #2223): a legacy alias key warns too.
+                "severity_overrides: \"undefined-method\" is a legacy alias of \
+                 `call.undefined-method`; the override has no effect, so write \
+                 `call.undefined-method`"
                     .to_string(),
             ]
         );

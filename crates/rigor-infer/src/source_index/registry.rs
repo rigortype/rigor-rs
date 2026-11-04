@@ -84,6 +84,37 @@ impl SourceIndex {
         self.defined_method_names.contains(method)
     }
 
+    /// Upstream v0.4.6 (#1817 / #2183) — whether some project definition of
+    /// `method` may run a block it receives under another `self` (the
+    /// reference's `project_may_rebind?`). See [`Self::rebind_names`].
+    pub fn block_callee_may_rebind(&self, method: &str) -> bool {
+        self.rebind_names.contains(method)
+    }
+
+    /// Upstream v0.4.6 (#2237 / issue #2013) — whether a `define_method` /
+    /// `alias_method` / `alias` of `method` in a body of the class whose last
+    /// constant segment is `owner` may give the name another visibility than
+    /// the `def` in `file` records: any replacer in another file, or one in
+    /// this file no later direct `private :x` settles. Coarse by owner
+    /// segment, so it only declines more.
+    pub fn visibility_replaced(&self, owner: &str, method: &str, file: &FileKey) -> bool {
+        let here = self.file_index.get(file).copied();
+        self.visibility_replacers
+            .get(&(owner.to_string(), method.to_string()))
+            .is_some_and(|rows| rows.iter().any(|&(i, settled)| !settled || Some(i) != here))
+    }
+
+    /// Record whether the project config lists `pre_eval:` files.
+    pub fn set_pre_eval_declared(&mut self, declared: bool) {
+        self.pre_eval_declared = declared;
+    }
+
+    /// Whether the project config lists `pre_eval:` files the port does not
+    /// load (upstream v0.4.6 #2183 reads their definitions as project ones).
+    pub fn pre_eval_declared(&self) -> bool {
+        self.pre_eval_declared
+    }
+
     /// Register a name in the id registry (idempotent), returning nothing.
     pub(crate) fn register(&mut self, name: &str) {
         if !self.name_to_id.contains_key(name) {

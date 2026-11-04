@@ -48,6 +48,7 @@ mod literal_fold;
 mod def_attribution;
 mod override_index;
 mod resolution_chain;
+mod ruby_library_roots;
 pub(crate) use resolution_chain::AncestryIndex;
 mod harvest;
 
@@ -626,6 +627,24 @@ pub struct SourceIndex {
     /// `self` ancestry buys nothing for names this rare. Read only to DECLINE
     /// (keep the pre-proof answer), never to witness.
     defined_method_names: HashSet<String>,
+    /// Upstream v0.4.6 (#1817 / #2183 / #2184) — every method name some
+    /// project definition may run a block under another `self` through: the
+    /// reference's `RebindingBlockCallees.project_may_rebind?`, read BY NAME
+    /// across every owner and side. A name is here when a `def` of it hands
+    /// its block on (`escapes?`), when a `def` of it sits where the def
+    /// tables cannot hold it, when two `def`s share one slot (sibling files,
+    /// `if` arms), or when a bodiless macro defines it. Read only to DECLINE
+    /// `call.unresolved-toplevel`.
+    rebind_names: HashSet<String>,
+    /// Upstream v0.4.6 (#2237 / issue #2013) — `(owner's last constant
+    /// segment, method)` → every `(file index, settled)` replacer
+    /// (`define_method` / `alias_method` / `alias`) of that instance method.
+    /// See [`Self::visibility_replaced`].
+    visibility_replacers: HashMap<(String, String), Vec<(usize, bool)>>,
+    /// The project config lists `pre_eval:` files. The port does not load
+    /// them, so a definition there (#2183: a block callee that may rebind)
+    /// is invisible; read only to DECLINE. See [`Self::pre_eval_declared`].
+    pre_eval_declared: bool,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see

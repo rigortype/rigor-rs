@@ -1,0 +1,61 @@
+{
+  "fixture": "harness/corpus/149_v046_review_declines.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `not_named' for singleton(Rational)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `not_named' for singleton(Complex)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 45,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `zzz_i' for singleton(Integer)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 101,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `not_named' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 130,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 80,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `x' reduced from public to private (overrides P149#x); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 84,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `x' reduced from public to private (overrides P149#x); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 88,
+      "column": 15,
+      "severity": "warning",
+      "message": "visibility of `x' reduced from public to private (overrides P149#x); breaks substitutability"
+    }
+  ]
+}

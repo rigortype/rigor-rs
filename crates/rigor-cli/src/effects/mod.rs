@@ -175,7 +175,10 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => positional.push(p),
             Item::Opt { key, value, .. } => match key {
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "format" => format = value.unwrap().as_str().to_string(),
                 "full" => full = true,
                 // Accepted and deliberately inert, exactly as upstream accepts

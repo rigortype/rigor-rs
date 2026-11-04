@@ -106,6 +106,12 @@ pub(crate) fn unresolved_toplevel_diagnostics(
             if source.object_mixin_may_define(index, method, false) {
                 continue;
             }
+            // Upstream v0.4.6 (#1817 / #2183 / #2184 / #2186): a block handed
+            // to a callee that may run it under another `self` is not a
+            // top-level scope. Asked last, as the reference does.
+            if inside_rebound_block(ast, index, source, n.span()) {
+                continue;
+            }
             let severity = catalog(CALL_UNRESOLVED_TOPLEVEL)
                 .map(|e| e.default_severity)
                 .unwrap_or(Severity::Warning);
@@ -124,6 +130,113 @@ pub(crate) fn unresolved_toplevel_diagnostics(
                 method_name: Some(method.clone()),
             });
         }
+    }
+}
+
+/// `RebindingBlockCallees::REBINDING_CORE_CALLS`: core methods that run their
+/// block under another `self`, as a method body or under the receiver.
+const REBINDING_CORE_CALLS: &[&str] = &[
+    "define_method",
+    "define_singleton_method",
+    "instance_eval",
+    "instance_exec",
+    "class_eval",
+    "class_exec",
+    "module_eval",
+    "module_exec",
+];
+
+/// The reference's `RebindingBlockCallees.inside_rebound_block?`
+/// (`check_rules/rebinding_block_callees.rb`, upstream v0.4.6): does the call
+/// at `span` sit inside a block (or a heredoc body opened in one) that its
+/// receiving call may run under another `self`? Every enclosing block is
+/// asked; an UNKNOWN row (a proc value the walk cannot follow) declines.
+///
+/// FP-safety: every arm only declines. The two type-reading arms are
+/// syntactic allow-lists where the reference reads the receiver's type: a
+/// receiver counts as possibly callable unless it is a literal or a constant
+/// naming a known class, and a callee resolves on its receiver only for a
+/// receiverless call (`Object`), a literal, or a constant naming an RBS class
+/// whose chain is fully loaded. Anything else goes on to the
+/// `method_missing` arm, which declines more.
+fn inside_rebound_block(
+    ast: &LoweredAst,
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    span: rigor_parse::Span,
+) -> bool {
+    let facts = &ast.ancestry_facts().rebind;
+    facts.enclosing(span.0, span.1).into_iter().any(|site| match site {
+        None => true,
+        // Upstream v0.4.6 (#2183): a `pre_eval:` file's definition of the
+        // callee may rebind; the port does not load those files, so any
+        // enclosing block declines while the config lists one.
+        Some(_) if source.pre_eval_declared() => true,
+        Some(site) => callee_may_rebind(index, source, site),
+    })
+}
+
+/// `callee_may_rebind?`.
+fn callee_may_rebind(
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    site: &rigor_parse::RebindSite,
+) -> bool {
+    let Some(name) = site.name.as_deref() else {
+        return true;
+    };
+    if REBINDING_CORE_CALLS.contains(&name) {
+        return true;
+    }
+    if rigor_parse::REBIND_METHOD_OBJECT_CALLS.contains(&name)
+        && receiver_may_be_callable(index, source, &site.receiver)
+    {
+        return true;
+    }
+    if source.block_callee_may_rebind(name) {
+        return true;
+    }
+    // Ruby reaches `method_missing` only for a name the receiver lacks.
+    if resolves_on_receiver(index, &site.receiver, name) {
+        return false;
+    }
+    source.block_callee_may_rebind("method_missing")
+}
+
+/// `Dispatch.callable?`, as an allow-list of receivers that are NOT a
+/// Method / UnboundMethod / Proc: a literal, or a constant naming a class.
+fn receiver_may_be_callable(
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    receiver: &rigor_parse::RebindReceiver,
+) -> bool {
+    use rigor_parse::RebindReceiver as R;
+    match receiver {
+        R::Implicit | R::Unsayable | R::Literal(_) => false,
+        R::Constant(c) => !(index.knows_class(c) || source.knows_class(c)),
+        R::Other { .. } => true,
+    }
+}
+
+/// `Dispatch.resolves_on_receiver?`, true only where the port can witness
+/// the method: `Object` for a receiverless call, a literal's core class, or
+/// the singleton of an RBS class (not a module) whose chain is loaded.
+fn resolves_on_receiver(index: &CoreIndex, receiver: &rigor_parse::RebindReceiver, name: &str) -> bool {
+    use rigor_parse::RebindReceiver as R;
+    let instance = |class: &str| {
+        index.knows_class(class) && index.chain_complete(class) && index.class_has_method(class, name)
+    };
+    match receiver {
+        R::Implicit => instance("Object"),
+        R::Literal(class) => instance(class),
+        R::Constant(c) => {
+            index.knows_class(c)
+                && !index.is_module(c)
+                && index.chain_complete(c)
+                && index.chain_complete("Class")
+                && index.class_has_singleton_method(c, name)
+        }
+        R::Unsayable | R::Other { .. } => false,
     }
 }
 

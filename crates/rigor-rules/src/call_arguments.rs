@@ -740,7 +740,8 @@ pub(crate) fn check_argument_type_mismatch(
             let name = source.class_name_for_id(class)?;
             // Upstream #1456 `unauthoritative_inherited_signature?`: on an open
             // receiver only a signature the class DECLARES itself is trusted.
-            if crate::call_receiver::core_overlay_open_receiver(name)
+            if (crate::call_receiver::core_overlay_open_receiver(name)
+                || source.ruby_library_reopen(index, name))
                 && !index.singleton_declared_own(name, method)
             {
                 return None;
@@ -752,7 +753,8 @@ pub(crate) fn check_argument_type_mismatch(
             if !index.knows_class(&name) {
                 return None;
             }
-            if crate::call_receiver::core_overlay_open_receiver(&name)
+            if (crate::call_receiver::core_overlay_open_receiver(&name)
+                || source.ruby_library_reopen(index, &name))
                 && index
                     .declaring_ancestor(&name, method)
                     .is_none_or(|owner| strip_root(owner) != strip_root(&name))

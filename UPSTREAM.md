@@ -15,8 +15,14 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.5`** (2026-10-19) |
-| Commit | `56cbfce6` |
+| **Pinned ref** | **`v0.4.6`** (2026-10-23) |
+| Commit | `25e63773` |
+
+> **`v0.4.5 → v0.4.6` (2026-11-05): 459 commits, step seven.** Nothing vendored
+> moved. The raw bump left 1 fixture FP (#2264) and 179,407 sweep FPs: mail and
+> dependabot `call.unresolved-toplevel` inside blocks a project `method_missing` may
+> rebind (#2183), and net-ssh's singleton-side `IO` taint (#2269). Eight families were
+> ported, all to 0 FP. See the [note](docs/notes/20261105-repin-v046.md).
 
 > **`v0.4.4 → v0.4.5` (2026-11-04): 402 commits, step six.** Nothing vendored
 > moved. The raw bump left 4 fixture FPs (#2055 module_function private copy, #2036

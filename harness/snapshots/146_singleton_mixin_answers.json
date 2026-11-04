@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/146_singleton_mixin_answers.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `zzz_h' for singleton(Hash)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `zzz_i' for singleton(Integer)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 55,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `zzz_r' for singleton(Rational)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 57,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `zzz_s' for singleton(Symbol)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 60,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `zzz_f' for singleton(Float)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 64,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `zzz_a' for singleton(Array)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 65,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `zzz_arr' for [1]"
+    }
+  ]
+}

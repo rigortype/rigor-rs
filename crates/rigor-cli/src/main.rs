@@ -620,7 +620,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => files.push(p.clone()),
             Item::Opt { key, value, .. } => match *key {
-                "config" => explicit_config = Some(value.as_ref().unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.as_ref().unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "format" => format = value.as_ref().unwrap().as_str().to_string(),
                 // Accepted no-ops — the semantics trivially hold for a port
                 // with no persistent cache and no run-stats output.
@@ -1850,7 +1853,8 @@ fn analyze_files(
             (harvest, ast)
         })
         .collect();
-    let project_source = rigor_infer::SourceIndex::merge(&files, &index);
+    let mut project_source = rigor_infer::SourceIndex::merge(&files, &index);
+    project_source.set_pre_eval_declared(!cfg.pre_eval.is_empty());
     let t_stage2 = std::time::Instant::now();
 
     // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen
@@ -2491,7 +2495,10 @@ fn baseline_generate(args: &[String]) -> ExitCode {
             // config `paths:`. The reference accepts no positionals here.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "output" => output = value.unwrap().as_str().to_string(),
                 // `Choice` already canonicalized/validated the value.
                 "match-mode" => {
@@ -2537,7 +2544,10 @@ fn baseline_regenerate(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "output" => output = value.unwrap().as_str().to_string(),
                 "match-mode" => {
                     mode = if value.unwrap().as_str() == "message" {
@@ -2750,7 +2760,10 @@ fn baseline_drift(args: &[String]) -> ExitCode {
             // config `paths:`. The reference accepts no positionals here.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "baseline" => path = value.unwrap().as_str().to_string(),
                 "only" => {
                     only = Some(match value.unwrap().as_str() {
@@ -2861,7 +2874,10 @@ fn baseline_prune(args: &[String]) -> ExitCode {
             // config `paths:`. The reference accepts no positionals here.
             Item::Positional(p) => files.push(p),
             Item::Opt { key, value, .. } => match key {
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "baseline" => path = value.unwrap().as_str().to_string(),
                 "dry-run" => dry_run = true,
                 _ => unreachable!("the switch table is closed"),

@@ -89,6 +89,11 @@ pub fn cmd_lsp(args: &[String]) -> ExitCode {
             // honour it — rejected rather than silently ignored.
             "log" => {}
             "config" => {
+                // #2204 — the shared `--config` check runs where the flag is
+                // read, before the port's own rejection.
+                if let Err(code) = crate::config::checked_config_path(value.unwrap().as_str()) {
+                    return code;
+                }
                 eprintln!("rigor: lsp --config is not supported by rigor-rs");
                 return ExitCode::from(64);
             }
@@ -250,6 +255,7 @@ fn run_stdio() -> Result<(), String> {
         folder,
         stamp: SeverityStamp::from_config(&cfg),
         exclude: ExcludeMatcher::from_config(&root, &cfg),
+        pre_eval_declared: !cfg.pre_eval.is_empty(),
         overlay,
     });
 
@@ -549,6 +555,10 @@ struct ProjectContext {
     /// overlay is OFF (the scale guard tripped, or no project files were found)
     /// and diagnostics fall back to today's single-file [`SourceIndex::build`].
     overlay: Option<ProjectFiles>,
+    /// `.rigor.yml` lists `pre_eval:` files (`check`'s
+    /// `SourceIndex::set_pre_eval_declared`). Config-derived like
+    /// [`Self::disable`].
+    pre_eval_declared: bool,
 }
 
 /// The ADR-8 SeverityStamp inputs (reference `severity_stamp.rb`), carried on the
@@ -2003,6 +2013,7 @@ fn swap_project(
         // session root) on every context swap, so a newly-added `exclude:` entry
         // takes effect on the next publish.
         exclude: ExcludeMatcher::from_config(&ctx.project_root, &st.cfg),
+        pre_eval_declared: !st.cfg.pre_eval.is_empty(),
         overlay,
     });
     // Every cross-file cache entry was built against the context just superseded
@@ -2727,7 +2738,9 @@ fn overlay_source_index(
     ast: &LoweredAst,
 ) -> (Arc<SourceIndex>, Option<Duration>) {
     let Some(overlay) = &project.overlay else {
-        return (Arc::new(SourceIndex::build(ast, &project.index)), None);
+        let mut source = SourceIndex::build(ast, &project.index);
+        source.set_pre_eval_declared(project.pre_eval_declared);
+        return (Arc::new(source), None);
     };
     // The timer starts HERE, before the buffer's harvest: the guard's budget is
     // "what one dispatch costs", and the buffer harvest is part of that.
@@ -2754,7 +2767,8 @@ fn overlay_source_index(
     if !replaced {
         files.push((&buffer, ast));
     }
-    let source = SourceIndex::merge(&files, &project.index);
+    let mut source = SourceIndex::merge(&files, &project.index);
+    source.set_pre_eval_declared(project.pre_eval_declared);
     // The timer stops on the MERGE, before the `Arc` wrap: the guard's budget is
     // the analysis work, and an `Arc::new` is one allocation of a moved value.
     let elapsed = t0.elapsed();

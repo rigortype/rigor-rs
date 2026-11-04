@@ -296,6 +296,26 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             _ => Vec::new(),
         })
         .collect();
+    // Upstream v0.4.6 (#2285, `DeepErasure.widen_element_aliases`): a block
+    // call or `for` whose body mutates an element in place drops the shapes
+    // its receiver's locals carry at every depth. Recorded as a content
+    // mutation of each local, keyed by the whole call / loop span (the
+    // reference widens on the scope AFTER the construct), so the binding
+    // widens — coarser than `DeepErasure.widen`, never more diagnostics.
+    let element_mutations = ast.element_mutations();
+    if !element_mutations.is_empty() {
+        for (id, n) in ast.iter() {
+            let span = match n {
+                Node::Call { span, .. } | Node::Loop { span, .. } => *span,
+                _ => continue,
+            };
+            for (s, names) in element_mutations {
+                if *s == span {
+                    out.extend(names.iter().map(|name| (id, span, name.clone(), true)));
+                }
+            }
+        }
+    }
     let shadow_scopes = closure_shadow_scopes(ast);
     out.retain(|(id, _, name, _)| {
         !shadow_scopes.iter().any(|(descendants, bound)| {
@@ -391,6 +411,25 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
                 out.extend(names.iter().map(|name| (id, *span, name.clone())));
             }
             _ => {}
+        }
+    }
+    // Upstream v0.4.6 (#2285, `DeepErasure.widen_element_aliases`): a block
+    // call / `for` whose body mutates an element in place re-binds its
+    // receiver's locals with every shape dropped. Read as a rebind of each
+    // local at the whole call / loop span — the binding widens, which only
+    // declines more than the reference's nominal-keeping widen.
+    let element_mutations = ast.element_mutations();
+    if !element_mutations.is_empty() {
+        for (id, n) in ast.iter() {
+            let span = match n {
+                Node::Call { span, .. } | Node::Loop { span, .. } => *span,
+                _ => continue,
+            };
+            for (s, names) in element_mutations {
+                if *s == span {
+                    out.extend(names.iter().map(|name| (id, span, name.clone())));
+                }
+            }
         }
     }
     out

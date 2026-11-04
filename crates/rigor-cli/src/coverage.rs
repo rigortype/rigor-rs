@@ -376,7 +376,10 @@ fn parse_options(args: &[String]) -> Result<(Options, Vec<String>), ExitCode> {
             crate::optparse::Item::Positional(p) => positional.push(p),
             crate::optparse::Item::Opt { key, value, .. } => match key {
                 "format" => options.format = value.unwrap().as_str().to_string(),
-                "config" => options.config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => options.config = Some(path),
+                    Err(code) => return Err(code),
+                },
                 "protection" => options.protection = true,
                 "mutation" => options.mutation = true,
                 "with-tests" => options.with_tests = true,

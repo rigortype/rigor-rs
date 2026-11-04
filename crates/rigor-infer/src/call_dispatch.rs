@@ -315,6 +315,14 @@ impl<'i> Typer<'i> {
         // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
             if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
+                // Upstream v0.4.6 (#2125 / #2247): a String fold past the byte
+                // limit declines whole; the reference's next tier answers a
+                // `literal-string` carrier the port does not model, so the
+                // call types untyped (silent) rather than as a giant constant
+                // or a bare `String` whose message would drift.
+                if folding::string_fold_oversized(&scalar, method, &arg_scalars) {
+                    return interner.untyped();
+                }
                 // A String lookup can answer `nil`, so a stale value flips the
                 // result's CLASS. The top-level flat env keeps a local's first
                 // literal across `<<`, `+=`, branch and block writes, so a lookup
@@ -328,6 +336,9 @@ impl<'i> Typer<'i> {
                 if let Some(folded) =
                     (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
                 {
+                    if folding::oversized_string_result(&folded) {
+                        return interner.untyped();
+                    }
                     return interner.intern(Type::Constant(folded));
                 }
                 // Issue #164: for these `Integer?` lookups an unfolded literal
@@ -344,6 +355,9 @@ impl<'i> Typer<'i> {
                         && !folding::sidecar_blows_up(method, &arg_scalars)
                     {
                         if let Some(folded) = folder.fold(&scalar, method, &arg_scalars) {
+                            if folding::oversized_string_result(&folded) {
+                                return interner.untyped();
+                            }
                             return interner.intern(Type::Constant(folded));
                         }
                     }

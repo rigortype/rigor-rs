@@ -20,7 +20,7 @@ pub mod mutators;
 pub use ast::{
     lower, lower_with_key, AncestryFacts, BlockParamKind, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, ConstMutation, FileKey, HashKey, HashKeyTag,
     Compound, IndexTargetKey, IndexWrites, JumpKind, LoopKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
-    NodeId, ParamShape, RescueClause,
+    NodeId, ParamShape, RebindFacts, RebindReceiver, RebindSite, REBIND_METHOD_OBJECT_CALLS, RescueClause,
     Span, StatementsKind, Visibility,
 };
 

@@ -156,7 +156,10 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => paths.push(p),
             Item::Opt { key, value, .. } => match key {
-                "config" => explicit_config = Some(value.unwrap().as_str().to_string()),
+                "config" => match crate::config::checked_config_path(value.unwrap().as_str()) {
+                    Ok(path) => explicit_config = Some(path),
+                    Err(code) => return code,
+                },
                 "format" => format = value.unwrap().as_str().to_string(),
                 // `Integer()` already validated; a negative N would raise
                 // upstream (`Array#first(-1)` is an ArgumentError crash) —

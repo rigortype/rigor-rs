@@ -150,6 +150,142 @@ pub fn sidecar_blows_up(method: &str, args: &[Scalar]) -> bool {
             || matches!(args.first(), Some(Scalar::BigInt(_))))
 }
 
+/// Upstream v0.4.6 (#2125 / #2247, `constant_folding.rb` `OVERSIZED_STRING`):
+/// whether a String-producing fold on a value-pinned receiver would build (or
+/// is handed) a String past [`crate::kernel_fold::STRING_FOLD_BYTE_LIMIT`]
+/// bytes. The reference declines the WHOLE fold there and a later tier
+/// answers `literal-string` (or `literal-string & non-empty-string`), a
+/// carrier the port does not model; the caller types the call untyped
+/// instead, which only stays silent. The prechecks mirror
+/// `string_blow_up?` (`*`, `+`), `format_blow_up?` (`%`),
+/// `string_pad_blow_up?` (`center` / `ljust` / `rjust`) and
+/// `string_unary_blow_up?` (a String receiver already at the limit).
+pub fn string_fold_oversized(receiver: &Scalar, method: &str, args: &[Scalar]) -> bool {
+    const LIMIT: usize = crate::kernel_fold::STRING_FOLD_BYTE_LIMIT;
+    let Scalar::Str(recv) = receiver else {
+        return false;
+    };
+    // `integer_operand`: an Integer, a finite Float's truncation; a Bignum is
+    // past any limit (`None` = huge).
+    let operand = |s: &Scalar| -> Option<Option<i128>> {
+        match s {
+            Scalar::Int(n) => Some(Some(i128::from(*n))),
+            Scalar::BigInt(d) => Some(if d.starts_with('-') { Some(-1) } else { None }),
+            Scalar::Float(f) if f.is_finite() => Some(Some(f.trunc().clamp(-1e30, 1e30) as i128)),
+            _ => None,
+        }
+    };
+    match (method, args) {
+        ("*", [count]) => match operand(count) {
+            Some(Some(n)) => n >= 0 && (recv.len() as i128) * n > LIMIT as i128,
+            Some(None) => !recv.is_empty(),
+            None => false,
+        },
+        ("+", [Scalar::Str(b)]) => recv.len() + b.len() > LIMIT,
+        ("%", [arg]) => format_blows_up(recv, std::slice::from_ref(arg)),
+        ("center" | "ljust" | "rjust", [width, ..]) => match operand(width) {
+            Some(Some(w)) => w > LIMIT as i128,
+            Some(None) => true,
+            None => false,
+        },
+        (_, []) => recv.len() >= LIMIT,
+        _ => false,
+    }
+}
+
+/// `format_blow_up?`: a directive width / precision past the byte limit, or a
+/// `*` width with an Integer argument past it.
+pub fn format_blows_up(format: &str, args: &[Scalar]) -> bool {
+    const LIMIT: u128 = crate::kernel_fold::STRING_FOLD_BYTE_LIMIT as u128;
+    let bytes = format.as_bytes();
+    let mut star = false;
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'%' {
+            i += 1;
+            continue;
+        }
+        if bytes.get(i + 1) == Some(&b'%') {
+            i += 2;
+            continue;
+        }
+        // `%(?:<[^>]*>|\{[^}]*\}|[-+ 0#*$.\d])*`, with the `<…>` / `{…}`
+        // names and `N$` positions removed before the digits are read.
+        i += 1;
+        let mut spec: Vec<u8> = Vec::new();
+        loop {
+            match bytes.get(i) {
+                Some(b'<') | Some(b'{') => {
+                    let close = if bytes[i] == b'<' { b'>' } else { b'}' };
+                    match bytes[i + 1..].iter().position(|&b| b == close) {
+                        Some(p) => i += p + 2,
+                        None => break,
+                    }
+                }
+                Some(&b) if b"-+ 0#*$.".contains(&b) || b.is_ascii_digit() => {
+                    spec.push(b);
+                    i += 1;
+                }
+                _ => break,
+            }
+        }
+        // Drop `\d+\$` positions.
+        let mut cleaned: Vec<u8> = Vec::new();
+        let mut j = 0;
+        while j < spec.len() {
+            if spec[j].is_ascii_digit() {
+                let start = j;
+                while j < spec.len() && spec[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if spec.get(j) == Some(&b'$') {
+                    j += 1;
+                    continue;
+                }
+                cleaned.extend_from_slice(&spec[start..j]);
+            } else {
+                cleaned.push(spec[j]);
+                j += 1;
+            }
+        }
+        let mut k = 0;
+        while k < cleaned.len() {
+            if cleaned[k].is_ascii_digit() {
+                let start = k;
+                while k < cleaned.len() && cleaned[k].is_ascii_digit() {
+                    k += 1;
+                }
+                let digits = &cleaned[start..k];
+                let trimmed: &[u8] = {
+                    let z = digits.iter().position(|&b| b != b'0').unwrap_or(digits.len());
+                    &digits[z..]
+                };
+                if trimmed.len() > 5 {
+                    return true;
+                }
+                let v: u128 = std::str::from_utf8(trimmed).ok().and_then(|t| t.parse().ok()).unwrap_or(0);
+                if v > LIMIT {
+                    return true;
+                }
+            } else {
+                k += 1;
+            }
+        }
+        star |= cleaned.contains(&b'*');
+    }
+    star && args.iter().any(|a| match a {
+        Scalar::Int(n) => n.unsigned_abs() as u128 > LIMIT,
+        Scalar::BigInt(_) => true,
+        Scalar::Float(f) if f.is_finite() => f.trunc().abs() > LIMIT as f64,
+        _ => false,
+    })
+}
+
+/// `oversized_string?`: a String result past the byte limit.
+pub fn oversized_string_result(value: &Scalar) -> bool {
+    matches!(value, Scalar::Str(s) if s.len() > crate::kernel_fold::STRING_FOLD_BYTE_LIMIT)
+}
+
 /// Executes a purity-gated fold the Rust core declined, by running the real Ruby
 /// method (ADR-0008 — the Ruby sidecar). Injected into the [`crate::Typer`] so
 /// the pure `rigor-infer` crate never itself does IO / spawns a process; the
