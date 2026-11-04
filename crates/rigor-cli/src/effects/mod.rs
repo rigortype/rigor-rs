@@ -204,6 +204,20 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
         return ExitCode::from(64);
     }
 
+    // v0.4.7 `misspelled_verb?`: a first word that is no path (no `/` or
+    // `.`, not an existing file) but is near a snapshot verb is a misspelled
+    // subcommand, not a scope.
+    if let Some(word) = positional.first() {
+        if !word.contains(['/', '.']) && !Path::new(word).exists() {
+            let verbs = ["update", "check", "diff", "explain"];
+            if let Some(nearest) = crate::optparse::spell_checker_correct(&verbs, word).first() {
+                eprintln!("rigor: unknown effects subcommand: {word}");
+                eprintln!("Did you mean `rigor effects {nearest}`?");
+                return ExitCode::from(64);
+            }
+        }
+    }
+
     // The file `config_declares_effect_lane` probes is the one
     // `Configuration.load` would read — `--config`, else discovery's winner
     // (`.rigor.yml` before `.rigor.dist.yml`), else the bare name.
