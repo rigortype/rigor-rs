@@ -99,6 +99,10 @@ pub struct AncestryFacts {
     /// scanned exactly as the reference's `PATTERN` + `commented?` do — see
     /// [`required_vendored_features`].
     pub required_features: Vec<String>,
+    /// Upstream v0.4.6 (#2264 / issue #2174, `RequiredFeatures.features_of`'s
+    /// `ANY_FEATURE` scan): the FIRST path segment of every feature this
+    /// file's text requires — see [`required_feature_segments`].
+    pub required_segments: Vec<String>,
     /// Upstream v0.4.5 (#2086 / issue #1722) — every RECEIVER-form instance
     /// mixin `X.include(M)` / `X.prepend(M)` / `X.send(:include, M)`, wherever
     /// it is written: `(owner candidates, names)`, a non-constant argument as
@@ -177,6 +181,88 @@ pub fn required_vendored_features(source: &[u8]) -> Vec<String> {
         if found {
             out.push((*feature).to_string());
         }
+    }
+    out
+}
+
+/// Upstream v0.4.6 (#2264 / issue #2174) — the reference's
+/// `RequiredFeatures.features_of` `ANY_FEATURE` scan, reduced to each match's
+/// first path segment (`"digest/sha2"` → `"digest"`): `require "x"` /
+/// `require('x/y')` / `Kernel.require "x"`, the name `[\w-]+(?:/[\w-]+)*`
+/// between matching quotes, skipping a match on a whole-line comment. The
+/// regex runs over the source's BYTES, so `\w` is ASCII only and a non-ASCII
+/// byte before `require` does not block it. The reference then keeps only a
+/// segment Ruby ships (`SHIPPED_SEGMENTS`); the reader of this list
+/// intersects with a table that already holds only shipped segments.
+pub fn required_feature_segments(source: &[u8]) -> Vec<String> {
+    let word = |b: u8| b.is_ascii_alphanumeric() || b == b'_';
+    let name = |b: u8| word(b) || b == b'-';
+    let kw = b"require";
+    let mut out: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i + kw.len() <= source.len() {
+        if &source[i..i + kw.len()] != kw {
+            i += 1;
+            continue;
+        }
+        let at = i;
+        // `(?:(?<![\w.$@])|(?<=Kernel\.))`
+        let ok_prefix = at == 0 || {
+            let b = source[at - 1];
+            !(word(b) || b == b'.' || b == b'$' || b == b'@') || source[..at].ends_with(b"Kernel.")
+        };
+        if !ok_prefix {
+            i += 1;
+            continue;
+        }
+        let mut j = at + kw.len();
+        while j < source.len() && (source[j] == b' ' || source[j] == b'\t') {
+            j += 1;
+        }
+        if j < source.len() && source[j] == b'(' {
+            j += 1;
+            while j < source.len() && (source[j] == b' ' || source[j] == b'\t') {
+                j += 1;
+            }
+        }
+        let Some(&q) = source.get(j) else { break };
+        if q != b'"' && q != b'\'' {
+            i += 1;
+            continue;
+        }
+        let start = j + 1;
+        let mut k = start;
+        while k < source.len() && name(source[k]) {
+            k += 1;
+        }
+        let first_end = k;
+        let mut matched = k > start;
+        while matched && source.get(k) == Some(&b'/') {
+            let seg = k + 1;
+            let mut m = seg;
+            while m < source.len() && name(source[m]) {
+                m += 1;
+            }
+            if m == seg {
+                matched = false;
+            } else {
+                k = m;
+            }
+        }
+        if !matched || source.get(k) != Some(&q) {
+            i += 1;
+            continue;
+        }
+        // `commented?`: the line's first non-blank byte is `#`.
+        let line_start = source[..at].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+        let first = source[line_start..at].iter().find(|b| !b.is_ascii_whitespace());
+        if first != Some(&b'#') {
+            let seg = String::from_utf8_lossy(&source[start..first_end]).into_owned();
+            if !out.contains(&seg) {
+                out.push(seg);
+            }
+        }
+        i = k + 1;
     }
     out
 }
@@ -730,6 +816,30 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
 #[cfg(test)]
 mod tests {
     use super::required_vendored_features as scan;
+
+    /// The reference's `ANY_FEATURE` + `commented?`, probed row by row
+    /// against `RequiredFeatures.features_of` (v0.4.6), reduced to first
+    /// segments.
+    #[test]
+    fn required_segment_scan_matches_the_reference_any_feature() {
+        use super::required_feature_segments as seg;
+        let rows: &[(&[u8], &[&str])] = &[
+            (b"require \"digest\"", &["digest"]),
+            (b"require \"digest/sha2\"", &["digest"]),
+            (b"\xc3\xa9require \"digest\"", &["digest"]),
+            (b"require \"digest/\"", &[]),
+            (b"x.require \"digest\"", &[]),
+            (b"require \"set\"; require \"matrix\"", &["set", "matrix"]),
+            (b"  # require 'digest'", &[]),
+            (b"Kernel.require('digest')", &["digest"]),
+            (b"require_relative 'digest'", &[]),
+            (b"require 'digest\"", &[]),
+        ];
+        for (src, want) in rows {
+            let want: Vec<String> = want.iter().map(|s| s.to_string()).collect();
+            assert_eq!(seg(src), want, "{}", String::from_utf8_lossy(src));
+        }
+    }
 
     /// The reference's `RequiredFeatures::PATTERN` + `commented?`, row by row.
     #[test]

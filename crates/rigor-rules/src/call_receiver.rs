@@ -200,6 +200,11 @@ pub(crate) fn check_call(
         if unenumerable_receiver_class(name) {
             return None;
         }
+        // Upstream v0.4.6 (#2264) — `unbounded_receiver_surface?`'s
+        // `ruby_library_reopen?` arm, on both sides.
+        if typer.source().ruby_library_reopen(index, name) {
+            return None;
+        }
         // `class_has_singleton_method` is conservative: `false` only when the
         // class-method surface is fully known and lacks the method (handles
         // `extend`ed modules; incomplete/unknown ⇒ `true` ⇒ silent).
@@ -329,7 +334,9 @@ pub(crate) fn check_call(
             // same reason the reference puts `unenumerable_receiver?` at the top of
             // the diagnostic: the question is about the receiver, not about which
             // surface happens to model it.
-            if unenumerable_instance_receiver(index, name) {
+            if unenumerable_instance_receiver(index, name)
+                || typer.source().ruby_library_reopen(index, name)
+            {
                 return None;
             }
             let use_prefix = typer.enclosing_prefix(message_span);
@@ -513,7 +520,9 @@ fn check_union_call(
             }) {
             None => return None,
             Some((class_name, registry_arm)) => {
-                if unenumerable_instance_receiver(index, &class_name) {
+                if unenumerable_instance_receiver(index, &class_name)
+                    || typer.source().ruby_library_reopen(index, &class_name)
+                {
                     return None;
                 }
                 if registry_arm {
