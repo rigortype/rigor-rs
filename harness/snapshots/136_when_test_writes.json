@@ -21,6 +21,13 @@
       "column": 23,
       "severity": "error",
       "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 81,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

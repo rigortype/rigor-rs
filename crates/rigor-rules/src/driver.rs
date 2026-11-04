@@ -450,6 +450,19 @@ pub fn analyze_with_source_and_folder(
     let truthy_snapshots = typer.always_truthy_snapshots(ast, interner);
     for (id, node) in ast.iter() {
         if let Node::If { predicate, .. } = node {
+            // Upstream #2036: a `when` test that writes a local is evaluated in
+            // order, so the snapshot's pre-`case` binding is stale for a
+            // predicate after it. Decline on a predicate that reads such a local.
+            let pspan = ast.get(*predicate).span();
+            let widened = env.case_widened_names(pspan);
+            if !widened.is_empty()
+                && ast.iter().any(|(_, n)| {
+                    matches!(n, Node::LocalVariableRead { name, span }
+                        if crate::span_within(*span, pspan) && widened.contains(&name.as_str()))
+                })
+            {
+                continue;
+            }
             if let Some(diag) =
                 check_always_truthy(ast, id, *predicate, &truthy_snapshots, interner)
             {

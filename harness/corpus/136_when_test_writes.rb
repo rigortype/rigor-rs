@@ -63,3 +63,21 @@ case gets
 when (u = "a") then v.upcase
 end
 p u
+
+# always-truthy reads the widened local too (#2036): silent on v0.4.5.
+z = nil
+case gets
+when (z = gets) then 1
+end
+if z
+  1
+end
+
+# Control: a `case` whose tests write nothing leaves the fold intact.
+q = nil
+case gets
+when "a" then 1
+end
+if q
+  1
+end

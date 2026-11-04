@@ -1,5 +1,5 @@
 {
-  "fixture": "../../../../../../private/tmp/claude-501/-Users-megurine-repo-rust-rigor-rs/eae17166-00a5-4d29-9dc0-bf6d57ffce0b/scratchpad/v045/b/fx/140_core_receiver_ancestor_answers.rb",
+  "fixture": "harness/corpus/140_core_receiver_ancestor_answers.rb",
   "diagnostics": [
     {
       "rule": "call.undefined-method",
