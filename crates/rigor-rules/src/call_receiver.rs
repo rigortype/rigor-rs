@@ -215,6 +215,10 @@ pub(crate) fn check_call(
         if typer.source().core_singleton_hook(index, name) {
             return None;
         }
+        // Upstream v0.4.6 (#2269 / #2094) — `singleton_mixin_may_answer?`.
+        if typer.source().core_singleton_mixin_may_answer(index, name, method) {
+            return None;
+        }
         let receiver_render = format!("singleton({name})");
         let message = format!("undefined method `{method}' for {receiver_render}");
         let severity = catalog(CALL_UNDEFINED_METHOD)

@@ -113,6 +113,24 @@ pub struct AncestryFacts {
     /// The port keeps its wildcard taint for the order readers and lists the
     /// names here for the set-shaped `call.undefined-method` decline only.
     pub receiver_mixins: Vec<(Vec<String>, Vec<String>)>,
+    /// Upstream v0.4.6 (#2094 / #2269) — every SINGLETON-side mixin of an
+    /// owner, wherever written: `(owner candidates, names)`, where a
+    /// spelling the reference cannot record is [`WILDCARD`] (its
+    /// `taint(owner, :extend)`). Named: `X.extend(M)` and
+    /// `X.singleton_class.include(M)` with constant arguments, a class-body
+    /// `extend M`. Wildcard: a `send` spelling, a non-constant or `self`
+    /// argument, any `send` / `*_eval` / computed-name naming call on
+    /// `X.singleton_class` (or a literal-named one that is not a direct
+    /// statement), and `singleton_class.include` inside `class << self`.
+    /// Read only by the set-shaped `call.undefined-method` singleton decline,
+    /// so the order readers keep their own taints.
+    pub singleton_mixins: Vec<(Vec<String>, Vec<String>)>,
+    /// Upstream v0.4.6 (#2094, `ObjectMixins.macro_named?`) — `(owner,
+    /// name)` for each literal method name (a Symbol / String argument, or a
+    /// `def` handed as one) a receiverless or `self.` class-body call that is
+    /// not name-neutral passes (`dsl_method :x`, `def_delegators :@t, :x`):
+    /// the opaque instance envelope the reference files for it.
+    pub macro_names: Vec<(String, String)>,
     /// Upstream v0.4.5 (#2086 / issue #1722) — the reference's
     /// `LexicalMethodSites` singleton-local table for this file.
     pub singleton_locals: super::singleton_locals::SingletonLocals,
@@ -265,6 +283,55 @@ pub fn required_feature_segments(source: &[u8]) -> Vec<String> {
         i = k + 1;
     }
     out
+}
+
+/// `ScopeIndexer::NAME_NEUTRAL_MACROS`.
+const NAME_NEUTRAL_MACROS: [&str; 13] = [
+    "private",
+    "public",
+    "protected",
+    "module_function",
+    "private_class_method",
+    "public_class_method",
+    "private_constant",
+    "public_constant",
+    "require",
+    "require_relative",
+    "autoload",
+    "autoload_relative",
+    // `include` / `prepend` / `extend` take constants, never literal names.
+    "include",
+];
+
+/// `surface_rewriting_call?`: `SURFACE_EVAL_CALLS`, `SURFACE_NAMING_CALLS`,
+/// `SURFACE_SEND_CALLS`, `ATTR_MACROS`, `SURFACE_MIXIN_CALLS` and the
+/// `(?:\A|_)(?:include|prepend|extend)(?:_|\z)` helper pattern.
+fn surface_rewriting_call(name: &str) -> bool {
+    const NAMING: [&str; 5] =
+        ["define_method", "define_singleton_method", "alias_method", "remove_method", "undef_method"];
+    const ATTR: [&str; 3] = ["attr_reader", "attr_writer", "attr_accessor"];
+    EVAL_CALLS.contains(&name)
+        || NAMING.contains(&name)
+        || SEND_NAMES.contains(&name)
+        || ATTR.contains(&name)
+        || name.split('_').any(|seg| MIXIN_KINDS.contains(&seg))
+}
+
+/// `singleton_class_named_call?`: `alias_method` / `define_method` (first
+/// argument), `remove_method` / `attr_*` (every argument), every rewritten
+/// argument a literal Symbol or String (a `define_method` body argument
+/// aside).
+fn singleton_class_named_call(name: &str, args: &[PrismNode<'_>]) -> bool {
+    let naming = matches!(
+        name,
+        "alias_method" | "define_method" | "remove_method" | "attr_reader" | "attr_writer" | "attr_accessor"
+    );
+    naming
+        && !args.is_empty()
+        && args.iter().enumerate().all(|(i, a)| {
+            (name == "define_method" && i > 0)
+                || super::definitions::literal_symbol_or_string_name(a).is_some()
+        })
 }
 
 const MODIFIERS: [&str; 3] = ["private", "protected", "public"];
@@ -478,6 +545,27 @@ impl Census {
                 (true, _) | (false, "extend") => MixinSide::Extend,
                 _ => MixinSide::Include,
             };
+            if side == MixinSide::Extend {
+                // `self` as an argument names the owner itself.
+                let all_named = !args.is_empty()
+                    && args.iter().all(|a| {
+                        strict_constant_path_string(a).is_some() || a.as_self_node().is_some()
+                    });
+                let mut listed: Vec<String> = args
+                    .iter()
+                    .filter_map(|a| {
+                        if a.as_self_node().is_some() {
+                            Some(owner[0].clone())
+                        } else {
+                            strict_constant_path_string(a)
+                        }
+                    })
+                    .collect();
+                if via_send || !all_named {
+                    listed.push(WILDCARD.to_string());
+                }
+                self.out.singleton_mixins.push((owner.clone(), listed));
+            }
             if recv.is_none() && !via_send && complete {
                 if self.is_direct(n) && !singleton {
                     if kind != "extend" {
@@ -517,6 +605,15 @@ impl Census {
         if let Some(raw) = strict_constant_path_string(&recv) {
             let side = if kind == "extend" { MixinSide::Extend } else { MixinSide::Include };
             let owners = self.candidates(&raw);
+            if kind == "extend" {
+                // `receiver_extend_recorded?`: constant arguments name edges;
+                // a `self` or other argument, or a `send`, taints.
+                let mut listed = names.clone();
+                if via_send || !complete || args.iter().any(|a| a.as_self_node().is_some()) {
+                    listed.push(WILDCARD.to_string());
+                }
+                self.out.singleton_mixins.push((owners.clone(), listed));
+            }
             if kind != "extend" && !args.is_empty() {
                 let mut listed = names.clone();
                 if !complete {
@@ -531,6 +628,78 @@ impl Census {
             if let Some(owner) = self.owner() {
                 self.wildcard(owner.clone(), MixinSide::Include);
                 self.wildcard(owner, MixinSide::Extend);
+            }
+        }
+    }
+
+    /// Upstream v0.4.6 (#2269, `singleton_class_rewrite_tainted?` +
+    /// `singleton_class_include_recorded?`): a surface-rewriting call on
+    /// `singleton_class` (bare, `self.` or a constant's) records the owner's
+    /// singleton side — named for a constant-argument `include` / `prepend`,
+    /// nothing for a literal-named naming call written as a direct statement,
+    /// the wildcard otherwise.
+    fn record_singleton_class_rewrite(&mut self, n: &PrismNode<'_>, call: &ruby_prism::CallNode<'_>) {
+        let Some(recv) = call.receiver() else { return };
+        let Some(sc) = recv.as_call_node() else { return };
+        if constant_string(sc.name().as_slice()) != "singleton_class" || sc.arguments().is_some() {
+            return;
+        }
+        let name = constant_string(call.name().as_slice());
+        if !surface_rewriting_call(&name) {
+            return;
+        }
+        let object = sc.receiver();
+        let lexical_self = object.as_ref().is_none_or(|o| o.as_self_node().is_some());
+        let owner = if lexical_self {
+            self.owner()
+        } else {
+            object.as_ref().and_then(strict_constant_path_string).map(|raw| self.candidates(&raw))
+        };
+        let Some(owner) = owner else { return };
+        let args: Vec<PrismNode<'_>> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if self.is_direct(n) && singleton_class_named_call(&name, &args) {
+            return;
+        }
+        let up_level = self.frame().singleton && lexical_self;
+        let consts: Vec<Option<String>> = args.iter().map(strict_constant_path_string).collect();
+        if !up_level
+            && (name == "include" || name == "prepend")
+            && !consts.is_empty()
+            && consts.iter().all(Option::is_some)
+        {
+            self.out.singleton_mixins.push((owner, consts.into_iter().flatten().collect()));
+            return;
+        }
+        self.out.singleton_mixins.push((owner, vec![WILDCARD.to_string()]));
+    }
+
+    /// Upstream v0.4.6 (#2094, `record_named_arguments_opaque`): the literal
+    /// names a non-neutral receiverless (or `self.`) class-body call passes.
+    /// Dynamic surface calls are included: a superset that only declines more.
+    fn record_macro_names(&mut self, call: &ruby_prism::CallNode<'_>) {
+        if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+            return;
+        }
+        let name = constant_string(call.name().as_slice());
+        if NAME_NEUTRAL_MACROS.contains(&name.as_str()) {
+            return;
+        }
+        let Some(owner) = self.owner() else { return };
+        let Some(arguments) = call.arguments() else { return };
+        for a in arguments.arguments().iter() {
+            let lit = if let Some(d) = a.as_def_node() {
+                Some(constant_string(d.name().as_slice()))
+            } else {
+                super::definitions::literal_symbol_or_string_name(&a)
+            };
+            if let Some(lit) = lit {
+                for o in &owner {
+                    let pair = (o.clone(), lit.clone());
+                    if !self.out.macro_names.contains(&pair) {
+                        self.out.macro_names.push(pair);
+                    }
+                }
             }
         }
     }
@@ -724,6 +893,10 @@ impl<'pr> Visit<'pr> for Census {
             }
         }
         self.record_mixin(&n, node);
+        self.record_singleton_class_rewrite(&n, node);
+        if self.in_def == 0 && !self.frame().singleton {
+            self.record_macro_names(node);
+        }
 
         // An eval block on an object the walk cannot name: in a hook, or
         // holding a mixin call, it reshapes the enclosing class.
