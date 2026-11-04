@@ -56,6 +56,13 @@
       "column": 11,
       "severity": "error",
       "message": "undefined method `frobnicate_zzz' for Hash | String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 115,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash"
     }
   ]
 }
