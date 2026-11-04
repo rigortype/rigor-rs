@@ -25,6 +25,7 @@ fn project_with_config_rooted(cfg: &Config, root: &Path) -> ProjectContext {
         folder: None,
         stamp: SeverityStamp::from_config(cfg),
         exclude: ExcludeMatcher::from_config(root, cfg),
+        pre_eval_declared: false,
         overlay: None,
     }
 }
@@ -656,6 +657,7 @@ impl Harness {
                 folder: None,
                 stamp: SeverityStamp::from_config(&cfg),
                 exclude: ExcludeMatcher::from_config(&root, &cfg),
+                pre_eval_declared: false,
                 overlay,
             });
             main_loop(&server_conn, &ctx, project, cfg, guard, config_broken).unwrap();
@@ -2207,6 +2209,7 @@ fn held_harvest_dispatch_index_equals_the_pre_slice_rebuild() {
         folder: None,
         stamp: SeverityStamp::from_config(&Config::default()),
         exclude: ExcludeMatcher::from_config(&p.root, &Config::default()),
+        pre_eval_declared: false,
         overlay: None,
     };
     let ast = lower(&parse(SUB_RB.as_bytes()));
@@ -2380,6 +2383,7 @@ fn session_for(root: &Path, cfg: Config, budget: Duration) -> (ServerContext, Se
             folder: None,
             stamp: SeverityStamp::from_config(&cfg),
             exclude: ExcludeMatcher::from_config(root, &cfg),
+            pre_eval_declared: false,
             overlay: Some(build.files),
         }),
         cfg,
