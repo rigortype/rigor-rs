@@ -62,7 +62,7 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
             "format",
             &[("format", false)],
             crate::optparse::ArgStyle::Required,
-            crate::optparse::ValueKind::Choice(&["text", "json"]),
+            crate::optparse::ValueKind::Exact(&["text", "json"]),
             "--format",
             "=FORMAT",
             &["Output format: text (default) or json (a { line => type } map)"],

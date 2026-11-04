@@ -46,7 +46,7 @@ pub fn cmd_doctor(args: &[String]) -> ExitCode {
             "format",
             &[("format", false)],
             crate::optparse::ArgStyle::Required,
-            crate::optparse::ValueKind::Raw,
+            crate::optparse::ValueKind::Exact(&["text", "json"]),
             "--format",
             "=FORMAT",
             &["Output format: text (default) or json"],

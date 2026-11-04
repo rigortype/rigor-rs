@@ -199,7 +199,7 @@ fn run_command() -> ExitCode {
 /// parsing (`--ruby=MODE` and `--ruby MODE`).
 const CHECK_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
-    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text, json, sarif, github, gitlab, checkstyle, junit, teamcity"]),
+    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json", "sarif", "github", "gitlab", "checkstyle", "junit", "teamcity"]), "--format", "=FORMAT", &["Output format: text, json, sarif, github, gitlab, checkstyle, junit, teamcity"]),
     optparse::Switch::new("explain", &[("explain", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--explain", "", &["Surface fail-soft fallback events as :info diagnostics"]),
     optparse::Switch::new("cache-stats", &[("cache-stats", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--cache-stats", "", &["Print on-disk cache inventory at end of run"]),
     optparse::Switch::new("coverage", &[("coverage", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--coverage", "", &["Add a type-precision coverage block (an extra precision pass over the analyzed files)"]),
@@ -247,7 +247,7 @@ fn check_unsupported(flag: &str) -> ExitCode {
 const TRACE_PARSER: optparse::OptParser = optparse::OptParser::new(
     "Usage: rigor trace [options] FILE",
     &[
-        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (animation) or json (raw event stream)"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (animation) or json (raw event stream)"]),
         optparse::Switch::new("delay", &[("delay", false)], optparse::ArgStyle::Required, optparse::ValueKind::Float, "--delay", "=SECONDS", &["Autoplay with SECONDS between frames (default: step on key press)"]),
         optparse::Switch::new("line", &[("line", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--line", "=N", &["Only replay events whose source range starts on line N"]),
         optparse::Switch::new("verbose", &[("verbose", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--verbose", "", &["Include every expression enter/result frame"]),
@@ -258,7 +258,7 @@ const TRACE_PARSER: optparse::OptParser = optparse::OptParser::new(
 const TYPE_SCAN_PARSER: optparse::OptParser = optparse::OptParser::new(
     "Usage: rigor type-scan [options] PATH...",
     &[
-        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text or json"]),
         optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
         optparse::Switch::new("limit", &[("limit", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--limit", "=N", &["Max example events to print (text only)"]),
         optparse::Switch::new("show-recognized", &[("show-recognized", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--show-recognized", "", &["Include classes with 0 unrecognized in the table"]),
@@ -270,7 +270,7 @@ const UNUSED_PARSER: optparse::OptParser = optparse::OptParser::new(
     "Usage: rigor unused [options] [paths]",
     &[
         optparse::Switch::new("config", &[("config", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
-        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (default) or json"]),
+        optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
         optparse::Switch::new("entry-point", &[("entry-point", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--entry-point", "=GLOB", &["Treat declarations in files matching GLOB as roots (repeatable)"]),
         optparse::Switch::new("limit", &[("limit", false)], optparse::ArgStyle::Required, optparse::ValueKind::Int, "--limit", "=N", &["Print at most N candidates (default: all)"]),
         optparse::Switch::new("incremental", &[("incremental", false)], optparse::ArgStyle::Flag, optparse::ValueKind::Raw, "--incremental", "", &["(unsupported)"]),
@@ -2351,7 +2351,7 @@ const BASELINE_REGENERATE_SWITCHES: &[optparse::Switch] = &[
 ];
 const BASELINE_DUMP_SWITCHES: &[optparse::Switch] = &[
     optparse::Switch::new("baseline", &[("baseline", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--baseline", "=PATH", &["Path to the baseline file (default: .rigor-baseline.yml)"]),
-    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Choice(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
+    optparse::Switch::new("format", &[("format", false)], optparse::ArgStyle::Required, optparse::ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
     optparse::Switch::new("rule", &[("rule", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--rule", "=RULE", &["Filter rows by exact rule id"]),
     optparse::Switch::new("file", &[("file", false)], optparse::ArgStyle::Required, optparse::ValueKind::Raw, "--file", "=GLOB", &["Filter rows by File.fnmatch? glob"]),
 ];

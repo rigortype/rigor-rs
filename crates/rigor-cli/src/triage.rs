@@ -71,7 +71,7 @@ const TRIAGE_SWITCHES: &[Switch] = &[
         "format",
         &[("format", false)],
         ArgStyle::Required,
-        ValueKind::Raw,
+        ValueKind::Exact(&["text", "json"]),
         "--format",
         "=FORMAT",
         &["Output format: text (default) or json"],

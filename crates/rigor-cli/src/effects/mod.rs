@@ -145,7 +145,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
     const SWITCHES: &[Switch] = &[
         Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
-        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (default) or json"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
         Switch::new("full", &[("full", false)], ArgStyle::Flag, ValueKind::Raw, "--full", "", &["List every method, including the ones with nothing to say"]),
         Switch::new("label", &[("label", false)], ArgStyle::Required, ValueKind::Raw, "--label", "=LABEL", &["Only methods carrying LABEL (or a label under it), in either lane"]),
         Switch::new("pure", &[("pure", false)], ArgStyle::Flag, ValueKind::Raw, "--pure", "", &["Only methods proven to do nothing beyond mutate.local — the %a{pure} set"]),

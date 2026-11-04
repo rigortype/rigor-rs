@@ -43,7 +43,7 @@ const DIFF_SWITCHES: &[Switch] = &[
         "format",
         &[("format", false)],
         ArgStyle::Required,
-        ValueKind::Choice(&["text", "json"]),
+        ValueKind::Exact(&["text", "json"]),
         "--format",
         "=FORMAT",
         &["Output format (text | json). Default: text."],

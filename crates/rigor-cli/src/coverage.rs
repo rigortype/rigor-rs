@@ -344,7 +344,7 @@ pub fn cmd_coverage(args: &[String]) -> ExitCode {
 fn parse_options(args: &[String]) -> Result<(Options, Vec<String>), ExitCode> {
     use crate::optparse::{ArgStyle, OptParser, Switch, ValueKind};
     const SWITCHES: &[Switch] = &[
-        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text or json"]),
         Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
         Switch::new("protection", &[("protection", false)], ArgStyle::Flag, ValueKind::Raw, "--protection", "", &["Report type-protection coverage (ADR-63 Tier 1) instead of type precision"]),
         Switch::new("mutation", &[("mutation", false)], ArgStyle::Flag, ValueKind::Raw, "--mutation", "", &["With --protection: measure actual mutation effectiveness (ADR-63 Tier 2). Scopes to git-changed files when no paths are given; explicit paths override."]),

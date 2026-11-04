@@ -161,7 +161,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         Switch::new("include-private", &[("include-private", false)], ArgStyle::Flag, ValueKind::Raw, "--include-private", "", &["Emit private / protected instance methods (default: public only)"]),
         Switch::new("effect-envelopes", &[("effect-envelopes", false)], ArgStyle::Flag, ValueKind::Raw, "--effect-envelopes", "", &["Also emit %a{rigor:v1:effect ...} for effectful methods (requires the effects: opt-in)"]),
         Switch::new("no-cache", &[("no-cache", false)], ArgStyle::Flag, ValueKind::Raw, "--no-cache", "", &["Do not read or write the analysis cache (effect collection only)"]),
-        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text or json"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text or json"]),
         Switch::new("params", &[("params", false)], ArgStyle::Required, ValueKind::Raw, "--params", "=POLICY", &["Parameter policy: untyped (default), observed, observed-strict"]),
         Switch::new("observe", &[("observe", false)], ArgStyle::Required, ValueKind::Raw, "--observe", "=PATH", &["Directory / file to scan for call-site observations (repeatable)"]),
         Switch::new("new-files", &[("new-files", false)], ArgStyle::Flag, ValueKind::Raw, "--new-files", "", &["Emit only new-file classifications"]),

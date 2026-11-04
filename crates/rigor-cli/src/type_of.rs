@@ -56,7 +56,7 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
             "format",
             &[("format", false)],
             crate::optparse::ArgStyle::Required,
-            crate::optparse::ValueKind::Raw,
+            crate::optparse::ValueKind::Exact(&["text", "json"]),
             "--format",
             "=FORMAT",
             &["Output format: text or json"],

@@ -82,6 +82,11 @@ pub enum ValueKind {
     /// prefix; the delivered value is the canonical entry (a string for us —
     /// symbol/string identity is irrelevant to the port).
     Choice(&'static [&'static str]),
+    /// Reference `Options.add_format` (#2502): a raw switch whose block raises
+    /// `InvalidArgument` unless the value is EXACTLY one of the list — no
+    /// prefix completion, so `--format=j` is `invalid argument: --format=j`
+    /// at parse time, before any analysis runs.
+    Exact(&'static [&'static str]),
 }
 
 /// One `opts.on(...)` declaration.
@@ -963,6 +968,13 @@ fn convert(kind: ValueKind, v: &str) -> Result<Value, ValueError> {
             let cleaned: String = v.chars().filter(|&c| c != '_').collect();
             Ok(Value::Float(cleaned.parse::<f64>().unwrap_or(0.0)))
         }
+        ValueKind::Exact(list) => {
+            if list.contains(&v) {
+                Ok(Value::Str(v.to_string()))
+            } else {
+                Err(ValueError::Invalid)
+            }
+        }
         ValueKind::Choice(list) => {
             // `CompletingHash#match`: exact fetch, else unique-prefix
             // completion (same subsumption rule as option names).
@@ -1400,6 +1412,37 @@ mod tests {
                 assert_eq!(stderr, "invalid argument: --workers bogus\n");
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn exact_value_list_refuses_a_prefix() {
+        // Reference `Options.add_format` (#2502): exact match only, and the
+        // refusal names the whole token (`=` form) or the pair.
+        const EX: &[Switch] = &[Switch::new(
+            "format",
+            &[("format", false)],
+            ArgStyle::Required,
+            ValueKind::Exact(&["text", "json"]),
+            "--format",
+            "=FORMAT",
+            &["format"],
+        )];
+        let p = OptParser::new("Usage: t [options]", EX);
+        let i = items(p.parse(&argv("--form=json")));
+        assert!(matches!(&i[0], Item::Opt { key: "format", value: Some(Value::Str(v)), .. } if v == "json"));
+        for (args, want) in [
+            ("--format=j", "invalid argument: --format=j\n"),
+            ("--format j", "invalid argument: --format j\n"),
+            ("--form=bogus", "invalid argument: --form=bogus\n"),
+        ] {
+            match p.parse(&argv(args)) {
+                Parsed::Exit { stderr, code, .. } => {
+                    assert_eq!(code, 64);
+                    assert_eq!(stderr, want);
+                }
+                _ => panic!("{args} parsed"),
+            }
         }
     }
 }
