@@ -314,7 +314,10 @@ fn write_diff_json(diff: &Diff, baseline_path: &str, baseline_count: usize, curr
     // delta is machine-readable and JSON key order is not significant, so this is
     // left as-is rather than flipping the crate-wide `preserve_order` feature
     // (which would perturb the `explain`/`sarif` JSON) or hand-building the tree.
-    println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    println!(
+        "{}",
+        crate::json_document::stamp_pretty(&serde_json::to_string_pretty(&payload).unwrap(), None)
+    );
 }
 
 /// `path:line:column [qualified_rule] message` (reference `render_diagnostic`).

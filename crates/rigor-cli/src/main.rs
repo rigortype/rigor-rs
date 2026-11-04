@@ -42,6 +42,7 @@ mod doctor;
 mod effects;
 mod explain;
 mod init;
+mod json_document;
 mod lsp;
 mod mcp;
 mod outline;

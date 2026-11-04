@@ -2200,6 +2200,9 @@ fn render_json(report: &Report) -> String {
     let g = report.grand_total();
     let mut j = JsonWriter::new();
     j.begin_object();
+    // `JsonDocument.stamp(..., mode: "precision")` (v0.4.7, #2509).
+    j.int_field("schema_version", u64::from(crate::json_document::SCHEMA_VERSION));
+    j.str_field("mode", "precision");
 
     // summary
     j.key("summary");

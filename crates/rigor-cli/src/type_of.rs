@@ -489,6 +489,8 @@ fn render_json(probe: &Probe) {
         "erased": probe.erased,
     });
     println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    // v0.4.7 `SHAPE_NOTICES[:type_of]` (ADR-126 WD4): stdout is unchanged.
+    eprintln!("{}", crate::json_document::type_of_notice());
 }
 
 #[cfg(test)]

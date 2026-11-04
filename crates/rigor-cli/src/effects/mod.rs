@@ -518,8 +518,9 @@ fn render_json(rows: &[Row]) -> String {
             }),
         );
     }
-    serde_json::to_string_pretty(&serde_json::json!({ "methods": methods }))
-        .unwrap_or_else(|_| "{\"methods\":{}}".to_string())
+    let doc = serde_json::to_string_pretty(&serde_json::json!({ "methods": methods }))
+        .unwrap_or_else(|_| "{\n  \"methods\": {}\n}".to_string());
+    crate::json_document::stamp_pretty(&doc, None)
 }
 
 fn render_text(rows: &[Row]) {

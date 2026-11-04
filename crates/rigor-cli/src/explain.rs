@@ -829,6 +829,8 @@ pub fn cmd_explain(args: &[String]) -> ExitCode {
 fn render_index(format: &str) {
     if format == "json" {
         println!("{}", json_array(&all()));
+        // v0.4.7 `SHAPE_NOTICES[:explain_rules]` (ADR-126 WD4).
+        eprintln!("{}", crate::json_document::explain_rules_notice());
         return;
     }
     println!("Available rules:");
@@ -846,6 +848,7 @@ fn render_index(format: &str) {
 fn render_entries(entries: &[&Entry], format: &str) {
     if format == "json" {
         println!("{}", json_array(entries));
+        eprintln!("{}", crate::json_document::explain_rules_notice());
         return;
     }
     for (i, entry) in entries.iter().enumerate() {

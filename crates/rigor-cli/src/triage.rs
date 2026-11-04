@@ -757,7 +757,7 @@ fn report_json(report: &Report) -> String {
         })).collect::<Vec<_>>(),
         "include_info": report.include_info,
     });
-    serde_json::to_string_pretty(&payload).unwrap()
+    crate::json_document::stamp_pretty(&serde_json::to_string_pretty(&payload).unwrap(), None)
 }
 
 #[cfg(test)]

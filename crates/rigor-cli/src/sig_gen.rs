@@ -1510,7 +1510,7 @@ fn render_json(candidates: &[Candidate]) {
 fn candidates_json_string(candidates: &[Candidate]) -> String {
     use serde_json::json;
     let rows: Vec<_> = candidates.iter().map(candidate_json).collect();
-    serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap()
+    crate::json_document::stamp_pretty(&serde_json::to_string_pretty(&json!({ "candidates": rows })).unwrap(), None)
 }
 
 /// MCP `sig_gen` tool seam (reference `rigor_sig_gen`, a READ-ONLY
@@ -1965,7 +1965,10 @@ fn render_write_json(results: &[WriteResult]) {
             })
         })
         .collect();
-    println!("{}", serde_json::to_string_pretty(&json!({ "results": rows })).unwrap());
+    println!(
+        "{}",
+        crate::json_document::stamp_pretty(&serde_json::to_string_pretty(&json!({ "results": rows })).unwrap(), None)
+    );
 }
 
 // ---------------------------------------------------------------------------

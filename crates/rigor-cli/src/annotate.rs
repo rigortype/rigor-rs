@@ -375,7 +375,10 @@ fn annotate_text(source: &str, line_types: &BTreeMap<usize, String>) -> String {
 /// `--format json` — the `{ "annotations": { "<line>": "<type>" } }` map
 /// (reference `emit_json`), 1-based string line keys in ascending order.
 fn emit_json(line_types: &BTreeMap<usize, String>) {
-    println!("{}", annotations_json_string(line_types));
+    // `JsonDocument.stamp` (v0.4.7, ADR-126 WD2): `schema_version` leads the
+    // CLI document. The MCP `annotate` tool keeps the bare map.
+    let doc = annotations_json_string(line_types);
+    println!("{{\"schema_version\":1,{}", &doc[1..]);
 }
 
 fn annotations_json_string(line_types: &BTreeMap<usize, String>) -> String {
