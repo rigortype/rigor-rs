@@ -12,7 +12,8 @@ use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
     closure_mutations, collect_flow_writes, indexed_flow_writes, join_flow_envs,
-    multi_target_binder, qualify_self, toplevel_mutations, toplevel_rebinds, widen_flow_writes,
+    multi_target_binder, qualify_self, toplevel_mutations, toplevel_rebinds, widen_clause_entry,
+    widen_flow_writes,
     DefKind, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
 };
 use crate::dead::DeadOp;
@@ -433,6 +434,18 @@ impl<'i> Typer<'i> {
                         .iter()
                         .find(|&&s| within_span(site, ast.get(s).span()))
                     {
+                        // Upstream #1837 (rigor #1231): with no `retry` aimed
+                        // at this `begin`, the arm reads each local the
+                        // protected body writes as `Dynamic[top]` — before
+                        // the reference binds, so `rescue => e` still wins.
+                        if let (Some(&f), Some(&l)) = (main_body.first(), main_body.last()) {
+                            if !clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
+                                let region = (ast.get(f).span().0, ast.get(l).span().1);
+                                widen_clause_entry(
+                                    &flow.rebinds, region, &flow.indexed.scope_spans, env, interner,
+                                );
+                            }
+                        }
                         // `rescue => e` binds the exception inside the arm —
                         // `bind_rescue_reference` on the oracle
                         // (`statement_evaluator.rb:5100`).
@@ -2258,13 +2271,23 @@ impl<'i> Typer<'i> {
                     self.flow_eval_scope(
                         ast, &main_body, &mut scratch, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                     );
+                    // Upstream #1837 (rigor #1231): with no `retry` aimed at
+                    // this `begin`, each arm reads a local the protected body
+                    // writes as `Dynamic[top]` (`widen_clause_entry`;
+                    // `rescue_writes` is nil under a retry edge, for EVERY arm).
+                    let body_region = match (main_body.first(), main_body.last()) {
+                        (Some(&f), Some(&l)) => Some((ast.get(f).span().0, ast.get(l).span().1)),
+                        _ => None,
+                    };
+                    let retried = clauses.iter().any(|c| self.clause_retries(ast, c.span));
                     let mut arm_envs = Vec::with_capacity(clauses.len());
                     for c in &clauses {
                         // The arm's entry scope is the `begin`'s ENTRY scope —
                         // the exception may fire before ANY try statement runs,
-                        // so try-body writes never flow in (probed: `timed =
-                        // nil; begin; timed = true; rescue; if timed` warns
-                        // FALSEY on the oracle, not truthy). A `retry` inside
+                        // so try-body writes never flow in — and since v0.4.3
+                        // (#1837) each name the body writes reads untyped there
+                        // (`timed = nil; begin; timed = true; rescue; if timed`
+                        // warned FALSEY up to v0.4.2, silent since). A `retry` inside
                         // the arm re-runs the `begin`, carrying the arm's own
                         // writes back round — widened, since the re-entry order
                         // is not the straight line (`retried = false; begin;
@@ -2279,6 +2302,8 @@ impl<'i> Typer<'i> {
                         let mut cenv = env.clone();
                         if self.clause_retries(ast, c.span) {
                             widen_flow_writes(rebinds, begin_span, &mut cenv, interner);
+                        } else if let (false, Some(region)) = (retried, body_region) {
+                            widen_clause_entry(rebinds, region, &indexed.scope_spans, &mut cenv, interner);
                         }
                         self.flow_eval_scope(
                             ast, &c.body, &mut cenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
@@ -2320,6 +2345,17 @@ impl<'i> Typer<'i> {
                             }
                         }
                     };
+                    // Upstream #1837 (rigor #1231 / #1457): the `ensure`
+                    // clause reads each local the body, its `else` or a rescue
+                    // arm writes as `Dynamic[top]` — the region is everything
+                    // ahead of the `ensure` statements (a method-level
+                    // `ensure` included: its `begin` is the `def` body). The
+                    // env past the `begin` is not this one, so the widening
+                    // stays inside the clause.
+                    if let Some(&first) = ensure_body.first() {
+                        let region = (begin_span.0, ast.get(first).span().0);
+                        widen_clause_entry(rebinds, region, &indexed.scope_spans, &mut eenv, interner);
+                    }
                     self.flow_eval_scope(
                         ast, &ensure_body, &mut eenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
                     );
