@@ -185,6 +185,14 @@ pub struct Config {
     /// `false` for the default (no file). Never (de)serialized.
     #[serde(skip)]
     parity_text_ok: bool,
+    /// Issue #476: the raw text of every `severity_overrides:` key written in
+    /// the loaded file and its `includes:` (each file's first document, in
+    /// read order). A non-String key's `to_s` depends on how Psych resolved
+    /// the PLAIN scalar, which the typed value no longer shows (`0o17` and
+    /// `15` both load here as 15; Psych keeps the first a String). Read only
+    /// by [`Config::severity_override_key_names`]. Never (de)serialized.
+    #[serde(skip)]
+    severity_override_key_texts: Vec<String>,
 }
 
 /// ADR-0036: the `rigor_rs:` namespace for rigor-rs-specific config keys — those
@@ -279,6 +287,7 @@ impl Default for Config {
             core_root: serde_yaml::Value::Null,
             base_dir: None,
             parity_text_ok: false,
+            severity_override_key_texts: Vec::new(),
         }
     }
 }
@@ -596,10 +605,12 @@ impl Config {
             Err(f) => return ConfigRead::Fatal(f),
         };
         let mut includes_seen = false;
+        let mut key_texts: Vec<String> = Vec::new();
         let merged = match load_with_includes(
             &absolute,
             &std::collections::BTreeSet::new(),
             &mut includes_seen,
+            &mut key_texts,
         ) {
             Ok(m) => m,
             Err(f) => return ConfigRead::Fatal(f),
@@ -648,6 +659,7 @@ impl Config {
             .get("signature_paths")
             .is_some_and(serde_yaml::Value::is_null);
         cfg.base_dir = absolute.parent().map(Path::to_path_buf);
+        cfg.severity_override_key_texts = key_texts;
         cfg.parity_text_ok = crate::conformance_gate::config_text_ok(
             &std::fs::read_to_string(&absolute).unwrap_or_default(),
         );
@@ -864,6 +876,44 @@ impl Config {
                 Some((key, sev))
             })
             .collect()
+    }
+
+    /// Issue #476 — the `severity_overrides:` keys as the reference's config
+    /// audit reads them (`configuration.severity_overrides.keys`):
+    /// `coerce_severity_overrides` builds a Hash of `k.to_s`, so `1:` names
+    /// `"1"`, `~:` names `""`, `true:` names `"true"`, and two keys with one
+    /// `to_s` collapse at the FIRST one's position. A non-String key's `to_s`
+    /// is Psych's resolution of its plain text ([`psych_plain_to_s`]), found
+    /// through [`Self::severity_override_key_texts`]; a key the texts cannot
+    /// settle (spellings that disagree, a `<<`-merged key, a float spelled
+    /// two ways) is left out, so the audit stays silent on it rather than
+    /// print another name. A String key prints as loaded when its plain
+    /// spelling would load as the same String; one Psych would read as
+    /// another type when plain (`on`, `1_000`, `017`, `1:30` — serde_yaml's
+    /// YAML 1.2 keeps them Strings) is left out too, because the loaded value
+    /// no longer says whether it was quoted.
+    #[must_use]
+    pub fn severity_override_key_names(&self) -> Vec<String> {
+        use serde_yaml::Value;
+        let Value::Mapping(map) = &self.severity_overrides else {
+            return Vec::new();
+        };
+        let mut out: Vec<String> = Vec::new();
+        for k in map.keys() {
+            let name = match k {
+                Value::String(s) => (psych_plain_to_s(s).as_deref() == Some(s.as_str())).then(|| s.clone()),
+                Value::Null | Value::Bool(_) | Value::Number(_) => {
+                    plain_key_to_s(k, &self.severity_override_key_texts)
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                if !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        out
     }
 
     /// Whether `paths:` was EXPLICITLY declared in the loaded `.rigor.yml` (vs.
@@ -1879,6 +1929,213 @@ fn utf8_error_detail(bytes: &[u8], start: usize) -> &'static str {
 /// applied Psych-style inside [`DupOkVisitor::visit_map`] — NEVER through
 /// `Value::apply_merge`, which errors on non-mapping merge values where
 /// Psych keeps `<<` as a literal key.
+/// Issue #476 — the raw text of each key of the top-level
+/// `severity_overrides:` mapping in `text`'s first document, in order.
+/// `String`'s deserialize asks serde_yaml for `deserialize_string`, which
+/// hands over a scalar's text unresolved (`1`, `~`, `0o17`). Anything this
+/// cannot read (a complex key, a non-mapping value) yields what was read so
+/// far; [`plain_key_to_s`] declines a key it finds no text for.
+fn severity_override_key_texts(text: &str) -> Vec<String> {
+    use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
+    struct Top<'a>(&'a mut Vec<String>);
+    struct Keys<'a>(&'a mut Vec<String>);
+    impl<'de> Visitor<'de> for Top<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a mapping")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                if key == "severity_overrides" {
+                    map.next_value_seed(Keys(&mut *self.0))?;
+                } else {
+                    map.next_value::<IgnoredAny>()?;
+                }
+            }
+            Ok(())
+        }
+    }
+    impl<'de> DeserializeSeed<'de> for Keys<'_> {
+        type Value = ();
+        fn deserialize<D: Deserializer<'de>>(self, d: D) -> Result<(), D::Error> {
+            d.deserialize_map(self)
+        }
+    }
+    impl<'de> Visitor<'de> for Keys<'_> {
+        type Value = ();
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            f.write_str("a mapping")
+        }
+        fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
+            while let Some(key) = map.next_key::<String>()? {
+                self.0.push(key);
+                map.next_value::<IgnoredAny>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut out = Vec::new();
+    if let Some(doc) = serde_yaml::Deserializer::from_str(text).next() {
+        let _ = doc.deserialize_map(Top(&mut out));
+    }
+    out
+}
+
+/// The `to_s` of a non-String `severity_overrides:` key: every written key
+/// text that serde_yaml resolves to `key` must give one Psych `to_s`, or the
+/// key is unsettled (`None`). Only texts made of the characters a YAML
+/// null, bool, int or float can be spelled with are resolved, so a quoted
+/// key's text is never re-read as YAML syntax.
+fn plain_key_to_s(key: &serde_yaml::Value, texts: &[String]) -> Option<String> {
+    use serde_yaml::Value;
+    let same = |a: &Value, b: &Value| match (a, b) {
+        (Value::Number(x), Value::Number(y)) if x.is_f64() && y.is_f64() => {
+            let (x, y) = (x.as_f64()?, y.as_f64()?);
+            Some(x == y && x.is_sign_negative() == y.is_sign_negative() || x.is_nan() && y.is_nan())
+        }
+        _ => Some(a == b),
+    };
+    let mut found: Option<String> = None;
+    for t in texts {
+        if !t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_' | b'~')) {
+            continue;
+        }
+        let resolved = if t.is_empty() {
+            Value::Null
+        } else {
+            match serde_yaml::from_str::<Value>(t) {
+                Ok(v) => v,
+                Err(_) => continue,
+            }
+        };
+        if !same(&resolved, key)? {
+            continue;
+        }
+        let s = psych_plain_to_s(t)?;
+        match &found {
+            Some(f) if *f != s => return None,
+            _ => found = Some(s),
+        }
+    }
+    found
+}
+
+/// `Psych::ScalarScanner#tokenize(text).to_s` for a PLAIN scalar (Ruby
+/// 4.0's Psych, legacy integers; `nil.to_s` is `""`), or `None` past
+/// `i128`. A time, a date or a symbol reads as its own text: plain, it
+/// makes the reference's `safe_load` raise `Psych::DisallowedClass` before
+/// any audit, so only the quoted String reaches one.
+fn psych_plain_to_s(t: &str) -> Option<String> {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static RES: OnceLock<[Regex; 8]> = OnceLock::new();
+    let [stringish, time, date, sexagesimal, sexagesimal_float, float, int, lone_dot] = RES.get_or_init(|| {
+        [
+            Regex::new(r"^[^\d.:-]?[\p{Alphabetic}_\s!@#$%^&*(){}<>|/\\~;=]+").unwrap(),
+            Regex::new(r"^-?\d{4}-\d{1,2}-\d{1,2}(?:[Tt]|\s+)\d{1,2}:\d\d:\d\d").unwrap(),
+            Regex::new(r"^\d{4}-(?:1[012]|0\d|\d)-(?:[12]\d|3[01]|0\d|\d)$").unwrap(),
+            Regex::new(r"^[-+]?[0-9][0-9_]*(:[0-5]?[0-9]){1,2}$").unwrap(),
+            Regex::new(r"^[-+]?[0-9][0-9_]*(:[0-5]?[0-9]){1,2}\.[0-9_]*$").unwrap(),
+            Regex::new(r"^[-+]?([0-9][0-9_,]*)?\.[0-9]*([eE][-+][0-9]+)?$").unwrap(),
+            Regex::new(
+                r"^(?:[-+]?0b[_,]*[0-1][0-1_,]*|[-+]?0[_,]*[0-7][0-7_,]*|[-+]?(?:0|[1-9](?:[0-9]|,[0-9]|_[0-9])*)|[-+]?0x[_,]*[0-9a-fA-F][0-9a-fA-F_,]*)$",
+            )
+            .unwrap(),
+            Regex::new(r"^[-+]?\.$").unwrap(),
+        ]
+    });
+    if t.is_empty() {
+        return Some(String::new());
+    }
+    if stringish.is_match(t) || t.contains('\n') {
+        let lower = t.to_ascii_lowercase();
+        return Some(if t.chars().count() > 5 {
+            t.to_string()
+        } else if !matches!(lower.chars().next(), Some('y' | 't' | 'o' | 'n' | 'f' | '~')) {
+            t.to_string()
+        } else if t == "~" || lower == "null" {
+            String::new()
+        } else if matches!(lower.as_str(), "yes" | "true" | "on") {
+            "true".to_string()
+        } else if matches!(lower.as_str(), "no" | "false" | "off") {
+            "false".to_string()
+        } else {
+            t.to_string()
+        });
+    }
+    // Ruby's `^` matches after any newline; only the first line can match
+    // these once the String branch took every text holding one.
+    if time.is_match(t) || date.is_match(t) {
+        return Some(t.to_string());
+    }
+    let lower = t.to_ascii_lowercase();
+    if lower == ".inf" || lower == "+.inf" {
+        return Some("Infinity".to_string());
+    }
+    if lower == "-.inf" {
+        return Some("-Infinity".to_string());
+    }
+    if lower == ".nan" {
+        return Some("NaN".to_string());
+    }
+    if t.starts_with(':') && t.chars().count() > 1 {
+        return Some(t.to_string());
+    }
+    if sexagesimal.is_match(t) {
+        // `n.to_i * 60 ** (e - 2).abs` summed: `1:30` is 5400, Psych's own
+        // reading (a two-part value counts hours and minutes).
+        let mut total: i128 = 0;
+        for (e, n) in t.split(':').enumerate() {
+            let digits: String = n.chars().filter(|&c| c != '_').collect();
+            let v: i128 = digits.parse().ok()?;
+            total += v * 60i128.pow((e as i32 - 2).unsigned_abs());
+        }
+        return Some(total.to_string());
+    }
+    if sexagesimal_float.is_match(t) {
+        let mut total = 0.0f64;
+        for (e, n) in t.split(':').enumerate() {
+            let digits: String = n.chars().filter(|&c| c != '_').collect();
+            let v: f64 = digits.parse().ok()?;
+            total += v * 60f64.powi((e as i32 - 2).abs());
+        }
+        return Some(rigor_types::ruby_float_to_s(total));
+    }
+    if float.is_match(t) {
+        if lone_dot.is_match(t) {
+            return Some(t.to_string());
+        }
+        // `Float(string.delete(',_').gsub(/\.([Ee]|$)/, '\1'))`
+        let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
+        let cleaned = match cleaned.find('.') {
+            Some(i) if matches!(cleaned[i + 1..].chars().next(), None | Some('e' | 'E')) => {
+                format!("{}{}", &cleaned[..i], &cleaned[i + 1..])
+            }
+            _ => cleaned,
+        };
+        return cleaned.parse::<f64>().ok().map(rigor_types::ruby_float_to_s);
+    }
+    if int.is_match(t) {
+        // `Integer(string.delete(',_'))`: `0b` / `0x` / a leading-`0` octal.
+        let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
+        let (neg, mag) = match cleaned.strip_prefix('-') {
+            Some(m) => (true, m),
+            None => (false, cleaned.strip_prefix('+').unwrap_or(&cleaned)),
+        };
+        let value = if let Some(h) = mag.strip_prefix("0x") {
+            i128::from_str_radix(h, 16).ok()?
+        } else if let Some(b) = mag.strip_prefix("0b") {
+            i128::from_str_radix(b, 2).ok()?
+        } else if mag.len() > 1 && mag.starts_with('0') {
+            i128::from_str_radix(&mag[1..], 8).ok()?
+        } else {
+            mag.parse::<i128>().ok()?
+        };
+        return Some(if neg { -value } else { value }.to_string());
+    }
+    Some(t.to_string())
+}
+
 fn parse_yaml(text: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
     let Some(doc) = serde_yaml::Deserializer::from_str(text).next() else {
         return Ok(serde_yaml::Value::Null);
@@ -2872,6 +3129,7 @@ fn load_with_includes(
     absolute: &Path,
     visited: &std::collections::BTreeSet<std::path::PathBuf>,
     includes_seen: &mut bool,
+    key_texts: &mut Vec<String>,
 ) -> Result<serde_yaml::Mapping, LoadFailure> {
     if visited.contains(absolute) {
         return Err(LoadFailure {
@@ -2882,6 +3140,10 @@ fn load_with_includes(
     let serde_yaml::Value::Mapping(mut raw) = read_yaml(absolute)? else {
         unreachable!("read_yaml yields a mapping");
     };
+    // `read_yaml` read it as UTF-8 already.
+    if let Ok(text) = std::fs::read_to_string(absolute) {
+        key_texts.extend(severity_override_key_texts(&text));
+    }
     let base_dir = absolute.parent().unwrap_or_else(|| Path::new("/"));
     let includes = match raw.remove("includes") {
         Some(v) => {
@@ -2893,7 +3155,7 @@ fn load_with_includes(
     resolve_paths_in(&mut raw, base_dir)?;
     let mut next_visited = visited.clone();
     next_visited.insert(absolute.to_path_buf());
-    merge_includes(raw, &includes, base_dir, &next_visited, includes_seen)
+    merge_includes(raw, &includes, base_dir, &next_visited, includes_seen, key_texts)
 }
 
 /// `Configuration::merge_includes`: each `includes:` entry is
@@ -2908,6 +3170,7 @@ fn merge_includes(
     base_dir: &Path,
     visited: &std::collections::BTreeSet<std::path::PathBuf>,
     includes_seen: &mut bool,
+    key_texts: &mut Vec<String>,
 ) -> Result<serde_yaml::Mapping, LoadFailure> {
     let mut accumulated = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
     for inc in includes {
@@ -2922,7 +3185,7 @@ fn merge_includes(
                 code: 64,
             });
         }
-        let sub = load_with_includes(&inc_path, visited, includes_seen)?;
+        let sub = load_with_includes(&inc_path, visited, includes_seen, key_texts)?;
         accumulated = deep_merge(
             &accumulated,
             &serde_yaml::Value::Mapping(sub),
