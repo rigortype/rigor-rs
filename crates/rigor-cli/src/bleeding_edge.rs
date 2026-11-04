@@ -97,7 +97,7 @@ pub fn cmd_show_bleedingedge(args: &[String]) -> ExitCode {
             "format",
             &[("format", false)],
             crate::optparse::ArgStyle::Required,
-            crate::optparse::ValueKind::Choice(&["text", "json"]),
+            crate::optparse::ValueKind::Exact(&["text", "json"]),
             "--format",
             "=FORMAT",
             &["Output format (text | json). Default: text."],

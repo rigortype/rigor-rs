@@ -56,7 +56,7 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
             "format",
             &[("format", false)],
             crate::optparse::ArgStyle::Required,
-            crate::optparse::ValueKind::Raw,
+            crate::optparse::ValueKind::Exact(&["text", "json"]),
             "--format",
             "=FORMAT",
             &["Output format: text or json"],
@@ -489,6 +489,8 @@ fn render_json(probe: &Probe) {
         "erased": probe.erased,
     });
     println!("{}", serde_json::to_string_pretty(&payload).unwrap());
+    // v0.4.7 `SHAPE_NOTICES[:type_of]` (ADR-126 WD4): stdout is unchanged.
+    eprintln!("{}", crate::json_document::type_of_notice());
 }
 
 #[cfg(test)]
@@ -588,9 +590,9 @@ mod tests {
     fn erases_string_keyed_hash_shape_to_hash_bound() {
         // A non-symbol (string) key cannot be an RBS record key, so the shape
         // generalizes to `Hash[String, V]` (reference `hash_erasure`), while
-        // `type:` keeps the value-pinned `{ "k": 2 }`.
+        // `type:` keeps the value-pinned `{ "k" => 2 }` (#2449 spelling).
         let (_kind, ty, erased) = probe_full("i = { \"k\" => 2 }\n", 1, 5);
-        assert_eq!(ty, "{ \"k\": 2 }");
+        assert_eq!(ty, "{ \"k\" => 2 }");
         assert_eq!(erased, "Hash[String, 2]");
     }
 

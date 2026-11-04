@@ -68,7 +68,7 @@ pub fn cmd_lsp(args: &[String]) -> ExitCode {
     use crate::optparse::{ArgStyle, OptParser, Switch, ValueKind};
     const SWITCHES: &[Switch] = &[
         Switch::new("transport", &[("transport", false)], ArgStyle::Required, ValueKind::Raw, "--transport", "=NAME", &["Transport (default: stdio; only stdio supported in v1)"]),
-        Switch::new("log", &[("log", false)], ArgStyle::Required, ValueKind::Raw, "--log", "=PATH", &["Write LSP wire log + server debug to PATH (default: stderr)"]),
+        Switch::new("log", &[("log", false)], ArgStyle::Required, ValueKind::Raw, "--log", "=PATH", &["Append the LSP wire log and server debug output to PATH (default: no wire log; debug output goes to stderr)"]),
         Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
     ];
     const PARSER: OptParser = OptParser::new(USAGE, SWITCHES);

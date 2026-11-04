@@ -82,6 +82,11 @@ pub enum ValueKind {
     /// prefix; the delivered value is the canonical entry (a string for us —
     /// symbol/string identity is irrelevant to the port).
     Choice(&'static [&'static str]),
+    /// Reference `Options.add_format` (#2502): a raw switch whose block raises
+    /// `InvalidArgument` unless the value is EXACTLY one of the list — no
+    /// prefix completion, so `--format=j` is `invalid argument: --format=j`
+    /// at parse time, before any analysis runs.
+    Exact(&'static [&'static str]),
 }
 
 /// One `opts.on(...)` declaration.
@@ -230,7 +235,12 @@ impl Parsed {
                     eprint!("{stderr}");
                 }
                 if code == 64 {
-                    eprintln!("{usage}");
+                    // `puts`: no second newline after a heredoc USAGE.
+                    if usage.ends_with('\n') {
+                        eprint!("{usage}");
+                    } else {
+                        eprintln!("{usage}");
+                    }
                 }
                 Err(ExitCode::from(code))
             }
@@ -374,7 +384,21 @@ impl OptParser {
     /// `parser.parse!(argv)` — `order!` when `POSIXLY_CORRECT` is present
     /// (even empty), `permute!` otherwise.
     pub fn parse(&self, argv: &[String]) -> Parsed {
-        let posix = std::env::var_os("POSIXLY_CORRECT").is_some();
+        self.parse_mode(argv, std::env::var_os("POSIXLY_CORRECT").is_some())
+    }
+
+    /// `parser.order!(argv)` — stops at the first positional regardless of
+    /// `POSIXLY_CORRECT` (reference `rigor help`'s `parse_help_options`).
+    pub fn parse_order(&self, argv: &[String]) -> Parsed {
+        self.parse_mode(argv, true)
+    }
+
+    /// `pub(crate)` for completeness: the banner + switch summary `--help` prints.
+    pub fn help(&self) -> String {
+        self.help_text()
+    }
+
+    fn parse_mode(&self, argv: &[String], posix: bool) -> Parsed {
         let mut rest: VecDeque<String> = argv.iter().cloned().collect();
         let mut items: Vec<Item> = Vec::new();
         let mut nonopts: Vec<String> = Vec::new();
@@ -963,6 +987,13 @@ fn convert(kind: ValueKind, v: &str) -> Result<Value, ValueError> {
             let cleaned: String = v.chars().filter(|&c| c != '_').collect();
             Ok(Value::Float(cleaned.parse::<f64>().unwrap_or(0.0)))
         }
+        ValueKind::Exact(list) => {
+            if list.contains(&v) {
+                Ok(Value::Str(v.to_string()))
+            } else {
+                Err(ValueError::Invalid)
+            }
+        }
         ValueKind::Choice(list) => {
             // `CompletingHash#match`: exact fetch, else unique-prefix
             // completion (same subsumption rule as option names).
@@ -1261,6 +1292,22 @@ fn dym_levenshtein(a: &str, b: &str) -> usize {
 /// in dictionary order (the `all_candidates & correct` in
 /// `OptionParser#additional_message`).
 fn spell_correct(dict: &[String], input: &str) -> Vec<String> {
+    let corrections = spell_checker_correct(dict, input);
+    let mut out: Vec<String> = Vec::new();
+    for cand in dict {
+        if corrections.iter().any(|c| c == cand) && !out.iter().any(|c| c == cand) {
+            out.push(cand.clone());
+        }
+    }
+    out
+}
+
+/// `DidYouMean::SpellChecker.new(dictionary:).correct(input)` — the
+/// corrections in the checker's own (score) order. The CLI's
+/// ``Did you mean `rigor X`?`` lines take its `.first`.
+pub fn spell_checker_correct<S: AsRef<str>>(dict: &[S], input: &str) -> Vec<String> {
+    let dict: Vec<String> = dict.iter().map(|w| w.as_ref().to_string()).collect();
+    let dict = &dict;
     let norm = |s: &str| s.to_lowercase().replace('@', "");
     let ni = norm(input);
     let threshold = if ni.chars().count() > 3 { 0.834 } else { 0.77 };
@@ -1290,13 +1337,7 @@ fn spell_correct(dict: &[String], input: &str) -> Vec<String> {
             }
         }
     }
-    let mut out: Vec<String> = Vec::new();
-    for cand in dict {
-        if corrections.iter().any(|c| c == cand) && !out.iter().any(|c| c == cand) {
-            out.push(cand.clone());
-        }
-    }
-    out
+    corrections
 }
 
 #[cfg(test)]
@@ -1400,6 +1441,37 @@ mod tests {
                 assert_eq!(stderr, "invalid argument: --workers bogus\n");
             }
             _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn exact_value_list_refuses_a_prefix() {
+        // Reference `Options.add_format` (#2502): exact match only, and the
+        // refusal names the whole token (`=` form) or the pair.
+        const EX: &[Switch] = &[Switch::new(
+            "format",
+            &[("format", false)],
+            ArgStyle::Required,
+            ValueKind::Exact(&["text", "json"]),
+            "--format",
+            "=FORMAT",
+            &["format"],
+        )];
+        let p = OptParser::new("Usage: t [options]", EX);
+        let i = items(p.parse(&argv("--form=json")));
+        assert!(matches!(&i[0], Item::Opt { key: "format", value: Some(Value::Str(v)), .. } if v == "json"));
+        for (args, want) in [
+            ("--format=j", "invalid argument: --format=j\n"),
+            ("--format j", "invalid argument: --format j\n"),
+            ("--form=bogus", "invalid argument: --form=bogus\n"),
+        ] {
+            match p.parse(&argv(args)) {
+                Parsed::Exit { stderr, code, .. } => {
+                    assert_eq!(code, 64);
+                    assert_eq!(stderr, want);
+                }
+                _ => panic!("{args} parsed"),
+            }
         }
     }
 }

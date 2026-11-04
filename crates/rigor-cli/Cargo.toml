@@ -54,6 +54,10 @@ rigor-effects = { path = "../rigor-effects" }
 # existing target `.rbs` for byte-offset splice locations + member identity.
 # Same version rigor-index already depends on (in Cargo.lock, cached offline).
 ruby-rbs = "0.3"
+# The C parser's error token (range + type), which `ruby-rbs` does not
+# surface: sig-gen's `RBS::ParsingError`-shaped refusal message. Already in
+# Cargo.lock as `ruby-rbs`'s own dependency.
+ruby-rbs-sys = "0.3"
 # Config loader (.rigor.yml) deps — all already present in Cargo.lock / cached
 # (serde 1.0.228, serde_yaml 0.9.34, glob 0.3.3); no network fetch needed.
 serde = { version = "1", features = ["derive"] }

@@ -145,7 +145,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     use crate::optparse::{ArgStyle, Item, OptParser, Switch, ValueKind};
     const SWITCHES: &[Switch] = &[
         Switch::new("config", &[("config", false)], ArgStyle::Required, ValueKind::Raw, "--config", "=PATH", &["Path to the Rigor configuration file"]),
-        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Raw, "--format", "=FORMAT", &["Output format: text (default) or json"]),
+        Switch::new("format", &[("format", false)], ArgStyle::Required, ValueKind::Exact(&["text", "json"]), "--format", "=FORMAT", &["Output format: text (default) or json"]),
         Switch::new("full", &[("full", false)], ArgStyle::Flag, ValueKind::Raw, "--full", "", &["List every method, including the ones with nothing to say"]),
         Switch::new("label", &[("label", false)], ArgStyle::Required, ValueKind::Raw, "--label", "=LABEL", &["Only methods carrying LABEL (or a label under it), in either lane"]),
         Switch::new("pure", &[("pure", false)], ArgStyle::Flag, ValueKind::Raw, "--pure", "", &["Only methods proven to do nothing beyond mutate.local — the %a{pure} set"]),
@@ -202,6 +202,20 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
         eprintln!("unsupported format: {format}");
         eprintln!("{USAGE}");
         return ExitCode::from(64);
+    }
+
+    // v0.4.7 `misspelled_verb?`: a first word that is no path (no `/` or
+    // `.`, not an existing file) but is near a snapshot verb is a misspelled
+    // subcommand, not a scope.
+    if let Some(word) = positional.first() {
+        if !word.contains(['/', '.']) && !Path::new(word).exists() {
+            let verbs = ["update", "check", "diff", "explain"];
+            if let Some(nearest) = crate::optparse::spell_checker_correct(&verbs, word).first() {
+                eprintln!("rigor: unknown effects subcommand: {word}");
+                eprintln!("Did you mean `rigor effects {nearest}`?");
+                return ExitCode::from(64);
+            }
+        }
     }
 
     // The file `config_declares_effect_lane` probes is the one
@@ -518,8 +532,9 @@ fn render_json(rows: &[Row]) -> String {
             }),
         );
     }
-    serde_json::to_string_pretty(&serde_json::json!({ "methods": methods }))
-        .unwrap_or_else(|_| "{\"methods\":{}}".to_string())
+    let doc = serde_json::to_string_pretty(&serde_json::json!({ "methods": methods }))
+        .unwrap_or_else(|_| "{\n  \"methods\": {}\n}".to_string());
+    crate::json_document::stamp_pretty(&doc, None)
 }
 
 fn render_text(rows: &[Row]) {

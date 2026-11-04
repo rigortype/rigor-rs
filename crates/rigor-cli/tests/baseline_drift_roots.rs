@@ -1,5 +1,10 @@
-//! End-to-end regression coverage for the `baseline drift`/`prune` positional-root
-//! extension and the silently-empty-audit guard.
+//! End-to-end regression coverage for the `baseline` positional-argument
+//! refusal and the silently-empty-audit guard.
+//!
+//! v0.4.7 (#2575, reference issues #2466/#2577): every `baseline` subcommand
+//! refuses positional paths (exit 64) — the baseline always covers the
+//! configured `paths:`. The positional-root extension described below is gone;
+//! the empty-analysis-set guard remains.
 //!
 //! The defect (branch `baseline-drift-roots`): `drift`/`prune` dropped positional
 //! path arguments and analyzed ONLY the config `paths:` directive. On a project
@@ -75,35 +80,30 @@ fn fixture_project() -> TempDir {
     dir
 }
 
+/// Seed a non-empty baseline at `bl` by generating under a temporary
+/// `paths: [.]` config, then remove the config again (no `.rigor.yml`).
+fn seed_baseline(dir: &Path, bl: &str) {
+    let cfg = dir.join(".rigor.yml");
+    fs::write(&cfg, b"paths:\n  - .\n").expect("write config");
+    let (_o, err, code) = run_rigor(dir, &["baseline", "generate", "--output", bl, "--force"]);
+    assert_eq!(code, 0, "seed generate should succeed; stderr: {err}");
+    fs::remove_file(&cfg).expect("remove config");
+    assert!(fs::read_to_string(bl).unwrap().contains("sample.rb"));
+}
+
 #[test]
-fn generate_then_drift_with_positional_root_reports_zero_drift() {
+fn every_subcommand_refuses_positional_paths() {
     let dir = fixture_project();
-    let bl = dir.path().join("bl.yml");
-    let bl_str = bl.to_str().unwrap();
-
-    // generate over the positional root `.` writes a non-empty baseline.
-    let (_o, gen_err, gen_code) =
-        run_rigor(dir.path(), &["baseline", "generate", ".", "--output", bl_str, "--force"]);
-    assert_eq!(gen_code, 0, "generate should succeed; stderr: {gen_err}");
-    assert!(bl.exists(), "baseline file should be written");
-    let bl_body = fs::read_to_string(&bl).unwrap();
-    assert!(
-        bl_body.contains("sample.rb"),
-        "baseline should record the sample.rb diagnostic; got:\n{bl_body}"
-    );
-
-    // drift over the SAME positional root must see the same diagnostic → no drift.
-    let (drift_out, drift_err, drift_code) =
-        run_rigor(dir.path(), &["baseline", "drift", ".", "--baseline", bl_str]);
-    assert_eq!(drift_code, 0, "drift should succeed; stderr: {drift_err}");
-    assert!(
-        drift_out.contains("No drift detected."),
-        "drift with a positional root must report no drift, NOT all-cleared; got stdout:\n{drift_out}\nstderr:\n{drift_err}"
-    );
-    assert!(
-        !drift_out.contains("Cleared"),
-        "drift must not report any Cleared bucket; got:\n{drift_out}"
-    );
+    for sub in ["generate", "regenerate", "dump", "drift", "prune"] {
+        let (out, err, code) = run_rigor(dir.path(), &["baseline", sub, "."]);
+        assert_eq!(code, 64, "{sub} . must be a usage error; stderr: {err}");
+        assert!(out.is_empty(), "{sub}: nothing on stdout; got {out}");
+        assert!(
+            err.starts_with(&format!("rigor baseline {sub}: unexpected argument(s) \".\"; ")),
+            "{sub}: got {err}"
+        );
+    }
+    assert!(!dir.path().join(".rigor-baseline.yml").exists(), "nothing may be written");
 }
 
 #[test]
@@ -112,10 +112,8 @@ fn drift_without_roots_or_config_paths_against_nonempty_baseline_errors() {
     let bl = dir.path().join("bl.yml");
     let bl_str = bl.to_str().unwrap();
 
-    // Seed a non-empty baseline (via a positional root).
-    let (_o, _e, gen_code) =
-        run_rigor(dir.path(), &["baseline", "generate", ".", "--output", bl_str, "--force"]);
-    assert_eq!(gen_code, 0);
+    // Seed a non-empty baseline.
+    seed_baseline(dir.path(), bl_str);
 
     // drift with NO positional AND no config `paths:` must refuse (exit 64),
     // not silently report all-cleared.
@@ -163,9 +161,7 @@ fn prune_without_roots_or_config_paths_against_nonempty_baseline_errors() {
     let bl = dir.path().join("bl.yml");
     let bl_str = bl.to_str().unwrap();
 
-    let (_o, _e, gen_code) =
-        run_rigor(dir.path(), &["baseline", "generate", ".", "--output", bl_str, "--force"]);
-    assert_eq!(gen_code, 0);
+    seed_baseline(dir.path(), bl_str);
     let before = fs::read_to_string(&bl).unwrap();
 
     // prune with an empty analysis set must refuse rather than empty the baseline.
