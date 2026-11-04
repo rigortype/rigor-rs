@@ -51,6 +51,9 @@ pub(crate) struct AncestryIndex {
     /// Upstream v0.4.2 (#1706): every file's top-level `include` names
     /// ([`AncestryFacts::toplevel_includes`]), project-wide, deduplicated.
     toplevel_includes: Vec<String>,
+    /// Upstream v0.4.2 (#1701): the gated vendored features some analysed
+    /// file requires ([`AncestryFacts::required_features`]).
+    required_features: HashSet<String>,
 }
 
 impl AncestryIndex {
@@ -77,6 +80,7 @@ impl AncestryIndex {
         self.contested.extend(facts.contested_visibilities.iter().cloned());
         self.dirty.extend(facts.dirty_owners.iter().cloned());
         self.def_owners.extend(facts.def_owners.iter().cloned());
+        self.required_features.extend(facts.required_features.iter().cloned());
         for raw in &facts.toplevel_includes {
             if !self.toplevel_includes.contains(raw) {
                 self.toplevel_includes.push(raw.clone());
@@ -511,6 +515,13 @@ fn external_may_define(core: &CoreIndex, from: &str, raw: &str, method: &str, ex
 }
 
 impl SourceIndex {
+    /// Upstream v0.4.2 (#1701, `Environment::RequiredFeatures`): whether some
+    /// analysed file requires the gated vendored `feature` (`"prime"`), which
+    /// the reference answers by loading that gem's signatures.
+    pub fn requires_vendored_feature(&self, feature: &str) -> bool {
+        self.ancestry.required_features.contains(feature)
+    }
+
     /// Upstream v0.4.2 (#1706 / issue #1697; `Inference::ObjectMixins.may_define?`)
     /// — whether a module the project mixes into `Object` may define `method`:
     /// a top-level `include M` in any analysed file (`main.include`, i.e.

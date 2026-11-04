@@ -87,6 +87,16 @@ ingested by `CoreData::load()` (`src/rbs.rs`) when `RIGOR_RBS_CORE_DIR` is unset
     `v0.3.2` pin and is not optional: `nokogiri.rbs` declares
     `Nokogiri::CSS::Parser < Racc::Parser`, and a declared superclass with no
     declaration anywhere took that whole definition down (upstream #299).
+    `prime/` (upstream v0.4.2, #1700/#1701) is deliberately NOT copied: the
+    reference loads it only when an analysed file's text requires `"prime"`
+    (`Environment::RequiredFeatures`, plus the `singleton` library supplement),
+    and stays lenient on an unknown `Prime` / `Integer#prime?` otherwise, so an
+    unconditional copy would fire where it is silent. The port mirrors the gate
+    as a decline instead: `AncestryFacts::required_features` scans each file
+    with the reference's `PATTERN`, and the driver drops `call.undefined-method`
+    on the four `Integer` names `integer-extension.rbs` declares wherever a
+    file requires it (coverage: the reference's checks against those
+    signatures, e.g. `12.prime?(1)`'s wrong-arity, stay unported).
   - `overlay/rbs_shims/` ⇐ the **rbs GEM's** `sig/shims/` (`bundler.rbs`,
     `rubygems.rbs`, `enumerable.rbs`) — the one place this tree deliberately
     reaches into the `rbs` gem's own `sig/`, and the `v0.3.2` pin is what forced
@@ -176,7 +186,7 @@ five overlay files and adding two directories.
 rsync -a --delete --exclude README.md --exclude hash_rbs3.rbs \
   reference/rigor/data/core_overlay/ \
   crates/rigor-index/vendor/rbs/overlay/core_overlay/
-rsync -a --delete --exclude README.md --exclude prism/ \
+rsync -a --delete --exclude README.md --exclude prism/ --exclude prime/ \
   reference/rigor/data/vendored_gem_sigs/ \
   crates/rigor-index/vendor/rbs/overlay/vendored_gem_sigs/
 cp "$(gem env gemdir)"/gems/rbs-<version>/sig/shims/*.rbs \
@@ -184,8 +194,8 @@ cp "$(gem env gemdir)"/gems/rbs-<version>/sig/shims/*.rbs \
 ```
 
 Then `diff -r` both `data/` halves against the copies: an "Only in reference"
-line is a new file to consider, and the `prism/` and `hash_rbs3.rbs` exclusions
-are the two deliberate omissions (plus the `README.md`s).
+line is a new file to consider, and the `prism/`, `prime/` and `hash_rbs3.rbs`
+exclusions are the three deliberate omissions (plus the `README.md`s).
 
 **`rsync -a` preserves the SOURCE mtimes, and `build.rs` only re-embeds on
 `cargo:rerun-if-changed=vendor/rbs`.** A file added with an mtime older than the

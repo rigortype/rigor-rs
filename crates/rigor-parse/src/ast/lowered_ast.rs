@@ -497,7 +497,8 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
-    let ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
+    let mut ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
+    ancestry_facts.required_features = super::ancestry_facts::required_vendored_features(source);
     let mut local_read_starts: Vec<usize> = builder
         .nodes
         .iter()

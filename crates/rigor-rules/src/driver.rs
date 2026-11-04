@@ -415,6 +415,19 @@ pub fn analyze_with_source_and_folder(
         });
     }
 
+    // Upstream v0.4.2 (#1700/#1701): a `require "prime"` in any analysed file
+    // loads the vendored prime signatures, which declare `Integer#prime?`,
+    // `#prime_division`, `Integer.each_prime` and `.from_prime_division`. The
+    // port does not vendor them (loading them unconditionally would fire where
+    // the reference, without the require, stays lenient), so it declines
+    // `call.undefined-method` on those names wherever the require exists.
+    if source.requires_vendored_feature("prime") {
+        out.retain(|d| {
+            d.rule_id != crate::CALL_UNDEFINED_METHOD
+                || !d.method_name.as_deref().is_some_and(|m| PRIME_INTEGER_METHODS.contains(&m))
+        });
+    }
+
     // Upstream v0.4.2 (#1706 / issue #1697): a module the project mixes into
     // `Object` gives every object its instance methods, so no receiver's
     // `call.undefined-method` can witness a name such a module declares (the
@@ -432,6 +445,11 @@ pub fn analyze_with_source_and_folder(
 
     out
 }
+
+/// The `Integer` methods the vendored prime signatures (`integer-extension.rbs`)
+/// declare, instance and singleton.
+const PRIME_INTEGER_METHODS: &[&str] =
+    &["prime?", "prime_division", "each_prime", "from_prime_division"];
 
 /// The rules the reference withholds where an unreadable refinement is in
 /// effect (ADR-121 WD7): every reader of `refined_method_in_effect?` /

@@ -94,6 +94,78 @@ pub struct AncestryFacts {
     /// method, a conditional, a `send(:include, …)` and a top-level `extend` are not
     /// recorded, exactly as the reference's `toplevel_include_owner` leaves them.
     pub toplevel_includes: Vec<String>,
+    /// Upstream v0.4.2 (#1700/#1701, `Environment::RequiredFeatures`): the
+    /// gated vendored features (only `"prime"`) this file's TEXT requires,
+    /// scanned exactly as the reference's `PATTERN` + `commented?` do — see
+    /// [`required_vendored_features`].
+    pub required_features: Vec<String>,
+}
+
+/// `RequiredFeatures::VENDORED_DIRS`' keys: the features whose vendored gem
+/// signatures the reference loads only when some analysed file requires them.
+pub const GATED_FEATURES: &[&str] = &["prime"];
+
+/// The reference's `RequiredFeatures.features_of`: every [`GATED_FEATURES`]
+/// entry `source` names in a `require "x"` / `require('x')` /
+/// `Kernel.require "x"` (not `obj.require`, not `require_relative`, not a
+/// computed name), skipping a match on a whole-line comment. Textual, so a
+/// heredoc, `=begin` block or trailing comment counts, as it does upstream.
+pub fn required_vendored_features(source: &[u8]) -> Vec<String> {
+    let mut out = Vec::new();
+    for feature in GATED_FEATURES {
+        if !source.windows(feature.len()).any(|w| w == feature.as_bytes()) {
+            continue;
+        }
+        let word = b"require";
+        let mut i = 0;
+        let mut found = false;
+        while !found && i + word.len() <= source.len() {
+            if &source[i..i + word.len()] != word {
+                i += 1;
+                continue;
+            }
+            let at = i;
+            i += 1;
+            // `(?:(?<![\w.$@])|(?<=Kernel\.))`
+            let ok_prefix = at == 0 || {
+                let b = source[at - 1];
+                !(b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 || b == b'.' || b == b'$' || b == b'@')
+                    || source[..at].ends_with(b"Kernel.")
+            };
+            if !ok_prefix {
+                continue;
+            }
+            let mut j = at + word.len();
+            while j < source.len() && (source[j] == b' ' || source[j] == b'\t') {
+                j += 1;
+            }
+            if j < source.len() && source[j] == b'(' {
+                j += 1;
+                while j < source.len() && (source[j] == b' ' || source[j] == b'\t') {
+                    j += 1;
+                }
+            }
+            let Some(&q) = source.get(j) else { continue };
+            if q != b'"' && q != b'\'' {
+                continue;
+            }
+            let name_end = j + 1 + feature.len();
+            if source.get(j + 1..name_end) != Some(feature.as_bytes()) || source.get(name_end) != Some(&q) {
+                continue;
+            }
+            // `commented?`: the line's first non-blank byte is `#`.
+            let line_start = source[..at].iter().rposition(|&b| b == b'\n').map_or(0, |p| p + 1);
+            let lead = &source[line_start..at];
+            let first = lead.iter().find(|b| !b.is_ascii_whitespace());
+            if first != Some(&b'#') {
+                found = true;
+            }
+        }
+        if found {
+            out.push((*feature).to_string());
+        }
+    }
+    out
 }
 
 const TOGGLES: [&str; 4] = ["private", "protected", "public", "module_function"];
@@ -581,4 +653,42 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
     };
     c.visit(root);
     c.out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::required_vendored_features as scan;
+
+    /// The reference's `RequiredFeatures::PATTERN` + `commented?`, row by row.
+    #[test]
+    fn required_feature_scan_matches_the_reference_pattern() {
+        let yes: &[&[u8]] = &[
+            b"require \"prime\"\n",
+            b"require 'prime'",
+            b"require('prime')",
+            b"require ( \"prime\" )",
+            b"Kernel.require 'prime'",
+            b"p 1 # require \"prime\"\n",
+            b"x = <<~R\n  require 'prime'\nR\n",
+            b"  x; require \"prime\"",
+        ];
+        for src in yes {
+            assert_eq!(scan(src), vec!["prime".to_string()], "{}", String::from_utf8_lossy(src));
+        }
+        let no: &[&[u8]] = &[
+            b"# require \"prime\"\n",
+            b"   # require 'prime'",
+            b"require_relative 'prime'",
+            b"obj.require 'prime'",
+            b"$require 'prime'",
+            b"require \"primes\"",
+            b"require 'prime\"",
+            b"send(:require, 'prime')",
+            b"require(\n'prime')",
+            b"prime = 1",
+        ];
+        for src in no {
+            assert!(scan(src).is_empty(), "{}", String::from_utf8_lossy(src));
+        }
+    }
 }
