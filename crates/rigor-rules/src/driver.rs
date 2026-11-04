@@ -186,7 +186,18 @@ pub fn analyze_with_source_and_folder(
                     if crate::span_within(*span, rspan) && case_widened.contains(&name.as_str()))
             })
         };
-        let diag = (!nil_skip)
+        // Upstream v0.4.5 (#2086 / issue #1722, `singleton_local_def?`): a
+        // local whose object this scope gives singleton methods (`def o.m`,
+        // `o.extend(M)`, `class << o`, …) declines `call.undefined-method`.
+        let singleton_local = match ast.get(recv) {
+            Node::LocalVariableRead { name, .. } => ast.ancestry_facts().singleton_locals.holds(
+                name,
+                &method,
+                ast.get(call_id).span().0,
+            ),
+            _ => false,
+        };
+        let diag = (!nil_skip && !singleton_local)
             .then(|| {
                 check_call(
                     ast, recv, &method, message_span, safe_nav, env, &typer, interner, index,
@@ -194,7 +205,7 @@ pub fn analyze_with_source_and_folder(
             })
             .flatten()
             .or_else(|| {
-                if snap_skip {
+                if snap_skip || singleton_local {
                     return None;
                 }
                 check_narrowed_call(
@@ -211,7 +222,7 @@ pub fn analyze_with_source_and_folder(
                 // union-then-rejoin on both edges (rigor-rs#139). `gate_env`'s
                 // unwidened bindings stay for the narrowing rule, whose snaps
                 // replace a Dynamic carrier rather than witness a concrete one.
-                if snap_skip {
+                if snap_skip || singleton_local {
                     return None;
                 }
                 check_collection_call(

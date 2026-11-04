@@ -97,6 +97,52 @@ fn unenumerable_instance_receiver(index: &CoreIndex, class_name: &str) -> bool {
     unenumerable_receiver_class(class_name) || index.is_qualified_module(class_name)
 }
 
+/// Upstream v0.4.5 (#2086 / issue #1722, `subclass_instance_may_answer?`'s
+/// `exact_literal_receiver?`): a value the engine built from a literal is
+/// exactly its class — a literal type, a tuple or a hash shape, or a union
+/// of them.
+fn exact_literal_receiver(interner: &Interner, ty: rigor_types::TypeId) -> bool {
+    let exact = |t: rigor_types::TypeId| {
+        matches!(interner.get(t), Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_))
+    };
+    match interner.get(ty) {
+        Type::Union(members) => members.iter().all(|m| exact(*m)),
+        _ => exact(ty),
+    }
+}
+
+/// `LITERAL_RECEIVER_NODES`: a receiver WRITTEN as a String / xstring /
+/// Array / Hash / Regexp literal. A parenthesised one is a `ParenthesesNode`
+/// on the reference, so an unwrapped receiver is not a literal here.
+fn literal_receiver_node(ast: &LoweredAst, receiver: rigor_parse::NodeId) -> bool {
+    !ast.paren_unwrapped(receiver)
+        && matches!(
+            ast.get(receiver),
+            rigor_parse::Node::StringLit { .. }
+                | rigor_parse::Node::InterpolatedString { .. }
+                | rigor_parse::Node::ArrayLit { .. }
+                | rigor_parse::Node::HashLit { .. }
+        )
+}
+
+/// Upstream v0.4.5 (#2086 / issue #1722) — the program may answer an
+/// instance call the RBS lookup found absent on `class_name`: a
+/// `method_missing` or project mixin on an RBS ancestor
+/// (`rbs_ancestor_may_answer?`), or, for a receiver typed by its class's
+/// name rather than built from a literal (`exact` false), a project subclass
+/// that defines the method (`subclass_instance_may_answer?`). Asked last,
+/// once every other gate has come back "absent".
+fn core_instance_may_answer(
+    source: &rigor_infer::SourceIndex,
+    index: &CoreIndex,
+    class_name: &str,
+    method: &str,
+    exact: bool,
+) -> bool {
+    source.core_ancestor_may_answer(index, class_name, method)
+        || (!exact && source.project_subclass_may_define(class_name, method))
+}
+
 /// Apply `call.undefined-method` to a single call with a receiver.
 ///
 /// Zero-false-positive gate (ADR-0023): emit *only* when the receiver's concrete
@@ -158,6 +204,10 @@ pub(crate) fn check_call(
         // class-method surface is fully known and lacks the method (handles
         // `extend`ed modules; incomplete/unknown ⇒ `true` ⇒ silent).
         if index.class_has_singleton_method(name, method) {
+            return None;
+        }
+        // Upstream v0.4.5 (#2086) — `singleton_hook?`.
+        if typer.source().core_singleton_hook(index, name) {
             return None;
         }
         let receiver_render = format!("singleton({name})");
@@ -290,6 +340,13 @@ pub(crate) fn check_call(
                 || (index.knows_qualified_class(name)
                     && typer.source().is_declaration_only_class(name)))
                 && !index.qualified_class_has_method(name, method)
+                && !core_instance_may_answer(
+                    typer.source(),
+                    index,
+                    name,
+                    method,
+                    exact_literal_receiver(interner, recv_ty) || literal_receiver_node(ast, receiver),
+                )
             {
                 let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
                 let message = format!("undefined method `{method}' for {receiver_render}");
@@ -346,6 +403,15 @@ pub(crate) fn check_call(
         .source()
         .project_declares_method_through_ancestors(typer.file_key(), class_name, method)
     {
+        return None;
+    }
+    if core_instance_may_answer(
+        typer.source(),
+        index,
+        class_name,
+        method,
+        exact_literal_receiver(interner, recv_ty) || literal_receiver_node(ast, receiver),
+    ) {
         return None;
     }
 
@@ -485,6 +551,16 @@ fn check_union_call(
                         return None;
                     }
                 }
+                // Upstream v0.4.5 (#2086, `arm_surface_may_answer?`).
+                if core_instance_may_answer(
+                    typer.source(),
+                    index,
+                    &class_name,
+                    method,
+                    exact_literal_receiver(interner, member),
+                ) {
+                    return None;
+                }
                 arm_classes.push(class_name);
             }
         }
@@ -617,6 +693,10 @@ pub(crate) fn check_narrowed_call(
     if typer.source().project_declares_method(typer.file_key(), class_name, method) {
         return None;
     }
+    // Upstream v0.4.5 (#2086) — a narrowed receiver is typed by its class.
+    if core_instance_may_answer(typer.source(), index, class_name, method, false) {
+        return None;
+    }
     // Render the narrowed receiver as the reference does — the FULL resolved
     // path ("undefined method `frobnicate_zzz' for URI::HTTP", probes §1/§3),
     // which for a core name is the same plain class name `Nominal[C]` rendered
@@ -692,6 +772,11 @@ pub(crate) fn check_collection_call(
         return None;
     }
     if typer.source().project_declares_method(typer.file_key(), class_name, method) {
+        return None;
+    }
+    // Upstream v0.4.5 (#2086) — the carrier's exactness is not read here, so
+    // the subclass half is asked too (declines more).
+    if core_instance_may_answer(typer.source(), index, class_name, method, false) {
         return None;
     }
     let class = index.class_id(class_name)?;

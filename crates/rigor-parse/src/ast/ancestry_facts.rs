@@ -99,6 +99,19 @@ pub struct AncestryFacts {
     /// scanned exactly as the reference's `PATTERN` + `commented?` do — see
     /// [`required_vendored_features`].
     pub required_features: Vec<String>,
+    /// Upstream v0.4.5 (#2086 / issue #1722) — every RECEIVER-form instance
+    /// mixin `X.include(M)` / `X.prepend(M)` / `X.send(:include, M)`, wherever
+    /// it is written: `(owner candidates, from, names)`, with `from` the call's
+    /// lexical nesting plus one placeholder segment (the shape
+    /// `resolve_override_ancestor` reads) and a non-constant argument as
+    /// [`WILDCARD`]. The reference records such an edge (unpositioned) under
+    /// the class the receiver names; the port keeps its wildcard taint for the
+    /// order readers and lists the names here for the set-shaped
+    /// `call.undefined-method` decline only.
+    pub receiver_mixins: Vec<(Vec<String>, String, Vec<String>)>,
+    /// Upstream v0.4.5 (#2086 / issue #1722) — the reference's
+    /// `LexicalMethodSites` singleton-local table for this file.
+    pub singleton_locals: super::singleton_locals::SingletonLocals,
 }
 
 /// `RequiredFeatures::VENDORED_DIRS`' keys: the features whose vendored gem
@@ -418,6 +431,15 @@ impl Census {
         if let Some(raw) = strict_constant_path_string(&recv) {
             let side = if kind == "extend" { MixinSide::Extend } else { MixinSide::Include };
             let owners = self.candidates(&raw);
+            if kind != "extend" && !args.is_empty() {
+                let mut listed = names.clone();
+                if !complete {
+                    listed.push(WILDCARD.to_string());
+                }
+                let mut from = self.prefix.clone();
+                from.push("_".to_string());
+                self.out.receiver_mixins.push((owners.clone(), from.join("::"), listed));
+            }
             self.wildcard(owners, side);
             return;
         }
@@ -703,6 +725,7 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
         direct_includes: std::collections::HashMap::new(),
     };
     c.visit(root);
+    c.out.singleton_locals = super::singleton_locals::collect(root);
     c.out
 }
 
