@@ -170,6 +170,15 @@ impl SigEnv {
         self.decls.contains_key(class_fqn) || core.knows_toplevel_class(class_fqn)
     }
 
+    /// `Reflection.rbs_class_known?` for sig-gen's superclass checks: the
+    /// project's own RBS declares `class_fqn`, or the core/stdlib index does
+    /// (a genuine top-level declaration, or an unambiguous qualified one).
+    pub fn class_known(&self, core: &CoreIndex, class_fqn: &str) -> bool {
+        self.decls.contains_key(class_fqn)
+            || core.knows_toplevel_class(class_fqn)
+            || (class_fqn.contains("::") && core.knows_qualified_class(class_fqn))
+    }
+
     /// Whether the project's own RBS declares `method` DIRECTLY on `class_fqn` —
     /// no ancestor walk, no core tail. This is deliberately NOT [`Self::lookup`]:
     /// the synthesised-member suppression it gates must not defer to an INHERITED

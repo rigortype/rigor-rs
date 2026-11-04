@@ -2,7 +2,7 @@ use super::*;
 
 fn candidates_tagged(tag: &str, src: &str, include_private: bool) -> Vec<Candidate> {
     // Write to a UNIQUE temp file per test so parallel runs never race on a
-    // shared path (write to `generate_file`'s read path is the point).
+    // shared path (write to `generate_run`'s read path is the point).
     let dir = std::env::temp_dir().join(format!("rigor_siggen_test_{tag}"));
     let _ = std::fs::create_dir_all(&dir);
     let file = dir.join("t.rb");
@@ -11,7 +11,7 @@ fn candidates_tagged(tag: &str, src: &str, include_private: bool) -> Vec<Candida
     // (these tests exercise inference/rendering, not env classification —
     // that has its own `sig_env` unit tests + the oracle E2E gate).
     let env = SigEnv::build(&[]);
-    let out = generate_file(file.to_str().unwrap(), include_private, &env);
+    let out = generate_run(&[file.to_str().unwrap().to_string()], include_private, &env, &writes).0;
     let _ = std::fs::remove_file(&file);
     out
 }
@@ -28,7 +28,7 @@ fn candidates_with_sig(tag: &str, rb_src: &str, rbs_src: &str) -> Vec<Candidate>
     std::fs::write(&rb, rb_src).unwrap();
     std::fs::write(dir.join("sig/foo.rbs"), rbs_src).unwrap();
     let env = SigEnv::build(&[dir.join("sig")]);
-    let out = generate_file(rb.to_str().unwrap(), false, &env);
+    let out = generate_run(&[rb.to_str().unwrap().to_string()], false, &env, &writes).0;
     let _ = std::fs::remove_dir_all(&dir);
     out
 }
@@ -436,8 +436,45 @@ fn meta_member_declared_on_the_class_itself_is_suppressed_but_inherited_is_not()
 fn plain_subclass_group_prints_its_written_ancestry() {
     // The print header carries the source's own superclass too (upstream
     // `declaration_header` reads the same per-file map the writer does).
-    let cs = candidates_tagged("hdrsuper", "class Foo < Bar\n  def m\n    \"m\"\n  end\nend\n", false);
-    assert_eq!(cs[0].decl_header, "class Foo < Bar");
+    // v0.4.7: written rooted (`SuperclassSpelling.absolute`).
+    let cs = candidates_tagged(
+        "hdrsuper",
+        "class Foo < StandardError\n  def m\n    \"m\"\n  end\nend\n",
+        false,
+    );
+    assert_eq!(cs[0].decl_header, "class Foo < ::StandardError");
+}
+
+#[test]
+fn a_class_whose_superclass_resolves_nowhere_is_dropped() {
+    // Reference #735/#2478: `Bar` is neither RBS-known nor written by this
+    // run, so `class Foo < ::Bar` would fail the next build — Foo is dropped.
+    let cs = candidates_tagged("hdrdrop", "class Foo < Bar\n  def m = 1\nend\n", false);
+    assert!(cs.is_empty(), "{cs:?}");
+    // A project superclass this run writes keeps the subclass, and a
+    // superclass whose only method is untyped is not written (#2478).
+    let cs = candidates_tagged(
+        "hdrkeep",
+        "class Base\n  def b = 1\nend\nclass Kid < Base\n  def k = 2\nend\nclass U\n  def u = zork\nend\nclass V < U\n  def v = 3\nend\n",
+        false,
+    );
+    let names: Vec<(&str, &str)> =
+        cs.iter().map(|c| (c.class_name.as_str(), c.decl_header.as_str())).collect();
+    assert_eq!(names, vec![("Base", "class Base"), ("Kid", "class Kid < ::Base")]);
+}
+
+#[test]
+fn nested_same_name_superclass_and_rooted_header() {
+    // #2661: `class B; class B < B` names the outer `::B`; a rooted
+    // `class ::Box` inside `module A` declares the top-level `Box`.
+    let cs = candidates_tagged(
+        "hdrnest",
+        "class B\n  class B < B\n    def x = 1\n  end\nend\nmodule A\n  class ::Box\n    def y = 2\n  end\nend\n",
+        false,
+    );
+    let names: Vec<(&str, &str)> =
+        cs.iter().map(|c| (c.class_name.as_str(), c.decl_header.as_str())).collect();
+    assert_eq!(names, vec![("B::B", "class B::B < ::B"), ("Box", "class Box")]);
 }
 
 #[test]
@@ -597,7 +634,7 @@ fn render_new_file_wraps_nested_namespaces_with_kinds_and_super() {
     info.kinds.insert("Outer::Inner".into(), "class");
     info.supers.insert("Outer::Inner".into(), "Base".into());
     let out = render_new_file(&[cand("Outer::Inner", "def m: () -> :s")], &[], &info);
-    assert_eq!(out, "module Outer\n  class Inner < Base\n    def m: () -> :s\n  end\nend\n");
+    assert_eq!(out, "module Outer\n  class Inner < ::Base\n    def m: () -> :s\n  end\nend\n");
 }
 
 #[test]
@@ -1024,7 +1061,7 @@ fn append_new_class_compact_header_and_leading_blank() {
     assert_eq!(out.action, "updated");
     assert_eq!(
         out.source,
-        "class Foo\n  def existing: () -> String\nend\n\nclass Bar < Base\n  def added: () -> 7\nend\n"
+        "class Foo\n  def existing: () -> String\nend\n\nclass Bar < ::Base\n  def added: () -> 7\nend\n"
     );
 }
 

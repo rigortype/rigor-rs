@@ -78,7 +78,7 @@
 //!   with a core RBS name; otherwise it stays `Dynamic` and the method is skipped
 //!   (an under-emit — a pre-existing inference gap, not a naming defect).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -91,6 +91,7 @@ use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod meta_class;
 mod rbs_parse_error;
+mod superclasses;
 mod sig_env;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -291,8 +292,8 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // declaration during merge); on a print/diff run it is inert, exactly like the
     // reference (the flag lives on the Writer).
 
-    let candidates: Vec<Candidate> =
-        files.iter().flat_map(|p| generate_file(p, include_private, &sig_env)).collect();
+    let (candidates, _info, unresolvable) =
+        generate_run(&files, include_private, &sig_env, &writes);
 
     // `--format json` renders the candidate table regardless of print/diff mode
     // (reference `Renderer#render`); text picks the diff or print layout.
@@ -322,6 +323,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
     }
+    report_unresolvable_superclasses(&unresolvable);
     path_status
 }
 
@@ -380,36 +382,244 @@ struct NamespaceInfo {
     /// class exists even when every member candidate is suppressed as
     /// already-declared (reference `@class_shells`).
     shells: Vec<String>,
+    /// Every class header with a plain-constant superclass (whole-run once
+    /// merged); resolved into `supers` by [`finalize_superclasses`].
+    headers: Vec<superclasses::Header>,
+    /// `(source file, shell FQN)` — which file carries each shell, for the
+    /// written-set computation (a shell rides on its file's written candidates).
+    shell_files: Vec<(String, String)>,
+}
+
+impl NamespaceInfo {
+    /// Fold one file's metadata into a whole-run one.
+    fn absorb(&mut self, other: NamespaceInfo) {
+        self.kinds.extend(other.kinds);
+        self.supers.extend(other.supers);
+        self.shells.extend(other.shells);
+        self.headers.extend(other.headers);
+        self.shell_files.extend(other.shell_files);
+    }
 }
 
 /// Record each class/module declaration's keyword + superclass into `info`,
 /// keyed by qualified name (reference `build_namespace_kinds` /
 /// `build_superclasses`).
 fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
-    let (name, body, kind, superclass): (&String, &[NodeId], &'static str, Option<&String>) =
+    let (name, rooted, body, kind, superclass): (&String, bool, &[NodeId], &'static str, Option<&String>) =
         match ast.get(id) {
-            Node::ClassDef { name, body, superclass_path, .. } => {
-                (name, body, "class", superclass_path.as_ref())
+            Node::ClassDef { name, rooted, body, superclass_path, .. } => {
+                (name, *rooted, body, "class", superclass_path.as_ref())
             }
-            Node::ModuleDef { name, body, .. } => (name, body, "module", None),
+            Node::ModuleDef { name, rooted, body, .. } => (name, *rooted, body, "module", None),
             _ => return,
         };
-    let mut qualified = prefix.to_vec();
-    qualified.push(name.clone());
+    let qualified = declaration_prefix(prefix, name, rooted);
     let q = qualified.join("::");
     info.kinds.insert(q.clone(), kind);
-    if let Some(sp) = superclass {
-        info.supers.insert(q, sp.clone());
-    }
+    // A plain-constant superclass is recorded from the Prism tree
+    // ([`superclasses::collect`], rooted-aware) and resolved whole-run.
+    let _ = superclass;
     for &child in body {
         collect_namespace_info(ast, child, &qualified, info);
     }
 }
 
-/// Produce the printable candidates for one source file (drops the write-only
-/// [`NamespaceInfo`]).
-fn generate_file(path: &str, include_private: bool, sig_env: &SigEnv) -> Vec<Candidate> {
-    generate_file_with_info(path, include_private, sig_env).0
+/// Generate every file's candidates and finalize the run's superclasses
+/// ([`finalize_superclasses`]); the unresolvable-superclass report goes to
+/// stderr after the output, via [`report_unresolvable_superclasses`].
+fn generate_run(
+    files: &[String],
+    include_private: bool,
+    sig_env: &SigEnv,
+    written: &dyn Fn(&Candidate) -> bool,
+) -> (Vec<Candidate>, NamespaceInfo, Vec<UnresolvableSuperclass>) {
+    let mut candidates: Vec<Candidate> = Vec::new();
+    let mut info = NamespaceInfo::default();
+    for f in files {
+        let (cs, i) = generate_file_with_info(f, include_private, sig_env);
+        candidates.extend(cs);
+        info.absorb(i);
+    }
+    let (candidates, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
+    (candidates, info, report)
+}
+
+/// One class dropped because its superclass chain resolves nowhere.
+struct UnresolvableSuperclass {
+    class_name: String,
+    /// The token the report names (`Base`, or the external root).
+    superclass: String,
+    /// `true` for a project superclass this run wrote nothing for.
+    project: bool,
+}
+
+/// Reference `Generator#resolve_superclass_spellings` +
+/// `#demote_unresolvable_superclasses` (+ `unresolvable_superclass_report`):
+///
+/// 1. each recorded superclass token is resolved against its header's nesting
+///    (innermost first, the class being opened excluded — #722/#2661) to a
+///    class this run declares or the RBS environment knows (the renderers
+///    write it rooted, `< ::Base`);
+/// 2. a class whose superclass chain does not end in an RBS-known class or a
+///    class this run writes (`written`) is DROPPED with every class nested in
+///    it — its header would fail the next build (`RBS::NoSuperclassFoundError`,
+///    #735/#2437/#2478) — repeating until nothing more drops;
+/// 3. every surviving candidate's `--print` header is re-stamped.
+fn finalize_superclasses(
+    candidates: Vec<Candidate>,
+    info: &mut NamespaceInfo,
+    sig_env: &SigEnv,
+    written: &dyn Fn(&Candidate) -> bool,
+) -> (Vec<Candidate>, Vec<UnresolvableSuperclass>) {
+    let index = CoreIndex::new();
+    let rbs_known = |name: &str| sig_env.class_known(&index, name);
+    let mut known: HashSet<String> = candidates.iter().map(|c| c.class_name.clone()).collect();
+    known.extend(info.shells.iter().cloned());
+    known.extend(info.kinds.keys().cloned());
+    let headers = std::mem::take(&mut info.headers);
+    for h in &headers {
+        let declared = |c: &str| known.contains(c) || rbs_known(c);
+        let resolved = superclasses::resolve_token(&h.token, &h.nesting, &h.full, &declared);
+        info.supers.insert(h.full.clone(), resolved);
+    }
+    let supers = info.supers.clone();
+
+    let shell_files = info.shell_files.clone();
+    let declared_by_run = |kept: &[&Candidate]| -> HashSet<String> {
+        let written_cands: Vec<&&Candidate> = kept.iter().filter(|c| written(c)).collect();
+        let paths: HashSet<&str> = written_cands.iter().map(|c| c.file.as_str()).collect();
+        let mut declared: HashSet<String> =
+            written_cands.iter().map(|c| c.class_name.clone()).collect();
+        for (file, shell) in &shell_files {
+            if paths.contains(file.as_str()) {
+                declared.insert(shell.clone());
+            }
+        }
+        let wrappers: Vec<String> =
+            declared.iter().flat_map(|n| superclasses::wrapper_names(n)).collect();
+        declared.extend(wrappers);
+        declared
+    };
+    let owner_of = |class_name: &str, unresolvable: &HashMap<String, String>| -> Option<(String, String)> {
+        if let Some(root) = unresolvable.get(class_name) {
+            return Some((class_name.to_string(), root.clone()));
+        }
+        let mut names: Vec<&String> = unresolvable.keys().collect();
+        names.sort();
+        names
+            .into_iter()
+            .find(|n| class_name.starts_with(&format!("{n}::")))
+            .map(|n| (n.clone(), unresolvable[n].clone()))
+    };
+    let mut unresolvable: HashMap<String, String> = HashMap::new();
+    loop {
+        let kept: Vec<&Candidate> =
+            candidates.iter().filter(|c| owner_of(&c.class_name, &unresolvable).is_none()).collect();
+        let emitted = declared_by_run(&kept);
+        let found: HashMap<String, String> = supers
+            .keys()
+            .filter_map(|name| {
+                superclasses::unresolved_root(name, &supers, &emitted, &rbs_known)
+                    .map(|root| (name.clone(), root))
+            })
+            .collect();
+        if found.len() == unresolvable.len() {
+            break;
+        }
+        unresolvable = found;
+    }
+
+    // `@unresolvable_superclasses[class_name] ||= root`, in candidate order.
+    let mut owners: Vec<(String, String)> = Vec::new();
+    let mut out: Vec<Candidate> = Vec::new();
+    for mut c in candidates {
+        match owner_of(&c.class_name, &unresolvable) {
+            Some(owner) => {
+                if !owners.iter().any(|(n, _)| *n == owner.0) {
+                    owners.push(owner);
+                }
+            }
+            None => {
+                c.decl_header = declaration_header(info, &c.class_name);
+                out.push(c);
+            }
+        }
+    }
+
+    // `unresolvable_superclass_report`: a project superclass when the chain
+    // closes through source classes.
+    let source_classes: HashSet<&str> =
+        info.kinds.iter().filter(|(_, k)| **k == "class").map(|(n, _)| n.as_str()).collect();
+    let report = owners
+        .into_iter()
+        .map(|(class_name, token)| {
+            let mut name = superclasses::bare_superclass_name(&token);
+            let mut root = token.clone();
+            let mut seen: HashSet<String> = HashSet::new();
+            let mut project = false;
+            while source_classes.contains(name.as_str()) && seen.insert(name.clone()) {
+                let Some(h) = headers.iter().find(|h| h.full == name) else {
+                    project = true;
+                    break;
+                };
+                let declared = |c: &str| source_classes.contains(c) || rbs_known(c);
+                root = superclasses::resolve_token(&h.token, &h.nesting, &name, &declared);
+                name = superclasses::bare_superclass_name(&root);
+                if rbs_known(&name) {
+                    project = true;
+                    break;
+                }
+            }
+            UnresolvableSuperclass { class_name, superclass: if project { token } else { root }, project }
+        })
+        .collect();
+    (out, report)
+}
+
+/// Reference `SigGenCommand#report_unresolvable_superclasses`.
+fn report_unresolvable_superclasses(report: &[UnresolvableSuperclass]) {
+    let mut project: Vec<(&str, &str)> = report
+        .iter()
+        .filter(|r| r.project)
+        .map(|r| (r.class_name.as_str(), r.superclass.as_str()))
+        .collect();
+    let mut external: Vec<(&str, &str)> = report
+        .iter()
+        .filter(|r| !r.project)
+        .map(|r| (r.class_name.as_str(), r.superclass.as_str()))
+        .collect();
+    project.sort();
+    external.sort();
+    if !project.is_empty() {
+        eprintln!(
+            "rigor sig-gen: skipped {} class(es) whose superclass this run wrote no signature for. \
+             The superclass is declared in the project's source, but its own methods could not be typed, or its \
+             `sig/` file could not be written, so a signature for these subclasses would fail to build \
+             (`RBS::NoSuperclassFoundError`). Annotate or type the superclass's methods, fix its `sig/` file, or \
+             hand-write its declaration, and re-run.",
+            project.len()
+        );
+        for (c, s) in &project {
+            eprintln!("  {c} < {s}");
+        }
+    }
+    if !external.is_empty() {
+        eprintln!(
+            "rigor sig-gen: skipped {} class(es) whose superclass no loaded RBS declares. \
+             A signature for them would fail to build (`RBS::NoSuperclassFoundError`) and would leave the \
+             class LESS typed than it is now. Provide RBS for the superclass — `rbs collection install`, the \
+             gem's own `sig/`, or a `signature_paths:` entry — and re-run.",
+            external.len()
+        );
+        for (c, s) in &external {
+            eprintln!("  {c} < {s}");
+        }
+    }
+}
+
+/// `Writer.writes?`: only a `new_method` candidate is sure to be written.
+fn writes(c: &Candidate) -> bool {
+    c.classification == "new_method"
 }
 
 /// Produce candidates + the `--write` namespace metadata for one source file. A
@@ -482,8 +692,11 @@ fn generate_file_with_info(
         }
     }
     register_meta_classes(&layouts, &mut info);
+    info.headers = superclasses::collect(&parsed);
+    info.shell_files = info.shells.iter().map(|s| (path.to_string(), s.clone())).collect();
     // The print header depends on the WHOLE file's namespace metadata, so it is
-    // stamped once the walks are done rather than at construction.
+    // stamped once the walks are done rather than at construction (and again,
+    // whole-run, by [`finalize_superclasses`]).
     for c in &mut out {
         c.decl_header = declaration_header(&info, &c.class_name);
     }
@@ -557,7 +770,8 @@ fn declaration_header(info: &NamespaceInfo, class_name: &str) -> String {
         return format!("module {class_name}");
     }
     match info.supers.get(class_name) {
-        Some(superclass) => format!("class {class_name} < {superclass}"),
+        // `SuperclassSpelling.absolute` (#2661): written rooted.
+        Some(superclass) => format!("class {class_name} < {}", superclasses::absolute(superclass)),
         None => format!("class {class_name}"),
     }
 }
@@ -575,8 +789,8 @@ fn collect_source_fqns(
     out: &mut std::collections::HashSet<String>,
 ) {
     match ast.get(id) {
-        Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
-            let fqn = qualify_join(prefix, name);
+        Node::ClassDef { name, rooted, body, .. } | Node::ModuleDef { name, rooted, body, .. } => {
+            let fqn = declaration_prefix(prefix, name, *rooted).join("::");
             out.insert(fqn.clone());
             // The child prefix is the full path split (`A::B` nested under `M`
             // becomes prefix `["M", "A", "B"]` for its own body).
@@ -611,6 +825,16 @@ fn is_class_defining_call(ast: &LoweredAst, value: NodeId) -> bool {
         (recv_name.as_str(), method.as_str()),
         ("Data", "define") | ("Struct", "new")
     )
+}
+
+/// `Source::ConstantPath.declaration_prefix`: the namespace a `class`/`module`
+/// header declares — the enclosing `prefix` plus the written `name`, or, for a
+/// `::`-rooted header (`class ::Box` inside `module A`), the name alone
+/// (reference #722 residue 3: a rooted header re-anchors at the top level).
+fn declaration_prefix(prefix: &[String], name: &str, rooted: bool) -> Vec<String> {
+    let mut out: Vec<String> = if rooted { Vec::new() } else { prefix.to_vec() };
+    out.extend(name.split("::").filter(|s| !s.is_empty()).map(str::to_string));
+    out
 }
 
 /// Join a lexical `prefix` and a (possibly already-namespaced) `name` with `::`.
@@ -723,12 +947,12 @@ fn walk_namespace(
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
 ) {
-    let (name, visibilities, body) = match ast.get(id) {
-        Node::ClassDef { name, method_visibilities, body, .. } => {
-            (name, method_visibilities.clone(), body.as_slice())
+    let (name, rooted, visibilities, body) = match ast.get(id) {
+        Node::ClassDef { name, rooted, method_visibilities, body, .. } => {
+            (name, *rooted, method_visibilities.clone(), body.as_slice())
         }
-        Node::ModuleDef { name, method_visibilities, body, .. } => {
-            (name, method_visibilities.clone(), body.as_slice())
+        Node::ModuleDef { name, rooted, method_visibilities, body, .. } => {
+            (name, *rooted, method_visibilities.clone(), body.as_slice())
         }
         // A `Const = Data.define(...) do ... end` block is the new class's own
         // body: the runtime `class_eval`s it into the anonymous class it just
@@ -741,13 +965,12 @@ fn walk_namespace(
             if layouts.get(&qualify_join(prefix, name)).is_some() =>
         {
             let Node::Call { block_body, .. } = ast.get(*value) else { return };
-            (name, block_visibilities(ast, block_body), block_body.as_slice())
+            (name, false, block_visibilities(ast, block_body), block_body.as_slice())
         }
         _ => return,
     };
 
-    let mut qualified = prefix.to_vec();
-    qualified.push(name.clone());
+    let qualified = declaration_prefix(prefix, name, rooted);
     let class_name = qualified.join("::");
 
     // Collect instance + singleton methods in ONE pass over the class body so
@@ -1538,8 +1761,7 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
-    let candidates: Vec<Candidate> =
-        files.iter().flat_map(|p| generate_file(p, false, &sig_env)).collect();
+    let (candidates, _info, _unresolvable) = generate_run(&files, false, &sig_env, &writes);
     candidates_json_string(&candidates)
 }
 
@@ -1642,14 +1864,36 @@ fn cmd_write(
     // target as its enclosing class (a shell lives in the source file with its
     // constant). Preserves source order per file for stable shell rendering.
     let mut tagged_shells: Vec<(PathBuf, String)> = Vec::new();
-    for f in files {
-        let (candidates, info) = generate_file_with_info(f, include_private, sig_env);
-        for c in candidates {
-            let target =
-                target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout);
-            tagged.push((target, c));
+    // `Generator#written?` under a target writer (#2461): a `new_method`
+    // candidate aimed at a target the writer will write — inside the sig root,
+    // and either missing or an existing UTF-8 file that parses.
+    let sig_root_dir_w = project_root.join(&sig_root);
+    let accepts = |target: &Path| -> bool {
+        if !target.starts_with(&sig_root_dir_w) {
+            return false;
         }
-        for shell in &info.shells {
+        if !target.exists() {
+            return true;
+        }
+        std::fs::read(target)
+            .ok()
+            .and_then(|b| String::from_utf8(b).ok())
+            .is_some_and(|src| ruby_rbs::node::parse(&src).is_ok())
+    };
+    let written = |c: &Candidate| -> bool {
+        writes(c)
+            && accepts(&target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout))
+    };
+    let (all_candidates, run_info, unresolvable) =
+        generate_run(files, include_private, sig_env, &written);
+    for c in all_candidates {
+        let target =
+            target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout);
+        tagged.push((target, c));
+    }
+    {
+        let info = &run_info;
+        for (f, shell) in &info.shell_files {
             // Route a shell to its ENCLOSING class's target (a shell rides in the
             // same file as the class it is nested in — e.g. `Rigor::Triage::Selector`
             // routes with `Rigor::Triage`), so a consolidated layout keeps the
@@ -1659,10 +1903,8 @@ fn cmd_write(
                 target_for(f, route_name, &source_root, &sig_root, &project_root, &layout);
             tagged_shells.push((target, shell.clone()));
         }
-        merged.kinds.extend(info.kinds);
-        merged.supers.extend(info.supers);
-        merged.shells.extend(info.shells);
     }
+    merged.absorb(run_info);
 
     // Group by target, preserving first-seen order (reference groups by target).
     // A shell-only target (a file with a `Data.define` but no methods) still gets
@@ -1744,6 +1986,7 @@ fn cmd_write(
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
     }
+    report_unresolvable_superclasses(&unresolvable);
     // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
     // write and did not get one — exit 1.
     if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
@@ -1890,7 +2133,10 @@ fn render_tree_node(node: &TreeNode, info: &NamespaceInfo, depth: usize, prefix:
     let qualified = qual.join("::");
     let keyword = node_keyword(node, info, &qualified);
     let superclass = if keyword == "class" {
-        info.supers.get(&qualified).map(|s| format!(" < {s}")).unwrap_or_default()
+        info.supers
+            .get(&qualified)
+            .map(|s| format!(" < {}", superclasses::absolute(s)))
+            .unwrap_or_default()
     } else {
         String::new()
     };
@@ -2562,7 +2808,7 @@ fn append_new_class(
         .collect::<Vec<_>>()
         .join("\n");
     let header = match superclass {
-        Some(s) => format!("class {class_name} < {s}"),
+        Some(s) => format!("class {class_name} < {}", superclasses::absolute(s)),
         None => format!("class {class_name}"),
     };
     if !source.ends_with('\n') {
