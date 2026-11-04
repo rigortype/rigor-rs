@@ -11,19 +11,19 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT: re-pin tag by tag to `v0.4.7`; next `v0.4.2`.**
+▶ **NEXT: re-pin tag by tag to `v0.4.7`; next `v0.4.3`.**
 CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
-- **Pin is `v0.4.1`** (rbs 4.2.0 vendored). Both
+- **Pin is `v0.4.2`** (rbs 4.2.0 vendored). Both
   standing exception tables EMPTY; new entries are real findings
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
-State (verified 2026-11-04, at `v0.4.1`): harness **123 fixtures / 0
-unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 768
+State (verified 2026-11-04, at `v0.4.2`): harness **130 fixtures / 0
+unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 696
 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
 Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
@@ -69,7 +69,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-04 re-pin walk → `v0.4.1`** (#445, #456): 0 FP / 768 gaps. 0.4.0 loop edges + const guards; 0.4.1 35 override FPs → census; → #446–#458. [0.4.0](notes/20261104-repin-v040.md) [0.4.1](notes/20261104-repin-v041.md)
+- **2026-11-04 re-pin walk → `v0.4.2`** (#445, #456, #460): 0 FP / 696 gaps. 0.4.0 loop edges + const guards; 0.4.1 override FPs → census; 0.4.2 toplevel include/main (9,334 FPs). → #446–#464. [notes](notes/20261104-repin-v042.md)
 - **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 >1,600 s → 0.2 s, all 16,623 gem files ~10 s. Not decline-only (#442). 0 FP / 9,435; → #441–#443. [note](notes/20261030-fanout-cap-436.md)
 - **2026-10-30 #422 CLOSED** (stack #434 = PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; 10 of 12 slow gem files → <7 s (lexer-F0/F1 → #436), output byte-identical. 0 FP / 9,435; → #435–#439. [note](notes/20261030-reach-memo-422.md)
 - **2026-10-28 #412 CLOSED** (PR #426): 256 MiB analysis stacks + a 25,000-edge nesting bound (deeper files "skipped", `internal-error`); the reference aborts (rigor#2455). 0 FP / 9,435; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
