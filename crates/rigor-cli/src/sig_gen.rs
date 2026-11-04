@@ -2496,6 +2496,7 @@ struct ClassDeclInfo {
 /// order) the class is found (→ merge) or not (→ append), re-parsing fresh from
 /// the current source before each so byte offsets are never stale. The file is
 /// written only when at least one method was applied (`updated`).
+#[allow(clippy::too_many_arguments)]
 fn update_existing(
     source_path: String,
     target: &Path,
