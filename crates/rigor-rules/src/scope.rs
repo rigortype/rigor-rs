@@ -114,34 +114,46 @@ pub(crate) struct ScopedEnv {
     method_bodies: Vec<rigor_parse::Span>,
     /// `(body descendant ids, bound names)` per literal block/lambda.
     closures: Vec<(std::collections::HashSet<rigor_parse::NodeId>, Vec<String>)>,
-    /// `(case span, write end, name)` per local a `when` condition of an
-    /// UNENTERED `case` writes ([`unentered_case_condition_writes`]).
-    case_condition_writes: Vec<(rigor_parse::Span, usize, String)>,
+    /// Every local a `when` test writes ([`case_condition_writes`]).
+    case_condition_writes: Vec<CaseConditionWrite>,
     untyped: rigor_types::TypeId,
 }
 
 impl ScopedEnv {
     pub(crate) fn build(typer: &Typer, ast: &LoweredAst, interner: &mut Interner) -> Self {
+        let method_bodies = rigor_infer::method_body_spans(ast);
         ScopedEnv {
             flow: typer.build_toplevel_check_flow(ast, interner),
             gate_top: typer.build_toplevel_env(ast, interner),
             empty: rigor_infer::TypeEnv::new(),
-            method_bodies: rigor_infer::method_body_spans(ast),
+            case_condition_writes: case_condition_writes(ast, &method_bodies),
+            method_bodies,
             closures: rigor_infer::closure_shadow_scopes(ast),
-            case_condition_writes: unentered_case_condition_writes(ast),
             untyped: interner.untyped(),
         }
     }
 
-    /// The locals a `when` condition of an unentered `case` holding `site`
-    /// wrote before it (upstream #1484/#1961 `propagate_subject_case`'s
-    /// `widen_condition_writes`): the reference reads each as `Dynamic[top]`
-    /// from the write on, inside the `case`.
+    /// The locals a `when` test wrote before `site`, in `site`'s local scope
+    /// and not since rebound ([`case_condition_writes`], upstream
+    /// #1484/#1961/#2036): the port reads each as `Dynamic[top]`.
     pub(crate) fn case_widened_names(&self, site: rigor_parse::Span) -> Vec<&str> {
+        if self.case_condition_writes.is_empty() {
+            return Vec::new();
+        }
+        let def = self
+            .method_bodies
+            .iter()
+            .filter(|d| span_within(site, **d))
+            .min_by_key(|d| d.1 - d.0)
+            .copied();
         self.case_condition_writes
             .iter()
-            .filter(|(case, write_end, _)| span_within(site, *case) && site.0 >= *write_end)
-            .map(|(_, _, name)| name.as_str())
+            .filter(|w| {
+                site.0 >= w.write_end
+                    && w.def == def
+                    && !w.cuts.iter().any(|&(from, to)| from <= site.0 && site.0 < to)
+            })
+            .map(|w| w.name.as_str())
             .collect()
     }
 
@@ -215,28 +227,39 @@ impl ScopedEnv {
     }
 }
 
-/// Upstream v0.4.4 (#1484/#1961): a `case` the statement evaluator does not
-/// enter — a value-position `case` (an array element, a call argument or
-/// receiver, …) — is filled by the scope indexer's `propagate_subject_case`,
-/// which applies no write a `when` condition makes: every local one writes
-/// reads `Dynamic[top]` from the write on. The evaluator ENTERS a `case`
-/// written as a statement or as the value of a statement's local write, and
-/// there the condition write is dropped altogether (the port's flat env
-/// already matches that). So for every `case` NOT reached as such a statement
-/// ([`entered_cases`] — anything it misses counts as unentered, which only
-/// declines more), this lists `(case span, write end, name)` for each local
-/// write inside a `when` condition.
-fn unentered_case_condition_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, usize, String)> {
-    let mut entered = std::collections::HashSet::new();
-    if let Node::Program { body, .. } = ast.get(ast.root()) {
-        entered_cases(ast, body, &mut entered);
-    }
-    let mut conditions: Vec<(rigor_parse::Span, rigor_parse::Span)> = Vec::new();
-    for (id, node) in ast.iter() {
+/// One local a `when` test writes ([`case_condition_writes`]).
+struct CaseConditionWrite {
+    name: String,
+    /// The write's end offset: sites from here on read the local widened.
+    write_end: usize,
+    /// The innermost method body holding the write, if any — a site in a
+    /// different local scope reads a different local.
+    def: Option<rigor_parse::Span>,
+    /// `[from, to)` offset ranges where a later unconditional rebind of the
+    /// local, a direct statement of a statement list holding the `case`,
+    /// restored a binding the port types soundly.
+    cuts: Vec<(usize, usize)>,
+}
+
+/// Upstream v0.4.4 (#1484/#1961) and v0.4.5 (#2036): a `when` test that writes
+/// a local is code the reference runs. v0.4.4 read such a local `Dynamic[top]`
+/// from the write on inside a `case` the statement evaluator does not enter
+/// (`propagate_subject_case`'s `widen_condition_writes`); v0.4.5
+/// (`statement_evaluator.rb` `subject_when_scopes` / `run_when_test`) also
+/// evaluates the test in an ENTERED `case`, so its write binds — in the
+/// clause's body, every later clause, the `else` and after the `case` — and a
+/// subject it rebinds is narrowed by no later clause. The port's flat env
+/// drops the write, so it reads the stale pre-`case` binding. This lists every
+/// local any `when` test writes, in any `case`; [`ScopedEnv::at`] reads each
+/// as `Dynamic[top]` from the write on (the decline side), until a later
+/// direct rebind in a statement list holding the `case` that does not read
+/// the local itself.
+fn case_condition_writes(ast: &LoweredAst, method_bodies: &[rigor_parse::Span]) -> Vec<CaseConditionWrite> {
+    use rigor_parse::Span;
+    // (case span, condition span) for every `when` test.
+    let mut conditions: Vec<(Span, Span)> = Vec::new();
+    for (_, node) in ast.iter() {
         let Node::Case { branches, span, .. } = node else { continue };
-        if entered.contains(&id) {
-            continue;
-        }
         for &b in branches {
             if let Node::When { conditions: conds, .. } = ast.get(b) {
                 conditions.extend(conds.iter().map(|&c| (*span, ast.get(c).span())));
@@ -246,82 +269,96 @@ fn unentered_case_condition_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, 
     if conditions.is_empty() {
         return Vec::new();
     }
-    let mut out = Vec::new();
+    let innermost_def = |s: Span| {
+        method_bodies
+            .iter()
+            .filter(|d| span_within(s, **d))
+            .min_by_key(|d| d.1 - d.0)
+            .copied()
+    };
+    let mut writes: Vec<(Span, Span, String)> = Vec::new();
     for (_, node) in ast.iter() {
-        let (name, wspan) = match node {
+        let mut names: Vec<(String, Span)> = Vec::new();
+        match node {
             Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => (name, *span),
+            | Node::LocalVariableOpWrite { name, span, .. } => names.push((name.clone(), *span)),
+            Node::MultiWrite { targets, span, .. } => {
+                names.extend(targets.bound_names().into_iter().map(|(n, _)| (n, *span)));
+            }
+            Node::UnmodeledWrite { names: ns, span } => {
+                names.extend(ns.iter().map(|n| (n.clone(), *span)));
+            }
             _ => continue,
-        };
-        for (case, cond) in &conditions {
-            if span_within(wspan, *cond) {
-                out.push((*case, wspan.1, name.clone()));
+        }
+        for (name, wspan) in names {
+            for (case, cond) in &conditions {
+                if span_within(wspan, *cond) {
+                    writes.push((*case, wspan, name.clone()));
+                }
             }
         }
     }
+    if writes.is_empty() {
+        return Vec::new();
+    }
+    let lists = statement_lists(ast);
+    writes
+        .into_iter()
+        .map(|(case, wspan, name)| {
+            let mut cuts = Vec::new();
+            for list in &lists {
+                let Some(at) = list.iter().position(|&s| span_within(case, ast.get(s).span())) else {
+                    continue;
+                };
+                let Some(&last) = list.last() else { continue };
+                let end = ast.get(last).span().1;
+                let rebind = list[at + 1..].iter().find(|&&s| match ast.get(s) {
+                    Node::LocalVariableWrite { name: n, value, .. } if *n == name => {
+                        let vspan = ast.get(*value).span();
+                        !ast.iter().any(|(_, r)| {
+                            matches!(r, Node::LocalVariableRead { name: rn, span }
+                                if *rn == name && span_within(*span, vspan))
+                        })
+                    }
+                    _ => false,
+                });
+                if let Some(&s) = rebind {
+                    cuts.push((ast.get(s).span().1, end));
+                }
+            }
+            CaseConditionWrite { def: innermost_def(wspan), write_end: wspan.1, cuts, name }
+        })
+        .collect()
+}
+
+/// Every statement list a `case` can sit in as (part of) a direct statement:
+/// the program, sequences, `if` arms, `when`/`else` bodies, loop, class,
+/// module and method bodies, literal block bodies and `begin` bodies. A list
+/// this misses only drops a cut, which widens more (the decline side).
+fn statement_lists(ast: &LoweredAst) -> Vec<Vec<rigor_parse::NodeId>> {
+    let mut out: Vec<Vec<rigor_parse::NodeId>> = Vec::new();
+    for (_, node) in ast.iter() {
+        match node {
+            Node::Program { body, .. }
+            | Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. }
+            | Node::When { body, .. }
+            | Node::Loop { body, .. }
+            | Node::ClassDef { body, .. }
+            | Node::ModuleDef { body, .. } => out.push(body.clone()),
+            Node::If { then_body, else_body, .. } => {
+                out.push(then_body.clone());
+                out.push(else_body.clone());
+            }
+            Node::Case { else_body, .. } => out.push(else_body.clone()),
+            Node::Call { block_body, .. } => out.push(block_body.clone()),
+            Node::BeginRescue { main_body, ensure_body, clauses, .. } => {
+                out.push(main_body.clone());
+                out.push(ensure_body.clone());
+                out.extend(clauses.iter().map(|c| c.body.clone()));
+            }
+            _ => {}
+        }
+    }
+    out.retain(|l| !l.is_empty());
     out
-}
-
-/// Mark the `case` nodes the statement evaluator enters: written as a
-/// statement of a statement list, or as the value of such a statement's local
-/// write (through a parenthesised single-statement wrapper).
-fn entered_cases(
-    ast: &LoweredAst,
-    list: &[rigor_parse::NodeId],
-    entered: &mut std::collections::HashSet<rigor_parse::NodeId>,
-) {
-    for &id in list {
-        entered_case_stmt(ast, id, entered);
-    }
-}
-
-fn entered_case_stmt(
-    ast: &LoweredAst,
-    id: rigor_parse::NodeId,
-    entered: &mut std::collections::HashSet<rigor_parse::NodeId>,
-) {
-    match ast.get(id) {
-        Node::Case { branches, else_body, .. } => {
-            entered.insert(id);
-            for &b in branches {
-                if let Node::When { body, .. } = ast.get(b) {
-                    entered_cases(ast, body, entered);
-                }
-            }
-            entered_cases(ast, else_body, entered);
-        }
-        Node::LocalVariableWrite { value, .. } => {
-            let value = match ast.get(*value) {
-                Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. }
-                    if body.len() == 1 =>
-                {
-                    body[0]
-                }
-                _ => *value,
-            };
-            if matches!(ast.get(value), Node::Case { .. }) {
-                entered_case_stmt(ast, value, entered);
-            }
-        }
-        Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
-            entered_cases(ast, body, entered);
-        }
-        Node::If { then_body, else_body, .. } => {
-            entered_cases(ast, then_body, entered);
-            entered_cases(ast, else_body, entered);
-        }
-        Node::Loop { body, .. } | Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } => {
-            entered_cases(ast, body, entered);
-        }
-        // A statement call's literal block body (`xs.each do … end`).
-        Node::Call { block_body, .. } => entered_cases(ast, block_body, entered),
-        Node::BeginRescue { main_body, ensure_body, clauses, .. } => {
-            entered_cases(ast, main_body, entered);
-            entered_cases(ast, ensure_body, entered);
-            for c in clauses {
-                entered_cases(ast, &c.body, entered);
-            }
-        }
-        _ => {}
-    }
 }

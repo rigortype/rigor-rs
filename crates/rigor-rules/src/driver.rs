@@ -173,8 +173,8 @@ pub fn analyze_with_source_and_folder(
             let recv_ty = typer.type_of(ast, recv, env, interner);
             arg_is_pure_nil(interner, index, typer.source(), recv_ty)
         };
-        // Upstream #1961 — a receiver reading a local an unentered `case`'s
-        // `when` condition wrote reads `Dynamic[top]` on the reference
+        // Upstream #1961/#2036 — a receiver reading a local a `when` test
+        // wrote reads `Dynamic[top]` in the port
         // (`ScopedEnv::case_widened_names`). The snapshot rules below witness
         // from passes that never saw that widening (a Dynamic carrier OPENS
         // their gates), so they stand down on such a receiver.
