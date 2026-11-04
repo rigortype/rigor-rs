@@ -4519,3 +4519,28 @@ fn ivar_write_mismatch_withheld_by_admitting_rbs_declaration() {
     assert!(fired[0].contains("`@w' on Narrow"), "{fired:?}");
     assert!(fired[1].contains("`@p' on Plain"), "{fired:?}");
 }
+
+/// Upstream v0.4.3 (#1836, rigor #1752), cross-file: a project module's
+/// `refine(Object)` / `refine(Class)` names reach a class-object call under
+/// its `using` (oracle-probed `frag/f2x`, `check` stdout identical). The
+/// must-still-fire rows: the call before the `using`, `Class`'s name on a
+/// MODULE object, and a name nothing refines.
+#[test]
+fn refinement_reaches_class_object_receivers_across_files() {
+    let files: [&[u8]; 2] = [
+        b"module RO\n  refine(Object) { def oo = :o }\n  refine(Class) { def cc = 1 }\nend\n",
+        b"Integer.oo\nusing RO\nInteger.oo\nComparable.oo\nComparable.cc\nInteger.cc\nInteger.nothere\n",
+    ];
+    let asts: Vec<_> = files.iter().map(|s| lower(&parse(s))).collect();
+    let refs: Vec<&LoweredAst> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut interner = Interner::new();
+    let rows: Vec<String> = analyze_with_source(&asts[1], &mut interner, &index, &source)
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| String::from_utf8_lossy(&files[1][..d.start_offset]).lines().count().to_string()
+            + ":" + d.method_name.as_deref().unwrap_or(""))
+        .collect();
+    assert_eq!(rows, ["1:oo", "5:cc", "7:nothere"], "got {rows:?}");
+}

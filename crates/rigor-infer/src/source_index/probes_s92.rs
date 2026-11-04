@@ -710,6 +710,7 @@ fn legacy_collect_override_classes(
                 includes,
                 &[],
                 false,
+                &[],
             );
             let child_prefix = split_qualified(&qualified);
             for &child in body {
@@ -729,6 +730,7 @@ fn legacy_collect_override_classes(
                 includes,
                 &[],
                 true,
+                &[],
             );
             let child_prefix = split_qualified(&qualified);
             for &child in body {

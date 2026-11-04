@@ -218,6 +218,10 @@ struct OverrideClass {
     /// [`SourceIndex::namespace_children`] — the completion-side kind icon —
     /// never by a rule, a predicate, or the typer.
     is_module: bool,
+    /// The `refine(T) { def … }` blocks of every declaration, appended across
+    /// reopenings. Read only by [`SourceIndex::refined_names_in_effect`]'s
+    /// silencer (no positive inference reads it).
+    refines: Vec<Refinement>,
 }
 
 /// One harvested constant value: `(defining namespace segments, the
@@ -270,6 +274,19 @@ pub(crate) struct HarvestedOverrideClass {
     ///
     /// [`CoreIndex::namespace_children`]: rigor_index::CoreIndex::namespace_children
     is_module: bool,
+    /// The module body's `refine(T) { def … }` blocks — see
+    /// [`OverrideClass::refines`].
+    refines: Vec<Refinement>,
+}
+
+/// One `refine(T) { … }` block of a project module (upstream #1836's
+/// refinement-table rows, kind-less): the target constant as WRITTEN (`None`
+/// for a target that is not a plain constant, e.g. `refine(C.singleton_class)`)
+/// and every method name a `def` inside the block defines.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct Refinement {
+    pub(crate) target: Option<String>,
+    pub(crate) names: Vec<String>,
 }
 
 /// One QUALIFIED constant name written by a single file, in walk order, with the

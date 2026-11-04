@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/131_refinement_class_object_receivers.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `co_oo' for singleton(Integer)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `co_nothere' for singleton(Integer)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `co_cc' for singleton(Comparable)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `co_nothere' for 5"
+    }
+  ]
+}
