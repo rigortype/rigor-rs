@@ -102,6 +102,24 @@ tools — a partial sweep must never read as a full one.
 
 Custom directories passed as positional arguments replace the whole list.
 
+## Standing sweep-set baseline (2026-11-04, `v0.4.4`)
+
+Reference at `v0.4.4` (`c9f6388d`), release binary at PR #471's head. **9,441
+files, 0 FP candidates, 678 coverage gaps.** The raw bump also had 0 FP, and
+MATCHED is identical to `v0.4.3` on every corpus. Every gap delta (gitlab +1,
+mail +3, concurrent-ruby −18) comes from the reference's own count.
+
+| corpus | files | matched | coverage gaps |
+|---|---|---|---|
+| mastodon/app | 1236 | 410 | 15 |
+| gitlab-foss/lib | 4676 | 1078 | 159 |
+| survey/mail | 874 | 9611 | 302 |
+| survey/Ruby | 192 | 21 | 9 |
+| survey/dependabot-core | 1864 | 169886 | 89 |
+| survey/concurrent-ruby | 345 | 10 | 74 |
+| survey/net-ssh | 202 | 157 | 26 |
+| survey/haml/lib | 52 | 4 | 4 |
+
 ## Standing sweep-set baseline (2026-11-04, `v0.4.3`)
 
 Reference at `v0.4.3` (`8ad37954`), release binary at PR #466's head. **9,441

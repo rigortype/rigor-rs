@@ -15,8 +15,16 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.3`** (2026-10-15) |
-| Commit | `8ad37954` |
+| **Pinned ref** | **`v0.4.4`** (2026-10-16) |
+| Commit | `c9f6388d` |
+
+> **`v0.4.3 → v0.4.4` (2026-11-04): 248 commits, step five.** `core_overlay/ostruct.rbs`
+> is vendored. Raw: 0 fixture FPs and 0 sweep FPs, MATCHED unchanged. The fragment
+> probe found five gate-invisible families, all ported: OpenStruct as an open receiver
+> (#1982), wrapped `private def` visibility (#1819), `when`-condition writes in a
+> value-position `case` (#1961), `disable: [all]` covering `pre-eval.*` (#1948, which
+> reverses v0.4.3's F4), and plugin qualified-ID `disable:` (#1953). See the
+> [note](docs/notes/20261104-repin-v044.md).
 
 > **`v0.4.2 → v0.4.3` (2026-11-04): 221 commits, step four.** Nothing vendored
 > moved. Raw: 0 fixture FPs and 2 sweep FPs. Both were `unless flag` in an
