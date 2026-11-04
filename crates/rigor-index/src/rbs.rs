@@ -928,6 +928,7 @@ impl CoreData {
         let mut builder = Builder::default();
         let mut source = RbsSource::Embedded;
         if let Some(dir) = core_root {
+            builder.core_health = Some(Box::default());
             let mut found = Vec::new();
             glob_rbs(dir, &mut found);
             found.sort();
@@ -936,6 +937,16 @@ impl CoreData {
                     ingest_rbs_source(&mut builder, &f.to_string_lossy(), &code);
                 }
             }
+            // The supplied core must be closed on its own: every type its
+            // signatures name and every superclass / mixin it writes must be
+            // declared by the core itself. Otherwise the reference builds
+            // those types from stdlib / overlay reopens alone (or not at all)
+            // and fails in ways not modelled class by class here
+            // (`UnknownMethodAliasError` without `regexp.rbs`, overloads with
+            // no original without `module.rbs`, everything without
+            // `class.rbs`). Checked now, before stdlib and overlay load, so
+            // the env holds the core alone. rbs 3.4 / 3.10 / 4.2 cores pass.
+            let gap = builder.core_health_failures_open();
             for (name, contents) in EMBEDDED_RBS
                 .iter()
                 .filter(|(n, _)| !is_overlay(n) && !n.starts_with("core/"))
@@ -944,6 +955,9 @@ impl CoreData {
             }
             for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)) {
                 ingest_rbs_source(&mut builder, name, contents);
+            }
+            if let Some(h) = builder.core_health.as_deref_mut() {
+                h.core_gap = gap;
             }
             source = RbsSource::Override(dir.display().to_string());
         } else if let Ok(dir) = std::env::var("RIGOR_RBS_CORE_DIR") {
@@ -1012,6 +1026,10 @@ impl CoreData {
         // synthesized names join the same maps a written decl would (and the
         // project-sig snapshots above already exclude them).
         synthesize_missing_referenced_types(&mut builder, &qualified_project_sig_classes);
+        // Upstream v0.4.7 (#2517): a supplied core can leave classes the
+        // reference fails to build (`rbs.coverage.definition-build-failed`);
+        // decline them like an unbuildable definition, both sides.
+        let core_failures = builder.core_health_failures();
 
         let (
             mut classes,
@@ -1034,6 +1052,16 @@ impl CoreData {
         // A project-phase member that redeclares another declaration's key
         // fails that side's build (`DuplicatedMethodDefinitionError`); the
         // class reads `Dynamic[top]` in the reference. Same neutralisation.
+        for name in core_failures {
+            if let Some(entry) = qualified.get_mut(name) {
+                blank_unbuildable(entry, true, true);
+            }
+            if !name.contains("::") {
+                if let Some(entry) = classes.get_mut(name) {
+                    blank_unbuildable(entry, true, true);
+                }
+            }
+        }
         for (name, singleton) in dup_unbuildable {
             if let Some(entry) = qualified.get_mut(name) {
                 blank_unbuildable(entry, !singleton, singleton);
@@ -4179,6 +4207,30 @@ struct Builder {
     /// the same class already made (`RBS::DuplicatedMethodDefinitionError`):
     /// two `sig/` files both `def a`, or a `sig/` `def upcase` on `String`.
     dup_unbuildable: HashSet<(&'static str, bool)>,
+    /// `core_root:` mode (upstream v0.4.7, #2517) — the bookkeeping
+    /// [`Builder::core_health_failures`] reads. Off (and empty) otherwise.
+    core_health: Option<Box<CoreHealth>>,
+}
+
+/// What a supplied `core_root:` core needs checked that the embedded core
+/// (built cleanly by the reference) never does: every type a method signature
+/// names, every overloading `def m: ... | ...` having an original, and no
+/// member declared twice. Keys are qualified class names.
+#[derive(Default)]
+struct CoreHealth {
+    /// Type names each class's method signatures (every kind, `initialize`
+    /// included) reference, beside `ClassEntry::referenced_type_names`.
+    method_refs: HashMap<&'static str, Vec<&'static str>>,
+    /// Non-overloading member keys already declared.
+    originals: HashSet<MemberKey>,
+    /// Keys an overloading `def` continued.
+    overloads: HashSet<MemberKey>,
+    /// Classes a duplicated non-overloading member already failed.
+    duplicated: HashSet<&'static str>,
+    /// Set when a type the EMBEDDED core declares reaches the environment
+    /// only through stdlib / overlay reopens (the supplied core lacks its
+    /// primary declaration — see [`Builder::core_health_failures`]).
+    core_gap: bool,
 }
 
 /// `(qualified class, member name, singleton side?)` — one method key an RBS
@@ -4244,6 +4296,44 @@ impl Builder {
         let Some(qual) = qual else {
             return true;
         };
+        if let Some(h) = self.core_health.as_deref_mut() {
+            // Plugin and project members ride their own rules below; the
+            // core-health record covers the bundled load (core + stdlib +
+            // overlay) only.
+            if self.member_phase == MemberPhase::Bundled {
+                if let Node::MethodDefinition(md) = member {
+                    if md.overloading() {
+                        let n = intern(md.name().as_str());
+                        h.overloads.insert((qual, n, false));
+                        h.overloads.insert((qual, n, true));
+                    }
+                }
+                for key in Self::member_keys_of(qual, member) {
+                    if !h.originals.insert(key) {
+                        h.duplicated.insert(qual);
+                    }
+                }
+            }
+            if let Node::MethodDefinition(md) = member {
+                let written = FileSigCtx {
+                    root_only: false,
+                    use_map: HashMap::new(),
+                    bad_wildcard: false,
+                };
+                let mut names = Vec::new();
+                for ov in md.overloads().iter() {
+                    if let Node::MethodDefinitionOverload(ovn) = ov {
+                        if let Node::MethodType(mt) = ovn.method_type() {
+                            // A blank per-file ctx keeps each name as
+                            // WRITTEN (`Thread::Backtrace::Location`), not
+                            // the bare leaf the `None` ctx records.
+                            collect_method_type_names(&mt, Some(&written), &mut names);
+                        }
+                    }
+                }
+                h.method_refs.entry(qual).or_default().extend(names);
+            }
+        }
         match self.member_phase {
             MemberPhase::Bundled => true,
             MemberPhase::Plugin => {
@@ -4275,6 +4365,164 @@ impl Builder {
                 true
             }
         }
+    }
+
+    /// `core_root:` mode: the qualified classes whose definition the
+    /// reference cannot build over the supplied core — an interface or alias
+    /// a signature names that nothing declares (`RBS::NoTypeFoundError`), an overloading `def` with
+    /// no original (`InvalidOverloadMethodError`), a member declared twice,
+    /// or an unresolvable superclass / mixin — closed over the ancestor
+    /// relation (a class inheriting or mixing in a failed one fails too).
+    /// Deliberately a SUPERSET of the reference's failures: every class in
+    /// it is declined, never witnessed.
+    fn core_health_failures(&self) -> HashSet<&'static str> {
+        let Some(h) = self.core_health.as_deref() else {
+            return HashSet::new();
+        };
+        let resolves = |name: &str, entry: &ClassEntry| {
+            entry.member_ctxs.iter().any(|c| self.resolve_type_name_rbs(name, c).is_some())
+                || self.resolve_type_name_rbs(name, &[]).is_some()
+        };
+        // A CLASS a signature names that nothing declares does not fail the
+        // naming class's build by itself, but the reference's behaviour over
+        // such a core is not modelled class by class (removing `class.rbs`,
+        // `encoding.rbs` or `regexp.rbs` silences classes no rule here
+        // reaches): decline everything. A complete core (rbs 3.4 / 3.10 /
+        // 4.2) names no undeclared class.
+        let class_missing = h.core_gap || self.qualified.iter().any(|(&qual, entry)| {
+            h.method_refs.get(qual).into_iter().flatten().any(|n| {
+                let leaf = n.rsplit("::").next().unwrap_or(n);
+                leaf.starts_with(|c: char| c.is_ascii_uppercase()) && !resolves(n, entry)
+            })
+        });
+        if class_missing {
+            return self.qualified.keys().copied().collect();
+        }
+        let mut direct: HashSet<&'static str> = h.duplicated.clone();
+        // A module mixed into `Object` / `BasicObject` with no declared
+        // self-type takes the implicit `Object` self-type, whose ancestors
+        // include the module again: `RecursiveAncestorError` (a core without
+        // `kernel.rbs`, whose `module Kernel : BasicObject` is the only
+        // declaration giving one). Every class inherits the failure.
+        for root in ["BasicObject", "Object"] {
+            let Some(entry) = self.qualified.get(root) else {
+                continue;
+            };
+            for (w, ctx) in entry.includes_written.iter().chain(&entry.prepends_written) {
+                let bare = self
+                    .resolve_type_name_rbs(w, ctx)
+                    .and_then(|m| self.qualified.get(m))
+                    .is_some_and(|m| m.is_module && m.self_types_written.is_empty());
+                if bare {
+                    direct.insert(root);
+                }
+            }
+        }
+        for (&qual, entry) in &self.qualified {
+            // Only interface (`_ToS`, `Hash::_Pair`) and type-alias (`int`)
+            // references fail the build; an undeclared CLASS named in a
+            // signature does not (`Kernel#binding` without `binding.rbs`
+            // still builds). The leaf's first character tells them apart.
+            let mut refs = h.method_refs.get(qual).into_iter().flatten().filter(|n| {
+                let leaf = n.rsplit("::").next().unwrap_or(n);
+                leaf.starts_with(|c: char| c == '_' || c.is_ascii_lowercase())
+            });
+            if refs.any(|n| !resolves(n, entry)) {
+                direct.insert(qual);
+            }
+        }
+        // An overloading instance `def` continues an original declared on the
+        // class or any ancestor; none anywhere is `InvalidOverloadMethodError`.
+        // (Singleton-side continuations are not checked.)
+        for &(qual, name, single) in &h.overloads {
+            if single {
+                continue;
+            }
+            let mut seen = HashSet::new();
+            let mut stack = vec![qual];
+            let mut found = false;
+            while let Some(k) = stack.pop() {
+                if !seen.insert(k) {
+                    continue;
+                }
+                if h.originals.contains(&(k, name, false)) {
+                    found = true;
+                    break;
+                }
+                stack.extend(self.health_links(k).into_iter().flatten());
+            }
+            if !found {
+                direct.insert(qual);
+            }
+        }
+        // Close over ancestors (memoised DFS; a cycle reads as failed).
+        let mut memo: HashMap<&'static str, bool> = HashMap::new();
+        let keys: Vec<&'static str> = self.qualified.keys().copied().collect();
+        for k in keys {
+            self.health_failed(k, &direct, &mut memo, &mut HashSet::new());
+        }
+        memo.into_iter().filter(|&(_, f)| f).map(|(k, _)| k).collect()
+    }
+
+    /// The resolved superclass / include / prepend targets of `key` (`None`
+    /// for one that resolves to nothing declared).
+    /// Whether the types loaded so far name a type, superclass or mixin
+    /// nothing loaded so far declares (see the `core_root:` load).
+    fn core_health_failures_open(&self) -> bool {
+        let Some(h) = self.core_health.as_deref() else {
+            return false;
+        };
+        self.qualified.iter().any(|(&qual, entry)| {
+            let named = h.method_refs.get(qual).into_iter().flatten().any(|n| {
+                !entry.member_ctxs.iter().any(|c| self.resolve_type_name_rbs(n, c).is_some())
+                    && self.resolve_type_name_rbs(n, &[]).is_none()
+            });
+            named || self.health_links(qual).iter().any(Option::is_none)
+        })
+    }
+
+    fn health_links(&self, key: &'static str) -> Vec<Option<&'static str>> {
+        let Some(entry) = self.qualified.get(key) else {
+            return Vec::new();
+        };
+        let mut links: Vec<Option<&'static str>> = Vec::new();
+        for (w, ctx) in entry.includes_written.iter().chain(&entry.prepends_written) {
+            links.push(self.resolve_type_name_rbs(w, ctx));
+        }
+        match &entry.superclass_written {
+            Some((w, ctx)) => links.push(self.resolve_type_name_rbs(w, ctx)),
+            None if !entry.is_module && key != "BasicObject" => {
+                links.push(self.qualified.get_key_value("Object").map(|(&k, _)| k));
+            }
+            None => {}
+        }
+        links
+    }
+
+    fn health_failed(
+        &self,
+        key: &'static str,
+        direct: &HashSet<&'static str>,
+        memo: &mut HashMap<&'static str, bool>,
+        stack: &mut HashSet<&'static str>,
+    ) -> bool {
+        if let Some(&f) = memo.get(key) {
+            return f;
+        }
+        if !stack.insert(key) {
+            return true;
+        }
+        let failed = direct.contains(key) || {
+            self.health_links(key).into_iter().any(|l| match l {
+                Some(t) if self.qualified.contains_key(t) => {
+                    self.health_failed(t, direct, memo, stack)
+                }
+                _ => true,
+            })
+        };
+        stack.remove(key);
+        memo.insert(key, failed);
+        failed
     }
 
     /// Parse one RBS source and fold its top-level class/module declarations in.
