@@ -4464,6 +4464,18 @@ fn toplevel_include_reaches_other_files() {
     assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
     assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
     assert!(!got.iter().any(|(_, m)| m == "mine_x"), "{got:?}");
+    // MUST STILL FIRE: a receiver call is not silenced by an unnameable
+    // `include(…)` (a spec matcher) inside the included module's body — the
+    // concurrent-ruby shape that silenced `Benchmark.ips` project-wide.
+    let got = project_rule_methods(
+        &[
+            b"module Wm\n  describe('x') { expect(1).to include(2) }\n  def mine_x = 1\nend\ninclude Wm\n",
+            other,
+        ],
+        1,
+    );
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(!got.iter().any(|(_, m)| m == "mine_x"), "{got:?}");
     // MUST STILL FIRE: no top-level include anywhere (the include is in a block).
     let got = project_rule_methods(&[b"[1].each { include SomeGem::Helpers }\n", other], 1);
     assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");

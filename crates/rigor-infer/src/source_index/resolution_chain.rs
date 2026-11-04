@@ -561,24 +561,64 @@ impl SourceIndex {
         if raw == MIXIN_WILDCARD {
             return !explicit;
         }
-        match self.resolve_override_ancestor(owner, raw) {
-            Some(p) if self.known_user(&p) => {
-                let Some(chain) = self.instance_chain(&p) else {
+        // The question is a union over the module's ancestry, not "which
+        // definer does Ruby call", so the closure is walked directly: an order
+        // the port cannot vouch for (a fork, a multi-file mark) does not matter
+        // here, and declining on it silenced every receiver in a project whose
+        // included module merely had one (concurrent-ruby's `Concurrent`).
+        let mut queue: Vec<(String, String)> = vec![(owner.to_string(), raw.to_string())];
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some((from, raw)) = queue.pop() {
+            if raw == MIXIN_WILDCARD {
+                if !explicit {
                     return true;
-                };
-                chain.entries.iter().any(|e| match e {
-                    ChainEntry::External { raw, from } => {
-                        external_may_define(core, from, raw, method, explicit)
-                    }
-                    ChainEntry::Project(q) => {
-                        self.ancestry.wildcard_include(q)
-                            || self.ancestry.dirty.contains(q)
-                            || self.records_name(q, method)
-                    }
-                })
+                }
+                continue;
             }
-            _ => external_may_define(core, owner, raw, method, explicit),
+            match self.resolve_override_ancestor(&from, &raw) {
+                Some(q) if self.known_user(&q) => {
+                    if !seen.insert(q.clone()) {
+                        continue;
+                    }
+                    // `ResolutionChain::LIMIT`: a cut chain is uncertainty.
+                    if seen.len() > CHAIN_LIMIT {
+                        return true;
+                    }
+                    // A wildcard edge (an include the walk cannot name) or a
+                    // hook may hide a definer; only a bare call counts that,
+                    // as the reference's chain lists neither as an entry and
+                    // a receiver call skips every unknown module (an
+                    // `include('x')` matcher in a spec's `module Concurrent`
+                    // body would otherwise silence the whole project).
+                    if (!explicit
+                        && (self.ancestry.wildcard_include(&q) || self.ancestry.dirty.contains(&q)))
+                        || self.records_name(&q, method)
+                    {
+                        return true;
+                    }
+                    let mut edges: Vec<String> = self
+                        .override_classes
+                        .get(&q)
+                        .map(|e| e.includes.clone())
+                        .unwrap_or_default();
+                    if let Some(listed) = self.ancestry.include_listed.get(&q) {
+                        edges.extend(listed.iter().cloned());
+                    }
+                    for (_, names) in self.ancestry.groups.get(&q).into_iter().flatten() {
+                        edges.extend(names.iter().cloned());
+                    }
+                    for e in edges {
+                        queue.push((q.clone(), e));
+                    }
+                }
+                _ => {
+                    if external_may_define(core, &from, &raw, method, explicit) {
+                        return true;
+                    }
+                }
+            }
         }
+        false
     }
 }
 
