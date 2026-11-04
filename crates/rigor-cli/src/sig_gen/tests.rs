@@ -45,11 +45,12 @@ fn env_no_sig_class_is_new_method() {
 
 #[test]
 fn env_empty_decl_resolves_inherited_tighter() {
-    // Probe N: an EMPTY `class Foo` in sig ⇒ `hash` resolves through Object ⇒
-    // tighter, was: Integer.
+    // Probe N: an EMPTY `class Foo` in sig ⇒ `hash` resolves through Object
+    // (declared `Integer`), so it is not new. The literal `1` does not tighten
+    // it (#837, `pins_literal_over_declaration?`) ⇒ DROP. Unresolved, it would
+    // have been a `# [new]` row.
     let cs = candidates_with_sig("empty_decl", "class Foo\n  def hash\n    1\n  end\nend\n", "class Foo\nend\n");
-    assert_eq!(cs[0].classification, "tighter_return");
-    assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("Integer"));
+    assert!(cs.is_empty(), "{cs:?}");
 }
 
 #[test]
@@ -61,9 +62,8 @@ fn env_fqn_gate_resolves_nested_class() {
         "module M\n  class Foo\n    def hash\n      1\n    end\n  end\nend\n",
         "module M\n  class Foo\n  end\nend\n",
     );
-    assert_eq!(cs[0].class_name, "M::Foo");
-    assert_eq!(cs[0].classification, "tighter_return");
-    assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("Integer"));
+    // Resolved (not `# [new]`); the literal does not tighten it (#837).
+    assert!(cs.is_empty(), "{cs:?}");
 }
 
 #[test]
@@ -74,8 +74,8 @@ fn env_project_superclass_resolves_tighter() {
         "class Foo\n  def greeting\n    \"hi\"\n  end\nend\n",
         "class Base\n  def greeting: () -> String\nend\n\nclass Foo < Base\nend\n",
     );
-    assert_eq!(cs[0].classification, "tighter_return");
-    assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("String"));
+    // Resolved through Base (not `# [new]`); `"hi"` does not tighten (#837).
+    assert!(cs.is_empty(), "{cs:?}");
 }
 
 #[test]
@@ -100,10 +100,10 @@ fn env_initialize_bypasses_classification() {
 
 #[test]
 fn env_attr_reader_classifies_like_method() {
-    // Probe I: `attr_reader name: String` ⇒ `def name` tighter, was: String.
+    // Probe I: `attr_reader name: String` declares `def name` (not `# [new]`);
+    // the literal `"n"` does not tighten it (#837).
     let cs = candidates_with_sig("attr", "class Foo\n  def name\n    \"n\"\n  end\nend\n", "class Foo\n  attr_reader name: String\nend\n");
-    assert_eq!(cs[0].classification, "tighter_return");
-    assert_eq!(cs[0].declared_return_rbs.as_deref(), Some("String"));
+    assert!(cs.is_empty(), "{cs:?}");
 }
 
 #[test]
@@ -114,9 +114,8 @@ fn env_singleton_own_and_inherited() {
         "class Foo\n  def self.build\n    1\n  end\nend\n",
         "class Foo\n  def self.build: () -> Integer\nend\n",
     );
-    assert_eq!(own[0].classification, "tighter_return");
-    assert_eq!(own[0].kind, "singleton");
-    assert_eq!(own[0].declared_return_rbs.as_deref(), Some("Integer"));
+    // Declared (not `# [new]`); the literal does not tighten it (#837).
+    assert!(own.is_empty(), "{own:?}");
 
     // Probe Q3: `def self.hash` on an empty `class Foo` inherits `Object#hash`
     // through the class object's `Class`/`Module`/`Object` ancestry.
@@ -125,15 +124,14 @@ fn env_singleton_own_and_inherited() {
         "class Foo\n  def self.hash\n    1\n  end\nend\n",
         "class Foo\nend\n",
     );
-    assert_eq!(inh[0].classification, "tighter_return");
-    assert_eq!(inh[0].declared_return_rbs.as_deref(), Some("Integer"));
+    assert!(inh.is_empty(), "{inh:?}");
 }
 
 #[test]
 fn env_literal_tightening_emits_but_computed_drops() {
-    // A directly-authored literal tail tightens; a computed constant drops.
+    // Since #837 a literal never tightens, directly authored or not.
     let lit = candidates_with_sig("lit", "class Foo\n  def m\n    1\n  end\nend\n", "class Foo\n  def m: () -> Integer\nend\n");
-    assert_eq!(lit[0].classification, "tighter_return");
+    assert!(lit.is_empty(), "{lit:?}");
     // Assignment tail: `x = 1` types Constant<1> but the RAW tail is a write,
     // NOT a literal ⇒ computed_literal_tightening ⇒ DROP (no assignment unwrap).
     let asn = candidates_with_sig("asn", "class Foo\n  def m\n    x = 1\n  end\nend\n", "class Foo\n  def m: () -> Integer\nend\n");
@@ -163,10 +161,9 @@ fn env_unresolvable_declared_returns_drop() {
         let cs = candidates_with_sig(tag, "class Foo\n  def m\n    \"hi\"\n  end\nend\n", &rbs);
         assert!(cs.is_empty(), "{tag}: expected DROP, got {cs:?}");
     }
-    // A genuine tightening still emits (declared String, inferred "hi").
-    let ok = candidates_with_sig("tight", "class Foo\n  def m\n    \"hi\"\n  end\nend\n", "class Foo\n  def m: () -> String\nend\n");
-    assert_eq!(ok[0].classification, "tighter_return");
-    assert_eq!(ok[0].declared_return_rbs.as_deref(), Some("String"));
+    // Declared String, inferred "hi": a literal does not tighten (#837).
+    let lit = candidates_with_sig("tight", "class Foo\n  def m\n    \"hi\"\n  end\nend\n", "class Foo\n  def m: () -> String\nend\n");
+    assert!(lit.is_empty(), "{lit:?}");
 }
 
 #[test]
@@ -1051,9 +1048,10 @@ fn merge_attr_reader_blocks_matching_method_candidate() {
         &HashMap::new(),
         false,
     );
-    // attr_reader name: String vs candidate "n" → different → skipped.
+    // `attr_reader name` declares `name`: the candidate is skipped as
+    // user-authored, with its own classification.
     assert_eq!(out.skipped.len(), 1);
-    assert_eq!(out.skipped[0].declared_return_rbs.as_deref(), Some("String"));
+    assert_eq!(out.skipped[0].classification, "new_method");
     assert_eq!(out.source, src);
 }
 
@@ -1179,4 +1177,98 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
     );
     assert!(out.repaired.is_empty());
     assert_eq!(out.action, "noop");
+}
+
+/// The skip reasons of a run, in candidate order (#472: the stderr summary).
+fn skips_with_sig(tag: &str, rb_src: &str, rbs_src: &str) -> (Vec<Candidate>, Vec<&'static str>) {
+    let dir = std::env::temp_dir().join(format!("rigor_siggen_skips_{tag}"));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(dir.join("lib")).unwrap();
+    std::fs::create_dir_all(dir.join("sig")).unwrap();
+    let rb = dir.join("lib/foo.rb");
+    std::fs::write(&rb, rb_src).unwrap();
+    std::fs::write(dir.join("sig/foo.rbs"), rbs_src).unwrap();
+    let env = SigEnv::build(&[dir.join("sig")]);
+    let Generated { candidates, skips, .. } =
+        generate_run(&[rb.to_str().unwrap().to_string()], false, &env, &writes);
+    let _ = std::fs::remove_dir_all(&dir);
+    (candidates, skips)
+}
+
+#[test]
+fn skip_reasons_follow_candidate_order() {
+    // Oracle (v0.4.7): `(sig.skipped.overridden-by-unsigned-subclass: 1,
+    // sig.skipped.untyped-return: 1, sig.skipped.uncertain-module-function: 1,
+    // sig.skipped.top-level-def: 1)`.
+    let src = "class Base\n  def name = 1\n  def other = 2\nend\n\
+               class Sub < Base\n  def name(x) = x\nend\n\
+               module MF\n  module_function\n  def a = 1\n  public\n  def b = 2\nend\n\
+               module MF2\n  module_function\n  if rand > 0.5\n    private\n  end\n  def c = 3\nend\n\
+               if true\n  def tl = 1\nend\n\
+               foo do\n  def inblk = 1\nend\n\
+               def self.sx = 1\n";
+    let (cs, skips) = skips_with_sig("order", src, "");
+    let emitted: Vec<String> =
+        cs.iter().map(|c| format!("{}#{} {}", c.class_name, c.method_name, c.rbs)).collect();
+    assert_eq!(
+        emitted,
+        vec![
+            "Base#other def other: () -> 2",
+            "MF#a def self?.a: () -> 1",
+            "MF#b def b: () -> 2",
+        ]
+    );
+    assert_eq!(
+        skips,
+        vec![
+            "sig.skipped.overridden-by-unsigned-subclass",
+            "sig.skipped.untyped-return",
+            "sig.skipped.uncertain-module-function",
+            "sig.skipped.top-level-def",
+        ]
+    );
+}
+
+#[test]
+fn module_function_reset_readings() {
+    // Each module's def reads: a direct reset ends the mode (`def b`), one in
+    // `begin` ends it too but the visibility table keeps the `private` the
+    // bare call set (dropped), one in control flow or a block makes the next
+    // def uncertain, and `*_eval` / `Class.new do` blocks are another scope.
+    let src = "module A\n  module_function\n  self.private\n  def a = 1\nend\n\
+               module B\n  module_function\n  begin\n    private\n  end\n  def b = 1\nend\n\
+               module C\n  module_function\n  [1].each { private }\n  def c = 1\n  module_function\n  def c2 = 2\nend\n\
+               module D\n  module_function\n  String.class_eval { private }\n  def d = 1\nend\n\
+               module E\n  module_function\n  X = Class.new(Object) do\n    private\n  end\n  def e = 1\nend\n\
+               module F\n  module_function\n  case y\n  when 1 then private\n  end\n  private def f = 1\nend\n";
+    let (cs, skips) = skips_with_sig("mf", src, "");
+    let emitted: Vec<&str> = cs.iter().map(|c| c.rbs.as_str()).collect();
+    assert_eq!(emitted, vec!["def self?.c2: () -> 2", "def self?.d: () -> 1", "def self?.e: () -> 1"]);
+    assert_eq!(skips, vec!["sig.skipped.uncertain-module-function"; 2]);
+}
+
+#[test]
+fn bare_core_reopening_reads_every_method_as_new() {
+    // #482: `class Hash` without parameters fails Hash's definition build in
+    // the reference (GenericParameterMismatchError), so a member `sig/`
+    // already declares is NOT dropped as equivalent: it reaches the writer,
+    // which skips it as user-authored.
+    let (cs, _) = skips_with_sig(
+        "bare_hash",
+        "class Hash\n  def hfoo = 1\n  def hbar = 2\nend\nclass Foo\n  def ffoo = 1\nend\n",
+        "class Hash\n  def hfoo: () -> 1\nend\nclass Foo\n  def ffoo: () -> 1\nend\n",
+    );
+    let emitted: Vec<String> = cs.iter().map(|c| format!("{}#{}", c.class_name, c.method_name)).collect();
+    assert_eq!(emitted, vec!["Hash#hfoo", "Hash#hbar"], "Foo#ffoo stays equivalent");
+    let src = "# c\nclass Hash\n  def hfoo: () -> 1\nend\n".to_string();
+    let mut params = HashMap::new();
+    params.insert("Hash".to_string(), "[unchecked out K, unchecked out V]".to_string());
+    let out = apply_merge_with(src, cs, &HashMap::new(), &params, false);
+    assert_eq!(out.skipped.len(), 1);
+    assert_eq!(out.skipped[0].candidate.method_name, "hfoo");
+    assert_eq!(out.repaired, vec!["Hash[unchecked out K, unchecked out V]".to_string()]);
+    assert_eq!(
+        out.source,
+        "# c\nclass Hash[unchecked out K, unchecked out V]\n  def hfoo: () -> 1\n  def hbar: () -> 2\nend\n"
+    );
 }
