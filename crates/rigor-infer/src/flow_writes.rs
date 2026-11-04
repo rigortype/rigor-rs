@@ -6,7 +6,7 @@
 
 use std::collections::HashSet;
 
-use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, ShapeKey};
 
 use crate::{SourceIndex, TypeEnv};
@@ -1133,6 +1133,11 @@ pub(crate) fn argument_floor_writes(
         })
         .collect();
     let immutable = |name: &str| written.contains(name) && !mutable_names.contains(name);
+    let def_spans: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| matches!(n, Node::Definition { .. }).then(|| n.span()))
+        .collect();
+    let inside = |o: rigor_parse::Span, i: rigor_parse::Span| o.0 <= i.0 && i.1 <= o.1;
     for (_, n) in ast.iter() {
         let Node::Call { receiver, method, args, span, .. } = n else {
             continue;
@@ -1140,9 +1145,12 @@ pub(crate) fn argument_floor_writes(
         if args.is_empty() || !call_may_floor(ast, source, receiver.is_some(), method, args) {
             continue;
         }
+        let exempt = readonly_positions(ast, source, n);
         let mut passed = Vec::new();
-        for &a in args {
-            passed_locals(ast, a, &mut passed);
+        for (i, &a) in args.iter().enumerate() {
+            if !exempt.contains(&i) {
+                passed_locals(ast, a, &mut passed);
+            }
         }
         // The transitive closure over `holds`.
         let mut seen: HashSet<String> = HashSet::new();
@@ -1152,6 +1160,44 @@ pub(crate) fn argument_floor_writes(
             }
             if let Some(h) = holds.get(&name) {
                 passed.extend(h.iter().cloned());
+            }
+        }
+        // A local holding a floored one changed too (`alias_args = args`).
+        loop {
+            let grown: Vec<String> = holds
+                .iter()
+                .filter(|(z, held)| !seen.contains(*z) && held.iter().any(|h| seen.contains(h)))
+                .map(|(z, _)| z.clone())
+                .collect();
+            if grown.is_empty() {
+                break;
+            }
+            seen.extend(grown);
+        }
+        // `floor_splat_arguments`' documented limit: only the type says which
+        // local a splatted element is, so an equal literal another local
+        // holds floors too. Over-approximated as every local of the scope.
+        let splat = args.iter().any(|&a| {
+            matches!(ast.get(a), Node::Statements { kind: StatementsKind::Recovered, .. })
+        });
+        if splat && !seen.is_empty() {
+            let scope = def_spans
+                .iter()
+                .filter(|d| inside(**d, *span))
+                .min_by_key(|d| d.1 - d.0)
+                .copied();
+            for (_, w) in ast.iter() {
+                let Node::LocalVariableWrite { name, span: ws, .. } = w else {
+                    continue;
+                };
+                let innermost = def_spans
+                    .iter()
+                    .filter(|d| inside(**d, *ws))
+                    .min_by_key(|d| d.1 - d.0)
+                    .copied();
+                if innermost == scope {
+                    seen.insert(name.clone());
+                }
             }
         }
         let mut names: Vec<String> = seen.into_iter().filter(|n| !immutable(n)).collect();
@@ -1176,6 +1222,167 @@ pub(crate) fn toplevel_argument_floor(
     out
 }
 
+/// Receiver methods whose result is never the receiver nor one of its
+/// elements, and which write nothing: a parameter read only through these is
+/// read-only for [`readonly_positions`]. `to_s` / `to_a` / `to_h` are out
+/// (they may return the receiver: `CalleeWriteCensus::SELF_RETURNERS`).
+const READONLY_METHODS: &[&str] = &[
+    "size", "length", "count", "empty?", "any?", "none?", "nil?", "key?", "has_key?",
+    "include?", "member?", "is_a?", "kind_of?", "instance_of?", "respond_to?", "frozen?",
+    "hash", "==", "!=", "eql?", "equal?", "inspect",
+];
+
+/// Store methods whose result is their receiver: a parameter handed to one
+/// on another parameter is held, not written (`acc.push(flag)`).
+const HOLDING_STORES: &[&str] = &["push", "<<", "append", "unshift", "add"];
+
+/// The argument positions of `call` the reference keeps reading precisely
+/// after it: a receiverless call of a name exactly one project body answers
+/// (a plain top-level `def` of this file with plain positional parameters,
+/// no `method_missing` anywhere), made at the top level or in a top-level
+/// `def` outside any block, whose parameter at that position the def only
+/// reads ([`READONLY_METHODS`] receivers, or a [`HOLDING_STORES`] argument
+/// on another parameter the def only stores into or reads). The reference's
+/// write census finds no write there, so its floor leaves the local alone
+/// (`def ro(h) = h.size; ro(h7); h7[:a].upcase` still fires). Everything
+/// else is empty: an allow-list, so a shape it does not name floors.
+fn readonly_positions(ast: &LoweredAst, source: &SourceIndex, call: &Node) -> HashSet<usize> {
+    let none = HashSet::new();
+    let Node::Call { receiver: None, method, args, span, args_plain_positional: true, .. } = call
+    else {
+        return none;
+    };
+    if !source.unique_project_body(method) {
+        return none;
+    }
+    let inside = |o: rigor_parse::Span, i: rigor_parse::Span| o.0 <= i.0 && i.1 <= o.1;
+    // The call's context: no class/module body, block, lambda or
+    // non-top-level def around it.
+    let mut def_node: Option<NodeId> = None;
+    for (id, n) in ast.iter() {
+        let s = n.span();
+        match n {
+            Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Lambda { .. }
+                if inside(s, *span) =>
+            {
+                return none;
+            }
+            Node::Call { block_body, .. } if !block_body.is_empty() => {
+                if let Some(h) = span_hull(ast, block_body) {
+                    if inside(h, *span) {
+                        return none;
+                    }
+                }
+            }
+            Node::Definition { name, .. } if name.as_deref() == Some(method.as_str()) => {
+                if def_node.is_some() {
+                    return none;
+                }
+                def_node = Some(id);
+            }
+            Node::Definition { name: None, .. } if inside(s, *span) => return none,
+            _ => {}
+        }
+    }
+    let Some(def_id) = def_node else { return none };
+    let Node::Definition { params: Some(names), span: dspan, .. } = ast.get(def_id) else {
+        return none;
+    };
+    if names.len() != args.len() {
+        return none;
+    }
+    // The def itself sits at the top level: no scope node encloses it.
+    let top_level = !ast.iter().any(|(id, n)| {
+        id != def_id
+            && matches!(n, Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Definition { .. }
+                | Node::Lambda { .. } | Node::Call { .. })
+            && n.span() != *dspan
+            && inside(n.span(), *dspan)
+    });
+    if !top_level {
+        return none;
+    }
+    // Parent links over the def's subtree.
+    let mut parent: std::collections::HashMap<NodeId, NodeId> = std::collections::HashMap::new();
+    let mut stack = vec![def_id];
+    let mut seen: HashSet<NodeId> = HashSet::new();
+    while let Some(id) = stack.pop() {
+        if !seen.insert(id) {
+            continue;
+        }
+        let mut kids = Vec::new();
+        node_child_ids(ast.get(id), &mut kids);
+        for k in kids {
+            parent.entry(k).or_insert(id);
+            stack.push(k);
+        }
+    }
+    // Every node inside the def's span must be linked: an unlinked read
+    // could be anywhere.
+    let in_def: Vec<(NodeId, &Node)> = ast
+        .iter()
+        .filter(|(id, n)| *id != def_id && inside(*dspan, n.span()))
+        .collect();
+    if in_def.iter().any(|(id, _)| !seen.contains(id)) {
+        return none;
+    }
+    let rebound = |p: &str| {
+        in_def.iter().any(|(_, n)| match n {
+            Node::LocalVariableWrite { name, .. } | Node::LocalVariableOpWrite { name, .. } => {
+                name == p
+            }
+            Node::MultiWrite { targets, .. } => targets.bound_names().iter().any(|(b, _)| b == p),
+            Node::UnmodeledWrite { names, .. } => names.iter().any(|b| b == p),
+            _ => false,
+        })
+    };
+    let reads = |p: &str| -> Vec<NodeId> {
+        in_def
+            .iter()
+            .filter(|(_, n)| matches!(n, Node::LocalVariableRead { name, .. } if name == p))
+            .map(|(id, _)| *id)
+            .collect()
+    };
+    let read_only_receiver = |id: NodeId| match parent.get(&id).map(|&p| ast.get(p)) {
+        Some(Node::Call { receiver: Some(r), method, block_body, .. }) => {
+            *r == id && block_body.is_empty() && READONLY_METHODS.contains(&method.as_str())
+        }
+        _ => false,
+    };
+    let store_receiver = |id: NodeId| match parent.get(&id).map(|&p| ast.get(p)) {
+        Some(Node::Call { receiver: Some(r), method, block_body, .. }) => {
+            *r == id && block_body.is_empty() && HOLDING_STORES.contains(&method.as_str())
+        }
+        _ => false,
+    };
+    // A parameter the def only stores into or reads: nothing takes an
+    // element back out of it.
+    let store_only = |q: &str| {
+        !rebound(q) && reads(q).into_iter().all(|id| read_only_receiver(id) || store_receiver(id))
+    };
+    let held_by_store = |id: NodeId, p: &str| match parent.get(&id).map(|&x| ast.get(x)) {
+        Some(Node::Call { receiver: Some(r), method, args, block_body, .. })
+            if block_body.is_empty()
+                && HOLDING_STORES.contains(&method.as_str())
+                && args.contains(&id) =>
+        {
+            matches!(ast.get(*r), Node::LocalVariableRead { name, .. }
+                if name != p && names.contains(name) && store_only(name))
+        }
+        _ => false,
+    };
+    let mut out = HashSet::new();
+    for (i, p) in names.iter().enumerate() {
+        if !matches!(ast.get(args[i]), Node::LocalVariableRead { .. }) || rebound(p) {
+            continue;
+        }
+        if reads(p).into_iter().all(|id| read_only_receiver(id) || held_by_store(id, p)) {
+            out.insert(i);
+        }
+    }
+    out
+}
+
 /// The methods whose argument a receiver local holds afterwards (the
 /// `holds` table of [`argument_floor_writes`]).
 const FLOOR_STORE_METHODS: &[&str] = &[
@@ -1196,7 +1403,10 @@ fn call_may_floor(
         return true;
     }
     match method {
-        "call" | "instance_exec" | "class_exec" | "module_exec" => has_receiver,
+        // A receiverless `call` is a self-call to a def of that name;
+        // `instance_exec` and the rest run their block on any receiver.
+        "call" => has_receiver,
+        "instance_exec" | "class_exec" | "module_exec" => true,
         "send" | "__send__" | "public_send" => match ast.get(args[0]) {
             Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => {
                 source.call_may_mutate_arguments(value)
@@ -1231,6 +1441,22 @@ fn passed_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
         Node::Logical { left, right, .. } => {
             passed_locals(ast, *left, out);
             passed_locals(ast, *right, out);
+        }
+        // An `else` arm lowers as a `BeginRescue` carrier.
+        Node::BeginRescue { body, clauses, .. } => {
+            for &e in body.iter().chain(clauses.iter().flat_map(|c| c.body.iter())) {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &e in branches.iter().chain(else_body) {
+                passed_locals(ast, e, out);
+            }
+        }
+        Node::When { body, .. } => {
+            for &e in body {
+                passed_locals(ast, e, out);
+            }
         }
         Node::LocalVariableWrite { value, .. } | Node::LocalVariableOpWrite { value, .. } => {
             passed_locals(ast, *value, out);

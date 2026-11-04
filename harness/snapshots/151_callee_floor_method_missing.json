@@ -1,0 +1,12 @@
+{
+  "fixture": "harness/corpus/151_callee_floor_method_missing.rb",
+  "diagnostics": [
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 17,
+      "column": 13,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

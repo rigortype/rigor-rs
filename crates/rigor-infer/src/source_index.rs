@@ -646,8 +646,10 @@ pub struct SourceIndex {
     /// `define_method` / `alias_method` / `alias` / `attr_*` / delegation
     /// macro (the #2183 census's `defs` + `bodiless`). A mutable local
     /// passed to a call of one of these names is floored after the call
-    /// (see `flow_writes::argument_floor_writes`). Read only to WIDEN.
-    floor_callee_names: HashSet<String>,
+    /// (see `flow_writes::argument_floor_writes`), counted per definition
+    /// site (a count of one is a name only one body answers). Read only to
+    /// WIDEN, or to keep a unique read-only top-level callee firing.
+    floor_callee_names: HashMap<String, u32>,
     /// Upstream v0.4.7 (#2521) — some project `def` is named
     /// `method_missing`, so a call no def answers may still run a body
     /// against its arguments. Read only to WIDEN.
