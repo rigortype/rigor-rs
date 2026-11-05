@@ -448,13 +448,13 @@ fn disjoint_guard_suppression_does_not_over_reach() {
         // NON-disjoint guards: a superclass/module the carrier includes, the
         // same class, Object (probes n_super_enumerable, n_same_class,
         // n_object, x_*_ok, tripleeq_nondisj, elsif_nondisj)
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Object)\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.kind_of?(Enumerable)\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-        (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "Hash"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Array)\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.is_a?(Object)\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.kind_of?(Enumerable)\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz if h.instance_of?(Array)\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  if Enumerable === h\n    h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = { a: 1 }\n  h.frobnicate_zzz if h.is_a?(Enumerable)\nend\n"[..], "{ a: 1 }"),
         // (The two `ClassOrdering::Unknown`-on-a-NOMINAL rows that used to
         // sit here moved to the silence test at the `v0.3.8` re-pin —
         // upstream #533 item 4 widens that arm to `untyped`. The rows below
@@ -466,7 +466,7 @@ fn disjoint_guard_suppression_does_not_over_reach() {
         // twin of this row moved to the silence test at the `v0.3.9` re-pin:
         // `6cde8381` gave `narrow_shape_to_class` the same `declines_bot?`
         // the nominal arm had.)
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(Comparable)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_yyy if h.is_a?(Comparable)\n  h.frobnicate_zzz\nend\n"[..], "[1, 2]"),
         // A TERMINATING truthy edge widens only the path that returns; the
         // code after runs on the untouched falsey edge.
         (&b"def f\n  h = Array.new\n  return if h.is_a?(UnknownZzz)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
@@ -477,30 +477,30 @@ fn disjoint_guard_suppression_does_not_over_reach() {
         // S3 anti-over-suppression: a SHAPED carrier under a guard it IS a
         // subclass of survives and still witnesses. All three measured
         // firing on the reference (`… for [1, 2]` / `… for { a: 1 }`).
-        (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
-        (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Object)\n  v.frobnicate_zzz\nend\n"[..], "Array"),
-        (&b"def f\n  v = { a: 1 }\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "Hash"),
+        (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  v = [1, 2]\n  return unless v.is_a?(Object)\n  v.frobnicate_zzz\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  v = { a: 1 }\n  return unless v.is_a?(Enumerable)\n  v.frobnicate_zzz\nend\n"[..], "{ a: 1 }"),
         // the FALSEY edge of a disjoint guard is NOT narrowed
         // (`narrow_nominal_not_class` preserves it) — probes s_unless_body,
         // s_negated_if, s_case_when_else_branch
-        (&b"def f\n  h = [1, 2]\n  unless h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  if !h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  case h\n  when Hash then 0\n  else h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  unless h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  if !h.is_a?(Hash)\n    h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  case h\n  when Hash then 0\n  else h.frobnicate_zzz\n  end\nend\n"[..], "[1, 2]"),
         // a `when` clause whose conditions do NOT all collapse — the
         // reference unions them (probe case_multi_mixed)
-        (&b"def f\n  h = [1, 2]\n  case h\n  when Hash, Array then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  case h\n  when Hash, Array then h.frobnicate_zzz\n  else 0\n  end\nend\n"[..], "[1, 2]"),
         // a use BEFORE the guard, and AFTER the conditional (probes
         // before_guard_fires, after_branch)
-        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz\n  0 if h.is_a?(Hash)\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    0\n  end\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  h.frobnicate_zzz\n  0 if h.is_a?(Hash)\nend\n"[..], "[1, 2]"),
+        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    0\n  end\n  h.frobnicate_zzz\nend\n"[..], "[1, 2]"),
         // a REBIND kills the fact — in the branch and inside a block
         // (probes bot_rebind_use, rebind_in_branch, bot_block_rebind)
-        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h = [3, 4]\n    h.frobnicate_zzz\n  end\nend\n"[..], "Array"),
-        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each do\n      h = [3, 4]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    h = [3, 4]\n    h.frobnicate_zzz\n  end\nend\n"[..], "[3, 4]"),
+        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    [1].each do\n      h = [3, 4]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "[3, 4]"),
         // a non-disjoint guard's early-return propagation still witnesses
-        (&b"def f\n  h = [1, 2]\n  return 0 unless h.is_a?(Enumerable)\n  h.frobnicate_zzz\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  return 0 unless h.is_a?(Enumerable)\n  h.frobnicate_zzz\nend\n"[..], "[1, 2]"),
         // a nested `def` is an independent scope (probe bot_nested_def)
-        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    def g\n      h = [5, 6]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "Array"),
+        (&b"def f\n  h = [1, 2]\n  if h.is_a?(Hash)\n    def g\n      h = [5, 6]\n      h.frobnicate_zzz\n    end\n  end\nend\n"[..], "[5, 6]"),
     ] {
         let diags = run(src);
         assert_eq!(
