@@ -2049,9 +2049,9 @@ fn psych_plain_to_s(t: &str) -> Option<String> {
     }
     if stringish.is_match(t) || t.contains('\n') {
         let lower = t.to_ascii_lowercase();
-        return Some(if t.chars().count() > 5 {
-            t.to_string()
-        } else if !matches!(lower.chars().next(), Some('y' | 't' | 'o' | 'n' | 'f' | '~')) {
+        return Some(if t.chars().count() > 5
+            || !matches!(lower.chars().next(), Some('y' | 't' | 'o' | 'n' | 'f' | '~'))
+        {
             t.to_string()
         } else if t == "~" || lower == "null" {
             String::new()
