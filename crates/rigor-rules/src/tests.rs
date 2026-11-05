@@ -4550,3 +4550,28 @@ fn refinement_reaches_class_object_receivers_across_files() {
         .collect();
     assert_eq!(rows, ["1:oo", "5:cc", "7:nothere"], "got {rows:?}");
 }
+
+/// rigor-rs#472 item 3: a literal collection local inside a `def` names its
+/// literal shape (the collection-shape snapshot's carrier) as the reference's
+/// scope does; a mutated seed, or one whose element the port types
+/// `Dynamic[top]`, keeps the bare class.
+#[test]
+fn def_local_literal_collection_names_its_shape() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    assert_eq!(undefined(b"def m\n  c = [1]\n  c.nope\nend\n"), ["undefined method `nope' for [1]"]);
+    assert_eq!(undefined(b"def m\n  c = {}\n  c.nope\nend\n"), ["undefined method `nope' for {}"]);
+    assert_eq!(
+        undefined(b"def m\n  c = { a: [1, nil] }\n  c.nope\nend\n"),
+        ["undefined method `nope' for { a: [1, nil] }"]
+    );
+    // A mutator widens the seed: the message keeps the class.
+    assert_eq!(undefined(b"def m\n  c = [1]\n  c << 2\n  c.nope\nend\n"), ["undefined method `nope' for Array"]);
+    // A parameter element is `Dynamic[top]` here; the reference may type it.
+    assert_eq!(undefined(b"def m(a)\n  c = [a]\n  c.nope\nend\n"), ["undefined method `nope' for Array"]);
+}

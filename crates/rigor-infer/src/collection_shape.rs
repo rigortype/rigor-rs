@@ -15,6 +15,16 @@ use crate::{
     ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
+/// One collection-shape snapshot: the class a bare-local receiver's carrier
+/// dispatches on (`"Array"` / `"Hash"`), and the carrier itself at the use
+/// site — a literal `Tuple` / `HashShape` seed no mutator has widened yet, or a
+/// `Nominal[Array|Hash]`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CollSnap {
+    pub class: &'static str,
+    pub carrier: TypeId,
+}
+
 impl<'i> Typer<'i> {
     // -----------------------------------------------------------------------
     // Collection-shape receiver survival (spec
@@ -74,7 +84,7 @@ impl<'i> Typer<'i> {
         &self,
         ast: &LoweredAst,
         interner: &mut Interner,
-    ) -> HashMap<NodeId, &'static str> {
+    ) -> HashMap<NodeId, CollSnap> {
         let mut out = HashMap::new();
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
@@ -98,7 +108,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         ctx: &CollCtx<'_>,
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, &'static str>,
+        out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
         for &s in stmts {
@@ -121,7 +131,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         ctx: &CollCtx<'_>,
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, &'static str>,
+        out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
         let bound = ast.closure_bound_names(id);
@@ -152,7 +162,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         ctx: &CollCtx<'_>,
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, &'static str>,
+        out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
         match ast.get(id) {
@@ -362,7 +372,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         ctx: &CollCtx<'_>,
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, &'static str>,
+        out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
         match ast.get(id) {
@@ -391,9 +401,10 @@ impl<'i> Typer<'i> {
                 // Record the use BEFORE any of the call's own effects — the
                 // receiver read happens first (`output << 'a'` reads the seed).
                 if let Some(name) = &local {
-                    if let Some(cls) = tenv.get(name).and_then(|&ty| self.coll_carrier(interner, ty))
-                    {
-                        out.insert(id, cls);
+                    if let Some(&ty) = tenv.get(name) {
+                        if let Some(class) = self.coll_carrier(interner, ty) {
+                            out.insert(id, CollSnap { class, carrier: ty });
+                        }
                     }
                 }
                 // The mutator's effect is decided by the PRE-call carrier
@@ -512,9 +523,10 @@ impl<'i> Typer<'i> {
                 // Record the use BEFORE the write's own effects, as the `Call`
                 // arm does (`output[k] += 1` reads the seed).
                 if let Some(name) = &local {
-                    if let Some(cls) = tenv.get(name).and_then(|&ty| self.coll_carrier(interner, ty))
-                    {
-                        out.insert(id, cls);
+                    if let Some(&ty) = tenv.get(name) {
+                        if let Some(class) = self.coll_carrier(interner, ty) {
+                            out.insert(id, CollSnap { class, carrier: ty });
+                        }
                     }
                 }
                 let widened = match local.as_ref().and_then(|name| {
@@ -643,7 +655,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         ctx: &CollCtx<'_>,
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, &'static str>,
+        out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
         let Node::If { predicate, then_body, else_body, is_unless, .. } = ast.get(id) else {
@@ -676,7 +688,7 @@ impl<'i> Typer<'i> {
         tenv: &mut TypeEnv,
         ctx: &CollCtx<'_>,
         interner: &mut Interner,
-        out: &mut HashMap<NodeId, &'static str>,
+        out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
         let Node::Case { predicate, branches, else_body, span } = ast.get(id) else {
