@@ -77,7 +77,7 @@ pub use flow_writes::{closure_shadow_scopes, collect_flow_writes, diagnostic_rea
 };
 pub use folding::RubyFolder;
 pub use source_index::{
-    lexical_scopes, method_body_spans, ConstLit, DefKind, Harvest, ParamBoundReturn, SourceIndex,
+    lexical_scopes, method_body_spans, ConstLit, DefKind, Harvest, ParamBoundReturn, PatchCall, PreEvalPatches, SourceIndex,
     SOURCE_CLASS_BASE,
 };
 pub use typer::Typer;

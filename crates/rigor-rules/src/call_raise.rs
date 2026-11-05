@@ -174,7 +174,11 @@ fn raise_class_operand_verdict(
             RaiseVerdict::Legal
         }
         rigor_index::ClassOrdering::Superclass | rigor_index::ClassOrdering::Disjoint => {
-            if index.class_has_singleton_method(class_name, "exception") {
+            // `raise_duck_exception?`'s `source_declared_method?` reads a
+            // `pre_eval:` patch on the class itself.
+            if index.class_has_singleton_method(class_name, "exception")
+                || source.pre_eval_defines_on(&[class_name], "exception", true)
+            {
                 RaiseVerdict::Legal
             } else {
                 RaiseVerdict::Illegal
@@ -226,7 +230,9 @@ fn raise_instance_operand_verdict(
             RaiseVerdict::Legal
         }
         rigor_index::ClassOrdering::Disjoint => {
-            if index.class_has_method(&class_name, "exception") {
+            if index.class_has_method(&class_name, "exception")
+                || source.pre_eval_defines_on(&[class_name.as_str()], "exception", false)
+            {
                 RaiseVerdict::Legal
             } else {
                 RaiseVerdict::Illegal
@@ -309,6 +315,11 @@ fn raise_redefined_in_scope(
     // Covers the toplevel `def raise` and the Object/Kernel/BasicObject reopen
     // (`toplevel_defs` folds both — see `SourceIndex::build_project` pass 1c).
     if source.is_toplevel_def(Some(ast.file_key()), name) {
+        return true;
+    }
+    // ADR-17 — a `pre_eval:` patch of the name: the reference asks `Object`,
+    // `Kernel` and the enclosing class; coarse by name here (declines more).
+    if source.pre_eval_defines_name(name) {
         return true;
     }
     let call_span = ast.get(call_id).span();

@@ -123,9 +123,13 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
     // `execute` opens with `Configuration.load(options[:config])` upstream —
     // after the file check, before the read. The port's plain pipeline does
     // not consume the config, but it surfaces the same load errors.
-    if let Err(f) = crate::Config::load(explicit_config.as_deref().map(Path::new)) {
-        return f.report();
-    }
+    let cfg = match crate::Config::load(explicit_config.as_deref().map(Path::new)) {
+        Ok(cfg) => cfg,
+        Err(f) => return f.report(),
+    };
+    // ADR-17: the reference annotates against the project's `pre_eval:`
+    // registry (`ProjectEnvironment.project_patched_methods`).
+    let pre_eval = crate::pre_eval::load(&cfg.pre_eval);
     let source = match std::fs::read_to_string(file) {
         Ok(s) => s,
         Err(e) => {
@@ -145,7 +149,7 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
     };
     let ast = lower(&parsed);
     let index = CoreIndex::new();
-    let source_index = SourceIndex::build(&ast, &index);
+    let source_index = SourceIndex::build_with_pre_eval(&ast, &index, pre_eval);
     let typer = Typer::with_source(&index, &source_index);
     let mut interner = Interner::new();
     let env = typer.build_toplevel_env(&ast, &mut interner);

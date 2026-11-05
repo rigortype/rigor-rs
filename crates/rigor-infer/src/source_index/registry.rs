@@ -9,6 +9,9 @@ use rigor_types::{ClassId, Interner};
 
 use super::{SourceIndex, OVERRIDE_ANCESTOR_WALK_LIMIT, SOURCE_CLASS_BASE};
 
+/// `ToplevelDefCensus::OBJECT_OWNERS`.
+const PRE_EVAL_OBJECT_OWNERS: &[&str] = &["Object", "Kernel", "BasicObject"];
+
 impl SourceIndex {
     /// Whether the PROJECT declares instance method `method` on `class_name`
     /// (qualified) — the reference's `source_declared_method?` reading the
@@ -96,7 +99,13 @@ impl SourceIndex {
     /// and the project defines no `method_missing`: the one body a
     /// receiverless call of it can run. See [`Self::floor_callee_names`].
     pub fn unique_project_body(&self, method: &str) -> bool {
-        !self.floor_method_missing && self.floor_callee_names.get(method) == Some(&1)
+        !self.floor_method_missing
+            && self.floor_callee_names.get(method) == Some(&1)
+            // ADR-17 — `ToplevelDefCensus.patched?`: a `pre_eval:` patch of
+            // the name on `Object`, `Kernel` or `BasicObject` (either side)
+            // may be the method a receiverless call runs.
+            && !self.pre_eval_defines_on(PRE_EVAL_OBJECT_OWNERS, method, false)
+            && !self.pre_eval_defines_on(PRE_EVAL_OBJECT_OWNERS, method, true)
     }
 
     /// Upstream v0.4.6 (#1817 / #2183) — whether some project definition of

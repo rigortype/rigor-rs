@@ -814,6 +814,11 @@ impl<'i> Typer<'i> {
         if self.source.is_toplevel_def(self.file_key, method) {
             return false;
         }
+        // ADR-17 `pre_eval:` — `project_redefines_root?`'s and
+        // `rbs_ancestor_patched?`'s patch half, coarse by name (declines more).
+        if self.source.pre_eval_defines_name(method) {
+            return false;
+        }
         // `discovered_method_through_ancestors?` + `rbs_ancestor_patched?` —
         // a project reopening of the receiver class or any of its RBS
         // ancestors (`module Enumerable; def tap`) redefines the method
@@ -1225,7 +1230,9 @@ impl<'i> Typer<'i> {
     /// ANY project `def` of the name, on any class or module and either side,
     /// disables the non-returning-call proof.
     fn project_defines_anywhere(&self, method: &str) -> bool {
-        self.source.is_toplevel_def(self.file_key, method) || self.source.project_defines_method_name(method)
+        self.source.is_toplevel_def(self.file_key, method)
+            || self.source.project_defines_method_name(method)
+            || self.source.pre_eval_defines_name(method)
     }
 
     /// Every jump node (`Other{jump}` or the `Jump` carrier) whose span sits

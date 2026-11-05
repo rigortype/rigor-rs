@@ -26,6 +26,7 @@ fn project_with_config_rooted(cfg: &Config, root: &Path) -> ProjectContext {
         stamp: SeverityStamp::from_config(cfg),
         exclude: ExcludeMatcher::from_config(root, cfg),
         pre_eval_declared: false,
+        pre_eval: None,
         core_root_invalid: false,
         overlay: None,
     }
@@ -669,6 +670,7 @@ impl Harness {
                 stamp: SeverityStamp::from_config(&cfg),
                 exclude: ExcludeMatcher::from_config(&root, &cfg),
                 pre_eval_declared: false,
+                pre_eval: None,
                 core_root_invalid: false,
                 overlay,
             });
@@ -2222,6 +2224,7 @@ fn held_harvest_dispatch_index_equals_the_pre_slice_rebuild() {
         stamp: SeverityStamp::from_config(&Config::default()),
         exclude: ExcludeMatcher::from_config(&p.root, &Config::default()),
         pre_eval_declared: false,
+        pre_eval: None,
         core_root_invalid: false,
         overlay: None,
     };
@@ -2397,6 +2400,7 @@ fn session_for(root: &Path, cfg: Config, budget: Duration) -> (ServerContext, Se
             stamp: SeverityStamp::from_config(&cfg),
             exclude: ExcludeMatcher::from_config(root, &cfg),
             pre_eval_declared: false,
+            pre_eval: None,
             core_root_invalid: false,
             overlay: Some(build.files),
         }),

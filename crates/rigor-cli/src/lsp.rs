@@ -256,6 +256,7 @@ fn run_stdio() -> Result<(), String> {
         stamp: SeverityStamp::from_config(&cfg),
         exclude: ExcludeMatcher::from_config(&root, &cfg),
         pre_eval_declared: !cfg.pre_eval.is_empty(),
+        pre_eval: crate::pre_eval::load(&cfg.pre_eval),
         core_root_invalid: cfg.validate_core_root().is_err(),
         overlay,
     });
@@ -560,6 +561,10 @@ struct ProjectContext {
     /// `SourceIndex::set_pre_eval_declared`). Config-derived like
     /// [`Self::disable`].
     pre_eval_declared: bool,
+    /// ADR-17 — the `pre_eval:` registry `check` builds
+    /// ([`crate::pre_eval::load`]), handed to every `SourceIndex` this
+    /// context builds. Config-derived like [`Self::pre_eval_declared`].
+    pre_eval: Option<Arc<rigor_infer::PreEvalPatches>>,
     /// Upstream v0.4.7 (#2517): a configured `core_root:` that cannot serve
     /// as a core. `check` stops with exit 64 there; the reference's language
     /// server publishes nothing, so every dispatch returns an empty set.
@@ -2026,6 +2031,9 @@ fn swap_project(
         // takes effect on the next publish.
         exclude: ExcludeMatcher::from_config(&ctx.project_root, &st.cfg),
         pre_eval_declared: !st.cfg.pre_eval.is_empty(),
+        // Re-read with the config: an edit to a `pre_eval:` file swaps the
+        // context the same way (`.rigor.yml` / `sig/` edits, #1613).
+        pre_eval: crate::pre_eval::load(&st.cfg.pre_eval),
         core_root_invalid: st.cfg.validate_core_root().is_err(),
         overlay,
     });
@@ -2751,7 +2759,7 @@ fn overlay_source_index(
     ast: &LoweredAst,
 ) -> (Arc<SourceIndex>, Option<Duration>) {
     let Some(overlay) = &project.overlay else {
-        let mut source = SourceIndex::build(ast, &project.index);
+        let mut source = SourceIndex::build_with_pre_eval(ast, &project.index, project.pre_eval.clone());
         source.set_pre_eval_declared(project.pre_eval_declared);
         return (Arc::new(source), None);
     };
@@ -2780,7 +2788,7 @@ fn overlay_source_index(
     if !replaced {
         files.push((&buffer, ast));
     }
-    let mut source = SourceIndex::merge(&files, &project.index);
+    let mut source = SourceIndex::merge_with_pre_eval(&files, &project.index, project.pre_eval.clone());
     source.set_pre_eval_declared(project.pre_eval_declared);
     // The timer stops on the MERGE, before the `Arc` wrap: the guard's budget is
     // the analysis work, and an `Arc::new` is one allocation of a moved value.
@@ -3108,7 +3116,7 @@ fn hover(
         let source: &SourceIndex = match cached {
             Some(project_index) => project_index,
             None => {
-                single_file = SourceIndex::build(&ast, &project.index);
+                single_file = SourceIndex::build_with_pre_eval(&ast, &project.index, project.pre_eval.clone());
                 &single_file
             }
         };
@@ -3282,7 +3290,7 @@ fn completion(
         let source: &SourceIndex = match cached {
             Some(project_index) => project_index,
             None => {
-                single_file = SourceIndex::build(&ast, &project.index);
+                single_file = SourceIndex::build_with_pre_eval(&ast, &project.index, project.pre_eval.clone());
                 &single_file
             }
         };

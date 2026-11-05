@@ -540,6 +540,12 @@ impl CoreIndex {
         self.data.ancestor_names(class_name)
     }
 
+    /// ADR-17 `pre_eval:` — the owners a class object's method lookup walks.
+    /// See [`rbs::CoreData::singleton_ancestor_owners`].
+    pub fn singleton_ancestor_owners(&self, class_name: &str) -> Option<Vec<(&'static str, bool)>> {
+        self.data.singleton_ancestor_owners(class_name)
+    }
+
     /// rigor-rs#140 (upstream rigor#1105): the first ancestor that DIRECTLY
     /// declares `method` (its own `methods` or `aliases` table) — the resolved
     /// declaration's owner. See [`rbs::CoreData::declaring_ancestor`].

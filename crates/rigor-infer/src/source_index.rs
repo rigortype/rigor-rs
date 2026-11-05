@@ -49,6 +49,7 @@ mod def_attribution;
 mod override_index;
 mod resolution_chain;
 mod ruby_library_roots;
+mod pre_eval;
 pub(crate) use resolution_chain::AncestryIndex;
 mod harvest;
 
@@ -61,6 +62,7 @@ pub(crate) use constants::*;
 pub(crate) use literal_fold::*;
 pub(crate) use def_attribution::*;
 pub use override_index::{lexical_scopes, method_body_spans};
+pub use pre_eval::{PatchCall, PreEvalPatches};
 pub(crate) use override_index::*;
 
 /// C5 (const-literal harvest): an owned, interner-INDEPENDENT representation of a
@@ -670,6 +672,11 @@ pub struct SourceIndex {
     /// them, so a definition there (#2183: a block callee that may rebind)
     /// is invisible; read only to DECLINE. See [`Self::pre_eval_declared`].
     pre_eval_declared: bool,
+    /// ADR-17 — the resolved `pre_eval:` registry ([`PreEvalPatches`]),
+    /// `None` when no configured file patches anything. Read only to
+    /// DECLINE, except that a patch Ruby refuses on an explicit receiver
+    /// answers nothing. See [`Self::pre_eval_may_answer`].
+    pre_eval_patches: Option<std::sync::Arc<PreEvalPatches>>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see

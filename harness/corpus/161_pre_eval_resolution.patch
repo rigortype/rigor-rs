@@ -1,0 +1,13 @@
+# The first `pre_eval:` file fixture 161 lists.
+class String
+  def dd = 1
+  def ee = 1
+  private def ff = 1
+end
+module Kernel; module_function def mf = 1; end
+module Kernel; def raise(*) = nil; end
+class Integer; def exception = self; end
+module PM; private def mpriv = 1; def mpub = 2; end
+Object.include(PM)
+module Ext; module NumExt2; def ne = 1; end; end
+module Ext; Integer.include(NumExt2); end

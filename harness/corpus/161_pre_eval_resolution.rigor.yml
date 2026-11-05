@@ -1,0 +1,3 @@
+pre_eval:
+  - 161_pre_eval_resolution.patch
+  - 161_pre_eval_resolution.later.patch

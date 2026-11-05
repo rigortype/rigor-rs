@@ -2323,6 +2323,45 @@ impl CoreData {
     /// absent (the same conservative gate [`Self::class_has_method`] applies).
     /// Used by the exactly-once block-timing proof, which asks every ancestor
     /// whether a project reopening patched the method under it.
+    /// ADR-17 `pre_eval:` (upstream #1708) — the owners a CLASS OBJECT's method
+    /// lookup walks, as `(owner, singleton side)`: the singleton side of the
+    /// class and of each superclass, the instance side of every module an
+    /// `extend` adds there (with its ancestors), then the instance side of
+    /// `Class` and its ancestors. The reference reads the same set off RBS's
+    /// singleton definition (`RbsLoader#singleton_ancestors_for`); a module's
+    /// object is a `Module`, so `Class` is one owner more than its chain holds
+    /// (the read only declines). `None` when the class is unknown or any part
+    /// of the chain is not loaded.
+    pub fn singleton_ancestor_owners(&self, class_name: &str) -> Option<Vec<(&'static str, bool)>> {
+        if !self.classes.contains_key(class_name) {
+            return None;
+        }
+        let mut out: Vec<(&'static str, bool)> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let (&key, entry) = self.classes.get_key_value(name)?;
+            if !seen.insert(key) {
+                break;
+            }
+            out.push((key, true));
+            for &module in &entry.extends {
+                let (chain, complete) = self.ancestors(module);
+                if !complete {
+                    return None;
+                }
+                out.extend(chain.into_iter().map(|c| (c, false)));
+            }
+            cur = entry.superclass;
+        }
+        let (chain, complete) = self.ancestors("Class");
+        if !complete {
+            return None;
+        }
+        out.extend(chain.into_iter().map(|c| (c, false)));
+        Some(out)
+    }
+
     pub fn ancestor_names(&self, class_name: &str) -> Option<Vec<&'static str>> {
         if !self.classes.contains_key(class_name) {
             return None;

@@ -106,6 +106,13 @@ pub(crate) fn unresolved_toplevel_diagnostics(
             if source.object_mixin_may_define(index, method, false) {
                 continue;
             }
+            // ADR-17 (#1708): `main` is an `Object`, so a `pre_eval:` patch on
+            // its walk (`Object`, `Kernel`, `BasicObject`, a module the patches
+            // mix into one of them) defines the name. Asked with no call node:
+            // an implicit call reaches a private patch too.
+            if source.pre_eval_may_answer(index, "Object", method, false, rigor_infer::PatchCall::Implicit) {
+                continue;
+            }
             // Upstream v0.4.6 (#1817 / #2183 / #2184 / #2186): a block handed
             // to a callee that may run it under another `self` is not a
             // top-level scope. Asked last, as the reference does.

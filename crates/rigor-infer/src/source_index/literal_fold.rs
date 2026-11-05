@@ -197,6 +197,12 @@ impl SourceIndex {
         if let Some(v) = memo.get(key) {
             return v.clone();
         }
+        // ADR-17: a `pre_eval:` patch of the name may be the method that
+        // runs (the reference's patched tier answers `Dynamic` ahead of the
+        // project's own `def`), so its body is no evidence.
+        if self.pre_eval_defines_name(&key.1) {
+            return None;
+        }
         if visiting.contains(key) {
             return None; // cycle (recursive method) ⇒ decline, don't memoize.
         }

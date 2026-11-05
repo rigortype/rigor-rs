@@ -47,6 +47,7 @@ mod lsp;
 mod mcp;
 mod outline;
 mod plugins_cmd;
+mod pre_eval;
 mod rbs_collection;
 mod ruby_mode;
 mod severity;
@@ -2038,7 +2039,8 @@ fn analyze_files(
             (harvest, ast)
         })
         .collect();
-    let mut project_source = rigor_infer::SourceIndex::merge(&files, &index);
+    let mut project_source =
+        rigor_infer::SourceIndex::merge_with_pre_eval(&files, &index, pre_eval::load(&cfg.pre_eval));
     project_source.set_pre_eval_declared(!cfg.pre_eval.is_empty());
     let t_stage2 = std::time::Instant::now();
 

@@ -556,6 +556,13 @@ impl<'i> Typer<'i> {
             if !self.source.own_def_typing_settled(self.index, &src_name, method) {
                 return interner.untyped();
             }
+            // ADR-17: a `pre_eval:` patch of the name may answer ahead of the
+            // class's own `def` (the reference's patched tier sits above the
+            // discovered-method tier and answers `Dynamic`). Coarse by name:
+            // declining only costs precision.
+            if self.source.pre_eval_defines_name(method) {
+                return interner.untyped();
+            }
             if let Some(ret_core) = self.source.method_return(&src_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_core) {
                     return interner.intern(Type::Nominal { class: class_id, args: vec![] });

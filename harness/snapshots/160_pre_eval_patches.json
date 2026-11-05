@@ -1,0 +1,61 @@
+{
+  "fixture": "harness/corpus/160_pre_eval_patches.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `kp' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `np' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `only_hash' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `nope' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `nope' for \"x\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `nope' for singleton(Integer)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `nope' for \"a\" | 1"
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 31,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `unknown_top_level_call`. If a project file defines `unknown_top_level_call` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    }
+  ]
+}

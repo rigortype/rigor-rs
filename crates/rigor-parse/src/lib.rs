@@ -16,6 +16,8 @@ pub use depth::{parse_bounded, TooDeep, ANALYSIS_STACK_BYTES, MAX_NESTING_DEPTH}
 /// `OperandEffects` gate (`ast::operand_effects`, rigor-rs#361) and
 /// `rigor-infer`'s flow analysis.
 pub mod mutators;
+/// ADR-17 — the `pre_eval:` scanner (`ProjectPatchedScanner`'s walk).
+pub mod pre_eval;
 
 pub use ast::{
     lower, lower_with_key, AncestryFacts, BlockParamKind, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, ConstMutation, FileKey, HashKey, HashKeyTag,
