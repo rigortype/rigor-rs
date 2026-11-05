@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-06 `run_corpus.rb` REMOVED** (PR #495): a first-80-files sample of `fp_audit.py --sweep`; its one unique input, the reference's own trees, measures identically by path (examples 32 files, 0 FP). [PR](https://github.com/rigortype/rigor-rs/pull/495) / [CORPUS.md](../harness/CORPUS.md)
 - **2026-11-05 walk follow-ups** (#483–#488): port-only rows fixed, `pre_eval:` declines; 0 FP / 623. [note](notes/20261105-walk-followups.md)
 - **2026-11-05 re-pin walk → `v0.4.7` DONE** (#445…#481): 0 FP / 623 gaps. Last tag: callee floor, `core_root:`, CLI. [notes](notes/20261105-repin-v047.md)
 - **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 >1,600 s → 0.2 s, all 16,623 gem files ~10 s. Not decline-only (#442). 0 FP / 9,435; → #441–#443. [note](notes/20261030-fanout-cap-436.md)
