@@ -207,9 +207,18 @@ struct OverrideClass {
     /// into the class's OWN singleton surface, so they join the singleton
     /// ancestor walk (never the instance one).
     extends: Vec<String>,
-    /// The discovered instance-method VISIBILITY table. First-write-wins on
-    /// reopen (mirrors the reference accumulator's stable cross-file view).
+    /// The discovered instance-method VISIBILITY table: the slots a `def`
+    /// wrote (a re-mark alone never makes a definer), holding the last value
+    /// written. Read a visibility through [`SourceIndex::method_visibility`],
+    /// which answers from `file_visibilities`.
     method_visibilities: HashMap<String, Visibility>,
+    /// Per slot, each file's own final value, in merge order. The reference
+    /// keeps ONE table per file, where a later reopening's write wins (issue
+    /// #473: `class B; def foo; end; end` then `class B; private def foo;
+    /// end; end` reads `private`). Two files that disagree leave the answer
+    /// to load order and to the file being checked (probed at v0.4.7: either
+    /// order can fire or stay silent), so the port reads the slot as unknown.
+    file_visibilities: HashMap<String, Vec<(usize, Visibility)>>,
     /// Instance-method names defined directly (any visibility) — the existence
     /// set the walk stops on. Mirrors `SourceClass::methods` but lexically keyed.
     methods: HashSet<String>,
@@ -265,6 +274,9 @@ pub(crate) struct HarvestedOverrideClass {
     superclass: Option<String>,
     methods: Vec<String>,
     method_visibilities: Vec<(String, Visibility)>,
+    /// The body's re-marks of names it does not record
+    /// (`ClassDef::visibility_remarks`), applied before `method_visibilities`.
+    visibility_remarks: Vec<(String, Visibility)>,
     includes: Vec<String>,
     /// `extend`-ed module names as WRITTEN — see [`OverrideClass::extends`].
     extends: Vec<String>,

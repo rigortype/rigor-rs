@@ -2652,27 +2652,44 @@ fn override_vis_fires_cross_file() {
     );
 }
 
-/// Issue #92 invariant 1, example 1 — FILE ORDER IS NORMATIVE. The project
-/// index records `method_visibilities` first-write-wins, so which file
-/// declares `Base#m` FIRST decides whether the override fires. `a,b` sees
-/// `m` public on Base ⇒ `Sub#m` private reduces it ⇒ warns; `b,a` sees it
-/// already private ⇒ silent.
-///
-/// This is a property of the pre-existing accumulator, not of any refactor —
-/// which is exactly why it is pinned here: `SourceIndex::merge` replays the
-/// per-file harvests in the caller's file order and must never sort them.
+/// Issue #92 invariant 1, example 1 — two FILES that give `Base#m`
+/// different visibilities. The project index used to record
+/// `method_visibilities` first-write-wins, so `a,b` warned "public to
+/// private" where the reference is silent. The reference's answer there rests
+/// on load order and on the file being checked, so since issue #473 the port
+/// reads the slot as unknown and declines in BOTH orders (oracle-probed at the
+/// v0.4.7 pin: silent either way for these two files).
 #[test]
 fn override_vis_project_order_is_normative() {
     let a = b"class Base\n  def m\n    1\n  end\nend\n" as &[u8];
     let b = b"class Base\n  private\n  def m\n    2\n  end\nend\n\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\n" as &[u8];
     let forward = override_vis_project(&[a, b], 1);
-    assert_eq!(forward.len(), 1, "a,b must fire, got {forward:?}");
-    assert_eq!(
-        forward[0].message,
-        "visibility of `m' reduced from public to private (overrides Base#m); breaks substitutability"
-    );
+    assert!(forward.is_empty(), "a,b must stay silent, got {forward:?}");
     let reversed = override_vis_project(&[b, a], 0);
     assert!(reversed.is_empty(), "b,a must stay silent, got {reversed:?}");
+}
+
+/// Issue #473 — within ONE file a later reopening's visibility wins, as the
+/// reference's per-file table does: a public `B#foo` reopened as `private`
+/// is private (silent), and the reverse order is public (fires). A reopening
+/// that only re-marks the name (`private :foo`) re-marks the earlier slot.
+#[test]
+fn override_vis_same_file_reopening_is_last_write_wins() {
+    let child = "class S < B\n  protected\n  def foo = 3\nend\n";
+    let run = |parent: &str| override_vis_project(&[format!("{parent}{child}").as_bytes()], 0);
+    assert!(run("class B; def foo = 1; end\nclass B; private def foo = 2; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; private; def foo = 2; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; private :foo; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; private attr_reader :foo; end\n").is_empty());
+    assert!(run("class B; def foo = 1; end\nclass B; module_function :foo; end\n").is_empty());
+    let fires = run("class B; private def foo = 1; end\nclass B; def foo = 2; end\n");
+    assert_eq!(fires.len(), 1, "a later public reopening must fire, got {fires:?}");
+    assert_eq!(
+        fires[0].message,
+        "visibility of `foo' reduced from public to protected (overrides B#foo); breaks substitutability"
+    );
+    let remarked = run("class B; private; def foo = 1; end\nclass B; public :foo; end\n");
+    assert_eq!(remarked.len(), 1, "`public :foo` in a reopening must fire, got {remarked:?}");
 }
 
 /// Issue #92 invariant 1, example 2 — the same for `include` ACCUMULATION
@@ -4574,4 +4591,31 @@ fn def_local_literal_collection_names_its_shape() {
     assert_eq!(undefined(b"def m\n  c = [1]\n  c << 2\n  c.nope\nend\n"), ["undefined method `nope' for Array"]);
     // A parameter element is `Dynamic[top]` here; the reference may type it.
     assert_eq!(undefined(b"def m(a)\n  c = [a]\n  c.nope\nend\n"), ["undefined method `nope' for Array"]);
+}
+
+/// Issue #473 — a file-scope block / lambda body reads a captured local's
+/// binding AT the closure, never a write later in the file (the end-of-file
+/// env used to leak in). Oracle-probed at the v0.4.7 pin.
+#[test]
+fn issue_473_closure_reads_binding_at_the_closure() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    assert!(undefined(b"y = \"s\"\n[1].each { y.upcase }\ny = 1\n").is_empty());
+    assert!(undefined(b"y = \"s\"\nf = -> { y.upcase }\ny = 1\nf.call\n").is_empty());
+    assert!(undefined(b"y = \"s\"\n[1].each { [2].each { y.upcase } }\ny = 1\n").is_empty());
+    // The message names the binding the closure captured.
+    assert_eq!(
+        undefined(b"y = 1; [1].map { y.upcase }; y = [1]\n"),
+        vec!["undefined method `upcase' for 1".to_string()]
+    );
+    // CONTROLS — a later write never hides the captured binding, and a
+    // block that rebinds the captured local itself still declines.
+    assert_eq!(undefined(b"y = 1\n[1].each { y.upcase }\ny = \"s\"\n").len(), 1);
+    assert_eq!(undefined(b"y = 1\nl = -> { y.upcase }\ny = \"s\"\nl.call\n").len(), 1);
+    assert!(undefined(b"y = 1\n[1].each { y.upcase; y = \"s\" }\n").is_empty());
 }

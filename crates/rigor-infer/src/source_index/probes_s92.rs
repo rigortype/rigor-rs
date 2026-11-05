@@ -492,8 +492,8 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
     }
 
     // Pass 1b.
-    for ast in asts {
-        legacy_collect_override_classes(&mut idx, ast, ast.root(), &[]);
+    for (file, ast) in asts.iter().enumerate() {
+        legacy_collect_override_classes(&mut idx, file, ast, ast.root(), &[]);
     }
 
     // C1.
@@ -679,6 +679,7 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
 
 fn legacy_collect_override_classes(
     idx: &mut SourceIndex,
+    file: usize,
     ast: &LoweredAst,
     node: NodeId,
     prefix: &[String],
@@ -686,7 +687,7 @@ fn legacy_collect_override_classes(
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                legacy_collect_override_classes(idx, ast, child, prefix);
+                legacy_collect_override_classes(idx, file, ast, child, prefix);
             }
         }
         Node::ClassDef {
@@ -694,6 +695,7 @@ fn legacy_collect_override_classes(
             superclass_path,
             methods,
             method_visibilities,
+            visibility_remarks,
             includes,
             body,
             ..
@@ -703,10 +705,12 @@ fn legacy_collect_override_classes(
             }
             let qualified = qualify(prefix, name);
             idx.ingest_override_class(
+                file,
                 &qualified,
                 superclass_path.clone(),
                 methods,
                 method_visibilities,
+                visibility_remarks,
                 includes,
                 &[],
                 false,
@@ -714,19 +718,23 @@ fn legacy_collect_override_classes(
             );
             let child_prefix = split_qualified(&qualified);
             for &child in body {
-                legacy_collect_override_classes(idx, ast, child, &child_prefix);
+                legacy_collect_override_classes(idx, file, ast, child, &child_prefix);
             }
         }
-        Node::ModuleDef { name, methods, method_visibilities, includes, body, .. } => {
+        Node::ModuleDef {
+            name, methods, method_visibilities, visibility_remarks, includes, body, ..
+        } => {
             if name.is_empty() {
                 return;
             }
             let qualified = qualify(prefix, name);
             idx.ingest_override_class(
+                file,
                 &qualified,
                 None,
                 methods,
                 method_visibilities,
+                visibility_remarks,
                 includes,
                 &[],
                 true,
@@ -734,7 +742,7 @@ fn legacy_collect_override_classes(
             );
             let child_prefix = split_qualified(&qualified);
             for &child in body {
-                legacy_collect_override_classes(idx, ast, child, &child_prefix);
+                legacy_collect_override_classes(idx, file, ast, child, &child_prefix);
             }
         }
         _ => {}
@@ -1484,12 +1492,13 @@ fn fold_depth_cap_resets_per_site() {
 // semantics the merge is built on top of.
 // =======================================================================
 
-/// INVARIANT 1, example 1 (probe §3.2 i) — `method_visibilities` is
-/// FIRST-WRITE-WINS, so file order decides whether
-/// `def.override-visibility-reduced` fires. `a,b` records `m` public on
-/// `Base` (⇒ `Sub#m` private reduces it ⇒ fires); `b,a` records it private
-/// (⇒ silent). The diagnostic-level twin lives in rigor-rules
-/// (`override_vis_project_order_is_normative`).
+/// INVARIANT 1, example 1 (probe §3.2 i) — two FILES that record `Base#m`
+/// with different visibilities. It used to be FIRST-WRITE-WINS, so file
+/// order decided whether `def.override-visibility-reduced` fired. Since issue
+/// #473 each file's own last write is kept and a cross-file disagreement reads
+/// as unknown in either order (the reference's answer there depends on load
+/// order and on the file being checked). The diagnostic-level twin lives in
+/// rigor-rules (`override_vis_project_order_is_normative`).
 #[test]
 fn order_leak_visibility_first_write_wins() {
     let core = CoreIndex::new();
@@ -1497,22 +1506,17 @@ fn order_leak_visibility_first_write_wins() {
     let b = lower(&parse(
         b"class Base\n  private\n  def m\n    2\n  end\nend\n\nclass Sub < Base\n  private\n  def m\n    3\n  end\nend\n",
     ));
-    let vis = |idx: &SourceIndex| {
-        idx.override_classes.get("Base").and_then(|c| c.method_visibilities.get("m")).copied()
-    };
-    assert_eq!(vis(&SourceIndex::build_project(&[&a, &b], &core)), Some(Visibility::Public));
-    assert_eq!(vis(&SourceIndex::build_project(&[&b, &a], &core)), Some(Visibility::Private));
-    // …and the walk that reads it flips with them.
     let ab = SourceIndex::build_project(&[&a, &b], &core);
     let ba = SourceIndex::build_project(&[&b, &a], &core);
-    assert_eq!(
-        ab.nearest_ancestor_defining("Sub", "m"),
-        Some(("Base".to_string(), Some(Visibility::Public)))
-    );
-    assert_eq!(
-        ba.nearest_ancestor_defining("Sub", "m"),
-        Some(("Base".to_string(), Some(Visibility::Private)))
-    );
+    assert_eq!(ab.method_visibility("Base", "m"), None);
+    assert_eq!(ba.method_visibility("Base", "m"), None);
+    // …and the walk still stops at `Base`, with no visibility to compare.
+    assert_eq!(ab.nearest_ancestor_defining("Sub", "m"), Some(("Base".to_string(), None)));
+    assert_eq!(ba.nearest_ancestor_defining("Sub", "m"), Some(("Base".to_string(), None)));
+    // Two files that agree keep the answer.
+    let c = lower(&parse(b"class Base\n  def m\n    3\n  end\nend\n"));
+    let ac = SourceIndex::build_project(&[&a, &c], &core);
+    assert_eq!(ac.method_visibility("Base", "m"), Some(Visibility::Public));
 }
 
 /// INVARIANT 1, example 2 (probe §3.2 ii) — `includes` accumulate in FILE

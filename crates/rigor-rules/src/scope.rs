@@ -89,9 +89,10 @@ pub(crate) fn span_within(inner: rigor_parse::Span, outer: rigor_parse::Span) ->
 /// evaluation order up to the site (`Typer::check_env_at`, rigor-rs#136 — the
 /// port of the reference's per-node scope index): an operand typed earlier
 /// than a same-statement `local.<mutator>` call or rebind still reads the
-/// binding it saw, while a later operand sees the effect. Sites inside a
-/// literal block / lambda / class / module body keep the flat env — a
-/// closure may run at any later point.
+/// binding it saw, while a later operand sees the effect. A site inside a
+/// literal block / lambda body reads the env at the closure with the body's
+/// own rebinds widened (issue #473: never a write later in the file); a site
+/// inside a class / module body keeps the flat env.
 ///
 /// rigor-rs#137 (upstream rigor#1245) then shadows whichever env the site
 /// resolved: a block or lambda is a LEXICAL boundary — a local the literal
@@ -160,9 +161,9 @@ impl ScopedEnv {
     /// The env a use site at `site` (node `id`) may read: the entered-scope
     /// env at file scope — `Typer::check_env_at` replays this statement's
     /// recorded rebinds/mutations in evaluation order up to the site
-    /// (rigor-rs#136), and a site inside a barrier scope (a block/lambda or
-    /// `def`/`class`/`module` body) keeps the flat env — an empty env inside
-    /// any method body. On top of whichever env the site resolves, a site
+    /// (rigor-rs#136); a site inside a block/lambda body reads the env at
+    /// the closure (issue #473), one inside a `class`/`module` body keeps
+    /// the flat env, and one inside any method body an empty env. On top of whichever env the site resolves, a site
     /// inside a literal block/lambda body reads every name the enclosing
     /// closures bind as `Dynamic[top]` (the `Self::closures` shadow set,
     /// rigor-rs#137). `Cow` so an unshadowed site borrows the resolved env

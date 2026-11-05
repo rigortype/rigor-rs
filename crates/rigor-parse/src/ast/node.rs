@@ -505,6 +505,12 @@ pub enum Node {
         /// reads a `module_function` call as `private` (the instance copy is
         /// private). Only the override lint's PARENT read applies them.
         module_function_visibilities: Vec<(String, Visibility)>,
+        /// Issue #473: the re-marks (`private :foo`, an `attr_*` member,
+        /// `module_function :foo`, under that `private` reading) of names this
+        /// body does not record, in source order. The reference keeps one
+        /// visibility table per FILE, so they re-mark an earlier reopening's
+        /// slot; only the override lint's PARENT read applies them.
+        visibility_remarks: Vec<(String, Visibility)>,
         /// ADR-35 slice 1: the `include X` / `prepend X` constant names (last
         /// path component, mirroring how `superclass` is captured) in source
         /// order. The override-visibility ancestor walk resolves these FIRST,
@@ -533,6 +539,8 @@ pub enum Node {
         method_visibilities: Vec<(String, Visibility)>,
         /// See [`Node::ClassDef::module_function_visibilities`].
         module_function_visibilities: Vec<(String, Visibility)>,
+        /// See [`Node::ClassDef::visibility_remarks`].
+        visibility_remarks: Vec<(String, Visibility)>,
         /// ADR-35 slice 1 include/prepend names. See [`Node::ClassDef::includes`].
         includes: Vec<String>,
         body: Vec<NodeId>,
