@@ -308,9 +308,10 @@ reference checkouts MUST pass `--no-cache` and run each invocation from its
 own fresh temp cwd.
 
 Harness status (audited 2026-07-19): `harness/lib.rb` (`run_reference`, used by
-run.rb/snapshot.rb) uses a fresh per-invocation `Dir.mktmpdir` cwd — safe. `harness/fp_audit.py` previously ran from a shared
-persistent `cwd="/tmp"` (a stale `/tmp/.rigor/cache` could survive a pin bump
-and poison a re-baseline); it now uses a fresh temp cwd AND `--no-cache`.
+run.rb/snapshot.rb) uses a fresh per-invocation `Dir.mktmpdir` cwd — safe.
+`harness/fp_audit.py` previously ran from a shared persistent `cwd="/tmp"`
+(a stale `/tmp/.rigor/cache` could survive a pin bump and poison a
+re-baseline); it now uses a fresh temp cwd AND `--no-cache`.
 
 ## Oracle invocation hazard 3: `REFERENCE_RIGOR_DIR` pointed off the pin
 

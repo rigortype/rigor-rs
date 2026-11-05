@@ -69,19 +69,22 @@ the JSON parse.
 ## Corpora
 
 The **standing sweep set** is read from `harness/sweep-corpora.yml`, the
-single membership list for `harness/fp_audit.py --sweep` — the list a
-hand-typed command line drifted from, letting 24 false positives sit
+single membership list for `harness/fp_audit.py --sweep` and
+`harness/gap_census.py --sweep` (which reads it through `fp_audit.py`) — the
+list a hand-typed command line drifted from, letting 24 false positives sit
 unmeasured on corpora nobody had typed
 ([note](../docs/notes/20260731-survey-fp-triage-24.md)).
-   `harness/effects_diff.py` is a third reader: it resolves the paths of the
-   real projects in its own standing set by LABEL from this manifest, so those
-   paths stay single-sourced too.
+`harness/effects_diff.py` also reads it: it resolves the paths of the real
+projects in its own standing set by LABEL from this manifest, so those paths
+stay single-sourced too.
 
 Each entry carries a `why:` recording what that corpus caught that no other
 member catches. Add one only with such a reason; do not remove one because it is
-currently quiet. A member absent on this machine is reported as `SKIPPED` — a partial sweep must never read as a full one.
+currently quiet. A member absent on this machine is reported as `SKIPPED` — a
+partial sweep must never read as a full one.
 
-Custom directories passed as positional arguments replace the whole list. The
+Without `--sweep`, `fp_audit.py` measures only the directories it is given;
+with `--sweep`, extra directories run after the standing set. The
 reference's own trees (`reference/rigor/examples`, `reference/rigor/lib/rigor/type`)
 are not in the set; they move with the pin, so pass them by path when a change
 touches what the examples exercise.

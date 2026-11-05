@@ -47,7 +47,8 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # (this file, `gap_census.py`) therefore both mean
 # `target/release/rigor` by "rigor-rs". The fixture harness (`harness/run.rb` /
 # `lib.rb`, 76 tiny files in an edit-run loop) deliberately stays on debug.
-# Divergence between the two corpus entry points is what made a six-day-old
+# Divergence between two corpus entry points (this file and the since-removed
+# `run_corpus.rb`) is what made a six-day-old
 # binary measurable in the first place — see
 # docs/notes/20260807-fp-audit-port-side-blind-spots.md.
 RS_DEFAULT = os.path.join(REPO, "target/release/rigor")
@@ -134,7 +135,7 @@ def resolve_rs():
     Three things this must never do silently, all of them observed:
       * measure a binary that predates the source (a six-day-old release build
         made two merged slices read as "closed nothing"),
-      * disagree with the other corpus entry point about which file is rigor-rs,
+      * disagree with another corpus tool about which file is rigor-rs,
       * leave the measured path out of the transcript, so the staleness can only
         be reconstructed days later.
     So: auto-build when absent, print path + mtime in the

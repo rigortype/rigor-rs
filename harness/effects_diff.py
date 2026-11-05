@@ -1273,8 +1273,8 @@ def real_targets(scale):
 def resolve_targets(args, scale):
     """Everything to measure, plus the real corpora this machine does not have.
 
-    Positional arguments REPLACE the whole standing set — the same rule
-    `fp_audit.py` follows — so an ad-hoc project run costs
+    Positional arguments REPLACE the whole standing set (unlike
+    `fp_audit.py --sweep`, which runs them after it), so an ad-hoc project run costs
     nothing and reports no skips.
     """
     if args:
