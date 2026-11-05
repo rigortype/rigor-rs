@@ -577,6 +577,18 @@ pub fn analyze_with_source_and_folder(
     // expression reads such a local (or one derived from it) could carry a
     // different receiver or fold than the reference's, so it declines
     // (`rigor_infer::floor_tainted_reads`).
+    // rigor-rs#482: an arm the reference elides (its predicate folds) but
+    // the port's syntax-level dead set keeps live. The reference evaluates
+    // nothing inside it, so its own writes never reach its reads there
+    // (`h = {format: "text"}; if h[:format] == "json"; z = nil; z.upcase;
+    // end` is silent on the oracle); the port reads them. Every row inside
+    // such an arm declines. The outer predicate's row and the arm's
+    // liveness stay as they were.
+    let typed_dead = typer.typed_only_dead_arms(ast, &truthy_snapshots, interner);
+    if !typed_dead.is_empty() {
+        out.retain(|d| !typed_dead.iter().any(|h| h.0 <= d.start_offset && d.start_offset < h.1));
+    }
+
     let tainted = rigor_infer::floor_tainted_reads(ast, source);
     if !tainted.is_empty() {
         out.retain(|d| {

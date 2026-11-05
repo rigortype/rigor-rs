@@ -224,6 +224,144 @@ type Arity = (usize, Option<usize>);
 /// a retreat from the family.
 type ArityEnvelope = Option<Arity>;
 
+/// A method's flat slot: `(return, arity envelope, flag)`. The flag is the
+/// nilable bit on the instance side and `ret_instance` on the singleton
+/// side.
+type MethodSlot = (Option<&'static str>, ArityEnvelope, bool);
+
+/// rigor-rs#482 — one declaration's overloading reopens and the originals it
+/// brings for keys an earlier reopen left pending, taken out of the entry
+/// before the first-write-wins merge and folded in after it.
+struct OverloadMerge {
+    /// `(name, singleton?, reopen slot, reopen void?)`.
+    reopens: Vec<(&'static str, bool, MethodSlot, bool)>,
+    /// `(name, singleton?, original slot, original void?, original
+    /// private?)` for a key the target slot holds only a reopen for.
+    late: Vec<(&'static str, bool, MethodSlot, bool, bool)>,
+}
+
+impl OverloadMerge {
+    fn take(slot: Option<&ClassEntry>, entry: &mut ClassEntry) -> Self {
+        let mut reopens = Vec::new();
+        for (k, v, void) in std::mem::take(&mut entry.overloading_methods) {
+            reopens.push((k, false, v, void));
+        }
+        for (k, v, void) in std::mem::take(&mut entry.overloading_singletons) {
+            reopens.push((k, true, v, void));
+        }
+        let mut late = Vec::new();
+        if let Some(slot) = slot {
+            for &(k, single) in slot.overload_pending.keys() {
+                let (map, voids) = if single {
+                    (&entry.singleton_methods, &entry.void_singleton_methods)
+                } else {
+                    (&entry.methods, &entry.void_methods)
+                };
+                if let Some(&v) = map.get(k) {
+                    let private = !single && entry.private_methods.contains(k);
+                    late.push((k, single, v, voids.contains(k), private));
+                }
+            }
+        }
+        Self { reopens, late }
+    }
+
+    /// Drop the side slots the flat slot alone cannot pick between once a
+    /// reopen's overloads join a method's: its tuple, block and block-free
+    /// returns (and `void` unless both sides are `void`).
+    fn clear_side_slots(slot: &mut ClassEntry, k: &'static str, single: bool, void: bool) {
+        if single {
+            slot.singleton_tuple_returns.remove(k);
+            slot.singleton_block_free_returns.remove(k);
+            if !void {
+                slot.void_singleton_methods.remove(k);
+            }
+        } else {
+            slot.tuple_returns.remove(k);
+            slot.block_returns.remove(k);
+            slot.block_free_returns.remove(k);
+            if !void {
+                slot.void_methods.remove(k);
+            }
+        }
+    }
+
+    fn apply(self, slot: &mut ClassEntry) {
+        for (k, single, orig, orig_void, private) in self.late {
+            let Some(reopen_void) = slot.overload_pending.remove(&(k, single)) else {
+                continue;
+            };
+            let map = if single { &mut slot.singleton_methods } else { &mut slot.methods };
+            let Some(&reopen) = map.get(k) else { continue };
+            map.insert(k, combine_overloading(orig, reopen));
+            Self::clear_side_slots(slot, k, single, orig_void && reopen_void);
+            if orig_void && reopen_void {
+                if single {
+                    slot.void_singleton_methods.insert(k);
+                } else {
+                    slot.void_methods.insert(k);
+                }
+            }
+            if private {
+                slot.private_methods.insert(k);
+            }
+        }
+        for (k, single, reopen, reopen_void) in self.reopens {
+            let has_other = if single {
+                slot.singleton_attr_methods.contains(k) || slot.singleton_aliases.contains_key(k)
+            } else {
+                slot.attr_methods.contains(k) || slot.aliases.contains_key(k)
+            };
+            let map = if single { &mut slot.singleton_methods } else { &mut slot.methods };
+            match map.get(k).copied() {
+                Some(prev) => {
+                    map.insert(k, combine_overloading(prev, reopen));
+                    match slot.overload_pending.get_mut(&(k, single)) {
+                        // A second reopen over a still-missing original.
+                        Some(pv) => *pv &= reopen_void,
+                        None => Self::clear_side_slots(slot, k, single, reopen_void),
+                    }
+                }
+                // An attribute or alias original: existence only.
+                None if has_other => {
+                    map.insert(k, (None, None, false));
+                }
+                // No original yet: the reopen alone, pending the original
+                // (or, after the project phase, an unbuildable class).
+                None => {
+                    map.insert(k, reopen);
+                    slot.overload_pending.insert((k, single), reopen_void);
+                }
+            }
+        }
+    }
+}
+
+/// rigor-rs#482 — the flat slot of a method an overloading reopen (`def m:
+/// <reopen overloads> | ...`) extends: RBS prepends the reopen's overloads
+/// to the original's. The arity envelope is the union (an ineligible side
+/// makes the whole method ineligible, the reference's `arity_eligible?`);
+/// the return survives only when both sides agree on it and its flag. The
+/// reference picks the overload by the call's arguments, which the flat
+/// slot cannot, so a disagreement declines to `None` (`Dynamic`).
+fn combine_overloading(original: MethodSlot, reopen: MethodSlot) -> MethodSlot {
+    let arity = match (original.1, reopen.1) {
+        (Some((lo_a, hi_a)), Some((lo_b, hi_b))) => Some((
+            lo_a.min(lo_b),
+            match (hi_a, hi_b) {
+                (Some(a), Some(b)) => Some(a.max(b)),
+                _ => None,
+            },
+        )),
+        _ => None,
+    };
+    if original.0.is_some() && original.0 == reopen.0 && original.2 == reopen.2 {
+        (original.0, arity, original.2)
+    } else {
+        (None, arity, false)
+    }
+}
+
 /// The subtyping relation of two class names, mirroring the reference's
 /// `class_ordering` result atoms (`:equal` / `:subclass` / `:superclass` /
 /// `:disjoint` / `:unknown`). See [`CoreData::class_ordering`].
@@ -584,6 +722,21 @@ struct ClassEntry {
     overloading_method_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
     /// The singleton twin of `overloading_method_overloads`.
     overloading_singleton_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
+    /// rigor-rs#482 — an overloading reopen's own flat signature (`def
+    /// camelize: () -> Integer | ...`), with its `void` bit. Kept aside like
+    /// `overloading_method_overloads`: the reopen's overloads are prepended
+    /// to the original's, so the merged method's flat slot is the two
+    /// signatures COMBINED ([`combine_overloading`]) — the arity envelopes
+    /// unioned, the return kept only where both agree. The first-write-wins
+    /// `methods` merge used to drop it, typing the original's return alone.
+    overloading_methods: Vec<(&'static str, MethodSlot, bool)>,
+    /// The singleton twin of `overloading_methods`.
+    overloading_singletons: Vec<(&'static str, MethodSlot, bool)>,
+    /// `(name, singleton?)` keys whose flat slot holds ONLY an overloading
+    /// reopen's signature, because no original was merged yet. An original
+    /// merged later combines with it instead of losing to it.
+    /// The value is the reopen's `void` bit.
+    overload_pending: HashMap<(&'static str, bool), bool>,
     /// `method name -> block-overload return class name`, populated ONLY for
     /// methods that declare a block-bearing overload whose return is a
     /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
@@ -1003,7 +1156,25 @@ impl CoreData {
         builder.member_phase = MemberPhase::Project;
         ingest_project_dirs(&mut builder, sig_dirs, collection_dirs);
         builder.member_phase = MemberPhase::Bundled;
-        let dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
+        // rigor-rs#482: a reopen still pending after the project phase
+        // continues an INHERITED original (RBS checks `definition.methods`,
+        // which holds every ancestor's member) or none at all. A project
+        // reopen with none fails the class's build on the reference.
+        let project_overloads = std::mem::take(&mut builder.project_overloads);
+        let unresolved = builder.resolve_inherited_overloads();
+        for (qual, name, single) in project_overloads {
+            if unresolved.contains(&(qual, name, single)) {
+                builder.dup_unbuildable.insert((qual, single));
+            }
+        }
+        // An instance-side build failure takes the singleton side with it on
+        // the reference (probed for a duplicate member and for an overloading
+        // reopen with no original: `Foo.ok.zork` and `Foo.zork` are silent);
+        // a singleton-side failure leaves the instance side alone.
+        let mut dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
+        let instance_failed: Vec<&'static str> =
+            dup_unbuildable.iter().filter(|&&(_, single)| !single).map(|&(q, _)| q).collect();
+        dup_unbuildable.extend(instance_failed.into_iter().map(|q| (q, true)));
         // Issue #129: the capability-role catalogue goes in AFTER the project's
         // own signatures, per declaration (conformance table only).
         builder.conformance.ingest_capability_roles();
@@ -3171,6 +3342,15 @@ impl CoreData {
     /// purpose: both mean "do not arity-check this call", which is exactly what
     /// the reference's `compute_arity_envelope` returning nil means.
     pub fn method_arity(&self, class_name: &str, method: &str) -> Option<Arity> {
+        // rigor-rs#482: an unbuildable instance definition has no known
+        // surface at all on the reference, inherited members included
+        // (`"s".frozen?(1)` on an unbuildable `String` is silent).
+        let unbuildable = |e: &ClassEntry| e.instance_unbuildable;
+        if self.classes.get(class_name).is_some_and(unbuildable)
+            || self.qualified.get(class_name).is_some_and(unbuildable)
+        {
+            return None;
+        }
         let (chain, _) = self.ancestors(class_name);
         self.lookup_on_chain(&chain, method).and_then(|(_, arity, _)| arity)
     }
@@ -3837,6 +4017,10 @@ impl CoreData {
                     // classes, so the flags are inert under the fallback.
                     instance_unbuildable: false,
                     singleton_unbuildable: false,
+                    // The stub declares no overloading reopens.
+                    overloading_methods: Vec::new(),
+                    overloading_singletons: Vec::new(),
+                    overload_pending: HashMap::new(),
                 },
             );
         };
@@ -4207,6 +4391,11 @@ struct Builder {
     /// the same class already made (`RBS::DuplicatedMethodDefinitionError`):
     /// two `sig/` files both `def a`, or a `sig/` `def upcase` on `String`.
     dup_unbuildable: HashSet<(&'static str, bool)>,
+    /// rigor-rs#482: the `(class, method, singleton?)` keys a project-sig
+    /// overloading reopen (`def m: … | ...`) wrote. One no load declares an
+    /// original for fails the class's build on the reference
+    /// (`RBS::InvalidOverloadMethodError`), like a duplicate.
+    project_overloads: Vec<(&'static str, &'static str, bool)>,
     /// `core_root:` mode (upstream v0.4.7, #2517) — the bookkeeping
     /// [`Builder::core_health_failures`] reads. Off (and empty) otherwise.
     core_health: Option<Box<CoreHealth>>,
@@ -4348,11 +4537,13 @@ impl Builder {
                     let prior = self.project_member_keys.contains(&key)
                         || self.qualified.get(qual).is_some_and(|e| {
                             if single {
-                                e.singleton_methods.contains_key(name)
+                                (e.singleton_methods.contains_key(name)
+                                    && !e.overload_pending.contains_key(&(name, true)))
                                     || e.singleton_attr_methods.contains(name)
                                     || e.singleton_aliases.contains_key(name)
                             } else {
-                                e.methods.contains_key(name)
+                                (e.methods.contains_key(name)
+                                    && !e.overload_pending.contains_key(&(name, false)))
                                     || e.attr_methods.contains(name)
                                     || e.aliases.contains_key(name)
                             }
@@ -4479,6 +4670,134 @@ impl Builder {
             });
             named || self.health_links(qual).iter().any(Option::is_none)
         })
+    }
+
+    /// rigor-rs#482 — fold every still-pending overloading reopen (one no
+    /// declaration of its own class supplied an original for) into the
+    /// nearest INHERITED original: the instance side walks the ancestor
+    /// closure (superclass, includes, prepends, implicit `Object`); the
+    /// singleton side walks the superclass chain's singleton members, then
+    /// the instance members of `Class` (`Module` for a module) and their
+    /// ancestors. A singleton `new` always has one (derived from
+    /// `initialize`). Returns the `(class, method, singleton?)` keys with no
+    /// original anywhere. The short-name map keeps existence only for a
+    /// pending key.
+    fn resolve_inherited_overloads(&mut self) -> HashSet<(&'static str, &'static str, bool)> {
+        let pending: Vec<(&'static str, &'static str, bool)> = self
+            .qualified
+            .iter()
+            .flat_map(|(&q, e)| e.overload_pending.keys().map(move |&(n, s)| (q, n, s)))
+            .collect();
+        let mut unresolved = HashSet::new();
+        for (qual, name, single) in pending {
+            let found = if single {
+                self.inherited_singleton_slot(qual, name)
+            } else {
+                self.inherited_instance_slot(qual, name, false)
+            };
+            let Some(entry) = self.qualified.get_mut(qual) else { continue };
+            entry.overload_pending.remove(&(name, single));
+            let map = if single { &mut entry.singleton_methods } else { &mut entry.methods };
+            let Some(&reopen) = map.get(name) else { continue };
+            match found {
+                Some(orig) => {
+                    map.insert(name, combine_overloading(orig, reopen));
+                }
+                None => {
+                    unresolved.insert((qual, name, single));
+                }
+            }
+        }
+        // A top-level class's short slot takes the qualified answer; any
+        // other short slot keeps existence only.
+        let qualified = &self.qualified;
+        for (&short, entry) in self.classes.iter_mut() {
+            for (name, single) in std::mem::take(&mut entry.overload_pending).into_keys() {
+                let resolved = qualified.get(short).and_then(|q| {
+                    if single { q.singleton_methods.get(name) } else { q.methods.get(name) }
+                });
+                let v = resolved.copied().unwrap_or((None, None, false));
+                let map = if single { &mut entry.singleton_methods } else { &mut entry.methods };
+                map.insert(name, v);
+            }
+        }
+        unresolved
+    }
+
+    /// The nearest instance-side original of `name` among `qual`'s
+    /// ancestors (`qual` itself included when `include_self`).
+    fn inherited_instance_slot(&self, qual: &'static str, name: &'static str, include_self: bool) -> Option<MethodSlot> {
+        let mut seen = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        if include_self {
+            queue.push_back(qual);
+        } else {
+            seen.insert(qual);
+            queue.extend(self.health_links(qual).into_iter().flatten());
+        }
+        while let Some(k) = queue.pop_front() {
+            if !seen.insert(k) {
+                continue;
+            }
+            if let Some(e) = self.qualified.get(k) {
+                if !e.overload_pending.contains_key(&(name, false)) {
+                    if let Some(&v) = e.methods.get(name) {
+                        return Some(v);
+                    }
+                    if e.attr_methods.contains(name) || e.aliases.contains_key(name) {
+                        return Some((None, None, false));
+                    }
+                }
+            }
+            queue.extend(self.health_links(k).into_iter().flatten());
+        }
+        None
+    }
+
+    /// The singleton-side twin of [`Self::inherited_instance_slot`].
+    fn inherited_singleton_slot(&self, qual: &'static str, name: &'static str) -> Option<MethodSlot> {
+        if name == "new" {
+            // Derived from `initialize`: the instance return, any arity.
+            let own = self.qualified.get(qual).and_then(|e| e.singleton_methods.get(name)).copied();
+            let leaf = qual.rsplit("::").next().unwrap_or(qual);
+            return Some(match own {
+                Some((Some(r), _, f)) if r == qual || r == leaf => (Some(r), None, f),
+                _ => (None, None, false),
+            });
+        }
+        let is_module = self.qualified.get(qual).is_some_and(|e| e.is_module);
+        let mut cur = self.qualified.get(qual).and_then(|e| self.superclass_key(qual, e));
+        let mut seen = HashSet::new();
+        while let Some(k) = cur {
+            if !seen.insert(k) {
+                break;
+            }
+            let Some(e) = self.qualified.get(k) else { break };
+            if !e.overload_pending.contains_key(&(name, true)) {
+                if let Some(&v) = e.singleton_methods.get(name) {
+                    return Some(v);
+                }
+                if e.singleton_attr_methods.contains(name) || e.singleton_aliases.contains_key(name) {
+                    return Some((None, None, false));
+                }
+            }
+            cur = self.superclass_key(k, e);
+        }
+        let meta = if is_module { "Module" } else { "Class" };
+        self.qualified
+            .get_key_value(meta)
+            .and_then(|(&m, _)| self.inherited_instance_slot(m, name, true))
+    }
+
+    /// `key`'s resolved superclass (implicit `Object` for a class).
+    fn superclass_key(&self, key: &'static str, entry: &ClassEntry) -> Option<&'static str> {
+        if entry.is_module || key == "BasicObject" {
+            return None;
+        }
+        match &entry.superclass_written {
+            Some((w, ctx)) => self.resolve_type_name_rbs(w, ctx),
+            None => self.qualified.get_key_value("Object").map(|(&k, _)| k),
+        }
     }
 
     fn health_links(&self, key: &'static str) -> Vec<Option<&'static str>> {
@@ -4879,6 +5198,16 @@ impl Builder {
                         MethodDefinitionVisibility::Unspecified => section_private,
                     };
                     let kind = md.kind();
+                    if md.overloading() && self.member_phase == MemberPhase::Project {
+                        if let Some(q) = qual {
+                            if kind != MethodDefinitionKind::Singleton {
+                                self.project_overloads.push((q, mname, false));
+                            }
+                            if kind != MethodDefinitionKind::Instance {
+                                self.project_overloads.push((q, mname, true));
+                            }
+                        }
+                    }
                     // Issue #168 (`collect_member_references`): an instance-side
                     // method's signature types feed the missing-referenced-type
                     // stub pass — `initialize` and `def self.x` are excluded
@@ -4903,16 +5232,23 @@ impl Builder {
                         MethodDefinitionKind::Instance
                             | MethodDefinitionKind::SingletonInstance
                     ) {
-                        if ret_void && !entry.methods.contains_key(mname) {
+                        // rigor-rs#482: an overloading reopen's flat slot goes
+                        // aside (`overloading_methods`) and is COMBINED with the
+                        // original's at the merge; its block / tuple returns
+                        // are not recorded, and the merge drops the original's
+                        // (the reference picks among the prepended overloads
+                        // by argument, which those slots cannot).
+                        let overloading = md.overloading();
+                        if ret_void && !overloading && !entry.methods.contains_key(mname) {
                             entry.void_methods.insert(mname);
                         }
                         // Visibility rides the same first-write-wins gate as
                         // `void_methods`: it belongs to the definition being
                         // recorded, so a later reopen must not restate it.
-                        if is_private && !entry.methods.contains_key(mname) {
+                        if is_private && !overloading && !entry.methods.contains_key(mname) {
                             entry.private_methods.insert(mname);
                         }
-                        if let Some(shapes) = tuple_ret.clone() {
+                        if let Some(shapes) = tuple_ret.clone().filter(|_| !overloading) {
                             entry.tuple_returns.entry(mname).or_insert(shapes);
                         }
                         // `-> instance` on an INSTANCE method means "an instance
@@ -4927,12 +5263,16 @@ impl Builder {
                         } else {
                             ret
                         };
-                        entry.methods.entry(mname).or_insert((instance_ret, arity, nilable));
-                        if let Some(br) = block_ret {
-                            entry.block_returns.entry(mname).or_insert(br);
-                        }
-                        if let Some(bfr) = block_free_ret {
-                            entry.block_free_returns.entry(mname).or_insert(bfr);
+                        if overloading {
+                            entry.overloading_methods.push((mname, (instance_ret, arity, nilable), ret_void));
+                        } else {
+                            entry.methods.entry(mname).or_insert((instance_ret, arity, nilable));
+                            if let Some(br) = block_ret {
+                                entry.block_returns.entry(mname).or_insert(br);
+                            }
+                            if let Some(bfr) = block_free_ret {
+                                entry.block_free_returns.entry(mname).or_insert(bfr);
+                            }
                         }
                         // ATM substrate (Slice 1): retain the per-overload,
                         // per-parameter shapes the merged arity path discards.
@@ -4957,15 +5297,20 @@ impl Builder {
                         MethodDefinitionKind::Singleton
                             | MethodDefinitionKind::SingletonInstance
                     ) {
-                        if ret_void && !entry.singleton_methods.contains_key(mname) {
-                            entry.void_singleton_methods.insert(mname);
-                        }
-                        if let Some(shapes) = tuple_ret.clone() {
-                            entry.singleton_tuple_returns.entry(mname).or_insert(shapes);
-                        }
-                        entry.singleton_methods.entry(mname).or_insert((ret, arity, ret_instance));
-                        if let Some(bfr) = block_free_ret {
-                            entry.singleton_block_free_returns.entry(mname).or_insert(bfr);
+                        let overloading = md.overloading();
+                        if overloading {
+                            entry.overloading_singletons.push((mname, (ret, arity, ret_instance), ret_void));
+                        } else {
+                            if ret_void && !entry.singleton_methods.contains_key(mname) {
+                                entry.void_singleton_methods.insert(mname);
+                            }
+                            if let Some(shapes) = tuple_ret.clone() {
+                                entry.singleton_tuple_returns.entry(mname).or_insert(shapes);
+                            }
+                            entry.singleton_methods.entry(mname).or_insert((ret, arity, ret_instance));
+                            if let Some(bfr) = block_free_ret {
+                                entry.singleton_block_free_returns.entry(mname).or_insert(bfr);
+                            }
                         }
                         // ATM substrate: retain the class-method per-overload
                         // shapes so `call.argument-type-mismatch` can check a
@@ -5150,7 +5495,16 @@ impl Builder {
     /// non-authoritative (nested) entry may only fill a still-empty, unclaimed
     /// slot. Methods / includes / singletons still union unconditionally (the
     /// method-existence surface is deliberately the collapsed union).
-    fn merge(&mut self, name: &'static str, entry: ClassEntry, authoritative: bool) {
+    fn merge(&mut self, name: &'static str, mut entry: ClassEntry, authoritative: bool) {
+        let pending = OverloadMerge::take(self.classes.get(name), &mut entry);
+        self.merge_inner(name, entry, authoritative);
+        if let Some(slot) = self.classes.get_mut(name) {
+            pending.apply(slot);
+        }
+    }
+
+    /// [`Self::merge`] without the overloading-reopen fold (rigor-rs#482).
+    fn merge_inner(&mut self, name: &'static str, entry: ClassEntry, authoritative: bool) {
         let claimed = self.super_claimed.contains(name);
         let slot = self.classes.entry(name).or_default();
         if authoritative {
@@ -5283,7 +5637,17 @@ impl Builder {
     /// qualified key never collides across distinct classes (each lexical
     /// nesting path is unique), so there is no short-name-collapse superclass
     /// cycle to guard against here.
-    fn merge_qualified(&mut self, qual: &'static str, entry: ClassEntry) {
+    fn merge_qualified(&mut self, qual: &'static str, mut entry: ClassEntry) {
+        let pending = OverloadMerge::take(self.qualified.get(qual), &mut entry);
+        self.merge_qualified_inner(qual, entry);
+        if let Some(slot) = self.qualified.get_mut(qual) {
+            pending.apply(slot);
+        }
+    }
+
+    /// [`Self::merge_qualified`] without the overloading-reopen fold
+    /// (rigor-rs#482).
+    fn merge_qualified_inner(&mut self, qual: &'static str, entry: ClassEntry) {
         let slot = self.qualified.entry(qual).or_default();
         if slot.superclass.is_none() {
             slot.superclass = entry.superclass;
@@ -7084,6 +7448,9 @@ mod qualified_return_lookup_tests;
 
 #[cfg(test)]
 mod qualified_project_sig_tests;
+
+#[cfg(test)]
+mod overloading_reopen_tests;
 
 /// Issue #168: project `sig/` `use` directives, the `resolve-type-names`
 /// magic comment, and missing-referenced-type stubs — the acceptance rows a
