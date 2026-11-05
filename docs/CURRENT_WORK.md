@@ -12,7 +12,7 @@ note or ADR *first*. No status essays — hard byte budget.
 ## Now / Next
 
 ▶ **NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494.**
-CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
+Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
@@ -42,9 +42,9 @@ Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DI
 - **Five consecutive FP-safe flow slices closed 0 survey gaps** — never build a
   coverage slice without a valid-mode `fp_audit --gaps` prediction
   ([flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
-- **The receiver-typing lever is NOT exhausted** (2026-07 conclusion RETIRED): the
-  08-07 census buckets gaps by MECHANISM; four slices closed **47 rows**. Re-run
-  `gap_census.py --sweep` after each.
+- **The receiver-typing lever is open**: the gap census buckets gaps by
+  MECHANISM ([census](notes/20260807-gap-census.md)); four slices closed
+  **47 rows**. Re-run `gap_census.py --sweep` after each.
 - **The effects TRANSITIVE LABEL lane is DECLINED — not portable at parity** (s4): four typer-free rules measured, best still 5 OVER; matching the reference outranks the ~2,000-method prize — labels stay UNDER. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen closed** — byte surface 0, `--write` sound.
 - **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
@@ -52,14 +52,7 @@ Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DI
 
 ## Build & gates
 
-```sh
-cargo build --offline && cargo test --offline        # workspace tests
-ruby harness/run.rb                                  # live differential gate (0 FP)
-ruby harness/run_snapshot.rb                         # reference-free gate (CI parity job)
-ruby harness/run_corpus.rb                           # scaled real-corpus gate
-python3 harness/fp_audit.py --gaps --sweep           # STANDING sweep set (0 FP bar)
-python3 harness/docs_check.py                        # docs budget gate
-```
+The gate tiers and their commands: `AGENTS.md` → Gates.
 
 Reference oracle: pinned git submodule `reference/rigor` (see `UPSTREAM.md`);
 run from a clean temp cwd. Sweep membership: `harness/sweep-corpora.yml`
@@ -74,55 +67,16 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 >1,600 s → 0.2 s, all 16,623 gem files ~10 s. Not decline-only (#442). 0 FP / 9,435; → #441–#443. [note](notes/20261030-fanout-cap-436.md)
 - **2026-10-30 #422 CLOSED** (stack #434 = PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; 10 of 12 slow gem files → <7 s (lexer-F0/F1 → #436), output byte-identical. 0 FP / 9,435; → #435–#439. [note](notes/20261030-reach-memo-422.md)
 - **2026-10-28 #412 CLOSED** (PR #426): 256 MiB analysis stacks + a 25,000-edge nesting bound (deeper files "skipped", `internal-error`); the reference aborts (rigor#2455). 0 FP / 9,435; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
-- **2026-09-30 #309 CLOSED** (PR #333): rescue-carrier post-scope join in coll snapshots + literal-arm evidence. 0 FP; → #337–#339. [note](notes/20260930-issue-309-rescue-snapshot.md)
-- **2026-09-30 #325 CLOSED** (PR #336): `IndexedFlow` stored-slot narrowing — `h[k] ||= v` records reach `h[k]` reads. 0 FP; → #342–#344. [note](notes/20260930-issue-325-slot-narrowing.md)
-- **2026-09-30 #158 CLOSED** (PR #335): config parity — Psych dup/`<<`-merge/multi-doc/UTF-8, `~`/`..`/dist, exit-64 surface. → #345–#349. [note](notes/20260930-issue-158-config.md)
-- **2026-09-30 #342 CLOSED** (PR #350): index-target `[]=` stores drop the IndexedFlow slot record (`drop_key` on MultiWrite/Loop/BeginRescue). 0 FP; → #352–#354. [note](notes/20260930-issue-342-index-target.md)
-- **2026-09-30 #341 CLOSED** (PR #351): `when`/`in`-guard writes out of reach scans. 0 FP; → #355–#357. [note](notes/20260930-i341-when.md)
-- **2026-09-30 #155 CLOSED** (PR #359): OptionParser parity all subcommands — unknown flags 64, abbrev/`=`/`--`/POSIXLY_CORRECT, per-cmd tables. → #360. [note](notes/20260930-issue-155-optparse.md)
-- **2026-09-30 #343 CLOSED** (PR #358): `h.attr op=` own-lowered; evaluated-position attr writes on mutator names drop IndexedFlow records. 0 FP; → #361–#366. [note](notes/20260930-issue-343-attr-writes.md)
-- **2026-09-30 #357 CLOSED** (PR #367): blocked-extent writes stay out of reach/rebinds/binding — modifier `rescue` leak + dead-arm condition fix. 0 FP; → #368. [note](notes/20260930-i357-rescue-mod.md)
-- **2026-09-30 #361 CLOSED** (PR #369): `OperandEffects.any?` ported into the `evaluated` decision (Dead/Gate/Eval modes). 0 FP; → #372/#373. [note](notes/20261001-i361.md)
-- **2026-09-30 #157 CLOSED** (PR #371): config value validation — `Integer()` grammar, `enabled:false`-only, `target_ruby` split, plugin load-error rows. → #360. [note](notes/20260930-i157-config-values.md)
-- **2026-10-01 #352 CLOSED** (PR #370): `String#[]` post-`[]=` reads non-firing + `T|nil` retry + rebind-gated index-target widening; `UnmodeledWrite` carries pattern-bound names. 0 FP; → #374. [note](notes/20261001-i352-string-index.md)
-- **2026-10-01 #360 CLOSED** (PR #375): deferred `plugin path|print`/`skill --*` argument-boundary grammar — missing name → 64+usage, unknown → 1; bundled-name tables. → #376. [note](notes/20261001-i360-deferred-grammar.md)
-- **2026-10-01 #366 CLOSED** (PR #377): in-block attr writes drop indexed records — `closure_evaluated` + `closure_mutations`/`closure_descend` replay. 0 FP; → #379–#381. [note](notes/20261001-i366-block-attr-drop.md)
-- **2026-10-01 #304 CLOSED** (PR #378): `RetainedParamType` keeps generic args — `Range[::int]` byte-identical both channels; `stub_typed_param` gate (kills a master FP). → #382–#384. [note](notes/20261001-i304-range-render.md)
-- **2026-10-08 #368 CLOSED** (PR #385): `dead.rs` dead-position exclusion — folded if-arms, dead rescue clauses, modifier blocks; `RescueArm.span` clip; live-only ensure join. → #386. [note](notes/20261008-i368-dead-positions.md)
-- **2026-10-10 #379 CLOSED** (PR #387): nested-body Barrier siblings apply under `owner=id` (re-key one level late); shared `owns_deferred_body`. 0 FP / 815; → #388, #381. [note](notes/20261010-i379.md)
-- **2026-10-10 #380 CLOSED** (PR #389): `Loop`/`Case`/`When`-body/`begin` else-ensure descend to the site's deferred body; `preserve_env` skips the `flow.env` capture. 0 FP / 815; → #390. [note](notes/20261010-i380-nondescending-containers.md)
-- **2026-10-10 #388 CLOSED** (PR #391): `[]=` at content write-back positions (Barrier bodies, `while`/`until`) drops all rooted indexed records. 0 FP / 815; → #392/#393. [note](notes/20261010-i388-block-index-opwrite.md)
-- **2026-10-14 #382 CLOSED** (PR #394): param class rejection gates on host-resolvable arg class (generated 1769-name table); `Numeric→Integer` gap closed. 0 FP / 815; → #395/#396. [note](notes/20261014-i382-hostresolvable-arg-class.md)
-- **2026-10-14 #386 CLOSED** (PR #397): dead-position reach leaks (rescue entry scope, `stmt_exits` Bot half, `Const.m` fold, block interiors, `class <<`). 0 FP / 9,337; → #398/#399. [note](notes/20261014-i386-dead-position-leaks.md)
-- **2026-10-14 #381 CLOSED** (PR #400): `closure_mutations` gains the `in_inert_carrier` retain (inert-carrier attr writes in blocks keep indexed records). 0 FP / 9,337; → #401/#402. [note](notes/20261014-i381-inert-carrier-attr-writes.md)
-- **2026-10-14 #362 CLOSED** (PR #403): `blocked` vs `discarded` split (`discarded_spans`, `write_reaches` relative rule). 0 FP / 9,337. [note](notes/20261014-i362-discarded-arm-attr-writes.md)
-- **2026-10-14 #363 CLOSED** (PR #404): break-arg attr mutations invisible past `join_break_scopes` locals-only join — `lexical_loop` + `locals_only`/`bare_locals_only`/`iterated_body_spans`. 0 FP; → #406–#408. [note](notes/20261014-i363-break-arg-scope.md)
-- **2026-09-30 #332 CLOSED** (PR #334): pin-value threading (`local_reach` → `(Reach, Option<Scalar>)`); nominal multi-arg + `when`-pattern FPs. 0 FP / 818; → #340/#341. [note](notes/20260930-issue-332-multi-arg.md)
-- **2026-09-30 #312 CLOSED** (PR #324): recovery collector models `joined`/`blocked`/loop-writeback marks — index writes widen where the reference joins. 0 FP; → #325. [note](notes/20260930-issue-312-recovery.md)
-- **2026-09-30 #146 CLOSED** (PR #318): `Reach::multi` + tier-3 decline for multi-valued args; unentered closures floor to untyped. → #330–#332. [note](notes/20260930-issue-146-untyped-args.md)
-- **2026-09-30 #162 CLOSED** (PR #323): baseline parity — (file,rule) regroup, Psych scalar IO, `../` keys. 0 FP; → #326–#329. [note](notes/20260930-issue-162-baseline.md)
-- **2026-09-30 #306 CLOSED** (PR #320): `Loop`/`rescue` index targets decline + `Range` bounds link Uncond. 0 FP / 818; → #321/#322. [note](notes/20260930-issue-306-effect-spans.md)
-- **2026-09-29 #137 CLOSED** (PR #305): closure-bound locals shadow outer to `Dynamic[top]` in unentered blocks. 0 FP / 818; → #315–#317. [note](notes/20260929-issue-137-closure-shadow.md)
-- **2026-09-29 #135 CLOSED** (PR #297): `Node::IndexWrite` for `h[k] op=/||=/&&=` routes into mutator widening; resolves #298. 0 FP; → #312–#314. [note](notes/20260929-issue-135-index-write.md)
-- **2026-09-29 #136 CLOSED** (PR #296): per-site operand env replay (`OperandWalk` port) — later operands type from the scope earlier ones left. 0 FP; → #306–#311. [note](notes/20260929-issue-136-operand-scope.md)
-- **2026-09-29 #134 CLOSED** (PR #295): index-target stores widen receivers via `MultiTarget::Index`. 0 FP; → #298–#304. [note](notes/20260929-issue-134-index-widening.md)
-- **2026-09-29 #194 CLOSED** (PR #291): symbol/BigInt/float witness spelling; literal-tuple block fold + write gate. → #292–#294. [note](notes/20260929-issue-194-witness-rendering.md)
-- **2026-09-29 #168 CLOSED** (PR #289): project-`sig/` `use` + `resolve-type-names` + missing-name stubs; alias-aware head-first resolver. 0 FP / 818; → #286–#290. [note](notes/20260929-issue-168-rbs-use.md)
-- **2026-09-28 #201 CLOSED** (PR #285): `exclude:` + `BUILTIN_EXCLUDES` inside directory expansion; exact `dir.c` `fnmatch` port; LSP exclusion-immunity. 0 FP / sweep. [note](notes/20260928-issue-201-excludes.md)
-- **2026-09-28 #139 CLOSED** (PR #284): `[]=` splice writes + top-level mutation widening (uncond → `Nominal`, cond → `Dynamic`, coll joins); `BeginRescue` flow arm; coll rule reads widened env. 0 FP / sweep. [note](notes/20260928-issue-139-splice-write.md)
-- **2026-09-28 #163 CLOSED** (PR #282): `text`/`github`/`sarif` byte-matched (`[rule]` suffix, summaries, serde key-order; SARIF version is the port's). 0 FP; `output_formats.rs` pin. [note](notes/20260928-issue-163-output-formats.md)
-- **2026-09-28 #164 CLOSED** (PR #283): `getbyte`/`rindex`/`byteindex`/`byterindex`/`Float#<=>` literal folds incl. nil; Dynamic decline via `declines_unfolded`. 0 FP; fx 119. [note](notes/20260928-issue-164-nilable-fold.md)
-- **2026-09-28 #199 CLOSED** (PR #281): list config keys via `Array().map(&:to_s)` — scalar keeps entries, `signature_paths: ~` keeps nil→default. 0 FP. [note](notes/20260928-issue-199-scalar-list-keys.md)
-- **Splits** #204/#234/#258/#260/#279/#416/#418/#420: infer lib 14,084→144, rules 4,497→95; ast 3,756→80; source_index 4,650→668; lower_node→5 files (gh-stack). [note](notes/20261027-lower-node-family-split.md)
+- **2026-10-27 splits** #204/#234/#258/#260/#279/#416/#418/#420: infer lib 14,084→144, rules 4,497→95; ast 3,756→80; source_index 4,650→668; lower_node→5 files (gh-stack). [note](notes/20261027-lower-node-family-split.md)
+- **2026-10-08/14 dead-position + reach arc, folded** (#362/#363/#368/#379–#382/#386/#388, PRs #385–#404): `dead.rs` dead-position exclusion and its reach leaks, deferred-body descend, write-back drops, host-resolvable arg-class gate, `blocked`/`discarded` split. 0 FP. [dead](notes/20261008-i368-dead-positions.md) / [leaks](notes/20261014-i386-dead-position-leaks.md)
+- **2026-09-30/10-01 CLI + config parity, folded** (#155/#157/#158/#360, PRs #335/#359/#371/#375): Psych config parity, value validation, OptionParser on all subcommands, deferred-subcommand grammar; → #345–#349, #376. [config](notes/20260930-issue-158-config.md) / [optparse](notes/20260930-issue-155-optparse.md)
+- **2026-09-30/10-01 IndexedFlow arc, folded** (#304/#309/#325/#341–#343/#352/#357/#361/#366, PRs #333–#378): stored-slot narrowing and the writes that drop it (`[]=`, attr, `when` guards, blocked extents, blocks), `OperandEffects.any?`, `String#[]` post-write reads, `Range[::int]` rendering. 0 FP. [slots](notes/20260930-issue-325-slot-narrowing.md) / [blocks](notes/20261001-i366-block-attr-drop.md)
+- **2026-09-28/30 index-write + scope arc, folded** (#134–#137/#139/#146/#306/#312/#332, PRs #284–#334): index and splice writes widen receivers, per-site operand env replay, closure shadowing, multi-valued args decline. 0 FP / 818. [index](notes/20260929-issue-134-index-widening.md) / [operand](notes/20260929-issue-136-operand-scope.md)
+- **2026-09-28/30 output, config + RBS parity, folded** (#162/#163/#168/#194/#199/#201, PRs #281–#323): baseline, `text`/`github`/`sarif` bytes, project-`sig/` `use`, witness spelling, list keys, `exclude:` expansion. 0 FP. [formats](notes/20260928-issue-163-output-formats.md) / [rbs-use](notes/20260929-issue-168-rbs-use.md)
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review met the deepest infer file; branches keep the work (`6e86120`/`9502a3a`/`eb1edd3`). [note](notes/20260927-abandoned-infer-pr-stream.md).
-- **2026-09-27 #140 CLOSED** (PR #180): `tap`/`then`/`yield_self` call the block once. 0 FP; fx 117; → #190/#195/#198–#203. [note](notes/20260927-issue-140-tap-exactly-once.md).
+- **2026-09-25/28 fold + binder slices, folded** (#121/#133/#140/#151/#153/#164–#166, PRs #148–#283): String lookup folds, nested-rebind decline, `tap` once, binder carrier kinds, splat arity, block-param shadowing; fixtures 112–119. 0 FP / 9,337. [rebind](notes/20260925-issue-133-jump-path-rebind.md) / [binder](notes/20260925-issues-151-153-binder-writes.md)
 - **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver (`declaration_prefix` re-anchoring). **3,002 gaps (→827), 0 FP**; fx 118; → #185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
-- **2026-09-26 #166 CLOSED** (PR #174): block/lambda params shadow toplevel locals — bound set = Prism `locals`; membership structural not span. 0 FP; fx 116b. [note](notes/20260926-issue-166-block-param-shadow.md).
-- **2026-09-26 #165 CLOSED** (PR #175): `wrong-arity` declines on splat/kwarg/`...`; `&b`→#176. 0 FP; fx 116. [note](notes/20260926-issue-165-splat-arity.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 4 review rounds found 39 FP families; **0 FP / 9,337**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
-- **2026-09-25 #151 CLOSED + #153 rows 1–3** (PR #154): `Statements` carriers gain a kind; `for` index is a rebind. **0 FP / 9,337, = master**; fixture 114 exact. [note](notes/20260925-issues-151-153-binder-writes.md).
-- **2026-09-25 #121 CLOSED** (PR #149): String `[]`/`slice`/`byteslice`/`index` fold on literals; a class-guarded param drops the nilable slot (10 FPs). **0 FP / 9,337, gaps = master**; fixture 113. [note](notes/20260925-string-lookup-fold-guarded-arg.md).
-- **2026-09-25 #133 CLOSED by a decline** (PR #148): the flat top-level binder never saw a nested rebind; rules now widen such locals, Dynamic-only gates keep the old env. **0 FP / 9,337, = master**; fixture 112 7→0 FPs. → #152. [note](notes/20260925-issue-133-jump-path-rebind.md).
 - **2026-09-25 re-pin `v0.3.9 → e59b7b89`** (1,030 commits): 0 FP / 9,337. Raw 8+9 FPs (#1021 reach analysis; `fb781023` unported, #141); 10 invisible retractions → #133–#138. [note](notes/20260925-repin-e59b7b89.md)
 - **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — member is the erased class of the value's `stmt_value_type`; union-carrier stores widen per-arm. **0 FP / 9,337**; #132. [note](notes/20260921-issue-128-store-value-typing.md).
 - **2026-09-21 upstream re-pin `v0.3.8 → v0.3.9`** (447 commits): **0 FP / 9,337, gaps 799→892**, 108 fixtures, 0 OVER. Raw bump: 4 FPs in three families (`declines_bot?` shaped carriers, rooted `::RUBY_VERSION`, `MutationRejoin`). Residues: #128–#130. [note](notes/20260921-repin-v039.md).
@@ -144,7 +98,6 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-07-31 era (7 slices, folded)** — sig-gen `Data.define`/`Struct.new` members; `BigMath` blinded-oracle asymmetry CLOSED; survey FP triage 24→0 ([note](notes/20260731-survey-fp-triage-24.md)); project-`sig/` blind-spot → fixture 79; `-> self` on instance methods; standing sweep set CODIFIED ([CORPUS.md](../harness/CORPUS.md)).
 - **2026-07-31 upstream pin `v0.3.0 → v0.3.1` + vendored rbs `4.0.3 → 4.1.0`** — **0 FP / 9153 files, gaps net −2**. 4.1.0's rewritten signatures broke two things, both FIXED: bounded type params resolve to their bound; `-> instance` resolves via the `SELF_RETURN` call-site sentinel. [note](notes/20260731-upstream-pin-v031-rbs41.md) / [survey](notes/20260731-v031-preflight-survey.md).
 - **2026-07-25 era (3 slices, folded)** — MultiWrite substrate s1+s2 (PRs #46/#47: arena lowering + `MultiTargetBinder`, RBS tuple returns — [spec](notes/20260725-multiwrite-substrate-spec.md)); LSP `exclude:` parity (PR #45, matrix 24→144); LSP stage-3 tail (PR #44).
-
 - **2026-07-18/19 era (5 arcs + the RC bump, folded)** — LSP §12 two-tier S1–S4b (PRs #35–#38/#42/#43); `coverage` precision mode + MCP + node-granularity audit (PRs #33/#40); ADR-0042 gate + Slices 1–4 ([deliverables](notes/20260719-adr0042-gate-deliverables.md)); compat arc + severity + `--bleeding-edge` ([findings](notes/20260718-phase0-m1-m2-findings.md)); RC bump `47ec8625→7a69f142` ([note](notes/20260718-upstream-rc-bump-47ec8625-7a69f142.md)).
 - **2026-07-17 era (folded)**: docs economy (baton + [PORT_BACKLOG.md](PORT_BACKLOG.md), `docs_check.py`, #21); Tier B/C CLOSED ([note](notes/20260717-tier-bc-track-closed.md)); ATM arc + constant-shadow gate + C3a String-tail, gitlab UM 356→179 ([spec](notes/20260717-atm-substrate-arc-plan.md)).
 - **2026-07-16 two MERGED inference slices** — `def.ivar-write-mismatch` (gitlab ivar gaps 2→0) + literal-tail return folding (gitlab always-truthy 28→16). 0 FP both. [ivar](notes/20260716-ivar-write-mismatch-spec.md) / [fold](notes/20260716-literal-tail-fold-spec.md).
