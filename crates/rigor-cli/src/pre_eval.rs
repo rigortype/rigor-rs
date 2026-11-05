@@ -35,7 +35,9 @@ fn expand_entry(entry: &str) -> Option<Vec<PathBuf>> {
             p
         }
     };
-    let count = (1..segments.len()).take_while(|&n| Path::new(&join(n)).is_dir()).count();
+    let count = (1..segments.len())
+        .take_while(|&n| Path::new(&join(n)).is_dir())
+        .count();
     let (base, pattern) = if count == 0 {
         (None, entry.to_string())
     } else {
@@ -66,7 +68,10 @@ fn expand_entry(entry: &str) -> Option<Vec<PathBuf>> {
         require_literal_separator: true,
         require_literal_leading_dot: false,
     };
-    let mut out: Vec<PathBuf> = glob::glob_with(&full, options).ok()?.filter_map(Result::ok).collect();
+    let mut out: Vec<PathBuf> = glob::glob_with(&full, options)
+        .ok()?
+        .filter_map(Result::ok)
+        .collect();
     out.sort();
     Some(out)
 }
@@ -99,9 +104,47 @@ pub(crate) fn load(entries: &[String]) -> Option<Arc<PreEvalPatches>> {
         }
         // An unreadable file is skipped, as the reference's `scan_file`
         // rescue skips it.
-        let Ok(bytes) = std::fs::read(&path) else { continue };
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
         scans.push(scan_pre_eval(&bytes));
     }
     let patches = PreEvalPatches::build(scans);
     (!patches.is_empty()).then(|| Arc::new(patches))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn literal_entry_passes_through() {
+        assert_eq!(
+            expand_entry("/no/such/dir/patch.rb"),
+            Some(vec![PathBuf::from("/no/such/dir/patch.rb")])
+        );
+    }
+
+    #[test]
+    fn glob_entry_expands_sorted_under_a_literal_directory() {
+        let dir =
+            std::env::temp_dir().join(format!("rigor-pre-eval-glob-[x]-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("ext")).unwrap();
+        std::fs::write(dir.join("ext/b.rb"), "class String; def gb = 1; end\n").unwrap();
+        std::fs::write(dir.join("ext/a.rb"), "class String; def ga = 1; end\n").unwrap();
+        let entry = format!("{}/ext/*.rb", dir.display());
+        let got = expand_entry(&entry).unwrap();
+        assert_eq!(got, vec![dir.join("ext/a.rb"), dir.join("ext/b.rb")]);
+        let patches = load(&[entry]).expect("patches");
+        assert!(patches.defines_name("ga") && patches.defines_name("gb"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_brace_pattern_the_port_cannot_expand_reads_as_unknown() {
+        assert_eq!(expand_entry("/tmp/{a,b}/*.rb"), None);
+        let patches =
+            load(&["/tmp/rigor-no-such-{a,b}/*.rb".to_string()]).expect("opaque registry");
+        assert!(patches.defines_name("anything"));
+    }
 }

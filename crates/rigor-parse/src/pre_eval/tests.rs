@@ -5,15 +5,26 @@ fn defs(src: &str) -> Vec<(String, String, bool, PatchVisibility, bool)> {
         .expect("parses")
         .into_iter()
         .filter_map(|i| match i {
-            PreEvalItem::Def { class_name, method, singleton, visibility, guarded, .. } => {
-                Some((class_name, method, singleton, visibility, guarded))
-            }
+            PreEvalItem::Def {
+                class_name,
+                method,
+                singleton,
+                visibility,
+                guarded,
+                ..
+            } => Some((class_name, method, singleton, visibility, guarded)),
             _ => None,
         })
         .collect()
 }
 
-fn d(c: &str, m: &str, s: bool, v: PatchVisibility, g: bool) -> (String, String, bool, PatchVisibility, bool) {
+fn d(
+    c: &str,
+    m: &str,
+    s: bool,
+    v: PatchVisibility,
+    g: bool,
+) -> (String, String, bool, PatchVisibility, bool) {
     (c.to_string(), m.to_string(), s, v, g)
 }
 
@@ -35,12 +46,18 @@ fn records_defs_in_class_and_module_bodies_only() {
 
 #[test]
 fn does_not_descend_into_def_bodies() {
-    assert_eq!(defs("class A; def m; def nested_in_def = 1; end; end\n"), vec![d("A", "m", false, Public, false)]);
+    assert_eq!(
+        defs("class A; def m; def nested_in_def = 1; end; end\n"),
+        vec![d("A", "m", false, Public, false)]
+    );
 }
 
 #[test]
 fn block_bodies_are_walked() {
-    assert_eq!(defs("[1].each { class String; def in_block = 1; end }\n"), vec![d("String", "in_block", false, Public, false)]);
+    assert_eq!(
+        defs("[1].each { class String; def in_block = 1; end }\n"),
+        vec![d("String", "in_block", false, Public, false)]
+    );
 }
 
 #[test]
@@ -79,7 +96,12 @@ fn mixins_and_guarded_mixins() {
     let mixins: Vec<(String, String, bool)> = items
         .into_iter()
         .filter_map(|i| match i {
-            PreEvalItem::Mixin { owner, module_name, prepend, .. } => Some((owner, module_name, prepend)),
+            PreEvalItem::Mixin {
+                owner,
+                module_name,
+                prepend,
+                ..
+            } => Some((owner, module_name, prepend)),
             _ => None,
         })
         .collect();
@@ -96,5 +118,8 @@ fn mixins_and_guarded_mixins() {
 
 #[test]
 fn syntax_error_skips_the_file() {
-    assert_eq!(scan_pre_eval(b"class String; def x = 1; end\ndef (\n"), Err(PreEvalScanError::Syntax));
+    assert_eq!(
+        scan_pre_eval(b"class String; def x = 1; end\ndef (\n"),
+        Err(PreEvalScanError::Syntax)
+    );
 }

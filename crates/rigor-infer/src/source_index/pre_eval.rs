@@ -74,10 +74,20 @@ impl PreEvalPatches {
             };
             for item in items {
                 match item {
-                    PreEvalItem::Mixin { owner, module_name, prepend, prefix } => {
+                    PreEvalItem::Mixin {
+                        owner,
+                        module_name,
+                        prepend,
+                        prefix,
+                    } => {
                         pending.push((owner, module_name, prepend, prefix));
                     }
-                    PreEvalItem::VisibilityCall { class_name, names, singleton, visibility } => {
+                    PreEvalItem::VisibilityCall {
+                        class_name,
+                        names,
+                        singleton,
+                        visibility,
+                    } => {
                         // `Visibility.apply`.
                         for name in names {
                             let key = (class_name.clone(), name.clone(), singleton);
@@ -88,14 +98,23 @@ impl PreEvalPatches {
                             if visibility == PatchVisibility::ModuleFunction {
                                 bound.insert(key, PatchVisibility::Private);
                                 if !singleton {
-                                    bound.insert((class_name.clone(), name, true), PatchVisibility::Public);
+                                    bound.insert(
+                                        (class_name.clone(), name, true),
+                                        PatchVisibility::Public,
+                                    );
                                 }
                             } else {
                                 bound.insert(key, visibility);
                             }
                         }
                     }
-                    PreEvalItem::Alias { class_name, new_name, old_name, singleton, .. } => {
+                    PreEvalItem::Alias {
+                        class_name,
+                        new_name,
+                        old_name,
+                        singleton,
+                        ..
+                    } => {
                         // `alias_entry`: the old name's visibility when a
                         // patch binds it, else public.
                         let visibility = bound
@@ -104,7 +123,14 @@ impl PreEvalPatches {
                             .unwrap_or(PatchVisibility::Public);
                         bound.insert((class_name, new_name, singleton), visibility);
                     }
-                    PreEvalItem::Def { class_name, method, singleton, visibility, guarded, .. } => {
+                    PreEvalItem::Def {
+                        class_name,
+                        method,
+                        singleton,
+                        visibility,
+                        guarded,
+                        ..
+                    } => {
                         let key = (class_name, method, singleton);
                         if guarded && bound.contains_key(&key) {
                             continue;
@@ -154,16 +180,22 @@ impl PreEvalPatches {
         if !self.names.contains(method) {
             return false;
         }
-        owners
-            .iter()
-            .any(|o| self.by_key.contains_key(&(o.to_string(), method.to_string(), singleton)))
+        owners.iter().any(|o| {
+            self.by_key
+                .contains_key(&(o.to_string(), method.to_string(), singleton))
+        })
     }
 
     /// `ancestor_keys`: the owners a `singleton` / instance receiver of
     /// `class_name` reaches, with every module the patches mix into an
     /// instance-side owner (transitively). `None` when the class is RBS-known
     /// but its chain is not fully loaded.
-    fn ancestor_keys(&self, core: &CoreIndex, class_name: &str, singleton: bool) -> Option<Vec<(String, bool)>> {
+    fn ancestor_keys(
+        &self,
+        core: &CoreIndex,
+        class_name: &str,
+        singleton: bool,
+    ) -> Option<Vec<(String, bool)>> {
         let pairs: Vec<(String, bool)> = if singleton {
             match core.singleton_ancestor_owners(class_name) {
                 Some(v) => v.into_iter().map(|(n, s)| (n.to_string(), s)).collect(),
@@ -173,7 +205,8 @@ impl PreEvalPatches {
         } else {
             match core.ancestor_names(class_name) {
                 Some(v) => {
-                    let mut v: Vec<(String, bool)> = v.into_iter().map(|n| (n.to_string(), false)).collect();
+                    let mut v: Vec<(String, bool)> =
+                        v.into_iter().map(|n| (n.to_string(), false)).collect();
                     if !v.iter().any(|(n, _)| n == class_name) {
                         v.insert(0, (class_name.to_string(), false));
                     }
@@ -216,7 +249,14 @@ impl PreEvalPatches {
     /// refuses the call", which does not depend on the walk's order, so the
     /// port answers it over the set of owners. A visibility override on the
     /// walk, an incomplete chain or an unreadable file answers "may answer".
-    pub fn may_answer(&self, core: &CoreIndex, class_name: &str, method: &str, singleton: bool, call: PatchCall) -> bool {
+    pub fn may_answer(
+        &self,
+        core: &CoreIndex,
+        class_name: &str,
+        method: &str,
+        singleton: bool,
+        call: PatchCall,
+    ) -> bool {
         if self.opaque {
             return true;
         }
@@ -241,7 +281,13 @@ impl PreEvalPatches {
     }
 
     /// `ProjectPatchedMethods#callable?` for one patch.
-    fn callable(&self, core: &CoreIndex, visibility: PatchVisibility, owner: &str, call: PatchCall) -> bool {
+    fn callable(
+        &self,
+        core: &CoreIndex,
+        visibility: PatchVisibility,
+        owner: &str,
+        call: PatchCall,
+    ) -> bool {
         match (call, visibility) {
             (PatchCall::Implicit, _) | (_, PatchVisibility::Public) => true,
             (_, PatchVisibility::Private | PatchVisibility::ModuleFunction) => false,
@@ -286,13 +332,15 @@ impl SourceIndex {
     /// Whether a `pre_eval:` patch defines a method named `method` anywhere
     /// ([`PreEvalPatches::defines_name`]). False with no registry.
     pub fn pre_eval_defines_name(&self, method: &str) -> bool {
-        self.pre_eval_patches().is_some_and(|p| p.defines_name(method))
+        self.pre_eval_patches()
+            .is_some_and(|p| p.defines_name(method))
     }
 
     /// Whether a `pre_eval:` patch defines `method` on one of `owners`
     /// ([`PreEvalPatches::defines_on`]). False with no registry.
     pub fn pre_eval_defines_on(&self, owners: &[&str], method: &str, singleton: bool) -> bool {
-        self.pre_eval_patches().is_some_and(|p| p.defines_on(owners, method, singleton))
+        self.pre_eval_patches()
+            .is_some_and(|p| p.defines_on(owners, method, singleton))
     }
 }
 
@@ -310,22 +358,40 @@ mod tests {
         let p = patches(
             "class Integer\n  def foo = 1\n  private :foo\n  alias_method :foo, :succ\n  def bar = 1\n  alias_method :bar_alias, :bar\n  private :bar_alias\nend\n",
         );
-        assert_eq!(p.by_key.get(&("Integer".into(), "foo".into(), false)), Some(&PatchVisibility::Public));
-        assert_eq!(p.by_key.get(&("Integer".into(), "bar".into(), false)), Some(&PatchVisibility::Public));
-        assert_eq!(p.by_key.get(&("Integer".into(), "bar_alias".into(), false)), Some(&PatchVisibility::Private));
+        assert_eq!(
+            p.by_key.get(&("Integer".into(), "foo".into(), false)),
+            Some(&PatchVisibility::Public)
+        );
+        assert_eq!(
+            p.by_key.get(&("Integer".into(), "bar".into(), false)),
+            Some(&PatchVisibility::Public)
+        );
+        assert_eq!(
+            p.by_key.get(&("Integer".into(), "bar_alias".into(), false)),
+            Some(&PatchVisibility::Private)
+        );
     }
 
     #[test]
     fn module_function_named_call_binds_a_public_singleton_copy() {
         let p = patches("module Kernel; def mf2 = 1; module_function :mf2; end\n");
-        assert_eq!(p.by_key.get(&("Kernel".into(), "mf2".into(), false)), Some(&PatchVisibility::Private));
-        assert_eq!(p.by_key.get(&("Kernel".into(), "mf2".into(), true)), Some(&PatchVisibility::Public));
+        assert_eq!(
+            p.by_key.get(&("Kernel".into(), "mf2".into(), false)),
+            Some(&PatchVisibility::Private)
+        );
+        assert_eq!(
+            p.by_key.get(&("Kernel".into(), "mf2".into(), true)),
+            Some(&PatchVisibility::Public)
+        );
     }
 
     #[test]
     fn inherited_visibility_call_is_an_override() {
-        let p = patches("module Kernel; private def kpv = 1; end\nclass Integer; public :kpv; end\n");
-        assert!(p.overrides.contains(&("Integer".into(), "kpv".into(), false)));
+        let p =
+            patches("module Kernel; private def kpv = 1; end\nclass Integer; public :kpv; end\n");
+        assert!(p
+            .overrides
+            .contains(&("Integer".into(), "kpv".into(), false)));
     }
 
     #[test]
@@ -334,13 +400,19 @@ mod tests {
             scan_pre_eval(b"class String; private def gg = 1; end\n"),
             scan_pre_eval(b"class String; def gg = 1 unless method_defined?(:gg); end\n"),
         ]);
-        assert_eq!(p.by_key.get(&("String".into(), "gg".into(), false)), Some(&PatchVisibility::Private));
+        assert_eq!(
+            p.by_key.get(&("String".into(), "gg".into(), false)),
+            Some(&PatchVisibility::Private)
+        );
     }
 
     #[test]
     fn mixin_names_resolve_lexically() {
         let p = patches("module Ext; module NumExt2; def ne = 1; end; end\nmodule Ext; Integer.include(NumExt2); end\n");
-        assert_eq!(p.mixins_of.get("Integer"), Some(&(vec![], vec!["Ext::NumExt2".to_string()])));
+        assert_eq!(
+            p.mixins_of.get("Integer"),
+            Some(&(vec![], vec!["Ext::NumExt2".to_string()]))
+        );
     }
 
     #[test]

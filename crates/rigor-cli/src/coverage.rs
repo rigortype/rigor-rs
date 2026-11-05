@@ -322,7 +322,8 @@ pub fn cmd_coverage(args: &[String]) -> ExitCode {
     }
 
     let index = build_index(&cfg);
-    let report = scan_paths(&paths, &index, options.workers);
+    let pre_eval = crate::pre_eval::load(&cfg.pre_eval);
+    let report = scan_paths(&paths, &index, pre_eval.as_ref(), options.workers);
 
     let out = match options.format.as_str() {
         "json" => render_json(&report),
@@ -453,7 +454,8 @@ pub fn mcp_coverage_json(
         return Err("coverage: at least one path is required".to_string());
     }
     let index = build_index(&cfg);
-    let report = scan_paths(&paths, &index, None);
+    let pre_eval = crate::pre_eval::load(&cfg.pre_eval);
+    let report = scan_paths(&paths, &index, pre_eval.as_ref(), None);
     Ok(render_json(&report))
 }
 
@@ -547,9 +549,14 @@ fn glob_rb_walk(dir: &str, out: &mut Vec<String>) {
 
 /// Scan every path (file-parallel on rayon), merging per-file results in input
 /// order — byte-identical to a sequential scan.
-fn scan_paths(paths: &[String], index: &CoreIndex, workers: Option<usize>) -> Report {
+fn scan_paths(
+    paths: &[String],
+    index: &CoreIndex,
+    pre_eval: Option<&std::sync::Arc<rigor_infer::PreEvalPatches>>,
+    workers: Option<usize>,
+) -> Report {
     let scan_all = || -> Vec<Result<FileResult, Vec<String>>> {
-        paths.par_iter().map(|p| scan_file(p, index)).collect()
+        paths.par_iter().map(|p| scan_file(p, index, pre_eval)).collect()
     };
 
     // `--workers=N` sizes a scoped rayon pool; absent → the global pool. The
@@ -588,7 +595,11 @@ fn scan_paths(paths: &[String], index: &CoreIndex, workers: Option<usize>) -> Re
 
 /// Parse + scan one file, returning its tier breakdown or the parse-error
 /// messages.
-fn scan_file(path: &str, index: &CoreIndex) -> Result<FileResult, Vec<String>> {
+fn scan_file(
+    path: &str,
+    index: &CoreIndex,
+    pre_eval: Option<&std::sync::Arc<rigor_infer::PreEvalPatches>>,
+) -> Result<FileResult, Vec<String>> {
     let source = match std::fs::read(path) {
         Ok(s) => s,
         Err(e) => return Err(vec![format!("cannot read {path}: {e}")]),
@@ -605,7 +616,7 @@ fn scan_file(path: &str, index: &CoreIndex) -> Result<FileResult, Vec<String>> {
     }
 
     let ast = lower(&parse_result);
-    let source_index = SourceIndex::build(&ast, index);
+    let source_index = SourceIndex::build_with_pre_eval(&ast, index, pre_eval.cloned());
     let typer = Typer::with_source(index, &source_index);
     let mut interner = Interner::new();
 

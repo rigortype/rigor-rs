@@ -56,14 +56,30 @@ pub enum PreEvalItem {
         line: usize,
     },
     /// `alias new old` / `alias_method :new, :old` (`PendingAlias`).
-    Alias { class_name: String, new_name: String, old_name: String, singleton: bool, line: usize },
+    Alias {
+        class_name: String,
+        new_name: String,
+        old_name: String,
+        singleton: bool,
+        line: usize,
+    },
     /// A named visibility call (`private :x`, `module_function :x`,
     /// `private_class_method :x`) — `Visibility::Pending`.
-    VisibilityCall { class_name: String, names: Vec<String>, singleton: bool, visibility: PatchVisibility },
+    VisibilityCall {
+        class_name: String,
+        names: Vec<String>,
+        singleton: bool,
+        visibility: PatchVisibility,
+    },
     /// An `include` / `prepend` edge (`Mixins::Pending`): `owner` gains
     /// `module_name` (as written; `prefix` is the lexical prefix the
     /// resolution reads).
-    Mixin { owner: String, module_name: String, prepend: bool, prefix: Vec<String> },
+    Mixin {
+        owner: String,
+        module_name: String,
+        prepend: bool,
+        prefix: Vec<String>,
+    },
 }
 
 /// Why a `pre_eval:` file yielded no items.
@@ -97,7 +113,8 @@ fn visibility_call(node: &ruby_prism::CallNode<'_>) -> Option<(PatchVisibility, 
 
 /// `ModuleFunctionState.bare?`: no arguments.
 fn bare(node: &ruby_prism::CallNode<'_>) -> bool {
-    node.arguments().is_none_or(|a| a.arguments().iter().next().is_none())
+    node.arguments()
+        .is_none_or(|a| a.arguments().iter().next().is_none())
 }
 
 fn span_key(n: &PrismNode<'_>) -> (usize, usize) {
@@ -157,7 +174,8 @@ fn read_body(body: Option<PrismNode<'_>>, table: &mut VisibilityTable, top_level
                 if let Some(args) = c.arguments() {
                     for arg in args.arguments().iter() {
                         if let Some(d) = arg.as_def_node() {
-                            let self_recv = d.receiver().is_some_and(|r| r.as_self_node().is_some());
+                            let self_recv =
+                                d.receiver().is_some_and(|r| r.as_self_node().is_some());
                             if singleton == self_recv {
                                 mark(&arg, v, table);
                             }
@@ -296,7 +314,9 @@ fn guarded_mixin(node: &PrismNode<'_>, top_level: bool) -> Option<(usize, usize)
         b"<" => Some(guard.receiver()?),
         b"include?" => match guard.receiver() {
             Some(r) => match r.as_call_node() {
-                Some(rc) if rc.name().as_slice() == b"ancestors" && rc.arguments().is_none() => rc.receiver(),
+                Some(rc) if rc.name().as_slice() == b"ancestors" && rc.arguments().is_none() => {
+                    rc.receiver()
+                }
                 _ => Some(r),
             },
             None => None,
@@ -387,11 +407,19 @@ impl<'pr> Visit<'pr> for MarkGuarded<'_> {
 }
 
 impl GuardWalk {
-    fn guard(&mut self, predicate: PrismNode<'_>, when_true: Option<PrismNode<'_>>, when_false: Option<PrismNode<'_>>) {
+    fn guard(
+        &mut self,
+        predicate: PrismNode<'_>,
+        when_true: Option<PrismNode<'_>>,
+        when_false: Option<PrismNode<'_>>,
+    ) {
         if let Some((name, negated)) = definedness_guard(predicate) {
             let branch = if negated { when_true } else { when_false };
             if let Some(b) = branch {
-                let mut m = MarkGuarded { name: &name, found: &mut self.found };
+                let mut m = MarkGuarded {
+                    name: &name,
+                    found: &mut self.found,
+                };
                 m.visit(&b);
             }
         }
@@ -400,11 +428,19 @@ impl GuardWalk {
 
 impl<'pr> Visit<'pr> for GuardWalk {
     fn visit_if_node(&mut self, node: &ruby_prism::IfNode<'pr>) {
-        self.guard(node.predicate(), node.statements().map(|s| s.as_node()), node.subsequent());
+        self.guard(
+            node.predicate(),
+            node.statements().map(|s| s.as_node()),
+            node.subsequent(),
+        );
         ruby_prism::visit_if_node(self, node);
     }
     fn visit_unless_node(&mut self, node: &ruby_prism::UnlessNode<'pr>) {
-        self.guard(node.predicate(), node.else_clause().map(|e| e.as_node()), node.statements().map(|s| s.as_node()));
+        self.guard(
+            node.predicate(),
+            node.else_clause().map(|e| e.as_node()),
+            node.statements().map(|s| s.as_node()),
+        );
         ruby_prism::visit_unless_node(self, node);
     }
 }
@@ -429,7 +465,12 @@ impl Scan<'_> {
     }
 
     /// `descend_class_or_module`.
-    fn descend<'pr>(&mut self, node: &PrismNode<'pr>, path: PrismNode<'pr>, body: Option<PrismNode<'pr>>) {
+    fn descend<'pr>(
+        &mut self,
+        node: &PrismNode<'pr>,
+        path: PrismNode<'pr>,
+        body: Option<PrismNode<'pr>>,
+    ) {
         match (strict_constant_path_string(&path), body) {
             (Some(_), Some(body)) => {
                 let name = constant_path_string(&path);
@@ -460,7 +501,9 @@ impl Scan<'_> {
 
     /// `record_alias`.
     fn record_alias(&mut self, new_name: String, old_name: String, offset: usize) {
-        let Some(class_name) = self.class_name() else { return };
+        let Some(class_name) = self.class_name() else {
+            return;
+        };
         let line = self.line(offset);
         self.items.push(PreEvalItem::Alias {
             class_name,
@@ -498,13 +541,21 @@ impl<'pr> Visit<'pr> for Scan<'_> {
 
     /// `record_def_node`. The walk does not descend into a `def` body.
     fn visit_def_node(&mut self, node: &ruby_prism::DefNode<'pr>) {
-        let Some(class_name) = self.class_name() else { return };
+        let Some(class_name) = self.class_name() else {
+            return;
+        };
         let n = node.as_node();
         let key = span_key(&n);
-        let singleton = node.receiver().is_some_and(|r| r.as_self_node().is_some()) || self.in_singleton;
+        let singleton =
+            node.receiver().is_some_and(|r| r.as_self_node().is_some()) || self.in_singleton;
         let method = text(node.name().as_slice());
         let line = self.line(key.0);
-        let visibility = self.vis.defs.get(&key).copied().unwrap_or(PatchVisibility::Public);
+        let visibility = self
+            .vis
+            .defs
+            .get(&key)
+            .copied()
+            .unwrap_or(PatchVisibility::Public);
         let guarded = self.guarded.contains(&key);
         // `Visibility.applied`: `module_function` makes the instance method
         // private and binds a public singleton copy.
@@ -528,7 +579,14 @@ impl<'pr> Visit<'pr> for Scan<'_> {
                 });
             }
         } else {
-            self.items.push(PreEvalItem::Def { class_name, method, singleton, visibility, guarded, line });
+            self.items.push(PreEvalItem::Def {
+                class_name,
+                method,
+                singleton,
+                visibility,
+                guarded,
+                line,
+            });
         }
     }
 
@@ -564,10 +622,18 @@ impl<'pr> Visit<'pr> for Scan<'_> {
 impl Scan<'_> {
     /// `Visibility.pending`.
     fn pending_visibility(&mut self, node: &ruby_prism::CallNode<'_>) {
-        let Some(class_name) = self.class_name() else { return };
-        let Some((visibility, side)) = visibility_call(node) else { return };
+        let Some(class_name) = self.class_name() else {
+            return;
+        };
+        let Some((visibility, side)) = visibility_call(node) else {
+            return;
+        };
         let Some(args) = node.arguments() else { return };
-        let names: Vec<String> = args.arguments().iter().filter_map(|a| symbol_or_string(&a)).collect();
+        let names: Vec<String> = args
+            .arguments()
+            .iter()
+            .filter_map(|a| symbol_or_string(&a))
+            .collect();
         if names.is_empty() {
             return;
         }
@@ -611,10 +677,23 @@ impl Scan<'_> {
             },
         };
         for arg in args.arguments().iter() {
-            let Some(module_name) = strict_constant_path_string(&arg) else { continue };
-            let rooted = arg.as_constant_path_node().is_some_and(|cp| cp.parent().is_none());
-            let prefix = if rooted { Vec::new() } else { self.prefix.clone() };
-            self.items.push(PreEvalItem::Mixin { owner: owner.clone(), module_name, prepend, prefix });
+            let Some(module_name) = strict_constant_path_string(&arg) else {
+                continue;
+            };
+            let rooted = arg
+                .as_constant_path_node()
+                .is_some_and(|cp| cp.parent().is_none());
+            let prefix = if rooted {
+                Vec::new()
+            } else {
+                self.prefix.clone()
+            };
+            self.items.push(PreEvalItem::Mixin {
+                owner: owner.clone(),
+                module_name,
+                prepend,
+                prefix,
+            });
         }
     }
 }
@@ -633,7 +712,9 @@ pub fn scan_pre_eval(source: &[u8]) -> Result<Vec<PreEvalItem>, PreEvalScanError
     if let Some(program) = root.as_program_node() {
         read_body(Some(program.statements().as_node()), &mut table, true);
     }
-    let mut guards = GuardWalk { found: HashSet::new() };
+    let mut guards = GuardWalk {
+        found: HashSet::new(),
+    };
     guards.visit(&root);
     let mut line_starts = vec![0];
     for (i, &b) in source.iter().enumerate() {

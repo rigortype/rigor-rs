@@ -24,6 +24,16 @@ impl SourceIndex {
         Self::build_project(&[ast], core)
     }
 
+    /// [`Self::build`] with the run's `pre_eval:` registry installed before
+    /// the passes run (see [`Self::merge_with_pre_eval`]).
+    pub fn build_with_pre_eval(
+        ast: &LoweredAst,
+        core: &CoreIndex,
+        pre_eval: Option<std::sync::Arc<super::PreEvalPatches>>,
+    ) -> Self {
+        Self::merge_with_pre_eval(&[(Self::harvest(ast, core), ast)], core, pre_eval)
+    }
+
     /// Build a PROJECT-WIDE index from EVERY analyzed file's lowered AST. Class /
     /// module names are harvested from all `asts`, so [`knows_class`] answers
     /// project-wide — this is what lets the rules layer refuse to singleton-type a

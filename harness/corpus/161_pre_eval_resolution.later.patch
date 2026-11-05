@@ -1,0 +1,7 @@
+# The second `pre_eval:` file fixture 161 lists: it runs after the first.
+class String
+  private :dd
+  private def ee = 2
+  public :ff
+  def gg = 1 unless method_defined?(:gg)
+end

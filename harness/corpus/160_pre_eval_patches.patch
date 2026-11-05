@@ -1,0 +1,23 @@
+# The `pre_eval:` file fixture 160 lists (ADR-17). Not a `.rb`, so the harness
+# does not take it for a fixture of its own.
+class Integer; def zz = :i; end
+class String
+  def bar
+    yield
+  end
+end
+class Object; def oz = :o; end
+module Kernel; def kk = :k; end
+module Comparable; def cc = :c; end
+module NumExt; def inc_m = :inc; end
+Numeric.include(NumExt)
+module GM; def gm = :gm; end
+Numeric.prepend(GM) unless Numeric.include?(GM)
+class String
+  alias_method :ali, :upcase
+  alias ali2 upcase
+end
+class Integer; class << self; def mk = 1; end; end
+module Kernel; private def kp = 1; end
+class Numeric; protected def np = 2; end
+class Hash; def only_hash = 1; end

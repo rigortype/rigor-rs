@@ -95,6 +95,8 @@ pub fn cmd_mcp(args: &[String]) -> ExitCode {
 struct ServerContext {
     index: CoreIndex,
     disable: SuppressSet,
+    /// ADR-17 — the session config's `pre_eval:` registry, as `check` builds it.
+    pre_eval: Option<std::sync::Arc<rigor_infer::PreEvalPatches>>,
 }
 
 /// The stdio read/dispatch/respond loop. Reads one JSON-RPC message per line;
@@ -116,6 +118,7 @@ fn run_stdio(config_path: Option<&str>) -> Result<(), String> {
             core_root.as_deref(),
         ),
         disable: cfg.disable_matcher(),
+        pre_eval: crate::pre_eval::load(&cfg.pre_eval),
     };
 
     let stdin = io::stdin();
@@ -341,7 +344,7 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         };
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
-        let src = SourceIndex::build(&ast, &ctx.index);
+        let src = SourceIndex::build_with_pre_eval(&ast, &ctx.index, ctx.pre_eval.clone());
         let mut interner = Interner::new();
         let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
         diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
@@ -397,7 +400,7 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         };
         let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
-        let src = SourceIndex::build(&ast, &ctx.index);
+        let src = SourceIndex::build_with_pre_eval(&ast, &ctx.index, ctx.pre_eval.clone());
         let mut interner = Interner::new();
         let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
         diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
@@ -476,7 +479,7 @@ fn tool_type_of(ctx: &ServerContext, args: &Value) -> Result<String, String> {
         let Some(node_id) = crate::type_of::locate_node(&ast, offset) else {
             return Ok(None);
         };
-        let src = SourceIndex::build(&ast, &ctx.index);
+        let src = SourceIndex::build_with_pre_eval(&ast, &ctx.index, ctx.pre_eval.clone());
         let typer = Typer::with_source(&ctx.index, &src);
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
@@ -555,6 +558,7 @@ mod tests {
         ServerContext {
             index: CoreIndex::new(),
             disable: Config::default().disable_matcher(),
+            pre_eval: None,
         }
     }
 

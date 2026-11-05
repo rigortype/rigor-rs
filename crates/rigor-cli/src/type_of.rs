@@ -166,11 +166,14 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
     // `Configuration.load(options[:config])` opens `execute` upstream — a bad
     // config beats a missing file. The port's single-file probe does not read
     // the config, but it surfaces the same load errors.
-    if let Err(f) =
-        crate::config::Config::load(explicit_config.as_deref().map(Path::new))
-    {
-        return f.report();
-    }
+    let cfg = match crate::config::Config::load(explicit_config.as_deref().map(Path::new)) {
+        Ok(cfg) => cfg,
+        Err(f) => return f.report(),
+    };
+    // ADR-17: the one config input the probe does read — the reference's
+    // `type-of` types against the project's `pre_eval:` registry
+    // (`ProjectEnvironment.project_patched_methods`).
+    let pre_eval = crate::pre_eval::load(&cfg.pre_eval);
 
     // The file must exist on disk (no editor-mode buffer binding in this port).
     if !Path::new(file).is_file() {
@@ -218,7 +221,7 @@ pub fn cmd_type_of(args: &[String]) -> ExitCode {
     // index is enough for a one-file probe (the project-wide cross-file index is
     // a `check`-only concern).
     let index = CoreIndex::new();
-    let source_index = SourceIndex::build(&ast, &index);
+    let source_index = SourceIndex::build_with_pre_eval(&ast, &index, pre_eval);
     let typer = Typer::with_source(&index, &source_index);
     let mut interner = Interner::new();
     let env = typer.build_toplevel_env(&ast, &mut interner);
