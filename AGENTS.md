@@ -155,10 +155,9 @@ What the gates cannot see, so probe it by hand:
   reported as success; `git diff | rg -n 'eprintln!|dbg!|println!'` —
   committed debug output once survived to review; never `cargo fmt --all`
   (it reformats ~120 untouched files); rebase onto `origin/master` when it
-  moved — a #139×#164 interaction FP was invisible locally until CI ran the
-  rebased tree.
-- Reviewers from other agents are Grok 4.6 and Opus 5.5, both at `high`,
-  run together (`docs/agents/review.md`).
+  moved — an FP from two branches interacting shows only on the rebased tree.
+- Who reviews, and which verdict gates the PR: `docs/agents/review.md` →
+  "Who reviews".
 - A new worktree starts with an empty `reference/rigor`. Populate it with
   `git submodule update --init reference/rigor`, which reads the main
   checkout's module store at the pin. Never point `REFERENCE_RIGOR_DIR` at

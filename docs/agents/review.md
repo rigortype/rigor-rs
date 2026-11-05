@@ -5,7 +5,7 @@ loop, step 7). A reviewer is adversarial and read-only: it builds the input that
 would make the change wrong, probes it on both engines, and never edits or
 merges.
 
-## Merge bar (2026-09-27 policy)
+## Merge bar
 
 A PR's purpose is resolving the scope in its issue's agent brief. Per-PR full
 parity with the reference is NOT required — convergence is measured across the
@@ -36,14 +36,14 @@ three such findings non-actionable. The full-parity review that produced the
 - **Claude Code subagents**: Opus 5.5, inheriting the session model. Opus is
   the review gate; one `Approved` is enough.
 - **Reviewers from other agents**: Grok 4.6 (`high`) may run as a second
-  independent review when available — it catches different things (on PR #154
-  it approved while Opus found six message regressions), but its verdict is
-  advisory, not blocking.
+  independent review when available — it catches different things, and has
+  approved PRs Opus found regressions in, so its verdict is advisory, not
+  blocking.
 - **Substitute reviewers**: when OpenCode providers or Grok are quota-blocked,
   Codex (`gpt-5.6-sol`) may run either pass with the same prompt and contract —
   record the substitution in the PR body. Always attach the diff INLINE in the
-  prompt and forbid tool calls: a tool-driven reviewer once burned its whole
-  budget reading and produced no verdict (GLM-5.2, 2026-09-28). Probe failures
+  prompt and forbid tool calls: a tool-driven reviewer can spend its whole
+  budget reading and produce no verdict. Probe failures
   cheaply — try each provider once, then move on; do not retry a hang.
 
 Review once per PR, on the final head after CI is green, not on every push. A
