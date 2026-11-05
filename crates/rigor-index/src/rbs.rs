@@ -1156,14 +1156,25 @@ impl CoreData {
         builder.member_phase = MemberPhase::Project;
         ingest_project_dirs(&mut builder, sig_dirs, collection_dirs);
         builder.member_phase = MemberPhase::Bundled;
-        // rigor-rs#482: a project overloading reopen with no original anywhere
-        // fails the class's build on the reference.
-        for (qual, name, single) in std::mem::take(&mut builder.project_overloads) {
-            if builder.qualified.get(qual).is_some_and(|e| e.overload_pending.contains_key(&(name, single))) {
+        // rigor-rs#482: a reopen still pending after the project phase
+        // continues an INHERITED original (RBS checks `definition.methods`,
+        // which holds every ancestor's member) or none at all. A project
+        // reopen with none fails the class's build on the reference.
+        let project_overloads = std::mem::take(&mut builder.project_overloads);
+        let unresolved = builder.resolve_inherited_overloads();
+        for (qual, name, single) in project_overloads {
+            if unresolved.contains(&(qual, name, single)) {
                 builder.dup_unbuildable.insert((qual, single));
             }
         }
-        let dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
+        // An instance-side build failure takes the singleton side with it on
+        // the reference (probed for a duplicate member and for an overloading
+        // reopen with no original: `Foo.ok.zork` and `Foo.zork` are silent);
+        // a singleton-side failure leaves the instance side alone.
+        let mut dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
+        let instance_failed: Vec<&'static str> =
+            dup_unbuildable.iter().filter(|&&(_, single)| !single).map(|&(q, _)| q).collect();
+        dup_unbuildable.extend(instance_failed.into_iter().map(|q| (q, true)));
         // Issue #129: the capability-role catalogue goes in AFTER the project's
         // own signatures, per declaration (conformance table only).
         builder.conformance.ingest_capability_roles();
@@ -3331,6 +3342,15 @@ impl CoreData {
     /// purpose: both mean "do not arity-check this call", which is exactly what
     /// the reference's `compute_arity_envelope` returning nil means.
     pub fn method_arity(&self, class_name: &str, method: &str) -> Option<Arity> {
+        // rigor-rs#482: an unbuildable instance definition has no known
+        // surface at all on the reference, inherited members included
+        // (`"s".frozen?(1)` on an unbuildable `String` is silent).
+        let unbuildable = |e: &ClassEntry| e.instance_unbuildable;
+        if self.classes.get(class_name).is_some_and(unbuildable)
+            || self.qualified.get(class_name).is_some_and(unbuildable)
+        {
+            return None;
+        }
         let (chain, _) = self.ancestors(class_name);
         self.lookup_on_chain(&chain, method).and_then(|(_, arity, _)| arity)
     }
@@ -4517,11 +4537,13 @@ impl Builder {
                     let prior = self.project_member_keys.contains(&key)
                         || self.qualified.get(qual).is_some_and(|e| {
                             if single {
-                                e.singleton_methods.contains_key(name)
+                                (e.singleton_methods.contains_key(name)
+                                    && !e.overload_pending.contains_key(&(name, true)))
                                     || e.singleton_attr_methods.contains(name)
                                     || e.singleton_aliases.contains_key(name)
                             } else {
-                                e.methods.contains_key(name)
+                                (e.methods.contains_key(name)
+                                    && !e.overload_pending.contains_key(&(name, false)))
                                     || e.attr_methods.contains(name)
                                     || e.aliases.contains_key(name)
                             }
@@ -4648,6 +4670,134 @@ impl Builder {
             });
             named || self.health_links(qual).iter().any(Option::is_none)
         })
+    }
+
+    /// rigor-rs#482 — fold every still-pending overloading reopen (one no
+    /// declaration of its own class supplied an original for) into the
+    /// nearest INHERITED original: the instance side walks the ancestor
+    /// closure (superclass, includes, prepends, implicit `Object`); the
+    /// singleton side walks the superclass chain's singleton members, then
+    /// the instance members of `Class` (`Module` for a module) and their
+    /// ancestors. A singleton `new` always has one (derived from
+    /// `initialize`). Returns the `(class, method, singleton?)` keys with no
+    /// original anywhere. The short-name map keeps existence only for a
+    /// pending key.
+    fn resolve_inherited_overloads(&mut self) -> HashSet<(&'static str, &'static str, bool)> {
+        let pending: Vec<(&'static str, &'static str, bool)> = self
+            .qualified
+            .iter()
+            .flat_map(|(&q, e)| e.overload_pending.keys().map(move |&(n, s)| (q, n, s)))
+            .collect();
+        let mut unresolved = HashSet::new();
+        for (qual, name, single) in pending {
+            let found = if single {
+                self.inherited_singleton_slot(qual, name)
+            } else {
+                self.inherited_instance_slot(qual, name, false)
+            };
+            let Some(entry) = self.qualified.get_mut(qual) else { continue };
+            entry.overload_pending.remove(&(name, single));
+            let map = if single { &mut entry.singleton_methods } else { &mut entry.methods };
+            let Some(&reopen) = map.get(name) else { continue };
+            match found {
+                Some(orig) => {
+                    map.insert(name, combine_overloading(orig, reopen));
+                }
+                None => {
+                    unresolved.insert((qual, name, single));
+                }
+            }
+        }
+        // A top-level class's short slot takes the qualified answer; any
+        // other short slot keeps existence only.
+        let qualified = &self.qualified;
+        for (&short, entry) in self.classes.iter_mut() {
+            for (name, single) in std::mem::take(&mut entry.overload_pending).into_keys() {
+                let resolved = qualified.get(short).and_then(|q| {
+                    if single { q.singleton_methods.get(name) } else { q.methods.get(name) }
+                });
+                let v = resolved.copied().unwrap_or((None, None, false));
+                let map = if single { &mut entry.singleton_methods } else { &mut entry.methods };
+                map.insert(name, v);
+            }
+        }
+        unresolved
+    }
+
+    /// The nearest instance-side original of `name` among `qual`'s
+    /// ancestors (`qual` itself included when `include_self`).
+    fn inherited_instance_slot(&self, qual: &'static str, name: &'static str, include_self: bool) -> Option<MethodSlot> {
+        let mut seen = HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        if include_self {
+            queue.push_back(qual);
+        } else {
+            seen.insert(qual);
+            queue.extend(self.health_links(qual).into_iter().flatten());
+        }
+        while let Some(k) = queue.pop_front() {
+            if !seen.insert(k) {
+                continue;
+            }
+            if let Some(e) = self.qualified.get(k) {
+                if !e.overload_pending.contains_key(&(name, false)) {
+                    if let Some(&v) = e.methods.get(name) {
+                        return Some(v);
+                    }
+                    if e.attr_methods.contains(name) || e.aliases.contains_key(name) {
+                        return Some((None, None, false));
+                    }
+                }
+            }
+            queue.extend(self.health_links(k).into_iter().flatten());
+        }
+        None
+    }
+
+    /// The singleton-side twin of [`Self::inherited_instance_slot`].
+    fn inherited_singleton_slot(&self, qual: &'static str, name: &'static str) -> Option<MethodSlot> {
+        if name == "new" {
+            // Derived from `initialize`: the instance return, any arity.
+            let own = self.qualified.get(qual).and_then(|e| e.singleton_methods.get(name)).copied();
+            let leaf = qual.rsplit("::").next().unwrap_or(qual);
+            return Some(match own {
+                Some((Some(r), _, f)) if r == qual || r == leaf => (Some(r), None, f),
+                _ => (None, None, false),
+            });
+        }
+        let is_module = self.qualified.get(qual).is_some_and(|e| e.is_module);
+        let mut cur = self.qualified.get(qual).and_then(|e| self.superclass_key(qual, e));
+        let mut seen = HashSet::new();
+        while let Some(k) = cur {
+            if !seen.insert(k) {
+                break;
+            }
+            let Some(e) = self.qualified.get(k) else { break };
+            if !e.overload_pending.contains_key(&(name, true)) {
+                if let Some(&v) = e.singleton_methods.get(name) {
+                    return Some(v);
+                }
+                if e.singleton_attr_methods.contains(name) || e.singleton_aliases.contains_key(name) {
+                    return Some((None, None, false));
+                }
+            }
+            cur = self.superclass_key(k, e);
+        }
+        let meta = if is_module { "Module" } else { "Class" };
+        self.qualified
+            .get_key_value(meta)
+            .and_then(|(&m, _)| self.inherited_instance_slot(m, name, true))
+    }
+
+    /// `key`'s resolved superclass (implicit `Object` for a class).
+    fn superclass_key(&self, key: &'static str, entry: &ClassEntry) -> Option<&'static str> {
+        if entry.is_module || key == "BasicObject" {
+            return None;
+        }
+        match &entry.superclass_written {
+            Some((w, ctx)) => self.resolve_type_name_rbs(w, ctx),
+            None => self.qualified.get_key_value("Object").map(|(&k, _)| k),
+        }
     }
 
     fn health_links(&self, key: &'static str) -> Vec<Option<&'static str>> {
@@ -7298,6 +7448,9 @@ mod qualified_return_lookup_tests;
 
 #[cfg(test)]
 mod qualified_project_sig_tests;
+
+#[cfg(test)]
+mod overloading_reopen_tests;
 
 /// Issue #168: project `sig/` `use` directives, the `resolve-type-names`
 /// magic comment, and missing-referenced-type stubs — the acceptance rows a
