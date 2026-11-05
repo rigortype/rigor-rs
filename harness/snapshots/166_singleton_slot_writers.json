@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/166_singleton_slot_writers.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 56,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 63,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 71,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 77,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    }
+  ]
+}

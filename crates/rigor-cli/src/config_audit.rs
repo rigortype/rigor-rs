@@ -271,16 +271,21 @@ fn classify_signature_path(path: &str, project_root: &Path) -> Option<String> {
     let resolved = project_root.join(path);
     if !resolved.exists() {
         return Some(format!(
-            "signature_paths: {path:?} does not exist (no signatures loaded from it)"
+            "signature_paths: {} does not exist (no signatures loaded from it)",
+            ruby_string_inspect(path)
         ));
     }
     if !resolved.is_dir() {
         return Some(format!(
-            "signature_paths: {path:?} is not a directory (no signatures loaded from it)"
+            "signature_paths: {} is not a directory (no signatures loaded from it)",
+            ruby_string_inspect(path)
         ));
     }
     if count_rbs_files(&resolved) == 0 {
-        return Some(format!("signature_paths: {path:?} matched 0 signature files"));
+        return Some(format!(
+            "signature_paths: {} matched 0 signature files",
+            ruby_string_inspect(path)
+        ));
     }
     None
 }
@@ -315,13 +320,15 @@ fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
         if let Some(reason) = disable_token_problem(token, plugin_ids.as_deref()) {
             out.push(ConfigWarning {
                 kind: "disabled_rule",
-                message: format!("disable: {token:?} {reason}"),
+                message: format!("disable: {} {reason}", ruby_string_inspect(token)),
             });
         }
     }
-    let overrides = cfg.severity_overrides();
-    let present: Vec<&str> = overrides.iter().map(|(k, _)| k.as_str()).collect();
-    for (key, _) in &overrides {
+    // Issue #476: every key by its `to_s`, a non-String one included
+    // (`1:` warns `"1"`, `~:` warns `""`).
+    let overrides = cfg.severity_override_key_names();
+    let present: Vec<&str> = overrides.iter().map(String::as_str).collect();
+    for key in &overrides {
         // Upstream v0.4.6 (#2005 / #2223, `legacy_alias_problem`): `disable:`
         // expands a legacy alias, but the severity resolver matches canonical
         // ids only, so an alias key reaches no row.
@@ -339,10 +346,65 @@ fn rule_token_warnings(cfg: &Config, out: &mut Vec<ConfigWarning>) {
         if let Some(reason) = reason {
             out.push(ConfigWarning {
                 kind: "severity_override",
-                message: format!("severity_overrides: {key:?} {reason}"),
+                message: format!("severity_overrides: {} {reason}", ruby_string_inspect(key)),
             });
         }
     }
+}
+
+/// Issue #476 — Ruby `String#inspect` for a UTF-8 string, as the
+/// reference's config warnings quote a key, token or path (`rb_str_inspect`).
+/// `"` and `\` are escaped; `#` is escaped before `{`, `$` or `@`; `\n`
+/// `\r` `\t` `\f` `\v` `\b` `\a` `\e` take their short forms; every other
+/// non-printable character prints `\uXXXX` (`\u{XXXXX}` past the BMP).
+/// Non-printable here is a C0/C1 control or DEL, U+2028/U+2029, a surrogate
+/// or a noncharacter; Ruby also escapes an unassigned code point, which
+/// needs the Unicode tables and is printed raw here.
+pub(crate) fn ruby_string_inspect(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    let mut chars = s.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '#' => {
+                if matches!(chars.peek(), Some('{' | '$' | '@')) {
+                    out.push('\\');
+                }
+                out.push('#');
+            }
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            '\x0c' => out.push_str("\\f"),
+            '\x0b' => out.push_str("\\v"),
+            '\x08' => out.push_str("\\b"),
+            '\x07' => out.push_str("\\a"),
+            '\x1b' => out.push_str("\\e"),
+            c if is_ruby_unprintable(c) => {
+                let cp = c as u32;
+                if cp < 0x10000 {
+                    out.push_str(&format!("\\u{cp:04X}"));
+                } else {
+                    out.push_str(&format!("\\u{{{cp:X}}}"));
+                }
+            }
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+fn is_ruby_unprintable(c: char) -> bool {
+    let cp = c as u32;
+    cp < 0x20
+        || (0x7f..=0x9f).contains(&cp)
+        || cp == 0x2028
+        || cp == 0x2029
+        || (0xfdd0..=0xfdef).contains(&cp)
+        || (cp & 0xfffe) == 0xfffe
 }
 
 /// The plugin loader's own rows, which a `severity_overrides:` key names by
@@ -451,7 +513,7 @@ fn explicit_path_warnings(cfg: &Config, project_root: &Path, out: &mut Vec<Confi
         if !project_root.join(path).is_file() {
             out.push(ConfigWarning {
                 kind: "rbs_collection_lockfile",
-                message: format!("rbs_collection.lockfile: {path:?} does not exist"),
+                message: format!("rbs_collection.lockfile: {} does not exist", ruby_string_inspect(path)),
             });
         }
     }
@@ -563,6 +625,58 @@ mod tests {
                     .to_string(),
             ]
         );
+    }
+
+    // Issue #476, oracle-probed at v0.4.7: Ruby `String#inspect` quoting.
+    #[test]
+    fn ruby_string_inspect_matches_ruby() {
+        for (raw, want) in [
+            ("a#{b}", r#""a\#{b}""#),
+            ("c#$x", r#""c\#$x""#),
+            ("d#@y", r#""d\#@y""#),
+            ("e#z", r#""e#z""#),
+            ("#", r##""#""##),
+            ("esc\x1b", r#""esc\e""#),
+            ("fe\x0c\x0b\x08\r\x07", r#""fe\f\v\b\r\a""#),
+            ("nul\0\x01\x7f\u{85}", r#""nul\u0000\u0001\u007F\u0085""#),
+            ("q\"\\", r#""q\"\\""#),
+            ("\u{2028}\u{fffe}\u{10ffff}", r#""\u2028\uFFFE\u{10FFFF}""#),
+            ("é\u{200b}\u{e000}😀", "\"é\u{200b}\u{e000}😀\""),
+        ] {
+            assert_eq!(ruby_string_inspect(raw), want, "{raw:?}");
+        }
+    }
+
+    // Issue #476, oracle-probed at v0.4.7: a non-String key warns by its
+    // Psych `to_s`; a key whose `to_s` collides with an earlier one warns
+    // once; a String key whose plain spelling Psych reads as another type
+    // (and a `0o` spelling the typed value cannot tell from `15`) is settled
+    // by the written text or left out.
+    #[test]
+    fn non_string_override_keys_warn_by_to_s() {
+        let dir = std::env::temp_dir().join(format!("rigor_audit_keys_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".rigor.yml");
+        std::fs::write(
+            &path,
+            "severity_overrides:\n  1: warning\n  \"1\": error\n  ~: warning\n  1.5: warning\n  \
+             1.50: warning\n  1e3: warning\n  1.0e+20: warning\n  .nan: warning\n  true: warning\n  \
+             on: warning\n  0x1f: warning\n  0o17: warning\n  +7: warning\n  1_000: warning\n  \
+             \"on\": warning\n  \"a#{b}\": warning\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        let hint = " is not a recognized rule id; the override has no effect \
+                    (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)";
+        let want: Vec<String> = [
+            r#""1""#, r#""""#, r#""1.5""#, r#""1e3""#, r#""1.0e+20""#, r#""NaN""#, r#""true""#,
+            r#""31""#, r#""0o17""#, r#""7""#, r#""a\#{b}""#,
+        ]
+        .iter()
+        .map(|k| format!("severity_overrides: {k}{hint}"))
+        .collect();
+        assert_eq!(messages(&cfg, &dir), want);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // A third-party gem without `id:` makes the configured ids unknowable, so

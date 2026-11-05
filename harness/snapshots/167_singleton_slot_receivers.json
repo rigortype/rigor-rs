@@ -1,0 +1,26 @@
+{
+  "fixture": "harness/corpus/167_singleton_slot_receivers.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 45,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 58,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `even?' for \"s\""
+    }
+  ]
+}
