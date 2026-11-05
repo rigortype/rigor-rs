@@ -1,0 +1,54 @@
+{
+  "fixture": "harness/corpus/168_tuple_index_and_literal_concat.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `zork' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `zork' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 40,
+      "column": 16,
+      "severity": "error",
+      "message": "undefined method `zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 15,
+      "severity": "error",
+      "message": "undefined method `zzz' for Array"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 21,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

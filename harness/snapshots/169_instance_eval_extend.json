@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/169_instance_eval_extend.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `not_named' for singleton(Rational)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `not_named' for singleton(Complex)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `not_named' for singleton(Float)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `zork' for singleton(Symbol)"
+    }
+  ]
+}
