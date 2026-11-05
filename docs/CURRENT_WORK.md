@@ -11,7 +11,7 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT: walk follow-ups #472/#473/#476/#479/#482; then the ADR-127 floor's coverage cost.**
+▶ **NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494.**
 CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
@@ -22,7 +22,7 @@ CLI/config: #155–#157, #159, #169–#171, #130, #132; #160 blocked.
   standing exception tables EMPTY; new entries are real findings
   (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
-State (verified 2026-11-05, at `v0.4.7`): harness **159 fixtures / 0
+State (verified 2026-11-05, at `v0.4.7`): harness **170 fixtures / 0
 unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 623
 gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
 Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
@@ -69,7 +69,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-05 re-pin walk → `v0.4.7` DONE** (#445…#481): 0 FP / 623 gaps. Last tag: callee floor, `core_root:`, CLI. → #446–#482. [notes](notes/20261105-repin-v047.md)
+- **2026-11-05 walk follow-ups** (#483–#488): port-only rows fixed, `pre_eval:` declines; 0 FP / 623. [note](notes/20261105-walk-followups.md)
+- **2026-11-05 re-pin walk → `v0.4.7` DONE** (#445…#481): 0 FP / 623 gaps. Last tag: callee floor, `core_root:`, CLI. [notes](notes/20261105-repin-v047.md)
 - **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 >1,600 s → 0.2 s, all 16,623 gem files ~10 s. Not decline-only (#442). 0 FP / 9,435; → #441–#443. [note](notes/20261030-fanout-cap-436.md)
 - **2026-10-30 #422 CLOSED** (stack #434 = PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; 10 of 12 slow gem files → <7 s (lexer-F0/F1 → #436), output byte-identical. 0 FP / 9,435; → #435–#439. [note](notes/20261030-reach-memo-422.md)
 - **2026-10-28 #412 CLOSED** (PR #426): 256 MiB analysis stacks + a 25,000-edge nesting bound (deeper files "skipped", `internal-error`); the reference aborts (rigor#2455). 0 FP / 9,435; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
@@ -140,9 +141,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-08-01/08 instruments + adjudication, folded** — the 0-FP gate could pass VACUOUSLY (PR #65 — [note](notes/20260807-fp-audit-port-side-blind-spots.md)); the coverage-gap CENSUS buckets gaps by MECHANISM ([note](notes/20260807-gap-census.md)); `arity_eligible?` was never ported = a `call.wrong-arity` FP (fixture 80); LSP config reload keeps LAST GOOD ([lsp](notes/20260801-lsp-config-reload.md)).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup routing** (PR #64) — the 8-member return family routes namespaced receivers via the qualified registry (refs AS WRITTEN + lexical ctx; ambiguity DECLINES); **14 closures (→1179), 0 FP / 9204**; fixture 82 pins the Tier-3 instance boundary (gaps 3→4 on merge). [spec+outcome](notes/20260807-adr0042-s5-return-lookup-spec.md).
 - **2026-08-07 upstream survey + feedback batch 2, folded** — the `v0.3.1`→`80aaf9bc` self-diff moved 2 diagnostics on 9204 (superseded by the `v0.3.2` re-pin) and retired GEM_HOME rbs selection ([note](notes/20260807-upstream-survey-v031-to-master.md)); batch 2 filed 3 reference-side defects with repros ([note](notes/20260807-upstream-feedback-batch2.md)).
-- **2026-07-31 era (7 slices, folded)** — sig-gen `Data.define`/`Struct.new` members; `BigMath` blinded-oracle asymmetry CLOSED; LSP v4 const completion; survey FP triage 24→0 ([note](notes/20260731-survey-fp-triage-24.md)); project-`sig/` blind-spot → fixture 79; `-> self` on instance methods; standing sweep set CODIFIED ([CORPUS.md](../harness/CORPUS.md)).
+- **2026-07-31 era (7 slices, folded)** — sig-gen `Data.define`/`Struct.new` members; `BigMath` blinded-oracle asymmetry CLOSED; survey FP triage 24→0 ([note](notes/20260731-survey-fp-triage-24.md)); project-`sig/` blind-spot → fixture 79; `-> self` on instance methods; standing sweep set CODIFIED ([CORPUS.md](../harness/CORPUS.md)).
 - **2026-07-31 upstream pin `v0.3.0 → v0.3.1` + vendored rbs `4.0.3 → 4.1.0`** — **0 FP / 9153 files, gaps net −2**. 4.1.0's rewritten signatures broke two things, both FIXED: bounded type params resolve to their bound; `-> instance` resolves via the `SELF_RETURN` call-site sentinel. [note](notes/20260731-upstream-pin-v031-rbs41.md) / [survey](notes/20260731-v031-preflight-survey.md).
-- **2026-07-25 era (3 slices, folded)** — MultiWrite substrate s1+s2 (PRs #46/#47: arena lowering + `MultiTargetBinder`, RBS tuple returns; 14 corpora / 35,706 files bit-identical — [spec](notes/20260725-multiwrite-substrate-spec.md)); LSP `exclude:` parity (PR #45, matrix 24→144); LSP stage-3 tail (PR #44, 4 E2E tests vs real `check`).
+- **2026-07-25 era (3 slices, folded)** — MultiWrite substrate s1+s2 (PRs #46/#47: arena lowering + `MultiTargetBinder`, RBS tuple returns — [spec](notes/20260725-multiwrite-substrate-spec.md)); LSP `exclude:` parity (PR #45, matrix 24→144); LSP stage-3 tail (PR #44).
 
 - **2026-07-18/19 era (5 arcs + the RC bump, folded)** — LSP §12 two-tier S1–S4b (PRs #35–#38/#42/#43); `coverage` precision mode + MCP + node-granularity audit (PRs #33/#40); ADR-0042 gate + Slices 1–4 ([deliverables](notes/20260719-adr0042-gate-deliverables.md)); compat arc + severity + `--bleeding-edge` ([findings](notes/20260718-phase0-m1-m2-findings.md)); RC bump `47ec8625→7a69f142` ([note](notes/20260718-upstream-rc-bump-47ec8625-7a69f142.md)).
 - **2026-07-17 era (folded)**: docs economy (baton + [PORT_BACKLOG.md](PORT_BACKLOG.md), `docs_check.py`, #21); Tier B/C CLOSED ([note](notes/20260717-tier-bc-track-closed.md)); ATM arc + constant-shadow gate + C3a String-tail, gitlab UM 356→179 ([spec](notes/20260717-atm-substrate-arc-plan.md)).
