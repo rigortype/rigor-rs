@@ -1,0 +1,589 @@
+diff --git a/.pi/agents/rigor-lane.md b/.pi/agents/rigor-lane.md
+index 2497455c7..373a5abf1 100644
+--- a/.pi/agents/rigor-lane.md
++++ b/.pi/agents/rigor-lane.md
+@@ -6,7 +6,7 @@ description: >-
+ advertise: true
+ aliases: lane, rigor-worker
+ acceptanceRole: writer
+-model: opencode-go/deepseek-v4.1-flash
++model: devin/swe-2-flash
+ thinking: high
+ systemPromptMode: replace
+ inheritProjectContext: true
+diff --git a/.pi/agents/rigor-reviewer-grok.md b/.pi/agents/rigor-reviewer-grok.md
+index 0eab833f6..887391e1e 100644
+--- a/.pi/agents/rigor-reviewer-grok.md
++++ b/.pi/agents/rigor-reviewer-grok.md
+@@ -1,12 +1,12 @@
+ ---
+ name: rigor-reviewer-grok
+ description: >-
+-  Rigor adversarial reviewer (Grok:max) — default Grok 4.6:max adversarial reviewer (use 4.7 for deep RCA); Opus added when complex; returns Approved or Needs fix
++  Rigor adversarial reviewer (Grok:xhigh) — co-primary Grok 4.6:xhigh pass alongside rigor-reviewer-swe2 (use 4.7 for deep RCA); Opus added when complex; returns Approved or Needs fix
+ advertise: true
+ aliases: reviewer-grok
+ acceptanceRole: read-only
+ model: xai/grok-4.6
+-thinking: max
++thinking: xhigh
+ systemPromptMode: replace
+ inheritProjectContext: true
+ inheritSkills: false
+@@ -17,16 +17,18 @@ defaultContext: fresh
+ async: true
+ ---
+ 
+-You are `rigor-reviewer-grok`: the default (**Grok:max**) pass of the ADR-115
+-Approved gate for Rigor engine / implementation changes.
++You are `rigor-reviewer-grok`: a **co-primary** (**Grok:xhigh**) pass of the ADR-115
++Approved gate for Rigor engine / implementation changes, run alongside the
++independent `rigor-reviewer-swe2` (`devin/swe-2`) pass. Both must `Approved`.
+ 
+ Stay **read-focused**. Use bash only for inspection (`git diff`, `git log`,
+ `git show`, reading logs). Do not edit files or merge.
+ 
+ ## Gate position
+ 
+-**Default Approved reviewer on `xai/grok-4.6`.** Prefer 4.6 for PR review /
+-scoped patch judgment (less over-scope). Use `xai/grok-4.7` only when the
++**Co-primary Approved reviewer on `xai/grok-4.6`.** Prefer 4.6 for PR review /
++scoped patch judgment (less over-scope). `devin/swe-2` reviews independently —
++do not defer to its verdict. Use `xai/grok-4.7` only when the
+ orchestrator routes a **deep root-cause / multi-hour investigation**. Complex
+ implementation may add Opus afterward; complex design may use Fable instead.
+ 
+@@ -65,7 +67,7 @@ misleading PR text unaddressed).
+ ## Review shape
+ 
+ ```
+-## Review (Grok:max)
++## Review (Grok:xhigh)
+ - Correct: …
+ - Finding: P0/P1/P2, location, evidence, smallest fix
+ - Verdict: Approved | Needs fix
+diff --git a/.pi/agents/rigor-reviewer-opus.md b/.pi/agents/rigor-reviewer-opus.md
+index c3bbb75ff..e039de1bc 100644
+--- a/.pi/agents/rigor-reviewer-opus.md
++++ b/.pi/agents/rigor-reviewer-opus.md
+@@ -5,7 +5,7 @@ description: >-
+ advertise: true
+ aliases: reviewer-opus
+ acceptanceRole: read-only
+-model: claude-bridge/claude-opus-5
++model: claude-bridge/claude-opus-5-5
+ thinking: high
+ systemPromptMode: replace
+ inheritProjectContext: true
+@@ -25,7 +25,7 @@ Stay **read-focused**. Use bash only for inspection (`git diff`, `git log`,
+ 
+ ## Gate position
+ 
+-**Add-on for complex implementation** after Grok:max. Do not rubber-stamp a
++**Add-on for complex implementation** after the co-primary Grok:xhigh + devin/swe-2 passes. Do not rubber-stamp a
+ prior Grok `Approved`. Fable stays reserved for complex design.
+ 
+ Your `Needs fix` blocks advancement for this pass.
+diff --git a/.pi/agents/rigor-reviewer-swe2.md b/.pi/agents/rigor-reviewer-swe2.md
+new file mode 100644
+index 000000000..29b444b27
+--- /dev/null
++++ b/.pi/agents/rigor-reviewer-swe2.md
+@@ -0,0 +1,78 @@
++---
++name: rigor-reviewer-swe2
++description: >-
++  Rigor adversarial reviewer (devin/swe-2:high) — independent co-primary reviewer alongside rigor-reviewer-grok; free-tier this month so run on every pass; returns Approved or Needs fix
++advertise: true
++aliases: reviewer-swe2, reviewer-devin
++acceptanceRole: read-only
++model: devin/swe-2
++thinking: high
++systemPromptMode: replace
++inheritProjectContext: true
++inheritSkills: false
++skills: rigor-reviewer
++skillPath: ../../agents/pi-harness/skills
++tools: read, grep, find, ls, bash
++defaultContext: fresh
++async: true
++---
++
++You are `rigor-reviewer-swe2`: an **independent co-primary** pass of the
++ADR-115 Approved gate for Rigor engine / implementation changes, alongside
++`rigor-reviewer-grok`. `devin/swe-2` is free-tier this month — run on every
++review, do not ration it.
++
++Stay **read-focused**. Use bash only for inspection (`git diff`, `git log`,
++`git show`, reading logs). Do not edit files or merge.
++
++## Gate position
++
++**Co-primary Approved reviewer on `devin/swe-2`.** You review independently of
++the Grok pass — do not defer to its verdict. Both primaries must reach
++`Approved`; either `Needs fix` sends the PR back to the fix loop. Complex
++implementation may add Opus afterward; complex design may use Fable instead.
++
++Your `Needs fix` blocks advancement for this pass.
++
++## Input
++
++Expect a PR / diff / head SHA plus Acceptance bullets (or a `ReviewInput`).
++
++## Output
++
++End with exactly one verdict:
++
++- `Approved`
++- `Needs fix` (with a concrete checklist)
++
++Prefer counterexamples and evidence over trusting green CI alone when behaviour
++is claimed.
++
++## Final approval artifacts (required when ending with `Approved`)
++
++Also output:
++
++1. **PR body revision draft** — rewrite Summary / Test plan / issue links
++   (`Fixes` vs `Refs`) so every claim matches the actual diff. Call out
++   dropped scope explicitly.
++2. **Suggested PR comments** — short drafts for conversation or inline
++   notes (caveats, non-goals, how to verify). Use `[]` only if the revised
++   body already covers everything.
++
++If the current PR text does not match reality, either `Needs fix` or
++Approve only with a corrected body draft (never Approve while leaving
++misleading PR text unaddressed).
++
++## Review shape
++
++```
++## Review (swe-2:high)
++- Correct: …
++- Finding: P0/P1/P2, location, evidence, smallest fix
++- Verdict: Approved | Needs fix
++- PR body draft: …
++- PR comment drafts: […]
++```
++
++Cite paths and line numbers. Do not invent issues you cannot justify from the
++diff or source.
+diff --git a/.pi/agents/rigor-reviewer.md b/.pi/agents/rigor-reviewer.md
+index 706432cad..ba857e4ae 100644
+--- a/.pi/agents/rigor-reviewer.md
++++ b/.pi/agents/rigor-reviewer.md
+@@ -6,7 +6,7 @@ description: >-
+ advertise: true
+ aliases: reviewer
+ acceptanceRole: read-only
+-model: claude-bridge/claude-fable-5
++model: claude-bridge/claude-fable-5-1
+ thinking: medium
+ systemPromptMode: replace
+ inheritProjectContext: true
+@@ -21,7 +21,7 @@ async: true
+ You are `rigor-reviewer`: an ADR-115 adversarial reviewer for Rigor engine /
+ implementation changes.
+ 
+-**Approved gate (Fable:medium):** reserved for **complex design** (architecture / API / inference shape). Do not use on routine tidies. Default review is Grok:max; complex implementation adds Opus:high.
++**Approved gate (Fable:medium):** reserved for **complex design** (architecture / API / inference shape). Do not use on routine tidies. Default review is co-primary Grok:xhigh + devin/swe-2 (both must Approve); complex implementation adds Opus:high.
+ 
+ Stay **read-focused**. Use bash only for inspection (`git diff`, `git log`,
+ `git show`, reading logs). Do not edit files or run mutating commands unless the
+diff --git a/agents/pi-harness/README.md b/agents/pi-harness/README.md
+index 3eef18a84..be839e3a7 100644
+--- a/agents/pi-harness/README.md
++++ b/agents/pi-harness/README.md
+@@ -35,13 +35,13 @@ slash prompts as `/architect`, `/lane`, `/reviewer`, `/docs`,
+ 
+ | Role | Model band | Skill | Owns |
+ | --- | --- | --- | --- |
+-| `architect` | Opus / Grok | `rigor-architect` | Direction, contracts, planning |
+-| `lane` | DeepSeek Flash | `rigor-lane` | Worktree imitation; push head SHA and stop |
+-| `reviewer` | default Grok 4.6:max; +Opus if complex; Fable for design | `rigor-reviewer-grok` / `-opus` / `rigor-reviewer` | Adversarial Approved with Fable reserved |
++| `architect` | `devin/swe-2` (Opus / Grok fallback) | `rigor-architect` | Direction, contracts, planning |
++| `lane` | `devin/swe-2-flash` / DeepSeek Flash | `rigor-lane` | Worktree imitation; push head SHA and stop |
++| `reviewer` | co-primary Grok 4.6:xhigh + `devin/swe-2:high`; +Opus if complex; Fable for design | `rigor-reviewer-grok` / `-swe2` / `-opus` / `rigor-reviewer` | Adversarial Approved with Fable reserved |
+ | `docs` | Gemini Flash | `rigor-docs` | JA publish + EN docs finish; docs-only |
+-| `orchestrator` | Opus / Grok-class | `rigor-orchestrator` | Issue selection, CI watch, merge judgment |
+-| queue (release) | Opus / claude-bridge opus / Grok | `rigor-queue-release` | Interactive pre-clear before a cut (`/queue-release`) |
+-| queue (survey) | Opus / claude-bridge opus / Grok | `rigor-queue-survey` | Interactive survey coverage holes (`/queue-survey`) |
++| `orchestrator` | `devin/swe-2` (Opus / Grok-class fallback) | `rigor-orchestrator` | Issue selection, CI watch, merge judgment |
++| queue (release) | `devin/swe-2` / claude-bridge opus / Grok | `rigor-queue-release` | Interactive pre-clear before a cut (`/queue-release`) |
++| queue (survey) | `devin/swe-2` / claude-bridge opus / Grok | `rigor-queue-survey` | Interactive survey coverage holes (`/queue-survey`) |
+ 
+ I/O shapes: [`contracts/README.md`](contracts/README.md). Role stubs:
+ [`roles/`](roles/).
+@@ -54,7 +54,7 @@ sets `--model` and scopes Ctrl+P via `--models`:
+ ```bash
+ ./agents/pi-harness/scripts/run-role.sh architect
+ ISSUE=123 ./agents/pi-harness/scripts/run-role.sh lane
+-MODEL=anthropic/claude-opus-5 ./agents/pi-harness/scripts/run-role.sh architect
++MODEL=claude-bridge/claude-opus-5-5 ./agents/pi-harness/scripts/run-role.sh architect
+ DRY_RUN=1 ./agents/pi-harness/scripts/run-role.sh architect   # print argv only
+ PRINT=1 ./agents/pi-harness/scripts/run-role.sh architect -nt "…"  # pi -p
+ ```
+@@ -63,16 +63,17 @@ Defaults (first match from `pi --list-models`; override with `MODEL=`):
+ 
+ | Role | Preferred id | Fallback patterns |
+ | --- | --- | --- |
+-| architect / orchestrator | `claude-bridge/claude-opus-5` | `anthropic/claude-opus-5`, `xai/grok-4.7` (deep RCA), `xai/grok-4.6`, `*opus*`, `grok*` |
+-| lane | `opencode-go/deepseek-v4.1-flash` | `opencode-go/*deepseek*flash*`, `opencode/*deepseek*flash*`, `*deepseek*flash*` |
+-| reviewer | default Grok **4.6**:max; +Opus if complex; Fable reserved | `xai/grok-4.6`, `claude-bridge/claude-opus-5`, `claude-bridge/claude-fable-5` (RCA: `xai/grok-4.7`) |
++| architect / orchestrator | `devin/swe-2` | `claude-bridge/claude-opus-5-5`, `xai/grok-4.7` (deep RCA), `xai/grok-4.6`, `grok*` |
++| lane | `devin/swe-2-flash` | `opencode-go/deepseek-v4.1-flash`, `opencode-go/*deepseek*flash*`, `opencode/*deepseek*flash*`, `*deepseek*flash*` |
++| reviewer | co-primary Grok **4.6**:xhigh + `devin/swe-2:high`; +Opus if complex; Fable reserved | `xai/grok-4.6`, `devin/swe-2`, `claude-bridge/claude-opus-5-5`, `claude-bridge/claude-fable-5-1` (RCA: `xai/grok-4.7`) |
+ | docs | `antigravity/gemini-3.8-flash` | `opencode/gemini*flash*`, `google/gemini*flash*` |
+ 
+ If no provider is configured, the script **exits with `pi auth` / `/login`
+ guidance** instead of silently using an unbound default.
+ 
+-Auth cheatsheet: `ANTHROPIC_API_KEY` / Claude subscription, `XAI_API_KEY`,
+-`DEEPSEEK_API_KEY`, `GEMINI_API_KEY`. Inspect: `pi --list-models`.
++Auth cheatsheet: Claude **only** via `pi-claude-bridge` (subscription), `XAI_API_KEY`,
++`DEEPSEEK_API_KEY`, `GEMINI_API_KEY`. `devin/` provider is limited to
++`swe-2` / `swe-2-flash`. Inspect: `pi --list-models`.
+ 
+ ## v1 path (architect → lane)
+ 
+@@ -142,8 +143,9 @@ subagent({
+ - Source checkout must be **clean** before managed worktree fanout (excluding
+   `.pi/subagents/` runtime state). Isolation is rejected for a dirty tree.
+ - Do **not** auto-merge worktree patches into master without a human.
+-- Lane model default is `opencode-go/deepseek-v4.1-flash` with `thinking: high`.
+-  Approved: default Grok 4.6:max; add Opus:high when complex; reserve Fable:medium
++- Lane model default is `devin/swe-2-flash` (`thinking: high`) for non-complex
++  work; `opencode-go/deepseek-v4.1-flash` for cheap parallel capacity.
++  Approved: co-primary Grok 4.6:xhigh + devin/swe-2:high; add Opus:high when complex; reserve Fable:medium
+   for complex design. Final Approve must include a PR body revision draft and
+   suggested PR comments so claims match the diff. Pin ids with `MODEL=` /
+   launch `model:` / `subagents.agentOverrides` if needed.
+@@ -244,13 +246,13 @@ Do not leave `ANTHROPIC_API_KEY` exported when using claude-bridge (it overrides
+ 
+ | Role / agent | Band | Prefer | Criterion (why this band) | Never |
+ | --- | --- | --- | --- | --- |
+-| `architect` / orchestrator queue parent | Opus / Grok | `claude-bridge/claude-opus-5` | Sets direction, contracts, merge judgment; cheap models thrash policy (ADR-115) | DeepSeek / Gemini as architect |
+-| `rigor-lane` / `/lane` | DeepSeek Flash | `opencode-go/deepseek-v4.1-flash` | Parallel imitation under fixed LaneInput; failure is local | Self-promoting to Opus mid-lane |
+-| `rigor-reviewer-grok` (+`-opus` / Fable) | Grok / Opus / Fable | `xai/grok-4.6:max` default review; `xai/grok-4.7` for deep RCA; Opus:high if complex; Fable:medium for design | Complexity-routed Approved; Fable reserved | Gemini for engine review; defaulting review to 4.7 |
++| `architect` / orchestrator queue parent | `devin/swe-2` (Opus / Grok fallback) | `devin/swe-2` | Sets direction, contracts, merge judgment; cheap models thrash policy (ADR-115) | DeepSeek / Gemini as architect |
++| `rigor-lane` / `/lane` | `devin/swe-2-flash` / DeepSeek Flash | `devin/swe-2-flash` (non-complex work), `opencode-go/deepseek-v4.1-flash` | Parallel imitation under fixed LaneInput; failure is local | Self-promoting to Opus mid-lane |
++| `rigor-reviewer-grok` (+`-opus` / Fable) | Grok / Opus / Fable | `xai/grok-4.6:xhigh` + `devin/swe-2:high` co-primary review; `xai/grok-4.7` for deep RCA; Opus:high if complex; Fable:medium for design | Complexity-routed Approved; Fable reserved | Gemini for engine review; defaulting review to 4.7 |
+ | `rigor-docs` / `/docs` | Gemini Flash | `antigravity/gemini-3.8-flash` | JA/EN docs quality on Google AI Pro; docs-only | Engine edits |
+ | queue release/survey parent | Opus-class | same as architect | Ranking + spawn decisions are policy | Letting Flash rank the backlog alone |
+ 
+-**Subagent fan-out rule:** parent (queue) stays Opus-class; children inherit the agent file `model:` (`rigor-lane` → DeepSeek Flash `thinking: high`; reviewers → Grok:max default; +Opus if complex; Fable reserved for design; `rigor-docs` → Antigravity Gemini). Override with launch `model:` only when the user asks.
++**Subagent fan-out rule:** parent (queue) stays `devin/swe-2` (Opus-class fallback); children inherit the agent file `model:` (`rigor-lane` → `devin/swe-2-flash` `thinking: high` or DeepSeek Flash; reviewers → Grok:xhigh + swe-2:high co-primary; +Opus if complex; Fable reserved for design; `rigor-docs` → Antigravity Gemini). Override with launch `model:` only when the user asks.
+ 
+ **Override:** `MODEL=… ./agents/pi-harness/scripts/run-role.sh <role>` or `subagents.agentOverrides` in Pi settings.
+ 
+diff --git a/agents/pi-harness/contracts/README.md b/agents/pi-harness/contracts/README.md
+index 3d98230dc..225b9636f 100644
+--- a/agents/pi-harness/contracts/README.md
++++ b/agents/pi-harness/contracts/README.md
+@@ -12,7 +12,7 @@ LaneInput:
+   touch:           [path glob / file, ...]   # likely bounds
+   must_not:        [constraint, ...]
+   worktree:        path | branch name
+-  model_band:      deepseek-flash-class
++  model_band:      flash-class   # devin/swe-2-flash | deepseek-v4.1-flash
+ ```
+ 
+ ```text
+diff --git a/agents/pi-harness/prompts/architect.md b/agents/pi-harness/prompts/architect.md
+index 63e018510..b9b729648 100644
+--- a/agents/pi-harness/prompts/architect.md
++++ b/agents/pi-harness/prompts/architect.md
+@@ -2,7 +2,7 @@
+ description: Bind architect role — load rigor-architect skill and emit Plan ready
+ argument-hint: "[issue URL or number]"
+ ---
+-You are running as **architect** (Opus/Grok-class; do not demote via `/model`).
++You are running as **architect** (`devin/swe-2` default, Opus/Grok-class fallback; do not demote via `/model`).
+ 
+ 1. Load and follow skill `/skill:rigor-architect` (read its SKILL.md if not already loaded).
+ 2. Scope: ${@:-the current issue / user request}.
+diff --git a/agents/pi-harness/prompts/orchestrator.md b/agents/pi-harness/prompts/orchestrator.md
+index 7de123f32..a916e7ce6 100644
+--- a/agents/pi-harness/prompts/orchestrator.md
++++ b/agents/pi-harness/prompts/orchestrator.md
+@@ -2,7 +2,7 @@
+ description: Bind orchestrator — issue selection, CI watch, merge judgment
+ argument-hint: "[backlog / PR signals]"
+ ---
+-You are running as **orchestrator** (Opus/Grok-class; do not demote via `/model`).
++You are running as **orchestrator** (`devin/swe-2` default, Opus/Grok-class fallback; do not demote via `/model`).
+ 
+ 1. Load and follow skill `/skill:rigor-orchestrator`.
+ 2. Context: ${@:-backlog / lane SHAs / PR URLs from the user}.
+diff --git a/agents/pi-harness/roles/lane.md b/agents/pi-harness/roles/lane.md
+index 0832be9f5..8abcae170 100644
+--- a/agents/pi-harness/roles/lane.md
++++ b/agents/pi-harness/roles/lane.md
+@@ -1,8 +1,11 @@
+ # Role: lane
+ 
+-Model band: **DeepSeek Flash** (cheap parallel capacity; pin a registry id
+-such as `opencode-go/deepseek-v4.1-flash` — `deepseek/deepseek-flash` is often
+-absent).
++Model band: **Flash-class**. Two pins in current use:
++
++- `devin/swe-2-flash` (`thinking: high`) — implementations that do not need
++  complex logic; default when the Devin provider is available.
++- `opencode-go/deepseek-v4.1-flash` — cheap parallel capacity
++  (`deepseek/deepseek-flash` is often absent).
+ 
+ ## Persona
+ 
+diff --git a/agents/pi-harness/roles/orchestrator.md b/agents/pi-harness/roles/orchestrator.md
+index 3889612b1..a0bef94d5 100644
+--- a/agents/pi-harness/roles/orchestrator.md
++++ b/agents/pi-harness/roles/orchestrator.md
+@@ -1,6 +1,7 @@
+ # Role: orchestrator
+ 
+-Model band: **Opus / Grok-class**.
++Model band: **`devin/swe-2`** (default). Opus / Grok-class remains the
++fallback when the Devin provider is unavailable.
+ 
+ ## Persona
+ 
+diff --git a/agents/pi-harness/roles/reviewer.md b/agents/pi-harness/roles/reviewer.md
+index 4ec80eb09..bc342b720 100644
+--- a/agents/pi-harness/roles/reviewer.md
++++ b/agents/pi-harness/roles/reviewer.md
+@@ -4,20 +4,23 @@ Model bands for the **Approved** gate:
+ 
+ | Band | Prefer | Thinking | When |
+ | --- | --- | --- | --- |
+-| Grok | `xai/grok-4.6` | `max` | **Default** adversarial pass (PR review / scoped judgment) |
++| Grok | `xai/grok-4.6` | `xhigh` | **Co-primary** adversarial pass (PR review / scoped judgment) |
++| swe-2 | `devin/swe-2` | `high` | **Co-primary** independent pass — free-tier this month, run on every review |
+ | Grok 4.7 | `xai/grok-4.7` | `max` | **Deep RCA / long investigation only** — not default review |
+-| Opus | `claude-bridge/claude-opus-5` | `high` | Added when the change is judged complex |
+-| Fable | `claude-bridge/claude-fable-5` | `medium` | **Reserved** for complex design / architecture-shaped review |
++| Opus | `claude-bridge/claude-opus-5-5` | `high` | Added when the change is judged complex |
++| Fable | `claude-bridge/claude-fable-5-1` | `medium` | **Reserved** for complex design / architecture-shaped review |
+ 
+-Agents: `rigor-reviewer-grok`, `rigor-reviewer-opus`, `rigor-reviewer`.
++Agents: `rigor-reviewer-grok`, `rigor-reviewer-swe2`, `rigor-reviewer-opus`, `rigor-reviewer`.
+ 
+ ## Selection rule (orchestrator)
+ 
+-1. **Default:** always run `rigor-reviewer-grok` on **`xai/grok-4.6:max`**. One
+-   `Approved` is enough for ordinary / tidy / local fixes. Do **not** default
++1. **Default:** run **two co-primary passes** — `rigor-reviewer-grok` on
++   **`xai/grok-4.6:xhigh`** and `rigor-reviewer-swe2` on **`devin/swe-2:high`**
++   (free-tier this month). Both must `Approved` for ordinary / tidy / local
++   fixes; either `Needs fix` → fix loop. Do **not** default
+    review to 4.7 (over-scope tax on merge-quality reviews).
+ 2. **Complex (implementation-heavy, multi-file engine, subtle contracts):**
+-   after Grok, also run `rigor-reviewer-opus` (Opus:high). Both must `Approved`
++   after the co-primaries, also run `rigor-reviewer-opus` (Opus:high). All must `Approved`
+    (either `Needs fix` → fix loop).
+ 3. **Complex design** (new architecture, API surface, inference-engine shape
+    changes, ADR-level judgment): use `rigor-reviewer` (Fable:medium) — alone or
+diff --git a/agents/pi-harness/scripts/run-queue.sh b/agents/pi-harness/scripts/run-queue.sh
+index b3fe947ed..f87fbcde3 100755
+--- a/agents/pi-harness/scripts/run-queue.sh
++++ b/agents/pi-harness/scripts/run-queue.sh
+@@ -70,22 +70,19 @@ if [[ ! -f "$SKILL_DIR/SKILL.md" ]]; then
+   exit 1
+ fi
+ 
+-# Orchestrator band: claude-bridge opus first, then anthropic opus, then grok.
+-PREFERRED="claude-bridge/claude-opus-5"
++# Orchestrator band: devin/swe-2 first, then claude-bridge opus (the only
++# Claude route), then grok. devin/ is limited to swe-2 / swe-2-flash.
++PREFERRED="devin/swe-2"
+ PATTERNS=(
++  "devin/swe-2"
+   "claude-bridge/*opus*"
+-  "claude-bridge/opus"
+   "*claude-bridge*opus*"
+-  "anthropic/claude-opus-5"
+-  "anthropic/claude-opus"
+   "xai/grok-4.7"
+   "xai/grok-4.6"
+-  "xai/grok-4.5"
+   "xai/grok"
+-  "opus"
+   "grok"
+ )
+-CYCLE="*opus*,claude-bridge/*,grok*,anthropic/claude-opus*,xai/grok*"
++CYCLE="devin/swe-2,claude-bridge/*opus*,xai/grok*,grok*"
+ 
+ glob_to_ere() {
+   local g="$1" out="" i c
+@@ -122,7 +119,7 @@ No usable orchestrator-band model matched.
+ 
+   pi          # /login
+   pi --list-models opus
+-  MODEL=anthropic/claude-opus-5 ./agents/pi-harness/scripts/run-queue.sh release
++  MODEL=claude-bridge/claude-opus-5-5 ./agents/pi-harness/scripts/run-queue.sh release
+ 
+ Prefer starting bare `pi` and using /queue-release or /queue-survey instead.
+ HELP
+diff --git a/agents/pi-harness/scripts/run-role.sh b/agents/pi-harness/scripts/run-role.sh
+index 56e543dd3..306d6f657 100755
+--- a/agents/pi-harness/scripts/run-role.sh
++++ b/agents/pi-harness/scripts/run-role.sh
+@@ -25,15 +25,16 @@ Environment:
+ 
+ Model defaults (patterns; first match from `pi --list-models` wins):
+   architect / orchestrator
+-    patterns: claude-bridge/*opus*  anthropic/*opus*  xai/grok*  *opus*  grok*
+-    preferred ids: claude-bridge/claude-opus-5 , anthropic/claude-opus-5 , xai/grok-4.7 (deep RCA; review default is 4.6)
++    patterns: devin/swe-2  claude-bridge/*opus*  xai/grok*  grok*
++    preferred ids: devin/swe-2 , claude-bridge/claude-opus-5-5 , xai/grok-4.7 (deep RCA; review default is 4.6)
++    note: Claude via claude-bridge only; devin/ limited to swe-2 / swe-2-flash
+   lane
+-    patterns: opencode-go/deepseek-v4.1-flash  opencode-go/*deepseek*flash*  opencode/*deepseek*flash*  *deepseek*flash*
+-    preferred ids: opencode-go/deepseek-v4.1-flash
++    patterns: devin/swe-2-flash  opencode-go/deepseek-v4.1-flash  opencode-go/*deepseek*flash*  opencode/*deepseek*flash*  *deepseek*flash*
++    preferred ids: devin/swe-2-flash (non-complex implementation), opencode-go/deepseek-v4.1-flash
+   reviewer
+-    patterns: xai/grok-4.6  xai/grok  grok  claude-bridge/claude-opus-5  anthropic/claude-opus-5
+-    preferred: xai/grok-4.6 (default pass; xai/grok-4.7 only for deep RCA);
+-      Opus/Fable only via MODEL= per roles/reviewer.md
++    patterns: xai/grok-4.6  xai/grok  grok  devin/swe-2  claude-bridge/claude-opus-5-5  claude-bridge/claude-fable-5-1
++    preferred: xai/grok-4.6:xhigh + devin/swe-2:high (co-primary; xai/grok-4.7 only for deep RCA);
++      Opus/Fable only via MODEL= per roles/reviewer.md; Claude via claude-bridge only
+   docs
+     patterns: antigravity/gemini*flash*  opencode/gemini*flash*  google/gemini*flash*  *gemini*flash*
+     preferred ids: antigravity/gemini-3.8-flash
+@@ -81,26 +82,26 @@ declare -a PATTERNS=()
+ PREFERRED=""
+ case "$ROLE" in
+   architect|orchestrator)
+-    # Prefer Claude Max via pi-claude-bridge (subscription), then API Anthropic, then Grok.
+-    PREFERRED="claude-bridge/claude-opus-5"
++    # Default: devin/swe-2. Then Claude Max via pi-claude-bridge (subscription),
++    # API Anthropic, then Grok.
++    PREFERRED="devin/swe-2"
+     PATTERNS=(
+-      "claude-bridge/claude-opus-5"
++      "devin/swe-2"
++      "claude-bridge/claude-opus-5-5"
+       "claude-bridge/claude-opus"
+-      "anthropic/claude-opus-5"
+-      "anthropic/claude-opus"
+       "xai/grok-4.7"
+       "xai/grok-4.6"
+-      "xai/grok-4.5"
+       "xai/grok"
+-      "opus"
+       "grok"
+     )
+-    CYCLE="claude-bridge/*opus*,*opus*,grok*,anthropic/claude-opus*,xai/grok*"
++    CYCLE="devin/swe-2,claude-bridge/*opus*,xai/grok*,grok*"
+     ;;
+   lane)
+-    # OpenCode Go Flash-class (subscription). Prefer latest v4.1; deepseek/deepseek-flash is not listed.
+-    PREFERRED="opencode-go/deepseek-v4.1-flash"
++    # Flash-class. devin/swe-2-flash for non-complex implementation; OpenCode
++    # Go DeepSeek Flash for cheap parallel capacity (deepseek/deepseek-flash is not listed).
++    PREFERRED="devin/swe-2-flash"
+     PATTERNS=(
++      "devin/swe-2-flash"
+       "opencode-go/deepseek-v4.1-flash"
+       "opencode-go/deepseek-v4-flash"
+       "opencode/deepseek-v4.1-flash"
+@@ -112,7 +113,7 @@ case "$ROLE" in
+       "deepseek/*flash*"
+       "deepseek-flash"
+     )
+-    CYCLE="opencode-go/*deepseek*flash*,opencode/*deepseek*flash*,*deepseek*flash*"
++    CYCLE="devin/swe-2-flash,opencode-go/*deepseek*flash*,opencode/*deepseek*flash*,*deepseek*flash*"
+     ;;
+   reviewer)
+     # Default adversarial pass (roles/reviewer.md). Opus / Fable passes: pin MODEL= explicitly.
+@@ -121,10 +122,11 @@ case "$ROLE" in
+       "xai/grok-4.6"
+       "xai/grok"
+       "grok"
+-      "claude-bridge/claude-opus-5"
+-      "anthropic/claude-opus-5"
++      "devin/swe-2"
++      "claude-bridge/claude-opus-5-5"
++      "claude-bridge/claude-fable-5-1"
+     )
+-    CYCLE="xai/grok*,grok*,claude-bridge/*opus*,anthropic/claude-opus*,claude-bridge/*fable*,anthropic/claude-fable*"
++    CYCLE="xai/grok*,grok*,devin/swe-2,claude-bridge/*opus*,claude-bridge/*fable*"
+     ;;
+   docs)
+     # Prefer Google AI Pro via pi-antigravity (subscription), then OpenCode Gemini, then google API.
+@@ -154,7 +156,7 @@ Authenticate a provider, then re-run:
+ 
+   pi          # interactive: /login
+   # or set an API key, e.g.:
+-  #   export ANTHROPIC_API_KEY=...    # architect / reviewer / orchestrator
++  #   pi install npm:pi-claude-bridge   # Claude route (only) for architect / reviewer / orchestrator
+   #   export XAI_API_KEY=...          # grok-class architect alternative
+   #   export DEEPSEEK_API_KEY=...     # lane
+   #   export GEMINI_API_KEY=...       # docs
+@@ -169,7 +171,7 @@ Inspect what pi can see:
+ 
+ Override explicitly when you know an id:
+ 
+-  MODEL=claude-bridge/claude-opus-5 ./agents/pi-harness/scripts/run-role.sh architect
++  MODEL=claude-bridge/claude-opus-5-5 ./agents/pi-harness/scripts/run-role.sh architect
+ 
+ This harness refuses to silently fall back to an unbound default (e.g. google).
+ HELP
+diff --git a/agents/pi-harness/skills/rigor-queue-release/SKILL.md b/agents/pi-harness/skills/rigor-queue-release/SKILL.md
+index b22053eef..3ca3a9daf 100644
+--- a/agents/pi-harness/skills/rigor-queue-release/SKILL.md
++++ b/agents/pi-harness/skills/rigor-queue-release/SKILL.md
+@@ -114,7 +114,8 @@ Every turn:
+ 
+ From `docs/notes/20260921-queue-release-lane-experience.md`:
+ 
+-- Pin Flash registry id on spawn (`opencode-go/deepseek-v4.1-flash` or current).
++- Pin Flash registry id on spawn (`devin/swe-2-flash` for non-complex work,
++  `opencode-go/deepseek-v4.1-flash` or current).
+ - Child ~30m is enough for code, **not** for dual-project corpus `check` twice —
+   tell lanes to skip full corpus; collect counts in PR body / residual, or run
+   measurement out-of-band.
+@@ -126,7 +127,8 @@ From `docs/notes/20260921-queue-release-lane-experience.md`:
+ 
+ After CI is green on a draft PR:
+ 
+-1. **Default:** spawn `rigor-reviewer-grok` (`thinking: max`). One `Approved` is enough.
++1. **Default:** spawn co-primaries `rigor-reviewer-grok` (`thinking: xhigh`) and
++   `rigor-reviewer-swe2` (`devin/swe-2:high`). Both must `Approved`.
+ 2. **Complex implementation:** also spawn `rigor-reviewer-opus` (`thinking: high`);
+    both must `Approved`.
+ 3. **Complex design:** spawn `rigor-reviewer` (Fable:medium) — reserve for
+@@ -144,7 +146,7 @@ Never merge from this queue skill; human or a later ship step owns merge.
+ | Ranking, triage, evidence, proposing next unit | Architect: only if a unit needs a fresh LaneInput |
+ | Waiting on next/skip/stop / spawn | Lane: prefer `subagent` → `rigor-lane` + managed worktree; fallback `run-role.sh lane` |
+ | Sparse CI verdict after a lane push | — |
+-| CI green on a draft PR | Default `rigor-reviewer-grok`; +Opus if complex; Fable only for complex design |
++| CI green on a draft PR | Co-primary `rigor-reviewer-grok` + `rigor-reviewer-swe2`; +Opus if complex; Fable only for complex design |
+ 
+ ## Finish phrases
+ 
+diff --git a/agents/pi-harness/skills/rigor-reviewer/SKILL.md b/agents/pi-harness/skills/rigor-reviewer/SKILL.md
+index a09e95dfd..14ed95cef 100644
+--- a/agents/pi-harness/skills/rigor-reviewer/SKILL.md
++++ b/agents/pi-harness/skills/rigor-reviewer/SKILL.md
+@@ -2,7 +2,7 @@
+ name: rigor-reviewer
+ description: >-
+   Adversarial review of a Rigor draft PR against architect Acceptance.
+-  Default Grok:max; add Opus:high when complex; reserve Fable:medium for
++  Default Grok:xhigh; add Opus:high when complex; reserve Fable:medium for
+   complex design. Never merge. Finish Approved or Needs fix.
+ ---
+ 
+@@ -15,7 +15,9 @@ Load and follow:
+ 
+ ## Approved gate
+ 
+-1. **Default:** `rigor-reviewer-grok` (`thinking: max`) — one `Approved` suffices.
++1. **Default:** co-primaries `rigor-reviewer-grok` (`thinking: xhigh`) and
++   `rigor-reviewer-swe2` (`devin/swe-2:high`, free-tier this month) — both must
++   `Approved`.
+ 2. **Complex implementation:** also `rigor-reviewer-opus` (`thinking: high`);
+    both must `Approved`.
+ 3. **Complex design:** `rigor-reviewer` (Fable:medium) — reserve for
