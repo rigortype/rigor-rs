@@ -774,14 +774,14 @@ pub(crate) fn check_collection_call(
     typer: &Typer,
     interner: &mut Interner,
     index: &CoreIndex,
-    snapshots: &std::collections::HashMap<rigor_parse::NodeId, &'static str>,
+    snapshots: &std::collections::HashMap<rigor_parse::NodeId, rigor_infer::CollSnap>,
 ) -> Option<Diagnostic> {
     // (1) Safe-nav dispatch is out of the envelope.
     if safe_nav {
         return None;
     }
     // (2) The flow pass must have typed this exact call's receiver.
-    let class_name = *snapshots.get(&call_id)?;
+    let rigor_infer::CollSnap { class: class_name, carrier } = *snapshots.get(&call_id)?;
     // (3) Dynamic/Top-only: any concrete carrier at the use site declines.
     let rty = typer.type_of(ast, receiver, env, interner);
     if !matches!(interner.get(rty), Type::Dynamic(_) | Type::Top) {
@@ -802,8 +802,17 @@ pub(crate) fn check_collection_call(
     if core_instance_may_answer(typer.source(), index, class_name, method, false) {
         return None;
     }
-    let class = index.class_id(class_name)?;
-    let recv_ty = interner.intern(Type::Nominal { class, args: vec![] });
+    // The message names the carrier the flow pass holds at this site when it
+    // is a literal seed no mutator has widened (`c = [1]; c.nope` inside a
+    // `def` reads `for [1]`, as the reference's scope does, rigor-rs#472).
+    // Anything else (a mutator-widened nominal, a tier fold, a seed with a
+    // non-literal element the two engines may type apart) keeps the bare class.
+    let recv_ty = if literal_seed(interner, carrier) {
+        carrier
+    } else {
+        let class = index.class_id(class_name)?;
+        interner.intern(Type::Nominal { class, args: vec![] })
+    };
     let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
     let message = format!("undefined method `{method}' for {receiver_render}");
     let severity = catalog(CALL_UNDEFINED_METHOD)
@@ -819,6 +828,25 @@ pub(crate) fn check_collection_call(
         receiver_type: Some(receiver_render),
         method_name: Some(method.to_string()),
     })
+}
+
+/// Whether `ty` is an array or hash shape built from literals alone: a `Tuple`
+/// or `HashShape` whose every element (recursively) is a `Constant`, a
+/// `Tuple` or a required `HashShape` member of one of these. The allow-list
+/// keeps out a `Dynamic[top]` element (a block parameter the reference types
+/// and the port does not) and every element whose rendering depends on how
+/// the two engines type a call.
+fn literal_seed(interner: &Interner, ty: rigor_types::TypeId) -> bool {
+    fn element(interner: &Interner, ty: rigor_types::TypeId) -> bool {
+        matches!(interner.get(ty), Type::Constant(_)) || literal_seed(interner, ty)
+    }
+    match interner.get(ty) {
+        Type::Tuple(members) => members.iter().all(|&m| element(interner, m)),
+        Type::HashShape(members) => {
+            members.iter().all(|m| !m.optional && element(interner, m.value))
+        }
+        _ => false,
+    }
 }
 
 /// Apply `call.possible-nil-receiver` to a single call, firing from the
