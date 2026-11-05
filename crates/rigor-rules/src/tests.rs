@@ -4567,3 +4567,30 @@ fn refinement_reaches_class_object_receivers_across_files() {
         .collect();
     assert_eq!(rows, ["1:oo", "5:cc", "7:nothere"], "got {rows:?}");
 }
+
+/// Issue #473 — a file-scope block / lambda body reads a captured local's
+/// binding AT the closure, never a write later in the file (the end-of-file
+/// env used to leak in). Oracle-probed at the v0.4.7 pin.
+#[test]
+fn issue_473_closure_reads_binding_at_the_closure() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    assert!(undefined(b"y = \"s\"\n[1].each { y.upcase }\ny = 1\n").is_empty());
+    assert!(undefined(b"y = \"s\"\nf = -> { y.upcase }\ny = 1\nf.call\n").is_empty());
+    assert!(undefined(b"y = \"s\"\n[1].each { [2].each { y.upcase } }\ny = 1\n").is_empty());
+    // The message names the binding the closure captured.
+    assert_eq!(
+        undefined(b"y = 1; [1].map { y.upcase }; y = [1]\n"),
+        vec!["undefined method `upcase' for 1".to_string()]
+    );
+    // CONTROLS — a later write never hides the captured binding, and a
+    // block that rebinds the captured local itself still declines.
+    assert_eq!(undefined(b"y = 1\n[1].each { y.upcase }\ny = \"s\"\n").len(), 1);
+    assert_eq!(undefined(b"y = 1\nl = -> { y.upcase }\ny = \"s\"\nl.call\n").len(), 1);
+    assert!(undefined(b"y = 1\n[1].each { y.upcase; y = \"s\" }\n").is_empty());
+}

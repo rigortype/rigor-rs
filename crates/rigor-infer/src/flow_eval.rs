@@ -258,11 +258,12 @@ impl<'i> Typer<'i> {
     /// (`OperandWalk`, rigor-rs#136) — while a LATER operand still sees the
     /// effect, exactly as the flat env already produced.
     ///
-    /// Sites inside a barrier scope (literal block body, lambda, `def`,
-    /// `class`, `module` body) get the flat env: a closure may run at any
-    /// later point, which is the answer `ScopedEnv::at` gave before this
-    /// pass. So does a site with no recorded effect at or after its
-    /// statement — the replayed env is then byte-identical to the flat one.
+    /// Sites inside a literal block body or lambda read the env at the
+    /// closure with the body's own effects applied conservatively
+    /// ([`Self::closure_entry`], issue #473). Sites inside a `def`, `class`
+    /// or `module` body get the flat env, and so does a site with no
+    /// recorded effect at or after its statement — the replayed env is then
+    /// byte-identical to the flat one.
     pub fn check_env_at<'f>(
         &self,
         ast: &LoweredAst,
@@ -502,15 +503,17 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
-            // A closure body or class/module body captures the whole env —
-            // today's `ScopedEnv::at` answer, kept verbatim — unless the
-            // descent came from a non-descending container, whose flat env
-            // is already in place (`preserve_env`). A lambda body is also a
-            // deferred scope with its OWN evaluated attribute writes:
-            // replay them positionally inside it (rigor-rs#366).
+            // A closure body reads the env at the closure, with its own
+            // rebinds and mutations applied conservatively (issue #473,
+            // `closure_entry`), unless the descent came from a
+            // non-descending container, whose flat env is already in place
+            // (`preserve_env`). A class/module body captures the whole env.
+            // A lambda body is also a deferred scope with its OWN evaluated
+            // attribute writes: replay them positionally inside it
+            // (rigor-rs#366).
             Node::Lambda { .. } => {
                 if !preserve_env {
-                    *env = flow.env.clone();
+                    self.closure_entry(ast, id, site, env, flow, interner);
                 }
                 self.closure_descend(ast, id, site, env, flow, id);
             }
@@ -577,18 +580,16 @@ impl<'i> Typer<'i> {
             let cspan = ast.get(child).span();
             if cspan.0 <= site.0 && site.0 < cspan.1 {
                 if edge == FlowEdge::Barrier {
-                    // A literal block body's scope is the captured env —
-                    // skipped when the descent came from a non-descending
-                    // container, whose flat env already stands
-                    // (`preserve_env`; `flow.env` is the end-of-file env
-                    // and would resurrect post-statement rebinds —
-                    // rigor-rs#380). Then the body's own evaluated
-                    // attribute writes drop their indexed narrowings
-                    // positionally inside it (rigor-rs#366). A
-                    // `def`/`class`/`module` body is a fresh local scope
-                    // the flat env already stands for.
+                    // A literal block body's scope is the env at the call
+                    // with the body's own effects applied conservatively
+                    // (`closure_entry`, issue #473) — skipped when the
+                    // descent came from a non-descending container, whose
+                    // flat env already stands (`preserve_env`, rigor-rs#380).
+                    // Then the body's own evaluated attribute writes drop
+                    // their indexed narrowings positionally inside it
+                    // (rigor-rs#366).
                     if !preserve_env {
-                        *env = flow.env.clone();
+                        self.closure_entry(ast, id, site, env, flow, interner);
                     }
                     if matches!(ast.get(id), Node::Call { .. }) {
                         self.closure_descend(ast, id, site, env, flow, id);
@@ -627,6 +628,30 @@ impl<'i> Typer<'i> {
                 );
             }
         }
+    }
+
+    /// The env a site inside the literal block / lambda `closure` reads:
+    /// the env replayed up to the closure (`env`, already in place), with
+    /// every rebind and mutation the closure's own subtree holds applied
+    /// conservatively — the body may run more than once, so a captured
+    /// local it rebinds is widened as the flat env widened it.
+    ///
+    /// Issue #473: this used to be the end-of-FILE flat env, so a later
+    /// top-level write leaked in (`y = "s"; [1].each { y.upcase }; y = 1`
+    /// fired `for 1`). The reference types the body from the scope at the
+    /// closure (silent there, and `y = 1; [1].each { y.upcase }; y = "s"`
+    /// fires `for 1`); a write after the closure never reaches it, even for
+    /// a lambda called after the write.
+    fn closure_entry(
+        &self,
+        ast: &LoweredAst,
+        closure: NodeId,
+        site: rigor_parse::Span,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        self.apply_subtree_effects(ast, closure, site, false, env, flow, interner);
     }
 
     /// After a non-descending container's flat
@@ -1349,8 +1374,8 @@ impl<'i> Typer<'i> {
                 let mut v: Vec<(NodeId, FlowEdge)> =
                     receiver.iter().map(|&c| (c, FlowEdge::Uncond)).collect();
                 v.extend(args.iter().map(|&c| (c, FlowEdge::Uncond)));
-                // A literal block body is a scope barrier (it may run at any
-                // later point, so it keeps the flat env); a `&expr`
+                // A literal block body is a scope barrier (it may run more
+                // than once, so its own effects widen, `closure_entry`); a `&expr`
                 // block-pass is an operand evaluated before dispatch — its
                 // `block_span` is `None` by construction.
                 let edge = if block_span.is_some() {
