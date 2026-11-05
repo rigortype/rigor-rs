@@ -282,8 +282,8 @@ ruby -I reference/rigor/lib -I reference/rigor/plugins/rigor-rbs-inline/lib \
   reference/rigor/exe/rigor check <path>
 ```
 
-`harness/lib.rb`, `harness/fp_audit.py`, `harness/probe.py` and
-`harness/run_corpus.rb` do this unconditionally. Ad-hoc probes must too.
+`harness/lib.rb`, `harness/fp_audit.py` and `harness/probe.py` do this
+unconditionally. Ad-hoc probes must too.
 
 **Status (verified at the `v0.3.4` pin on 2026-08-26; the mechanism is unchanged
 at `v0.3.9`, where the same defensive `-I` is still passed):** upstream
@@ -308,10 +308,10 @@ reference checkouts MUST pass `--no-cache` and run each invocation from its
 own fresh temp cwd.
 
 Harness status (audited 2026-07-19): `harness/lib.rb` (`run_reference`, used by
-run.rb/snapshot.rb) and `harness/run_corpus.rb` use a fresh per-invocation
-`Dir.mktmpdir` cwd — safe. `harness/fp_audit.py` previously ran from a shared
-persistent `cwd="/tmp"` (a stale `/tmp/.rigor/cache` could survive a pin bump
-and poison a re-baseline); it now uses a fresh temp cwd AND `--no-cache`.
+run.rb/snapshot.rb) uses a fresh per-invocation `Dir.mktmpdir` cwd — safe.
+`harness/fp_audit.py` previously ran from a shared persistent `cwd="/tmp"`
+(a stale `/tmp/.rigor/cache` could survive a pin bump and poison a
+re-baseline); it now uses a fresh temp cwd AND `--no-cache`.
 
 ## Oracle invocation hazard 3: `REFERENCE_RIGOR_DIR` pointed off the pin
 

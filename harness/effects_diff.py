@@ -86,8 +86,8 @@ SWEEP_MANIFEST = os.environ.get(
 #
 # Selection and rationale live here; the PATHS do not. Each entry names a label
 # from `harness/sweep-corpora.yml`, which stays the repo's single membership
-# list for "which external checkouts do we measure" — the drift `run_corpus.rb`
-# and `fp_audit.py` already share that file to avoid. A label this table names
+# list for "which external checkouts do we measure" — `fp_audit.py` shares that
+# file to avoid drift. A label this table names
 # that the manifest does not carry is a REPO bug and hard-fails; a corpus the
 # manifest carries that is not on this MACHINE is SKIPPED, loudly.
 #
@@ -1273,8 +1273,8 @@ def real_targets(scale):
 def resolve_targets(args, scale):
     """Everything to measure, plus the real corpora this machine does not have.
 
-    Positional arguments REPLACE the whole standing set — the same rule
-    `run_corpus.rb` states for its corpus list — so an ad-hoc project run costs
+    Positional arguments REPLACE the whole standing set (unlike
+    `fp_audit.py --sweep`, which runs them after it), so an ad-hoc project run costs
     nothing and reports no skips.
     """
     if args:
