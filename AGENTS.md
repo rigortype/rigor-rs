@@ -74,7 +74,9 @@ tests on Linux and macOS; `cargo clippy --workspace --all-targets -- -D
 warnings` on the pinned 1.88 toolchain; `run_snapshot.rb`; `snapshot.rb
 --check` against the live reference (the two together are `run.rb`); the docs
 budget. CI is the authority for clippy: a newer local clippy disagrees with
-1.88 (e.g. `only_used_in_recursion`).
+1.88 (e.g. `only_used_in_recursion`). To check locally, run
+`cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings` in a
+fresh `CARGO_TARGET_DIR`: a warm target skips crates that already passed.
 
 **Once, before ready (local).**
 - `cargo build --release` then `python3 harness/fp_audit.py --gaps --sweep`:
@@ -97,6 +99,10 @@ What the gates cannot see, so probe it by hand:
   token, a syntax error, or a name that driver code and a later `def` share.
   After a change to scoping, positions or lowering, also run `fp_audit.py` on
   the survey corpora (`harness/README.md`).
+- **Time**: the gates compare output, not runtime. After adding a per-node or
+  per-predicate hook to reach or flow, time `check` per file, with a timeout,
+  on a large tree of installed gems. One such hook took five gem files from
+  under a second to over 15 minutes with every gate green (#422).
 
 ## Probing
 
@@ -123,6 +129,11 @@ What the gates cannot see, so probe it by hand:
   type, not text: a call chain dies at its first unresolved link, so the
   method named near a gap's column is often not the one to fix. Build the
   slice on a scratch branch and diff the gap set.
+- A one-file probe is necessary, not sufficient, before crediting a gap row
+  to a slice. Confirm the row on the real corpus file and in
+  `gap_census.py`, and check that the port's witness path can see the class
+  involved: a lone file has no project, so it cannot exercise a predicate
+  like "the project does not define this constant".
 
 ## Parity bars
 
@@ -142,7 +153,9 @@ What the gates cannot see, so probe it by hand:
 - Claude Code subagents run on Opus 5.5 for every role: investigation,
   implementation and review. Leave `model` unset so they inherit the session
   model. Where the stakes are high, run two independent investigations.
-- An implementer works in an isolated worktree, from a spec that names the
+- Every subagent gets its own worktree, read-only ones included: an agent
+  without one can switch the main checkout's branch under you.
+- An implementer works from a spec that names the
   likely mis-implementations and requires the full *Gates* list. It may
   resolve a spec-vs-oracle conflict toward the oracle; the review confirms it.
 - Implementers commit WIP early and often — provider capacity deaths have
@@ -173,3 +186,7 @@ What the gates cannot see, so probe it by hand:
 - `docs/CURRENT_WORK.md` holds Now/Next plus one ledger line per closed arc.
   Byte budgets are enforced by `harness/docs_check.py`.
 - Small doc-only changes go straight to master; code goes through a PR.
+  Before such a commit from the main checkout, run
+  `git submodule update reference/rigor` and check that `git status` shows no
+  `M reference/rigor`: otherwise the commit can carry a stale gitlink and
+  revert the pin.

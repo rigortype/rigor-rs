@@ -76,6 +76,10 @@ the implementer.
   argument shapes, project `sig/`, and value edges (literals past `i32` and
   `i64`, `&.`, control and multi-byte characters, interpolated or mutated
   receivers). A green gate is not evidence for a shape the gate cannot see.
+- **What a decline feeds.** A value that stops folding can turn an arm the
+  reference treats as dead into a live one, and narrowing is lost with it.
+  Probe where a declined value feeds dead code and narrowing, not only its
+  direct users.
 - **Subset arguments.** "The port only declines where the reference would",
   "we handle a subset of its receivers": such arguments quantify over a term
   (`Dynamic`, "block", "narrower") whose meaning differs between the engines.

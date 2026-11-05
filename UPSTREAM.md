@@ -340,6 +340,9 @@ chasing a non-bug.)
 > this project had adjudicated and deliberately left matched. **A filed upstream
 > issue is a scheduled port obligation**, and the bump that lands the fix is
 > when it comes due. Expect step 7 to send you back to step 4.
+> Upstream keeps fixes as `changelog.d/fixed/` fragments. Probe each one
+> against the old pin, the new pin and the port: that is the only instrument
+> that sees a retraction no fixture or corpus file exercises.
 > [note](docs/notes/20260823-repin-v034.md).
 
 1. Fetch + check out the new tag inside the submodule:
@@ -493,7 +496,9 @@ chasing a non-bug.)
    over-declines passes the 0-FP gate while silently costing matched rows, and
    at `v0.3.9` the first cut of the #580 port did exactly that (mastodon 420 →
    419, recovered by modelling the union re-join rather than collapsing to
-   untyped). Also `python3 harness/effects_diff.py`: the
+   untyped). When the raw FP count is huge, count it by (corpus, rule) before
+   reading rows: a six-figure count has been one rule on two corpora. Also
+   `python3 harness/effects_diff.py`: the
    effects gate has its own retraction class (`v0.3.5` made `super` taint).
 8. Update the tag/commit in this file (and `PROVENANCE.md` if rbs moved), record
    the numbers in `harness/CORPUS.md`, write a dated note in `docs/notes/`, and
