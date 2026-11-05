@@ -369,6 +369,13 @@ struct Frame {
     owner: Option<Vec<String>>,
     singleton: bool,
     uncertain: bool,
+    /// Upstream v0.4.6 (#2269 / #2094, `walk_eval_extends_call`): the class
+    /// an `instance_eval` / `instance_exec` block's `self` names, where
+    /// `owner` stays `None` (its `def`s bind on the singleton). The
+    /// reference's extends walk opens that block as the receiver's own body,
+    /// exactly as `class_eval`, so `X.instance_eval { extend M }` files `M`
+    /// on `X`'s singleton side. Read only by [`Census::singleton_owner`].
+    eval_owner: Option<Vec<String>>,
 }
 
 struct Census {
@@ -398,6 +405,14 @@ impl Census {
 
     fn owner(&self) -> Option<Vec<String>> {
         self.frame().owner.clone()
+    }
+
+    /// The owner a singleton-side mixin in this frame files under (the
+    /// [`AncestryFacts::singleton_mixins`] census only): [`Census::owner`],
+    /// else the `instance_eval` receiver ([`Frame::eval_owner`]).
+    fn singleton_owner(&self) -> Option<Vec<String>> {
+        let f = self.frame();
+        f.owner.clone().or_else(|| f.eval_owner.clone())
     }
 
     fn is_direct(&self, n: &PrismNode<'_>) -> bool {
@@ -465,7 +480,8 @@ impl Census {
         let direct = self.is_direct(n);
         if name.is_empty() {
             // An unnameable declaration owns nothing the port can hold.
-            self.frames.push(Frame { owner: None, singleton: false, uncertain: false });
+            let f = Frame { owner: None, singleton: false, uncertain: false, eval_owner: None };
+            self.frames.push(f);
             if let Some(b) = &body {
                 self.visit(b);
             }
@@ -485,7 +501,12 @@ impl Census {
         );
         let saved_def = std::mem::replace(&mut self.in_def, 0);
         let saved_hooks = std::mem::take(&mut self.hook_params);
-        self.frames.push(Frame { owner: Some(vec![qualified]), singleton: false, uncertain: false });
+        self.frames.push(Frame {
+            owner: Some(vec![qualified]),
+            singleton: false,
+            uncertain: false,
+            eval_owner: None,
+        });
         if let Some(b) = &body {
             self.visit(b);
         }
@@ -543,7 +564,6 @@ impl Census {
         }
         let self_recv = recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
         if recv.is_none() || self_recv {
-            let Some(owner) = self.owner() else { return };
             let singleton = self.frame().singleton;
             let side = match (singleton, kind) {
                 (true, "extend") => return,
@@ -551,26 +571,32 @@ impl Census {
                 _ => MixinSide::Include,
             };
             if side == MixinSide::Extend {
-                // `self` as an argument names the owner itself.
-                let all_named = !args.is_empty()
-                    && args.iter().all(|a| {
-                        strict_constant_path_string(a).is_some() || a.as_self_node().is_some()
-                    });
-                let mut listed: Vec<String> = args
-                    .iter()
-                    .filter_map(|a| {
-                        if a.as_self_node().is_some() {
-                            Some(owner[0].clone())
-                        } else {
-                            strict_constant_path_string(a)
-                        }
-                    })
-                    .collect();
-                if via_send || !all_named {
-                    listed.push(WILDCARD.to_string());
+                if let Some(owner) = self.singleton_owner() {
+                    // `self` as an argument names the owner itself.
+                    let all_named = !args.is_empty()
+                        && args.iter().all(|a| {
+                            strict_constant_path_string(a).is_some() || a.as_self_node().is_some()
+                        });
+                    let mut listed: Vec<String> = args
+                        .iter()
+                        .filter_map(|a| {
+                            if a.as_self_node().is_some() {
+                                Some(owner[0].clone())
+                            } else {
+                                strict_constant_path_string(a)
+                            }
+                        })
+                        .collect();
+                    // `singleton_mixin_recorded?` reads a `self.` receiver
+                    // through `receiver_extend_recorded?`, whose
+                    // `prepend_call_receiver` names no class for `self`: a taint.
+                    if via_send || !all_named || self_recv {
+                        listed.push(WILDCARD.to_string());
+                    }
+                    self.out.singleton_mixins.push((owner, listed));
                 }
-                self.out.singleton_mixins.push((owner.clone(), listed));
             }
+            let Some(owner) = self.owner() else { return };
             if recv.is_none() && !via_send && complete {
                 if self.is_direct(n) && !singleton {
                     if kind != "extend" {
@@ -656,7 +682,7 @@ impl Census {
         let object = sc.receiver();
         let lexical_self = object.as_ref().is_none_or(|o| o.as_self_node().is_some());
         let owner = if lexical_self {
-            self.owner()
+            self.singleton_owner()
         } else {
             object.as_ref().and_then(strict_constant_path_string).map(|raw| self.candidates(&raw))
         };
@@ -753,8 +779,11 @@ impl<'pr> Visit<'pr> for Census {
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
         let expr = node.expression();
         self.visit(&expr);
-        let owner = if expr.as_self_node().is_some() { self.owner() } else { None };
-        self.frames.push(Frame { owner, singleton: true, uncertain: false });
+        let is_self = expr.as_self_node().is_some();
+        let owner = if is_self { self.owner() } else { None };
+        // `class << self` inside `X.instance_eval { … }` opens `X`'s singleton.
+        let eval_owner = if is_self { self.singleton_owner() } else { None };
+        self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner });
         if let Some(b) = node.body() {
             self.visit(&b);
         }
@@ -951,7 +980,7 @@ impl<'pr> Visit<'pr> for Census {
                 | (Some("Data" | "::Data"), "define")
         );
         let frame = if meta_new {
-            Some(Frame { owner: None, singleton: false, uncertain: false })
+            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None })
         } else if eval {
             let instance_side = name == "instance_eval" || name == "instance_exec";
             let owner = match (&recv, &recv_const) {
@@ -960,8 +989,15 @@ impl<'pr> Visit<'pr> for Census {
                 (Some(_), Some(raw)) => Some(self.candidates(raw)),
                 _ => None,
             };
+            // A bare / `self` receiver keeps the enclosing self, an
+            // `instance_eval` frame's included.
+            let eval_owner = match (&recv, &recv_const) {
+                (None, _) => self.singleton_owner(),
+                (Some(r), _) if r.as_self_node().is_some() => self.singleton_owner(),
+                _ => owner.clone(),
+            };
             let owner = if instance_side { None } else { owner };
-            Some(Frame { owner, singleton: false, uncertain: false })
+            Some(Frame { owner, singleton: false, uncertain: false, eval_owner })
         } else {
             None
         };
@@ -981,7 +1017,7 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
     let mut c = Census {
         out: AncestryFacts::default(),
         prefix: Vec::new(),
-        frames: vec![Frame { owner: None, singleton: false, uncertain: false }],
+        frames: vec![Frame { owner: None, singleton: false, uncertain: false, eval_owner: None }],
         direct: HashSet::new(),
         recorded_arg_defs: HashSet::new(),
         in_def: 0,

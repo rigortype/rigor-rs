@@ -82,7 +82,18 @@ fn tuple_projection_folds() {
     case(b"[10, 20][-1]\n", Type::Constant(Scalar::Int(20)));
     case(b"[1, 2].empty?\n", Type::Constant(Scalar::Bool(false)));
     case(b"[].first\n", Type::Constant(Scalar::Nil));
-    case(b"[1, 2][9]\n", Type::Constant(Scalar::Nil)); // out of bounds → nil
+    // Out of bounds DECLINES (reference `tuple_single_index` → nil from
+    // `normalise_index`, issue #479): never a proven `nil`.
+    for src in [&b"[1, 2][9]\n"[..], b"[1, 2][-3]\n"] {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let call_id = ast
+            .iter()
+            .find_map(|(id, n)| matches!(n, Node::Call { receiver: Some(_), .. }).then_some(id))
+            .unwrap();
+        let ty = typer.type_of(&ast, call_id, &TypeEnv::new(), &mut i);
+        assert_eq!(ty, i.untyped(), "src={}", String::from_utf8_lossy(src));
+    }
 }
 
 /// Kernel `#p` / `#pp` identity typing on the implicit-self (`receiver:
