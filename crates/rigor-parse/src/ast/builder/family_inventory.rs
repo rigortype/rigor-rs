@@ -149,9 +149,8 @@ fn dispatched_families() -> Vec<&'static str> {
 /// string naming a Prism type is fine.
 fn check_lower_node_body(text: &str, open: usize, close: usize, file: &str) {
     let b = text.as_bytes();
-    for (rel, _) in text[open..close].match_indices("PrismNode::") {
-        let at = open + rel;
-        let line = text[..at].matches('\n').count() + 1;
+    if let Some((rel, _)) = text[open..close].match_indices("PrismNode::").next() {
+        let line = text[..open + rel].matches('\n').count() + 1;
         panic!("{file}:{line}: `lower_node`'s body names `PrismNode::`: a type's arm goes in a family");
     }
     for (rel, _) in text[open..close].match_indices("node") {
