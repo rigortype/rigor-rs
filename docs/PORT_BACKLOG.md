@@ -11,7 +11,7 @@ measured outcomes and narratives live in `docs/notes/` + `docs/adr/`.
 - ✅ done (working + tested/parity-checked) · 🟡 partial / stub · ⬜ not started
 
 The hard rule for every increment: **zero false positives**. The differential
-harnesses (`harness/run.rb`, `harness/run_corpus.rb`) fail if rigor-rs emits a
+harnesses (`harness/run.rb`, `harness/fp_audit.py`) fail if rigor-rs emits a
 diagnostic the reference does not. Coverage grows; it never regresses into guessing.
 
 ---
@@ -785,7 +785,7 @@ Converged single walk (ADR-0005). Reference has ~19 built-ins.
   param-binding witness/decline pair, the `flow.always-truthy-condition`
   witness/adversarial-negatives pair, and the `call.unresolved-toplevel`
   witness/pure-negatives pair) + divergence-registry.
-- ✅ `harness/run_corpus.rb` (scaled, real-corpus gate; 2458 files validated 0 FP; `harness/CORPUS.md`).
+- ✅ real-corpus gate: `harness/fp_audit.py --sweep` (`harness/CORPUS.md`); the earlier sampled `run_corpus.rb` was removed as a subset of it.
 - ✅ **CI workflow** (`.github/workflows/ci.yml`): `cargo build` + `cargo test` (the
   Ruby-free gates) on push/PR over ubuntu+macos, toolchain pinned to the **1.88** build MSRV
   (forced by the `ruby-rbs` dep's let-chains), `--locked`, libclang for

@@ -151,24 +151,23 @@ converge.
 
 `harness/run.rb` gates on 76 hand-built fixtures; real code finds what fixtures
 structurally cannot (an all-ASCII, well-formed corpus cannot contain an encoding
-or scoping bug — [note](../docs/notes/20260731-survey-fp-triage-24.md)). Two
-tools sweep real corpora, and **both read the same membership list**,
+or scoping bug — [note](../docs/notes/20260731-survey-fp-triage-24.md)).
+`fp_audit.py` sweeps real corpora from one membership list,
 `harness/sweep-corpora.yml`:
 
 ```sh
 python3 harness/fp_audit.py --gaps --sweep   # the standing set, per-rule gap map
-ruby harness/run_corpus.rb                   # same set + the reference's own trees
 ```
 
 `--sweep` exists so the sweep set is a committed, reviewable thing instead of
 whatever directories the last session typed. That drift is not hypothetical: the
 survey corpora sat outside the hand-typed set and carried 24 false positives
 nobody was measuring. A manifest entry that is absent on this machine is
-reported as `SKIPPED` by both tools — a partial sweep must never read as a full
+reported as `SKIPPED` — a partial sweep must never read as a full
 one.
 
-Both run each side from a clean cwd (core+stdlib only), so **no project-`sig/`
-behaviour is measured by either** — and no plugin, and no `.rigor.yml` at all.
+It runs each side from a clean cwd (core+stdlib only), so **no project-`sig/`
+behaviour is measured** — and no plugin, and no `.rigor.yml` at all.
 That blind spot has now cost two separate live-FP findings: the `sig/shims`
 dependency at the `v0.3.2` re-pin, and a stale vendored plugin RBS worth 10 false
 positives at `v0.3.4` ([note](../docs/notes/20260825-upstream-survey-v034-master.md)).
@@ -207,7 +206,7 @@ to master on all seven fixture projects
 also measures `mastodon/app`, and `--scale` adds `gitlab-foss/lib`.
 
 Their paths come from `sweep-corpora.yml` — the repo's single membership list
-for external checkouts, shared with `run_corpus.rb` and `fp_audit.py` — while
+for external checkouts, shared with `fp_audit.py` — while
 which of them this instrument uses, and why, lives in `effects_diff.py`'s
 `REAL_PROJECTS`. A label that table names and the manifest does not carry is a
 repo bug and hard-fails; a corpus the manifest carries that is not on this

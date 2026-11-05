@@ -1,56 +1,43 @@
-# Scaled Corpus Harness — Audit R4
+# Corpus-scale tools
 
 ## Purpose
 
-`harness/run_corpus.rb` is the scaled differential corpus harness for Audit
-action R4 ("land OSS corpora — 12 fixtures can't grade the design").  It runs
-the reference Ruby Rigor and rigor-rs over real Ruby source files, compares the
-diagnostic sets, and surfaces **false positives**: diagnostics rigor-rs emits
-that the reference does NOT.  False positives are the gate — any nonzero count
-fails the run and exits 1.
-
-Coverage gaps (reference emits, rigor-rs misses) are reported but are expected
-noise given that rigor-rs currently implements only three rules.
+`harness/fp_audit.py` runs the reference and rigor-rs over real Ruby source,
+compares the diagnostic sets, and surfaces **false positives**: diagnostics
+rigor-rs emits that the reference does NOT. False positives are the gate — any
+nonzero count fails the run. Coverage gaps (reference emits, rigor-rs misses)
+are reported, and `--gaps` maps them per rule. `gap_census.py` buckets those
+gaps by mechanism.
 
 ## How to run
 
 From the repo root:
 
 ```sh
-ruby harness/run_corpus.rb
-```
-
-Default corpora are built in (see below).  Custom directories can be passed as
-positional arguments:
-
-```sh
-ruby harness/run_corpus.rb /path/to/dir1 /path/to/dir2
+python3 harness/fp_audit.py --gaps --sweep          # the standing set (0 FP bar)
+python3 harness/fp_audit.py reference/rigor/examples # any directories instead
 ```
 
 ### Environment variables
 
 | Variable              | Default                                     | Purpose                                |
 |-----------------------|---------------------------------------------|----------------------------------------|
-| `CORPUS_LIMIT`        | `80`                                        | Max .rb files sampled per corpus dir   |
 | `REFERENCE_RIGOR_DIR` | `reference/rigor` (the PINNED submodule)    | The oracle. Pointing this at a working checkout compares against a different version — UPSTREAM.md hazard 3 |
 | `SWEEP_CORPORA`       | `harness/sweep-corpora.yml`                 | The standing sweep set's manifest      |
-| `RIGOR_RS_BIN`        | `target/release/rigor` (under repo root)    | Path to the rigor-rs binary. Same default in `run_corpus.rb`, `fp_audit.py` and `gap_census.py` |
+| `RIGOR_RS_BIN`        | `target/release/rigor` (under repo root)    | Path to the rigor-rs binary. Same default in `fp_audit.py` and `gap_census.py` |
 
 ### Which binary IS rigor-rs
 
-**`target/release/rigor`, for every corpus-scale tool** — `run_corpus.rb`,
-`fp_audit.py`, `gap_census.py`. Release is what every recorded sweep number was
+**`target/release/rigor`, for every corpus-scale tool** — `fp_audit.py`,
+`gap_census.py`. Release is what every recorded sweep number was
 measured with, and the sweep runs 9204 files through both implementations, where
 a debug build costs several times more. The fixture harness (`harness/run.rb`,
 `harness/lib.rb` — 76 tiny files in an edit-run loop) deliberately stays on
 `target/debug/rigor`; it is a different loop with different economics.
 
-`run_corpus.rb` used to default to debug while `fp_audit.py` defaulted to
-release, so the two corpus entry points disagreed about which file *is*
-rigor-rs — and nothing rebuilt or dated the release one. A six-day-old release
-binary was measured silently, and two merged slices read as "closed nothing"
-([note](../docs/notes/20260807-fp-audit-port-side-blind-spots.md)). All three
-tools now share one contract:
+A release binary older than the tree once measured two merged slices as
+"closed nothing" ([note](../docs/notes/20260807-fp-audit-port-side-blind-spots.md)).
+The corpus tools therefore share one contract:
 
 * the binary is **auto-built when absent** (`cargo build --offline --release -p
   rigor-cli`) — unless `RIGOR_RS_BIN` was set explicitly, which is then required
@@ -81,26 +68,23 @@ the JSON parse.
 
 ## Corpora
 
-Two sources, one list:
-
-1. The reference's own trees (`examples/`, `lib/rigor/type/`) — taken from the
-   **pinned submodule**, so they move with the pin.
-2. The **standing sweep set**, read from `harness/sweep-corpora.yml`. That file
-   is the single membership list for both this script and
-   `harness/fp_audit.py --sweep`, so the two cannot drift apart on *which*
-   corpora are measured — the drift that let 24 false positives sit unmeasured
-   on corpora nobody had typed into a command line
-   ([note](../docs/notes/20260731-survey-fp-triage-24.md)).
+The **standing sweep set** is read from `harness/sweep-corpora.yml`, the
+single membership list for `harness/fp_audit.py --sweep` — the list a
+hand-typed command line drifted from, letting 24 false positives sit
+unmeasured on corpora nobody had typed
+([note](../docs/notes/20260731-survey-fp-triage-24.md)).
    `harness/effects_diff.py` is a third reader: it resolves the paths of the
    real projects in its own standing set by LABEL from this manifest, so those
    paths stay single-sourced too.
 
 Each entry carries a `why:` recording what that corpus caught that no other
 member catches. Add one only with such a reason; do not remove one because it is
-currently quiet. A member absent on this machine is reported as `SKIPPED` by both
-tools — a partial sweep must never read as a full one.
+currently quiet. A member absent on this machine is reported as `SKIPPED` — a partial sweep must never read as a full one.
 
-Custom directories passed as positional arguments replace the whole list.
+Custom directories passed as positional arguments replace the whole list. The
+reference's own trees (`reference/rigor/examples`, `reference/rigor/lib/rigor/type`)
+are not in the set; they move with the pin, so pass them by path when a change
+touches what the examples exercise.
 
 ## Standing sweep-set baseline (2026-11-05, `v0.4.7`)
 
