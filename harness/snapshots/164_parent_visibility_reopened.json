@@ -1,0 +1,33 @@
+{
+  "fixture": "harness/corpus/164_parent_visibility_reopened.rb",
+  "diagnostics": [
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 71,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to protected (overrides BaseG#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 82,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to protected (overrides BaseH#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 90,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from public to protected (overrides BaseI#foo); breaks substitutability"
+    },
+    {
+      "rule": "def.override-visibility-reduced",
+      "line": 98,
+      "column": 7,
+      "severity": "warning",
+      "message": "visibility of `foo' reduced from protected to private (overrides BaseJ#foo); breaks substitutability"
+    }
+  ]
+}

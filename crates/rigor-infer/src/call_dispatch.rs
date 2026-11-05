@@ -101,6 +101,10 @@ impl<'i> Typer<'i> {
 
         let recv_ty = self.type_of(ast, receiver, env, interner);
 
+        if self.literal_concat_declines(ast, receiver, recv_ty, method, args, env, interner) {
+            return interner.untyped();
+        }
+
         // Issue #352 — port of the reference's `try_non_nil_receiver_retry`
         // (expression_typer.rb, upstream #519): a `T | nil` union receiver
         // whose dispatch exhausts every tier retries the whole cascade on the
@@ -809,5 +813,80 @@ impl<'i> Typer<'i> {
             class_name = ret.to_string();
         }
         Some(class_name)
+    }
+    /// Issue #479 — reference `LiteralStringFolding.fold_concat`
+    /// (`literal_string_folding.rb`, the tier after ConstantFolding, which
+    /// never folds these two mutators): `<<` / `concat` with one argument, a
+    /// literal-bearing receiver and a literal-bearing argument answers
+    /// `literal-string` (`& non-empty-string`), a carrier the port does not
+    /// model. The caller types the call untyped (silent), as the oversized-fold
+    /// decline does, instead of the RBS `-> self` `String`, which witnessed
+    /// `"a".concat("b").zzz`. (A `Dynamic[String]` would still dispatch a
+    /// chained call on its `String` facet, `.upcase.zzz`, where the reference's
+    /// carrier stays a refinement.) A Dynamic argument may be a
+    /// `literal-string` the port lost (an oversized fold), so it declines too.
+    /// The reference ignores a block here, and so does this check.
+    ///
+    /// A bare-local receiver typed plain `String` declines as well (and so
+    /// does a self-returning call on one, see below): a rule
+    /// re-types an enclosing call's receiver (`c.concat("d").zzz`) under the
+    /// env AT that enclosing call, which already carries this very call's
+    /// content-mutation widening of `c` (`"c"` → `String`), while the reference
+    /// typed `c` before the mutation. The port cannot tell that widening from a
+    /// genuine `String` binding, so both stay silent (a coverage loss on the
+    /// genuine one, never a diagnostic).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn literal_concat_declines(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        recv_ty: TypeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> bool {
+        if !matches!(method, "<<" | "concat") || args.len() != 1 {
+            return false;
+        }
+        // The reference folds these to the receiver `Constant` (`ConstantFolding
+        // CONSTANT_SELF_RETURNERS`, the unary `+@` / `-@`, `to_s` / `to_str`);
+        // the port types them `String`, so `"a".dup.concat("b")` reads a plain
+        // `String` receiver the reference keeps literal.
+        let self_returner = |n: &Node| match n {
+            Node::Call { receiver: Some(_), method, args, block_body, .. } => {
+                args.is_empty()
+                    && block_body.is_empty()
+                    && matches!(
+                        method.as_str(),
+                        "freeze" | "itself" | "dup" | "clone" | "+@" | "-@" | "to_s" | "to_str"
+                    )
+            }
+            _ => false,
+        };
+        let recv_node = ast.get(receiver);
+        let local_string_receiver = (matches!(recv_node, Node::LocalVariableRead { .. })
+            || self_returner(recv_node))
+            && matches!(interner.get(recv_ty), Type::Nominal { args, .. } if args.is_empty())
+            && self.index.class_name_of(interner, recv_ty) == Some("String");
+        if !(literal_string_compatible(recv_ty, interner) || local_string_receiver) {
+            return false;
+        }
+        let arg_ty = self.type_of(ast, args[0], env, interner);
+        literal_string_compatible(arg_ty, interner)
+            || matches!(interner.get(arg_ty), Type::Dynamic(_))
+    }
+}
+
+/// Reference `Type::Combinator.literal_string_compatible?`, over the carriers
+/// the port models: a `Constant<String>`, or a union whose every member is
+/// one. (The `literal-string` refinement itself the port never mints.)
+fn literal_string_compatible(ty: TypeId, interner: &Interner) -> bool {
+    match interner.get(ty) {
+        Type::Constant(rigor_types::Scalar::Str(_)) => true,
+        Type::Union(members) => {
+            !members.is_empty() && members.iter().all(|&m| literal_string_compatible(m, interner))
+        }
+        _ => false,
     }
 }

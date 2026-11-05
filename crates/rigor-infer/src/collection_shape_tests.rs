@@ -11,7 +11,7 @@ fn coll_snaps(src: &[u8]) -> (LoweredAst, HashMap<NodeId, &'static str>) {
     let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
     let mut i = Interner::new();
     let snaps = typer.collection_shape_snapshots(&ast, &mut i);
-    (ast, snaps)
+    (ast, snaps.into_iter().map(|(id, snap)| (id, snap.class)).collect())
 }
 
 /// The node id of the first call named `method`, or panic.

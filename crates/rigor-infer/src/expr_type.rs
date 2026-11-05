@@ -226,6 +226,14 @@ impl<'i> Typer<'i> {
                     *safe_nav,
                 );
                 if !block_body.is_empty() {
+                    // Issue #479: `"a".concat("b") { }` — the reference's
+                    // literal-string tier ignores the block.
+                    let args = args.clone();
+                    let recv_ty = self.type_of(ast, r, env, interner);
+                    if self.literal_concat_declines(ast, r, recv_ty, &method, &args, env, interner)
+                    {
+                        return interner.untyped();
+                    }
                     // A block changes which RBS overload applies: the reference
                     // selects the block-bearing overload (`block_required: true`)
                     // and the call yields ITS return type. We model that
@@ -1135,8 +1143,12 @@ impl<'i> Typer<'i> {
                     .count();
                 Some(interner.intern(Type::Constant(Scalar::Bool(truthy == 1))))
             }
-            // `t[n]` — a constant integer index (Ruby negative-from-end);
-            // out-of-bounds folds to `nil`. A non-constant index declines.
+            // `t[n]` — a constant integer index (Ruby negative-from-end). An
+            // out-of-range index DECLINES (reference `tuple_single_index` →
+            // `normalise_index` answers nil, so the RBS `Array#[] -> Elem`
+            // tier types it), as `at` does: a proven `nil` there newly
+            // surfaces diagnostics the reference never emits (issue #479,
+            // `f = [[1]]; f[0][1].succ`). A non-constant index declines.
             "[]" if args.len() == 1 => {
                 let idx_ty = self.type_of(ast, args[0], env, interner);
                 let Type::Constant(Scalar::Int(i)) = interner.get(idx_ty) else {
@@ -1144,11 +1156,7 @@ impl<'i> Typer<'i> {
                 };
                 let (i, len) = (*i, elems.len() as i64);
                 let real = if i < 0 { len + i } else { i };
-                if (0..len).contains(&real) {
-                    Some(elems[real as usize])
-                } else {
-                    Some(nil(interner))
-                }
+                (0..len).contains(&real).then(|| elems[real as usize])
             }
             _ => None,
         }

@@ -370,16 +370,19 @@ impl SourceIndex {
         }
 
         // Pass 1b: the lexically-qualified override index. First-write-wins on
-        // superclass + visibility, ordered append-with-dedup on includes — so
-        // this replay is exactly today's call sequence.
-        for (h, _) in files {
+        // superclass, last-write-wins on a visibility within one file (a
+        // cross-file disagreement contests it), ordered append-with-dedup on
+        // includes — so this replay is exactly today's call sequence.
+        for (file, (h, _)) in files.iter().enumerate() {
             let h = h.borrow();
             for oc in &h.override_classes {
                 idx.ingest_override_class(
+                    file,
                     &oc.qualified,
                     oc.superclass.clone(),
                     &oc.methods,
                     &oc.method_visibilities,
+                    &oc.visibility_remarks,
                     &oc.includes,
                     &oc.extends,
                     oc.is_module,

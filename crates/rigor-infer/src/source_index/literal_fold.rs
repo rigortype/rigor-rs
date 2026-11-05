@@ -651,6 +651,23 @@ pub(crate) fn walk_fold_defs(
 /// every name. A `def` written after the definer wins again, read across the
 /// file's bodies of the class (a same-file reopening counts). The superseded
 /// singleton sites in `out` (this file's harvest) capture a `Decline` tail.
+///
+/// Issue #476 — the reference's singleton slot is last-writer-wins
+/// (`SingletonDefTable#write`), and more writers fill it than the harvest
+/// captures as sites: a `module_function` copy (the bare toggle's later
+/// `def x`, or `module_function :x`), a `def` in an `instance_eval` /
+/// `instance_exec` block, a `def self.x` in a `class_eval`-family block, a
+/// `def C.x`, and a `def self.x` the reference writes as POSSIBLE (under an
+/// `if`, in a block), which leaves the slot contested. The port folds none
+/// of these, so each counts as a superseding event here and the earlier site
+/// declines: where the reference folds the later writer's body instead (a
+/// certain `module_function` copy) the port is silent, a coverage loss and
+/// never a false positive. Only a site the harvest itself captured (a direct
+/// body `def self.x`, a `class << self` body `def`) wins the slot back. The
+/// explicit-receiver forms (`V.instance_eval { def x }`,
+/// `V.singleton_class.alias_method`, `def V.x`) may sit anywhere in the
+/// file, and match an owner by the receiver path's last segment, a superset
+/// of the lexical resolutions.
 pub(crate) fn decline_superseded_singletons(ast: &LoweredAst, out: &mut [HarvestedFoldDef]) {
     let mut owners: Vec<(NodeId, String)> = Vec::new();
     qualified_bodies(ast, ast.root(), &[], &mut owners);
@@ -658,7 +675,15 @@ pub(crate) fn decline_superseded_singletons(ast: &LoweredAst, out: &mut [Harvest
     for (id, owner) in owners {
         events.entry(owner).or_default().extend(singleton_events(ast, id));
     }
+    let foreign = foreign_singleton_events(ast);
     for (owner, evs) in &mut events {
+        let tail = owner.rsplit("::").next().unwrap_or(owner);
+        evs.extend(
+            foreign
+                .iter()
+                .filter(|(path, _)| path.rsplit("::").next() == Some(tail))
+                .map(|(_, e)| e.clone()),
+        );
         evs.sort_by_key(|(off, _)| *off);
         for d in out.iter_mut() {
             if d.owner == *owner && d.kind == DefKind::Singleton && superseded(evs, &d.method) {
@@ -708,32 +733,77 @@ fn qualified_bodies(ast: &LoweredAst, node: NodeId, prefix: &[String], out: &mut
     }
 }
 
+/// The `*_eval` / `*_exec` calls whose block body runs with `self` the
+/// receiver: an `instance_*` block's every `def` binds on the receiver's
+/// singleton, a `class_eval`-family block's `def self.x` does.
+const INSTANCE_EVALS: [&str; 2] = ["instance_eval", "instance_exec"];
+const CLASS_EVALS: [&str; 4] = ["class_eval", "class_exec", "module_eval", "module_exec"];
+
+fn literal_name(ast: &LoweredAst, id: NodeId) -> Option<String> {
+    match ast.get(id) {
+        Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => Some(value.clone()),
+        _ => None,
+    }
+}
+
+/// `None` = every name.
+fn all_literal_names(ast: &LoweredAst, args: &[NodeId]) -> Option<Vec<String>> {
+    let names: Vec<String> = args.iter().filter_map(|&a| literal_name(ast, a)).collect();
+    (!names.is_empty() && names.len() == args.len()).then_some(names)
+}
+
+/// The names a naming call on a singleton class replaces
+/// (`singleton_naming_call_names`): `Some(None)` for every name, `None` for a
+/// call that names nothing.
+fn singleton_naming(ast: &LoweredAst, method: &str, args: &[NodeId]) -> Option<Option<Vec<String>>> {
+    Some(match method {
+        "class_eval" | "class_exec" | "module_eval" | "module_exec" | "instance_eval"
+        | "instance_exec" | "send" | "public_send" | "__send__" => None,
+        "alias_method" | "define_method" => all_literal_names(ast, &args[..args.len().min(1)]),
+        "remove_method" | "undef_method" => all_literal_names(ast, args),
+        "attr_reader" => all_literal_names(ast, args),
+        "attr_writer" => {
+            all_literal_names(ast, args).map(|ns| ns.iter().map(|n| format!("{n}=")).collect())
+        }
+        "attr_accessor" => all_literal_names(ast, args)
+            .map(|ns| ns.iter().flat_map(|n| [n.clone(), format!("{n}=")]).collect()),
+        _ => return None,
+    })
+}
+
+/// The `def` ids of `class_id`'s body the harvest captures as singleton
+/// sites ([`walk_fold_defs`] / [`walk_singleton_fold_defs`]): a direct
+/// `def self.x`, and a direct `def` of a direct `class << self` body. These
+/// are the reference's certain slot writes; every other singleton write is
+/// possible or not folded.
+fn certain_singleton_defs(ast: &LoweredAst, body: &[NodeId], in_sc: bool, out: &mut HashSet<NodeId>) {
+    for &child in body {
+        match ast.get(child) {
+            Node::Definition { is_singleton_class: true, singleton_operand, body: inner, .. } => {
+                if !in_sc && singleton_operand.is_some_and(|op| matches!(ast.get(op), Node::SelfExpr { .. })) {
+                    certain_singleton_defs(ast, inner, true, out);
+                }
+            }
+            Node::Definition { name: Some(_), .. } if in_sc => {
+                out.insert(child);
+            }
+            Node::Definition { singleton_name: Some(_), .. } if !in_sc => {
+                out.insert(child);
+            }
+            _ => {}
+        }
+    }
+}
+
 fn singleton_events(ast: &LoweredAst, class_id: NodeId) -> Vec<SingletonEvent> {
     use rigor_parse::Span;
     let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
-    let class_span = ast.get(class_id).span();
-    let literal = |id: NodeId| match ast.get(id) {
-        Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => Some(value.clone()),
-        _ => None,
-    };
-    // `None` = every name.
-    let all_literal = |args: &[NodeId]| -> Option<Vec<String>> {
-        let names: Vec<String> = args.iter().filter_map(|&a| literal(a)).collect();
-        (!names.is_empty() && names.len() == args.len()).then_some(names)
-    };
-    let naming = |method: &str, args: &[NodeId]| -> Option<Option<Vec<String>>> {
-        Some(match method {
-            "class_eval" | "class_exec" | "module_eval" | "module_exec" | "instance_eval"
-            | "instance_exec" | "send" | "public_send" | "__send__" => None,
-            "alias_method" | "define_method" => all_literal(&args[..args.len().min(1)]),
-            "remove_method" | "undef_method" => all_literal(args),
-            "attr_reader" => all_literal(args),
-            "attr_writer" => all_literal(args).map(|ns| ns.iter().map(|n| format!("{n}=")).collect()),
-            "attr_accessor" => all_literal(args)
-                .map(|ns| ns.iter().flat_map(|n| [n.clone(), format!("{n}=")]).collect()),
-            _ => return None,
-        })
-    };
+    let class_node = ast.get(class_id);
+    let class_span = class_node.span();
+    let mut certain: HashSet<NodeId> = HashSet::new();
+    if let Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } = class_node {
+        certain_singleton_defs(ast, body, false, &mut certain);
+    }
     let self_or_none =
         |r: &Option<NodeId>| r.is_none_or(|r| matches!(ast.get(r), Node::SelfExpr { .. }));
     // The scopes nested in this body: (id, span, `class << self`?).
@@ -751,7 +821,24 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId) -> Vec<SingletonEvent> {
             _ => None,
         })
         .collect();
+    // The `instance_*` eval blocks inside this body, any receiver: their
+    // `def`s bind on a singleton (this class's, for a `self` receiver; an
+    // explicit receiver's is also read by [`foreign_singleton_events`]).
+    let instance_eval_blocks: Vec<Span> = ast
+        .iter()
+        .filter(|(_, n)| within(n.span(), class_span))
+        .filter_map(|(_, n)| match n {
+            Node::Call { method, block_span: Some(b), .. } if INSTANCE_EVALS.contains(&method.as_str()) => {
+                Some(*b)
+            }
+            _ => None,
+        })
+        .collect();
     let mut events: Vec<SingletonEvent> = Vec::new();
+    // Bare `module_function` toggles of this body, and the receiverless
+    // instance `def`s of this body (each a copy candidate).
+    let mut mf_toggles: Vec<usize> = Vec::new();
+    let mut instance_defs: Vec<(usize, String)> = Vec::new();
     for (id, n) in ast.iter() {
         let span = n.span();
         if id == class_id || !within(span, class_span) {
@@ -767,13 +854,39 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId) -> Vec<SingletonEvent> {
             Some((_, _, true)) => true,
             Some(_) => continue,
         };
-        match n {
-            Node::Definition { singleton_name: Some(m), .. } if !in_sc => {
-                events.push((span.0, Ok(m.clone())));
+        // A certain site wins the slot back; any other write of the name
+        // contests it.
+        let write = |m: &String| {
+            if certain.contains(&id) {
+                (span.0, Ok(m.clone()))
+            } else {
+                (span.0, Err(Some(vec![m.clone()])))
             }
-            Node::Definition { name: Some(m), .. } if in_sc => events.push((span.0, Ok(m.clone()))),
+        };
+        match n {
+            Node::Definition { singleton_name: Some(m), .. } if !in_sc => events.push(write(m)),
+            Node::Definition { name: Some(m), .. } if in_sc => events.push(write(m)),
+            Node::Definition { name: Some(m), .. } => {
+                if instance_eval_blocks.iter().any(|b| within(span, *b)) {
+                    events.push((span.0, Err(Some(vec![m.clone()]))));
+                }
+                instance_defs.push((span.0, m.clone()));
+            }
             Node::Alias { new_name, .. } if in_sc => {
-                events.push((span.0, Err(literal(*new_name).map(|m| vec![m]))));
+                events.push((span.0, Err(literal_name(ast, *new_name).map(|m| vec![m]))));
+            }
+            Node::Call { receiver: None, method, args, .. } if method == "module_function" && !in_sc => {
+                if args.is_empty() {
+                    mf_toggles.push(span.0);
+                } else {
+                    // `module_function :x` copies `x` at the call; a
+                    // `module_function def x` argument copies nothing
+                    // (`each_singleton_copy`).
+                    let names: Vec<String> = args.iter().filter_map(|&a| literal_name(ast, a)).collect();
+                    if !names.is_empty() {
+                        events.push((span.0, Err(Some(names))));
+                    }
+                }
             }
             Node::Call { receiver, method, args, .. } => {
                 let on_singleton_class = receiver.is_some_and(|r| {
@@ -781,11 +894,11 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId) -> Vec<SingletonEvent> {
                         if method == "singleton_class" && self_or_none(rr))
                 });
                 let names = if on_singleton_class && !in_sc {
-                    naming(method, args)
+                    singleton_naming(ast, method, args)
                 } else if self_or_none(receiver) && method == "define_singleton_method" && !in_sc {
-                    Some(all_literal(&args[..args.len().min(1)]))
+                    Some(all_literal_names(ast, &args[..args.len().min(1)]))
                 } else if self_or_none(receiver) && in_sc {
-                    naming(method, args)
+                    singleton_naming(ast, method, args)
                 } else {
                     None
                 };
@@ -796,14 +909,123 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId) -> Vec<SingletonEvent> {
             _ => {}
         }
     }
+    // A bare `module_function` copies every later receiverless `def` onto the
+    // singleton, up to a bare `public` / `private` / `protected` that ends
+    // the mode (`each_singleton_sibling`, #1968). The toggle is read wherever
+    // it sits and a reset only as a direct body statement, where it surely
+    // runs: an over-approximation, so only more declines.
+    let resets: Vec<usize> = match class_node {
+        Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } => body
+            .iter()
+            .filter_map(|&c| match ast.get(c) {
+                Node::Call { receiver, method, args, span, .. }
+                    if args.is_empty()
+                        && self_or_none(receiver)
+                        && matches!(method.as_str(), "public" | "private" | "protected") =>
+                {
+                    Some(span.0)
+                }
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    for (off, m) in instance_defs {
+        let on = mf_toggles
+            .iter()
+            .filter(|&&t| t < off)
+            .max()
+            .is_some_and(|&t| !resets.iter().any(|&r| t < r && r < off));
+        if on {
+            events.push((off, Err(Some(vec![m]))));
+        }
+    }
     events
+}
+
+/// The singleton writes of the file whose owner a CONSTANT receiver names, as
+/// `(receiver path, event)`: `C.instance_eval { def x }` (every `def`),
+/// `C.class_eval { def self.x }` (a singleton `def`, or one in a `class <<`
+/// there), `C.singleton_class.<naming call>`, and `def C.x`.
+fn foreign_singleton_events(ast: &LoweredAst) -> Vec<(String, SingletonEvent)> {
+    use rigor_parse::Span;
+    let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
+    let const_path = |r: Option<NodeId>| match r.map(|r| ast.get(r)) {
+        Some(Node::ConstantRead { name, .. }) if !name.is_empty() => Some(name.clone()),
+        _ => None,
+    };
+    // (receiver path, block span, `instance_*`?)
+    let mut eval_blocks: Vec<(String, Span, bool)> = Vec::new();
+    let mut out: Vec<(String, SingletonEvent)> = Vec::new();
+    for (_, n) in ast.iter() {
+        match n {
+            Node::Call { receiver, method, args, block_span, span, .. } => {
+                if let (Some(path), Some(b)) = (const_path(*receiver), block_span) {
+                    if INSTANCE_EVALS.contains(&method.as_str()) {
+                        eval_blocks.push((path, *b, true));
+                    } else if CLASS_EVALS.contains(&method.as_str()) {
+                        eval_blocks.push((path, *b, false));
+                    }
+                }
+                let sc_path = receiver.and_then(|r| match ast.get(r) {
+                    Node::Call { method, receiver: rr, .. } if method == "singleton_class" => const_path(*rr),
+                    _ => None,
+                });
+                if let Some(path) = sc_path {
+                    if let Some(names) = singleton_naming(ast, method, args) {
+                        out.push((path, (span.0, Err(names))));
+                    }
+                }
+            }
+            Node::Definition { receiver_def_name: Some(m), def_receiver_path: Some(path), span, .. } => {
+                out.push((path.clone(), (span.0, Err(Some(vec![m.clone()])))));
+            }
+            _ => {}
+        }
+    }
+    if eval_blocks.is_empty() {
+        return out;
+    }
+    let sclasses: Vec<Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { is_singleton_class: true, .. } => Some(n.span()),
+            _ => None,
+        })
+        .collect();
+    for (_, n) in ast.iter() {
+        let Node::Definition { is_singleton_class: false, name, singleton_name, receiver_def_name, .. } = n
+        else {
+            continue;
+        };
+        let Some(m) = name.as_ref().or(singleton_name.as_ref()).or(receiver_def_name.as_ref()) else {
+            continue;
+        };
+        let span = n.span();
+        for (path, b, instance) in &eval_blocks {
+            if !within(span, *b) {
+                continue;
+            }
+            let binds = *instance
+                || name.is_none()
+                || sclasses.iter().any(|s| within(*s, *b) && within(span, *s));
+            if binds {
+                out.push((path.clone(), (span.0, Err(Some(vec![m.clone()])))));
+            }
+        }
+    }
+    out
 }
 
 /// The `def` children of a `class << <operand>` body — each files on the
 /// resolved singleton owner ([`walk_fold_defs`]'s sclass arm) as
 /// `DefKind::Singleton`. Nested `class <<` bodies re-resolve their operand
-/// the same way; a `def self.x` / `def <recv>.x` inside one is a
-/// singleton-of-singleton and stays out of scope.
+/// the same way, except `class << self`: `self` in a `class <<` body is the
+/// singleton class itself, so a nested `class << self` opens the
+/// singleton's own singleton, which no `Const.x` call reaches (issue #476;
+/// the reference walks that body as unnameable). A `def self.x` /
+/// `def <recv>.x` inside one is a singleton-of-singleton and stays out of
+/// scope too.
 fn walk_singleton_fold_defs(
     ast: &LoweredAst,
     body: &[NodeId],
@@ -819,7 +1041,6 @@ fn walk_singleton_fold_defs(
                 ..
             } => {
                 let inner_owner = match singleton_operand.map(|op| ast.get(op)) {
-                    Some(Node::SelfExpr { .. }) => Some(owner.to_string()),
                     Some(Node::ConstantRead { name, .. }) if !name.is_empty() => {
                         Some(name.strip_prefix("::").unwrap_or(name).to_string())
                     }

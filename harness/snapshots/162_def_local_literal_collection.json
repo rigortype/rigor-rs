@@ -1,0 +1,68 @@
+{
+  "fixture": "harness/corpus/162_def_local_literal_collection.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 8,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1, :a, \"s\", nil]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 13,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for { a: 1, \"b\" => [2, 3] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for []"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for {}"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1, 2]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Array[1 | Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 39,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for Hash[Dynamic[top] | Symbol, Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 45,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [[1, 2], { k: [3] }]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for [1]"
+    }
+  ]
+}

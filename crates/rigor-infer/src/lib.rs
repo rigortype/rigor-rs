@@ -70,6 +70,7 @@ use rigor_parse::{LoweredAst, NodeId};
 use rigor_types::{Interner, TypeId};
 
 pub use class_narrowing::ClassNarrowing;
+pub use collection_shape::CollSnap;
 pub use flow_eval::CheckFlow;
 pub use flow_writes::{closure_shadow_scopes, collect_flow_writes, diagnostic_reads_floor_taint, floor_tainted_reads,
     TaintAnchor,

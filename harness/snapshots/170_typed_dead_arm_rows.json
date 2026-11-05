@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/170_typed_dead_arm_rows.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zork' for 1"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 11,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 24,
+      "column": 6,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 31,
+      "column": 13,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    },
+    {
+      "rule": "flow.always-truthy-condition",
+      "line": 34,
+      "column": 4,
+      "severity": "warning",
+      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
+    }
+  ]
+}

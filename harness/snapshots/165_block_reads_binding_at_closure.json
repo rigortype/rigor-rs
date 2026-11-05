@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/165_block_reads_binding_at_closure.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `center' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 45,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 50,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    }
+  ]
+}
