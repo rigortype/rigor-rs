@@ -181,6 +181,15 @@ pub(crate) struct Builder<'src> {
     /// propagates (rigor-rs#363). Masked inside block/lambda bodies —
     /// a `break` there targets the yielding call, not the loop.
     pub(crate) lexical_loop: u32,
+    /// [`Self::lexical_loop`] WITHOUT the block/lambda mask — a
+    /// `break` inside a block body still SITS inside an enclosing
+    /// `while`/`until`/`for` body, and that loop's
+    /// `loop_content_writeback` text scan covers the break's argument
+    /// the way it covers the rest of the body (rigor-rs#407 review).
+    /// The `block_break_locals_only` carrier classifies only a
+    /// block-bodied `break` with NO enclosing loop here — inside a
+    /// loop the generic iterated-body path already matches the oracle.
+    pub(crate) unmasked_loop: u32,
     /// The spans of `break` nodes whose argument scope lands on a
     /// lexical loop's locals-only break join ([`Self::lexical_loop`] —
     /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]). Split by

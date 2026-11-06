@@ -306,6 +306,7 @@ impl<'src> Builder<'src> {
             // whatever position or jump it sits under (rigor-rs#312).
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
+            self.unmasked_loop += 1;
             let body_span = if let Some(s) = while_node.statements() {
                 let b = span_of(&s.location());
                 self.iterated_body_spans.push(b);
@@ -321,6 +322,7 @@ impl<'src> Builder<'src> {
             self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
             self.lexical_loop -= 1;
+            self.unmasked_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -335,6 +337,7 @@ impl<'src> Builder<'src> {
             let predicate = Some(self.lower_node(&until_node.predicate()));
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
+            self.unmasked_loop += 1;
             let body_span = if let Some(s) = until_node.statements() {
                 let b = span_of(&s.location());
                 self.iterated_body_spans.push(b);
@@ -350,6 +353,7 @@ impl<'src> Builder<'src> {
             self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
             self.lexical_loop -= 1;
+            self.unmasked_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -380,6 +384,7 @@ impl<'src> Builder<'src> {
             // so a `break` argument's scope effects never propagate
             // here either (rigor-rs#363).
             self.lexical_loop += 1;
+            self.unmasked_loop += 1;
             // `for` bodies are NOT `iterated_body_spans` (no writeback
             // scan) — the stack entry exists only to pair a valued
             // `next` inside with the body it lands under.
@@ -397,6 +402,7 @@ impl<'src> Builder<'src> {
             self.recovery_joined -= 1;
             self.recovery_next_sink -= 1;
             self.lexical_loop -= 1;
+            self.unmasked_loop -= 1;
             let (index, index_writes) = for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,

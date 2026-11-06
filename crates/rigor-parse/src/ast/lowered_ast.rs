@@ -543,6 +543,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         discarded_spans: Vec::new(),
         blocked_iterative_spans: Vec::new(),
         lexical_loop: 0,
+        unmasked_loop: 0,
         locals_only_spans: Vec::new(),
         bare_locals_only_spans: Vec::new(),
         block_break_locals_only_spans: Vec::new(),
