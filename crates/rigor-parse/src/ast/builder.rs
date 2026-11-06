@@ -474,6 +474,7 @@ impl<'src> Builder<'src> {
             typed: self.typed_depth > 0,
             dead: self.dead_operand > 0,
             closure: self.closure_depth > 0,
+            inside_loop: self.unmasked_loop > 0,
         }
     }
 
@@ -497,6 +498,7 @@ impl<'src> Builder<'src> {
                      typed,
                      dead,
                      closure,
+                     inside_loop,
                  }| {
                 let child_span = span_of(&node.location());
                 if blocked {
@@ -512,6 +514,12 @@ impl<'src> Builder<'src> {
                 self.recovery_suppressed += u32::from(suppressed);
                 self.dead_operand += u32::from(dead);
                 self.closure_depth += u32::from(closure);
+                // A child recovered under a `while`/`until`/`for` body
+                // carries the enclosing loop past the flattening — the
+                // `block_break_locals_only` classification reads it the
+                // same as the owned lowering's [`Self::unmasked_loop`]
+                // bump (rigor-rs#407 review).
+                self.unmasked_loop += u32::from(inside_loop);
                 // A `typed`-marked recovered node is an operand ELEMENT —
                 // `thread_operand` re-gates it on `OperandEffects.any?`
                 // rather than forcing `evaluated: false` outright
@@ -529,6 +537,7 @@ impl<'src> Builder<'src> {
                 self.recovery_suppressed -= u32::from(suppressed);
                 self.dead_operand -= u32::from(dead);
                 self.closure_depth -= u32::from(closure);
+                self.unmasked_loop -= u32::from(inside_loop);
                 if !bound.is_empty() {
                     self.closure_bindings.push((id, bound));
                 }
