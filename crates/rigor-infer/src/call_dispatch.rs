@@ -32,6 +32,38 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
+        self.type_call_declines(ast, receiver, method, args, env, interner, true)
+    }
+
+    /// `type_call` for the internal `recv[k]` / `recv.attr` current-read a
+    /// compound write performs (rigor-rs#178). A user-facing `x[9]`
+    /// declines the nilable lookup, but declining here would erase the
+    /// stored-slot record to `Dynamic` (`s = "abc"; s[0] ||= nil; x =
+    /// s[0]; x.upcase` lost its `possible-nil` row); the read keeps the
+    /// flat nominal so the record's join stands as on master.
+    pub(crate) fn type_call_for_write_value(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        self.type_call_declines(ast, receiver, method, args, env, interner, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_call_declines(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+        user_facing: bool,
+    ) -> TypeId {
         // Tier 4 (in-source / RBS `.new`): `X.new` where `X` is a constant
         // naming a class known to the RBS index OR the SourceIndex types to a
         // Nominal INSTANCE of `X`, so a chained `X.new.method` can be checked.
@@ -347,7 +379,13 @@ impl<'i> Typer<'i> {
                 }
                 // Issue #164: for these `Integer?` lookups an unfolded literal
                 // call must not reach tier 3's bare `Integer` (see the predicate).
-                if folding::declines_unfolded(&scalar, method) {
+                // Issue #178 widened the set to the whole `is_str_lookup` family,
+                // but only for the user-facing read: a compound write's internal
+                // `current` read keeps the flat nominal (its slot record joins
+                // `String | nil` / `Integer | nil` from it).
+                if folding::declines_unfolded(&scalar, method)
+                    && (user_facing || !folding::declines_str_index_family(&scalar, method))
+                {
                     return interner.untyped();
                 }
                 // ADR-0008 sidecar fallback: the Rust core declined, but if this
@@ -366,7 +404,7 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
-            } else if folding::is_str_lookup(&scalar, method) {
+            } else if user_facing && folding::is_str_lookup(&scalar, method) {
                 // Issue #178: the fold never runs when an argument does not
                 // pin (a Range or Regexp literal, a local bound to one), but
                 // a nilable String lookup can still answer `nil` — the

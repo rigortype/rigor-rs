@@ -582,6 +582,16 @@ pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
     is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
 }
 
+/// The lookups #178 added to `declines_unfolded`. A compound index/attr
+/// write's internal `current` read (`s[0] ||= nil`'s `s[0]`) keeps the
+/// flat nominal instead — the stored-slot record joins it with the rhs
+/// (`String | nil`), which the `[]` interception then hands to later
+/// reads. Declining it would erase the record to `Dynamic`.
+pub fn declines_str_index_family(recv: &Scalar, method: &str) -> bool {
+    matches!(recv, Scalar::Str(_))
+        && matches!(method, "[]" | "slice" | "byteslice" | "index")
+}
+
 /// Whether a stale pinned value could change the fold's CLASS (a lookup's
 /// `nil`, or `Float#<=>`'s `nil` against a receiver a later write retypes), so
 /// the tier-1 fold must decline when the call reads a local.
