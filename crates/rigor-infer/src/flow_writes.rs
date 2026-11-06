@@ -211,6 +211,7 @@ pub(crate) const MUTATOR_METHODS: &[&str] = &[
 ///   `for` index (`for h[:k] in xs`) or `rescue` reference (`rescue => h[:e]`):
 ///   each stores through `[]=` on `h` (`IndexWriteWidening`, rigor-rs#134). Keyed
 ///   by the TARGET's span, so it widens inside whichever construct owns it.
+///
 /// The unfiltered mark list [`collect_flow_writes`] filters: every
 /// `(node, span, local, scan_visible)` write/mutation in the file, in every
 /// scope (def bodies and shadowed block scopes included). `scan_visible`
