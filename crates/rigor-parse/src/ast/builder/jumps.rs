@@ -127,12 +127,16 @@ impl<'src> Builder<'src> {
                         } else {
                             self.bare_locals_only_spans.push(span);
                         }
-                    } else if self.recovery_iterative > 0 {
-                        // `break` inside a BLOCK/LAMBDA body — it targets
-                        // the yielding call's `join_block_break_bindings`,
-                        // locals-only for scope effects, with the block
-                        // body itself as the iterated carrier
-                        // (rigor-rs#407).
+                    } else if self.recovery_iterative > 0 && self.unmasked_loop == 0 {
+                        // `break` inside a BLOCK/LAMBDA body under NO
+                        // enclosing loop — it targets the yielding call's
+                        // `join_block_break_bindings`, locals-only for
+                        // scope effects, with the block body itself as
+                        // the iterated carrier (rigor-rs#407). Under a
+                        // `while`/`until`/`for` the ENCLOSING loop's
+                        // writeback scan still covers the argument —
+                        // the generic iterated-body path there already
+                        // matches the oracle, so nothing classifies.
                         self.block_break_locals_only_spans.push(span);
                     }
                     let body = self.lower_body(&args.arguments());
