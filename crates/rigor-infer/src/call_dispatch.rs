@@ -366,6 +366,15 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
+            } else if folding::is_str_lookup(&scalar, method) {
+                // Issue #178: the fold never runs when an argument does not
+                // pin (a Range or Regexp literal, a local bound to one), but
+                // a nilable String lookup can still answer `nil` — the
+                // reference folds the real call and is silent on the miss,
+                // where tier 3's bare `String` / `Integer` fires on the
+                // chained call. Decline as `declines_unfolded` does for the
+                // pinned-but-unfolded path.
+                return interner.untyped();
             }
         }
 
