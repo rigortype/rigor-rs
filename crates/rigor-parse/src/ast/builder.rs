@@ -178,6 +178,15 @@ pub(crate) struct Builder<'src> {
     /// propagates (rigor-rs#363). Masked inside block/lambda bodies —
     /// a `break` there targets the yielding call, not the loop.
     pub(crate) lexical_loop: u32,
+    /// [`Self::lexical_loop`] WITHOUT the block/lambda mask — a
+    /// `break` inside a block body still SITS inside an enclosing
+    /// `while`/`until`/`for` body, and that loop's
+    /// `loop_content_writeback` text scan covers the break's argument
+    /// the way it covers the rest of the body (rigor-rs#407 review).
+    /// The `block_break_locals_only` carrier classifies only a
+    /// block-bodied `break` with NO enclosing loop here — inside a
+    /// loop the generic iterated-body path already matches the oracle.
+    pub(crate) unmasked_loop: u32,
     /// The spans of `break` nodes whose argument scope lands on a
     /// lexical loop's locals-only break join ([`Self::lexical_loop`] —
     /// rigor-rs#363; [`LoweredAst::in_locals_only_carrier`]). Split by
@@ -197,6 +206,12 @@ pub(crate) struct Builder<'src> {
     /// `loop_content_writeback`, so nothing re-joins an adder mark's
     /// store evidence (rigor-rs#363).
     pub(crate) bare_locals_only_spans: Vec<Span>,
+    /// `break` argument spans inside a BLOCK/LAMBDA body — the break
+    /// targets the yielding call's `join_block_break_bindings`, which
+    /// is locals-only for scope effects exactly like
+    /// [`Self::locals_only_spans`], except the enclosing iterated body
+    /// is the block body itself (rigor-rs#407).
+    pub(crate) block_break_locals_only_spans: Vec<Span>,
     /// Every body span lowered under `recovery_iterative` — `while`/
     /// `until` bodies and block/lambda bodies: the regions the
     /// reference's content-writeback TEXT scans cover
@@ -456,6 +471,7 @@ impl<'src> Builder<'src> {
             typed: self.typed_depth > 0,
             dead: self.dead_operand > 0,
             closure: self.closure_depth > 0,
+            inside_loop: self.unmasked_loop > 0,
         }
     }
 
@@ -479,6 +495,7 @@ impl<'src> Builder<'src> {
                      typed,
                      dead,
                      closure,
+                     inside_loop,
                  }| {
                 let child_span = span_of(&node.location());
                 if blocked {
@@ -494,6 +511,12 @@ impl<'src> Builder<'src> {
                 self.recovery_suppressed += u32::from(suppressed);
                 self.dead_operand += u32::from(dead);
                 self.closure_depth += u32::from(closure);
+                // A child recovered under a `while`/`until`/`for` body
+                // carries the enclosing loop past the flattening — the
+                // `block_break_locals_only` classification reads it the
+                // same as the owned lowering's [`Self::unmasked_loop`]
+                // bump (rigor-rs#407 review).
+                self.unmasked_loop += u32::from(inside_loop);
                 // A `typed`-marked recovered node is an operand ELEMENT —
                 // `thread_operand` re-gates it on `OperandEffects.any?`
                 // rather than forcing `evaluated: false` outright
@@ -511,6 +534,7 @@ impl<'src> Builder<'src> {
                 self.recovery_suppressed -= u32::from(suppressed);
                 self.dead_operand -= u32::from(dead);
                 self.closure_depth -= u32::from(closure);
+                self.unmasked_loop -= u32::from(inside_loop);
                 if !bound.is_empty() {
                     self.closure_bindings.push((id, bound));
                 }
