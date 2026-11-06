@@ -4094,16 +4094,20 @@ fn issue_146_multi_value_argument_stays_silent() {
     assert!(run(b"v = 1\nv = 2 if $c\n\"abc\"[v].wA\n").is_empty());
     assert!(run(b"def g(c)\n  v = 1\n  v = 2 if c\n  1.fdiv(v).wB\nend\n").is_empty());
     assert!(run(b"def g(c)\n  \"abc\"[c ? 1 : 2].wC\nend\n").is_empty());
-    // CONTROLS — a literal argument still folds (`for "b"`), and a single
-    // reaching value keeps its nominal pin (the reference's `for "b"` there
-    // is the recorded precision gap, not an FP).
+    // CONTROLS — a literal argument still folds (`for "b"`). A single
+    // reaching value no longer answers the nominal: #178 declines every
+    // nilable String lookup the stale-env gate stands down on, so
+    // `"abc"[v]` is silent where the reference folds `v` to `for "b"` —
+    // a recorded coverage loss, never an FP.
     let diags = run(b"\"abc\"[1].wK\n");
     assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
     assert_eq!(diags[0].message, "undefined method `wK' for \"b\"");
     let diags = run(b"def g\n  v = 1\n  \"abc\"[v].wL\nend\n");
-    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
-    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert!(
+        diags.is_empty(),
+        "#178 declines the local-read `[]` lookup, got {diags:?}"
+    );
 }
 
 /// rigor-rs#309, adversarial review — a union of DISTINCT literal
@@ -4422,11 +4426,15 @@ fn issue_436_reaching_write_cap_boundary() {
             .collect()
     }
     // One plain write plus `n` conditional ones: `n + 1` reaching writes.
+    // The probe call is `1.fdiv(v)`, not `"abc"[v]`: #178 declines every
+    // nilable String lookup whose argument reads a local, so `[]` can no
+    // longer observe the cap — `fdiv` folds on the pinned single value and
+    // declines on the same `multi` reach the cap mints.
     let fan_def = |n: usize| {
-        format!("def f(c)\n  v = 1\n{}  \"abc\"[v].zz\nend\n", "  v = 1 if c\n".repeat(n))
+        format!("def f(c)\n  v = 1\n{}  1.fdiv(v).zz\nend\n", "  v = 1 if c\n".repeat(n))
     };
     let fan_top =
-        |n: usize| format!("v = 1\n{}\"abc\"[v].zz\n", "v = 1 if rand > 0.5\n".repeat(n));
+        |n: usize| format!("v = 1\n{}1.fdiv(v).zz\n", "v = 1 if rand > 0.5\n".repeat(n));
     for (shape, fan) in [("def", &fan_def as &dyn Fn(usize) -> String), ("top", &fan_top)] {
         assert_eq!(undefined(&fan(255)).len(), 1, "{shape}: 256 writes must still fire");
         assert!(undefined(&fan(256)).is_empty(), "{shape}: 257 writes must decline");
@@ -4437,7 +4445,7 @@ fn issue_436_reaching_write_cap_boundary() {
     // sees one write and fires. (A literal `if false` arm is no test: its
     // writes are not collector events at all.)
     let writes = "    v = 2\n".repeat(300);
-    let read = "  \"abc\"[v].zz\nend\n";
+    let read = "  1.fdiv(v).zz\nend\n";
     let rescue_dead =
         format!("def f(c)\n  v = 1\n  begin\n    c.g\n  rescue\n{writes}    raise\n  end\n{read}");
     let fold_dead = format!("def f(c)\n  v = 1\n  t = nil\n  if t\n{writes}  end\n{read}");

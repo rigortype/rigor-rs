@@ -566,20 +566,30 @@ pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
         )
 }
 
-/// Issue #164 — the literal calls whose tier-1 fold OWNS the answer: a call
-/// that pins every argument but does not fold must not fall through to the
-/// tier-3 flat slot. Each returns `Integer?`, and the reference, which folds
-/// these by running the method, either lands on a value the port does not model
-/// (a multibyte receiver, a Float index) or, when Ruby raises (`"abc".getbyte("a")`,
-/// a wrong arity), declines to the `Integer | nil` RBS join no rule fires on.
-/// The flat slot's bare `Integer` is wrong both ways, so the caller answers
+/// Issues #164/#178 — the literal calls whose tier-1 fold OWNS the answer:
+/// a call that pins every argument but does not fold must not fall through
+/// to the tier-3 flat slot. Each nilable String lookup (`String?` for `[]` /
+/// `slice` / `byteslice`, `Integer?` for `index` / `getbyte` / `rindex` /
+/// `byteindex` / `byterindex`) can answer `nil` — a substring miss, an
+/// out-of-range index or Range — and the reference, which folds these by
+/// running the method, is silent downstream where the flat slot's bare
+/// `String` / `Integer` fires `call.undefined-method` on the chained call.
+/// The same for a fold the port cannot reproduce (a multibyte receiver, a
+/// Float index) or where Ruby raises (a wrong arity) and the reference
+/// declines to the `String | nil` / `Integer | nil` join. The caller answers
 /// `Dynamic` instead: a coverage loss, never a false positive.
 pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
-    match recv {
-        Scalar::Str(_) => matches!(method, "getbyte" | "rindex" | "byteindex" | "byterindex"),
-        Scalar::Float(_) => method == "<=>",
-        _ => false,
-    }
+    is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
+}
+
+/// The lookups #178 added to `declines_unfolded`. A compound index/attr
+/// write's internal `current` read (`s[0] ||= nil`'s `s[0]`) keeps the
+/// flat nominal instead — the stored-slot record joins it with the rhs
+/// (`String | nil`), which the `[]` interception then hands to later
+/// reads. Declining it would erase the record to `Dynamic`.
+pub fn declines_str_index_family(recv: &Scalar, method: &str) -> bool {
+    matches!(recv, Scalar::Str(_))
+        && matches!(method, "[]" | "slice" | "byteslice" | "index")
 }
 
 /// Whether a stale pinned value could change the fold's CLASS (a lookup's
