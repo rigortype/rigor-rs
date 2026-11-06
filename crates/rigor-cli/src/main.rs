@@ -1417,9 +1417,11 @@ fn finding_fails_run(d: &Diagnostic) -> bool {
 /// The analysis pipeline shared by `check` and `baseline generate`: read +
 /// parse + lower every file (project pass), then analyze each against the
 /// shared project source, applying config `exclude:`/`disable:` and inline
-/// `# rigor:disable` suppression. Returns `(findings, had_io_error,
-/// rbs_class_decl_counts)` — the counts the `check` run-stats summary prints
-/// (rigor-rs#502) — with
+/// `(findings, had_io_error, (rbs_total, rbs_project_sig))` — the counts
+/// feed the `check` run-stats summary (rigor-rs#502).
+type AnalysisOutcome = (Vec<(usize, String, String, Diagnostic)>, bool, (usize, usize));
+
+/// `# rigor:disable` suppression. Returns [`AnalysisOutcome`] with
 /// findings in input order. The baseline filter is NOT applied here — that is
 /// the LAST stage, applied only by `check` (reference WD6). `verb` labels the
 /// command in error messages (`check` / `baseline`).
@@ -1666,7 +1668,7 @@ fn analyze_files(
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
     bleeding_edge: &config::BleedingEdgeSelector,
     ref_has_files: bool,
-) -> (Vec<(usize, String, String, Diagnostic)>, bool, (usize, usize)) {
+) -> AnalysisOutcome {
     let disable_matcher = cfg.disable_matcher();
     // ADR-8 "Severity profile" — the resolution inputs, computed once: the
     // configured profile, the user's per-rule/family overrides, and the merged
