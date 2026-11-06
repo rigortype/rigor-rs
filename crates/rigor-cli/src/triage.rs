@@ -204,7 +204,7 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
     let (expanded_owned, _errs) =
         crate::expand_check_paths_excluding(roots, &crate::exclude_set(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _io) = crate::analyze_files(
+    let (findings, _io, _rbs) = crate::analyze_files(
         &expanded,
         // `None` on the `paths:` fallback — same no-widening rule as
         // `check` (`paths == configuration.paths` upstream).

@@ -4329,6 +4329,37 @@ impl CoreData {
     pub fn class_count(&self) -> usize {
         self.classes.len()
     }
+
+    /// The `env.class_decls.size` analogue — every loaded class/module
+    /// declaration keyed by its QUALIFIED name, so nested declarations
+    /// (`CGI::Util`) count apart from their leaf (`Util`), unlike
+    /// [`Self::class_count`]'s merged short keys — PLUS the
+    /// [`gem_sig_census`] names: the class decls the reference's
+    /// `DEFAULT_LIBRARIES` pulls from the `prism`/`rbs`/`rdoc` gems' own
+    /// `sig/` trees, which this build deliberately does not ingest
+    /// (`vendor/rbs/PROVENANCE.md`). They join the telemetry count only
+    /// — the analysis surface is untouched. Backs the `RBS classes
+    /// available` line of the `check` run-stats summary (rigor-rs#502).
+    pub fn class_decl_count(&self) -> usize {
+        let mut n = self.qualified.len();
+        for &name in crate::gem_sig_census::GEM_SIG_DECL_NAMES {
+            if !self.qualified.contains_key(name) {
+                n += 1;
+            }
+        }
+        n
+    }
+
+    /// The project-`sig/` share of [`Self::class_decl_count`] — the qualified
+    /// names the project `signature_paths:` INTRODUCED. The reference's
+    /// `RunStats.partition_classes` counts a class toward `project sig/` when
+    /// its PRIMARY declaration's source path lives under `signature_paths:`;
+    /// a `sig/` file reopening a bundled class keeps the bundled primary
+    /// (measured: `sig/class String` reports project `0`), which is exactly
+    /// the introduced-only set this returns.
+    pub fn project_sig_class_decl_count(&self) -> usize {
+        self.qualified_project_sig_classes.len()
+    }
 }
 
 /// What [`Builder::finish`] hands back: the per-class map, the genuine-top-level
