@@ -333,10 +333,23 @@ impl<'i> Typer<'i> {
                 // that reads a local declines to the RBS answer (#149 review:
                 // `buf = ""; buf << "x"; buf[0].upcase` fired `for nil`).
                 // `Float#<=>` joins them: its `nil` arm has the same problem.
+                // rigor-rs#499: the risk is a STALE pin, not a local read —
+                // `s = "abc"; s[9]` folds to `nil` on the oracle because its
+                // env tracks the literal through the binding. A local whose
+                // only mark is the seeding write still proves its pin
+                // (`stale_local` counts a second rebind or any content
+                // mutation); a composite expression reading any local keeps
+                // the old any-read decline — the port cannot see which of
+                // its names the value pinned on.
                 let stale_risk = folding::is_nilable_fold(&scalar, method)
                     && std::iter::once(receiver)
                         .chain(args.iter().copied())
-                        .any(|id| ast.reads_local_within(ast.get(id).span()));
+                        .any(|id| match ast.get(id) {
+                            Node::LocalVariableRead { name, .. } => {
+                                self.stale_local(ast, name)
+                            }
+                            _ => ast.reads_local_within(ast.get(id).span()),
+                        });
                 if let Some(folded) =
                     (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
                 {

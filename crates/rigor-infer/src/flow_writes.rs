@@ -4,7 +4,7 @@
 //! the mutator-method tables behind them, and the env joins/widenings that
 //! consume them.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, ShapeKey};
@@ -211,12 +211,15 @@ pub(crate) const MUTATOR_METHODS: &[&str] = &[
 ///   `for` index (`for h[:k] in xs`) or `rescue` reference (`rescue => h[:e]`):
 ///   each stores through `[]=` on `h` (`IndexWriteWidening`, rigor-rs#134). Keyed
 ///   by the TARGET's span, so it widens inside whichever construct owns it.
-pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
-    // The bool is `scan_visible`: the mark names a CONTENT mutation the
-    // reference's writeback text scan (`content_mutation_target` — a
-    // mutator `CallNode`, a compound index write, or an `IndexTargetNode`)
-    // sees even inside a never-evaluated operand of an iterated body
-    // (rigor-rs#312). Rebinds are never scan-visible.
+/// The unfiltered mark list [`collect_flow_writes`] filters: every
+/// `(node, span, local, scan_visible)` write/mutation in the file, in every
+/// scope (def bodies and shadowed block scopes included). `scan_visible`
+/// marks a CONTENT mutation the reference's writeback text scan
+/// (`content_mutation_target` — a mutator `CallNode`, a compound index
+/// write, or an `IndexTargetNode`) sees even inside a never-evaluated
+/// operand of an iterated body (rigor-rs#312); rebinds are never
+/// scan-visible.
+fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, bool)> {
     let mut out: Vec<(NodeId, rigor_parse::Span, String, bool)> = ast
         .iter()
         .flat_map(|(id, n)| match n {
@@ -316,6 +319,56 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             }
         }
     }
+    out
+}
+
+/// The staleness map behind [`Typer::stale_local`]: per local, a rebind
+/// count and the content-mutation mark spans (rigor-rs#499). Counted on the
+/// RAW marks — a write a scope filter would drop still invalidates a fold
+/// reading that name (a shadowed block's mutation lands on the captured
+/// local the flat env pinned).
+#[derive(Default)]
+pub struct StaleLocals {
+    rebinds: HashMap<String, u32>,
+    mutation_spans: HashMap<String, Vec<rigor_parse::Span>>,
+}
+
+impl StaleLocals {
+    /// `name` carries any content mutation OR a second rebind — the pinned
+    /// literal a read's env kept can no longer be trusted.
+    pub fn stale(&self, name: &str) -> bool {
+        self.rebinds.get(name).is_some_and(|c| *c >= 2)
+            || self.mutation_spans.contains_key(name)
+    }
+
+    /// [`Self::stale`] ignoring mutation marks AT `except` — the
+    /// `current` read inside `s[9] ||= v` evaluates BEFORE its own
+    /// statement mutates, so that statement's mark does not invalidate the
+    /// pin it reads.
+    pub fn stale_except(&self, name: &str, except: rigor_parse::Span) -> bool {
+        self.rebinds.get(name).is_some_and(|c| *c >= 2)
+            || self
+                .mutation_spans
+                .get(name)
+                .is_some_and(|spans| spans.iter().any(|s| *s != except))
+    }
+}
+
+/// The unfiltered staleness table — see [`StaleLocals`].
+pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
+    let mut table = StaleLocals::default();
+    for (_id, span, name, scan_visible) in raw_flow_writes(ast) {
+        if scan_visible {
+            table.mutation_spans.entry(name).or_default().push(span);
+        } else {
+            *table.rebinds.entry(name).or_insert(0) += 1;
+        }
+    }
+    table
+}
+
+pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    let mut out = raw_flow_writes(ast);
     let shadow_scopes = closure_shadow_scopes(ast);
     out.retain(|(id, _, name, _)| {
         !shadow_scopes.iter().any(|(descendants, bound)| {

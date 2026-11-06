@@ -6,7 +6,7 @@
 use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
-use crate::{kernel_fold, ConstLit, TypeEnv, Typer};
+use crate::{folding, kernel_fold, ConstLit, TypeEnv, Typer};
 
 /// The value-pinned scalar key a hash-literal key NODE carries, or `None` when
 /// the key is dynamic (a computed expression, an interpolated string, a
@@ -567,7 +567,38 @@ impl<'i> Typer<'i> {
         if !self.fully_tracked_type(*pre, interner) {
             return None;
         }
-        let current = self.type_call(ast, w.receiver, "[]", &[w.key_node], env, interner);
+        // rigor-rs#499 — the `current` read inside `s[k] op= v` evaluates
+        // BEFORE that statement's own mutation lands, so its mark does not
+        // invalidate `pre`'s pin (`stale_local_except`). Fold the pinned
+        // scalar directly: `s = "abc"; s[9] ||= nil` reads `"abc"[9]` → `nil`
+        // on the oracle, and the flat `type_call` could only see the stale
+        // mark and decline to untyped. A key the pin cannot value-fold
+        // falls back to the dispatch as before.
+        let current = match interner.get(*pre).clone() {
+            Type::Constant(recv_scalar)
+                if !self.stale_local_except(ast, &w.name, w.span) =>
+            {
+                match self.pin_arg_scalars(ast, &[w.key_node], env, interner) {
+                    Some(key_scalars) => {
+                        match folding::fold(&recv_scalar, "[]", &key_scalars) {
+                            Some(f) => interner.intern(Type::Constant(f)),
+                            None => {
+                                if folding::declines_unfolded(&recv_scalar, "[]") {
+                                    interner.untyped()
+                                } else {
+                                    self.type_call(
+                                        ast, w.receiver, "[]", &[w.key_node],
+                                        env, interner,
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    None => self.type_call(ast, w.receiver, "[]", &[w.key_node], env, interner),
+                }
+            }
+            _ => self.type_call(ast, w.receiver, "[]", &[w.key_node], env, interner),
+        };
         let rhs = self.type_of(ast, w.value, env, interner);
         let truthy = self.narrow_truthy(current, interner);
         Some(rigor_types::Algebra::join(interner, truthy, rhs))

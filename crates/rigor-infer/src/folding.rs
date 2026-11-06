@@ -574,9 +574,19 @@ pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
 /// a wrong arity), declines to the `Integer | nil` RBS join no rule fires on.
 /// The flat slot's bare `Integer` is wrong both ways, so the caller answers
 /// `Dynamic` instead: a coverage loss, never a false positive.
+/// rigor-rs#499 — the whole `is_str_lookup` family declines, not only the
+/// `#164` four: `s[9] ||= nil` read its `current` from a stale-risk-skipped
+/// fold (the receiver reads a local the flat env may have lost a mutation
+/// on) and fell through to `method_return`'s bare `String`, minting a
+/// `String` the reference knows is `nil` — `s[9].frobnicate` then fired
+/// `for String` where the oracle fires `for nil` (or declines); and
+/// zero-arg `s.index` landed on bare `Integer`, collapsing under
+/// `narrow_falsey` in `s.index &&= 1` to `1` where the oracle keeps
+/// `Integer | nil` → `1 | nil`. An unf folded lookup answers `Dynamic` on
+/// both counts — the flat nominal is never the right fallback.
 pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
     match recv {
-        Scalar::Str(_) => matches!(method, "getbyte" | "rindex" | "byteindex" | "byterindex"),
+        Scalar::Str(_) => is_str_lookup(recv, method),
         Scalar::Float(_) => method == "<=>",
         _ => false,
     }
