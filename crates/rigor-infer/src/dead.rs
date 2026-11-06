@@ -256,7 +256,13 @@ impl DeadPositions {
         // landed scope. A `while`/`until` `break` argument's rebind
         // still reaches in-body reads — its fixpoint replays it.
         if self.bare.iter().any(|&b| contains(b, write))
-            && !self.bare.iter().any(|&b| contains(b, use_))
+            // The argument's own evaluated scope is exempt, not ANY
+            // bare span — a sibling `break` argument reads the body's
+            // env, not this argument's discarded one.
+            && !self
+                .bare
+                .iter()
+                .any(|&b| contains(b, write) && contains(b, use_))
             && self
                 .loops
                 .iter()
