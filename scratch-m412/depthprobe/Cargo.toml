@@ -1,0 +1,13 @@
+# #412 measuring probe (standalone; never a workspace member). Extends the
+# #279 depthprobe with the uncapped shapes and a Prism-cap mode.
+#   CARGO_TARGET_DIR=<scratch>/targets/probe cargo +1.88.0 build --release --offline
+[package]
+name = "depthprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rigor-parse = { path = "../../../trees/master/crates/rigor-parse" }
