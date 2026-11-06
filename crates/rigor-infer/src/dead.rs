@@ -170,6 +170,13 @@ pub(crate) struct DeadPositions {
     /// (`break h.merge!(…)`, `h.clear`) reaches it like a scanned one
     /// (`flow_writes::break_join_suppresses`).
     locals_only_attr_writes: Vec<Span>,
+    /// `break` argument spans inside a BLOCK/LAMBDA body —
+    /// `join_block_break_bindings` drops every scope effect (a slot
+    /// mutation's widening, a mutator's record drop) while a rebind
+    /// still unions into the post-call scope and a scan-visible
+    /// mutation lands past the block's join through
+    /// `content_writeback_block_captures` (rigor-rs#407).
+    block_break: Vec<Span>,
     /// The `scanned_inert` carriers — `END { }`/`BEGIN { }`/`super(…)`/
     /// `yield(…)` operands inside an iterated body: never evaluated (the
     /// write's own position lands nothing) but covered by the body's
@@ -276,6 +283,25 @@ impl DeadPositions {
         {
             return false;
         }
+        // A rebind inside a BLOCK/LAMBDA body's `break` argument joins
+        // `join_block_break_bindings` — locals-only, so it lands on the
+        // post-call scope (and nowhere inside the block body that holds
+        // the argument, not even inside the argument's own tail — the
+        // reference reads the pre-`break` env there: `each { break
+        // (h = {}; h.m) }` fires `m` for the OLD `h`, rigor-rs#407).
+        // The owning carrier is the SMALLEST iterated body holding the
+        // write — the block body itself; a read later in an OUTER
+        // loop's body still sees the landed scope.
+        if self.block_break.iter().any(|&b| contains(b, write))
+            && self
+                .iterated
+                .iter()
+                .filter(|&&b| contains(b, write))
+                .min_by_key(|b| b.1 - b.0)
+                .is_some_and(|&b| b.0 <= use_.0 && use_.0 < b.1)
+        {
+            return false;
+        }
         if let Some(arm) = self.rescue.iter().find(|a| contains(a.span, write)) {
             // "Inside the arm" must start BEFORE its clipped end: the last
             // clause's span runs to the `begin`'s own `end`, so a zero-width
@@ -311,6 +337,26 @@ impl DeadPositions {
         // h[:a].n); end` fires `m` and `n` on the oracle, declines
         // post-loop — rigor-rs#363 review). A non-scanned write's drop
         // lands nowhere at all.
+        // A mutation inside a BLOCK/LAMBDA body's `break` argument:
+        // `join_block_break_bindings` drops every scope effect — the
+        // widening lands NOWHERE (`each { break h.merge!(…) }` keeps
+        // `h[:a]`'s record on the oracle — rigor-rs#407) — except a
+        // scan-visible mutation, whose drop `content_writeback_block_
+        // captures` still applies past the SMALLEST iterated body
+        // holding the write (the block body: `each { break h[:a] = 9 }`
+        // declines post-call). A nested iterated body inside the
+        // argument does not widen the reach — the owning block body
+        // bound is the minimum, so a `for` inside the argument keeps
+        // the suppression.
+        if self.block_break.iter().any(|&b| contains(b, write)) {
+            return scanned
+                && self
+                    .iterated
+                    .iter()
+                    .filter(|&&b| contains(b, write))
+                    .min_by_key(|b| b.1 - b.0)
+                    .is_some_and(|&b| !(b.0 <= use_.0 && use_.0 < b.1));
+        }
         if self.locals_only.iter().any(|&l| contains(l, write)) {
             return (scanned || !self.locals_only_attr_writes.contains(&write))
                 && self
@@ -447,6 +493,7 @@ impl<'i> Typer<'i> {
             iterated: ast.iterated_body_spans().to_vec(),
             bare: ast.bare_locals_only_spans().to_vec(),
             locals_only: ast.locals_only_spans().to_vec(),
+            block_break: ast.block_break_locals_only_spans().to_vec(),
             scanned_inert: ast.scanned_inert_spans().to_vec(),
             next_args: ast.next_arg_spans().to_vec(),
             ..Default::default()

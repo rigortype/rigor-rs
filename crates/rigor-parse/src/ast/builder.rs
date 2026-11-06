@@ -200,6 +200,12 @@ pub(crate) struct Builder<'src> {
     /// `loop_content_writeback`, so nothing re-joins an adder mark's
     /// store evidence (rigor-rs#363).
     pub(crate) bare_locals_only_spans: Vec<Span>,
+    /// `break` argument spans inside a BLOCK/LAMBDA body — the break
+    /// targets the yielding call's `join_block_break_bindings`, which
+    /// is locals-only for scope effects exactly like
+    /// [`Self::locals_only_spans`], except the enclosing iterated body
+    /// is the block body itself (rigor-rs#407).
+    pub(crate) block_break_locals_only_spans: Vec<Span>,
     /// Every body span lowered under `recovery_iterative` — `while`/
     /// `until` bodies and block/lambda bodies: the regions the
     /// reference's content-writeback TEXT scans cover

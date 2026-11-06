@@ -127,6 +127,13 @@ impl<'src> Builder<'src> {
                         } else {
                             self.bare_locals_only_spans.push(span);
                         }
+                    } else if self.recovery_iterative > 0 {
+                        // `break` inside a BLOCK/LAMBDA body — it targets
+                        // the yielding call's `join_block_break_bindings`,
+                        // locals-only for scope effects, with the block
+                        // body itself as the iterated carrier
+                        // (rigor-rs#407).
+                        self.block_break_locals_only_spans.push(span);
                     }
                     let body = self.lower_body(&args.arguments());
                     self.push(Node::Statements {
