@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 
 pub mod plugins;
+mod gem_sig_census;
 mod rbs;
 
 pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
@@ -189,6 +190,17 @@ impl CoreIndex {
     /// coverage signal reported by `rigor doctor`.
     pub fn class_count(&self) -> usize {
         self.data.class_count()
+    }
+
+    /// The `(total, project_sig)` class-declaration counts the `check`
+    /// run-stats summary reports (`env.class_decls` partitioned by whether the
+    /// primary declaration's source lives under `signature_paths:`). See
+    /// [`rbs::CoreData::class_decl_count`] (rigor-rs#502).
+    pub fn class_decl_counts(&self) -> (usize, usize) {
+        (
+            self.data.class_decl_count(),
+            self.data.project_sig_class_decl_count(),
+        )
     }
 
     /// Whether `class_name` is one this index models at all. The rule must stay
