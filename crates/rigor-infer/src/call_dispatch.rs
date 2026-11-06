@@ -358,6 +358,33 @@ impl<'i> Typer<'i> {
                     }
                     return interner.intern(Type::Constant(folded));
                 }
+                // rigor-rs#499 — a STALE pin cannot fold (the env literal is
+                // not the runtime value) but the oracle still answers the RBS
+                // signature: `s << "x"; s[9]` types `String?`, `s.index` types
+                // `Integer?`. A bare untyped loses the nil (`x = s[0]; x.upcase`
+                // keeps its `possible-nil` row on the oracle), and a bare
+                // nominal would invent the flat `String` the pin's decline was
+                // introduced to erase — so the fallback is the SAME
+                // `method_return_nilable` answer tier 3 gives a Nominal
+                // receiver: `T | nil` for a nilable return, the flat nominal
+                // otherwise, untyped only when the class does not define the
+                // method at all.
+                if stale_risk {
+                    return match self
+                        .index
+                        .method_return_nilable(folding::scalar_class(&scalar), method)
+                    {
+                        Some((ret, nilable)) => {
+                            let nominal = self.nominal_or_untyped(ret, interner);
+                            if nilable {
+                                rigor_types::Algebra::join(interner, nominal, interner.nil())
+                            } else {
+                                nominal
+                            }
+                        }
+                        None => interner.untyped(),
+                    };
+                }
                 // Issue #164: for these `Integer?` lookups an unfolded literal
                 // call must not reach tier 3's bare `Integer` (see the predicate).
                 if folding::declines_unfolded(&scalar, method) {
