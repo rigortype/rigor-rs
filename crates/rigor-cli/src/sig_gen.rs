@@ -3010,6 +3010,10 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
         }
         groups.entry(c.class_name.clone()).or_default().push(c);
     }
+    // The reference merges `groups.keys.sort` — class-name order, not first-seen
+    // order — which is what orders the `skipped` report lines too (rigor-rs#493
+    // item 5).
+    order.sort();
     order.into_iter().map(|k| (k.clone(), groups.remove(&k).unwrap())).collect()
 }
 

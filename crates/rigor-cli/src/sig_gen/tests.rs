@@ -783,6 +783,22 @@ fn is_bare_generic_name_only_matches_bare_generics() {
 // -- UPDATE/merge + LayoutIndex ------------------------------------------
 
 /// A merge-candidate factory for the `apply_merge` tests.
+#[test]
+fn group_by_class_orders_groups_by_class_name() {
+    // Reference `merge_candidates`: `groups.keys.sort.each { merge_class }` —
+    // class-name order, which is also the `skipped` report's line order
+    // (rigor-rs#493 item 5).
+    let groups = group_by_class(vec![
+        mc("Zebra", "z", "instance", "def z: () -> 1"),
+        mc("Apple", "a", "instance", "def a: () -> 2"),
+        mc("Apple", "b", "instance", "def b: () -> 3"),
+    ]);
+    assert_eq!(
+        groups.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["Apple", "Zebra"]
+    );
+}
+
 fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
     Candidate {
         file: "lib/f.rb".into(),
