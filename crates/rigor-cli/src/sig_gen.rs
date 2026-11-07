@@ -2999,7 +2999,8 @@ fn names_word(text: &str, name: &str) -> bool {
     false
 }
 
-/// Group candidates by `class_name`, preserving first-seen class order
+/// Group candidates by `class_name` (merged in class-name order, reference
+/// `groups.keys.sort`).
 /// (reference `candidates.group_by(&:class_name)`).
 fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
     let mut order: Vec<String> = Vec::new();
