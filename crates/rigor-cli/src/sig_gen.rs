@@ -452,6 +452,49 @@ fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info:
     let _ = superclass;
     for &child in body {
         collect_namespace_info(ast, child, &qualified, info);
+        collect_namespace_info_nested(ast, child, &qualified, info);
+    }
+}
+
+/// `if`-/`begin`-carried namespaces still record their kind for the merge
+/// (`module K::M2` inside `if` writes `module`), just as
+/// [`collect_conditional_definers`] walks them for candidates.
+fn collect_namespace_info_nested(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
+    let children: &[NodeId] = match ast.get(id) {
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => return,
+        Node::Definition { is_singleton_class: false, .. } => return,
+        Node::If { then_body, else_body, .. } => {
+            for &b in then_body.iter().chain(else_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &b in branches.iter().chain(else_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        Node::When { body, .. }
+        | Node::Loop { body, .. }
+        | Node::BeginRescue { body, .. }
+        | Node::Statements { body, .. }
+        | Node::Lambda { body, .. }
+        | Node::Definition { is_singleton_class: true, body, .. } => body,
+        Node::Call { args, block_body, .. } => {
+            for &b in args.iter().chain(block_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        _ => return,
+    };
+    for &b in children {
+        collect_namespace_info(ast, b, prefix, info);
+        collect_namespace_info_nested(ast, b, prefix, info);
     }
 }
 
@@ -944,6 +987,8 @@ fn generate_file_with_info(
                     &layouts,
                     &modes,
                     &[],
+                    Visibility::Public,
+                    false,
                     &mut interner,
                     &mut out,
                     &mut definers,
@@ -1316,6 +1361,7 @@ fn walk_namespace(
     // form does not flip the mode. It applies in a CLASS body too.
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
     let mut uncertain: Vec<(&str, usize)> = Vec::new();
+    let mut conditionals: Vec<(usize, NodeId)> = Vec::new();
     for &child in body {
         match ast.get(child) {
             Node::Definition {
@@ -1436,6 +1482,7 @@ fn walk_namespace(
                 // definer too (`rigor_each_child` descends arguments).
                 // `Definition` args are already handled above — descending
                 // them would double-count the wrapped def.
+                let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
                 for &arg in args {
                     if !matches!(ast.get(arg), Node::Definition { .. }) {
                         collect_conditional_definers(
@@ -1454,6 +1501,8 @@ fn walk_namespace(
                             layouts,
                             modes,
                             &visibilities,
+                            running_vis,
+                            running_mf,
                             interner,
                             out,
                             definers,
@@ -1467,6 +1516,7 @@ fn walk_namespace(
                 let dsl_scope = method == "class_methods"
                     || (method == "refine" && matches!(ast.get(id), Node::ModuleDef { .. }));
                 if !dsl_scope {
+                    let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
                     for &b in block_body {
                         collect_conditional_definers(
                             ast,
@@ -1484,6 +1534,8 @@ fn walk_namespace(
                             layouts,
                             modes,
                             &visibilities,
+                            running_vis,
+                            running_mf,
                             interner,
                             out,
                             definers,
@@ -1536,30 +1588,12 @@ fn walk_namespace(
             // `if cond; attr_reader :x; end` then contests a preceding
             // `def x` (rigor-rs#525 item 2). Namespace children are walked
             // by `Emit::Nested` instead — do not double-count them.
-            _ => {
-                if !is_namespace_node(ast, child, &qualified, layouts) {
-                    collect_conditional_definers(
-                        ast,
-                        child,
-                        &qualified,
-                        false,
-                        matches!(ast.get(id), Node::ModuleDef { .. }),
-                        path,
-                        include_private,
-                        index,
-                        typer,
-                        env,
-                        fqns,
-                        sig_env,
-                        layouts,
-                        modes,
-                        &visibilities,
-                        interner,
-                        out,
-                        definers,
-                    );
-                }
-            }
+            // Any other body statement — an `if`/`case`/`begin`/loop/block
+            // — can still CARRY a `def` or `attr_*` (`walk_defs` descends).
+            // Their candidates emit in source order via `Emit::Conditional`;
+            // the uncertain definers they register ride along
+            // (rigor-rs#525 item 2, rigor-rs#535).
+            _ => conditionals.push((ast.get(child).span().0, child)),
         }
     }
     // Emit own methods AND descend into nested classes in ONE source-order
@@ -1572,6 +1606,7 @@ fn walk_namespace(
         Method(&'a MethodSig<'a>, Option<Visibility>),
         Uncertain(&'a str),
         Nested(NodeId),
+        Conditional(NodeId),
     }
     let mut items: Vec<(usize, Emit)> = Vec::new();
     for (sig, vis, span) in &sigs {
@@ -1584,6 +1619,9 @@ fn walk_namespace(
         if is_namespace_node(ast, child, &qualified, layouts) {
             items.push((ast.get(child).span().0, Emit::Nested(child)));
         }
+    }
+    for (span, child) in &conditionals {
+        items.push((*span, Emit::Conditional(*child)));
     }
     items.sort_by_key(|(span, _)| *span);
     for (_, item) in items {
@@ -1630,6 +1668,31 @@ fn walk_namespace(
                 out,
                 definers,
             ),
+            Emit::Conditional(child) => {
+                let (running_vis, running_mf) = running_toggles_at(ast, body, ast.get(child).span().0);
+                collect_conditional_definers(
+                    ast,
+                    child,
+                    &qualified,
+                    false,
+                    matches!(ast.get(id), Node::ModuleDef { .. }),
+                    path,
+                    include_private,
+                    index,
+                    typer,
+                    env,
+                    fqns,
+                    sig_env,
+                    layouts,
+                    modes,
+                    &visibilities,
+                    running_vis,
+                    running_mf,
+                    interner,
+                    out,
+                    definers,
+                );
+            }
         }
     }
 }
@@ -1659,77 +1722,78 @@ fn collect_conditional_definers(
     layouts: &MetaLayouts,
     modes: &HashMap<usize, module_function::Mode>,
     visibilities: &[(String, Visibility)],
+    running_vis: Visibility,
+    running_mf: bool,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
     definers: &mut Vec<Definer>,
 ) {
+    // A bare `private`/`public`/`protected`/`module_function` STATEMENT sets
+    // the running default for the rest of ITS statements list — so the
+    // per-child loops below pass the current pair and update it on a toggle
+    // (`private; if c; def y` and `if c; private; def y` both read it).
     macro_rules! descend {
+        ($child:expr, $vis:expr, $mf:expr, $sclass:expr, $module:expr) => {
+            collect_conditional_definers(
+                ast,
+                $child,
+                prefix,
+                $sclass,
+                $module,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                visibilities,
+                $vis,
+                $mf,
+                interner,
+                out,
+                definers,
+            )
+        };
+        ($child:expr, $vis:expr, $mf:expr) => {
+            descend!($child, $vis, $mf, in_singleton_class, in_module)
+        };
         ($child:expr) => {
-            collect_conditional_definers(
-                ast,
-                $child,
-                prefix,
-                in_singleton_class,
-                in_module,
-                path,
-                include_private,
-                index,
-                typer,
-                env,
-                fqns,
-                sig_env,
-                layouts,
-                modes,
-                visibilities,
-                interner,
-                out,
-                definers,
-            )
+            descend!($child, running_vis, running_mf)
         };
-        ($child:expr, sclass) => {
-            collect_conditional_definers(
-                ast,
-                $child,
-                prefix,
-                true,
-                in_module,
-                path,
-                include_private,
-                index,
-                typer,
-                env,
-                fqns,
-                sig_env,
-                layouts,
-                modes,
-                visibilities,
-                interner,
-                out,
-                definers,
-            )
-        };
-        ($child:expr, depth) => {
-            collect_conditional_definers(
-                ast,
-                $child,
-                prefix,
-                in_singleton_class,
-                in_module,
-                path,
-                include_private,
-                index,
-                typer,
-                env,
-                fqns,
-                sig_env,
-                layouts,
-                modes,
-                visibilities,
-                interner,
-                out,
-                definers,
-            )
-        };
+    }
+    // Iterate a statements list letting bare visibility toggles update the
+    // running pair for the statements that follow them.
+    macro_rules! descend_list {
+        ($body:expr) => {{
+            let mut vis = running_vis;
+            let mut mf = running_mf;
+            for &b in $body {
+                descend!(b, vis, mf);
+                if let Node::Call { receiver: None, method, args, .. } = ast.get(b) {
+                    if args.is_empty() {
+                        match method.as_str() {
+                            "private" => {
+                                vis = Visibility::Private;
+                                mf = false;
+                            }
+                            "protected" => {
+                                vis = Visibility::Protected;
+                                mf = false;
+                            }
+                            "public" => {
+                                vis = Visibility::Public;
+                                mf = false;
+                            }
+                            "module_function" => mf = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }};
     }
     match ast.get(id) {
         // A nested `class`/`module`/layout-carrying `Const =` inside a
@@ -1801,7 +1865,7 @@ fn collect_conditional_definers(
                             certain: true,
                         });
                     }
-                    _ => descend!(inner, sclass),
+                    _ => descend!(inner, Visibility::Public, false, true, in_module),
                 }
             }
         }
@@ -1811,47 +1875,26 @@ fn collect_conditional_definers(
             if let Some(n) = name.as_ref().or(singleton_name.as_ref()) {
                 let singleton = in_singleton_class || singleton_name.is_some();
                 let class_name = prefix.join("::");
-                // Candidates the reference emits even here (`walk_defs`
-                // collects every def); the definer is UNCERTAIN — only
-                // direct statements are `certain_definers` (rigor-rs#535).
                 if !class_name.is_empty() {
+                    // A named table entry wins (`private :y` re-marks); else
+                    // the body's RUNNING default at the conditional's
+                    // position — `private; if c; def y` is private on the
+                    // oracle, `module_function; if c; def u` is `self?.`
+                    // (rigor-rs#535 review).
                     let vis = if singleton {
                         None
                     } else {
-                        visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v)
+                        visibilities
+                            .iter()
+                            .find(|(m, _)| m == n)
+                            .map(|(_, v)| *v)
+                            .or(Some(running_vis))
                     };
-                    let sig = sig_of(
-                        n.as_str(), b, params, param_shape, *has_explicit_return, singleton, false, span.0,
+                    emit_conditional_def(
+                        ast, n.as_str(), b, params, param_shape, *has_explicit_return, span.0, singleton, vis,
+                        &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
+                        interner, out, definers,
                     );
-                    if let Some(c) = method_candidate(
-                        ast, &sig, vis, &class_name, path, include_private, index, typer, env, fqns, sig_env, interner,
-                    ) {
-                        out.push(c);
-                    }
-                }
-                if !class_name.is_empty() {
-                    definers.push(Definer {
-                        class_name: class_name.clone(),
-                        kind: if singleton { "singleton" } else { "instance" },
-                        method_name: n.clone(),
-                        offset: span.0,
-                        certain: false,
-                    });
-                }
-                if !class_name.is_empty()
-                    && !in_singleton_class
-                    && matches!(
-                        modes.get(&span.0),
-                        Some(module_function::Mode::On) | Some(module_function::Mode::Uncertain)
-                    )
-                {
-                    definers.push(Definer {
-                        class_name,
-                        kind: "singleton",
-                        method_name: n.clone(),
-                        offset: span.0,
-                        certain: false,
-                    });
                 }
             }
         }
@@ -1893,21 +1936,52 @@ fn collect_conditional_definers(
                     }
                 }
             }
-            for &b in args {
-                descend!(b);
+            // `private def y` inside a conditional: a `Definition` argument
+            // of a receiverless/self visibility modifier takes the modifier
+            // (`apply_visibility_argument`). Symbol re-marks are a contested
+            // slot on the oracle — not modelled.
+            let arg_vis = if receiver
+                .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                .unwrap_or(true)
+                && !args.is_empty()
+            {
+                match method.as_str() {
+                    "private" => Some(Visibility::Private),
+                    "protected" => Some(Visibility::Protected),
+                    "public" => Some(Visibility::Public),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            for &arg in args {
+                match (arg_vis, ast.get(arg)) {
+                    (
+                        Some(v),
+                        Node::Definition { name: Some(n), body: b, params, param_shape, has_explicit_return, span: dspan, .. },
+                    ) => {
+                        let singleton = in_singleton_class;
+                        let class_name = prefix.join("::");
+                        if !class_name.is_empty() {
+                            emit_conditional_def(
+                                ast, n.as_str(), b, params, param_shape, *has_explicit_return, dspan.0, singleton,
+                                if singleton { None } else { Some(v) },
+                                &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
+                                interner, out, definers,
+                            );
+                        }
+                    }
+                    _ => descend!(arg),
+                }
             }
-            // A literal block is a deferred scope — `def`s inside still
-            // define on the prefix, but a `def` at an empty prefix is not
-            // the reported top-level kind (`@block_depth`).
-            for &b in block_body {
-                descend!(b);
-            }
+            // A block body is a fresh statements list: it inherits the
+            // running state but a toggle inside it does not flow back out.
+            descend_list!(block_body);
         }
         Node::If { predicate, then_body, else_body, .. } => {
             descend!(*predicate);
-            for &b in then_body.iter().chain(else_body.iter()) {
-                descend!(b);
-            }
+            descend_list!(then_body);
+            descend_list!(else_body);
         }
         Node::Case { predicate, branches, else_body, .. } => {
             if let Some(p) = predicate {
@@ -1918,22 +1992,19 @@ fn collect_conditional_definers(
             }
         }
         Node::When { conditions, body, .. } => {
-            for &b in conditions.iter().chain(body.iter()) {
+            for &b in conditions {
                 descend!(b);
             }
+            descend_list!(body);
         }
         Node::Loop { predicate, body, .. } => {
             if let Some(p) = predicate {
                 descend!(*p);
             }
-            for &b in body {
-                descend!(b);
-            }
+            descend_list!(body);
         }
         Node::BeginRescue { body, .. } | Node::Statements { body, .. } => {
-            for &b in body {
-                descend!(b);
-            }
+            descend_list!(body);
         }
         // Expression-level containers carry the same children
         // (`rigor_each_child` descends everywhere): `_x = if c; attr_reader
@@ -1969,11 +2040,7 @@ fn collect_conditional_definers(
             descend!(*left);
             descend!(*right);
         }
-        Node::Lambda { body, .. } => {
-            for &b in body {
-                descend!(b);
-            }
-        }
+        Node::Lambda { body, .. } => descend_list!(body),
         Node::Return { values: body, .. } => {
             for &b in body {
                 descend!(b);
@@ -1996,6 +2063,91 @@ fn collect_conditional_definers(
         }
         _ => {}
     }
+}
+
+/// Emit one conditional-carried `def` as a candidate + uncertain definer —
+/// the shared tail of the `Definition` and `private`-call-arg arms of
+/// [`collect_conditional_definers`].
+#[allow(clippy::too_many_arguments)]
+fn emit_conditional_def(
+    ast: &LoweredAst,
+    name: &str,
+    body: &[NodeId],
+    params: &Option<Vec<String>>,
+    param_shape: &rigor_parse::ParamShape,
+    has_explicit_return: bool,
+    offset: usize,
+    singleton: bool,
+    vis: Option<Visibility>,
+    class_name: &str,
+    running_mf: bool,
+    path: &str,
+    include_private: bool,
+    index: &CoreIndex,
+    typer: &Typer,
+    env: &TypeEnv,
+    fqns: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
+    interner: &mut Interner,
+    out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
+) {
+    let sig = sig_of(name, body, params, param_shape, has_explicit_return, singleton, running_mf, offset);
+    if let Some(c) = method_candidate(
+        ast, &sig, vis, class_name, path, include_private, index, typer, env, fqns, sig_env, interner,
+    ) {
+        out.push(c);
+    }
+    definers.push(Definer {
+        class_name: class_name.to_string(),
+        kind: if singleton { "singleton" } else { "instance" },
+        method_name: name.to_string(),
+        offset,
+        certain: false,
+    });
+    if running_mf && !singleton {
+        definers.push(Definer {
+            class_name: class_name.to_string(),
+            kind: "singleton",
+            method_name: name.to_string(),
+            offset,
+            certain: false,
+        });
+    }
+}
+
+/// The `(running visibility, running module_function)` state at `offset`
+/// inside `body` — the bare `private`/`protected`/`public` toggles before it
+/// set the default a conditional `def` there reads, and a bare
+/// `module_function` marks it dual (`self?.`). `module_function` does not
+/// itself flip the visibility default the sig-gen table reads (that is the
+/// separate `module_function_visibilities` table's job).
+fn running_toggles_at(ast: &LoweredAst, body: &[NodeId], offset: usize) -> (Visibility, bool) {
+    let mut vis = Visibility::Public;
+    let mut mf = false;
+    for &child in body {
+        let Node::Call { receiver: None, method, args, span, .. } = ast.get(child) else { continue };
+        if span.0 >= offset || !args.is_empty() {
+            continue;
+        }
+        match method.as_str() {
+            "private" => {
+                vis = Visibility::Private;
+                mf = false;
+            }
+            "protected" => {
+                vis = Visibility::Protected;
+                mf = false;
+            }
+            "public" => {
+                vis = Visibility::Public;
+                mf = false;
+            }
+            "module_function" => mf = true,
+            _ => {}
+        }
+    }
+    (vis, mf)
 }
 
 /// Whether `id` opens a namespace [`walk_namespace`] descends into: a real
