@@ -1814,14 +1814,16 @@ fn non_emitted(
 /// every slot it defines — except the singleton-only survival, which a
 /// `def self?.u` downgrades to `def self.u`.
 fn live_definitions(out: &mut Vec<Candidate>, definers: &[Definer]) {
-    let mut table: HashMap<(String, &'static str, String), Vec<(usize, bool)>> = HashMap::new();
+    /// `(class_name, kind, method_name)` — the reference's definer-table key.
+    type Slot = (String, &'static str, String);
+    let mut table: HashMap<Slot, Vec<(usize, bool)>> = HashMap::new();
     for d in definers {
         table
             .entry((d.class_name.clone(), d.kind, d.method_name.clone()))
             .or_default()
             .push((d.offset, d.certain));
     }
-    let live_at = |slot: &(String, &'static str, String), offset: usize| -> bool {
+    let live_at = |slot: &Slot, offset: usize| -> bool {
         let Some(entries) = table.get(slot) else { return true };
         if entries.len() <= 1 {
             return true;
