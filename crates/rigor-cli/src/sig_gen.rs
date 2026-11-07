@@ -2842,6 +2842,13 @@ fn render_write_json(results: &[WriteResult]) {
             if let Some(e) = &r.error {
                 row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
             }
+            // `to_h`: `replaced` is present only when a member was rewritten
+            // (pre-#1076 payloads stay byte-identical without it).
+            if !r.replaced.is_empty() {
+                let replaced: Vec<_> =
+                    r.replaced.iter().map(|(c, _)| candidate_json(c)).collect();
+                row.as_object_mut().unwrap().insert("replaced".to_string(), json!(replaced));
+            }
             if !r.repaired.is_empty() {
                 row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
             }
