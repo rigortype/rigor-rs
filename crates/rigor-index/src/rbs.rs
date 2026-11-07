@@ -858,7 +858,7 @@ struct ClassEntry {
     /// merged class's declarations share one param arity: two different
     /// counts is `GenericParameterMismatchError` and the definition fails to
     /// build — rigor-rs#493 item 12, `class Hash` reopening `Hash[K, V]`.
-    decl_type_params: Vec<usize>, 
+    decl_type_params: Vec<usize>,
     /// `true` when this name was declared as a `module` (not a `class`) in RBS —
     /// the analogue of the reference's `Environment#rbs_module?`. Read ONLY by
     /// `call.raise-non-exception`'s instance path (a value typed as a module
@@ -5617,11 +5617,15 @@ impl Builder {
                 Node::Include(inc) => {
                     // Issue #168: the type ARGUMENTS are member references;
                     // the mixin's own name fails the definition build instead
-                    // of being stubbed (see `referenced_type_names`).
+                    // of being stubbed (see `referenced_type_names`). They
+                    // are also instance-def build inputs — `include G[Hash]`
+                    // under a bare `class Hash` fails the includer on the
+                    // reference (rigor-rs#493).
                     let mut names = Vec::new();
                     for arg in inc.args().iter() {
                         collect_type_node_names(&arg, ctx, &mut names);
                     }
+                    Self::record_instance_ref_names(entry, &names);
                     Self::record_ref_names(entry, names);
                     if let Some(modname) = type_name_str(&inc.name()) {
                         if !entry.includes.contains(&modname) {
@@ -5649,6 +5653,7 @@ impl Builder {
                     for arg in pre.args().iter() {
                         collect_type_node_names(&arg, ctx, &mut names);
                     }
+                    Self::record_instance_ref_names(entry, &names);
                     Self::record_ref_names(entry, names);
                     if let Some(modname) = type_name_str(&pre.name()) {
                         if !entry.prepends.contains(&modname) {
