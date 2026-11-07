@@ -995,6 +995,7 @@ fn generate_file_with_info(
                 );
             }
             collect_namespace_info(&ast, child, &[], &mut info);
+            collect_namespace_info_nested(&ast, child, &[], &mut info);
         }
     }
     for (name, _) in top_level {
@@ -1853,21 +1854,26 @@ fn collect_conditional_definers(
                     Node::Definition {
                         name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
                     } => {
-                        let sig = sig_of(
-                            n.as_str(), b, params, param_shape, *has_explicit_return, true, false, span.0,
-                        );
-                        if let Some(c) = method_candidate(
-                            ast, &sig, None, &prefix.join("::"), path, include_private, index, typer, env, fqns, sig_env, interner,
-                        ) {
-                            out.push(c);
+                        // The top level has no enclosing cref — a
+                        // `class << self` there defines on `main`'s
+                        // singleton, which the reference does not emit.
+                        if !prefix.is_empty() {
+                            let sig = sig_of(
+                                n.as_str(), b, params, param_shape, *has_explicit_return, true, false, span.0,
+                            );
+                            if let Some(c) = method_candidate(
+                                ast, &sig, None, &prefix.join("::"), path, include_private, index, typer, env, fqns, sig_env, interner,
+                            ) {
+                                out.push(c);
+                            }
+                            definers.push(Definer {
+                                class_name: prefix.join("::"),
+                                kind: "singleton",
+                                method_name: n.clone(),
+                                offset: span.0,
+                                certain: true,
+                            });
                         }
-                        definers.push(Definer {
-                            class_name: prefix.join("::"),
-                            kind: "singleton",
-                            method_name: n.clone(),
-                            offset: span.0,
-                            certain: true,
-                        });
                     }
                     _ => descend!(inner, Visibility::Public, false, true, in_module),
                 }
