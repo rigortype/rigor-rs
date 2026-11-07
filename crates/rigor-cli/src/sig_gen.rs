@@ -1593,7 +1593,11 @@ fn walk_namespace(
             // Their candidates emit in source order via `Emit::Conditional`;
             // the uncertain definers they register ride along
             // (rigor-rs#525 item 2, rigor-rs#535).
-            _ => conditionals.push((ast.get(child).span().0, child)),
+            _ => {
+                if !is_namespace_node(ast, child, &qualified, layouts) {
+                    conditionals.push((ast.get(child).span().0, child));
+                }
+            }
         }
     }
     // Emit own methods AND descend into nested classes in ONE source-order
