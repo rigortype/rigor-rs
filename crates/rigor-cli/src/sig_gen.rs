@@ -699,8 +699,15 @@ fn finalize_superclasses(
                 if !owners.iter().any(|(n, _)| *n == owner.0) {
                     owners.push(owner);
                 }
-                // Already demoted to `sig.skipped.unresolvable-superclass` —
-                // the JSON payload still lists the row.
+                // Demoted by an earlier fixpoint pass already; a class the
+                // SECOND pass (after the override demotion) first marks
+                // unresolvable is demoted here — the JSON payload lists the
+                // row either way.
+                // The reference demotes EVERY row of the class — an earlier
+                // `untyped-return` reason is replaced too.
+                if c.skip_reason != Some("sig.skipped.unresolvable-superclass") {
+                    c = demoted(c, "sig.skipped.unresolvable-superclass");
+                }
                 all_rows.push(c);
             }
             None if emittable(&c) => {
@@ -2125,15 +2132,18 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
 /// present ONLY on a `tighter_return` (the reference `.compact`s the nil).
 fn candidate_json(c: &Candidate) -> serde_json::Value {
     use serde_json::json;
-    let mut obj = json!({
-        "file": c.file,
-        "class": c.class_name,
-        "method": c.method_name,
-        "kind": c.kind,
-        "classification": c.classification,
-    });
-    // `to_h.compact`: a nil `rbs` / `inferred_return` (every skipped row)
-    // leaves the key out entirely.
+    // `MethodCandidate#to_h.compact`, in the reference's key order:
+    // `class` is nil for a top-level `def`, and a nil `rbs` /
+    // `inferred_return` (every skipped row) leaves the key out entirely.
+    let mut obj = json!({ "file": c.file });
+    if !c.class_name.is_empty() {
+        obj.as_object_mut().unwrap().insert("class".to_string(), json!(c.class_name));
+    }
+    obj.as_object_mut().unwrap().insert("method".to_string(), json!(c.method_name));
+    obj.as_object_mut().unwrap().insert("kind".to_string(), json!(c.kind));
+    obj.as_object_mut()
+        .unwrap()
+        .insert("classification".to_string(), json!(c.classification));
     if !c.rbs.is_empty() {
         obj.as_object_mut().unwrap().insert("rbs".to_string(), json!(c.rbs));
     }
