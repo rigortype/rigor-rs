@@ -1405,11 +1405,28 @@ fn walk_namespace(
                         }
                     }
                 }
+                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
+                // definer too (`rigor_each_child` descends arguments).
+                // `Definition` args are already handled above — descending
+                // them would double-count the wrapped def.
+                for &arg in args {
+                    if !matches!(ast.get(arg), Node::Definition { .. }) {
+                        collect_conditional_definers(
+                            ast,
+                            arg,
+                            &qualified,
+                            false,
+                            matches!(ast.get(id), Node::ModuleDef { .. }),
+                            layouts,
+                            modes,
+                            definers,
+                        );
+                    }
+                }
                 // `foo do; attr_reader :x; end` — the block's `def`/`attr`
                 // children are uncertain definers (`walk_attr_calls` descends
                 // call blocks too; a `refine`/`class_methods` block is a DSL
-                // scope and skipped). Args are already handled above —
-                // descending them would double-count the wrapped def.
+                // scope and skipped).
                 let dsl_scope = method == "class_methods"
                     || (method == "refine" && matches!(ast.get(id), Node::ModuleDef { .. }));
                 if !dsl_scope {
@@ -1746,6 +1763,16 @@ fn collect_conditional_definers(
         Node::Logical { left, right, .. } => {
             recurse(ast, *left, prefix, in_singleton_class, in_module, definers);
             recurse(ast, *right, prefix, in_singleton_class, in_module, definers);
+        }
+        Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::InterpolatedString { parts, .. } => {
+            for &b in parts {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
         }
         _ => {}
     }
