@@ -1074,9 +1074,10 @@ fn append_new_class_compact_header_and_leading_blank() {
 }
 
 #[test]
-fn append_new_class_qualified_name_stays_compact() {
-    // A class not in the file with a qualified name uses `class A::B`, NOT
-    // nested modules.
+fn append_new_class_qualified_name_nests_the_missing_chain() {
+    // Reference `insert_namespace_chain`: with no declared ancestor the
+    // whole chain renders NESTED, not as a flat `class A::B` header
+    // (rigor-rs#493 item 11).
     let src = "class Foo\nend\n".to_string();
     let out = apply_merge(
         src,
@@ -1084,7 +1085,37 @@ fn append_new_class_qualified_name_stays_compact() {
         &HashMap::new(),
         false,
     );
-    assert_eq!(out.source, "class Foo\nend\n\nclass A::B\n  def m: () -> 1\nend\n");
+    assert_eq!(
+        out.source,
+        "class Foo\nend\n\nmodule A\n  class B\n    def m: () -> 1\n  end\nend\n"
+    );
+}
+
+#[test]
+fn insert_into_existing_ancestor_nests_the_leaf() {
+    // `module A` already declared: `A::Base`/`A::Sub2` merge INSIDE it, at
+    // member depth (rigor-rs#493 item 11 — the reported FP).
+    let src = "module A\nend\n".to_string();
+    let mut supers = HashMap::new();
+    supers.insert("A::Sub2".to_string(), "::A::Base".to_string());
+    let mut kinds: HashMap<String, &'static str> = HashMap::new();
+    kinds.insert("A".to_string(), "module");
+    kinds.insert("A::Sub2".to_string(), "class");
+    let out = apply_merge_with(
+        src,
+        vec![
+            mc("A::Base", "b", "instance", "def b: () -> 1"),
+            mc("A::Sub2", "m", "instance", "def m: () -> 1"),
+        ],
+        &kinds,
+        &supers,
+        &HashMap::new(),
+        false,
+    );
+    assert_eq!(
+        out.source,
+        "module A\n  class Base\n    def b: () -> 1\n  end\n  class Sub2 < ::A::Base\n    def m: () -> 1\n  end\nend\n"
+    );
 }
 
 #[test]
@@ -1162,6 +1193,7 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
         "class Array\n  def old: () -> Integer\nend\n".to_string(),
         vec![mc("Array", "second_elem", "instance", "def second_elem: () -> 1")],
         &HashMap::new(),
+        &HashMap::new(),
         &params,
         false,
     );
@@ -1171,6 +1203,7 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
     let out = apply_merge_with(
         "class Array\n  def old: () -> E\nend\n".to_string(),
         Vec::new(),
+        &HashMap::new(),
         &HashMap::new(),
         &params,
         false,
@@ -1263,7 +1296,7 @@ fn bare_core_reopening_reads_every_method_as_new() {
     let src = "# c\nclass Hash\n  def hfoo: () -> 1\nend\n".to_string();
     let mut params = HashMap::new();
     params.insert("Hash".to_string(), "[unchecked out K, unchecked out V]".to_string());
-    let out = apply_merge_with(src, cs, &HashMap::new(), &params, false);
+    let out = apply_merge_with(src, cs, &HashMap::new(), &HashMap::new(), &params, false);
     assert_eq!(out.skipped.len(), 1);
     assert_eq!(out.skipped[0].candidate.method_name, "hfoo");
     assert_eq!(out.repaired, vec!["Hash[unchecked out K, unchecked out V]".to_string()]);

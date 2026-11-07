@@ -2292,6 +2292,7 @@ fn cmd_write(
                 target_str,
                 group,
                 &shells,
+                &merged.kinds,
                 &merged.supers,
                 &merged.params,
                 overwrite,
@@ -2776,6 +2777,7 @@ fn update_existing(
     target_str: String,
     candidates: Vec<Candidate>,
     shells: &[String],
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
@@ -2820,7 +2822,7 @@ fn update_existing(
     // for a `Data.define` return — a documented follow-up, not a regression.
     let _ = shells;
     let MergeOutcome { source: merged, action, applied, skipped, repaired } =
-        apply_merge_with(source, candidates, supers, params, overwrite);
+        apply_merge_with(source, candidates, kinds, supers, params, overwrite);
     if action == "updated" {
         let _ = std::fs::write(target, &merged);
     }
@@ -2858,7 +2860,7 @@ fn apply_merge(
     supers: &HashMap<String, String>,
     overwrite: bool,
 ) -> MergeOutcome {
-    apply_merge_with(source, candidates, supers, &HashMap::new(), overwrite)
+    apply_merge_with(source, candidates, &HashMap::new(), supers, &HashMap::new(), overwrite)
 }
 
 /// [`apply_merge`] with the run's generic header spellings (`params`): new
@@ -2867,6 +2869,7 @@ fn apply_merge(
 fn apply_merge_with(
     mut source: String,
     candidates: Vec<Candidate>,
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
@@ -2885,7 +2888,7 @@ fn apply_merge_with(
     let mut applied: Vec<Candidate> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
-        merge_class(&mut source, &class_name, group, supers, params, overwrite, &mut applied, &mut skipped);
+        merge_class(&mut source, &class_name, group, kinds, supers, params, overwrite, &mut applied, &mut skipped);
     }
     let repaired = repair_generic_headers(&mut source, params);
     // `state_changed?`: a repaired header is a change too.
@@ -3021,6 +3024,7 @@ fn merge_class(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
@@ -3034,14 +3038,7 @@ fn merge_class(
     };
     match found {
         Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
-        None => append_new_class(
-            source,
-            class_name,
-            candidates,
-            supers.get(class_name),
-            params.get(class_name).map_or("", String::as_str),
-            applied,
-        ),
+        None => insert_namespace_chain(source, class_name, candidates, kinds, supers, params, applied),
     }
 }
 
@@ -3290,30 +3287,113 @@ fn is_word_byte(b: u8) -> bool {
 }
 
 /// Append a NEW class block for a class not declared in the file (reference
-/// `append_new_class`): a COMPACT qualified header + `< Super` when known, body
-/// lines at 2-space indent, ONE leading blank line, and a trailing-newline
-/// repair on the original file first. All methods are applied.
-fn append_new_class(
+fn line_start_index(source: &str, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    source[..pos].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Reference `blank_range?`: only spaces/tabs between `from` and `to`.
+fn blank_range(source: &str, from: usize, to: usize) -> bool {
+    source[from..to].chars().all(|c| c == ' ' || c == '\t')
+}
+
+/// Reference `insert_namespace_chain` + `render_chain_snippet`: the part of
+/// `class_name`'s chain the file does not yet declare is rendered as a NESTED
+/// block inside the deepest declared ancestor — `class Sub2 < ::A::Base`
+/// lands inside the existing `module A`, never as a flat top-level
+/// `class A::Sub2` (rigor-rs#493 item 11). With no ancestor the whole chain
+/// appends top-level, still nested.
+#[allow(clippy::too_many_arguments)]
+fn insert_namespace_chain(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
-    superclass: Option<&String>,
-    params: &str,
+    kinds: &HashMap<String, &'static str>,
+    supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     applied: &mut Vec<Candidate>,
 ) {
-    let body = candidates
-        .iter()
-        .map(|c| format!("{INDENT}{}", c.rbs))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let header = match superclass {
-        Some(s) => format!("class {class_name}{params} < {}", superclasses::absolute(s)),
-        None => format!("class {class_name}{params}"),
-    };
-    if !source.ends_with('\n') {
-        source.push('\n');
+    let segments: Vec<&str> = class_name.split("::").collect();
+    // `split_at_existing_ancestor`: the longest leading run the file declares.
+    let mut split = 0usize;
+    let mut anchor: Option<ClassDeclInfo> = None;
+    for i in (1..segments.len()).rev() {
+        let prefix = segments[..i].join("::");
+        let Ok(sig) = ruby_rbs::node::parse(source) else { break };
+        if let Some(info) = find_and_extract(source, sig.declarations().iter(), &[], &prefix) {
+            split = i;
+            anchor = Some(info);
+            break;
+        }
     }
-    source.push_str(&format!("\n{header}\n{body}\nend\n"));
+    let missing = &segments[split.min(segments.len() - 1)..];
+    if missing.is_empty() {
+        return;
+    }
+    // `member_indent_depth`: a member sits one level below the decl's keyword
+    // column — the `end` token's column stands in (canonical RBS keeps them
+    // at the same indent).
+    let depth = anchor.as_ref().map_or(0, |a| {
+        (a.end_start - line_start_index(source, a.end_start)) / INDENT.len() + 1
+    });
+    let mut snippet = String::new();
+    for (j, seg) in missing.iter().enumerate() {
+        let qualified = [segments[..split].join("::"), missing[..=j].join("::")]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("::");
+        let is_leaf = j == missing.len() - 1;
+        // `node_keyword`: kinds first, `class` for a method-bearing leaf,
+        // `module` for an intermediate segment.
+        let keyword = kinds
+            .get(&qualified)
+            .copied()
+            .unwrap_or(if is_leaf { "class" } else { "module" });
+        snippet.push_str(&format!("{}{} {}", INDENT.repeat(depth + j), keyword, seg));
+        if let Some(p) = params.get(&qualified) {
+            snippet.push_str(p);
+        }
+        if keyword == "class" {
+            if let Some(spr) = supers.get(&qualified) {
+                snippet.push_str(&format!(" < {}", superclasses::absolute(spr)));
+            }
+        }
+        snippet.push('\n');
+    }
+    let member_indent = INDENT.repeat(depth + missing.len());
+    for c in &candidates {
+        snippet.push_str(&format!("{member_indent}{}\n", c.rbs));
+    }
+    for j in (0..missing.len()).rev() {
+        snippet.push_str(&format!("{}end\n", INDENT.repeat(depth + j)));
+    }
+    match anchor {
+        Some(a) => {
+            // `insert_before_end`: an `end` starting its own line takes the
+            // snippet at the line's start; otherwise before the token.
+            let line_start = line_start_index(source, a.end_start);
+            if blank_range(source, line_start, a.end_start) {
+                source.insert_str(line_start, &snippet);
+            } else {
+                source.insert_str(a.end_start, &format!("\n{snippet}"));
+            }
+        }
+        None => {
+            // `append_top_level`: separated by exactly one blank line.
+            if !source.is_empty() {
+                if !source.ends_with('\n') {
+                    source.push('\n');
+                }
+                if !source.ends_with("\n\n") {
+                    source.push('\n');
+                }
+            }
+            source.push_str(&snippet);
+        }
+    }
     applied.extend(candidates);
 }
 
