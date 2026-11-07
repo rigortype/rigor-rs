@@ -18,7 +18,7 @@ fn coll_snaps(src: &[u8]) -> (LoweredAst, HashMap<NodeId, &'static str>) {
 /// re-run's joined carrier (rigor-rs#493).
 fn snap_carrier_is_union(src: &[u8], method: &str) -> bool {
     let ast = lower(&parse(src));
-    let (mut i, snaps) = {
+    let (i, snaps) = {
         let index = CoreIndex::new();
         let source = SourceIndex::build(&ast, &index);
         let scopes = lexical_scopes(&ast);
