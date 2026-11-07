@@ -1769,10 +1769,26 @@ fn collect_conditional_definers(
                 recurse(ast, b, prefix, in_singleton_class, in_module, definers);
             }
         }
-        Node::InterpolatedString { parts, .. } => {
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
             for &b in parts {
                 recurse(ast, b, prefix, in_singleton_class, in_module, definers);
             }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &b in elements {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Range { left, right, .. } => {
+            for bound in [left, right].into_iter().flatten() {
+                recurse(ast, *bound, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::AttrWrite { receiver, value, .. } => {
+            if let Some(r) = receiver {
+                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+            }
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
         }
         _ => {}
     }
