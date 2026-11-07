@@ -56,8 +56,28 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeEnv {
         let mut env = env.clone();
-        self.replay_statements(ast, &mut env, stmts, interner);
+        let mut returns = Vec::new();
+        self.replay_statements(ast, &mut env, stmts, interner, &mut returns);
         env
+    }
+
+    /// [`bind_statements_into`] plus the type of every `return`'s value at
+    /// ITS position in the replay — `(value node, type)` pairs keyed by node
+    /// id, so `a = :initial; if c; return a; end; a = 100; a` reads
+    /// `(100 | :initial)` not the final-env `100` (rigor-rs#546 review).
+    /// Returns under `def` / block bodies are never reached by the replay, so
+    /// every recorded return is a real return-site of the body.
+    pub fn bind_statements_into_with_returns(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        stmts: &[NodeId],
+        interner: &mut Interner,
+    ) -> (TypeEnv, Vec<(NodeId, TypeId)>) {
+        let mut env = env.clone();
+        let mut returns = Vec::new();
+        self.replay_statements(ast, &mut env, stmts, interner, &mut returns);
+        (env, returns)
     }
 
     /// The straight-line statement replay behind [`bind_statements_into`]:
@@ -68,18 +88,33 @@ impl<'i> Typer<'i> {
     /// name was unbound at entry, since the arm may not run. `begin`/`rescue`,
     /// op-writes and block bodies are left to `bind_statement` (decline), a
     /// coverage loss vs the reference's flow env, never a wrong type.
-    fn replay_statements(&self, ast: &LoweredAst, env: &mut TypeEnv, stmts: &[NodeId], interner: &mut Interner) {
+    fn replay_statements(
+        &self,
+        ast: &LoweredAst,
+        env: &mut TypeEnv,
+        stmts: &[NodeId],
+        interner: &mut Interner,
+        returns: &mut Vec<(NodeId, TypeId)>,
+    ) {
         for &stmt in stmts {
+            // `return e` mid-body: its value types at the position it runs,
+            // not against the body's final env.
+            if let Node::Return { values, .. } = ast.get(stmt) {
+                if let [v] = values.as_slice() {
+                    let ty = self.type_of(ast, *v, env, interner);
+                    returns.push((*v, ty));
+                }
+            }
             match ast.get(stmt) {
                 Node::If { then_body, else_body, .. } => {
                     // An empty `else` IS an arm that leaves every name at its
                     // entry binding — `if c; a = 1; end` joins `a` with `nil`.
-                    self.join_arm_writes(ast, env, &[then_body, else_body], interner);
+                    self.join_arm_writes(ast, env, &[then_body, else_body], interner, returns);
                 }
                 Node::Logical { right, .. } => {
                     // `c && a = 1` / `c || a = 1`: the right side runs only
                     // when the left's truthiness reaches it — a one-arm join.
-                    self.join_arm_writes(ast, env, &[std::slice::from_ref(right), &[]], interner);
+                    self.join_arm_writes(ast, env, &[std::slice::from_ref(right), &[]], interner, returns);
                 }
                 // `begin`+`rescue`: the protected body and each clause are
                 // alternative paths — `begin; a = 1; rescue; a = 2; end; a`
@@ -87,17 +122,21 @@ impl<'i> Typer<'i> {
                 // widens to `nil`. With no rescue clause the main body is the
                 // only path (straight-line; the `else`/`in` carriers lower
                 // their statements into `main_body`/`body` alike).
-                Node::BeginRescue { main_body, body, clauses, .. } => {
+                Node::BeginRescue { main_body, body, clauses, ensure_body, .. } => {
                     if clauses.is_empty() {
-                        self.replay_statements(ast, env, body, interner);
+                        self.replay_statements(ast, env, body, interner, returns);
                     } else {
                         let mut arms: Vec<Vec<NodeId>> = vec![main_body.clone()];
                         arms.extend(clauses.iter().map(|c| c.body.clone()));
                         let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
-                        self.join_arm_writes(ast, env, &arm_refs, interner);
+                        self.join_arm_writes(ast, env, &arm_refs, interner, returns);
                     }
+                    // `ensure` always runs — its writes apply after the join
+                    // (`begin; a = 1; rescue; a = 2; ensure; a = 3; end` → 3).
+                    self.replay_statements(ast, env, ensure_body, interner, returns);
                 }
                 Node::Case { branches, else_body, .. } => {
+                    // (see join_arm_writes)
                     // Each `When` node's body is one arm; a missing `else`
                     // reads as a no-op arm via `entry` inside the join.
                     let mut arms: Vec<Vec<NodeId>> = branches
@@ -109,14 +148,41 @@ impl<'i> Typer<'i> {
                         .collect();
                     arms.push(else_body.clone());
                     let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
-                    self.join_arm_writes(ast, env, &arm_refs, interner);
+                    self.join_arm_writes(ast, env, &arm_refs, interner, returns);
                 }
                 Node::Loop { body, .. } => {
                     // The body runs zero or more times: the empty arm is the
                     // zero-iteration path (entry env).
-                    self.join_arm_writes(ast, env, &[body, &[]], interner);
+                    self.join_arm_writes(ast, env, &[body, &[]], interner, returns);
                 }
-                Node::Statements { body, .. } => self.replay_statements(ast, env, body, interner),
+                Node::Statements { body, .. } => {
+                    self.replay_statements(ast, env, body, interner, returns);
+                }
+                // A `x op= v` write's stored type is the dispatch result
+                // (`a + v` for `+=`, `narrow_truthy(a) | v` for `||=`) —
+                // the lowered node does not keep the operator. Widening the
+                // local to `untyped` declines the method (the tail then
+                // reads `Dynamic`) rather than emit the stale pre-write type
+                // — `a = nil; a ||= "default"; a` must not emit `-> nil`.
+                Node::LocalVariableOpWrite { name, .. } => {
+                    env.insert(name.clone(), interner.untyped());
+                }
+                Node::Call { block_body, .. } if !block_body.is_empty() => {
+                    // A block may run and rebind a captured local — its
+                    // writes are not modelled (block params are unbindable
+                    // here), so every name the block could rebind widens to
+                    // `untyped`. Without this `a = :s; loop do; a = 1; break;
+                    // end; a` kept `:s` (review).
+                    self.bind_statement(ast, stmt, env, interner);
+                    let mut block_env = env.clone();
+                    self.replay_statements(ast, &mut block_env, block_body, interner, returns);
+                    let untyped = interner.untyped();
+                    for (name, ty) in block_env.iter() {
+                        if env.get(name) != Some(ty) {
+                            env.insert(name.clone(), untyped);
+                        }
+                    }
+                }
                 _ => self.bind_statement(ast, stmt, env, interner),
             }
         }
@@ -132,6 +198,7 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         arms: &[&[NodeId]],
         interner: &mut Interner,
+        returns: &mut Vec<(NodeId, TypeId)>,
     ) {
         let entry = env.clone();
         let nil = interner.nil();
@@ -139,7 +206,7 @@ impl<'i> Typer<'i> {
         let mut arm_envs: Vec<TypeEnv> = Vec::new();
         for arm in arms {
             let mut e = entry.clone();
-            self.replay_statements(ast, &mut e, arm, interner);
+            self.replay_statements(ast, &mut e, arm, interner, returns);
             arm_envs.push(e);
         }
         // An EMPTY arm contributes the entry env unchanged (the `else_body`
