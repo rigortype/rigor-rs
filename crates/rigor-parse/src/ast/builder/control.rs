@@ -489,14 +489,25 @@ impl<'src> Builder<'src> {
                     .reference()
                     .map(|reference| rescue_reference_index_writes(&reference))
                     .unwrap_or_default();
+                // Prism's RescueNode location runs INTO the following
+                // clause's `rescue` keyword — a `retry` inside the next
+                // arm would otherwise count for this one (`clause_retries`)
+                // and the retry-edge widening would cover the sibling's
+                // own writes (rigor-rs#468 review). Truncate at the
+                // subsequent clause's start.
+                let subsequent = r.subsequent();
+                let clause_end = subsequent
+                    .as_ref()
+                    .map(|s| s.location().start_offset())
+                    .unwrap_or_else(|| r.location().end_offset());
                 clauses.push(RescueClause {
                     exceptions,
                     body: clause_body,
                     bound_name,
                     index_writes,
-                    span: span_of(&r.location()),
+                    span: (r.location().start_offset(), clause_end),
                 });
-                rescue = r.subsequent();
+                rescue = subsequent;
             }
             if let Some(e) = begin_node.else_clause().and_then(|e| e.statements()) {
                 body.extend(self.lower_body(&e.body()));
