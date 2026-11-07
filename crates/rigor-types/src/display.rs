@@ -372,10 +372,11 @@ const OPERATOR_SYMNAMES: &[&str] = &[
 ];
 
 /// One character that may appear inside a Ruby identifier (`is_identchar`).
-/// Byte-level like the C check: on the pinned toolchain a non-ASCII byte
-/// never counts, which is why `:"café"` inspects quoted.
+/// On the PINNED Ruby (4.x) the check is encoding-aware: non-ASCII
+/// alphanumeric characters count too — `:café` and `:é` inspect BARE
+/// (rigor-rs#493 item 3).
 fn identchar(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_'
+    c.is_ascii_alphanumeric() || c == '_' || (c.is_alphanumeric() && !c.is_ascii())
 }
 
 /// `is_global_name_punct`'s byte set (parse.y `SPECIAL_PUNCT`): the
@@ -410,7 +411,12 @@ fn special_global_tail(tail: &str) -> bool {
 /// (`:"$foo?"`, `:"@x="` quote).
 fn ident_tail(name: &str, allow_sigil: bool) -> bool {
     let mut chars = name.chars();
-    if !chars.next().is_some_and(|c| c == '_' || c.is_ascii_alphabetic()) {
+    // First char: `_`, an ASCII letter, or — encoding-aware on the pinned
+    // Ruby — a non-ASCII alphabetic (`:é` inspects bare).
+    if !chars
+        .next()
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic() || (c.is_alphabetic() && !c.is_ascii()))
+    {
         return false;
     }
     if chars.all(identchar) {
@@ -446,12 +452,13 @@ fn bare_symname(name: &str) -> bool {
 }
 
 /// Ruby's double-quoted `inspect` escaping for a symbol name or string body —
-/// the `rb_str_inspect` ASCII forms (`\"`, `\\`, `\n`, `\t`, `\r`, `\0`, `\a`,
-/// `\b`, `\f`, `\v`, `\e`, `\xNN` for other control bytes and DEL) plus the
-/// interpolation-guard `\#` before `{`/`@`/`$`. A byte-exact match of Ruby's
-/// full Unicode escaping is out of scope (same documented bound as
-/// `rigor-parse`'s `ruby_inspect_string`): non-ASCII printable characters are
-/// emitted raw.
+/// on the PINNED Ruby (4.x), `rb_str_inspect` spells `"`, `\`, the named
+/// escapes `\n` `\t` `\r` `\a` `\b` `\f` `\v` `\e`, and every OTHER
+/// non-printable as `\uNNNN` (uppercase hex — `\u0000`, `\u007F`, `\u0085`,
+/// `\u2028`), never `\xNN` or `\0`; above U+FFFF it spells `\u{XXXXX}`.
+/// Plus the interpolation-guard `\#` before `{`/`@`/`$`. Non-ASCII PRINTABLE
+/// characters are emitted raw (`"é"`), matching the same documented bound as
+/// `rigor-parse`'s `ruby_inspect_string`.
 fn ruby_inspect_dq(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -463,7 +470,6 @@ fn ruby_inspect_dq(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
             '\x07' => out.push_str("\\a"),
             '\x08' => out.push_str("\\b"),
             '\x0c' => out.push_str("\\f"),
@@ -475,14 +481,46 @@ fn ruby_inspect_dq(s: &str) -> String {
                 }
                 out.push('#');
             }
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                out.push_str(&format!("\\x{:02X}", c as u32));
+            c if !ruby_printable(c) => {
+                let cp = c as u32;
+                if cp <= 0xFFFF {
+                    out.push_str(&format!("\\u{cp:04X}"));
+                } else {
+                    out.push_str(&format!("\\u{{{cp:X}}}"));
+                }
             }
             c => out.push(c),
         }
     }
     out.push('"');
     out
+}
+
+/// The `rb_enc_isprint` half of `inspect` escaping, over the scalar set the
+/// harvesters actually reach: ASCII prints raw except the escapes above; C1
+/// controls (U+0080–U+009F) and the Cf/format + line/paragraph separators the
+/// reference's fixture corpora exercise (`\u0085`, `\u200E`, `\u2028`,
+/// `\u2029`, `\uFEFF`) escape; supplementary non-printables escape `\u{…}`.
+/// Every other non-ASCII char is treated as printable — the raw-emission bound
+/// the doc above already takes.
+fn ruby_printable(c: char) -> bool {
+    let cp = c as u32;
+    if (0x20..0x7f).contains(&cp) {
+        return true;
+    }
+    if cp < 0x20 || cp == 0x7f {
+        return false;
+    }
+    // C1 controls and the common non-printables above.
+    !((0x80..=0x9f).contains(&cp)
+        || (0x200e..=0x200f).contains(&cp)
+        || (0x2028..=0x2029).contains(&cp)
+        || (0x202a..=0x202e).contains(&cp)
+        || (0x2066..=0x2069).contains(&cp)
+        || cp == 0xfeff
+        || (0xd800..=0xdfff).contains(&cp)
+        || (0xfff9..=0xfffb).contains(&cp)
+        || (0x10fffe..=0x10ffff).contains(&cp))
 }
 
 /// Ruby `Float#inspect` always shows a decimal point (`3.0.inspect == "3.0"`),
@@ -1213,6 +1251,21 @@ mod tests {
             max: Some(10),
         });
         assert_eq!(describe(&i, r), "(1..10)");
+    }
+
+    #[test]
+    fn literal_inspect_matches_pinned_ruby4() {
+        // rigor-rs#493 item 3: on the pinned toolchain `inspect` spells
+        // `\uNNNN` for unnamed non-printables (never `\0`/`\xNN`) and lets
+        // a non-ASCII identifier symbol inspect bare.
+        assert_eq!(ruby_inspect_dq("\u{0}"), "\"\\u0000\"");
+        assert_eq!(ruby_inspect_dq("\u{7f}"), "\"\\u007F\"");
+        assert_eq!(ruby_inspect_dq("\u{85}"), "\"\\u0085\"");
+        assert_eq!(ruby_inspect_dq("\u{2028}"), "\"\\u2028\"");
+        assert_eq!(ruby_inspect_dq("a\nb\tc"), "\"a\\nb\\tc\"");
+        assert_eq!(symbol_inspect("é"), ":é");
+        assert_eq!(symbol_inspect("café"), ":café");
+        assert_eq!(symbol_inspect("a b"), ":\"a b\"");
     }
 
     #[test]
