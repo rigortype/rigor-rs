@@ -879,9 +879,11 @@ fn merge_inserts_new_method_flat_before_end() {
 }
 
 #[test]
-fn merge_inserts_new_method_nested_reproduces_indent_quirk() {
-    // The token-start splice + fixed 2-space indent: the inserted line renders
-    // 4-space and the inner `end` drops to column 0 (oracle-verified).
+fn merge_inserts_new_method_nested_at_member_depth() {
+    // `insert_into_class` at `member_indent_depth`: the inserted line renders
+    // one level below the inner decl and its `end` keeps its own line
+    // (oracle-verified; an earlier token-start splice stranded `end` at
+    // column 0, rigor-rs#493 item 11 review).
     let src = "module Outer\n  class Inner\n    def existing: () -> String\n  end\nend\n"
         .to_string();
     let out = apply_merge(
@@ -892,7 +894,7 @@ fn merge_inserts_new_method_nested_reproduces_indent_quirk() {
     );
     assert_eq!(
         out.source,
-        "module Outer\n  class Inner\n    def existing: () -> String\n    def newm: () -> 5\nend\nend\n"
+        "module Outer\n  class Inner\n    def existing: () -> String\n    def newm: () -> 5\n  end\nend\n"
     );
 }
 

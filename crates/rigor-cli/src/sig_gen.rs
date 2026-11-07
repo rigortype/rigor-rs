@@ -3188,18 +3188,27 @@ fn merge_into_existing(
         }
     }
 
-    // Splice NEW members before the class's closing `end` token (fixed 2-space
-    // indent, one `"  {rbs}\n"` per method, concatenated — reference
-    // `insert_into_class`). The token-start splice + fixed indent reproduces the
-    // oracle's nested-case bytes with no special-casing. This runs BEFORE any
-    // replacement: it inserts at `end_start`, after every existing member, so the
-    // captured member spans (all below `end_start`) stay valid (reference order:
+    // Splice NEW members before the class's closing `end` — reference
+    // `insert_into_class` at `member_indent_depth(decl)` (one level below the
+    // `end` token's own column), inserted at the `end` LINE's start when it
+    // carries only whitespace (`insert_before_end`): a nested decl's `end`
+    // sits at col >0, and splicing at the token would eat its indent and
+    // leave `end` at column 0. This runs BEFORE any replacement: it inserts
+    // at `end_start`, after every existing member, so the captured member
+    // spans (all below `end_start`) stay valid (reference order:
     // `insert_into_class` then `replace_eligible_conflicts`).
     if !new_methods.is_empty() {
-        let addition: String =
-            new_methods.iter().map(|c| format!("{INDENT}{}\n", c.rbs)).collect();
         let at = info.end_start.min(source.len());
-        source.insert_str(at, &addition);
+        let depth = (at - line_start_index(source, at)) / INDENT.len() + 1;
+        let member_indent = INDENT.repeat(depth);
+        let addition: String =
+            new_methods.iter().map(|c| format!("{member_indent}{}\n", c.rbs)).collect();
+        let line_start = line_start_index(source, at);
+        if blank_range(source, line_start, at) {
+            source.insert_str(line_start, &addition);
+        } else {
+            source.insert_str(at, &format!("\n{addition}"));
+        }
         applied.extend(new_methods);
     }
 
@@ -3286,7 +3295,6 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Append a NEW class block for a class not declared in the file (reference
 fn line_start_index(source: &str, pos: usize) -> usize {
     if pos == 0 {
         return 0;
