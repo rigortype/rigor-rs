@@ -539,6 +539,20 @@ fn module_function_dup_slots_last_definer_wins() {
 }
 
 #[test]
+fn module_function_def_survives_private_visibility() {
+    // rigor-rs#493 item 10 (reference `visibility_excludes?` returns false for
+    // a @module_function_methods def): `private` marks `h` private in the
+    // visibility table, but the re-armed module_function still writes its
+    // `self?.h` row.
+    let src = "module T\n  module_function\n  private\n  def g = 1\n  module_function\n  def h = 2\nend\n";
+    let cs = candidates_tagged("mfvis", src, false);
+    assert_eq!(
+        cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self?.h: () -> 2"]
+    );
+}
+
+#[test]
 fn module_function_with_args_does_not_flip_mode() {
     // `module_function :sym` (args form) neither flips the mode nor marks the
     // method (oracle-probed) — both defs stay plain instance methods.
