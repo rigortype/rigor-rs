@@ -2000,6 +2000,14 @@ fn method_candidate(
     // erased union).
     let Some(returns) = collect_explicit_returns(ast, sig) else { return row(None) };
 
+    // A def-LOCAL env (rigor-rs#546): the body's straight-line writes replayed
+    // on top of the file env, so a tail/return read of a method-local sees its
+    // binding (the reference types the body's env). Statements the binder
+    // declines leave the env alone — a coverage loss, never a wrong type.
+    let local =
+        typer.bind_statements_into(ast, env, &sig.body[..sig.body.len().saturating_sub(1)], interner);
+    let env = &local;
+
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).

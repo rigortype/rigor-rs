@@ -44,6 +44,135 @@ impl<'i> Typer<'i> {
         env
     }
 
+    /// A def-local env for `sig-gen` return typing (rigor-rs#546): the
+    /// straight-line binder replayed over `stmts` on top of `env` — the
+    /// method-body analogue of [`Self::build_toplevel_env`], so
+    /// `def z; a = 1; a; end` reads `a : Constant[1]`.
+    pub fn bind_statements_into(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        stmts: &[NodeId],
+        interner: &mut Interner,
+    ) -> TypeEnv {
+        let mut env = env.clone();
+        self.replay_statements(ast, &mut env, stmts, interner);
+        env
+    }
+
+    /// The straight-line statement replay behind [`bind_statements_into`]:
+    /// `bind_statement` per statement, plus shallow branch JOINS for the
+    /// conditional bodies sig-gen return typing reads (`if c; a = 1; end; a`
+    /// → `(1 | nil)`, `while c; a = "s"; end` after `a = 1` → `("s" | 1)`).
+    /// An arm's binding joins with the name's ENTRY type — `nil` when the
+    /// name was unbound at entry, since the arm may not run. `begin`/`rescue`,
+    /// op-writes and block bodies are left to `bind_statement` (decline), a
+    /// coverage loss vs the reference's flow env, never a wrong type.
+    fn replay_statements(&self, ast: &LoweredAst, env: &mut TypeEnv, stmts: &[NodeId], interner: &mut Interner) {
+        for &stmt in stmts {
+            match ast.get(stmt) {
+                Node::If { then_body, else_body, .. } => {
+                    // An empty `else` IS an arm that leaves every name at its
+                    // entry binding — `if c; a = 1; end` joins `a` with `nil`.
+                    self.join_arm_writes(ast, env, &[then_body, else_body], interner);
+                }
+                Node::Logical { right, .. } => {
+                    // `c && a = 1` / `c || a = 1`: the right side runs only
+                    // when the left's truthiness reaches it — a one-arm join.
+                    self.join_arm_writes(ast, env, &[std::slice::from_ref(right), &[]], interner);
+                }
+                // `begin`+`rescue`: the protected body and each clause are
+                // alternative paths — `begin; a = 1; rescue; a = 2; end; a`
+                // joins `(1 | 2)`, and a name only the protected body binds
+                // widens to `nil`. With no rescue clause the main body is the
+                // only path (straight-line; the `else`/`in` carriers lower
+                // their statements into `main_body`/`body` alike).
+                Node::BeginRescue { main_body, body, clauses, .. } => {
+                    if clauses.is_empty() {
+                        self.replay_statements(ast, env, body, interner);
+                    } else {
+                        let mut arms: Vec<Vec<NodeId>> = vec![main_body.clone()];
+                        arms.extend(clauses.iter().map(|c| c.body.clone()));
+                        let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
+                        self.join_arm_writes(ast, env, &arm_refs, interner);
+                    }
+                }
+                Node::Case { branches, else_body, .. } => {
+                    // Each `When` node's body is one arm; a missing `else`
+                    // reads as a no-op arm via `entry` inside the join.
+                    let mut arms: Vec<Vec<NodeId>> = branches
+                        .iter()
+                        .map(|&b| match ast.get(b) {
+                            Node::When { body, .. } => body.clone(),
+                            _ => vec![b],
+                        })
+                        .collect();
+                    arms.push(else_body.clone());
+                    let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
+                    self.join_arm_writes(ast, env, &arm_refs, interner);
+                }
+                Node::Loop { body, .. } => {
+                    // The body runs zero or more times: the empty arm is the
+                    // zero-iteration path (entry env).
+                    self.join_arm_writes(ast, env, &[body, &[]], interner);
+                }
+                Node::Statements { body, .. } => self.replay_statements(ast, env, body, interner),
+                _ => self.bind_statement(ast, stmt, env, interner),
+            }
+        }
+    }
+
+    /// Join the locals rebound inside each `arm` body into `env`: every name an
+    /// arm binds gets the union of the type each arm leaves it at — the entry
+    /// binding on an arm that does not rebind it, `nil` when it was unbound
+    /// both there and at entry (the arm may never have run).
+    fn join_arm_writes(
+        &self,
+        ast: &LoweredAst,
+        env: &mut TypeEnv,
+        arms: &[&[NodeId]],
+        interner: &mut Interner,
+    ) {
+        let entry = env.clone();
+        let nil = interner.nil();
+        let mut bound: Vec<String> = Vec::new();
+        let mut arm_envs: Vec<TypeEnv> = Vec::new();
+        for arm in arms {
+            let mut e = entry.clone();
+            self.replay_statements(ast, &mut e, arm, interner);
+            arm_envs.push(e);
+        }
+        // An EMPTY arm contributes the entry env unchanged (the `else_body`
+        // of an else-less `if` is `[]`, and the loop body's zero-iteration
+        // path is `entry` itself — appended by callers below).
+        let _ = &arm_envs;
+        for ae in &arm_envs {
+            for (name, _) in ae.iter() {
+                if !bound.contains(name) {
+                    bound.push(name.clone());
+                }
+            }
+        }
+        for name in bound {
+            // Only names an arm actually CHANGED need the join; a name no arm
+            // rebinds keeps its entry binding.
+            if arm_envs.iter().all(|ae| ae.get(&name) == entry.get(&name)) {
+                continue;
+            }
+            let mut members: Vec<TypeId> = Vec::new();
+            for ae in &arm_envs {
+                let ty = ae.get(&name).or_else(|| entry.get(&name)).copied().unwrap_or(nil);
+                if !members.contains(&ty) {
+                    members.push(ty);
+                }
+            }
+            let joined = members.iter().skip(1).fold(members[0], |acc, &m| {
+                rigor_types::Algebra::join(interner, acc, m)
+            });
+            env.insert(name, joined);
+        }
+    }
+
     /// [`Self::build_toplevel_env`] for the `check` rules: the same straight-line
     /// binder, except that every statement it does not bind WIDENS (to
     /// `Dynamic`) each top-level local rebound inside it, in statement order.
