@@ -1,0 +1,31 @@
+class A < B
+  def a: () -> Integer
+end
+class B < A
+end
+class C
+  def c: () -> Integer
+end
+class Self < Self
+  def s: () -> Integer
+end
+module M1
+  include M2
+end
+module M2
+  include M1
+end
+class UsesM
+  include M1
+end
+class Sub < Self
+end
+module M3
+end
+module M4
+  include M3
+end
+class Both
+  include M3
+  include M4
+end

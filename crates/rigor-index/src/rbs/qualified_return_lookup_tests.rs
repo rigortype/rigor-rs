@@ -100,9 +100,15 @@ fn ambiguous_superclass_leaf_declines() {
     // whose `hexdigest` would otherwise leak in).
     assert_eq!(idx.singleton_method_return("FooAmb::Sub", "hexdigest"), None);
     assert_eq!(idx.method_return("FooAmb::Sub", "hexdigest"), None);
-    // The leaf's own methods precede the break ⇒ still resolve.
+    // The leaf's own INSTANCE methods precede the break ⇒ still resolve.
     assert_eq!(idx.method_return("FooAmb::Sub", "own_i"), Some("Integer"));
-    assert_eq!(idx.singleton_method_return("FooAmb::Sub", "own_s"), Some("Integer"));
+    // rigor-rs#494: an unresolvable superclass fails the instance build
+    // (`NoSuperclassFoundError` on the reference, which reads `Sub` as
+    // `Dynamic[top]`), and the singleton definition is built ON the
+    // instance one — so `own_s` resolves nowhere. Before #494 this
+    // answered `Integer`, letting `Sub.own_s.frobnicate` mint a row the
+    // oracle's silence does not carry.
+    assert_eq!(idx.singleton_method_return("FooAmb::Sub", "own_s"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
 

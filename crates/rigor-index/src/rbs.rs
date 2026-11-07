@@ -1171,10 +1171,34 @@ impl CoreData {
         // the reference (probed for a duplicate member and for an overloading
         // reopen with no original: `Foo.ok.zork` and `Foo.zork` are silent);
         // a singleton-side failure leaves the instance side alone.
+        // rigor-rs#494: the failure's reach is the whole ancestor CLOSURE —
+        // `build_singleton` builds the instance definition first, so a cyclic
+        // chain or an included module whose own build fails
+        // (`RecursiveAncestorError`, an `InvalidOverloadMethodError` on the
+        // mixin) silences `UsesM.zork` / `Inc.nosuch` exactly the way a
+        // direct duplicate does. `health_failed` closes over the resolved
+        // superclass/include/prepend links — a cycle or an unresolvable link
+        // fails, matching the reference's `Dynamic[top]` read. The instance
+        // side needs no flag here: dispatch already declines these classes
+        // (`qualified_ancestors` reports the chain incomplete), so only the
+        // singleton twin joins the blanking set.
         let mut dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
-        let instance_failed: Vec<&'static str> =
-            dup_unbuildable.iter().filter(|&&(_, single)| !single).map(|&(q, _)| q).collect();
-        dup_unbuildable.extend(instance_failed.into_iter().map(|q| (q, true)));
+        let instance_failed: std::collections::HashSet<&'static str> = dup_unbuildable
+            .iter()
+            .filter(|&&(_, single)| !single)
+            .map(|&(q, _)| q)
+            .collect();
+        {
+            let mut memo: HashMap<&'static str, bool> = HashMap::new();
+            let mut stack: HashSet<&'static str> = HashSet::new();
+            let keys: Vec<&'static str> = builder.qualified.keys().copied().collect();
+            for key in keys {
+                builder.health_failed(key, &instance_failed, &mut memo, &mut stack);
+            }
+            dup_unbuildable.extend(
+                memo.into_iter().filter(|&(_, failed)| failed).map(|(q, _)| (q, true)),
+            );
+        }
         // Issue #129: the capability-role catalogue goes in AFTER the project's
         // own signatures, per declaration (conformance table only).
         builder.conformance.ingest_capability_roles();
