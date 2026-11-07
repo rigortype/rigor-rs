@@ -318,7 +318,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // declaration during merge); on a print/diff run it is inert, exactly like the
     // reference (the flag lives on the Writer).
 
-    let Generated { candidates, unresolvable, skips, .. } =
+    let Generated { candidates, all_rows, unresolvable, skips, .. } =
         generate_run(&files, include_private, &sig_env, &writes);
 
     // `--format json` renders the candidate table regardless of print/diff mode
@@ -327,7 +327,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         ("json", _) if !path_errors.is_empty() => {
             // The reference's key order (`Diagnostic#to_h`), which a
             // `serde_json::Value` map would sort.
-            let head = candidates_json_string(&candidates);
+            let head = candidates_json_string(&all_rows);
             let head = head.strip_suffix("\n}").unwrap_or(&head);
             let q = |v: &str| serde_json::to_string(v).unwrap();
             let rows: Vec<String> = path_errors
@@ -345,7 +345,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 .collect();
             println!("{head},\n  \"diagnostics\": [\n{}\n  ]\n}}", rows.join(",\n"));
         }
-        ("json", _) => render_json(&candidates),
+        ("json", _) => render_json(&all_rows),
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
     }
@@ -477,8 +477,8 @@ fn generate_run(
         candidates.extend(cs);
         info.absorb(i);
     }
-    let (candidates, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
-    Generated { candidates, info, unresolvable: report, skips }
+    let (candidates, all_rows, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
+    Generated { candidates, all_rows, info, unresolvable: report, skips }
 }
 
 /// One run's output: the emittable candidates (`new_method` / `tighter_return`),
@@ -487,6 +487,10 @@ fn generate_run(
 /// [`report_skipped`]).
 struct Generated {
     candidates: Vec<Candidate>,
+    /// Every considered row in candidate order — emittable AND `skipped`
+    /// rows (reference `filter(candidates, with_skipped: true)` for the
+    /// `--print --format json` payload; `dropped` rows stay out).
+    all_rows: Vec<Candidate>,
     info: NamespaceInfo,
     unresolvable: Vec<UnresolvableSuperclass>,
     skips: Vec<&'static str>,
@@ -561,7 +565,7 @@ fn finalize_superclasses(
     info: &mut NamespaceInfo,
     sig_env: &SigEnv,
     written: &dyn Fn(&Candidate) -> bool,
-) -> (Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
+) -> (Vec<Candidate>, Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
     let index = CoreIndex::new();
     let rbs_known = |name: &str| sig_env.class_known(&index, name);
     // Every row counts, emitted or not (`candidates.each_with_object`): the
@@ -687,6 +691,7 @@ fn finalize_superclasses(
     // `unresolvable-superclass` skip, which the summary does not count.
     let mut owners: Vec<(String, String)> = Vec::new();
     let mut out: Vec<Candidate> = Vec::new();
+    let mut all_rows: Vec<Candidate> = Vec::new();
     let mut skips: Vec<&'static str> = Vec::new();
     for mut c in candidates {
         match owner_of(&c.class_name, &unresolvable) {
@@ -694,12 +699,21 @@ fn finalize_superclasses(
                 if !owners.iter().any(|(n, _)| *n == owner.0) {
                     owners.push(owner);
                 }
+                // Already demoted to `sig.skipped.unresolvable-superclass` —
+                // the JSON payload still lists the row.
+                all_rows.push(c);
             }
             None if emittable(&c) => {
                 c.decl_header = declaration_header(info, &c.class_name);
+                all_rows.push(clone_candidate(&c));
                 out.push(c);
             }
-            None => skips.extend(c.skip_reason),
+            None => {
+                skips.extend(c.skip_reason);
+                if c.skip_reason.is_some() {
+                    all_rows.push(c);
+                }
+            }
         }
     }
 
@@ -730,7 +744,7 @@ fn finalize_superclasses(
             UnresolvableSuperclass { class_name, superclass: if project { token } else { root }, project }
         })
         .collect();
-    (out, skips, report)
+    (out, all_rows, skips, report)
 }
 
 /// Reference `Generator#demote_overridden_base_methods` (#744): a base
@@ -785,6 +799,9 @@ fn demote_overridden_base_methods(
 fn demoted(mut c: Candidate, reason: &'static str) -> Candidate {
     c.classification = "skipped";
     c.skip_reason = Some(reason);
+    // The reference's `demoted_candidate` rebuilds WITHOUT `rbs`, so the
+    // JSON row omits the key.
+    c.rbs = String::new();
     c
 }
 
@@ -2100,7 +2117,7 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
-    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).candidates)
+    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).all_rows)
 }
 
 /// One candidate's JSON object (reference `MethodCandidate#to_h`): the per-
@@ -2114,11 +2131,20 @@ fn candidate_json(c: &Candidate) -> serde_json::Value {
         "method": c.method_name,
         "kind": c.kind,
         "classification": c.classification,
-        "rbs": c.rbs,
-        "inferred_return": c.inferred_return,
     });
+    // `to_h.compact`: a nil `rbs` / `inferred_return` (every skipped row)
+    // leaves the key out entirely.
+    if !c.rbs.is_empty() {
+        obj.as_object_mut().unwrap().insert("rbs".to_string(), json!(c.rbs));
+    }
+    if !c.inferred_return.is_empty() {
+        obj.as_object_mut().unwrap().insert("inferred_return".to_string(), json!(c.inferred_return));
+    }
     if let Some(dr) = &c.declared_return_rbs {
         obj.as_object_mut().unwrap().insert("declared_return_rbs".to_string(), json!(dr));
+    }
+    if let Some(reason) = c.skip_reason {
+        obj.as_object_mut().unwrap().insert("skip_reason".to_string(), json!(reason));
     }
     obj
 }
@@ -2226,7 +2252,7 @@ fn cmd_write(
         writes(c)
             && accepts(&target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout))
     };
-    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips } =
+    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips, .. } =
         generate_run(files, include_private, sig_env, &written);
     for c in all_candidates {
         let target =
