@@ -2309,7 +2309,6 @@ impl<'i> Typer<'i> {
                         (Some(&f), Some(&l)) => Some((ast.get(f).span().0, ast.get(l).span().1)),
                         _ => None,
                     };
-                    let retried = clauses.iter().any(|c| self.clause_retries(ast, c.span));
                     let mut arm_envs = Vec::with_capacity(clauses.len());
                     for c in &clauses {
                         // The arm's entry scope is the `begin`'s ENTRY scope —
@@ -2332,7 +2331,14 @@ impl<'i> Typer<'i> {
                         let mut cenv = env.clone();
                         if self.clause_retries(ast, c.span) {
                             widen_flow_writes(rebinds, begin_span, &mut cenv, interner);
-                        } else if let (false, Some(region)) = (retried, body_region) {
+                        }
+                        // Under a retry edge the clause-entry widening
+                        // (`rescue_writes`) holds for EVERY arm, not just
+                        // the retrying one — a sibling can re-enter the
+                        // `begin` through the retry too, so `ok = false;
+                        // begin; ok = true; rescue A; retry; rescue B; if ok`
+                        // stays silent on the oracle (rigor-rs#468).
+                        if let Some(region) = body_region {
                             widen_clause_entry(rebinds, region, &indexed.scope_spans, &mut cenv, interner);
                         }
                         self.flow_eval_scope(

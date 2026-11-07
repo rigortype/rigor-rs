@@ -300,6 +300,7 @@ impl<'src> Builder<'src> {
                 // reference's syntax-level reading, so the `nil&.m` literal
                 // fold must not see through the parens.
                 self.paren_unwrapped.push(only.0);
+                self.paren_spans.insert(only.0, span_of(&parens.location()));
                 return only;
             }
             let main_body = body.clone();

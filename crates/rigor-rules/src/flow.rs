@@ -57,7 +57,10 @@ pub(crate) fn check_always_truthy(
     let ty = *snapshots.get(&if_id)?;
     let polarity = constant_polarity(interner, ty)?;
 
-    let span = ast.get(predicate).span();
+    // `(predicate)` unwrapped by the lowerer: the reference's predicate node
+    // is still the `ParenthesesNode`, which anchors on the `(` — use the
+    // recorded parens span when one exists (rigor-rs#468 item 2).
+    let span = ast.paren_span(predicate).unwrap_or_else(|| ast.get(predicate).span());
     let severity = catalog(FLOW_ALWAYS_TRUTHY_CONDITION)
         .map(|e| e.default_severity)
         .unwrap_or(Severity::Warning);

@@ -57,6 +57,9 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`LoweredAst::paren_unwrapped`]: crate::ast::LoweredAst::paren_unwrapped
     pub(crate) paren_unwrapped: Vec<u32>,
+    /// `(id, (start, end))` — the `(`…`)` span each unwrapped id replaced
+    /// (the reference's `ParenthesesNode` anchors diagnostics on the `(`).
+    pub(crate) paren_spans: std::collections::HashMap<u32, (usize, usize)>,
     /// `(arena id, bound names)` for recovered children the recovery walk
     /// reached by CROSSING a `BlockNode`/`LambdaNode` — the closure's `locals`
     /// still shadow the enclosing scope inside the recovered subtree
