@@ -2328,7 +2328,9 @@ fn cmd_write(
     report_unresolvable_superclasses(&unresolvable);
     // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
     // write and did not get one — exit 1.
-    if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
+    if results.iter().any(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    }) {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
@@ -2563,6 +2565,14 @@ fn render_write_text(results: &[WriteResult]) {
                 println!("REFUSED {} — the existing file was not updated", r.target);
                 println!("  {}", r.error.as_deref().unwrap_or_default());
                 println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+            }
+            "skipped_invalid_rbs" => {
+                println!(
+                    "REFUSED {} — the generated RBS does not parse, so it was not written",
+                    r.target
+                );
+                println!("  {}", r.error.as_deref().unwrap_or_default());
+                println!("  This is a bug in Rigor's RBS rendering, not in your code — please report it.");
             }
             _ => {}
         }
@@ -2822,7 +2832,13 @@ fn update_existing(
     // for a `Data.define` return — a documented follow-up, not a regression.
     let MergeOutcome { source: merged, action, applied, skipped, repaired } =
         apply_merge_with(source, candidates, kinds, supers, params, shells, overwrite);
+    // Reference `RbsValidity.source_error`: a spliced result that does not
+    // re-parse is a writer defect — refuse to write it (`:skipped_invalid_rbs`)
+    // rather than leave the consumer's `rigor check` to quarantine the file.
     if action == "updated" {
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &merged) {
+            return refused("skipped_invalid_rbs", detail);
+        }
         let _ = std::fs::write(target, &merged);
     }
     WriteResult {
