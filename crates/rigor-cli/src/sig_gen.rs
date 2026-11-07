@@ -2004,14 +2004,12 @@ fn method_candidate(
     // on top of the file env, so a tail/return read of a method-local sees its
     // binding (the reference types the body's env). Statements the binder
     // declines leave the env alone — a coverage loss, never a wrong type.
-    let local =
-        typer.bind_statements_into(ast, env, &sig.body[..sig.body.len().saturating_sub(1)], interner);
+    // The replay covers the WHOLE body — a `return` under the tail `if`
+    // still types at its position (the tail's own writes bind nothing the
+    // tail read needs that a later statement could invalidate).
+    let (local, positional_returns) =
+        typer.bind_statements_into_with_returns(ast, env, sig.body, interner);
     let env = &local;
-
-    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
-    // statement's type; an assignment tail evaluates to its RHS; a `return E`
-    // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -2027,10 +2025,26 @@ fn method_candidate(
             }
         }
     };
-    push_flat(interner, &mut members, tail_ty);
+
+    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
+    // statement's type; an assignment tail evaluates to its RHS; a `return E`
+    // tail evaluates to its value (`nil` when bare). A control tail whose
+    // every leaf is a `return` contributes NOTHING — `if c; return 1; else;
+    // return "s"; end` yields `("s" | 1)` from the returns alone.
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
+    if let Some(tail_ty) = tail_ty {
+        push_flat(interner, &mut members, tail_ty);
+    }
     for ret in &returns {
+        // A `return`'s value types at ITS position in the body — a name it
+        // reads may be rebound later (`a = :initial; if c; return a; end;
+        // a = 100` → `(100 | :initial)`).
         let ty = match ret {
-            Some(v) => typer.type_of(ast, *v, env, interner),
+            Some(v) => positional_returns
+                .iter()
+                .find(|(id, _)| id == v)
+                .map(|(_, t)| *t)
+                .unwrap_or_else(|| typer.type_of(ast, *v, env, interner)),
             None => interner.nil(),
         };
         push_flat(interner, &mut members, ty);
@@ -2420,6 +2434,9 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
 /// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
 /// `annotate` deferral) and is then skipped upstream.
+/// `Some(Some(ty))` — the tail's type; `Some(None)` — a control tail whose
+/// every value leaf is a `return`, contributing no member; `None` — skip
+/// (empty body, multi-value `return` tail).
 #[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
@@ -2430,29 +2447,131 @@ fn def_return_type(
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
-) -> Option<TypeId> {
+) -> Option<Option<TypeId>> {
     let &tail = body.last()?;
-    let target = match ast.get(tail) {
+    match ast.get(tail) {
         Node::LocalVariableWrite { value, .. }
         | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
-        | Node::ConstantWrite { value, .. } => *value,
+        | Node::ConstantWrite { value, .. } => {
+            Some(Some(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner)))
+        }
         Node::Return { values, .. } => match values.len() {
-            0 => return Some(interner.nil()),
-            1 => values[0],
-            _ => return None,
+            0 => Some(Some(interner.nil())),
+            1 => Some(Some(tail_value_type(ast, typer, env, values[0], index, class_name, fqns, interner))),
+            _ => None,
         },
-        _ => tail,
-    };
-    // Literal carriers `type_of` leaves Dynamic — sig-gen still emits their
-    // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
-    // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
-    // through recovery, so no dedicated node exists here).
-    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
-        return Some(lit);
+        Node::If { .. } | Node::Case { .. } | Node::BeginRescue { .. } | Node::Loop { .. } => {
+            // The tail's VALUE leaves, each typed under ITS arm's env: an
+            // arm's last statement that is not a `return` (a `return` leaf
+            // exits the method — it is already in `returns`), an absent
+            // `else` contributes `nil`, a loop tail contributes `nil`.
+            let mut members: Vec<TypeId> = Vec::new();
+            control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members);
+            match members.len() {
+                0 => Some(None),
+                _ => Some(Some(
+                    members.iter().skip(1).fold(members[0], |acc, &m| {
+                        rigor_types::Algebra::join(interner, acc, m)
+                    }),
+                )),
+            }
+        }
+        _ => Some(Some(tail_value_type(ast, typer, env, tail, index, class_name, fqns, interner))),
     }
-    Some(typer.type_of(ast, target, env, interner))
+}
+
+/// Push the value-contributing tail types of a control expression onto
+/// `out` — each arm's last non-`return` statement typed under the ARM's env
+/// (an arm's earlier writes bind there: `if c; a = 1; a; end` contributes
+/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else` and
+/// a loop tail contribute `nil`.
+#[allow(clippy::too_many_arguments)]
+fn control_tail_types(
+    ast: &LoweredAst,
+    typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    id: NodeId,
+    env: &TypeEnv,
+    interner: &mut Interner,
+    out: &mut Vec<TypeId>,
+) {
+    #[allow(clippy::too_many_arguments)]
+    fn body_tail(
+        ast: &LoweredAst,
+        typer: &Typer,
+        index: &CoreIndex,
+        class_name: &str,
+        fqns: &std::collections::HashSet<String>,
+        body: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+        out: &mut Vec<TypeId>,
+    ) {
+        let Some(&tail) = body.last() else {
+            out.push(interner.nil());
+            return;
+        };
+        // The arm's own writes bind before its tail is read.
+        let arm = typer.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
+        control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out);
+    }
+    match ast.get(id) {
+        Node::Return { .. } => {}
+        Node::If { then_body, else_body, .. } => {
+            body_tail(ast, typer, index, class_name, fqns, then_body, env, interner, out);
+            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out);
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &b in branches {
+                match ast.get(b) {
+                    Node::When { body, .. } => body_tail(ast, typer, index, class_name, fqns, body, env, interner, out),
+                    _ => out.push(tail_value_type(ast, typer, env, b, index, class_name, fqns, interner)),
+                }
+            }
+            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out);
+        }
+        Node::BeginRescue { main_body, body, clauses, .. } => {
+            // An `else`/`in`/paren carrier (empty clauses) is a statements
+            // wrapper — its tail is the body's. A real begin/rescue's value is
+            // the protected tail OR a clause tail.
+            if clauses.is_empty() {
+                body_tail(ast, typer, index, class_name, fqns, body, env, interner, out);
+            } else {
+                body_tail(ast, typer, index, class_name, fqns, main_body, env, interner, out);
+                for c in clauses {
+                    body_tail(ast, typer, index, class_name, fqns, &c.body, env, interner, out);
+                }
+            }
+        }
+        Node::Loop { .. } => out.push(interner.nil()),
+        Node::Statements { body, .. } => body_tail(ast, typer, index, class_name, fqns, body, env, interner, out),
+        _ => out.push(tail_value_type(ast, typer, env, id, index, class_name, fqns, interner)),
+    }
+}
+
+/// A tail value's type: the literal carriers `type_of` leaves Dynamic — sig-gen
+/// still emits their nominal (rigor-rs#493 item 7): `Range[bound-class-union]`,
+/// `Regexp`, `Rational`, `Complex` (interpolated regexps stay declined: they
+/// lower through recovery, so no dedicated node exists here) — else `type_of`.
+#[allow(clippy::too_many_arguments)]
+fn tail_value_type(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> TypeId {
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
+        return lit;
+    }
+    typer.type_of(ast, target, env, interner)
 }
 
 /// The sig-gen-side nominal for a literal tail `check` leaves Dynamic
