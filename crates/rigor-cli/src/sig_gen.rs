@@ -1645,14 +1645,21 @@ fn collect_conditional_definers(
                 }
             }
         }
-        Node::Call { method, args, block_body, span, .. } => {
-            // `class_methods` is always a DSL scope. `refine` is one only in a
-            // MODULE body — `Class` undefines `refine`, so the same spelling
-            // in a `class` body is the class's own method and its block walks
-            // as any other block (`class_body_refine?` / #1689).
-            if (method == "class_methods" || (method == "refine" && in_module))
-                && !block_body.is_empty()
-            {
+        Node::Call { receiver, method, args, block_body, span, .. } => {
+            // `class_methods` is a DSL scope only RECEIVERLESS
+            // (`class_methods_block?`); `refine` likewise on a nil or `self`
+            // receiver (`refine_call?`) and only in a MODULE body — `Class`
+            // undefines `refine`, so the same spelling in a `class` body is
+            // the class's own method and its block walks as any other block
+            // (`class_body_refine?` / #1689). A `obj.class_methods` /
+            // `obj.refine` block is an ordinary block and descends.
+            let refine_shaped = method == "refine"
+                && receiver
+                    .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                    .unwrap_or(true);
+            let dsl = (method == "class_methods" && receiver.is_none())
+                || (refine_shaped && in_module);
+            if dsl && !block_body.is_empty() {
                 return;
             }
             if !prefix.is_empty()
@@ -1711,6 +1718,34 @@ fn collect_conditional_definers(
             for &b in body {
                 recurse(ast, b, prefix, in_singleton_class, in_module, definers);
             }
+        }
+        // Expression-level containers carry the same children
+        // (`rigor_each_child` descends everywhere): `_x = if c; attr_reader
+        // :x; end` and `c && attr_reader(:x)` record just the same.
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+        }
+        Node::MultiWrite { value, target_exprs, .. } => {
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            for &b in target_exprs {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::IndexWrite { receiver, indices, value, .. } => {
+            if let Some(r) = receiver {
+                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in indices.iter().chain(std::iter::once(value)) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            recurse(ast, *left, prefix, in_singleton_class, in_module, definers);
+            recurse(ast, *right, prefix, in_singleton_class, in_module, definers);
         }
         _ => {}
     }
