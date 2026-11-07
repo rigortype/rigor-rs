@@ -29,6 +29,40 @@ fn qualified_singleton_return_probe_ladder() {
     assert_eq!(idx.singleton_method_return("No::Such", "hexdigest"), None);
 }
 
+/// rigor-rs#493 item 12: a bare `class Hash` in the project's `sig/`
+/// re-declares `Hash` with a DIFFERENT type-param count than the bundled
+/// `Hash[K, V]` — `GenericParameterMismatchError`, whose instance def is
+/// nil on the reference. Hash's own surface reads silent, the nil def
+/// spreads ONE hop to classes whose instance members name it (`Array#to_h`
+/// fails `Array`), and a descendant with no `Hash` member refs builds fine
+/// (`Integer#wut` still witnesses through a nil `Kernel`).
+#[test]
+fn bare_generic_project_sig_marks_def_nil() {
+    let dir = std::env::temp_dir().join("rigor_bare_generic_sig_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("x.rbs"), "class Hash\nend\n").unwrap();
+    let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+    if !idx.knows_class("Hash") {
+        return; // stub fallback.
+    }
+    // `Hash` itself: the def is nil — its surface is inconclusive (silent),
+    // and no return resolves through the emptied tables.
+    assert!(idx.qualified_class_has_method("Hash", "zzz"));
+    assert_eq!(idx.method_return("Hash", "to_h"), None);
+    // The one-hop spread: `Array` fails (its `to_h` names `Hash`).
+    assert!(idx.qualified_class_has_method("Array", "zork"));
+    assert_eq!(idx.method_return("Array", "to_h"), None);
+    // Descendants build over a nil ancestor: `Integer`/`String` keep their
+    // surfaces — `wut`/`zork` witness absent.
+    assert!(!idx.qualified_class_has_method("Integer", "wut"));
+    assert!(!idx.qualified_class_has_method("String", "nope"));
+    // The singleton side of a failed class is nil too (`Array.zork` silent),
+    // while a surviving class's singleton keeps witnessing.
+    assert!(!idx.class_has_singleton_method("String", "zork"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Rung 4: the INSTANCE side (`Digest::SHA256.new.hexdigest`) resolves
 /// through the include chain (`Digest::Class include ::Digest::Instance` —
 /// an ABSOLUTE written reference), and `-> self` resolves to the QUALIFIED

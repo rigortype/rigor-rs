@@ -841,6 +841,24 @@ struct ClassEntry {
     /// stubbing them, which `project_sig_chain_ok` mirrors instead. Read
     /// only by [`synthesize_missing_referenced_types`].
     referenced_type_names: Vec<&'static str>,
+    /// The type names the class's INSTANCE-side member signatures write,
+    /// restricted to members the definition build actually resolves: plain
+    /// (non-`...`-overloading) non-singleton `def`s (except `initialize`),
+    /// non-singleton attribute types, and the type ARGUMENTS of `super` /
+    /// module-self-type clauses. Read by the type-param-mismatch spread
+    /// (rigor-rs#493 item 12): a member signature naming a decl whose
+    /// merged type params disagree (`class Hash` vs `Hash[K, V]`) fails the
+    /// naming class's instance build with `GenericParameterMismatchError`.
+    /// Deliberately narrower than [`Self::referenced_type_names`], which
+    /// keeps `...` overload names for the stub pass.
+    instance_member_refs: Vec<&'static str>,
+    /// The type-parameter count each DECLARATION of this class/module wrote
+    /// (`class Hash` pushes `0`, `class Array[T]` pushes `1`), appended by
+    /// every decl the class merges (deduped per count). RBS validates a
+    /// merged class's declarations share one param arity: two different
+    /// counts is `GenericParameterMismatchError` and the definition fails to
+    /// build — rigor-rs#493 item 12, `class Hash` reopening `Hash[K, V]`.
+    decl_type_params: Vec<usize>, 
     /// `true` when this name was declared as a `module` (not a `class`) in RBS —
     /// the analogue of the reference's `Environment#rbs_module?`. Read ONLY by
     /// `call.raise-non-exception`'s instance path (a value typed as a module
@@ -877,6 +895,18 @@ struct ClassEntry {
     /// witnesses their instance methods. Conflating the two would be FP-safe but
     /// would silence rigor-rs where the oracle speaks.
     singleton_unbuildable: bool,
+    /// `true` alongside [`Self::instance_unbuildable`] when the nil def
+    /// contributes EMPTY surface but leaves DESCENDANTS' builds intact — the
+    /// `GenericParameterMismatchError` family (rigor-rs#493 item 12). The
+    /// reference builds `Integer`'s def fine over a nil `Kernel` def
+    /// (`i.wut` still fires under a bare `class Hash`), so ancestor walks
+    /// traverse this flag where [`Self::instance_unbuildable`] alone stops
+    /// them. The class's own surface stays degraded: a carrier typed as it
+    /// still reads `Dynamic[top]`.
+    instance_def_nil: bool,
+    /// The singleton twin of [`Self::instance_def_nil`] — `String.zork`
+    /// fires under a bare `class Hash` while `Kernel.zork` goes silent.
+    singleton_def_nil: bool,
 }
 
 /// Which signature source the loaded [`CoreData`] was built from. Surfaced by
@@ -1167,6 +1197,54 @@ impl CoreData {
                 builder.dup_unbuildable.insert((qual, single));
             }
         }
+        // rigor-rs#493 item 12: a class/module re-declared with a DIFFERENT
+        // type-parameter count fails its own definition build
+        // (`GenericParameterMismatchError`) — and, ONE hop out, every class
+        // whose member-level signatures name it (`Array#to_h -> Hash[K, V]`
+        // fails `Array` under a bare `class Hash`). It does NOT chain:
+        // `String#split -> Array[String]` keeps `String` buildable when only
+        // `Hash` mismatched (probed: `s.nope` still fires there). A bare
+        // `class Array` mismatches `Array` and fails nearly everything,
+        // matching the reference's `s.nope`-silent run.
+        let mut nil_marks: HashSet<(&'static str, bool)> = HashSet::new();
+        let mismatched: HashSet<&'static str> = builder
+            .qualified
+            .iter()
+            .filter(|(_, entry)| entry.decl_type_params.len() > 1)
+            .map(|(&q, _)| q)
+            .collect();
+        if !mismatched.is_empty() {
+            let mut fails = mismatched.clone();
+            for (&q, entry) in &builder.qualified {
+                if fails.contains(q) {
+                    continue;
+                }
+                let hits = entry.instance_member_refs.iter().any(|n| {
+                    entry
+                        .member_ctxs
+                        .iter()
+                        .chain(std::iter::once(&Vec::new()))
+                        .any(|ctx| {
+                            builder
+                                .resolve_type_name_rbs(n, ctx)
+                                .is_some_and(|t| mismatched.contains(t))
+                        })
+                });
+                if hits {
+                    fails.insert(q);
+                }
+            }
+            // The mark rides the `_def_nil` channel, NOT the plain
+            // `dup_unbuildable` blank: a param-mismatch failure leaves the
+            // class's own def nil while DESCENDANTS still build (Integer
+            // walks a nil Kernel — `i.wut` still fires). Both sides ride
+            // (`Kernel.zork` and `Array.zork` are oracle-silent too).
+            for &q in &fails {
+                nil_marks.insert((q, false));
+                nil_marks.insert((q, true));
+                builder.dup_unbuildable.insert((q, false));
+            }
+        }
         // An instance-side build failure takes the singleton side with it on
         // the reference (probed for a duplicate member and for an overloading
         // reopen with no original: `Foo.ok.zork` and `Foo.zork` are silent);
@@ -1234,12 +1312,27 @@ impl CoreData {
             }
         }
         for (name, singleton) in dup_unbuildable {
+            let nil = nil_marks.contains(&(name, singleton));
             if let Some(entry) = qualified.get_mut(name) {
                 blank_unbuildable(entry, !singleton, singleton);
+                if nil {
+                    if singleton {
+                        entry.singleton_def_nil = true;
+                    } else {
+                        entry.instance_def_nil = true;
+                    }
+                }
             }
             if !name.contains("::") {
                 if let Some(entry) = classes.get_mut(name) {
                     blank_unbuildable(entry, !singleton, singleton);
+                    if nil {
+                        if singleton {
+                            entry.singleton_def_nil = true;
+                        } else {
+                            entry.instance_def_nil = true;
+                        }
+                    }
                 }
             }
         }
@@ -1990,7 +2083,7 @@ impl CoreData {
                 if self
                     .classes
                     .get(module)
-                    .is_none_or(|m| m.instance_unbuildable)
+                    .is_none_or(|m| m.instance_unbuildable && !m.instance_def_nil)
                 {
                     complete = false;
                 }
@@ -2771,7 +2864,17 @@ impl CoreData {
         };
         // An unbuildable instance definition has no known surface (its tables
         // were emptied); walking past it could skip the true first definer.
-        if entry.instance_unbuildable {
+        // An unbuildable instance definition has no known surface (its tables
+        // were emptied); walking past it could skip the true first definer —
+        // EXCEPT a `def_nil` entry, whose nil def contributes empty surface
+        // while the DESCENDANT's build succeeds (rigor-rs#493 item 12):
+        // `qualified_ancestors("Integer")` walks through a nil `Kernel` so
+        // `i.wut` still fires. At the walk's own START a `def_nil` entry is
+        // still inconclusive — `qualified_ancestors("Hash")` must not stand
+        // behind `h.zzz`.
+        if entry.instance_unbuildable
+            && (!entry.instance_def_nil || order.is_empty())
+        {
             *ok = false;
             return;
         }
@@ -2857,7 +2960,12 @@ impl CoreData {
             let Some(entry) = self.qualified.get(key) else {
                 break;
             };
-            if entry.singleton_unbuildable || !seen.insert(key) {
+            // A `singleton_def_nil` ancestor contributes empty surface but
+            // leaves the class's own singleton build standing — `String.zork`
+            // fires through a nil `Kernel` singleton def (rigor-rs#493).
+            if (entry.singleton_unbuildable && !entry.singleton_def_nil)
+                || !seen.insert(key)
+            {
                 break;
             }
             chain.push(key);
@@ -3944,8 +4052,15 @@ impl CoreData {
         // through it is incomplete — otherwise the empty entry would read as
         // "definitively has nothing" and witness absence both on the class itself
         // and on anything inheriting from or including it. This walk is the
-        // instance-side chain, so only the instance flag applies.
-        if entry.instance_unbuildable {
+        // instance-side chain, so only the instance flag applies. A
+        // `def_nil` entry (the param-mismatch family) is an exception: its
+        // nil def contributes empty surface while the descendant's build
+        // stands — `i.wut` still fires through a nil `Kernel` (rigor-rs#493).
+        // At the walk's own START it stays inconclusive (`Hash` itself must
+        // not stand behind `h.zzz`).
+        if entry.instance_unbuildable
+            && (!entry.instance_def_nil || order.is_empty())
+        {
             *complete = false;
         }
         // PREPENDED modules sit AHEAD of the class in Ruby's MRO, so they are
@@ -3996,6 +4111,10 @@ impl CoreData {
                     // The stub declares everything public.
                     private_methods: HashSet::new(),
                     // The stub declares no attribute members.
+                    decl_type_params: Vec::new(),
+                    instance_member_refs: Vec::new(),
+                    instance_def_nil: false,
+                    singleton_def_nil: false,
                     attr_methods: HashSet::new(),
                     singleton_attr_methods: HashSet::new(),
                     ivar_types: HashMap::new(),
@@ -5063,6 +5182,7 @@ impl Builder {
             superclass_written,
             ..Default::default()
         };
+        entry.decl_type_params.push(c.type_params().iter().count());
         // ADR-0042 Slice 1: this decl's own qualified key, and the enclosing
         // context a NESTED decl within its members will qualify against.
         let qual = qualified_name(enclosing, &tn);
@@ -5073,7 +5193,8 @@ impl Builder {
         // context (this class included) — record it for member-level type-ref
         // resolution on the qualified path.
         entry.member_ctxs.push(child_enclosing.clone());
-        Self::record_ref_names(&mut entry, super_arg_names);
+        Self::record_ref_names(&mut entry, super_arg_names.iter().copied());
+        Self::record_instance_ref_names(&mut entry, &super_arg_names);
         self.collect_members(c.members().iter(), &mut entry, &child_enclosing, code, ctx);
         self.merge_qualified(qual, entry.clone());
         self.short_to_qualified_push(name, qual);
@@ -5100,6 +5221,7 @@ impl Builder {
             is_module: true,
             ..Default::default()
         };
+        entry.decl_type_params.push(m.type_params().iter().count());
         // ADR-0042: a module's self-type clause (`module PPMethods :
         // _PPMethodsRequired`) resolves in the OUTER lexical context, exactly
         // like a class's `< X` super clause. Issue #168: `use`-mapped /
@@ -5125,7 +5247,8 @@ impl Builder {
             enclosing.iter().copied().chain(std::iter::once(qual)).collect();
         // ADR-0042 Slice 5: see `ingest_class` — the inner member context.
         entry.member_ctxs.push(child_enclosing.clone());
-        Self::record_ref_names(&mut entry, self_arg_names);
+        Self::record_ref_names(&mut entry, self_arg_names.iter().copied());
+        Self::record_instance_ref_names(&mut entry, &self_arg_names);
         self.collect_members(m.members().iter(), &mut entry, &child_enclosing, code, ctx);
         self.merge_qualified(qual, entry.clone());
         self.short_to_qualified_push(name, qual);
@@ -5179,6 +5302,16 @@ impl Builder {
         for n in names {
             if !entry.referenced_type_names.contains(&n) {
                 entry.referenced_type_names.push(n);
+            }
+        }
+    }
+
+    /// The [`ClassEntry::instance_member_refs`] twin of
+    /// [`Self::record_ref_names`] — deduped append.
+    fn record_instance_ref_names(entry: &mut ClassEntry, names: &[&'static str]) {
+        for &n in names {
+            if !entry.instance_member_refs.contains(&n) {
+                entry.instance_member_refs.push(n);
             }
         }
     }
@@ -5261,7 +5394,23 @@ impl Builder {
                                 }
                             }
                         }
-                        Self::record_ref_names(entry, names);
+                        Self::record_ref_names(entry, names.clone());
+                        // rigor-rs#493 item 12: an `...`-overloading member's
+                        // own types are never resolved (the overlay's
+                        // `String#tr: (Hash) | ...` keeps `String` buildable
+                        // under a bare `class Hash` — probed against the
+                        // oracle); a plain overload's are (a `Hash` overload
+                        // on a non-`...` def fails the build). The type-param
+                        // mismatch spread reads THIS set, not
+                        // `referenced_type_names`, whose stub-pass contract
+                        // keeps the `...` names.
+                        if !md.overloading() {
+                            for n in names {
+                                if !entry.instance_member_refs.contains(&n) {
+                                    entry.instance_member_refs.push(n);
+                                }
+                            }
+                        }
                     }
                     // `def self.x` ⇒ Singleton; `def self?.x` ⇒ SingletonInstance
                     // (BOTH a class method AND an instance method); a plain
@@ -5382,7 +5531,8 @@ impl Builder {
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
                         collect_type_node_names(&a.type_(), ctx, &mut names);
-                        Self::record_ref_names(entry, names);
+                        Self::record_ref_names(entry, names.clone());
+                        Self::record_instance_ref_names(entry, &names);
                     }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, true, false);
@@ -5394,7 +5544,8 @@ impl Builder {
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
                         collect_type_node_names(&a.type_(), ctx, &mut names);
-                        Self::record_ref_names(entry, names);
+                        Self::record_ref_names(entry, names.clone());
+                        Self::record_instance_ref_names(entry, &names);
                     }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, false, true);
@@ -5406,7 +5557,8 @@ impl Builder {
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
                         collect_type_node_names(&a.type_(), ctx, &mut names);
-                        Self::record_ref_names(entry, names);
+                        Self::record_ref_names(entry, names.clone());
+                        Self::record_instance_ref_names(entry, &names);
                     }
                     let name = intern(a.name().as_str());
                     Self::record_attr(entry, a.kind(), name, true, true);
@@ -5648,6 +5800,16 @@ impl Builder {
                 slot.referenced_type_names.push(name);
             }
         }
+        for count in entry.decl_type_params {
+            if !slot.decl_type_params.contains(&count) {
+                slot.decl_type_params.push(count);
+            }
+        }
+        for name in entry.instance_member_refs {
+            if !slot.instance_member_refs.contains(&name) {
+                slot.instance_member_refs.push(name);
+            }
+        }
         for pre in entry.prepends {
             if !slot.prepends.contains(&pre) {
                 slot.prepends.push(pre);
@@ -5722,6 +5884,16 @@ impl Builder {
         for name in entry.referenced_type_names {
             if !slot.referenced_type_names.contains(&name) {
                 slot.referenced_type_names.push(name);
+            }
+        }
+        for count in entry.decl_type_params {
+            if !slot.decl_type_params.contains(&count) {
+                slot.decl_type_params.push(count);
+            }
+        }
+        for name in entry.instance_member_refs {
+            if !slot.instance_member_refs.contains(&name) {
+                slot.instance_member_refs.push(name);
             }
         }
         slot.is_module |= entry.is_module;
