@@ -2300,6 +2300,22 @@ fn cmd_write(
             continue;
         }
         let content = render_new_file(&group, &shells, &merged);
+        // Reference `RbsValidity.source_error` on the create path
+        // (writer.rb `create_new`): a render defect never reaches disk — the
+        // whole target is refused (`:skipped_invalid_rbs`), same as a broken
+        // splice on the update path.
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &content) {
+            results.push(WriteResult {
+                source,
+                target: target_str,
+                action: "skipped_invalid_rbs",
+                applied: Vec::new(),
+                skipped: Vec::new(),
+                error: Some(detail),
+                repaired: Vec::new(),
+            });
+            continue;
+        }
         if let Some(parent) = target.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
