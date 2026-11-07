@@ -195,6 +195,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let mut overwrite = false;
     let mut explicit_config: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
+    let mut mode_given = false;
     // The first flag naming machinery this slice does not port (in argv order,
     // so the diagnostic names the first offender).
     let mut deferred: Option<String> = None;
@@ -207,9 +208,17 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => positional.push(p),
             Item::Opt { key, value, .. } => match key {
-                "print" => mode = "print",
-                "diff" => mode = "diff",
-                "write" => mode = "write",
+                "print" | "diff" | "write" | "check" => {
+                    // `select_mode`: a second, different mode flag is a usage
+                    // error, not last-one-wins.
+                    if mode_given && mode != key {
+                        mode = "conflict";
+                    }
+                    mode_given = true;
+                    if mode != "conflict" {
+                        mode = key;
+                    }
+                }
                 "overwrite" => overwrite = true,
                 "include-private" => include_private = true,
                 // No persistent analysis cache exists in the port.
@@ -217,9 +226,6 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 "format" => format = value.unwrap().as_str().to_string(),
                 "params" => params = value.unwrap().as_str().to_string(),
                 "observe" => defer("--observe", &mut deferred),
-                // ADR-112 WD4's dry-run gate — the writer's compare mode is
-                // not ported.
-                "check" => defer("--check", &mut deferred),
                 "effect-envelopes" => defer("--effect-envelopes", &mut deferred),
                 "new-files" => defer("--new-files", &mut deferred),
                 "new-methods" => defer("--new-methods", &mut deferred),
@@ -235,6 +241,10 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
 
     // `validation_error` — inside `parse_options`, before `Configuration.load`,
     // each failure a `sig-gen: <msg>` line + exit 64.
+    if mode == "conflict" {
+        eprintln!("sig-gen: --print, --diff, --write, and --check are mutually exclusive flags; pick one");
+        return ExitCode::from(64);
+    }
     if !matches!(format.as_str(), "text" | "json") {
         eprintln!("sig-gen: unsupported --format={format}");
         return ExitCode::from(64);
@@ -296,8 +306,11 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
 
-    if mode == "write" {
-        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env);
+    if mode == "write" || mode == "check" {
+        // ADR-112 WD4 — `--check` is the writer's dry-run compare mode: same
+        // routing and merge decisions, nothing reaches disk, and the verdict
+        // is the exit status.
+        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env, mode == "check");
         return if path_status != ExitCode::SUCCESS { path_status } else { status };
     }
 
@@ -2129,6 +2142,9 @@ struct WriteResult {
     /// The refusal detail (reference `WriteResult#error`), on
     /// `skipped_invalid_encoding` / `skipped_unparseable` only.
     error: Option<String>,
+    /// `replaced` (reference `WriteResult#replaced`): applied candidates that
+    /// rewrote an existing member under `--overwrite`, with the old line.
+    replaced: Vec<(Candidate, String)>,
     /// `repaired_headers` (#2580): `Name[params]` per bare header repaired.
     repaired: Vec<String>,
 }
@@ -2160,6 +2176,7 @@ fn cmd_write(
     overwrite: bool,
     cfg: &crate::Config,
     sig_env: &SigEnv,
+    dry_run: bool,
 ) -> ExitCode {
     let project_root = std::env::current_dir()
         .and_then(|d| d.canonicalize())
@@ -2281,7 +2298,8 @@ fn cmd_write(
                 applied: Vec::new(),
                 skipped: Vec::new(),
                 error: None,
-                repaired: Vec::new(),
+            replaced: Vec::new(),
+        repaired: Vec::new(),
             });
             continue;
         }
@@ -2296,6 +2314,7 @@ fn cmd_write(
                 &merged.supers,
                 &merged.params,
                 overwrite,
+                dry_run,
             ));
             continue;
         }
@@ -2303,7 +2322,8 @@ fn cmd_write(
         // Reference `RbsValidity.source_error` on the create path
         // (writer.rb `create_new`): a render defect never reaches disk — the
         // whole target is refused (`:skipped_invalid_rbs`), same as a broken
-        // splice on the update path.
+        // splice on the update path. The check runs BEFORE the dry-run
+        // branch: `--check` reports a refusal the same way `--write` would.
         if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &content) {
             results.push(WriteResult {
                 source,
@@ -2312,16 +2332,19 @@ fn cmd_write(
                 applied: Vec::new(),
                 skipped: Vec::new(),
                 error: Some(detail),
+                replaced: Vec::new(),
                 repaired: Vec::new(),
             });
             continue;
         }
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        if std::fs::write(&target, content).is_err() {
-            eprintln!("sig-gen: failed to write {target_str}");
-            return ExitCode::from(1);
+        if !dry_run {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&target, content).is_err() {
+                eprintln!("sig-gen: failed to write {target_str}");
+                return ExitCode::from(1);
+            }
         }
         results.push(WriteResult {
             source,
@@ -2330,10 +2353,31 @@ fn cmd_write(
             applied: group,
             skipped: Vec::new(),
             error: None,
+            replaced: Vec::new(),
             repaired: Vec::new(),
         });
     }
 
+    // `out_of_date` — every result a `--write` would change or refuse; only
+    // `noop` / `skipped_outside_sig_root` stay silent under `--check`.
+    let stale: Vec<&WriteResult> = results
+        .iter()
+        .filter(|r| !matches!(r.action, "noop" | "skipped_outside_sig_root"))
+        .collect();
+    if dry_run {
+        match format {
+            "json" => render_check_json(&stale),
+            _ => render_check_text(&stale),
+        }
+        if format == "text" && !stale.is_empty() {
+            report_check_failure(&stale);
+        }
+        if format == "text" {
+            report_skipped(&skips);
+        }
+        report_unresolvable_superclasses(&unresolvable);
+        return if stale.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     match format {
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
@@ -2545,8 +2589,12 @@ fn render_write_text(results: &[WriteResult]) {
         match r.action {
             "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
             "updated" => {
-                // `applied_counts`: `+N`, then the repaired generic headers.
-                let mut counts = format!("+{}", r.applied.len());
+                // `applied_counts`: `+N` added lines, `replaced N` counted
+                // apart (a rewrite is not an addition), then repairs.
+                let mut counts = format!("+{}", r.applied.len() - r.replaced.len());
+                if !r.replaced.is_empty() {
+                    counts.push_str(&format!(", replaced {}", r.replaced.len()));
+                }
                 if !r.repaired.is_empty() {
                     counts.push_str(&format!(
                         ", repaired {} generic header(s): {}",
@@ -2567,30 +2615,194 @@ fn render_write_text(results: &[WriteResult]) {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target);
                 render_write_skips(r);
             }
-            "skipped_invalid_encoding" => {
-                println!(
-                    "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
-                    r.target
-                );
-                println!(
-                    "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
-                     read faithfully."
-                );
-            }
-            "skipped_unparseable" => {
-                println!("REFUSED {} — the existing file was not updated", r.target);
-                println!("  {}", r.error.as_deref().unwrap_or_default());
-                println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
-            }
-            "skipped_invalid_rbs" => {
-                println!(
-                    "REFUSED {} — the generated RBS does not parse, so it was not written",
-                    r.target
-                );
-                println!("  {}", r.error.as_deref().unwrap_or_default());
-                println!("  This is a bug in Rigor's RBS rendering, not in your code — please report it.");
+            "skipped_invalid_encoding" | "skipped_unparseable" | "skipped_invalid_rbs" => {
+                render_write_refusal(r)
             }
             _ => {}
+        }
+    }
+}
+
+/// The `REFUSED` block for a target the writer declines — shared by
+/// [`render_write_text`] and [`render_check_text`] (reference
+/// `render_write_invalid*`).
+fn render_write_refusal(r: &WriteResult) {
+    match r.action {
+        "skipped_invalid_encoding" => {
+            println!(
+                "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
+                r.target
+            );
+            println!(
+                "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
+                 read faithfully."
+            );
+        }
+        "skipped_unparseable" => {
+            println!("REFUSED {} — the existing file was not updated", r.target);
+            println!("  {}", r.error.as_deref().unwrap_or_default());
+            println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+        }
+        _ => {
+            println!(
+                "REFUSED {} — the generated RBS does not parse, so it was not written",
+                r.target
+            );
+            println!("  {}", r.error.as_deref().unwrap_or_default());
+            println!("  This is a bug in Rigor's RBS rendering, not in your code — please report it.");
+        }
+    }
+}
+
+/// `applied_counts` (reference `applied_counts`): `+N` added lines, with
+/// `, replaced N` when a rewrite applied and the repaired generic headers.
+fn applied_counts(r: &WriteResult) -> String {
+    let mut counts = format!("+{}", r.applied.len() - r.replaced.len());
+    if !r.replaced.is_empty() {
+        counts.push_str(&format!(", replaced {}", r.replaced.len()));
+    }
+    if !r.repaired.is_empty() {
+        counts.push_str(&format!(
+            ", repaired {} generic header(s): {}",
+            r.repaired.len(),
+            r.repaired.join(", ")
+        ));
+    }
+    counts
+}
+
+/// `--check` text report (reference `render_check_text` /
+/// `render_check_change`): `sig/ is up to date`, else one `would create` /
+/// `would update` line per stale target with the member lines it would add
+/// (`  - ` before `  + ` for a `--overwrite` replacement).
+fn render_check_text(stale: &[&WriteResult]) {
+    if stale.is_empty() {
+        println!("sig/ is up to date");
+        return;
+    }
+    for r in stale {
+        match r.action {
+            "created" => {
+                println!("would create {} ({} method(s))", r.target, r.applied.len());
+                render_check_applied(r);
+            }
+            "updated" => {
+                println!("would update {} ({})", r.target, applied_counts(r));
+                render_check_applied(r);
+            }
+            _ => render_write_refusal(r),
+        }
+    }
+}
+
+/// The `  - declared_rbs` (a replaced member) / `  + rbs` lines of one check
+/// entry (reference `render_check_change`'s per-candidate loop).
+fn render_check_applied(r: &WriteResult) {
+    for c in &r.applied {
+        if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
+            rc.method_name == c.method_name && rc.kind == c.kind
+        }) {
+            println!("  - {old}");
+        }
+        for line in c.rbs.lines() {
+            println!("  + {line}");
+        }
+    }
+}
+
+/// `--check --format json` (reference `render_check`): `{up_to_date, results,
+/// refused}` — the write entries with `created`/`updated` renamed to
+/// `would_*`. The port never produces `sig.skipped.inline-differs` rows (the
+/// inline-declaration feature is unported), so `refused` is always `[]`.
+fn render_check_json(stale: &[&WriteResult]) {
+    use serde_json::json;
+    let rows: Vec<_> = stale
+        .iter()
+        .map(|r| {
+            let applied: Vec<_> = r.applied.iter().map(candidate_json).collect();
+            let skipped: Vec<_> = r
+                .skipped
+                .iter()
+                .map(|s| {
+                    let c = &s.candidate;
+                    let mut obj = json!({
+                        "file": c.file, "class": c.class_name, "method": c.method_name,
+                        "kind": c.kind, "classification": s.classification, "rbs": c.rbs,
+                        "inferred_return": c.inferred_return, "write_skip_reason": "user_authored",
+                    });
+                    if let Some(dr) = &s.declared_return_rbs {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("declared_return_rbs".to_string(), json!(dr));
+                    }
+                    obj
+                })
+                .collect();
+            let action = match r.action {
+                "created" => "would_create",
+                "updated" => "would_update",
+                a => a,
+            };
+            let mut row = json!({
+                "source": r.source, "target": r.target, "action": action,
+                "applied": applied, "skipped": skipped,
+            });
+            if let Some(e) = &r.error {
+                row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            if !r.replaced.is_empty() {
+                let replaced: Vec<_> =
+                    r.replaced.iter().map(|(c, _)| candidate_json(c)).collect();
+                row.as_object_mut().unwrap().insert("replaced".to_string(), json!(replaced));
+            }
+            if !r.repaired.is_empty() {
+                row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
+            }
+            row
+        })
+        .collect();
+    println!(
+        "{}",
+        crate::json_document::stamp_pretty(
+            &serde_json::to_string_pretty(&json!({
+                "up_to_date": stale.is_empty(),
+                "results": rows,
+                "refused": [],
+            }))
+            .unwrap(),
+            None
+        )
+    );
+}
+
+/// The `--check` stderr verdict (reference `report_check_failure` +
+/// `refused_targets_line`): out-of-date targets counted apart from refused
+/// ones, and a refused target is listed as a hand fix unless the refusal was
+/// Rigor's own render.
+fn report_check_failure(stale: &[&WriteResult]) {
+    let (refusals, pending): (Vec<&&WriteResult>, Vec<&&WriteResult>) = stale.iter().partition(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    });
+    if !pending.is_empty() {
+        eprintln!(
+            "rigor sig-gen --check: {} signature file(s) out of date; run `rigor sig-gen --write` with the same options to update them.",
+            pending.len()
+        );
+    }
+    if !refusals.is_empty() {
+        let by_hand: Vec<&str> = refusals
+            .iter()
+            .filter(|r| r.action != "skipped_invalid_rbs")
+            .map(|r| r.target.as_str())
+            .collect();
+        let head = format!(
+            "rigor sig-gen --check: {} signature file(s) refused; `--write` does not update them",
+            refusals.len()
+        );
+        if by_hand.is_empty() {
+            eprintln!("{head}. The generated RBS did not parse: a Rigor bug, see its REFUSED line on stdout.");
+        } else {
+            eprintln!("{head}. Repair by hand: {}.", by_hand.join(", "));
         }
     }
 }
@@ -2807,6 +3019,7 @@ fn update_existing(
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
+    dry_run: bool,
 ) -> WriteResult {
     let Ok(bytes) = std::fs::read(target) else {
         return WriteResult {
@@ -2816,7 +3029,8 @@ fn update_existing(
             applied: Vec::new(),
             skipped: Vec::new(),
             error: None,
-            repaired: Vec::new(),
+            replaced: Vec::new(),
+        repaired: Vec::new(),
         };
     };
     // v0.4.7 (#2480/#2587): an existing target that is not UTF-8, or does not
@@ -2829,6 +3043,7 @@ fn update_existing(
         applied: Vec::new(),
         skipped: Vec::new(),
         error: Some(error),
+            replaced: Vec::new(),
         repaired: Vec::new(),
     };
     let Ok(source) = String::from_utf8(bytes) else {
@@ -2846,7 +3061,7 @@ fn update_existing(
     // `--write` re-run stays idempotent (the shell is present, no conflict). The
     // only uncovered case is merging into a USER-authored sig that lacks a shell
     // for a `Data.define` return — a documented follow-up, not a regression.
-    let MergeOutcome { source: merged, action, applied, skipped, repaired } =
+    let MergeOutcome { source: merged, action, applied, replaced, skipped, repaired } =
         apply_merge_with(source, candidates, kinds, supers, params, shells, overwrite);
     // Reference `RbsValidity.source_error`: a spliced result that does not
     // re-parse is a writer defect — refuse to write it (`:skipped_invalid_rbs`)
@@ -2855,13 +3070,16 @@ fn update_existing(
         if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &merged) {
             return refused("skipped_invalid_rbs", detail);
         }
-        let _ = std::fs::write(target, &merged);
+        if !dry_run {
+            let _ = std::fs::write(target, &merged);
+        }
     }
     WriteResult {
         source: source_path,
         target: target_str,
         action,
         applied,
+        replaced,
         skipped,
         error: None,
         repaired,
@@ -2874,6 +3092,11 @@ struct MergeOutcome {
     source: String,
     action: &'static str,
     applied: Vec<Candidate>,
+    /// The applied candidates that REPLACED an existing member line
+    /// (`--overwrite`), paired with the replaced line — the
+    /// `applied_counts` `, replaced N` tail and `--check`'s `  - ` diff
+    /// lines (reference `WriteResult#replaced` / `declared_rbs`).
+    replaced: Vec<(Candidate, String)>,
     skipped: Vec<SkipEntry>,
     /// `repaired_headers`: one `Name[params]` per bare generic header given
     /// its parameters (#2580/#2602).
@@ -2913,16 +3136,18 @@ fn apply_merge_with(
             source,
             action: "noop",
             applied: Vec::new(),
+            replaced: Vec::new(),
             skipped: Vec::new(),
             repaired: Vec::new(),
         };
     }
     let mut applied: Vec<Candidate> = Vec::new();
+    let mut replaced: Vec<(Candidate, String)> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
     let mut touched: Vec<String> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
         touched.push(class_name.clone());
-        merge_class(&mut source, &class_name, group, kinds, supers, params, overwrite, &mut applied, &mut skipped);
+        merge_class(&mut source, &class_name, group, kinds, supers, params, overwrite, &mut applied, &mut replaced, &mut skipped);
     }
     // `collapse_nested_declarations`: touched `Foo::Bar` decls move under an
     // existing `Foo` (rigor-rs#530). Runs after every merge so the parents
@@ -2932,7 +3157,7 @@ fn apply_merge_with(
     let repaired = repair_generic_headers(&mut source, params);
     // `state_changed?`: a repaired header is a change too.
     let action = if applied.is_empty() && repaired.is_empty() { "noop" } else { "updated" };
-    MergeOutcome { source, action, applied, skipped, repaired }
+    MergeOutcome { source, action, applied, replaced, skipped, repaired }
 }
 
 /// Reference `Writer#repair_generic_headers` (#2580/#2602): a declaration in
@@ -3068,6 +3293,7 @@ fn merge_class(
     params: &HashMap<String, String>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
+    replaced: &mut Vec<(Candidate, String)>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     // Extract owned decl info before mutating (the parsed tree borrows `source`).
@@ -3076,7 +3302,7 @@ fn merge_class(
         Err(_) => None,
     };
     match found {
-        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
+        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, replaced, skipped),
         None => insert_namespace_chain(source, class_name, candidates, kinds, supers, params, applied),
     }
 }
@@ -3213,6 +3439,7 @@ fn merge_into_existing(
     candidates: Vec<Candidate>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
+    replaced: &mut Vec<(Candidate, String)>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     let mut new_methods: Vec<Candidate> = Vec::new();
@@ -3280,6 +3507,7 @@ fn merge_into_existing(
         // leaves earlier offsets valid (reference sorts by `-member_position`).
         eligible.sort_by_key(|(_, (start, _))| std::cmp::Reverse(*start));
         for (c, (start, end)) in eligible {
+            replaced.push((clone_candidate(&c), source[start..end].to_string()));
             source.replace_range(start..end, &c.rbs);
             applied.push(c);
         }
