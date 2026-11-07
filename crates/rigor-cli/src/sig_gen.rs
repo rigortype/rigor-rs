@@ -905,23 +905,50 @@ fn generate_file_with_info(
             while let Some((name, _)) = top_level.next_if(|(_, start)| *start < end) {
                 out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
             }
-            walk_namespace(
-                &ast,
-                child,
-                &[],
-                path,
-                include_private,
-                &index,
-                &typer,
-                &env,
-                &fqns,
-                sig_env,
-                &layouts,
-                &modes,
-                &mut interner,
-                &mut out,
-                &mut definers,
-            );
+            if is_namespace_node(&ast, child, &[], &layouts) {
+                walk_namespace(
+                    &ast,
+                    child,
+                    &[],
+                    path,
+                    include_private,
+                    &index,
+                    &typer,
+                    &env,
+                    &fqns,
+                    sig_env,
+                    &layouts,
+                    &modes,
+                    &mut interner,
+                    &mut out,
+                    &mut definers,
+                );
+            } else {
+                // `if c; class N; def z; end; end` at TOP level: the
+                // conditional's namespace children still emit (`walk_defs`
+                // descends) — rigor-rs#535. Plain top-level `def`s are
+                // already reported by `top_level::collect`.
+                collect_conditional_definers(
+                    &ast,
+                    child,
+                    &[],
+                    false,
+                    false,
+                    path,
+                    include_private,
+                    &index,
+                    &typer,
+                    &env,
+                    &fqns,
+                    sig_env,
+                    &layouts,
+                    &modes,
+                    &[],
+                    &mut interner,
+                    &mut out,
+                    &mut definers,
+                );
+            }
             collect_namespace_info(&ast, child, &[], &mut info);
         }
     }
@@ -1417,8 +1444,18 @@ fn walk_namespace(
                             &qualified,
                             false,
                             matches!(ast.get(id), Node::ModuleDef { .. }),
+                            path,
+                            include_private,
+                            index,
+                            typer,
+                            env,
+                            fqns,
+                            sig_env,
                             layouts,
                             modes,
+                            &visibilities,
+                            interner,
+                            out,
                             definers,
                         );
                     }
@@ -1437,8 +1474,18 @@ fn walk_namespace(
                             &qualified,
                             false,
                             matches!(ast.get(id), Node::ModuleDef { .. }),
+                            path,
+                            include_private,
+                            index,
+                            typer,
+                            env,
+                            fqns,
+                            sig_env,
                             layouts,
                             modes,
+                            &visibilities,
+                            interner,
+                            out,
                             definers,
                         );
                     }
@@ -1497,8 +1544,18 @@ fn walk_namespace(
                         &qualified,
                         false,
                         matches!(ast.get(id), Node::ModuleDef { .. }),
+                        path,
+                        include_private,
+                        index,
+                        typer,
+                        env,
+                        fqns,
+                        sig_env,
                         layouts,
                         modes,
+                        &visibilities,
+                        interner,
+                        out,
                         definers,
                     );
                 }
@@ -1592,68 +1649,204 @@ fn collect_conditional_definers(
     prefix: &[String],
     in_singleton_class: bool,
     in_module: bool,
+    path: &str,
+    include_private: bool,
+    index: &CoreIndex,
+    typer: &Typer,
+    env: &TypeEnv,
+    fqns: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
     layouts: &MetaLayouts,
     modes: &HashMap<usize, module_function::Mode>,
+    visibilities: &[(String, Visibility)],
+    interner: &mut Interner,
+    out: &mut Vec<Candidate>,
     definers: &mut Vec<Definer>,
 ) {
-    let recurse = |ast: &LoweredAst,
-                   child: NodeId,
-                   prefix: &[String],
-                   sclass: bool,
-                   module: bool,
-                   definers: &mut Vec<Definer>| {
-        collect_conditional_definers(ast, child, prefix, sclass, module, layouts, modes, definers);
-    };
+    macro_rules! descend {
+        ($child:expr) => {
+            collect_conditional_definers(
+                ast,
+                $child,
+                prefix,
+                in_singleton_class,
+                in_module,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                visibilities,
+                interner,
+                out,
+                definers,
+            )
+        };
+        ($child:expr, sclass) => {
+            collect_conditional_definers(
+                ast,
+                $child,
+                prefix,
+                true,
+                in_module,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                visibilities,
+                interner,
+                out,
+                definers,
+            )
+        };
+        ($child:expr, depth) => {
+            collect_conditional_definers(
+                ast,
+                $child,
+                prefix,
+                in_singleton_class,
+                in_module,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                visibilities,
+                interner,
+                out,
+                definers,
+            )
+        };
+    }
     match ast.get(id) {
-        Node::ClassDef { name, rooted, body, .. } | Node::ModuleDef { name, rooted, body, .. } => {
-            let child_prefix = declaration_prefix(prefix, name, *rooted);
-            let module = matches!(ast.get(id), Node::ModuleDef { .. });
-            for &b in body {
-                recurse(ast, b, &child_prefix, false, module, definers);
-            }
-        }
-        // `Const = Data.define(...) do … end` inside a conditional: the block
-        // is the new class's own body (`meta_block_body`).
-        Node::ConstantWrite { name, value, .. }
+        // A nested `class`/`module`/layout-carrying `Const =` inside a
+        // conditional is a REAL namespace: its body's direct statements are
+        // `certain_definers` and candidates — the same walk the top level
+        // takes (`Emit::Nested`), so hand the whole node to
+        // `walk_namespace` (rigor-rs#535).
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => walk_namespace(
+            ast,
+            id,
+            prefix,
+            path,
+            include_private,
+            index,
+            typer,
+            env,
+            fqns,
+            sig_env,
+            layouts,
+            modes,
+            interner,
+            out,
+            definers,
+        ),
+        Node::ConstantWrite { name, .. }
             if layouts.get(&qualify_join(prefix, name)).is_some() =>
         {
-            if let Node::Call { block_body, .. } = ast.get(*value) {
-                let mut child_prefix = prefix.to_vec();
-                child_prefix.push(name.clone());
-                for &b in block_body {
-                    recurse(ast, b, &child_prefix, false, false, definers);
-                }
-            }
+            walk_namespace(
+                ast,
+                id,
+                prefix,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                interner,
+                out,
+                definers,
+            );
         }
         Node::Definition { is_singleton_class: true, body, .. } => {
-            for &b in body {
-                recurse(ast, b, prefix, true, in_module, definers);
+            // `class << self` under a conditional: its direct defs are
+            // certain singleton definers AND candidates; deeper children
+            // recurse as uncertain (`mark_certain_body` marks the body's
+            // direct statements wherever the body sits).
+            for &inner in body {
+                match ast.get(inner) {
+                    Node::Definition {
+                        name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
+                    } => {
+                        let sig = sig_of(
+                            n.as_str(), b, params, param_shape, *has_explicit_return, true, false, span.0,
+                        );
+                        if let Some(c) = method_candidate(
+                            ast, &sig, None, &prefix.join("::"), path, include_private, index, typer, env, fqns, sig_env, interner,
+                        ) {
+                            out.push(c);
+                        }
+                        definers.push(Definer {
+                            class_name: prefix.join("::"),
+                            kind: "singleton",
+                            method_name: n.clone(),
+                            offset: span.0,
+                            certain: true,
+                        });
+                    }
+                    _ => descend!(inner, sclass),
+                }
             }
         }
         // A `def` is a definer itself; its BODY is out of bounds
         // (`walk_attr_calls` returns at DefNode).
-        Node::Definition { name, singleton_name, span, .. } => {
+        Node::Definition { name, singleton_name, body: b, params, param_shape, has_explicit_return, span, .. } => {
             if let Some(n) = name.as_ref().or(singleton_name.as_ref()) {
-                let kind = if in_singleton_class || singleton_name.is_some() {
-                    "singleton"
-                } else {
-                    "instance"
-                };
-                definers.push(Definer {
-                    class_name: prefix.join("::"),
-                    kind,
-                    method_name: n.clone(),
-                    offset: span.0,
-                    certain: false,
-                });
-                if !in_singleton_class
+                let singleton = in_singleton_class || singleton_name.is_some();
+                let class_name = prefix.join("::");
+                // Candidates the reference emits even here (`walk_defs`
+                // collects every def); the definer is UNCERTAIN — only
+                // direct statements are `certain_definers` (rigor-rs#535).
+                if !class_name.is_empty() {
+                    let vis = if singleton {
+                        None
+                    } else {
+                        visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v)
+                    };
+                    let sig = sig_of(
+                        n.as_str(), b, params, param_shape, *has_explicit_return, singleton, false, span.0,
+                    );
+                    if let Some(c) = method_candidate(
+                        ast, &sig, vis, &class_name, path, include_private, index, typer, env, fqns, sig_env, interner,
+                    ) {
+                        out.push(c);
+                    }
+                }
+                if !class_name.is_empty() {
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: if singleton { "singleton" } else { "instance" },
+                        method_name: n.clone(),
+                        offset: span.0,
+                        certain: false,
+                    });
+                }
+                if !class_name.is_empty()
+                    && !in_singleton_class
                     && matches!(
                         modes.get(&span.0),
                         Some(module_function::Mode::On) | Some(module_function::Mode::Uncertain)
                     )
                 {
                     definers.push(Definer {
-                        class_name: prefix.join("::"),
+                        class_name,
                         kind: "singleton",
                         method_name: n.clone(),
                         offset: span.0,
@@ -1700,40 +1893,46 @@ fn collect_conditional_definers(
                     }
                 }
             }
-            for &b in args.iter().chain(block_body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            for &b in args {
+                descend!(b);
+            }
+            // A literal block is a deferred scope — `def`s inside still
+            // define on the prefix, but a `def` at an empty prefix is not
+            // the reported top-level kind (`@block_depth`).
+            for &b in block_body {
+                descend!(b);
             }
         }
         Node::If { predicate, then_body, else_body, .. } => {
-            recurse(ast, *predicate, prefix, in_singleton_class, in_module, definers);
+            descend!(*predicate);
             for &b in then_body.iter().chain(else_body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::Case { predicate, branches, else_body, .. } => {
             if let Some(p) = predicate {
-                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+                descend!(*p);
             }
             for &b in branches.iter().chain(else_body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::When { conditions, body, .. } => {
             for &b in conditions.iter().chain(body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::Loop { predicate, body, .. } => {
             if let Some(p) = predicate {
-                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+                descend!(*p);
             }
             for &b in body {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::BeginRescue { body, .. } | Node::Statements { body, .. } => {
             for &b in body {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         // Expression-level containers carry the same children
@@ -1744,51 +1943,56 @@ fn collect_conditional_definers(
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => {
-            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            descend!(*value);
         }
         Node::MultiWrite { value, target_exprs, .. } => {
-            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            descend!(*value);
             for &b in target_exprs {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::IndexWrite { receiver, indices, value, .. } => {
             if let Some(r) = receiver {
-                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+                descend!(*r);
             }
             for &b in indices.iter().chain(std::iter::once(value)) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::Logical { left, right, .. } => {
-            recurse(ast, *left, prefix, in_singleton_class, in_module, definers);
-            recurse(ast, *right, prefix, in_singleton_class, in_module, definers);
-        }
-        Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
-            for &b in body {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
-            for &b in parts {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
-            for &b in elements {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::Range { left, right, .. } => {
-            for bound in [left, right].into_iter().flatten() {
-                recurse(ast, *bound, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::AttrWrite { receiver, value, .. } => {
             if let Some(r) = receiver {
-                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+                descend!(*r);
             }
-            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            descend!(*value);
+        }
+        Node::Logical { left, right, .. } => {
+            descend!(*left);
+            descend!(*right);
+        }
+        Node::Lambda { body, .. } => {
+            for &b in body {
+                descend!(b);
+            }
+        }
+        Node::Return { values: body, .. } => {
+            for &b in body {
+                descend!(b);
+            }
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            for &b in parts {
+                descend!(b);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &b in elements {
+                descend!(b);
+            }
+        }
+        Node::Range { left, right, .. } => {
+            for bound in [left, right].into_iter().flatten() {
+                descend!(*bound);
+            }
         }
         _ => {}
     }
