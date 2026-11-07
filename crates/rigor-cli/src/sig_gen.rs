@@ -2849,7 +2849,7 @@ struct MergeOutcome {
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
-/// `action: "noop"`; otherwise each class group (first-seen order) is merged or
+/// `action: "noop"`; otherwise each class group (class-name order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
 #[cfg(test)]
 fn apply_merge(
