@@ -150,7 +150,17 @@ fn ruby_inspect_string(s: &str) -> String {
             '\x0b' => out.push_str("\\v"),
             '\x1b' => out.push_str("\\e"),
             '#' => out.push('#'),
-            c if (c as u32) < 0x20 || c == '\x7f' || (0x80..=0x9f).contains(&(c as u32)) => {
+            c if (c as u32) < 0x20
+                || c == '\x7f'
+                || (0x80..=0x9f).contains(&(c as u32))
+                || (0x200e..=0x200f).contains(&(c as u32))
+                || (0x2028..=0x202e).contains(&(c as u32))
+                || (0x2066..=0x2069).contains(&(c as u32))
+                || (0xfff9..=0xfffb).contains(&(c as u32))
+                || (0xd800..=0xdfff).contains(&(c as u32))
+                || (0x10fffe..=0x10ffff).contains(&(c as u32))
+                || (c as u32) == 0xfeff =>
+            {
                 out.push_str(&format!("\\u{:04X}", c as u32))
             }
             c => out.push(c),

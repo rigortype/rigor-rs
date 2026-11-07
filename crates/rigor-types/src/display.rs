@@ -372,11 +372,11 @@ const OPERATOR_SYMNAMES: &[&str] = &[
 ];
 
 /// One character that may appear inside a Ruby identifier (`is_identchar`).
-/// On the PINNED Ruby (4.x) the check is encoding-aware: non-ASCII
-/// alphanumeric characters count too — `:café` and `:é` inspect BARE
-/// (rigor-rs#493 item 3).
+/// On the PINNED Ruby (4.x) the check is encoding-aware: ANY printable
+/// multi-byte char counts, not just alphanumerics — `:§`, `:١` and `:😀`
+/// inspect bare (rigor-rs#493 item 3 review).
 fn identchar(c: char) -> bool {
-    c.is_ascii_alphanumeric() || c == '_' || (c.is_alphanumeric() && !c.is_ascii())
+    c.is_ascii_alphanumeric() || c == '_' || (!c.is_ascii() && ruby_printable(c))
 }
 
 /// `is_global_name_punct`'s byte set (parse.y `SPECIAL_PUNCT`): the
@@ -412,10 +412,10 @@ fn special_global_tail(tail: &str) -> bool {
 fn ident_tail(name: &str, allow_sigil: bool) -> bool {
     let mut chars = name.chars();
     // First char: `_`, an ASCII letter, or — encoding-aware on the pinned
-    // Ruby — a non-ASCII alphabetic (`:é` inspects bare).
+    // Ruby — any printable multi-byte char (`:é`, `:١` inspect bare).
     if !chars
         .next()
-        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic() || (c.is_alphabetic() && !c.is_ascii()))
+        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic() || (!c.is_ascii() && ruby_printable(c)))
     {
         return false;
     }
