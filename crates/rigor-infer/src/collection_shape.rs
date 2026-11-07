@@ -402,9 +402,7 @@ impl<'i> Typer<'i> {
                 // receiver read happens first (`output << 'a'` reads the seed).
                 if let Some(name) = &local {
                     if let Some(&ty) = tenv.get(name) {
-                        if let Some(class) = self.coll_carrier(interner, ty) {
-                            out.insert(id, CollSnap { class, carrier: ty });
-                        }
+                        self.record_coll_snap(out, id, ty, interner);
                     }
                 }
                 // The mutator's effect is decided by the PRE-call carrier
@@ -524,9 +522,7 @@ impl<'i> Typer<'i> {
                 // arm does (`output[k] += 1` reads the seed).
                 if let Some(name) = &local {
                     if let Some(&ty) = tenv.get(name) {
-                        if let Some(class) = self.coll_carrier(interner, ty) {
-                            out.insert(id, CollSnap { class, carrier: ty });
-                        }
+                        self.record_coll_snap(out, id, ty, interner);
                     }
                 }
                 let widened = match local.as_ref().and_then(|name| {
@@ -870,6 +866,43 @@ impl<'i> Typer<'i> {
     /// `Tuple` dispatches as `Array` and a `HashShape` as `Hash`, and a kept
     /// `Nominal[Array|Hash]` (mutator-widened or tier-folded) dispatches as
     /// itself. Every other carrier — including a `Union` — declines.
+    /// Record one call site's collection snapshot. A site re-evaluated by a
+    /// retry re-run (the `begin`'s protected body replayed over the arm's
+    /// retry-edge scope) records its carrier AGAIN — the reference's carrier
+    /// at the site is the JOIN of every pass's env (`c = [1]; begin; c.nope;
+    /// rescue; c = [2]; retry; end` types `c` `[1] | [2]` there), so merge the
+    /// fresh carrier into the recorded one instead of overwriting it. The
+    /// union keeps its member classes' names when one collection class
+    /// survives (`coll_carrier` answers `None` on a union — the rule declines
+    /// it before rendering, so `class` never witnesses).
+    fn record_coll_snap(
+        &self,
+        out: &mut HashMap<NodeId, CollSnap>,
+        id: NodeId,
+        ty: TypeId,
+        interner: &mut Interner,
+    ) {
+        if let Some(prev) = out.get(&id).copied() {
+            // A re-evaluated pass records a possibly DIFFERENT carrier: the
+            // site's type is their join (the re-run's `c` needs no collection
+            // class to contribute — `c = [2]` and `c = "s"` arms both join).
+            if prev.carrier != ty {
+                let carrier = self.union_members(vec![prev.carrier, ty], interner);
+                out.insert(
+                    id,
+                    CollSnap {
+                        class: prev.class,
+                        carrier,
+                    },
+                );
+            }
+            return;
+        }
+        if let Some(class) = self.coll_carrier(interner, ty) {
+            out.insert(id, CollSnap { class, carrier: ty });
+        }
+    }
+
     fn coll_carrier(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
         match interner.get(ty) {
             Type::Tuple(_) => Some("Array"),

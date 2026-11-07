@@ -854,6 +854,14 @@ pub(crate) fn check_collection_call(
     }
     // (2) The flow pass must have typed this exact call's receiver.
     let rigor_infer::CollSnap { class: class_name, carrier } = *snapshots.get(&call_id)?;
+    // A carrier re-evaluated by a retry re-run records the JOIN of every
+    // pass's env — a union. The union rule owns those receivers on the
+    // reference (its `nope` on `[1] | [2]` is silent while `zark` on
+    // `"s" | [1]` fires `for "s" | [1]`), and this snapshot cannot reach that
+    // surface, so it declines rather than invent a member or a bare nominal.
+    if matches!(interner.get(carrier), Type::Union(_)) {
+        return None;
+    }
     // (3) Dynamic/Top-only: any concrete carrier at the use site declines.
     let rty = typer.type_of(ast, receiver, env, interner);
     if !matches!(interner.get(rty), Type::Dynamic(_) | Type::Top) {
