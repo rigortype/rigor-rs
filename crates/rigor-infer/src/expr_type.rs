@@ -165,6 +165,14 @@ impl<'i> Typer<'i> {
                 interner.intern(Type::Constant(Scalar::Sym(value.clone())))
             }
             Node::NilLit { .. } => interner.intern(Type::Constant(Scalar::Nil)),
+            // A `def` expression evaluates to its method name as a Symbol —
+            // `def y = 1` is `:y`, so `def x; def y = 1; end` returns `:y`
+            // (and under a branch `(:y | nil)`). `def self.t` is `:t`; a
+            // `class << self` form carries no method name and stays
+            // `untyped` (rigor-rs#539).
+            Node::Definition { name: Some(name), .. } => {
+                interner.intern(Type::Constant(Scalar::Sym(name.clone())))
+            }
             Node::TrueLit { .. } => interner.intern(Type::Constant(Scalar::Bool(true))),
             Node::FalseLit { .. } => interner.intern(Type::Constant(Scalar::Bool(false))),
             Node::LocalVariableRead { name, .. } => env
