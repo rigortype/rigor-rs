@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/172_singleton_cyclic_project_sig.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 11,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `zork' for singleton(C)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 12,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `zork' for singleton(Both)"
+    }
+  ]
+}
