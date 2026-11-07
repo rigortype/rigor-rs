@@ -1234,6 +1234,55 @@ impl CoreData {
                     fails.insert(q);
                 }
             }
+            // …but the nil def DOES chain down the links that keep a
+            // definition build alive (measured on the oracle):
+            //   * `Sub < Failed` fails (and `E < Sub` transitively) — a class
+            //     superclass link needs the superclass's def to exist.
+            //   * `module M : Hash` fails on its OWN self-type clause, and a
+            //     `class C; include M` fails with it — the mixin self-type
+            //     must satisfy a real def.
+            //   * `C include MF` (a def-nil module with NO self-type) does
+            //     NOT fail `C` — `c.zork` fires.
+            //   * `Integer` walks a nil `Kernel` mixin — `i.wut` fires.
+            loop {
+                let mut grew = false;
+                for (&q, entry) in &builder.qualified {
+                    if fails.contains(q) {
+                        continue;
+                    }
+                    let resolve = |w: &str, ctx: &Vec<&'static str>| {
+                        builder.resolve_type_name_rbs(w, ctx)
+                    };
+                    let self_type_fails = |e: &ClassEntry| {
+                        e.self_types_written.iter().any(|(sw, sctx)| {
+                            resolve(sw, sctx).is_some_and(|t| fails.contains(t))
+                        })
+                    };
+                    let super_fails = entry
+                        .superclass_written
+                        .as_ref()
+                        .is_some_and(|(w, ctx)| {
+                            resolve(w, ctx).is_some_and(|t| fails.contains(t))
+                        });
+                    let own_self_fails = self_type_fails(entry);
+                    let mixin_self_fails = entry
+                        .includes_written
+                        .iter()
+                        .chain(&entry.prepends_written)
+                        .any(|(w, ctx)| {
+                            resolve(w, ctx)
+                                .and_then(|m| builder.qualified.get(m))
+                                .is_some_and(self_type_fails)
+                        });
+                    if super_fails || own_self_fails || mixin_self_fails {
+                        fails.insert(q);
+                        grew = true;
+                    }
+                }
+                if !grew {
+                    break;
+                }
+            }
             // The mark rides the `_def_nil` channel, NOT the plain
             // `dup_unbuildable` blank: a param-mismatch failure leaves the
             // class's own def nil while DESCENDANTS still build (Integer
@@ -1663,10 +1712,10 @@ impl CoreData {
         let mut seen: HashSet<&'static str> = HashSet::new();
         let mut complete = true;
         for pre in &entry.prepends {
-            self.collect(pre, &mut order, &mut seen, &mut complete);
+            self.collect(pre, &mut order, &mut seen, &mut complete, false);
         }
         for inc in &entry.includes {
-            self.collect(inc, &mut order, &mut seen, &mut complete);
+            self.collect(inc, &mut order, &mut seen, &mut complete, false);
         }
         // A MODULE gets `Object` here too. RBS gives a module declaration an
         // implicit self-type of `::Object` when it declares none, so a value
@@ -1684,7 +1733,7 @@ impl CoreData {
             }
         });
         if let Some(s) = sup {
-            self.collect(s, &mut order, &mut seen, &mut complete);
+            self.collect(s, &mut order, &mut seen, &mut complete, false);
         }
         if self.lookup_on_chain(&order, method).is_some() || self.attr_on_chain(&order, method) {
             return true;
@@ -2833,7 +2882,7 @@ impl CoreData {
         let mut seen: HashSet<&'static str> = HashSet::new();
         let mut on_stack: HashSet<&'static str> = HashSet::new();
         let mut ok = true;
-        self.collect_qualified(start, &mut order, &mut seen, &mut on_stack, &mut ok);
+        self.collect_qualified(start, &mut order, &mut seen, &mut on_stack, &mut ok, true);
         (order, ok)
     }
 
@@ -2850,6 +2899,7 @@ impl CoreData {
         seen: &mut HashSet<&'static str>,
         on_stack: &mut HashSet<&'static str>,
         ok: &mut bool,
+        at_start: bool,
     ) {
         if !*ok {
             return;
@@ -2872,9 +2922,7 @@ impl CoreData {
         // `i.wut` still fires. At the walk's own START a `def_nil` entry is
         // still inconclusive — `qualified_ancestors("Hash")` must not stand
         // behind `h.zzz`.
-        if entry.instance_unbuildable
-            && (!entry.instance_def_nil || order.is_empty())
-        {
+        if entry.instance_unbuildable && (!entry.instance_def_nil || at_start) {
             *ok = false;
             return;
         }
@@ -2898,7 +2946,7 @@ impl CoreData {
         // See `collect`: a PREPENDED module precedes the prepending class.
         for (w, ctx) in &entry.prepends_written {
             match self.resolve_written_ref(w, ctx) {
-                Some(m) => self.collect_qualified(m, order, seen, on_stack, ok),
+                Some(m) => self.collect_qualified(m, order, seen, on_stack, ok, false),
                 None => {
                     *ok = false;
                     return;
@@ -2911,7 +2959,7 @@ impl CoreData {
         order.push(key);
         for (w, ctx) in &entry.includes_written {
             match self.resolve_written_ref(w, ctx) {
-                Some(m) => self.collect_qualified(m, order, seen, on_stack, ok),
+                Some(m) => self.collect_qualified(m, order, seen, on_stack, ok, false),
                 None => {
                     *ok = false;
                     return;
@@ -2941,7 +2989,7 @@ impl CoreData {
                 *ok = false;
                 return;
             }
-            self.collect_qualified(s, order, seen, on_stack, ok);
+            self.collect_qualified(s, order, seen, on_stack, ok, false);
         }
     }
 
@@ -4028,7 +4076,7 @@ impl CoreData {
         let mut order: Vec<&'static str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut complete = true;
-        self.collect(class_name, &mut order, &mut seen, &mut complete);
+        self.collect(class_name, &mut order, &mut seen, &mut complete, true);
         (order, complete)
     }
 
@@ -4038,6 +4086,7 @@ impl CoreData {
         order: &mut Vec<&'static str>,
         seen: &mut HashSet<&'static str>,
         complete: &mut bool,
+        at_start: bool,
     ) {
         let Some((&key, entry)) = self.classes.get_key_value(name) else {
             // Referenced ancestor not loaded ⇒ chain incomplete.
@@ -4058,9 +4107,7 @@ impl CoreData {
         // stands — `i.wut` still fires through a nil `Kernel` (rigor-rs#493).
         // At the walk's own START it stays inconclusive (`Hash` itself must
         // not stand behind `h.zzz`).
-        if entry.instance_unbuildable
-            && (!entry.instance_def_nil || order.is_empty())
-        {
+        if entry.instance_unbuildable && (!entry.instance_def_nil || at_start) {
             *complete = false;
         }
         // PREPENDED modules sit AHEAD of the class in Ruby's MRO, so they are
@@ -4068,16 +4115,16 @@ impl CoreData {
         // over the class's own. (`seen` already holds `key`, so a module that
         // prepends its own prepender terminates.)
         for pre in &entry.prepends {
-            self.collect(pre, order, seen, complete);
+            self.collect(pre, order, seen, complete, false);
         }
         order.push(key);
         // Included modules sit between the class and its superclass in Ruby's
         // method resolution order; for *existence* the order doesn't matter.
         for inc in &entry.includes {
-            self.collect(inc, order, seen, complete);
+            self.collect(inc, order, seen, complete, false);
         }
         if let Some(sup) = entry.superclass {
-            self.collect(sup, order, seen, complete);
+            self.collect(sup, order, seen, complete, false);
         }
     }
 
