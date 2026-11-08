@@ -931,6 +931,19 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// The truthiness of `predicate` when its type decides it (`if true`,
+    /// `if 1 > 2`, `if @x.to_s`), as `type_of(If)` elides the dead arm on.
+    pub fn known_polarity(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        predicate: NodeId,
+        interner: &mut Interner,
+    ) -> Option<bool> {
+        let ty = self.type_of(ast, predicate, env, interner);
+        self.predicate_polarity(interner, ty)
+    }
+
     fn predicate_polarity(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => Some(false),

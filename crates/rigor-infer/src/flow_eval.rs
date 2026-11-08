@@ -85,9 +85,26 @@ impl<'i> Typer<'i> {
     /// conditional bodies sig-gen return typing reads (`if c; a = 1; end; a`
     /// → `(1 | nil)`, `while c; a = "s"; end` after `a = 1` → `("s" | 1)`).
     /// An arm's binding joins with the name's ENTRY type — `nil` when the
-    /// name was unbound at entry, since the arm may not run. `begin`/`rescue`,
-    /// op-writes and block bodies are left to `bind_statement` (decline), a
-    /// coverage loss vs the reference's flow env, never a wrong type.
+    /// name was unbound at entry, since the arm may not run.
+    ///
+    /// Everything the replay does not model DECLINES: a local the reference
+    /// would re-type there is bound to `untyped`, so a later read is
+    /// `Dynamic` — a coverage loss against the reference's flow env, never a
+    /// wrong type. The declines (rigor-rs#546 reviews):
+    ///
+    /// - a statement holding a DECISION (an `if` / `case` / loop predicate,
+    ///   `&&` / `||` left, `&.` receiver) that reads a typed local: the
+    ///   reference narrows and constant-folds on it ([`Self::replay_opaque`]);
+    /// - a local written at a position the replay does not walk — a
+    ///   predicate, an argument, an interpolation, a pattern, an `else`
+    ///   clause, a `for` index, a `rescue => e` ([`Self::widen_shell`]);
+    /// - a named-capture `=~` (unknown bound names);
+    /// - a construct arm that may leave the join (`return`, `raise`, a
+    ///   possibly-`bot` helper call) — the names it writes
+    ///   ([`Self::arm_suspect`]); a loop with `break` / `next` / `redo`;
+    ///   `begin` with `else` or `retry`; `case`/`in`;
+    /// - a rescue clause / ensure body reads the names the protected body
+    ///   writes as `untyped` (the reference's #1837 rule).
     fn replay_statements(
         &self,
         ast: &LoweredAst,
@@ -97,164 +114,326 @@ impl<'i> Typer<'i> {
         returns: &mut Vec<(NodeId, TypeId)>,
     ) {
         for &stmt in stmts {
-            // `return e` mid-body: its value types at the position it runs,
-            // not against the body's final env.
-            if let Node::Return { values, .. } = ast.get(stmt) {
-                if let [v] = values.as_slice() {
-                    let ty = self.type_of(ast, *v, env, interner);
-                    returns.push((*v, ty));
-                }
-            }
-            match ast.get(stmt) {
-                Node::If { then_body, else_body, .. } => {
-                    // An empty `else` IS an arm that leaves every name at its
-                    // entry binding — `if c; a = 1; end` joins `a` with `nil`.
-                    self.join_arm_writes(ast, env, &[then_body, else_body], interner, returns);
-                }
-                Node::Logical { right, .. } => {
-                    // `c && a = 1` / `c || a = 1`: the right side runs only
-                    // when the left's truthiness reaches it — a one-arm join.
-                    self.join_arm_writes(ast, env, &[std::slice::from_ref(right), &[]], interner, returns);
-                }
-                // `begin`+`rescue`: the protected body and each clause are
-                // alternative paths — `begin; a = 1; rescue; a = 2; end; a`
-                // joins `(1 | 2)`, and a name only the protected body binds
-                // widens to `nil`. With no rescue clause the main body is the
-                // only path (straight-line; the `else`/`in` carriers lower
-                // their statements into `main_body`/`body` alike).
-                Node::BeginRescue { main_body, body, clauses, ensure_body, .. } => {
-                    if clauses.is_empty() {
-                        self.replay_statements(ast, env, body, interner, returns);
-                    } else {
-                        let mut arms: Vec<Vec<NodeId>> = vec![main_body.clone()];
-                        arms.extend(clauses.iter().map(|c| c.body.clone()));
-                        let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
-                        self.join_arm_writes(ast, env, &arm_refs, interner, returns);
-                    }
-                    // `ensure` always runs — its writes apply after the join
-                    // (`begin; a = 1; rescue; a = 2; ensure; a = 3; end` → 3).
-                    self.replay_statements(ast, env, ensure_body, interner, returns);
-                }
-                Node::Case { branches, else_body, .. } => {
-                    // (see join_arm_writes)
-                    // Each `When` node's body is one arm; a missing `else`
-                    // reads as a no-op arm via `entry` inside the join.
-                    let mut arms: Vec<Vec<NodeId>> = branches
-                        .iter()
-                        .map(|&b| match ast.get(b) {
-                            Node::When { body, .. } => body.clone(),
-                            _ => vec![b],
-                        })
-                        .collect();
-                    arms.push(else_body.clone());
-                    let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
-                    self.join_arm_writes(ast, env, &arm_refs, interner, returns);
-                }
-                Node::Loop { predicate, body, span, .. } => {
-                    // The body runs zero or more times: the empty arm below is
-                    // the zero-iteration path (entry env).
-                    let before = returns.len();
-                    let marks = self.def_local_marks(ast);
-                    let changed = marks.changed_within(*span);
-                    let folds = predicate.is_some_and(|p| {
-                        marks.reads_within(ast.get(p).span()).iter().any(|n| {
-                            env.get(*n).is_some_and(|&t| {
-                                matches!(interner.get(t), Type::Constant(_) | Type::IntegerRange { .. })
-                            })
-                        })
-                    });
-                    self.join_arm_writes(ast, env, &[body, &[]], interner, returns);
-                    // A predicate that reads a constant-bound local is one the
-                    // reference folds (`while i < 3` over `i = 0` reads `bot`,
-                    // `while i > 3` never enters and keeps `i`); the
-                    // zero-or-more join below is wrong for the names such a
-                    // loop changes — decline them. (A bare literal predicate
-                    // is not folded there: `while true` joins like any other.)
-                    let decided = folds;
-                    if decided {
-                        let untyped = interner.untyped();
-                        for name in &changed {
-                            if env.get(name).is_some() {
-                                env.insert(name.clone(), untyped);
-                            }
-                        }
-                    }
-                    // A `return` recorded inside the body typed its value at
-                    // its source position, but the loop carries later writes
-                    // (and mutations) of the names it reads round to the next
-                    // iteration (`while c; return a if x; a = "s"; end`).
-                    if !changed.is_empty() {
-                        let untyped = interner.untyped();
-                        for (value, ty) in returns[before..].iter_mut() {
-                            if marks.reads_any_within(ast.get(*value).span(), &changed) {
-                                *ty = untyped;
-                            }
-                        }
-                    }
-                }
-                Node::Statements { body, .. } => {
-                    self.replay_statements(ast, env, body, interner, returns);
-                }
-                // A `x op= v` write's stored type is the dispatch result
-                // (`a + v` for `+=`, `narrow_truthy(a) | v` for `||=`) —
-                // the lowered node does not keep the operator. Widening the
-                // local to `untyped` declines the method (the tail then
-                // reads `Dynamic`) rather than emit the stale pre-write type
-                // — `a = nil; a ||= "default"; a` must not emit `-> nil`.
-                Node::LocalVariableOpWrite { name, .. } => {
-                    env.insert(name.clone(), interner.untyped());
-                }
-                Node::Call { block_body, .. } if !block_body.is_empty() => {
-                    // A block may run and rebind a captured local — its
-                    // writes are not modelled (block params are unbindable
-                    // here), so every name the block could rebind widens to
-                    // `untyped`. Without this `a = :s; loop do; a = 1; break;
-                    // end; a` kept `:s` (review).
-                    self.bind_statement(ast, stmt, env, interner);
-                    let mut block_env = env.clone();
-                    self.replay_statements(ast, &mut block_env, block_body, interner, returns);
-                    let untyped = interner.untyped();
-                    for (name, ty) in block_env.iter() {
-                        if env.get(name) != Some(ty) {
-                            env.insert(name.clone(), untyped);
-                        }
-                    }
-                }
-                _ => self.bind_statement(ast, stmt, env, interner),
+            let marks = self.def_local_marks(ast);
+            let span = ast.get(stmt).span();
+            let guards = self.typed_decision_reads(&marks, env, span, interner);
+            let wild = marks.wild_within(span);
+            if guards.is_empty() && !wild {
+                self.replay_one(ast, &marks, env, stmt, interner, returns);
+            } else {
+                self.replay_opaque(ast, &marks, env, stmt, &guards, wild, interner, returns);
             }
             // A mutation or closure write inside the statement leaves the
             // literal carrier a binding holds stale (`r = []; r << 1`,
             // `s = "a"; items.each { |i| s << i }`): the reference widens it,
             // the replay declines it (`def_local_marks`).
-            self.apply_def_local_marks(ast, env, ast.get(stmt).span(), interner);
+            self.apply_def_local_marks(ast, env, span, interner);
+        }
+    }
+
+    /// A statement the replay cannot model — a decision on a typed local, or
+    /// an unknown-name binding. It is replayed on a CLONE with the decision's
+    /// locals widened (so a `return` inside records its in-position type),
+    /// then every local it writes — and the decision's locals — are declined
+    /// in the real env.
+    #[allow(clippy::too_many_arguments)]
+    fn replay_opaque(
+        &self,
+        ast: &LoweredAst,
+        marks: &crate::def_local_marks::DefLocalMarks,
+        env: &mut TypeEnv,
+        stmt: NodeId,
+        guards: &[String],
+        wild: bool,
+        interner: &mut Interner,
+        returns: &mut Vec<(NodeId, TypeId)>,
+    ) {
+        let span = ast.get(stmt).span();
+        let before = returns.len();
+        let mut clone = env.clone();
+        if wild {
+            Self::widen_all(&mut clone, interner);
+        } else {
+            Self::widen_names(&mut clone, guards, interner);
+        }
+        self.replay_one(ast, marks, &mut clone, stmt, interner, returns);
+        // A `return` whose value holds the decision itself read it typed.
+        let untyped = interner.untyped();
+        for (value, ty) in returns[before..].iter_mut() {
+            let vs = ast.get(*value).span();
+            if wild || marks.wild_within(vs) || marks.reads_any_within_decisions(vs, guards) {
+                *ty = untyped;
+            }
+        }
+        if wild {
+            Self::widen_all(env, interner);
+        }
+        Self::widen_names(env, guards, interner);
+        Self::widen_names(env, &marks.written_within(span), interner);
+    }
+
+    /// One statement of the replay (see [`Self::replay_statements`]).
+    fn replay_one(
+        &self,
+        ast: &LoweredAst,
+        marks: &crate::def_local_marks::DefLocalMarks,
+        env: &mut TypeEnv,
+        stmt: NodeId,
+        interner: &mut Interner,
+        returns: &mut Vec<(NodeId, TypeId)>,
+    ) {
+        // `return e` mid-body: its value types at the position it runs,
+        // not against the body's final env.
+        if let Node::Return { values, .. } = ast.get(stmt) {
+            if let [v] = values.as_slice() {
+                let ty = self.type_of(ast, *v, env, interner);
+                returns.push((*v, ty));
+            }
+        }
+        let span = ast.get(stmt).span();
+        // A write at a position this replay does not walk is stale.
+        self.widen_shell(ast, marks, env, stmt, interner);
+        match ast.get(stmt) {
+            Node::If { predicate, then_body, else_body, is_unless, .. } => {
+                // A literal-only predicate is constant-folded by the
+                // reference: the dead arm never runs. A decided one replays
+                // the live arm; an undecided one (`if true && false`) is not
+                // modelled and declines.
+                let folded = self.known_polarity(ast, env, *predicate, interner);
+                let literal = crate::def_local_marks::literal_like(ast, *predicate);
+                if literal && folded.is_none() {
+                    self.replay_discard(ast, env, &[then_body, else_body], interner, returns);
+                    Self::widen_names(env, &marks.written_within(span), interner);
+                } else if literal {
+                    let (live, dead) =
+                        if folded == Some(!*is_unless) { (then_body, else_body) } else { (else_body, then_body) };
+                    if crate::def_local_marks::body_span(ast, dead)
+                        .is_some_and(|sp| marks.has_exit_within(sp, &[crate::def_local_marks::ExitKind::Return]))
+                    {
+                        // A `return` in the dead arm: whether the reference
+                        // still collects its value is not modelled.
+                        self.replay_discard(ast, env, &[then_body, else_body], interner, returns);
+                        Self::widen_names(env, &marks.written_within(span), interner);
+                    } else {
+                        self.replay_statements(ast, env, live, interner, returns);
+                    }
+                } else {
+                    // An empty `else` IS an arm that leaves every name at its
+                    // entry binding — `if c; a = 1; end` joins `a` with `nil`.
+                    self.join_arm_writes(ast, env, &[(then_body, &[]), (else_body, &[])], interner, returns);
+                }
+            }
+            Node::Logical { left, .. } if crate::def_local_marks::literal_like(ast, *left) => {
+                // `true && (a = 2)`: a literal left decides whether the right
+                // runs; the reference folds it. Not modelled.
+                self.replay_discard(ast, env, &[std::slice::from_ref(match ast.get(stmt) {
+                    Node::Logical { right, .. } => right,
+                    _ => unreachable!(),
+                })], interner, returns);
+                Self::widen_names(env, &marks.written_within(span), interner);
+            }
+            Node::Logical { right, .. } => {
+                // `c && a = 1` / `c || a = 1`: the right side runs only
+                // when the left's truthiness reaches it — a one-arm join.
+                self.join_arm_writes(
+                    ast,
+                    env,
+                    &[(std::slice::from_ref(right), &[]), (&[], &[])],
+                    interner,
+                    returns,
+                );
+            }
+            // `begin`+`rescue`: the protected body and each clause are
+            // alternative paths — `begin; a = 1; rescue; a = 2; end; a`
+            // joins `(1 | 2)`, and a name only the protected body binds
+            // widens to `nil`. A clause enters from ANY point of the body, so
+            // it reads the names the body writes as `untyped`; so does the
+            // `ensure`, which also runs on every path.
+            Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, .. } => {
+                let retry = marks.has_exit_within(span, &[crate::def_local_marks::ExitKind::Retry]);
+                if *has_else || retry {
+                    // `else` replaces the body's value / `retry` re-enters it:
+                    // not modelled — decline everything the begin writes.
+                    let mut arms: Vec<&[NodeId]> = vec![body];
+                    arms.extend(clauses.iter().map(|c| c.body.as_slice()));
+                    self.replay_discard(ast, env, &arms, interner, returns);
+                    Self::widen_names(env, &marks.written_within(span), interner);
+                } else if clauses.is_empty() {
+                    if ensure_body.is_empty() {
+                        self.replay_statements(ast, env, body, interner, returns);
+                    } else {
+                        self.replay_statements(ast, env, main_body, interner, returns);
+                        Self::widen_names(env, &marks.changed_within(span), interner);
+                        self.replay_statements(ast, env, ensure_body, interner, returns);
+                    }
+                } else {
+                    let stale = crate::def_local_marks::body_span(ast, main_body)
+                        .map(|sp| marks.changed_within(sp))
+                        .unwrap_or_default();
+                    let mut arms: Vec<(&[NodeId], &[String])> = vec![(main_body.as_slice(), &[])];
+                    arms.extend(clauses.iter().map(|c| (c.body.as_slice(), stale.as_slice())));
+                    self.join_arm_writes(ast, env, &arms, interner, returns);
+                    if !ensure_body.is_empty() {
+                        Self::widen_names(env, &marks.changed_within(span), interner);
+                        self.replay_statements(ast, env, ensure_body, interner, returns);
+                    }
+                }
+            }
+            Node::Case { branches, else_body, .. } => {
+                // Each `When` node's body is one arm; a missing `else`
+                // reads as a no-op arm via `entry` inside the join.
+                // `case`/`in` raises on no match and joins only the actual
+                // arms — not modelled: decline what it writes.
+                if branches.iter().all(|&b| matches!(ast.get(b), Node::When { .. })) {
+                    let mut arms: Vec<(&[NodeId], &[String])> = branches
+                        .iter()
+                        .map(|&b| match ast.get(b) {
+                            Node::When { body, .. } => (body.as_slice(), &[][..]),
+                            _ => (&[][..], &[][..]),
+                        })
+                        .collect();
+                    arms.push((else_body.as_slice(), &[]));
+                    self.join_arm_writes(ast, env, &arms, interner, returns);
+                } else {
+                    let mut arms: Vec<&[NodeId]> = branches
+                        .iter()
+                        .map(|&b| match ast.get(b) {
+                            Node::When { body, .. } => body.as_slice(),
+                            Node::BeginRescue { body, .. } => body.get(1..).unwrap_or(&[]),
+                            _ => &[][..],
+                        })
+                        .collect();
+                    arms.push(else_body.as_slice());
+                    self.replay_discard(ast, env, &arms, interner, returns);
+                    Self::widen_names(env, &marks.written_within(span), interner);
+                }
+            }
+            Node::Loop { body, kind, .. } => {
+                use crate::def_local_marks::ExitKind as K;
+                let before = returns.len();
+                let changed = marks.changed_within(span);
+                // A `begin … end while` body runs at least once; `for` types
+                // as its collection; `break` / `next` / `redo` leave the loop
+                // from the middle of the body — none is modelled.
+                let jumps = marks.has_exit_within(span, &[K::Break, K::Next, K::Redo, K::Retry]);
+                let once = matches!(
+                    kind,
+                    rigor_parse::LoopKind::While { begin_modifier: true }
+                        | rigor_parse::LoopKind::Until { begin_modifier: true }
+                );
+                if jumps || once || matches!(kind, rigor_parse::LoopKind::For) {
+                    self.replay_discard(ast, env, &[body], interner, returns);
+                    Self::widen_names(env, &marks.written_within(span), interner);
+                } else {
+                    // The body runs zero or more times: the empty arm below
+                    // is the zero-iteration path (entry env).
+                    self.join_arm_writes(ast, env, &[(body, &[]), (&[], &[])], interner, returns);
+                }
+                // A `return` recorded inside the body typed its value at
+                // its source position, but the loop carries later writes
+                // (and mutations) of the names it reads round to the next
+                // iteration (`while c; return a if x; a = "s"; end`).
+                if !changed.is_empty() {
+                    let untyped = interner.untyped();
+                    for (value, ty) in returns[before..].iter_mut() {
+                        if marks.reads_any_within(ast.get(*value).span(), &changed) {
+                            *ty = untyped;
+                        }
+                    }
+                }
+            }
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                self.replay_statements(ast, env, body, interner, returns);
+            }
+            // A carrier with no sequence order (`rescue` modifier,
+            // `super(…)`, `yield(…)`, `defined?`, `BEGIN` / `END`): its
+            // writes were declined by `widen_shell`; nothing binds.
+            Node::Statements { .. } => {}
+            // A `x op= v` write's stored type is the dispatch result
+            // (`a + v` for `+=`, `narrow_truthy(a) | v` for `||=`) —
+            // the lowered node does not keep the operator. Widening the
+            // local to `untyped` declines the method (the tail then
+            // reads `Dynamic`) rather than emit the stale pre-write type
+            // — `a = nil; a ||= "default"; a` must not emit `-> nil`.
+            Node::LocalVariableOpWrite { name, .. } => {
+                env.insert(name.clone(), interner.untyped());
+            }
+            Node::Call { block_body, .. } if !block_body.is_empty() => {
+                // A block may run and rebind a captured local — its
+                // writes are not modelled (block params are unbindable
+                // here), so every name the block could rebind widens to
+                // `untyped`. Without this `a = :s; loop do; a = 1; break;
+                // end; a` kept `:s` (review).
+                self.bind_statement(ast, stmt, env, interner);
+                let mut block_env = env.clone();
+                self.replay_statements(ast, &mut block_env, block_body, interner, returns);
+                let untyped = interner.untyped();
+                for (name, ty) in block_env.iter() {
+                    if env.get(name) != Some(ty) {
+                        env.insert(name.clone(), untyped);
+                    }
+                }
+            }
+            _ => self.bind_statement(ast, stmt, env, interner),
+        }
+    }
+
+    /// Replay each arm on its own clone of `env` and discard the result —
+    /// only to record the `return`s inside (typed at their positions).
+    fn replay_discard(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        arms: &[&[NodeId]],
+        interner: &mut Interner,
+        returns: &mut Vec<(NodeId, TypeId)>,
+    ) {
+        for arm in arms {
+            let mut e = env.clone();
+            self.replay_statements(ast, &mut e, arm, interner, returns);
         }
     }
 
     /// Join the locals rebound inside each `arm` body into `env`: every name an
     /// arm binds gets the union of the type each arm leaves it at — the entry
     /// binding on an arm that does not rebind it, `nil` when it was unbound
-    /// both there and at entry (the arm may never have run).
+    /// both there and at entry (the arm may never have run). Each arm carries
+    /// the names its ENTRY reads as `untyped`. An arm that may leave the
+    /// construct (`Self::arm_suspect`) has the names it writes declined: the
+    /// reference drops a terminating arm from the join.
     fn join_arm_writes(
         &self,
         ast: &LoweredAst,
         env: &mut TypeEnv,
-        arms: &[&[NodeId]],
+        arms: &[(&[NodeId], &[String])],
         interner: &mut Interner,
         returns: &mut Vec<(NodeId, TypeId)>,
     ) {
         let entry = env.clone();
         let nil = interner.nil();
+        let marks = self.def_local_marks(ast);
         let mut bound: Vec<String> = Vec::new();
         let mut arm_envs: Vec<TypeEnv> = Vec::new();
-        for arm in arms {
+        let mut written: Vec<String> = Vec::new();
+        let mut any_suspect = false;
+        for (arm, entry_stale) in arms {
             let mut e = entry.clone();
+            Self::widen_names(&mut e, entry_stale, interner);
             self.replay_statements(ast, &mut e, arm, interner, returns);
             arm_envs.push(e);
+            if let Some(sp) = crate::def_local_marks::body_span(ast, arm) {
+                written.extend(marks.written_within(sp));
+                any_suspect |= self.arm_suspect(ast, arm).is_some();
+            }
         }
+        // The reference drops a terminating arm from the join, so a sibling
+        // arm's write is the only one left (`if c; a = 2; else; raise; end`
+        // reads `2`): when ANY arm may leave, every name the arms write is
+        // declined.
+        let suspect = if any_suspect { written } else { Vec::new() };
         // An EMPTY arm contributes the entry env unchanged (the `else_body`
         // of an else-less `if` is `[]`, and the loop body's zero-iteration
         // path is `entry` itself — appended by callers below).
-        let _ = &arm_envs;
         for ae in &arm_envs {
             for (name, _) in ae.iter() {
                 if !bound.contains(name) {
@@ -280,6 +459,7 @@ impl<'i> Typer<'i> {
             });
             env.insert(name, joined);
         }
+        Self::widen_names(env, &suspect, interner);
     }
 
     /// [`Self::build_toplevel_env`] for the `check` rules: the same straight-line

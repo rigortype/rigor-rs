@@ -2017,6 +2017,16 @@ fn method_candidate(
             entry.insert(name.clone(), untyped);
         }
     }
+    // The def's own decisions: a Dynamic local narrowed by a type test and
+    // read in a second decision may be constant-folded by the reference.
+    struct ScopeGuard<'a>(&'a std::cell::Cell<Option<rigor_parse::Span>>);
+    impl Drop for ScopeGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(None);
+        }
+    }
+    typer.def_scope.set(rigor_infer::body_span(ast, sig.body));
+    let _scope_guard = ScopeGuard(&typer.def_scope);
     let (local, positional_returns) =
         typer.bind_statements_into_with_returns(ast, &entry, sig.body, interner);
     let env = &local;
@@ -2058,6 +2068,14 @@ fn method_candidate(
             None => interner.nil(),
         };
         push_flat(interner, &mut members, ty);
+    }
+
+    // A union INSIDE a tuple / hash-shape slot (`[1 | nil]`, a def-local
+    // typed local joined across a branch) prints in the interner's canonical
+    // member order, not the reference's describe-sorted order — a shared-method
+    // byte mismatch, so the method declines (rigor-rs#546 review).
+    if members.iter().any(|&m| composite_holds_union(interner, m)) {
+        return row(None);
     }
 
     // `dynamic_top?` (a reference PERMANENT skip): any Top/Dynamic member — or any
@@ -2401,10 +2419,15 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
                     barriers.push(ast.get(b).span());
                 }
             }
+            // A def whose body is a `rescue` / `ensure` chain lowers to one
+            // `BeginRescue` region spanning the whole def, so the def ITSELF
+            // would match as a "nested" barrier and swallow every `return`
+            // (rigor-rs#546 review 3: `def f; 5; ensure; return 3; end`
+            // lost its `3`). The def's own start offset identifies it.
             Node::Definition { span, .. }
             | Node::ClassDef { span, .. }
             | Node::ModuleDef { span, .. }
-                if within(*span, &regions) =>
+                if within(*span, &regions) && span.0 != sig.offset =>
             {
                 barriers.push(*span);
             }
@@ -2438,15 +2461,29 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
     Some(collected)
 }
 
+/// Whether a tuple / hash shape holds a union in one of its slots (at any
+/// depth through further tuples and shapes).
+fn composite_holds_union(interner: &Interner, ty: TypeId) -> bool {
+    match interner.get(ty) {
+        Type::Tuple(elems) => elems.iter().any(|&e| {
+            matches!(interner.get(e), Type::Union(_)) || composite_holds_union(interner, e)
+        }),
+        Type::HashShape(members) => members.iter().any(|m| {
+            matches!(interner.get(m.value), Type::Union(_)) || composite_holds_union(interner, m.value)
+        }),
+        _ => false,
+    }
+}
+
 /// A method's inferred return type, or `None` for an empty body (reference
 /// `DefReturnTyper`): the last statement's type, an assignment tail evaluating to
 /// its RHS value, a `return E` tail to its value (`nil` when bare — the oracle
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
-/// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
-/// `annotate` deferral) and is then skipped upstream.
+/// the def-local env (rigor-rs#546).
 /// `Some(Some(ty))` — the tail's type; `Some(None)` — a control tail whose
 /// every value leaf is a `return`, contributing no member; `None` — skip
-/// (empty body, multi-value `return` tail).
+/// (empty body, multi-value `return` tail, or a tail shape the def-local env
+/// does not model: see [`control_tail_types`]).
 #[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
@@ -2459,9 +2496,16 @@ fn def_return_type(
     interner: &mut Interner,
 ) -> Option<Option<TypeId>> {
     let &tail = body.last()?;
+    // A tail holding a decision on a typed local (the reference narrows /
+    // folds on it) or an unknown-name `=~` binding declines; a write at a
+    // position the replay does not walk is widened.
+    let tail_env = typer.tail_env(ast, env, tail, interner)?;
+    let env = &tail_env;
     match ast.get(tail) {
+        // `x op= v`: the lowered node keeps the operand, not the operator —
+        // typing the operand (`a = 1; a += 1` → `1`) would be wrong.
+        Node::LocalVariableOpWrite { .. } => None,
         Node::LocalVariableWrite { value, .. }
-        | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => {
@@ -2478,7 +2522,9 @@ fn def_return_type(
             // exits the method — it is already in `returns`), an absent
             // `else` contributes `nil`, a loop tail contributes `nil`.
             let mut members: Vec<TypeId> = Vec::new();
-            control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members);
+            if !control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members) {
+                return None;
+            }
             match members.len() {
                 0 => Some(None),
                 _ => Some(Some(
@@ -2495,8 +2541,22 @@ fn def_return_type(
 /// Push the value-contributing tail types of a control expression onto
 /// `out` — each arm's last non-`return` statement typed under the ARM's env
 /// (an arm's earlier writes bind there: `if c; a = 1; a; end` contributes
-/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else` and
-/// a loop tail contribute `nil`.
+/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else`
+/// contributes `nil`, and so does a loop tail that cannot carry a value.
+///
+/// Returns `false` to DECLINE the whole tail — the reference types these
+/// shapes by rules the def-local env does not model, so any typed answer
+/// would be a guess (rigor-rs#546 review 3):
+///
+/// - a `begin` with an `else` (the `else` value replaces the body's) or a
+///   `retry`; an ensure's value is discarded — `begin; 5; ensure; @m =
+///   false; end` is `5`, the protected body's tail;
+/// - a `for` loop (its value is the collection) and a `while` / `until` that
+///   holds a `break` (the break value joins `nil`) or runs its body first
+///   (`begin … end while`);
+/// - a `case`/`in` (no-match raises; patterns bind), a `rescue` modifier and
+///   the other non-sequence carriers;
+/// - a decision on a typed local, a named-capture `=~` ([`Typer::tail_env`]).
 #[allow(clippy::too_many_arguments)]
 fn control_tail_types(
     ast: &LoweredAst,
@@ -2508,7 +2568,7 @@ fn control_tail_types(
     env: &TypeEnv,
     interner: &mut Interner,
     out: &mut Vec<TypeId>,
-) {
+) -> bool {
     #[allow(clippy::too_many_arguments)]
     fn body_tail(
         ast: &LoweredAst,
@@ -2520,46 +2580,115 @@ fn control_tail_types(
         env: &TypeEnv,
         interner: &mut Interner,
         out: &mut Vec<TypeId>,
-    ) {
+    ) -> bool {
         let Some(&tail) = body.last() else {
             out.push(interner.nil());
-            return;
+            return true;
         };
         // The arm's own writes bind before its tail is read.
         let arm = typer.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
-        control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out);
+        control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out)
     }
+    use rigor_infer::ExitKind;
+    let Some(env) = typer.tail_env(ast, env, id, interner) else { return false };
+    let env = &env;
+    let marks = typer.def_local_marks(ast);
     match ast.get(id) {
-        Node::Return { .. } => {}
-        Node::If { then_body, else_body, .. } => {
-            body_tail(ast, typer, index, class_name, fqns, then_body, env, interner, out);
-            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out);
+        Node::Return { .. } => true,
+        Node::If { predicate, then_body, else_body, is_unless, .. } => {
+            // A predicate whose type decides it elides the dead arm
+            // (`type_of(If)`; `if true; 1; else; 2; end` is `1`); a
+            // literal-only predicate the port cannot decide
+            // (`if true && false`) is folded by the reference — decline.
+            match typer.known_polarity(ast, env, *predicate, interner) {
+                Some(b) => {
+                    let live = if b != *is_unless { then_body } else { else_body };
+                    body_tail(ast, typer, index, class_name, fqns, live, env, interner, out)
+                }
+                None if rigor_infer::literal_like(ast, *predicate) => false,
+                None => {
+                    body_tail(ast, typer, index, class_name, fqns, then_body, env, interner, out)
+                        && body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
+                }
+            }
         }
         Node::Case { branches, else_body, .. } => {
             for &b in branches {
                 match ast.get(b) {
-                    Node::When { body, .. } => body_tail(ast, typer, index, class_name, fqns, body, env, interner, out),
-                    _ => out.push(tail_value_type(ast, typer, env, b, index, class_name, fqns, interner)),
+                    Node::When { body, .. } => {
+                        if !body_tail(ast, typer, index, class_name, fqns, body, env, interner, out) {
+                            return false;
+                        }
+                    }
+                    // `case`/`in`: not modelled.
+                    _ => return false,
                 }
             }
-            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out);
+            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
         }
-        Node::BeginRescue { main_body, body, clauses, .. } => {
-            // An `else`/`in`/paren carrier (empty clauses) is a statements
-            // wrapper — its tail is the body's. A real begin/rescue's value is
-            // the protected tail OR a clause tail.
+        Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, span, .. } => {
+            if *has_else || marks.has_exit_within(*span, &[ExitKind::Retry]) {
+                return false;
+            }
             if clauses.is_empty() {
-                body_tail(ast, typer, index, class_name, fqns, body, env, interner, out);
+                // A statements / `else` / `in` / paren carrier (nothing to
+                // protect) is its body's tail; an ensure-only `begin`'s value
+                // is the protected body's, never the ensure's.
+                let tail_body = if ensure_body.is_empty() { body } else { main_body };
+                body_tail(ast, typer, index, class_name, fqns, tail_body, env, interner, out)
             } else {
-                body_tail(ast, typer, index, class_name, fqns, main_body, env, interner, out);
-                for c in clauses {
-                    body_tail(ast, typer, index, class_name, fqns, &c.body, env, interner, out);
+                // The protected tail, or a clause's: a clause enters from any
+                // point of the body, so it reads the names the body writes
+                // as `untyped`.
+                if !body_tail(ast, typer, index, class_name, fqns, main_body, env, interner, out) {
+                    return false;
                 }
+                let mut clause_env = env.clone();
+                if let Some(sp) = rigor_infer::body_span(ast, main_body) {
+                    rigor_infer::Typer::widen_names(&mut clause_env, &marks.changed_within(sp), interner);
+                }
+                for c in clauses {
+                    if !body_tail(ast, typer, index, class_name, fqns, &c.body, &clause_env, interner, out) {
+                        return false;
+                    }
+                }
+                true
             }
         }
-        Node::Loop { .. } => out.push(interner.nil()),
-        Node::Statements { body, .. } => body_tail(ast, typer, index, class_name, fqns, body, env, interner, out),
-        _ => out.push(tail_value_type(ast, typer, env, id, index, class_name, fqns, interner)),
+        Node::Loop { kind, span, .. } => {
+            let once = matches!(
+                kind,
+                rigor_parse::LoopKind::While { begin_modifier: true }
+                    | rigor_parse::LoopKind::Until { begin_modifier: true }
+            );
+            if once
+                || matches!(kind, rigor_parse::LoopKind::For)
+                || marks.has_exit_within(*span, &[ExitKind::Break, ExitKind::Redo, ExitKind::Retry])
+            {
+                return false;
+            }
+            out.push(interner.nil());
+            true
+        }
+        Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
+            body_tail(ast, typer, index, class_name, fqns, body, env, interner, out)
+        }
+        // A `rescue` modifier, `super(…)`, `yield(…)`, `defined?`: no
+        // sequence order to read a tail from.
+        Node::Statements { .. } => false,
+        // `x op= v` keeps the operand, not the operator.
+        Node::LocalVariableOpWrite { .. } => false,
+        Node::LocalVariableWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            out.push(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner));
+            true
+        }
+        _ => {
+            out.push(tail_value_type(ast, typer, env, id, index, class_name, fqns, interner));
+            true
+        }
     }
 }
 
