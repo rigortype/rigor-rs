@@ -1309,10 +1309,15 @@ impl CoreData {
         // side needs no flag here: dispatch already declines these classes
         // (`qualified_ancestors` reports the chain incomplete), so only the
         // singleton twin joins the blanking set.
+        // A param-mismatch (`def_nil`) class is NOT a closure seed: its nil
+        // def is traversable-empty for descendants (`Integer` builds over a
+        // nil `Kernel`; `String.zork` fires through a nil `Kernel`
+        // singleton — rigor-rs#522). Its own singleton and the classes the
+        // `fails` fixpoint reaches are already marked via `nil_marks`.
         let mut dup_unbuildable = std::mem::take(&mut builder.dup_unbuildable);
         let instance_failed: std::collections::HashSet<&'static str> = dup_unbuildable
             .iter()
-            .filter(|&&(_, single)| !single)
+            .filter(|&&(q, single)| !single && !nil_marks.contains(&(q, false)))
             .map(|&(q, _)| q)
             .collect();
         {
