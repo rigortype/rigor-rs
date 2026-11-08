@@ -144,6 +144,11 @@ struct Candidate {
     /// `# [tighter, was: X]` tag / `- def …` diff line / JSON `declared_return_rbs`);
     /// `None` for a `new_method`.
     declared_return_rbs: Option<String>,
+    /// For a `tighter_return` over the class's OWN declaration, that member's
+    /// whitespace-squished source — the `--diff` `- ` line (reference
+    /// `MethodCandidate#declared_rbs`). `None` when only an ancestor declares
+    /// the method; the diff then falls back to `- def <name>: () -> <declared>`.
+    declared_rbs: Option<String>,
     /// The `--print` declaration line for this candidate's class group
     /// (`module Geometry`, `class Geometry::Pair < ::Data`) — see
     /// [`declaration_header`]. Stamped once the whole file's [`NamespaceInfo`] is
@@ -1140,6 +1145,7 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         inferred_return: "untyped".to_string(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: Some((META_MEMBER_OFFSET, false)),
@@ -2346,6 +2352,7 @@ fn method_candidate(
             classification: "new_method",
             definer: Some((sig.offset, sig.module_function)),
             declared_return_rbs: None,
+            declared_rbs: None,
             decl_header: String::new(),
             skip_reason: None,
         });
@@ -2555,6 +2562,76 @@ fn method_candidate(
         return row(None);
     };
 
+    // A tighter return changes the return and ONLY the return: the reference
+    // re-spells the class's own declared overload with the new return
+    // (`tighter_return_line`), keeping the author's parameter types, block and
+    // type parameters. The port reuses the declared head when it is a canonical
+    // simple one and DECLINES any other own declaration (rigor-rs#544 review:
+    // `(Integer) -> Numeric` must not become `(untyped) -> Float`). A method
+    // only an ancestor declares keeps the `def`-shaped head, as for a new method.
+    let (rbs, head, declared_rbs) = if classification == "tighter_return" {
+        match sig_env.own_head(class_name, sig.name, sig.singleton) {
+            sig_env::OwnHead::NotOwn => (rbs, head, None),
+            sig_env::OwnHead::Own(sig_env::Head::Reusable { head: declared, source }) => (
+                format!("{prefix}{}: {declared} -> {ret}", sig.name),
+                declared.clone(),
+                Some(source.clone()),
+            ),
+            sig_env::OwnHead::Own(sig_env::Head::Declined) => return row(None),
+        }
+    } else {
+        (rbs, head, None)
+    };
+
+    // Declared `untyped`: the reference's tighter-return writes the inferred
+    // member WIDENED to its nominal — `def i = 1` against `-> untyped` emits
+    // `() -> Integer`, not `() -> 1` (rigor-rs#544). Members that erase to a
+    // literal spelling re-erase to their class name; others keep their form.
+    let (rbs, erased) = if declared_return_rbs.as_deref() == Some("untyped") {
+        let mut widened: Vec<String> = Vec::new();
+        for (m, e) in members.iter().zip(&erased_members) {
+            if e == "nil" {
+                // A `nil` member is not a pinned literal — it keeps its
+                // spelling inside the widened union.
+                if !widened.contains(&e.clone()) {
+                    widened.push(e.clone());
+                }
+                continue;
+            }
+            if matches!(e.as_str(), "true" | "false") {
+                // A bool literal member widens to the `(false | true)` pair,
+                // not `TrueClass` / `FalseClass` (rigor-rs#544).
+                for b in ["false", "true"] {
+                    if !widened.contains(&b.to_string()) {
+                        widened.push(b.to_string());
+                    }
+                }
+                continue;
+            }
+            let e = if matches!(interner.get(*m), Type::Constant(_))
+                && index.class_name_of(interner, *m) != Some(e.as_str())
+            {
+                index
+                    .class_name_of(interner, *m)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.clone())
+            } else {
+                e.clone()
+            };
+            if !widened.contains(&e) {
+                widened.push(e);
+            }
+        }
+        // The reference's `erase_to_rbs` union lists members in SORTED order
+        // (`Integer < String`, `Integer < nil`, `false < true`).
+        widened.sort();
+        let erased = widened.join(" | ");
+        let ret = paren_wrap_union(&erased);
+        (format!("{prefix}{}: {head} -> {ret}", sig.name), erased)
+    } else {
+        (rbs, erased)
+    };
+
     Some(Candidate {
         file: path.to_string(),
         class_name: class_name.to_string(),
@@ -2564,6 +2641,7 @@ fn method_candidate(
         inferred_return: erased,
         classification,
         declared_return_rbs,
+        declared_rbs,
         decl_header: String::new(),
         skip_reason: None,
         definer: Some((sig.offset, sig.module_function)),
@@ -2590,6 +2668,7 @@ fn non_emitted(
         inferred_return: String::new(),
         classification: if reason.is_some() { "skipped" } else { "dropped" },
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: reason,
         definer: None,
@@ -2688,6 +2767,27 @@ fn classify(
             if inferred_erased == decl {
                 return None;
             }
+            // Declared `untyped` accepts every concrete inferred form and is
+            // never accepted back — always `tighter` (rigor-rs#544). The
+            // single-member gate below does not apply: a union widens
+            // member-wise in the emit. A whole-return `nil` reads as
+            // equivalent (the reference's `untyped`-accepts-`nil`), so it
+            // drops; a literal `nil` INSIDE a union member stays `nil`.
+            if decl == "untyped" {
+                if inferred_erased == "nil" {
+                    return None;
+                }
+                // The reference widens a literal nested in a tuple element, a
+                // record value or a covariant generic argument
+                // (`[1, 2]` ⇒ `[Integer, Integer]`, `{ a: 1 }` ⇒
+                // `{ a: Integer }`); the emit here widens top-level members
+                // only. A composite member carrying a nested pinned literal is
+                // declined rather than emitted unwidened.
+                if members.iter().any(|&m| nested_pinned_literal(interner, m, false)) {
+                    return None;
+                }
+                return Some(("tighter_return", Some(decl)));
+            }
             // A tightening must be a SINGLE bare carrier whose nominal-of is
             // exactly the declared class. A union (`> 1` member) never bare-tightens
             // a single declared class (FP-safe under-emit; e.g. declared union member
@@ -2696,9 +2796,18 @@ fn classify(
                 [single] => *single,
                 _ => return None,
             };
-            // Wider / unrelated: the inferred's nominal is not the declared class
-            // (probe F — declared `Integer`, inferred `"hi"` → `String`).
-            if index.class_name_of(interner, inferred_ty) != Some(decl.as_str()) {
+            // Wider / unrelated: the inferred's nominal must ACCEPT the
+            // declared class — `decl` is the inferred class itself or one of
+            // its ancestors (declared `Numeric`, inferred `4.2` → `Float`;
+            // rigor-rs#544). String equality alone missed every strict
+            // subtype. An ancestor chain that fails to resolve (unknown or
+            // incomplete) refuses — the decline side.
+            let inferred_class = index.class_name_of(interner, inferred_ty);
+            let accepts = inferred_class == Some(decl.as_str())
+                || inferred_class
+                    .and_then(|c| index.ancestor_names(c))
+                    .is_some_and(|chain| chain.contains(&decl.as_str()));
+            if !accepts {
                 return None;
             }
             // `pins_literal_over_declaration?` (#837): a proposal that erases to
@@ -2708,9 +2817,13 @@ fn classify(
             // may; a Range's and a Set's erasure carries a type argument, so
             // they are excluded by class. (The inferred value's class is `decl`
             // here: the check above returned otherwise.)
+            // `rbs_literal?`: a Constant is PINNED only when its erasure is a
+            // literal spelling — i.e. differs from its own class name, not from
+            // `decl` (a Float constant erases to `Float`, an ordinary nominal;
+            // rigor-rs#544).
             if matches!(interner.get(inferred_ty), Type::Constant(_))
                 && !matches!(decl.as_str(), "Range" | "Set")
-                && inferred_erased != decl
+                && inferred_class != Some(inferred_erased)
             {
                 return None;
             }
@@ -2729,8 +2842,68 @@ fn classify(
             if computed_literal_tightening(interner, inferred_ty, raw_tail) {
                 return None;
             }
+            // The reference folds an all-literal computation (`4.2.to_s`,
+            // `[1].size.to_f`, `Math.sqrt(4)`) to a `Constant` and then drops
+            // it as `computed_literal_tightening?`. The port types such a
+            // tail as the scalar nominal; decline it when the whole tail is a
+            // closed literal expression (no local, ivar, self or parameter
+            // leaf) and the nominal is a foldable scalar class.
+            if matches!(interner.get(inferred_ty), Type::Nominal { .. })
+                && matches!(
+                inferred_class,
+                Some(
+                    "Integer" | "Float" | "String" | "Symbol" | "Rational" | "Complex"
+                        | "TrueClass" | "FalseClass" | "NilClass"
+                )
+            ) && closed_literal_expr(ast, *sig.body.last()?)
+            {
+                return None;
+            }
             Some(("tighter_return", Some(decl)))
         }
+    }
+}
+
+/// Whether `ty` is (or, inside a union, contains) a tuple / record / generic
+/// nominal carrying a pinned literal (`Constant`) nested inside — the shapes the
+/// reference's `widen_value_literals` widens element-wise. A top-level
+/// `Constant` is handled by the member-wise widening and does not count
+/// (`nested == false`).
+fn nested_pinned_literal(interner: &Interner, ty: TypeId, nested: bool) -> bool {
+    match interner.get(ty) {
+        Type::Constant(_) => nested,
+        Type::Union(ms) => ms.iter().any(|&m| nested_pinned_literal(interner, m, nested)),
+        Type::Tuple(es) => es.iter().any(|&e| nested_pinned_literal(interner, e, true)),
+        Type::HashShape(ms) => ms.iter().any(|m| nested_pinned_literal(interner, m.value, true)),
+        Type::Nominal { args, .. } => args.iter().any(|&a| nested_pinned_literal(interner, a, true)),
+        _ => false,
+    }
+}
+
+/// A closed literal expression: literals, constant reads and array literals of
+/// them, and block-less calls whose receiver and arguments are closed — an
+/// expression the reference's engine folds to a `Constant` when it can. Any
+/// other leaf (a local, `self`, an ivar, an implicit-self call, a parameter)
+/// is open.
+fn closed_literal_expr(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::IntegerLit { .. }
+        | Node::FloatLit { .. }
+        | Node::StringLit { .. }
+        | Node::SymbolLit { .. }
+        | Node::NilLit { .. }
+        | Node::TrueLit { .. }
+        | Node::FalseLit { .. }
+        | Node::RationalLit { .. }
+        | Node::ImaginaryLit { .. }
+        | Node::ConstantRead { .. } => true,
+        Node::ArrayLit { elements, .. } => elements.iter().all(|&e| closed_literal_expr(ast, e)),
+        Node::Call { receiver: Some(r), args, block_body, .. } => {
+            block_body.is_empty()
+                && closed_literal_expr(ast, *r)
+                && args.iter().all(|&a| closed_literal_expr(ast, a))
+        }
+        _ => false,
     }
 }
 
@@ -3404,7 +3577,9 @@ fn diff_string(candidates: &[Candidate]) -> String {
     let mut out = String::new();
     for c in candidates {
         out.push_str(&format!("--- {}: {}#{}\n", c.file, c.class_name, c.method_name));
-        if let Some(declared) = &c.declared_return_rbs {
+        if let Some(own) = &c.declared_rbs {
+            out.push_str(&format!("- {own}\n"));
+        } else if let Some(declared) = &c.declared_return_rbs {
             out.push_str(&format!("- def {}: () -> {declared}\n", c.method_name));
         }
         out.push_str(&format!("+ {}\n\n", c.rbs));
@@ -3772,6 +3947,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         inferred_return: c.inferred_return.clone(),
         classification: c.classification,
         declared_return_rbs: c.declared_return_rbs.clone(),
+        declared_rbs: c.declared_rbs.clone(),
         decl_header: c.decl_header.clone(),
         skip_reason: c.skip_reason,
         definer: c.definer,
@@ -4065,8 +4241,10 @@ fn render_check_text(stale: &[&WriteResult]) {
 /// entry (reference `render_check_change`'s per-candidate loop).
 fn render_check_applied(r: &WriteResult) {
     for c in &r.applied {
-        if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
-            rc.method_name == c.method_name && rc.kind == c.kind
+        if let Some(own) = &c.declared_rbs {
+            println!("  - {own}");
+        } else if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
+            rc.class_name == c.class_name && rc.method_name == c.method_name && rc.kind == c.kind
         }) {
             println!("  - {old}");
         }
@@ -4823,12 +5001,32 @@ fn merge_into_existing(
     let mut new_methods: Vec<Candidate> = Vec::new();
     let mut conflicting: Vec<(Candidate, Conflict)> = Vec::new();
     for c in candidates {
-        match info.members.iter().find(|m| m.name == c.method_name && m.kind == c.kind) {
+        // A `def self?.f` candidate conflicts with a declared instance OR
+        // singleton `f` (and a plain candidate with a declared `self?.f`):
+        // inserting it would declare that half twice (reference
+        // `partition_against_existing`, #1488). Only a member of the candidate's
+        // EXACT kind is replaceable (`find_method_member`).
+        let dual = c.rbs.starts_with("def self?.");
+        let touches = |m: &MemberInfo| {
+            m.name == c.method_name
+                && match m.kind {
+                    "singleton_instance" => true,
+                    k => dual || k == c.kind,
+                }
+        };
+        match info.members.iter().find(|m| touches(m)) {
             None => new_methods.push(c),
-            Some(m) => conflicting.push((
-                c,
-                Conflict { return_text: m.return_text.clone(), span: m.span, text: m.text.clone() },
-            )),
+            Some(m) => {
+                let exact = if dual { m.kind == "singleton_instance" } else { m.kind == c.kind };
+                conflicting.push((
+                    c,
+                    Conflict {
+                        return_text: m.return_text.clone(),
+                        span: m.span.filter(|_| exact),
+                        text: m.text.clone(),
+                    },
+                ))
+            }
         }
     }
 

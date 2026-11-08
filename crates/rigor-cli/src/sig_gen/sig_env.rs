@@ -76,6 +76,38 @@ struct Decl {
     instance: HashMap<String, Option<String>>,
     /// Singleton (`def self.x`) name → resolved return class.
     singleton: HashMap<String, Option<String>>,
+    /// Instance name → how the class's OWN declaration spells its head
+    /// (parameters / block / type params), for a tighter-return row that
+    /// replaces only the return (reference `tighter_return_line`).
+    instance_heads: HashMap<String, Head>,
+    /// Singleton name → head, as `instance_heads`.
+    singleton_heads: HashMap<String, Head>,
+}
+
+/// The class's own declaration of a method, as a tighter-return row must keep it:
+/// the reference re-spells the declared method type with only the return
+/// replaced (`tighter_return_line`), so the row carries the author's parameter
+/// types, block and type parameters rather than the `def`'s own shape
+/// (rigor-rs#544 review).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Head {
+    /// A canonical, single-overload, unannotated, visibility-free head the row
+    /// can reuse verbatim: `head` is the text before `-> ` (e.g. `(Integer x)`),
+    /// `source` the member's whitespace-squished source (the `--diff` `- ` line).
+    Reusable { head: String, source: String },
+    /// Declared on the class itself in a shape the port cannot re-spell
+    /// byte-identically (block, type params, annotations, visibility,
+    /// non-trivial parameter types, attr writer): the tighter row is DECLINED.
+    Declined,
+}
+
+/// Where a method is declared, for the head a tighter-return row takes.
+pub enum OwnHead<'a> {
+    /// Not declared on the class itself (an ancestor, or nothing): the row is
+    /// rendered from the `def`'s own shape, as for a new method.
+    NotOwn,
+    /// Declared on the class itself with this head.
+    Own(&'a Head),
 }
 
 /// The outcome of resolving a `(class, method, kind)` against the project env +
@@ -123,6 +155,7 @@ impl SigEnv {
         let mut raw_supers: HashMap<String, RawRef> = HashMap::new();
         let mut raw_includes: HashMap<String, Vec<RawRef>> = HashMap::new();
         let mut raw_extends: HashMap<String, Vec<RawRef>> = HashMap::new();
+        let mut seen_files: HashSet<std::path::PathBuf> = HashSet::new();
 
         for dir in signature_dirs {
             if !dir.is_dir() {
@@ -132,6 +165,12 @@ impl SigEnv {
             collect_rbs_files(dir, &mut files);
             files.sort();
             for f in files {
+                // An overlapping signature dir must not read one file twice: the
+                // second read would merge every method with itself.
+                let canon = f.canonicalize().unwrap_or_else(|_| f.clone());
+                if !seen_files.insert(canon) {
+                    continue;
+                }
                 let Ok(src) = std::fs::read_to_string(&f) else { continue };
                 let Ok(sig) = ruby_rbs::node::parse(&src) else { continue };
                 harvest_decls(
@@ -207,6 +246,17 @@ impl SigEnv {
             "instance" => decl.instance.contains_key(method),
             "singleton" => decl.singleton.contains_key(method),
             _ => false,
+        }
+    }
+
+    /// The class's OWN declaration head for `method` (no ancestor walk): the
+    /// reference's `signature_member(method_def, class_name)`.
+    pub fn own_head(&self, class_fqn: &str, method: &str, singleton: bool) -> OwnHead<'_> {
+        let Some(decl) = self.decls.get(class_fqn) else { return OwnHead::NotOwn };
+        let heads = if singleton { &decl.singleton_heads } else { &decl.instance_heads };
+        match heads.get(method) {
+            Some(h) => OwnHead::Own(h),
+            None => OwnHead::NotOwn,
         }
     }
 
@@ -415,14 +465,27 @@ fn harvest_decls<'a>(
             extends: Vec::new(),
             instance: HashMap::new(),
             singleton: HashMap::new(),
+            instance_heads: HashMap::new(),
+            singleton_heads: HashMap::new(),
         };
         let mut includes: Vec<RawRef> = Vec::new();
         let mut extends: Vec<RawRef> = Vec::new();
 
         collect_members(source, members.iter(), prefix, &mut decl, &mut includes, &mut extends);
 
-        // First-found-wins on a duplicated decl (sorted walk).
-        if !decls.contains_key(&fqn) {
+        // A reopened class: its methods join the first body's (a name in both
+        // is a multi-overload method — unresolvable); everything else stays
+        // first-found-wins (sorted walk).
+        if let Some(existing) = decls.get_mut(&fqn) {
+            for (name, ret) in decl.instance {
+                let head = decl.instance_heads.remove(&name).unwrap_or(Head::Declined);
+                put_method(&mut existing.instance, &mut existing.instance_heads, name, ret, head);
+            }
+            for (name, ret) in decl.singleton {
+                let head = decl.singleton_heads.remove(&name).unwrap_or(Head::Declined);
+                put_method(&mut existing.singleton, &mut existing.singleton_heads, name, ret, head);
+            }
+        } else {
             decls.insert(fqn.clone(), decl);
             if let Some(s) = super_ref {
                 raw_supers.insert(fqn.clone(), s);
@@ -454,7 +517,7 @@ fn harvest_decls<'a>(
 /// Fold a class/module's members into `decl` (method/attr returns) and collect
 /// raw include/extend reference names.
 fn collect_members<'a>(
-    _source: &str,
+    source: &str,
     members: impl Iterator<Item = RbsNode<'a>>,
     prefix: &[String],
     decl: &mut Decl,
@@ -466,32 +529,43 @@ fn collect_members<'a>(
             RbsNode::MethodDefinition(md) => {
                 let name = md.name().as_str().to_string();
                 let ret = resolve_method_return(&md);
+                let head = method_head(&md, source);
                 match md.kind() {
                     MethodDefinitionKind::Instance => {
-                        decl.instance.entry(name).or_insert(ret);
+                        put_method(&mut decl.instance, &mut decl.instance_heads, name, ret, head);
                     }
                     MethodDefinitionKind::Singleton => {
-                        decl.singleton.entry(name).or_insert(ret);
+                        put_method(&mut decl.singleton, &mut decl.singleton_heads, name, ret, head);
                     }
                     MethodDefinitionKind::SingletonInstance => {
                         // `def self?.x` is BOTH a class and an instance method.
-                        decl.instance.entry(name.clone()).or_insert(ret.clone());
-                        decl.singleton.entry(name).or_insert(ret);
+                        put_method(
+                            &mut decl.instance,
+                            &mut decl.instance_heads,
+                            name.clone(),
+                            ret.clone(),
+                            head.clone(),
+                        );
+                        put_method(&mut decl.singleton, &mut decl.singleton_heads, name, ret, head);
                     }
                 }
             }
             RbsNode::AttrReader(a) => {
                 let ret = resolve_type_node_return(&a.type_());
-                attr_insert(decl, a.name().as_str(), a.kind(), ret, false);
+                let plain = a.visibility_location().is_none() && a.annotations().iter().next().is_none();
+                let src = squished_source(source, &a.location());
+                attr_insert(decl, a.name().as_str(), a.kind(), ret, false, plain, src);
             }
             RbsNode::AttrWriter(a) => {
                 let ret = resolve_type_node_return(&a.type_());
-                attr_insert(decl, a.name().as_str(), a.kind(), ret, true);
+                attr_insert(decl, a.name().as_str(), a.kind(), ret, true, false, None);
             }
             RbsNode::AttrAccessor(a) => {
                 let ret = resolve_type_node_return(&a.type_());
-                attr_insert(decl, a.name().as_str(), a.kind(), ret.clone(), false);
-                attr_insert(decl, a.name().as_str(), a.kind(), ret, true);
+                let plain = a.visibility_location().is_none() && a.annotations().iter().next().is_none();
+                let src = squished_source(source, &a.location());
+                attr_insert(decl, a.name().as_str(), a.kind(), ret.clone(), false, plain, src);
+                attr_insert(decl, a.name().as_str(), a.kind(), ret, true, false, None);
             }
             RbsNode::Include(inc) => {
                 includes.push(RawRef {
@@ -514,13 +588,146 @@ fn collect_members<'a>(
 /// `attr_writer`/`attr_accessor` contribute `name=` (reference member
 /// expansion). A `self.` attr (`AttributeKind::Singleton`) contributes to the
 /// singleton surface.
-fn attr_insert(decl: &mut Decl, name: &str, kind: AttributeKind, ret: Option<String>, writer: bool) {
+///
+/// `plain` marks a reader with no visibility keyword or annotation: its head is
+/// the reference's `() -> T` shape. A writer's head (`(T) -> T`) is declined.
+/// `source` is the member's squished text.
+fn attr_insert(
+    decl: &mut Decl,
+    name: &str,
+    kind: AttributeKind,
+    ret: Option<String>,
+    writer: bool,
+    plain: bool,
+    source: Option<String>,
+) {
     let key = if writer { format!("{name}=") } else { name.to_string() };
-    let table = match kind {
-        AttributeKind::Singleton => &mut decl.singleton,
-        AttributeKind::Instance => &mut decl.instance,
+    let (table, heads) = match kind {
+        AttributeKind::Singleton => (&mut decl.singleton, &mut decl.singleton_heads),
+        AttributeKind::Instance => (&mut decl.instance, &mut decl.instance_heads),
     };
-    table.entry(key).or_insert(ret);
+    let head = match source {
+        Some(src) if plain && !writer => Head::Reusable { head: "()".to_string(), source: src },
+        _ => Head::Declined,
+    };
+    put_method(table, heads, key, ret, head);
+}
+
+/// Record one declared member. A name declared TWICE in the same class (an
+/// `| ...` overloading member beside the base `def`, a reopened body) has
+/// several definitions the reference merges into one multi-overload method: it
+/// is unresolvable here (`None`, DROP) and its head is [`Head::Declined`].
+fn put_method(
+    table: &mut HashMap<String, Option<String>>,
+    heads: &mut HashMap<String, Head>,
+    name: String,
+    ret: Option<String>,
+    head: Head,
+) {
+    if table.contains_key(&name) {
+        table.insert(name.clone(), None);
+        heads.insert(name, Head::Declined);
+    } else {
+        heads.insert(name.clone(), head);
+        table.insert(name, ret);
+    }
+}
+
+/// The head of a `def` member, for a tighter-return row.
+///
+/// The reference re-spells the declared overload through `RBS::MethodType#to_s`
+/// with only the return replaced. The port reuses the SOURCE text of the head
+/// instead, and only where that text is provably what `to_s` prints: a single
+/// overload (a `| ...` overloading member is no counterpart), no member or
+/// overload annotation, no visibility keyword, no type parameters, no block,
+/// and a parameter list of canonically spaced simple items (`untyped` or a
+/// constant path, optionally `?` / `*` / `name:`-prefixed or followed by a
+/// name). Anything else is [`Head::Declined`] — the decline side.
+fn method_head(md: &ruby_rbs::node::MethodDefinitionNode, source: &str) -> Head {
+    if md.overloading()
+        || md.visibility_location().is_some()
+        || md.annotations().iter().next().is_some()
+    {
+        return Head::Declined;
+    }
+    let mut overloads = md.overloads().iter();
+    let Some(first) = overloads.next() else { return Head::Declined };
+    if overloads.next().is_some() {
+        return Head::Declined;
+    }
+    let RbsNode::MethodDefinitionOverload(ov) = first else { return Head::Declined };
+    if ov.annotations().iter().next().is_some() {
+        return Head::Declined;
+    }
+    let RbsNode::MethodType(mt) = ov.method_type() else { return Head::Declined };
+    let RbsNode::FunctionType(ft) = mt.type_() else { return Head::Declined };
+    let start = usize::try_from(mt.location().start()).unwrap_or(usize::MAX);
+    let ret_start = usize::try_from(ft.return_type().location().start()).unwrap_or(0);
+    let Some(slice) = source.get(start..ret_start) else { return Head::Declined };
+    let Some(params) = slice.strip_suffix(" -> ") else { return Head::Declined };
+    let Some(member) = squished_source(source, &md.location()) else { return Head::Declined };
+    if canonical_param_list(params) {
+        Head::Reusable { head: params.to_string(), source: member }
+    } else {
+        Head::Declined
+    }
+}
+
+/// A member's source text with whitespace runs collapsed to one space (the
+/// reference's `squish`).
+fn squished_source(source: &str, loc: &ruby_rbs::node::RBSLocationRange) -> Option<String> {
+    let start = usize::try_from(loc.start()).ok()?;
+    let end = usize::try_from(loc.end()).ok()?;
+    let text = source.get(start..end)?;
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
+}
+
+/// `()` or `(item, item, ...)` with each item canonical (see [`method_head`]).
+fn canonical_param_list(text: &str) -> bool {
+    let Some(inner) = text.strip_prefix('(').and_then(|t| t.strip_suffix(')')) else {
+        return false;
+    };
+    if inner.is_empty() {
+        return true;
+    }
+    inner.split(", ").all(canonical_param)
+}
+
+fn canonical_param(item: &str) -> bool {
+    // `name: T` / `?name: T` keywords.
+    let item = item.strip_prefix('?').unwrap_or(item);
+    if let Some((kw, ty)) = item.split_once(": ") {
+        return is_lower_ident(kw) && simple_type_then_name(ty);
+    }
+    let item = item.strip_prefix('*').unwrap_or(item);
+    simple_type_then_name(item)
+}
+
+/// `T` or `T name`, `T` being `untyped` or a (maybe `::`-rooted) constant path.
+fn simple_type_then_name(text: &str) -> bool {
+    match text.split_once(' ') {
+        None => simple_type(text),
+        Some((ty, name)) => simple_type(ty) && is_lower_ident(name),
+    }
+}
+
+fn simple_type(text: &str) -> bool {
+    if text == "untyped" {
+        return true;
+    }
+    let path = text.strip_prefix("::").unwrap_or(text);
+    !path.is_empty()
+        && path.split("::").all(|seg| {
+            let mut cs = seg.chars();
+            cs.next().is_some_and(|c| c.is_ascii_uppercase())
+                && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+fn is_lower_ident(text: &str) -> bool {
+    let mut cs = text.chars();
+    cs.next().is_some_and(|c| c.is_ascii_lowercase() || c == '_')
+        && cs.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 /// Resolve a method's declared return to `Some(class)` ONLY when it has EXACTLY
@@ -543,6 +750,11 @@ fn resolve_method_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<St
 /// `String?` / `Array[Integer]` / `bool` / `untyped` ⇒ `None`).
 fn resolve_type_node_return(node: &RbsNode) -> Option<String> {
     match node {
+        // `untyped` is resolvable — a DECLARED `untyped` still classifies a
+        // concrete inferred return as `tighter` (rigor-rs#544). Recorded as the
+        // spelling "untyped"; classify special-cases it before the class-name
+        // acceptance check.
+        RbsNode::AnyType(_) => Some("untyped".to_string()),
         RbsNode::ClassInstanceType(ci) => {
             if ci.args().iter().next().is_some() {
                 None // has type args ⇒ not bare ⇒ DROP.
