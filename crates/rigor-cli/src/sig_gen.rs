@@ -2374,10 +2374,35 @@ fn method_candidate(
     // erased union).
     let Some(returns) = collect_explicit_returns(ast, sig) else { return row(None) };
 
-    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
-    // statement's type; an assignment tail evaluates to its RHS; a `return E`
-    // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
+    // A def-LOCAL env (rigor-rs#546): the body's straight-line writes replayed
+    // on top of the file env, so a tail/return read of a method-local sees its
+    // binding (the reference types the body's env). Statements the binder
+    // declines leave the env alone — a coverage loss, never a wrong type.
+    // The replay covers the WHOLE body — a `return` under the tail `if`
+    // still types at its position (the tail's own writes bind nothing the
+    // tail read needs that a later statement could invalidate).
+    // A parameter SHADOWS a same-named file-level local — the def body is a
+    // fresh scope (`x = "top"; def b2(x); x; end` reads the argument, not
+    // `"top"`; the reference skips it). Bind each to `untyped` first.
+    let mut entry = env.clone();
+    if let Some(names) = sig.params.as_ref() {
+        let untyped = interner.untyped();
+        for name in names {
+            entry.insert(name.clone(), untyped);
+        }
+    }
+    // The def's own decisions: a Dynamic local narrowed by a type test and
+    // read in a second decision may be constant-folded by the reference.
+    struct ScopeGuard<'a>(&'a std::cell::Cell<Option<rigor_parse::Span>>);
+    impl Drop for ScopeGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(None);
+        }
+    }
+    typer.def_scope.set(rigor_infer::body_span(ast, sig.body));
+    let _scope_guard = ScopeGuard(&typer.def_scope);
+    let (local, positional_returns) = typer.bind_body_for_tail(ast, &entry, sig.body, interner);
+    let env = &local;
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -2393,13 +2418,42 @@ fn method_candidate(
             }
         }
     };
-    push_flat(interner, &mut members, tail_ty);
+
+    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
+    // statement's type; an assignment tail evaluates to its RHS; a `return E`
+    // tail evaluates to its value (`nil` when bare). A control tail whose
+    // every leaf is a `return` contributes NOTHING — `if c; return 1; else;
+    // return "s"; end` yields `("s" | 1)` from the returns alone.
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
+    if let Some(tail_ty) = tail_ty {
+        push_flat(interner, &mut members, tail_ty);
+    }
     for ret in &returns {
+        // A `return`'s value types at ITS position in the body — a name it
+        // reads may be rebound later (`a = :initial; if c; return a; end;
+        // a = 100` → `(100 | :initial)`).
         let ty = match ret {
-            Some(v) => typer.type_of(ast, *v, env, interner),
+            Some(v) => match positional_returns.iter().find(|(id, _)| id == v) {
+                Some((_, t)) => *t,
+                // A `return` the replay never reached (inside a value
+                // position — `x = c.map { |i| return i }`): it reads locals
+                // the replay cannot place, so a read declines.
+                None if !typer.def_local_marks(ast).reads_within(ast.get(*v).span()).is_empty() => {
+                    interner.untyped()
+                }
+                None => typer.type_of(ast, *v, env, interner),
+            },
             None => interner.nil(),
         };
         push_flat(interner, &mut members, ty);
+    }
+
+    // A union or a bare generic INSIDE a tuple / hash-shape slot (`[1 | nil]`,
+    // a def-local typed local joined across a branch; `[400, Hash, [body]]`) is
+    // not the reference's byte output — a shared-method mismatch, so the
+    // method declines (rigor-rs#546 review).
+    if members.iter().any(|&m| composite_holds_unsound(interner, index, m)) {
+        return row(None);
     }
 
     // `dynamic_top?` (a reference PERMANENT skip): any Top/Dynamic member — or any
@@ -2438,6 +2492,24 @@ fn method_candidate(
             // `Range[untyped]` / `Array[untyped]` are the reference's own
             // elaborated emits (rigor-rs#493 item 7), not inference holes.
             if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
+            // A def-local the replay declined (or a call on one the port does
+            // not fold) reads `untyped`, and that hole lands in a generic's
+            // type-arg slot as `Hash[String, untyped]`, where the reference
+            // has the precise value union (`Rack::Directory#check_bad_request`).
+            // A tail / return that reads a local written in the def cannot be
+            // told apart from an elaborated `Hash[untyped, untyped]` — decline.
+            let marks = typer.def_local_marks(ast);
+            let written = rigor_infer::body_span(ast, sig.body)
+                .map(|sp| marks.written_within(sp))
+                .unwrap_or_default();
+            let reads_local = |sp: rigor_parse::Span| {
+                marks.reads_within(sp).iter().any(|r| written.iter().any(|w| w == r))
+            };
+            let tail_reads = sig.body.last().is_some_and(|&t| reads_local(ast.get(t).span()))
+                || returns.iter().flatten().any(|&v| reads_local(ast.get(v).span()));
+            if tail_reads {
                 return row(None);
             }
         }
@@ -2696,25 +2768,49 @@ fn computed_literal_tightening(interner: &Interner, inferred: TypeId, raw_tail: 
     )
 }
 
+/// Whether a call's block body is a return barrier: the reference
+/// `ReturnBarrier.block_call?` — a `define_method` / `define_singleton_method`
+/// block on any receiver (also through `send` / `public_send` / `__send__`
+/// with a literal symbol first argument), and `Kernel#lambda` (bare, on
+/// `self` or on `Kernel`).
+fn return_barrier_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str, args: &[NodeId]) -> bool {
+    let mut name = method.to_string();
+    if matches!(method, "send" | "public_send" | "__send__") {
+        match args.first().map(|&a| ast.get(a)) {
+            Some(Node::SymbolLit { value, .. }) => name = value.clone(),
+            _ => return false,
+        }
+    }
+    if matches!(name.as_str(), "define_method" | "define_singleton_method") {
+        return true;
+    }
+    name == "lambda"
+        && match receiver.map(|r| ast.get(r)) {
+            None | Some(Node::SelfExpr { .. }) => true,
+            Some(Node::ConstantRead { name, .. }) => name == "Kernel",
+            _ => false,
+        }
+}
+
 /// Collect the def's collectible explicit-return value expressions, or `None`
 /// when the method must be SKIPPED. Each element is `Some(value NodeId)` for a
 /// single-value `return e` / `None` for a bare `return` (→ `nil`). Ports the
 /// reference `DefReturnTyper#collect_return_types` semantics over the lowered
 /// arena:
 ///
-/// - **Barriers** (reference `RETURN_BARRIER_NODES` = block / lambda / def): a
-///   `return` inside a `Call`'s `block_body` or a nested def/class/module is NOT
-///   collected. A lambda's `return` never lowers to [`Node::Return`] at all (the
-///   lambda routes through the recovered-children fallthrough), so the lambda
-///   barrier holds structurally.
+/// - **Barriers** (reference `ReturnBarrier`, issue #1382): a `return` inside a
+///   nested `def` / class / module, a `->` lambda, or the block of a
+///   `define_method` / `define_singleton_method` / `Kernel#lambda` call
+///   ([`return_barrier_call`]) is NOT collected. A `return` in an ORDINARY
+///   block exits the method and IS collected (rigor-rs#546 review 3: the port
+///   treated every block as a barrier, so `a = nil; c.each { return "s" }; a`
+///   lost its `"s"` once the local env typed `a`).
 /// - **Multi-value** `return a, b`: the reference silently contributes NOTHING
 ///   (emitting a signature that misses the tuple — an unsound emit); rigor-rs
 ///   SKIPS the method instead (under-emit, FP-safe, no shared-method mismatch).
 /// - **Residual ambiguity**: `has_explicit_return` trips on returns inside
-///   lambdas AND inside unhandled wrappers; the former the reference barriers
-///   (safe to emit) but the latter it collects. When the flag is set yet NO
-///   [`Node::Return`] exists anywhere in the def, the two are indistinguishable
-///   → skip (rare, FP-safe).
+///   unhandled wrappers; when the flag is set yet NO [`Node::Return`] exists
+///   anywhere in the def, skip (rare, FP-safe).
 ///
 /// Membership is by span containment against the def's body-statement spans
 /// (the arena is flat; spans nest strictly), mirroring how outline/flow walks
@@ -2730,23 +2826,32 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
         regions.iter().any(|&(rs, re)| rs <= s.0 && s.1 <= re)
     };
 
-    // Barrier regions inside this def: block bodies + nested class-like scopes.
-    // (The def's own body statements are the regions, so any Definition matched
-    // within them is a NESTED def, never the def itself.)
+    // Barrier regions inside this def: a barrier call's block body, lambdas
+    // and nested class-like scopes. (The def's own body statements are the
+    // regions, so any Definition matched within them is a NESTED def, never
+    // the def itself.)
     let mut barriers: Vec<(usize, usize)> = Vec::new();
     for (_, node) in ast.iter() {
         match node {
-            Node::Call { block_body, span, .. }
-                if !block_body.is_empty() && within(*span, &regions) =>
+            Node::Call { receiver, method, args, block_body, block_span: Some(_), span, .. }
+                if !block_body.is_empty()
+                    && within(*span, &regions)
+                    && return_barrier_call(ast, *receiver, method, args) =>
             {
                 for &b in block_body {
                     barriers.push(ast.get(b).span());
                 }
             }
+            Node::Lambda { span, .. } if within(*span, &regions) => barriers.push(*span),
+            // A def whose body is a `rescue` / `ensure` chain lowers to one
+            // `BeginRescue` region spanning the whole def, so the def ITSELF
+            // would match as a "nested" barrier and swallow every `return`
+            // (rigor-rs#546 review 3: `def f; 5; ensure; return 3; end`
+            // lost its `3`). The def's own start offset identifies it.
             Node::Definition { span, .. }
             | Node::ClassDef { span, .. }
             | Node::ModuleDef { span, .. }
-                if within(*span, &regions) =>
+                if within(*span, &regions) && span.0 != sig.offset =>
             {
                 barriers.push(*span);
             }
@@ -2763,7 +2868,7 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
             }
             found_any = true;
             if within(*span, &barriers) {
-                continue; // block / nested-def barrier (reference design)
+                continue; // lambda / nested-def / define_method barrier (reference design)
             }
             match values.len() {
                 0 => collected.push(None),
@@ -2780,12 +2885,37 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
     Some(collected)
 }
 
+/// Whether a tuple / hash shape holds, in one of its slots (at any depth
+/// through further tuples and shapes), a union — the interner prints it in
+/// canonical member order, not the reference's describe-sorted order — or a
+/// bare generic nominal (`Hash`, `Array`: the reference elaborates it to
+/// `Hash[untyped, ...]` / its value union). Either way the byte output would
+/// differ from the reference's on a method both emit.
+fn composite_holds_unsound(interner: &Interner, index: &CoreIndex, ty: TypeId) -> bool {
+    let slot = |e: TypeId| match interner.get(e) {
+        Type::Union(_) => true,
+        Type::Nominal { class, args } => {
+            args.is_empty() && is_bare_generic_name(index.class_name_for_id(*class).unwrap_or(""))
+        }
+        _ => composite_holds_unsound(interner, index, e),
+    };
+    match interner.get(ty) {
+        Type::Tuple(elems) => elems.iter().any(|&e| slot(e)),
+        Type::HashShape(members) => members.iter().any(|m| slot(m.value)),
+        _ => false,
+    }
+}
+
 /// A method's inferred return type, or `None` for an empty body (reference
 /// `DefReturnTyper`): the last statement's type, an assignment tail evaluating to
 /// its RHS value, a `return E` tail to its value (`nil` when bare — the oracle
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
-/// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
-/// `annotate` deferral) and is then skipped upstream.
+/// the def-local env (rigor-rs#546).
+/// `Some(Some(ty))` — the tail's type (`untyped` for a tail shape the
+/// def-local env does not model, see [`control_tail_types`]: the method skips
+/// as an untyped return); `Some(None)` — a control tail whose every value leaf
+/// is a `return`, contributing no member; `None` — skip (empty body,
+/// multi-value `return` tail).
 #[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
@@ -2796,29 +2926,233 @@ fn def_return_type(
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
-) -> Option<TypeId> {
+) -> Option<Option<TypeId>> {
     let &tail = body.last()?;
-    let target = match ast.get(tail) {
+    // A declined tail types as `untyped`: the method skips as an untyped
+    // return (`sig.skipped.untyped-return`, counted — an override the port
+    // declines still reads as unsigned to the base-method demotion, as the
+    // reference's untyped tail does).
+    let declined = Some(Some(interner.untyped()));
+    // A tail holding a decision on a typed local (the reference narrows /
+    // folds on it) or an unknown-name `=~` binding declines; a write at a
+    // position the replay does not walk is widened.
+    let Some(tail_env) = typer.tail_env(ast, env, tail, interner) else { return declined };
+    let env = &tail_env;
+    match ast.get(tail) {
+        // `x op= v`: the lowered node keeps the operand, not the operator —
+        // typing the operand (`a = 1; a += 1` → `1`) would be wrong.
+        Node::LocalVariableOpWrite { .. } => declined,
         Node::LocalVariableWrite { value, .. }
-        | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
-        | Node::ConstantWrite { value, .. } => *value,
+        | Node::ConstantWrite { value, .. } => {
+            Some(Some(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner)))
+        }
         Node::Return { values, .. } => match values.len() {
-            0 => return Some(interner.nil()),
-            1 => values[0],
-            _ => return None,
+            0 => Some(Some(interner.nil())),
+            1 => Some(Some(tail_value_type(ast, typer, env, values[0], index, class_name, fqns, interner))),
+            _ => None,
         },
-        _ => tail,
-    };
-    // Literal carriers `type_of` leaves Dynamic — sig-gen still emits their
-    // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
-    // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
-    // through recovery, so no dedicated node exists here).
-    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
-        return Some(lit);
+        Node::If { .. } | Node::Case { .. } | Node::BeginRescue { .. } | Node::Loop { .. } => {
+            // The tail's VALUE leaves, each typed under ITS arm's env: an
+            // arm's last statement that is not a `return` (a `return` leaf
+            // exits the method — it is already in `returns`), an absent
+            // `else` contributes `nil`, a loop tail contributes `nil`.
+            let mut members: Vec<TypeId> = Vec::new();
+            if !control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members) {
+                return declined;
+            }
+            match members.len() {
+                0 => Some(None),
+                _ => Some(Some(
+                    members.iter().skip(1).fold(members[0], |acc, &m| {
+                        rigor_types::Algebra::join(interner, acc, m)
+                    }),
+                )),
+            }
+        }
+        _ => Some(Some(tail_value_type(ast, typer, env, tail, index, class_name, fqns, interner))),
     }
-    Some(typer.type_of(ast, target, env, interner))
+}
+
+/// Push the value-contributing tail types of a control expression onto
+/// `out` — each arm's last non-`return` statement typed under the ARM's env
+/// (an arm's earlier writes bind there: `if c; a = 1; a; end` contributes
+/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else`
+/// contributes `nil`, and so does a loop tail that cannot carry a value.
+///
+/// Returns `false` to DECLINE the whole tail — the reference types these
+/// shapes by rules the def-local env does not model, so any typed answer
+/// would be a guess (rigor-rs#546 review 3):
+///
+/// - a `begin` with an `else` (the `else` value replaces the body's) or a
+///   `retry`; an ensure's value is discarded — `begin; 5; ensure; @m =
+///   false; end` is `5`, the protected body's tail;
+/// - a `for` loop (its value is the collection) and a `while` / `until` that
+///   holds a `break` (the break value joins `nil`) or runs its body first
+///   (`begin … end while`);
+/// - a `case`/`in` (no-match raises; patterns bind), a `rescue` modifier and
+///   the other non-sequence carriers;
+/// - a decision on a typed local, a named-capture `=~` ([`Typer::tail_env`]).
+#[allow(clippy::too_many_arguments)]
+fn control_tail_types(
+    ast: &LoweredAst,
+    typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    id: NodeId,
+    env: &TypeEnv,
+    interner: &mut Interner,
+    out: &mut Vec<TypeId>,
+) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn body_tail(
+        ast: &LoweredAst,
+        typer: &Typer,
+        index: &CoreIndex,
+        class_name: &str,
+        fqns: &std::collections::HashSet<String>,
+        body: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+        out: &mut Vec<TypeId>,
+    ) -> bool {
+        let Some(&tail) = body.last() else {
+            out.push(interner.nil());
+            return true;
+        };
+        // An arm whose tail follows a statement that always leaves is dead
+        // code: the reference types it in a scope the replay cannot reproduce.
+        if body[..body.len() - 1].iter().any(|&s| typer.always_exits(ast, s)) {
+            return false;
+        }
+        // The arm's own writes bind before its tail is read.
+        let arm = typer.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
+        control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out)
+    }
+    use rigor_infer::ExitKind;
+    let Some(env) = typer.tail_env(ast, env, id, interner) else { return false };
+    let env = &env;
+    let marks = typer.def_local_marks(ast);
+    match ast.get(id) {
+        Node::Return { .. } => true,
+        Node::If { predicate, then_body, else_body, is_unless, .. } => {
+            // A predicate whose type decides it elides the dead arm
+            // (`type_of(If)`; `if true; 1; else; 2; end` is `1`); a
+            // literal-only predicate the port cannot decide
+            // (`if true && false`) is folded by the reference — decline.
+            match typer.known_polarity(ast, env, *predicate, interner) {
+                Some(b) => {
+                    let live = if b != *is_unless { then_body } else { else_body };
+                    body_tail(ast, typer, index, class_name, fqns, live, env, interner, out)
+                }
+                None if rigor_infer::literal_like(ast, *predicate) => false,
+                None => {
+                    body_tail(ast, typer, index, class_name, fqns, then_body, env, interner, out)
+                        && body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
+                }
+            }
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &b in branches {
+                match ast.get(b) {
+                    Node::When { body, .. } => {
+                        if !body_tail(ast, typer, index, class_name, fqns, body, env, interner, out) {
+                            return false;
+                        }
+                    }
+                    // `case`/`in`: not modelled.
+                    _ => return false,
+                }
+            }
+            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
+        }
+        Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, span, .. } => {
+            if *has_else || marks.has_exit_within(*span, &[ExitKind::Retry]) {
+                return false;
+            }
+            if clauses.is_empty() {
+                // A statements / `else` / `in` / paren carrier (nothing to
+                // protect) is its body's tail; an ensure-only `begin`'s value
+                // is the protected body's, never the ensure's.
+                let tail_body = if ensure_body.is_empty() { body } else { main_body };
+                body_tail(ast, typer, index, class_name, fqns, tail_body, env, interner, out)
+            } else {
+                // The protected tail, or a clause's: a clause enters from any
+                // point of the body, so it reads the names the body writes
+                // as `untyped`.
+                if !body_tail(ast, typer, index, class_name, fqns, main_body, env, interner, out) {
+                    return false;
+                }
+                let mut clause_env = env.clone();
+                if let Some(sp) = rigor_infer::body_span(ast, main_body) {
+                    rigor_infer::Typer::widen_names(&mut clause_env, &marks.changed_within(sp), interner);
+                }
+                for c in clauses {
+                    if !body_tail(ast, typer, index, class_name, fqns, &c.body, &clause_env, interner, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+        Node::Loop { kind, span, .. } => {
+            let once = matches!(
+                kind,
+                rigor_parse::LoopKind::While { begin_modifier: true }
+                    | rigor_parse::LoopKind::Until { begin_modifier: true }
+            );
+            if once
+                || matches!(kind, rigor_parse::LoopKind::For)
+                || marks.has_exit_within(*span, &[ExitKind::Break, ExitKind::Redo, ExitKind::Retry])
+            {
+                return false;
+            }
+            out.push(interner.nil());
+            true
+        }
+        Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
+            body_tail(ast, typer, index, class_name, fqns, body, env, interner, out)
+        }
+        // A `rescue` modifier, `super(…)`, `yield(…)`, `defined?`: no
+        // sequence order to read a tail from.
+        Node::Statements { .. } => false,
+        // `x op= v` keeps the operand, not the operator.
+        Node::LocalVariableOpWrite { .. } => false,
+        Node::LocalVariableWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            out.push(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner));
+            true
+        }
+        _ => {
+            out.push(tail_value_type(ast, typer, env, id, index, class_name, fqns, interner));
+            true
+        }
+    }
+}
+
+/// A tail value's type: the literal carriers `type_of` leaves Dynamic — sig-gen
+/// still emits their nominal (rigor-rs#493 item 7): `Range[bound-class-union]`,
+/// `Regexp`, `Rational`, `Complex` (interpolated regexps stay declined: they
+/// lower through recovery, so no dedicated node exists here) — else `type_of`.
+#[allow(clippy::too_many_arguments)]
+fn tail_value_type(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> TypeId {
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
+        return lit;
+    }
+    typer.type_of(ast, target, env, interner)
 }
 
 /// The sig-gen-side nominal for a literal tail `check` leaves Dynamic

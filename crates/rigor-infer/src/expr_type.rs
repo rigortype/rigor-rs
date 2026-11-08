@@ -816,7 +816,15 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         match body.last() {
-            Some(&tail) => self.stmt_value_type(ast, tail, env, interner),
+            Some(&tail) => {
+                // Arm-local writes before the tail bind in the arm's own env —
+                // `if c; a = 1; a; end` reads `a : Constant[1]` in the arm
+                // (rigor-rs#546, `cond_read`). The straight-line binder
+                // declines what it cannot bind; a declined write leaves the
+                // read `Dynamic`, a coverage loss, never a wrong type.
+                let arm = self.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
+                self.stmt_value_type(ast, tail, &arm, interner)
+            }
             None => interner.intern(Type::Constant(Scalar::Nil)),
         }
     }
@@ -921,6 +929,19 @@ impl<'i> Typer<'i> {
         } else {
             None
         }
+    }
+
+    /// The truthiness of `predicate` when its type decides it (`if true`,
+    /// `if 1 > 2`, `if @x.to_s`), as `type_of(If)` elides the dead arm on.
+    pub fn known_polarity(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        predicate: NodeId,
+        interner: &mut Interner,
+    ) -> Option<bool> {
+        let ty = self.type_of(ast, predicate, env, interner);
+        self.predicate_polarity(interner, ty)
     }
 
     fn predicate_polarity(&self, interner: &Interner, ty: TypeId) -> Option<bool> {

@@ -659,6 +659,11 @@ pub enum Node {
         /// `begin` node) `main_body` equals `body`.
         main_body: Vec<NodeId>,
         ensure_body: Vec<NodeId>,
+        /// Whether the `begin` has an `else` clause (even an empty one: the
+        /// `else` value replaces the protected body's value). The `else`
+        /// statements ride `body` after the rescue clauses and before the
+        /// ensure; only a real `begin` node ever sets this (rigor-rs#546).
+        has_else: bool,
         /// The per-clause rescue-chain structure (empty for the reused carriers —
         /// `else`/`when`/`in`/parenthesized groups — and for a `begin` with no
         /// `rescue`). Populated only from a real `BeginNode`'s rescue chain; see
