@@ -46,8 +46,13 @@ pub(crate) fn check_always_truthy(
     snapshots: &std::collections::HashMap<rigor_parse::NodeId, rigor_types::TypeId>,
     interner: &Interner,
 ) -> Option<Diagnostic> {
-    // Skip syntactic literals (unreachable-branch's domain) and defensive calls.
-    if literal_predicate_truthy(ast, predicate).is_some() {
+    // Skip syntactic literals (unreachable-branch's domain) and defensive
+    // calls — UNLESS the literal came wrapped in parens: the reference's
+    // predicate node is the `ParenthesesNode`, which its literal test
+    // (`TRUTHY_LITERAL_NODES`) does not match, so `if (5)` fires
+    // always-truthy on the oracle rather than unreachable-branch
+    // (rigor-rs#468 review).
+    if !ast.paren_unwrapped(predicate) && literal_predicate_truthy(ast, predicate).is_some() {
         return None;
     }
     if matches!(ast.get(predicate), Node::Call { method, .. } if DEFENSIVE_PREDICATES.contains(&method.as_str()))
@@ -57,7 +62,10 @@ pub(crate) fn check_always_truthy(
     let ty = *snapshots.get(&if_id)?;
     let polarity = constant_polarity(interner, ty)?;
 
-    let span = ast.get(predicate).span();
+    // `(predicate)` unwrapped by the lowerer: the reference's predicate node
+    // is still the `ParenthesesNode`, which anchors on the `(` — use the
+    // recorded parens span when one exists (rigor-rs#468 item 2).
+    let span = ast.paren_span(predicate).unwrap_or_else(|| ast.get(predicate).span());
     let severity = catalog(FLOW_ALWAYS_TRUTHY_CONDITION)
         .map(|e| e.default_severity)
         .unwrap_or(Severity::Warning);
@@ -129,6 +137,13 @@ pub(crate) fn check_unreachable_branch(
     else_body: &[rigor_parse::NodeId],
     is_unless: bool,
 ) -> Option<Diagnostic> {
+    // A parenthesised literal predicate is a `ParenthesesNode` on the
+    // oracle — not a truthy-literal node — so `if (false)` does not fire
+    // here (the always-truthy rule reports it at the `(` instead;
+    // rigor-rs#468 review).
+    if ast.paren_unwrapped(predicate) {
+        return None;
+    }
     let truthy = literal_predicate_truthy(ast, predicate)?;
 
     // Which branch is dead, accounting for the keyword. For `if`: truthy ⇒ else

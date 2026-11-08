@@ -94,6 +94,10 @@ pub struct LoweredAst {
     /// a literal. Sorted for a binary-search read via
     /// [`LoweredAst::paren_unwrapped`].
     paren_unwrapped: Vec<u32>,
+    /// The `(`…`)` span each [`Self::paren_unwrapped`] id replaced — a
+    /// sorted `(id, start, end)` vec like the flag itself (a HashMap would
+    /// push `LoweredAst` past the check-pipeline enum's clippy size cap).
+    paren_spans: Box<[(u32, usize, usize)]>,
     /// `(arena id, bound names)` for recovered children a wrapper's recovery
     /// walk reached by CROSSING a `BlockNode`/`LambdaNode` — `super { |o| … }`
     /// lowers its `o` reads into a `Statements` carrier with no `Node::Call` to
@@ -402,6 +406,16 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// The `(`…`)` span an unwrapped id replaced, if any — the anchor the
+    /// reference's `ParenthesesNode` gives a predicate diagnostic
+    /// (rigor-rs#468).
+    pub fn paren_span(&self, id: NodeId) -> Option<(usize, usize)> {
+        self.paren_spans
+            .binary_search_by_key(&id.0, |(i, _, _)| *i)
+            .ok()
+            .map(|i| (self.paren_spans[i].1, self.paren_spans[i].2))
+    }
+
     /// Upstream v0.4.1 — this file's [`AncestryFacts`]: the mixin edges,
     /// definers and visibility slots the direct-statement harvest cannot
     /// vouch for.
@@ -487,6 +501,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         source,
         line_starts,
         paren_unwrapped: Vec::new(),
+        paren_spans: std::collections::HashMap::new(),
         closure_bindings: Vec::new(),
         recovery_joined: 0,
         recovery_blocked: 0,
@@ -558,6 +573,12 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         local_read_starts,
         carrier_spans,
         paren_unwrapped,
+        paren_spans: {
+            let mut v: Vec<(u32, usize, usize)> =
+                builder.paren_spans.into_iter().map(|(id, (a, b))| (id, a, b)).collect();
+            v.sort_unstable_by_key(|(id, _, _)| *id);
+            v.into_boxed_slice()
+        },
         closure_bindings,
         ancestry_facts,
     }
