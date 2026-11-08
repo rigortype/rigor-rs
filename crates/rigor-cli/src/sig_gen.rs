@@ -1675,6 +1675,24 @@ fn method_candidate(
     let (rbs, erased) = if declared_return_rbs.as_deref() == Some("untyped") {
         let mut widened: Vec<String> = Vec::new();
         for (m, e) in members.iter().zip(&erased_members) {
+            if e == "nil" {
+                // A `nil` member is not a pinned literal — it keeps its
+                // spelling inside the widened union.
+                if !widened.contains(&e.clone()) {
+                    widened.push(e.clone());
+                }
+                continue;
+            }
+            if matches!(e.as_str(), "true" | "false") {
+                // A bool literal member widens to the `(false | true)` pair,
+                // not `TrueClass` / `FalseClass` (rigor-rs#544).
+                for b in ["false", "true"] {
+                    if !widened.contains(&b.to_string()) {
+                        widened.push(b.to_string());
+                    }
+                }
+                continue;
+            }
             let e = if matches!(interner.get(*m), Type::Constant(_))
                 && index.class_name_of(interner, *m) != Some(e.as_str())
             {
@@ -1689,6 +1707,9 @@ fn method_candidate(
                 widened.push(e);
             }
         }
+        // The reference's `erase_to_rbs` union lists members in SORTED order
+        // (`Integer < String`, `Integer < nil`, `false < true`).
+        widened.sort();
         let erased = widened.join(" | ");
         let ret = paren_wrap_union(&erased);
         (format!("{prefix}{}: {head} -> {ret}", sig.name), erased)
@@ -1767,6 +1788,18 @@ fn classify(
             if inferred_erased == decl {
                 return None;
             }
+            // Declared `untyped` accepts every concrete inferred form and is
+            // never accepted back — always `tighter` (rigor-rs#544). The
+            // single-member gate below does not apply: a union widens
+            // member-wise in the emit. A whole-return `nil` reads as
+            // equivalent (the reference's `untyped`-accepts-`nil`), so it
+            // drops; a literal `nil` INSIDE a union member stays `nil`.
+            if decl == "untyped" {
+                if inferred_erased == "nil" {
+                    return None;
+                }
+                return Some(("tighter_return", Some(decl)));
+            }
             // A tightening must be a SINGLE bare carrier whose nominal-of is
             // exactly the declared class. A union (`> 1` member) never bare-tightens
             // a single declared class (FP-safe under-emit; e.g. declared union member
@@ -1782,11 +1815,7 @@ fn classify(
             // subtype. An ancestor chain that fails to resolve (unknown or
             // incomplete) refuses — the decline side.
             let inferred_class = index.class_name_of(interner, inferred_ty);
-            // A declared `untyped` accepts every inferred form and is never
-            // accepted back by a concrete one — always a tightening
-            // (`def n = 4.2` vs `() -> untyped`; rigor-rs#544).
-            let accepts = decl == "untyped"
-                || inferred_class == Some(decl.as_str())
+            let accepts = inferred_class == Some(decl.as_str())
                 || inferred_class
                     .and_then(|c| index.ancestor_names(c))
                     .is_some_and(|chain| chain.contains(&decl.as_str()));
@@ -1804,10 +1833,7 @@ fn classify(
             // literal spelling — i.e. differs from its own class name, not from
             // `decl` (a Float constant erases to `Float`, an ordinary nominal;
             // rigor-rs#544).
-            // (`untyped` is exempt: its tighter-return widens a literal
-            // constant to its nominal rather than refusing; rigor-rs#544.)
-            if decl != "untyped"
-                && matches!(interner.get(inferred_ty), Type::Constant(_))
+            if matches!(interner.get(inferred_ty), Type::Constant(_))
                 && !matches!(decl.as_str(), "Range" | "Set")
                 && inferred_class != Some(inferred_erased)
             {
@@ -1824,13 +1850,8 @@ fn classify(
             // contract (probe P: `def hash; [1].size; end` folds `1` but the tail
             // `[1].size` is a Call). NB: the RAW `sig.body.last()` node, NOT the
             // assignment-unwrapped typing tail.
-            // (`untyped` exempt again: the widened nominal emit keeps the
-            // computed Constant — `def m; x = 1; end` against `-> untyped`
-            // still emits `() -> Integer`.)
             let raw_tail = ast.get(*sig.body.last()?);
-            if decl != "untyped"
-                && computed_literal_tightening(interner, inferred_ty, raw_tail)
-            {
+            if computed_literal_tightening(interner, inferred_ty, raw_tail) {
                 return None;
             }
             Some(("tighter_return", Some(decl)))
