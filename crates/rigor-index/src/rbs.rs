@@ -7287,9 +7287,14 @@ fn retained_param_type(
                 // `class String` retains `String::selector`, the reference's
                 // env-qualified name its `expected:` label renders
                 // (rigor-rs#463).
-                let name = if !name.contains("::") && !enclosing.is_empty() {
-                    let qual = format!("{}::{name}", enclosing.join("::"));
-                    known.get(qual.as_str()).copied().unwrap_or(name)
+                // `enclosing` entries are already qualified
+                // (`["A", "A::B"]`), so the prefix to prepend is the LAST.
+                let name = if !name.contains("::") {
+                    enclosing
+                        .last()
+                        .map(|scope| format!("{scope}::{name}"))
+                        .and_then(|qual| known.get(qual.as_str()).copied())
+                        .unwrap_or(name)
                 } else {
                     name
                 };
