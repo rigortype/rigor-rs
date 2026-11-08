@@ -483,15 +483,33 @@ fn alias_adopted_methods(
     let mut defined: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for &child in body {
-        if let Node::Definition {
-            name: Some(name),
-            receiver_def_name: None,
-            singleton_name: None,
-            ..
-        } = ast.get(child)
-        {
-            if !defined.contains(name) {
-                defined.push(name.clone());
+        // A `def` counts in source order — directly (`def z`), or as the
+        // ARGUMENT of a visibility call (`private def z` lowers to a Call
+        // carrying the Definition node, rigor-rs#458 review).
+        let def_name_of = |n: &Node| match n {
+            Node::Definition {
+                name: Some(name),
+                receiver_def_name: None,
+                singleton_name: None,
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        };
+        let mut mark_defined = |name: Option<String>| {
+            if let Some(name) = name {
+                if !defined.contains(&name) {
+                    defined.push(name);
+                }
+            }
+        };
+        mark_defined(def_name_of(ast.get(child)));
+        if let Node::Call { args, .. } = ast.get(child) {
+            let arg_defs: Vec<String> = args
+                .iter()
+                .filter_map(|a| def_name_of(ast.get(*a)))
+                .collect();
+            for name in arg_defs {
+                mark_defined(Some(name));
             }
         }
         let (new, old) = match ast.get(child) {
