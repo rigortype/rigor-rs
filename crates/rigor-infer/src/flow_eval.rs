@@ -225,7 +225,7 @@ impl<'i> Typer<'i> {
                     };
                     env.insert(name, new_ty);
                 }
-                Node::Call { receiver, method, block_body, block_params, .. }
+                Node::Call { receiver, method, block_body, block_locals, block_params, .. }
                     if !block_body.is_empty() =>
                 {
                     // A block may run and rebind a captured local — its
@@ -246,11 +246,29 @@ impl<'i> Typer<'i> {
                         ) {
                             block_env.insert(pname.clone(), bound);
                         }
+                        // `each_with_index`'s second positional binds
+                        // `Integer` (`|e, i|`'s `i`).
+                        if *method == "each_with_index" {
+                            if let Some((iname, ikind)) = block_params.get(1) {
+                                if matches!(ikind, BlockParamKind::RequiredArg) {
+                                    let i_ty =
+                                        self.nominal_or_untyped("Integer", interner);
+                                    block_env.insert(iname.clone(), i_ty);
+                                }
+                            }
+                        }
                     }
                     self.replay_statements(ast, &mut block_env, block_body, interner, returns);
                     let untyped = interner.untyped();
                     let is_loop = *method == "loop";
                     for (name, ty) in block_env.iter() {
+                        // Block params and `;`-locals SHADOW outer names and
+                        // cease to exist outside — they never propagate.
+                        if block_params.iter().any(|(p, _)| p == name)
+                            || block_locals.contains(name)
+                        {
+                            continue;
+                        }
                         let entry = env.get(name).copied();
                         if entry == Some(*ty) {
                             continue;
