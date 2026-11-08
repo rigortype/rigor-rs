@@ -6,7 +6,7 @@
 use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
-use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
+use crate::{folding, kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
 
 /// The value-pinned scalar key a hash-literal key NODE carries, or `None` when
 /// the key is dynamic (a computed expression, an interpolated string, a
@@ -523,8 +523,17 @@ impl<'i> Typer<'i> {
             } => {
                 let (r, read_name, compound, value) =
                     (*r, read_name.clone(), compound.clone(), *value);
-                let current =
-                    self.type_call_for_write_value(ast, r, &read_name, &[], env, interner);
+                // rigor-rs#499: `&&=` reads its current as a user-facing call,
+                // so the nilable String lookup declines (`s.index &&= 1`): the
+                // flat `Integer` the write-value read keeps collapses under
+                // `narrow_falsey` to `1`, where the oracle keeps
+                // `Integer | nil` and stays silent downstream. `||=` keeps the
+                // write-value read (#178): `narrow_truthy` is sound on it.
+                let current = if matches!(compound, Compound::And) {
+                    self.type_call(ast, r, &read_name, &[], env, interner)
+                } else {
+                    self.type_call_for_write_value(ast, r, &read_name, &[], env, interner)
+                };
                 let rhs = self.type_of(ast, value, env, interner);
                 match compound {
                     Compound::Or => {
@@ -602,8 +611,41 @@ impl<'i> Typer<'i> {
         if !self.fully_tracked_type(*pre, interner) {
             return None;
         }
-        let current =
-            self.type_call_for_write_value(ast, w.receiver, "[]", &[w.key_node], env, interner);
+        // rigor-rs#499 — the `current` read inside `s[k] op= v` evaluates
+        // BEFORE that statement's own mutation lands, so its mark does not
+        // invalidate `pre`'s pin (`stale_local_except`). Fold the pinned
+        // string directly: `s = "abc"; s[9] ||= nil` reads `"abc"[9]` → `nil`
+        // on the oracle, while the flat `type_call` sees the stale mark and
+        // declines to untyped. Only the `nil` fold is kept: an in-bounds
+        // key would record a `Constant | nil` union (`"a" | nil`) whose
+        // diagnostics the flat `String | nil` answer already produces —
+        // the oracle emits `possible-nil` there, and the possible-nil
+        // channel decodes the nominal union, not a literal-member one.
+        let current = match interner.get(*pre).clone() {
+            Type::Constant(rigor_types::Scalar::Str(ref s))
+                if !self.stale_local_except(ast, &w.name, w.span) =>
+            {
+                let folded = self
+                    .pin_arg_scalars(ast, &[w.key_node], env, interner)
+                    .and_then(|keys| folding::fold(&rigor_types::Scalar::Str(s.clone()), "[]", &keys));
+                match folded {
+                    Some(f @ rigor_types::Scalar::Nil) => {
+                        interner.intern(Type::Constant(f))
+                    }
+                    _ => {
+                        // In-bounds: the oracle records `"a" | nil`, whose
+                        // diagnostics a flat `String` current reproduces
+                        // exactly (`String | nil` → `possible-nil`). The
+                        // `type_call` path cannot answer — it sees the
+                        // write's own stale mark and declines.
+                        self.nominal_or_untyped("String", interner)
+                    }
+                }
+            }
+            _ => self.type_call_for_write_value(
+                ast, w.receiver, "[]", &[w.key_node], env, interner,
+            ),
+        };
         let rhs = self.type_of(ast, w.value, env, interner);
         let truthy = self.narrow_truthy(current, interner);
         Some(rigor_types::Algebra::join(interner, truthy, rhs))

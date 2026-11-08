@@ -601,6 +601,10 @@ pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
 /// Float index) or where Ruby raises (a wrong arity) and the reference
 /// declines to the `String | nil` / `Integer | nil` join. The caller answers
 /// `Dynamic` instead: a coverage loss, never a false positive.
+/// rigor-rs#499 — an unfolded lookup answers `Dynamic`, never the flat
+/// nominal: zero-arg `s.index` landed on bare `Integer`, collapsing under
+/// `narrow_falsey` in `s.index &&= 1` to `1` where the oracle keeps
+/// `Integer | nil` and stays silent downstream.
 pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
     is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
 }
