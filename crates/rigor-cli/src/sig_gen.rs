@@ -877,6 +877,22 @@ fn generate_file_with_info(
     // block body or its `class ... end` body defines.
     let mut out = collect_meta_candidates(path, &layouts, sig_env);
     let mut definers: Vec<Definer> = Vec::new();
+    // `meta_member_slots` (reference `definer_table`): every member a
+    // `Data.define`/`Struct.new` layout declares is a CERTAIN definer of its
+    // slot at `MEMBER_OFFSET` — a `def x` inside the block (or the class body)
+    // steals it, so `def x: () -> untyped` must not emit beside the real
+    // `def x` (rigor-rs#525 item 1).
+    for (class_name, layout) in layouts.iter() {
+        for member in meta_class::member_decls(layout) {
+            definers.push(Definer {
+                class_name: class_name.to_string(),
+                kind: member.kind,
+                method_name: member.method_name.clone(),
+                offset: META_MEMBER_OFFSET,
+                certain: true,
+            });
+        }
+    }
     let mut info = NamespaceInfo::default();
     // Top-level `def`s join the walk in source order, as `sig.skipped.top-level-def`
     // rows (#1676). None sits inside a namespace the walk enters, so each one
@@ -1012,9 +1028,15 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
-        definer: None,
+        definer: Some((META_MEMBER_OFFSET, false)),
     }
 }
+
+/// The reference's `MEMBER_OFFSET = -1`: a meta member's definer-table entry
+/// sorts BEFORE every real offset — a `def` anywhere after it steals the slot.
+/// `0` stands in for `-1` (the table holds only class-scoped slots; no
+/// class-level `def` can sit at byte 0).
+const META_MEMBER_OFFSET: usize = 0;
 
 /// The `--print` declaration line for a class group (reference
 /// `declaration_header`). Print mode used to hard-code `class`, which turned a
@@ -1322,7 +1344,7 @@ fn walk_namespace(
             // `private def x` after an uncertain reset: reported like a direct
             // def (the reference skips it before reading its visibility). In
             // any other mode the port does not walk a def passed to a call.
-            Node::Call { receiver: None, method, args, span, .. } => {
+            Node::Call { receiver: None, method, args, span, block_body, .. } => {
                 // `attr_reader :x` / `attr_writer` / `attr_accessor` are
                 // DEFINERS too (reference `record_attr_definers`): the call's
                 // offset ranks them like a `def`, so a later `attr_reader :u`
@@ -1383,6 +1405,44 @@ fn walk_namespace(
                         }
                     }
                 }
+                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
+                // definer too (`rigor_each_child` descends arguments).
+                // `Definition` args are already handled above — descending
+                // them would double-count the wrapped def.
+                for &arg in args {
+                    if !matches!(ast.get(arg), Node::Definition { .. }) {
+                        collect_conditional_definers(
+                            ast,
+                            arg,
+                            &qualified,
+                            false,
+                            matches!(ast.get(id), Node::ModuleDef { .. }),
+                            layouts,
+                            modes,
+                            definers,
+                        );
+                    }
+                }
+                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
+                // children are uncertain definers (`walk_attr_calls` descends
+                // call blocks too; a `refine`/`class_methods` block is a DSL
+                // scope and skipped).
+                let dsl_scope = method == "class_methods"
+                    || (method == "refine" && matches!(ast.get(id), Node::ModuleDef { .. }));
+                if !dsl_scope {
+                    for &b in block_body {
+                        collect_conditional_definers(
+                            ast,
+                            b,
+                            &qualified,
+                            false,
+                            matches!(ast.get(id), Node::ModuleDef { .. }),
+                            layouts,
+                            modes,
+                            definers,
+                        );
+                    }
+                }
             }
             Node::Definition {
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
@@ -1421,7 +1481,28 @@ fn walk_namespace(
                     }
                 }
             }
-            _ => {}
+            // Any other body statement — an `if`/`case`/`begin`/loop/block
+            // — can still CARRY a `def` or `attr_*`: the reference walks
+            // into every non-`def` child (`walk_attr_calls` +
+            // `walk_def_children`), recording each as an UNCERTAIN definer
+            // (only direct statements are `certain_definers`).
+            // `if cond; attr_reader :x; end` then contests a preceding
+            // `def x` (rigor-rs#525 item 2). Namespace children are walked
+            // by `Emit::Nested` instead — do not double-count them.
+            _ => {
+                if !is_namespace_node(ast, child, &qualified, layouts) {
+                    collect_conditional_definers(
+                        ast,
+                        child,
+                        &qualified,
+                        false,
+                        matches!(ast.get(id), Node::ModuleDef { .. }),
+                        layouts,
+                        modes,
+                        definers,
+                    );
+                }
+            }
         }
     }
     // Emit own methods AND descend into nested classes in ONE source-order
@@ -1493,6 +1574,223 @@ fn walk_namespace(
                 definers,
             ),
         }
+    }
+}
+
+/// Reference `walk_attr_calls` + the definer side of `walk_defs`: descend
+/// into every non-`def` node inside a class body — `if`/`case`/`begin`/loop
+/// bodies, call arguments and block bodies — recording each `def` and
+/// `attr_*` it holds as an UNCERTAIN definer (`certain_definers` marks only
+/// direct statements). An uncertain definer after a certain one contests the
+/// slot, so `def x; if c; attr_reader :x; end; end` writes nothing
+/// (rigor-rs#525 item 2). `refine`/`class_methods` block calls are DSL
+/// scopes the reference skips (`skipped_block_call?`).
+#[allow(clippy::too_many_arguments)]
+fn collect_conditional_definers(
+    ast: &LoweredAst,
+    id: NodeId,
+    prefix: &[String],
+    in_singleton_class: bool,
+    in_module: bool,
+    layouts: &MetaLayouts,
+    modes: &HashMap<usize, module_function::Mode>,
+    definers: &mut Vec<Definer>,
+) {
+    let recurse = |ast: &LoweredAst,
+                   child: NodeId,
+                   prefix: &[String],
+                   sclass: bool,
+                   module: bool,
+                   definers: &mut Vec<Definer>| {
+        collect_conditional_definers(ast, child, prefix, sclass, module, layouts, modes, definers);
+    };
+    match ast.get(id) {
+        Node::ClassDef { name, rooted, body, .. } | Node::ModuleDef { name, rooted, body, .. } => {
+            let child_prefix = declaration_prefix(prefix, name, *rooted);
+            let module = matches!(ast.get(id), Node::ModuleDef { .. });
+            for &b in body {
+                recurse(ast, b, &child_prefix, false, module, definers);
+            }
+        }
+        // `Const = Data.define(...) do … end` inside a conditional: the block
+        // is the new class's own body (`meta_block_body`).
+        Node::ConstantWrite { name, value, .. }
+            if layouts.get(&qualify_join(prefix, name)).is_some() =>
+        {
+            if let Node::Call { block_body, .. } = ast.get(*value) {
+                let mut child_prefix = prefix.to_vec();
+                child_prefix.push(name.clone());
+                for &b in block_body {
+                    recurse(ast, b, &child_prefix, false, false, definers);
+                }
+            }
+        }
+        Node::Definition { is_singleton_class: true, body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, true, in_module, definers);
+            }
+        }
+        // A `def` is a definer itself; its BODY is out of bounds
+        // (`walk_attr_calls` returns at DefNode).
+        Node::Definition { name, singleton_name, span, .. } => {
+            if let Some(n) = name.as_ref().or(singleton_name.as_ref()) {
+                let kind = if in_singleton_class || singleton_name.is_some() {
+                    "singleton"
+                } else {
+                    "instance"
+                };
+                definers.push(Definer {
+                    class_name: prefix.join("::"),
+                    kind,
+                    method_name: n.clone(),
+                    offset: span.0,
+                    certain: false,
+                });
+                if !in_singleton_class
+                    && matches!(
+                        modes.get(&span.0),
+                        Some(module_function::Mode::On) | Some(module_function::Mode::Uncertain)
+                    )
+                {
+                    definers.push(Definer {
+                        class_name: prefix.join("::"),
+                        kind: "singleton",
+                        method_name: n.clone(),
+                        offset: span.0,
+                        certain: false,
+                    });
+                }
+            }
+        }
+        Node::Call { receiver, method, args, block_body, span, .. } => {
+            // `class_methods` is a DSL scope only RECEIVERLESS
+            // (`class_methods_block?`); `refine` likewise on a nil or `self`
+            // receiver (`refine_call?`) and only in a MODULE body — `Class`
+            // undefines `refine`, so the same spelling in a `class` body is
+            // the class's own method and its block walks as any other block
+            // (`class_body_refine?` / #1689). A `obj.class_methods` /
+            // `obj.refine` block is an ordinary block and descends.
+            let refine_shaped = method == "refine"
+                && receiver
+                    .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                    .unwrap_or(true);
+            let dsl = (method == "class_methods" && receiver.is_none())
+                || (refine_shaped && in_module);
+            if dsl && !block_body.is_empty() {
+                return;
+            }
+            if !prefix.is_empty()
+                && !in_singleton_class
+                && matches!(method.as_str(), "attr_reader" | "attr_writer" | "attr_accessor")
+            {
+                for &arg in args {
+                    let Node::SymbolLit { value, .. } = ast.get(arg) else { continue };
+                    let reads = method != "attr_writer";
+                    let writes = method != "attr_reader";
+                    for (mname, emits) in [(value.clone(), reads), (format!("{value}="), writes)] {
+                        if emits {
+                            definers.push(Definer {
+                                class_name: prefix.join("::"),
+                                kind: "instance",
+                                method_name: mname,
+                                offset: span.0,
+                                certain: false,
+                            });
+                        }
+                    }
+                }
+            }
+            for &b in args.iter().chain(block_body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::If { predicate, then_body, else_body, .. } => {
+            recurse(ast, *predicate, prefix, in_singleton_class, in_module, definers);
+            for &b in then_body.iter().chain(else_body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Case { predicate, branches, else_body, .. } => {
+            if let Some(p) = predicate {
+                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in branches.iter().chain(else_body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::When { conditions, body, .. } => {
+            for &b in conditions.iter().chain(body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Loop { predicate, body, .. } => {
+            if let Some(p) = predicate {
+                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::BeginRescue { body, .. } | Node::Statements { body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        // Expression-level containers carry the same children
+        // (`rigor_each_child` descends everywhere): `_x = if c; attr_reader
+        // :x; end` and `c && attr_reader(:x)` record just the same.
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+        }
+        Node::MultiWrite { value, target_exprs, .. } => {
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            for &b in target_exprs {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::IndexWrite { receiver, indices, value, .. } => {
+            if let Some(r) = receiver {
+                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in indices.iter().chain(std::iter::once(value)) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            recurse(ast, *left, prefix, in_singleton_class, in_module, definers);
+            recurse(ast, *right, prefix, in_singleton_class, in_module, definers);
+        }
+        Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            for &b in parts {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &b in elements {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Range { left, right, .. } => {
+            for bound in [left, right].into_iter().flatten() {
+                recurse(ast, *bound, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::AttrWrite { receiver, value, .. } => {
+            if let Some(r) = receiver {
+                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+            }
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+        }
+        _ => {}
     }
 }
 
