@@ -509,6 +509,36 @@ fn bare_module_function_makes_subsequent_defs_dual() {
 }
 
 #[test]
+fn module_function_dup_slots_last_definer_wins() {
+    // rigor-rs#493 item 9 (reference `live_definitions`): a `module_function`
+    // `def u` owns BOTH slots; a later `def self.u` steals the singleton one,
+    // so the dual row is dropped outright — emitting both is an `rbs
+    // validate` duplicate-member failure.
+    let src = "module N15\n  module_function\n  def u = 1\n  def self.u = 2\nend\n";
+    let cs = candidates_tagged("mfdup", src, false);
+    assert_eq!(
+        cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self.u: () -> 2"]
+    );
+    // A later INSTANCE-only redefinition (a `public` reset ends the dual
+    // mode) steals the instance slot; the first def's surviving singleton
+    // copy is written `def self.u` — with the FIRST def's return.
+    let src2 = "module M\n  module_function\n  def u = 1\n  public\n  def u = 9\nend\n";
+    let cs2 = candidates_tagged("mfdup2", src2, false);
+    assert_eq!(
+        cs2.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self.u: () -> 1", "def u: () -> 9"]
+    );
+    // A plain redefinition keeps the LAST def, as before.
+    let src3 = "class C\n  def y = 1\n  def y = 2\nend\n";
+    let cs3 = candidates_tagged("mfdup3", src3, false);
+    assert_eq!(
+        cs3.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def y: () -> 2"]
+    );
+}
+
+#[test]
 fn module_function_with_args_does_not_flip_mode() {
     // `module_function :sym` (args form) neither flips the mode nor marks the
     // method (oracle-probed) — both defs stay plain instance methods.
@@ -573,6 +603,7 @@ fn diff_string_emits_header_and_plus_line_per_candidate() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     let cands = [
         c("Foo", "greeting", "def greeting: () -> \"h\""),
@@ -627,6 +658,7 @@ fn render_new_file_wraps_nested_namespaces_with_kinds_and_super() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     let mut info = NamespaceInfo::default();
     info.kinds.insert("Outer".into(), "module");
@@ -651,6 +683,7 @@ fn render_new_file_appends_data_struct_shells_after_real_children() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     let mut info = NamespaceInfo::default();
     info.kinds.insert("Host".into(), "class");
@@ -690,6 +723,7 @@ fn render_new_file_leaf_class_defaults_to_class_keyword() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     // No kinds recorded → a leaf with methods defaults to `class`.
     let out = render_new_file(&[cand], &[], &NamespaceInfo::default());
@@ -795,6 +829,7 @@ fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     }
 }
 

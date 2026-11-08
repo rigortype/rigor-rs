@@ -117,6 +117,8 @@ struct MethodSig<'a> {
     /// same body made dual — rendered `def self?.name` (reference
     /// `method_def_prefix` / `@module_function_methods`). Kind stays `instance`.
     module_function: bool,
+    /// The def node's source offset — the definer-table rank (last wins).
+    offset: usize,
 }
 
 /// One printable RBS skeleton row (the reference's emittable `MethodCandidate`,
@@ -154,6 +156,11 @@ struct Candidate {
     /// share (an equivalent declaration, a port-only confidence skip) are
     /// `"dropped"` with no reason. Neither kind leaves [`generate_run`].
     skip_reason: Option<&'static str>,
+    /// The `def` node this candidate came from: `(source offset, module_function)`.
+    /// `None` for meta members, stubs and skip rows. Feeds the
+    /// [`live_definitions`] slot pass (reference `definer_table` /
+    /// `live_definitions`, #2008/#2023).
+    definer: Option<(usize, bool)>,
 }
 
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
@@ -869,6 +876,7 @@ fn generate_file_with_info(
     // value class's members and constructors read first, ahead of the methods its
     // block body or its `class ... end` body defines.
     let mut out = collect_meta_candidates(path, &layouts, sig_env);
+    let mut definers: Vec<Definer> = Vec::new();
     let mut info = NamespaceInfo::default();
     // Top-level `def`s join the walk in source order, as `sig.skipped.top-level-def`
     // rows (#1676). None sits inside a namespace the walk enters, so each one
@@ -896,6 +904,7 @@ fn generate_file_with_info(
                 &modes,
                 &mut interner,
                 &mut out,
+                &mut definers,
             );
             collect_namespace_info(&ast, child, &[], &mut info);
         }
@@ -903,6 +912,14 @@ fn generate_file_with_info(
     for (name, _) in top_level {
         out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
     }
+    // `live_definitions` (reference): Ruby keeps the LAST certain definer of a
+    // `(class, kind, name)` slot, and a def is written only when it survives
+    // EVERY slot it defines. A module_function `def u` owns `[instance,u]` and
+    // `[singleton,u]`; a later `def self.u` steals the singleton slot, so the
+    // `self?.u` row is dropped entirely — writing both is the `rbs validate`
+    // duplicate-member failure of rigor-rs#493 item 9. One surviving singleton
+    // slot downgrades the row to `def self.u`; anything else drops it.
+    live_definitions(&mut out, &definers);
     register_meta_classes(&layouts, &mut info);
     info.headers = superclasses::collect(&parsed);
     // `register_core_subclass_shell` (#2224): a subclass of a core or stdlib
@@ -995,6 +1012,7 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     }
 }
 
@@ -1170,6 +1188,22 @@ fn describe_qualified(
     rigor_types::describe_named(interner, ty, &resolve)
 }
 
+/// One `def`'s contribution to the definer table (reference `definer_table` /
+/// `definer_slots`): a module_function instance def defines its instance slot
+/// AND a singleton slot; a def after an uncertain `module_function` reset defines
+/// the singleton slot only `possible`-ly (`certain = false`). Every collected
+/// `def` is a direct statement of a class/module/`class << self`/`Data.define`
+/// body or `class << self` inner def, so the own-kind slot is `certain` — the
+/// reference's `certain_definers` set.
+struct Definer {
+    class_name: String,
+    /// `"instance"` | `"singleton"` slot kind.
+    kind: &'static str,
+    method_name: String,
+    offset: usize,
+    certain: bool,
+}
+
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
 /// instance method and descending into nested namespaces (prefix accumulates the
 /// qualified name, reference `walk_defs`).
@@ -1189,6 +1223,7 @@ fn walk_namespace(
     modes: &HashMap<usize, module_function::Mode>,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
 ) {
     let (name, rooted, visibilities, body) = match ast.get(id) {
         Node::ClassDef { name, rooted, method_visibilities, body, .. } => {
@@ -1240,6 +1275,20 @@ fn walk_namespace(
                 let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
                 if mode == module_function::Mode::Uncertain {
                     uncertain.push((n.as_str(), span.0));
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "instance",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: true,
+                    });
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "singleton",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: false,
+                    });
                     continue;
                 }
                 let mf = mode == module_function::Mode::On;
@@ -1249,19 +1298,88 @@ fn walk_namespace(
                     visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v)
                 };
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf, span.0),
                     vis,
                     span.0,
                 ));
+                definers.push(Definer {
+                    class_name: class_name.clone(),
+                    kind: "instance",
+                    method_name: n.to_string(),
+                    offset: span.0,
+                    certain: true,
+                });
+                if mf {
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "singleton",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: true,
+                    });
+                }
             }
             // `private def x` after an uncertain reset: reported like a direct
             // def (the reference skips it before reading its visibility). In
             // any other mode the port does not walk a def passed to a call.
-            Node::Call { receiver: None, args, .. } => {
+            Node::Call { receiver: None, method, args, span, .. } => {
+                // `attr_reader :x` / `attr_writer` / `attr_accessor` are
+                // DEFINERS too (reference `record_attr_definers`): the call's
+                // offset ranks them like a `def`, so a later `attr_reader :u`
+                // steals the instance slot a `module_function def u` held.
+                if !class_name.is_empty()
+                    && matches!(method.as_str(), "attr_reader" | "attr_writer" | "attr_accessor")
+                {
+                    for &arg in args {
+                        let Node::SymbolLit { value, .. } = ast.get(arg) else { continue };
+                        let reads = method != "attr_writer";
+                        let writes = method != "attr_reader";
+                        for (mname, emits) in [(value.clone(), reads), (format!("{value}="), writes)] {
+                            if emits {
+                                definers.push(Definer {
+                                    class_name: class_name.clone(),
+                                    kind: "instance",
+                                    method_name: mname,
+                                    offset: span.0,
+                                    certain: true,
+                                });
+                            }
+                        }
+                    }
+                }
                 for &arg in args {
                     if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
-                        if modes.get(&span.0) == Some(&module_function::Mode::Uncertain) {
+                        let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                        if mode == module_function::Mode::Uncertain {
                             uncertain.push((n.as_str(), span.0));
+                        }
+                        // A def passed to `private` / `public` / `protected`
+                        // (or `module_function`) still DEFINES its slots — the
+                        // reference records it in `certain_definers` even
+                        // though the port never emits a candidate for it.
+                        definers.push(Definer {
+                            class_name: class_name.clone(),
+                            kind: "instance",
+                            method_name: n.to_string(),
+                            offset: span.0,
+                            certain: true,
+                        });
+                        match mode {
+                            module_function::Mode::On => definers.push(Definer {
+                                class_name: class_name.clone(),
+                                kind: "singleton",
+                                method_name: n.to_string(),
+                                offset: span.0,
+                                certain: true,
+                            }),
+                            module_function::Mode::Uncertain => definers.push(Definer {
+                                class_name: class_name.clone(),
+                                kind: "singleton",
+                                method_name: n.to_string(),
+                                offset: span.0,
+                                certain: false,
+                            }),
+                            _ => {}
                         }
                     }
                 }
@@ -1270,10 +1388,17 @@ fn walk_namespace(
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false, span.0),
                     None,
                     span.0,
                 ));
+                definers.push(Definer {
+                    class_name: class_name.clone(),
+                    kind: "singleton",
+                    method_name: n.to_string(),
+                    offset: span.0,
+                    certain: true,
+                });
             }
             Node::Definition { is_singleton_class: true, body: sbody, .. } => {
                 for &inner in sbody {
@@ -1282,10 +1407,17 @@ fn walk_namespace(
                     } = ast.get(inner)
                     {
                         sigs.push((
-                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false, span.0),
                             None,
                             span.0,
                         ));
+                        definers.push(Definer {
+                            class_name: class_name.clone(),
+                            kind: "singleton",
+                            method_name: n.to_string(),
+                            offset: span.0,
+                            certain: true,
+                        });
                     }
                 }
             }
@@ -1358,6 +1490,7 @@ fn walk_namespace(
                 modes,
                 interner,
                 out,
+                definers,
             ),
         }
     }
@@ -1439,8 +1572,9 @@ fn sig_of<'a>(
     has_explicit_return: bool,
     singleton: bool,
     module_function: bool,
+    offset: usize,
 ) -> MethodSig<'a> {
-    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function }
+    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function, offset }
 }
 
 /// Classify + render one method (instance or singleton), or `None` when skipped
@@ -1498,6 +1632,7 @@ fn method_candidate(
             // declared `initialize` is still emitted `new_method`) — keep the stub
             // path exactly as-is, before any classification.
             classification: "new_method",
+            definer: Some((sig.offset, sig.module_function)),
             declared_return_rbs: None,
             decl_header: String::new(),
             skip_reason: None,
@@ -1642,6 +1777,7 @@ fn method_candidate(
         declared_return_rbs,
         decl_header: String::new(),
         skip_reason: None,
+        definer: Some((sig.offset, sig.module_function)),
     })
 }
 
@@ -1667,7 +1803,68 @@ fn non_emitted(
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: reason,
+        definer: None,
     }
+}
+
+/// Reference `live_definitions` over the candidate rows: `definer_table` is
+/// `definers` (collected alongside the walk), `live_definer?` keeps the LAST
+/// certain entry of a slot unless an uncertain entry sits after it (contested
+/// → nothing is written), and a candidate survives only when its def owns
+/// every slot it defines — except the singleton-only survival, which a
+/// `def self?.u` downgrades to `def self.u`.
+fn live_definitions(out: &mut Vec<Candidate>, definers: &[Definer]) {
+    /// `(class_name, kind, method_name)` — the reference's definer-table key.
+    type Slot = (String, &'static str, String);
+    let mut table: HashMap<Slot, Vec<(usize, bool)>> = HashMap::new();
+    for d in definers {
+        table
+            .entry((d.class_name.clone(), d.kind, d.method_name.clone()))
+            .or_default()
+            .push((d.offset, d.certain));
+    }
+    let live_at = |slot: &Slot, offset: usize| -> bool {
+        let Some(entries) = table.get(slot) else { return true };
+        if entries.len() <= 1 {
+            return true;
+        }
+        let Some(last_certain) = entries.iter().filter(|(_, c)| *c).map(|(o, _)| *o).max() else {
+            return false;
+        };
+        if entries.iter().any(|(o, c)| !*c && *o > last_certain) {
+            return false;
+        }
+        offset == last_certain
+    };
+    for c in out.iter_mut() {
+        let Some((offset, module_function)) = c.definer else { continue };
+
+        let own = (c.class_name.clone(), c.kind, c.method_name.clone());
+        let live = live_at(&own, offset).then_some(own);
+        let mut single = None;
+        if module_function {
+            let s = (c.class_name.clone(), "singleton", c.method_name.clone());
+            if live_at(&s, offset) {
+                single = Some(s);
+            }
+        }
+        let all = live.is_some() && (!module_function || single.is_some());
+        if all {
+            continue;
+        }
+        if live.is_none() && single.is_some() {
+            // The instance half was replaced; the singleton copy Ruby keeps is
+            // written `def self.name` (reference `live_definitions`).
+            c.kind = "singleton";
+            c.rbs = c.rbs.replacen("def self?.", "def self.", 1);
+            continue;
+        }
+        // Nothing survived — mark the row dropped (invisible downstream, as a
+        // `"dropped"` classification already is).
+        c.skip_reason = None;
+        c.classification = "dropped";
+    }
+    out.retain(|c| c.classification != "dropped" || c.skip_reason.is_some());
 }
 
 /// Classify one already-inferred candidate against the project's own RBS
@@ -2346,6 +2543,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         declared_return_rbs: c.declared_return_rbs.clone(),
         decl_header: c.decl_header.clone(),
         skip_reason: c.skip_reason,
+        definer: c.definer,
     }
 }
 
