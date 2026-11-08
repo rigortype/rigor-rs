@@ -2528,7 +2528,9 @@ fn cmd_write(
     report_unresolvable_superclasses(&unresolvable);
     // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
     // write and did not get one — exit 1.
-    if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
+    if results.iter().any(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    }) {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
@@ -2764,6 +2766,14 @@ fn render_write_text(results: &[WriteResult]) {
                 println!("REFUSED {} — the existing file was not updated", r.target);
                 println!("  {}", r.error.as_deref().unwrap_or_default());
                 println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+            }
+            "skipped_invalid_rbs" => {
+                println!(
+                    "REFUSED {} — the generated RBS does not parse, so it was not written",
+                    r.target
+                );
+                println!("  {}", r.error.as_deref().unwrap_or_default());
+                println!("  This is a bug in Rigor's RBS rendering, not in your code — please report it.");
             }
             _ => {}
         }
@@ -3021,10 +3031,15 @@ fn update_existing(
     // `--write` re-run stays idempotent (the shell is present, no conflict). The
     // only uncovered case is merging into a USER-authored sig that lacks a shell
     // for a `Data.define` return — a documented follow-up, not a regression.
-    let _ = shells;
     let MergeOutcome { source: merged, action, applied, skipped, repaired } =
-        apply_merge_with(source, candidates, kinds, supers, params, overwrite);
+        apply_merge_with(source, candidates, kinds, supers, params, shells, overwrite);
+    // Reference `RbsValidity.source_error`: a spliced result that does not
+    // re-parse is a writer defect — refuse to write it (`:skipped_invalid_rbs`)
+    // rather than leave the consumer's `rigor check` to quarantine the file.
     if action == "updated" {
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &merged) {
+            return refused("skipped_invalid_rbs", detail);
+        }
         let _ = std::fs::write(target, &merged);
     }
     WriteResult {
@@ -3061,7 +3076,7 @@ fn apply_merge(
     supers: &HashMap<String, String>,
     overwrite: bool,
 ) -> MergeOutcome {
-    apply_merge_with(source, candidates, &HashMap::new(), supers, &HashMap::new(), overwrite)
+    apply_merge_with(source, candidates, &HashMap::new(), supers, &HashMap::new(), &[], overwrite)
 }
 
 /// [`apply_merge`] with the run's generic header spellings (`params`): new
@@ -3073,6 +3088,7 @@ fn apply_merge_with(
     kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
+    shells: &[String],
     overwrite: bool,
 ) -> MergeOutcome {
     // Parse-failure gate: a malformed target is left byte-untouched (reference
@@ -3088,9 +3104,16 @@ fn apply_merge_with(
     }
     let mut applied: Vec<Candidate> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
+    let mut touched: Vec<String> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
+        touched.push(class_name.clone());
         merge_class(&mut source, &class_name, group, kinds, supers, params, overwrite, &mut applied, &mut skipped);
     }
+    // `collapse_nested_declarations`: touched `Foo::Bar` decls move under an
+    // existing `Foo` (rigor-rs#530). Runs after every merge so the parents
+    // are in place; `repair_generic_headers` still goes last.
+    touched.extend(shells.iter().cloned());
+    collapse_nested_declarations(&mut source, &touched);
     let repaired = repair_generic_headers(&mut source, params);
     // `state_changed?`: a repaired header is a change too.
     let action = if applied.is_empty() && repaired.is_empty() { "noop" } else { "updated" };
@@ -3609,6 +3632,242 @@ fn insert_namespace_chain(
         }
     }
     applied.extend(candidates);
+}
+
+/// Owned snapshot of a class/module declaration for the relocation pass
+/// (reference `collapse_nested_declarations` reads `RBS` locations).
+struct RelocDecl {
+    /// `decl.location` start/end byte offsets.
+    start: usize,
+    end: usize,
+    /// `decl.location[:name]` byte offsets — the head rename's splice region.
+    name_start: usize,
+    name_end: usize,
+    /// `decl.location[:end]` start byte offset (the `insert_before_end` anchor).
+    end_start: usize,
+    /// `decl.location[:keyword].start_column` — drives both indent depths.
+    keyword_col: usize,
+    /// `leading_positions`: annotation + comment start offsets.
+    leading: Vec<usize>,
+    /// `decl.name.to_s.start_with?("::")` — a rooted decl keeps its layout.
+    rooted: bool,
+}
+
+/// [`find_and_extract`] returning the fuller [`RelocDecl`] the relocation
+/// pass needs (reference `find_class_decl` used from `relocate_under_parent`).
+fn find_reloc_decl<'a>(
+    source: &str,
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    target: &str,
+) -> Option<RelocDecl> {
+    for decl in decls {
+        let (local, members, info) = match &decl {
+            RbsNode::Class(c) => (
+                decl_full_name(&c.name()),
+                c.members(),
+                (
+                    c.location(),
+                    c.name_location(),
+                    c.end_location(),
+                    c.keyword_location(),
+                    c.annotations(),
+                    c.comment().map(|cm| cm.location()),
+                ),
+            ),
+            RbsNode::Module(m) => (
+                decl_full_name(&m.name()),
+                m.members(),
+                (
+                    m.location(),
+                    m.name_location(),
+                    m.end_location(),
+                    m.keyword_location(),
+                    m.annotations(),
+                    m.comment().map(|cm| cm.location()),
+                ),
+            ),
+            _ => continue,
+        };
+        let (loc, name_loc, end_loc, kw_loc, annotations, comment_loc) = info;
+        let full = if prefix.is_empty() {
+            local.clone()
+        } else {
+            format!("{}::{}", prefix.join("::"), local)
+        };
+        if full == target {
+            let mut leading: Vec<usize> = annotations
+                .iter()
+                .filter_map(|a| match a {
+                    RbsNode::Annotation(an) => {
+                        Some(clamp_offset(an.location().start(), source.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(cl) = comment_loc {
+                leading.push(clamp_offset(cl.start(), source.len()));
+            }
+            return Some(RelocDecl {
+                start: clamp_offset(loc.start(), source.len()),
+                end: clamp_offset(loc.end(), source.len()),
+                name_start: clamp_offset(name_loc.start(), source.len()),
+                name_end: clamp_offset(name_loc.end(), source.len()),
+                end_start: clamp_offset(end_loc.start(), source.len()),
+                keyword_col: clamp_offset(kw_loc.start(), source.len())
+                    - line_start_index(source, clamp_offset(kw_loc.start(), source.len())),
+                leading,
+                rooted: slice_of(source, name_loc).starts_with("::"),
+            });
+        }
+        let mut child_prefix = prefix.to_vec();
+        child_prefix.push(local);
+        if let Some(found) = find_reloc_decl(source, members.iter(), &child_prefix, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Reference `collapse_nested_declarations`: relocate each touched `A::B`
+/// declaration under an existing `A` in the same file, shallowest first
+/// (rigor-rs#530).
+fn collapse_nested_declarations(source: &mut String, names: &[String]) {
+    let mut uniq: Vec<&String> = names.iter().collect();
+    uniq.sort();
+    uniq.dedup();
+    for name in uniq {
+        relocate_under_parent(source, name);
+    }
+}
+
+/// Reference `relocate_under_parent`: move `qualified`'s own declaration
+/// under its existing parent decl, or leave the file untouched when any
+/// precondition fails (no parent, overlap, `::`-rooted head, non-isolated
+/// region, unparseable intermediate).
+fn relocate_under_parent(source: &mut String, qualified: &str) {
+    let segments: Vec<&str> = qualified.split("::").collect();
+    if segments.len() < 2 {
+        return;
+    }
+    let parent_name = segments[..segments.len() - 1].join("::");
+    let (parent, decl) = match ruby_rbs::node::parse(source) {
+        Ok(sig) => match (
+            find_reloc_decl(source, sig.declarations().iter(), &[], &parent_name),
+            find_reloc_decl(source, sig.declarations().iter(), &[], qualified),
+        ) {
+            (Some(p), Some(d)) => (p, d),
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    // `overlapping?`: either decl already nests the other — nothing to move.
+    if parent.start < decl.end && decl.start < parent.end {
+        return;
+    }
+    if decl.rooted {
+        return;
+    }
+    let Some(region) = decl_region(source, &decl) else { return };
+    let block = relocated_block(source, &decl, &parent, segments[segments.len() - 1], &region);
+    // `apply_relocation`: cut, re-parse for the (shifted) parent anchor,
+    // splice in before its `end`.
+    let spliced = splice_out(source, &region);
+    let anchor = match ruby_rbs::node::parse(&spliced) {
+        Ok(sig) => find_reloc_decl(&spliced, sig.declarations().iter(), &[], &parent_name),
+        Err(_) => None,
+    };
+    let Some(anchor) = anchor else { return };
+    let line_start = line_start_index(&spliced, anchor.end_start);
+    let mut merged = spliced;
+    if blank_range(&merged, line_start, anchor.end_start) {
+        merged.insert_str(line_start, &block);
+    } else {
+        merged.insert_str(anchor.end_start, &format!("\n{block}"));
+    }
+    *source = merged;
+}
+
+/// Reference `decl_region`: the declaration's full source region extended
+/// over its leading comment/annotations, ending just past its closing
+/// newline. `None` when either edge shares its line with other text.
+fn decl_region(source: &str, decl: &RelocDecl) -> Option<(usize, usize)> {
+    let start_pos = decl
+        .leading
+        .iter()
+        .copied()
+        .chain(std::iter::once(decl.start))
+        .min()?;
+    let line_start = line_start_index(source, start_pos);
+    if !blank_range(source, line_start, start_pos) {
+        return None;
+    }
+    let finish = decl.end;
+    let line_end = source[finish..].find('\n').map_or(source.len(), |i| finish + i);
+    if !blank_range(source, finish, line_end) {
+        return None;
+    }
+    Some((line_start, if line_end < source.len() { line_end + 1 } else { line_end }))
+}
+
+/// Reference `relocated_block` + `reindent`: the moved text with the
+/// `Foo::Bar` head shortened to `Bar` and every line pushed in to the
+/// parent's member depth (a non-positive delta leaves the text alone).
+fn relocated_block(
+    source: &str,
+    decl: &RelocDecl,
+    parent: &RelocDecl,
+    short_name: &str,
+    region: &(usize, usize),
+) -> String {
+    let text = &source[region.0..region.1];
+    let head = decl.name_start - region.0;
+    let tail = decl.name_end - region.0;
+    let renamed = format!("{}{}{}", &text[..head], short_name, &text[tail..]);
+    let member_depth = parent.keyword_col / INDENT.len() + 1;
+    let decl_depth = decl.keyword_col / INDENT.len();
+    let Some(delta) = member_depth.checked_sub(decl_depth) else {
+        return renamed;
+    };
+    let prefix = INDENT.repeat(delta);
+    let mut out = String::with_capacity(renamed.len() + prefix.len() * renamed.lines().count());
+    for line in renamed.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(&prefix);
+            out.push_str(line);
+        }
+    }
+    if !renamed.ends_with('\n') && renamed.rsplit('\n').next().is_some_and(|l| !l.trim().is_empty()) {
+        // `split_inclusive` already emitted the trailing unterminated line.
+    }
+    out
+}
+
+/// Reference `splice_out`: remove `region`, collapsing the newline run left
+/// at the seam so the cut never shows as a widening gap (or a trailing blank
+/// line at EOF). Spacing already fine is left exactly as written.
+fn splice_out(source: &str, region: &(usize, usize)) -> String {
+    let before = &source[..region.0];
+    let after = &source[region.1..];
+    if before.trim().is_empty() {
+        return after.trim_start_matches('\n').to_string();
+    }
+    if after.trim().is_empty() {
+        let trimmed = before.trim_end_matches('\n');
+        return format!("{trimmed}\n");
+    }
+    let seam = before.len() - before.trim_end_matches('\n').len()
+        + (after.len() - after.trim_start_matches('\n').len());
+    if seam <= 2 {
+        return format!("{before}{after}");
+    }
+    format!(
+        "{}\n\n{}",
+        before.trim_end_matches('\n'),
+        after.trim_start_matches('\n')
+    )
 }
 
 /// Extract a method's RETURN TEXT: the substring after the LAST `->` at bracket

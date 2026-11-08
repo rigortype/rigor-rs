@@ -1177,6 +1177,7 @@ fn insert_into_existing_ancestor_nests_the_leaf() {
         &kinds,
         &supers,
         &HashMap::new(),
+        &[],
         false,
     );
     assert_eq!(
@@ -1262,6 +1263,7 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
         &HashMap::new(),
         &HashMap::new(),
         &params,
+        &[],
         false,
     );
     assert_eq!(out.source, "class Array[unchecked out E]\n  def old: () -> Integer\n  def second_elem: () -> 1\nend\n");
@@ -1273,6 +1275,7 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
         &HashMap::new(),
         &HashMap::new(),
         &params,
+        &[],
         false,
     );
     assert!(out.repaired.is_empty());
@@ -1363,7 +1366,7 @@ fn bare_core_reopening_reads_every_method_as_new() {
     let src = "# c\nclass Hash\n  def hfoo: () -> 1\nend\n".to_string();
     let mut params = HashMap::new();
     params.insert("Hash".to_string(), "[unchecked out K, unchecked out V]".to_string());
-    let out = apply_merge_with(src, cs, &HashMap::new(), &HashMap::new(), &params, false);
+    let out = apply_merge_with(src, cs, &HashMap::new(), &HashMap::new(), &params, &[], false);
     assert_eq!(out.skipped.len(), 1);
     assert_eq!(out.skipped[0].candidate.method_name, "hfoo");
     assert_eq!(out.repaired, vec!["Hash[unchecked out K, unchecked out V]".to_string()]);
