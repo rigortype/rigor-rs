@@ -178,7 +178,9 @@ impl<'i> Typer<'i> {
             Type::Singleton(class) if self.source.class_name_for_id(*class) == Some("Kernel")
         );
         if kernel_module_receiver {
-            if let Some(ty) = self.type_implicit_self_call(ast, method, args, env, interner) {
+            if let Some(ty) =
+                self.type_implicit_self_call(ast, method, args, None, env, interner)
+            {
                 return ty;
             }
         }

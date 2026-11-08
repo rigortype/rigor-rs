@@ -6,7 +6,7 @@
 use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
-use crate::{kernel_fold, ConstLit, TypeEnv, Typer};
+use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
 
 /// The value-pinned scalar key a hash-literal key NODE carries, or `None` when
 /// the key is dynamic (a computed expression, an interpolated string, a
@@ -279,9 +279,9 @@ impl<'i> Typer<'i> {
             // change off the `p`/`pp` path). A block does NOT block the fold —
             // `p(x) { }` still types to `x` — because block reachability is the
             // rule walk's concern, not this value query.
-            Node::Call { receiver: None, method, args, .. } => {
-                let (method, args) = (method.clone(), args.clone());
-                self.type_implicit_self_call(ast, &method, &args, env, interner)
+            Node::Call { receiver: None, method, args, span, .. } => {
+                let (method, args, span) = (method.clone(), args.clone(), *span);
+                self.type_implicit_self_call(ast, &method, &args, Some(span), env, interner)
                     .unwrap_or_else(|| interner.untyped())
             }
             // A bare constant read (`Time`, `Array`) types to the CLASS OBJECT
@@ -1427,9 +1427,40 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         method: &str,
         args: &[NodeId],
+        span: Option<rigor_parse::Span>,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
+        // A bare `e` resolves to the enclosing scope's own zero-arg method —
+        // the reference's implicit-self literal-tail fold pins `def e = "m";
+        // e` to `Constant["m"]`, so `e.nope` witnesses `for "m"`
+        // (rigor-rs#553). Own-surface only inside `implicit_self_literal`;
+        // `None` for unresolvable names falls through to the Kernel folds.
+        if args.is_empty() {
+            if let Some(span) = span {
+                let (qual, kind) = match self.call_self(ast, span) {
+                    crate::dead::CallSelf::Singleton(q) => (q, DefKind::Singleton),
+                    crate::dead::CallSelf::Instance(q) => (q, DefKind::Instance),
+                    crate::dead::CallSelf::Unmodelled => {
+                        (String::new(), DefKind::Instance)
+                    }
+                };
+                if let Some(scalar) =
+                    self.source.implicit_self_literal(self.index, &qual, kind, method)
+                {
+                    return Some(interner.intern(Type::Constant(scalar)));
+                }
+                // A same-file TOPLEVEL `def helper = "top"` folds the same
+                // way (rigor-rs#368's predicate-path precedent;
+                // `self_type_answers?` still vetoes inside a scope that
+                // defines the name).
+                if let Some(scalar) =
+                    self.file_def_literal(ast, method, span, &mut Vec::new())
+                {
+                    return Some(interner.intern(Type::Constant(scalar)));
+                }
+            }
+        }
         // Only a fixed set of Kernel functions is folded on this path; every
         // other implicit-self call declines (a cheap membership test on the hot
         // path). `format`/`sprintf`/`String`/`Hash`/`Integer`/`Float` are the
