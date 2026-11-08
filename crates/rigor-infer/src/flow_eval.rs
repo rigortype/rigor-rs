@@ -133,13 +133,17 @@ impl<'i> Typer<'i> {
                         arm_envs.push(e);
                         for c in clauses {
                             let mut e = entry.clone();
-                            // A bare `rescue => e` binds `e : StandardError`
-                            // (a listed exception list is unmodelled — `e`
-                            // stays unbound in that arm, the decline side).
-                            if c.exceptions.is_empty() {
-                                if let Some(name) = &c.bound_name {
-                                    let ty =
-                                        self.nominal_or_untyped("StandardError", interner);
+                            // `rescue [T1, T2] => e` binds `e` to the union
+                            // of the listed exception classes; a bare
+                            // `rescue => e` binds `StandardError`
+                            // (rigor-rs#548).
+                            if let Some(name) = &c.bound_name {
+                                let ty = if c.exceptions.is_empty() {
+                                    self.nominal_or_untyped("StandardError", interner)
+                                } else {
+                                    self.exception_union(ast, &c.exceptions, interner)
+                                };
+                                if !matches!(interner.get(ty), Type::Dynamic(_)) {
                                     e.insert(name.clone(), ty);
                                 }
                             }
@@ -499,6 +503,47 @@ impl<'i> Typer<'i> {
             };
         }
         None
+    }
+
+    /// The union of the exception classes a `rescue T1, T2` list names —
+    /// each `ConstantRead` / `ConstantPath` resolves through the core class
+    /// table first, then the project registry. A class neither table knows
+    /// declines the WHOLE binding to `untyped` (the caller then leaves the
+    /// name unbound — the decline side).
+    fn exception_union(
+        &self,
+        ast: &LoweredAst,
+        exceptions: &[NodeId],
+        interner: &mut Interner,
+    ) -> TypeId {
+        let mut members: Vec<TypeId> = Vec::new();
+        for &ex in exceptions {
+            let name = match ast.get(ex) {
+                Node::ConstantRead { name, .. } => name.clone(),
+                _ => return interner.untyped(),
+            };
+            if name.is_empty() {
+                return interner.untyped();
+            }
+            let class = self
+                .index
+                .class_id(&name)
+                .or_else(|| self.source.class_id(&name));
+            match class {
+                Some(class) => {
+                    let n = interner.intern(Type::Nominal { class, args: vec![] });
+                    if !members.contains(&n) {
+                        members.push(n);
+                    }
+                }
+                None => return interner.untyped(),
+            }
+        }
+        match members.len() {
+            0 => interner.untyped(),
+            1 => members[0],
+            _ => interner.intern(Type::Union(members)),
+        }
     }
 
     /// The merge tail of [`Self::join_arm_writes`]: every name an arm env

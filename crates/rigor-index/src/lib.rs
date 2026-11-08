@@ -50,7 +50,7 @@ pub use rbs::{
 // the carrier for nominal round-tripping in the current slice (ADR-0004). It is
 // the surface the inference engine mints `Nominal { class }` ids against, so it
 // only lists the concrete value classes a return type can resolve TO.
-const CORE_CLASSES: [&str; 11] = [
+const CORE_CLASSES: [&str; 20] = [
     "String",
     "Integer",
     "Float",
@@ -61,9 +61,19 @@ const CORE_CLASSES: [&str; 11] = [
     "TrueClass",
     "FalseClass",
     "Proc",
-    // `rescue => e` binds `e : StandardError` (rigor-rs#548). Appended last so
-    // every earlier ClassId keeps its number.
+    // `rescue [TypeError, …] => e` binds `e` to the union of the listed
+    // exception classes (rigor-rs#548). Appended so every earlier ClassId
+    // keeps its number.
     "StandardError",
+    "TypeError",
+    "ArgumentError",
+    "RuntimeError",
+    "NameError",
+    "NoMethodError",
+    "IOError",
+    "KeyError",
+    "IndexError",
+    "ZeroDivisionError",
 ];
 
 /// A real, RBS-backed core index. For each loaded class it holds the resolved
