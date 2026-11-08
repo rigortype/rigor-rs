@@ -1,23 +1,33 @@
-//! The in-place-mutation / closure-write marks behind the def-local env
-//! (rigor-rs#546 review).
+//! The marks behind the def-local env: what the straight-line replay
+//! ([`Typer::bind_statements_into`]) does NOT model, so it declines
+//! (rigor-rs#546 reviews).
 //!
-//! The straight-line replay ([`Typer::bind_statements_into`]) binds a local to
-//! the literal carrier it was written with (`r = []` → `Tuple[]`, `s = "a"` →
-//! `Constant["a"]`). A later in-place call on that local — `r << 1`,
-//! `s.upcase!`, `h[:a] = 1`, a mutation inside an `each` block or a lambda —
-//! makes the carrier stale: the reference's `MutationWidening` widens the
-//! binding at the call site (`mutation_widening.rb`, `widen_after_call` /
-//! `widen_after_block`), but the replay does not model that widening, so
-//! without this table a signature would carry the pre-mutation literal
-//! (`-> []` for an accumulator that grows) — an unsound emit.
+//! The replay binds a local to the literal carrier it was written with
+//! (`r = []` → `Tuple[]`, `s = "a"` → `Constant["a"]`) and joins the arms of a
+//! few conditional shapes. The reference's flow evaluator does far more, so
+//! every place the two can disagree must make the replay give up — bind the
+//! local to `untyped`, which a tail read turns into a skipped method (a
+//! coverage loss, never a wrong signature). The tables here record those
+//! places by SPAN (orphan-proof: a node under a lossily lowered wrapper is
+//! still found):
 //!
-//! The marks are the DECLINE half of the reference rule: every local a
-//! mutation or a closure write may touch is recorded by SPAN (orphan-proof:
-//! a node under a lossily lowered wrapper is still found), and the replay
-//! widens each such binding that holds a stale-able carrier to `untyped`
-//! after the statement that contains the mark — a coverage loss against the
-//! reference's precise widened type (`Array[untyped]`, `String`), never a
-//! wrong signature.
+//! - `mutations` / `escapes` / `rebinds` — in-place calls (`r << 1`,
+//!   `s.upcase!`, `h[:a] = 1`), locals handed to a callee, closure writes: the
+//!   reference's `MutationWidening` widens the binding at the call site, the
+//!   replay widens a stale-able carrier to `untyped` after the statement.
+//! - `writes` — every local write position (including `for` indexes,
+//!   `rescue => e`, pattern bindings): a write at a position the replay does not
+//!   walk (a predicate, an argument, an interpolation, an `else` clause) is stale
+//!   ([`Typer::widen_shell`]).
+//! - `decisions` — `if` / `case` / loop predicates, `&&` / `||` lefts, `&.`
+//!   receivers: the reference narrows and constant-folds on a local a decision
+//!   reads, the replay does not, so a statement or tail holding a decision on a
+//!   typed local is declined ([`Typer::typed_decision_reads`]).
+//! - `exits` — `return` / `break` / `next` / `redo` / `retry` / `raise`: the
+//!   reference drops a terminating arm from a join, rejects a loop that
+//!   `break`s from the zero-or-more model, and re-enters a `begin` on `retry`.
+//! - `wild` — a named-capture `=~` binds locals with unknown names.
+//! - `scopes` — nested `def` / `class` / `module` bodies are another scope.
 
 use std::rc::Rc;
 
@@ -478,11 +488,10 @@ impl DefLocalMarks {
             .iter()
             .take_while(|t| t.0 < scope.1)
             .any(|t| t.1 == name);
+        let first = self.decisions.partition_point(|d| d.0 < scope.0);
         tested
-            && self
-                .decisions
+            && self.decisions[first..]
                 .iter()
-                .skip_while(|d| d.0 < scope.0)
                 .take_while(|d| d.0 < scope.1)
                 .filter(|d| d.1 <= scope.1)
                 .filter(|d| self.reads_within((d.0, d.1)).contains(&name))
@@ -786,26 +795,26 @@ impl<'i> Typer<'i> {
     /// the reference may type `bot` (a project helper that always raises).
     /// The reference drops such an arm from the join; the replay does not
     /// model that, so the names the arm writes are declined.
-    pub(crate) fn arm_suspect(&self, ast: &LoweredAst, arm: &[rigor_parse::NodeId]) -> Option<Span> {
-        let sp = body_span(ast, arm)?;
+    pub(crate) fn arm_suspect(&self, ast: &LoweredAst, arm: &[rigor_parse::NodeId]) -> bool {
+        let Some(sp) = body_span(ast, arm) else { return false };
         let marks = self.def_local_marks(ast);
         if marks.has_exit_within(
             sp,
             &[ExitKind::Return, ExitKind::Next, ExitKind::Break, ExitKind::Redo, ExitKind::Retry, ExitKind::Raise],
         ) {
-            return Some(sp);
+            return true;
         }
-        let &last = arm.last()?;
+        let Some(&last) = arm.last() else { return false };
         if let Node::Call { receiver, method, .. } = ast.get(last) {
             let guessable = match receiver {
                 None => true,
                 Some(r) => matches!(ast.get(*r), Node::SelfExpr { .. } | Node::ConstantRead { .. }),
             };
             if guessable && !benign_call(method) {
-                return Some(sp);
+                return true;
             }
         }
-        None
+        false
     }
 }
 

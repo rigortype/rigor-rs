@@ -267,13 +267,10 @@ impl<'i> Typer<'i> {
                     self.join_arm_writes(ast, env, &[(then_body, &[]), (else_body, &[])], interner, returns);
                 }
             }
-            Node::Logical { left, .. } if crate::def_local_marks::literal_like(ast, *left) => {
+            Node::Logical { left, right, .. } if crate::def_local_marks::literal_like(ast, *left) => {
                 // `true && (a = 2)`: a literal left decides whether the right
                 // runs; the reference folds it. Not modelled.
-                self.replay_discard(ast, env, &[std::slice::from_ref(match ast.get(stmt) {
-                    Node::Logical { right, .. } => right,
-                    _ => unreachable!(),
-                })], interner, returns);
+                self.replay_discard(ast, env, &[std::slice::from_ref(right)], interner, returns);
                 Self::widen_names(env, &marks.written_within(span), interner);
             }
             Node::Logical { right, .. } => {
@@ -489,7 +486,7 @@ impl<'i> Typer<'i> {
             arm_envs.push(e);
             if let Some(sp) = crate::def_local_marks::body_span(ast, arm) {
                 written.extend(marks.written_within(sp));
-                any_suspect |= self.arm_suspect(ast, arm).is_some();
+                any_suspect |= self.arm_suspect(ast, arm);
             }
         }
         // The reference drops a terminating arm from the join, so a sibling

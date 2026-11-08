@@ -1837,6 +1837,47 @@ def dd1(c); begin; a = []; return []; @i = a; ensure; ; end; end
 }
 
 #[test]
+fn def_local_env_declines_a_call_the_port_does_not_fold() {
+    // The reference folds a pure call on a constant receiver to a constant (`a =
+    // 1.5; a.to_s` is the string 1.5); the port folds only some and types the rest
+    // as the RBS nominal (`String`) — a shared-method byte mismatch the def-local
+    // env exposed through locals (a literal receiver, `1.5.to_s`, is the pre-
+    // existing gap master shares). A call on a def-local constant carrier whose
+    // result is a scalar / array / hash nominal declines; a folded `Constant`
+    // result is kept.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_a_call_the_port_does_not_fold",
+        r##"
+def ft1(c); a = 1.5; a.to_s; end
+def ft2(c); a = [1]; a.to_s; end
+def ft3(c); a = {a: 1}; a.size; end
+def ft4(c); a = "ab"; a.strip; end
+def ft5(c); a = :s; a.upcase; end
+def ft6(c); a = 1; a.to_s; end
+def ft7(c); a = "x"; a.upcase; end
+def ft8(c); a = [1, 2]; a.size; end
+def ft9(c); a = 5; a * 2; end
+def ft10(c); a = "ab"; a.length; end
+def ft11(c); a = {a: 1}; a[:a]; end
+"##,
+    );
+    assert!(!rows.contains_key("ft1"), "ft1 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft2"), "ft2 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft3"), "ft3 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft4"), "ft4 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft5"), "ft5 must decline: {rows:?}");
+    assert_eq!(rows["ft6"], r##"def ft6: (untyped) -> "1""##);
+    assert_eq!(rows["ft7"], r##"def ft7: (untyped) -> "X""##);
+    assert_eq!(rows["ft8"], r##"def ft8: (untyped) -> 2"##);
+    assert_eq!(rows["ft9"], r##"def ft9: (untyped) -> 10"##);
+    assert_eq!(rows["ft10"], r##"def ft10: (untyped) -> 2"##);
+    assert_eq!(rows["ft11"], r##"def ft11: (untyped) -> 1"##);
+}
+
+#[test]
 fn def_local_env_folds_a_literal_decision() {
     // The reference constant-folds a decision built from literals (`if true`, `if
     // 1 > 2`, `x = 5 if (y = 3)`); `type_of(If)` elides the dead arm, so the tail
