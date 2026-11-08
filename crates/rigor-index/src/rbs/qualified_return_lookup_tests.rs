@@ -57,9 +57,15 @@ fn bare_generic_project_sig_marks_def_nil() {
     // surfaces — `wut`/`zork` witness absent.
     assert!(!idx.qualified_class_has_method("Integer", "wut"));
     assert!(!idx.qualified_class_has_method("String", "nope"));
-    // The singleton side of a failed class is nil too (`Array.zork` silent),
-    // while a surviving class's singleton keeps witnessing.
-    assert!(!idx.class_has_singleton_method("String", "zork"));
+    // The singleton side of a failed class is nil too (`Array.zork` silent).
+    // `String`'s singleton, though, can no longer PROVE `zork` absent:
+    // `Kernel` itself fails now — `Kernel#Hash()`'s return names the nil
+    // `Hash` def (#493 item 12's propagation) — so the class-object
+    // ancestry is incomplete and the lookup stays silent (`true`), the
+    // reference's identical answer. A surviving-to-the-root singleton
+    // (`Integer`'s `Class` chain does not load a nil base only when Kernel
+    // is intact) would witness; assert the honest result instead.
+    assert!(idx.class_has_singleton_method("String", "zork"));
     let _ = std::fs::remove_dir_all(&dir);
 }
 
