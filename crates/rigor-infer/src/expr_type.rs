@@ -3,7 +3,7 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{Compound, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, LoweredAst, Node, NodeId, Span};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
@@ -1493,6 +1493,22 @@ impl<'i> Typer<'i> {
                 if let Some(scalar) =
                     self.file_def_literal(ast, method, span, &mut Vec::new())
                 {
+                    return Some(interner.intern(Type::Constant(scalar)));
+                }
+            }
+        }
+        // rigor-rs#462: a bare call resolves a TOPLEVEL `def` (the
+        // `def_nodes["<toplevel>"]` table merges project-wide on the oracle —
+        // `helpers.rb` `def format(x) = 42` types `script.rb`'s `format(1)`
+        // to `42`, outranking `Kernel#format`'s `String` return). The
+        // `self_answers` veto is `file_def_literal`'s (a `self` that already
+        // answers the name binds first). Inside a BLOCK / lambda body the
+        // reference keeps the Kernel binding — probed: `[1].each {
+        // format(1).bit_length }` fires `for String` on BOTH engines — so the
+        // fold declines there and the call falls through to the Kernel path.
+        if let Some(scalar) = self.source.toplevel_def_literal(method, args.len()) {
+            if let Some(site) = span {
+                if !self.self_answers(ast, site, method) && !self.inside_block(ast, site) {
                     return Some(interner.intern(Type::Constant(scalar)));
                 }
             }
