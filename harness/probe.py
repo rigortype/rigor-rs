@@ -44,6 +44,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -136,6 +137,13 @@ def probe_raw(rs, proj, args, root, ignore_stderr):
         shutil.copytree(proj, d, symlinks=True)
         cmd = ref_cmd(args) if eng == "ref" else [rs] + list(args)
         results[eng] = run(cmd, d)
+    # `check`'s stderr run-stats block carries two run-dependent values
+    # (`Wall time`, `Memory peak`); normalise them so raw-mode stderr stays
+    # comparable (rigor-rs#502).
+    results = {
+        e: (r[0], r[1], re.sub(r"(?m)^(  Wall time:   |  Memory peak: ).*$", r"\1<NORM>", r[2]))
+        for e, r in results.items()
+    }
     channels = (("exit", 0), ("stdout", 1)) + (() if ignore_stderr else (("stderr", 2),))
     same = all(results["ref"][i] == results["port"][i] for _, i in channels)
     if not same and any(results[e][0] < 0 for e in ("ref", "port")):
