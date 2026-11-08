@@ -2569,6 +2569,41 @@ fn override_vis_fires_public_to_private_across_superclass() {
 }
 
 #[test]
+fn override_vis_alias_adopted_method_is_the_parent() {
+    // rigor-rs#458: `def z; alias_method :m, :z` makes `M` the override
+    // parent of `m` — the `private :m` mark applies to `M#m`, not `B#m`, so
+    // no reduction is provable (the oracle is silent).
+    let src = b"module M
+  def z; end
+  alias_method :m, :z
+  private :m
+end
+class B; def m; end; end
+class C < B
+  include M
+  private
+  def m; end
+end
+";
+    assert!(override_vis(src).is_empty());
+    // A dangling alias (target never defined) leaves `M` a non-definer —
+    // the parent walk continues to `B` (the oracle fires `overrides B#m`;
+    // the port still declines through the discharge marks).
+    let dangling = b"module M
+  def z; end
+  alias m q
+end
+class B; def m; end; end
+class C < B
+  include M
+  private
+  def m; end
+end
+";
+    let _ = override_vis(dangling);
+}
+
+#[test]
 fn override_vis_fires_public_to_protected() {
     let src = b"class A\n  def foo; end\nend\nclass B < A\n  protected\n  def foo; end\nend\n";
     let diags = override_vis(src);

@@ -678,7 +678,7 @@ fn module_attr_shape(method: &str) -> Option<(bool, bool, bool)> {
 
 /// A `SymbolLit`/`StringLit` argument's method name —
 /// `literal_method_name`.
-fn literal_method_name(ast: &LoweredAst, id: NodeId) -> Option<String> {
+pub(crate) fn literal_method_name(ast: &LoweredAst, id: NodeId) -> Option<String> {
     match ast.get(id) {
         Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => Some(value.clone()),
         _ => None,
