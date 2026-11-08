@@ -52,6 +52,7 @@ mod call_dispatch;
 mod class_narrowing;
 mod collection_shape;
 mod dead;
+mod def_local_marks;
 mod expr_type;
 mod flow_eval;
 mod flow_writes;

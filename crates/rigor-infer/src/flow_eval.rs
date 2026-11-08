@@ -150,10 +150,47 @@ impl<'i> Typer<'i> {
                     let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
                     self.join_arm_writes(ast, env, &arm_refs, interner, returns);
                 }
-                Node::Loop { body, .. } => {
-                    // The body runs zero or more times: the empty arm is the
-                    // zero-iteration path (entry env).
+                Node::Loop { predicate, body, span, .. } => {
+                    // The body runs zero or more times: the empty arm below is
+                    // the zero-iteration path (entry env).
+                    let before = returns.len();
+                    let marks = self.def_local_marks(ast);
+                    let changed = marks.changed_within(*span);
+                    let folds = predicate.is_some_and(|p| {
+                        marks.reads_within(ast.get(p).span()).iter().any(|n| {
+                            env.get(*n).is_some_and(|&t| {
+                                matches!(interner.get(t), Type::Constant(_) | Type::IntegerRange { .. })
+                            })
+                        })
+                    });
                     self.join_arm_writes(ast, env, &[body, &[]], interner, returns);
+                    // A predicate that reads a constant-bound local is one the
+                    // reference folds (`while i < 3` over `i = 0` reads `bot`,
+                    // `while i > 3` never enters and keeps `i`); the
+                    // zero-or-more join below is wrong for the names such a
+                    // loop changes — decline them. (A bare literal predicate
+                    // is not folded there: `while true` joins like any other.)
+                    let decided = folds;
+                    if decided {
+                        let untyped = interner.untyped();
+                        for name in &changed {
+                            if env.get(name).is_some() {
+                                env.insert(name.clone(), untyped);
+                            }
+                        }
+                    }
+                    // A `return` recorded inside the body typed its value at
+                    // its source position, but the loop carries later writes
+                    // (and mutations) of the names it reads round to the next
+                    // iteration (`while c; return a if x; a = "s"; end`).
+                    if !changed.is_empty() {
+                        let untyped = interner.untyped();
+                        for (value, ty) in returns[before..].iter_mut() {
+                            if marks.reads_any_within(ast.get(*value).span(), &changed) {
+                                *ty = untyped;
+                            }
+                        }
+                    }
                 }
                 Node::Statements { body, .. } => {
                     self.replay_statements(ast, env, body, interner, returns);
@@ -185,6 +222,11 @@ impl<'i> Typer<'i> {
                 }
                 _ => self.bind_statement(ast, stmt, env, interner),
             }
+            // A mutation or closure write inside the statement leaves the
+            // literal carrier a binding holds stale (`r = []; r << 1`,
+            // `s = "a"; items.each { |i| s << i }`): the reference widens it,
+            // the replay declines it (`def_local_marks`).
+            self.apply_def_local_marks(ast, env, ast.get(stmt).span(), interner);
         }
     }
 
