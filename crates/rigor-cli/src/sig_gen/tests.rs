@@ -148,12 +148,11 @@ fn env_collection_to_shape_drops() {
 
 #[test]
 fn env_unresolvable_declared_returns_drop() {
-    // optional / union / untyped / multi-overload / generic-args declared ⇒
+    // optional / union / multi-overload / generic-args declared ⇒
     // Declared(None) or not-tighter ⇒ DROP (No candidates).
     for (tag, decl) in [
         ("opt", "def m: () -> String?"),
         ("uni", "def m: () -> (String | Integer)"),
-        ("unt", "def m: () -> untyped"),
         ("gen", "def m: () -> Array[Integer]"),
         ("wid", "def m: () -> Integer"), // wider: inferred "hi" is String
     ] {
@@ -161,6 +160,16 @@ fn env_unresolvable_declared_returns_drop() {
         let cs = candidates_with_sig(tag, "class Foo\n  def m\n    \"hi\"\n  end\nend\n", &rbs);
         assert!(cs.is_empty(), "{tag}: expected DROP, got {cs:?}");
     }
+    // `untyped` resolves and tightens (#544): the literal `"hi"` widens to its
+    // nominal in the emitted row.
+    let unt = candidates_with_sig(
+        "unt",
+        "class Foo\n  def m\n    \"hi\"\n  end\nend\n",
+        "class Foo\n  def m: () -> untyped\nend\n",
+    );
+    assert_eq!(unt.len(), 1, "{unt:?}");
+    assert_eq!(unt[0].classification, "tighter_return");
+    assert_eq!(unt[0].rbs, "def m: () -> String");
     // Declared String, inferred "hi": a literal does not tighten (#837).
     let lit = candidates_with_sig("tight", "class Foo\n  def m\n    \"hi\"\n  end\nend\n", "class Foo\n  def m: () -> String\nend\n");
     assert!(lit.is_empty(), "{lit:?}");

@@ -1668,6 +1668,34 @@ fn method_candidate(
         return row(None);
     };
 
+    // Declared `untyped`: the reference's tighter-return writes the inferred
+    // member WIDENED to its nominal — `def i = 1` against `-> untyped` emits
+    // `() -> Integer`, not `() -> 1` (rigor-rs#544). Members that erase to a
+    // literal spelling re-erase to their class name; others keep their form.
+    let (rbs, erased) = if declared_return_rbs.as_deref() == Some("untyped") {
+        let mut widened: Vec<String> = Vec::new();
+        for (m, e) in members.iter().zip(&erased_members) {
+            let e = if matches!(interner.get(*m), Type::Constant(_))
+                && index.class_name_of(interner, *m) != Some(e.as_str())
+            {
+                index
+                    .class_name_of(interner, *m)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| e.clone())
+            } else {
+                e.clone()
+            };
+            if !widened.contains(&e) {
+                widened.push(e);
+            }
+        }
+        let erased = widened.join(" | ");
+        let ret = paren_wrap_union(&erased);
+        (format!("{prefix}{}: {head} -> {ret}", sig.name), erased)
+    } else {
+        (rbs, erased)
+    };
+
     Some(Candidate {
         file: path.to_string(),
         class_name: class_name.to_string(),
@@ -1747,9 +1775,22 @@ fn classify(
                 [single] => *single,
                 _ => return None,
             };
-            // Wider / unrelated: the inferred's nominal is not the declared class
-            // (probe F — declared `Integer`, inferred `"hi"` → `String`).
-            if index.class_name_of(interner, inferred_ty) != Some(decl.as_str()) {
+            // Wider / unrelated: the inferred's nominal must ACCEPT the
+            // declared class — `decl` is the inferred class itself or one of
+            // its ancestors (declared `Numeric`, inferred `4.2` → `Float`;
+            // rigor-rs#544). String equality alone missed every strict
+            // subtype. An ancestor chain that fails to resolve (unknown or
+            // incomplete) refuses — the decline side.
+            let inferred_class = index.class_name_of(interner, inferred_ty);
+            // A declared `untyped` accepts every inferred form and is never
+            // accepted back by a concrete one — always a tightening
+            // (`def n = 4.2` vs `() -> untyped`; rigor-rs#544).
+            let accepts = decl == "untyped"
+                || inferred_class == Some(decl.as_str())
+                || inferred_class
+                    .and_then(|c| index.ancestor_names(c))
+                    .is_some_and(|chain| chain.contains(&decl.as_str()));
+            if !accepts {
                 return None;
             }
             // `pins_literal_over_declaration?` (#837): a proposal that erases to
@@ -1759,9 +1800,16 @@ fn classify(
             // may; a Range's and a Set's erasure carries a type argument, so
             // they are excluded by class. (The inferred value's class is `decl`
             // here: the check above returned otherwise.)
-            if matches!(interner.get(inferred_ty), Type::Constant(_))
+            // `rbs_literal?`: a Constant is PINNED only when its erasure is a
+            // literal spelling — i.e. differs from its own class name, not from
+            // `decl` (a Float constant erases to `Float`, an ordinary nominal;
+            // rigor-rs#544).
+            // (`untyped` is exempt: its tighter-return widens a literal
+            // constant to its nominal rather than refusing; rigor-rs#544.)
+            if decl != "untyped"
+                && matches!(interner.get(inferred_ty), Type::Constant(_))
                 && !matches!(decl.as_str(), "Range" | "Set")
-                && inferred_erased != decl
+                && inferred_class != Some(inferred_erased)
             {
                 return None;
             }
@@ -1776,8 +1824,13 @@ fn classify(
             // contract (probe P: `def hash; [1].size; end` folds `1` but the tail
             // `[1].size` is a Call). NB: the RAW `sig.body.last()` node, NOT the
             // assignment-unwrapped typing tail.
+            // (`untyped` exempt again: the widened nominal emit keeps the
+            // computed Constant — `def m; x = 1; end` against `-> untyped`
+            // still emits `() -> Integer`.)
             let raw_tail = ast.get(*sig.body.last()?);
-            if computed_literal_tightening(interner, inferred_ty, raw_tail) {
+            if decl != "untyped"
+                && computed_literal_tightening(interner, inferred_ty, raw_tail)
+            {
                 return None;
             }
             Some(("tighter_return", Some(decl)))

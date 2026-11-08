@@ -543,6 +543,11 @@ fn resolve_method_return(md: &ruby_rbs::node::MethodDefinitionNode) -> Option<St
 /// `String?` / `Array[Integer]` / `bool` / `untyped` ⇒ `None`).
 fn resolve_type_node_return(node: &RbsNode) -> Option<String> {
     match node {
+        // `untyped` is resolvable — a DECLARED `untyped` still classifies a
+        // concrete inferred return as `tighter` (rigor-rs#544). Recorded as the
+        // spelling "untyped"; classify special-cases it before the class-name
+        // acceptance check.
+        RbsNode::AnyType(_) => Some("untyped".to_string()),
         RbsNode::ClassInstanceType(ci) => {
             if ci.args().iter().next().is_some() {
                 None // has type args ⇒ not bare ⇒ DROP.
