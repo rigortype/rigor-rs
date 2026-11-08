@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use rigor_parse::{LoweredAst, Node, NodeId, OpWriteKind, StatementsKind};
+use rigor_parse::{BlockParamKind, LoweredAst, Node, NodeId, OpWriteKind, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
@@ -225,20 +225,44 @@ impl<'i> Typer<'i> {
                     };
                     env.insert(name, new_ty);
                 }
-                Node::Call { block_body, .. } if !block_body.is_empty() => {
+                Node::Call { receiver, method, block_body, block_params, .. }
+                    if !block_body.is_empty() =>
+                {
                     // A block may run and rebind a captured local — its
-                    // writes are not modelled (block params are unbindable
-                    // here), so every name the block could rebind widens to
-                    // `untyped`. Without this `a = :s; loop do; a = 1; break;
-                    // end; a` kept `:s` (review).
+                    // writes JOIN the entry binding like an arm merge (the
+                    // block may run zero times): `a = :s; 2.times { a = 1 };
+                    // a` ⇒ `(1 | :s)`, and `[2].each { |e| a = e }` binds `e`
+                    // to the element type so `a` joins `(1 | 2)`
+                    // (rigor-rs#548). `loop` is the exception — its writes
+                    // widen to `untyped` (the reference declines a loop-block
+                    // rebind entirely). A name bound only inside the block
+                    // (`[2].each { |e| x = e }; x`) is `untyped`, never a
+                    // `v | nil` guess.
                     self.bind_statement(ast, stmt, env, interner);
                     let mut block_env = env.clone();
+                    if let (Some(r), Some((pname, pkind))) = (receiver, block_params.first()) {
+                        if let Some(bound) = self.block_first_param_type(
+                            ast, method, *r, *pkind, env, interner,
+                        ) {
+                            block_env.insert(pname.clone(), bound);
+                        }
+                    }
                     self.replay_statements(ast, &mut block_env, block_body, interner, returns);
                     let untyped = interner.untyped();
+                    let is_loop = *method == "loop";
                     for (name, ty) in block_env.iter() {
-                        if env.get(name) != Some(ty) {
-                            env.insert(name.clone(), untyped);
+                        let entry = env.get(name).copied();
+                        if entry == Some(*ty) {
+                            continue;
                         }
+                        let merged = match (entry, is_loop) {
+                            (_, true) => untyped,
+                            (Some(e), false) => {
+                                rigor_types::Algebra::join(interner, e, *ty)
+                            }
+                            (None, false) => untyped,
+                        };
+                        env.insert(name.clone(), merged);
                     }
                 }
                 _ => self.bind_statement(ast, stmt, env, interner),
@@ -381,6 +405,82 @@ impl<'i> Typer<'i> {
             Some(ret) => self.nominal_or_untyped(ret, interner),
             None => interner.untyped(),
         }
+    }
+
+    /// The type the FIRST block positional binds for the element-yielding
+    /// and `yield self` method families, when the param is a plain first
+    /// positional (`SelfArg` / `SelfOpt`). `each` / `map` / `select` / … bind
+    /// the receiver's element type (a Tuple's member join, a `Hash`'s pair,
+    /// `Array[T]`'s `T`); `tap` / `then` / `yield_self` bind the receiver
+    /// with literal constants widened to their nominal class (`2.tap` ⇒
+    /// `Integer`). `each_with_index` additionally binds its second positional
+    /// to `Integer` (handled by the caller seeing the kind pair). `None`
+    /// leaves the param unbound (the decline side).
+    fn block_first_param_type(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        receiver: NodeId,
+        kind: BlockParamKind,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        const ELEMENT_YIELDERS: &[&str] = &[
+            "each",
+            "map",
+            "collect",
+            "select",
+            "filter",
+            "find_all",
+            "reject",
+            "find",
+            "detect",
+            "each_with_index",
+            "filter_map",
+            "flat_map",
+        ];
+        const SELF_YIELDERS: &[&str] = &["tap", "then", "yield_self"];
+        if !matches!(kind, BlockParamKind::SelfArg | BlockParamKind::SelfOpt) {
+            return None;
+        }
+        let recv = self.type_of(ast, receiver, env, interner);
+        if ELEMENT_YIELDERS.contains(&method) {
+            // The element type: a Tuple's member join, `Array[T]`'s `T`.
+            return match interner.get(recv).clone() {
+                Type::Tuple(elems) => {
+                    let mut it = elems.iter();
+                    let first = it.next().copied()?;
+                    let mut acc = first;
+                    for &m in it {
+                        acc = rigor_types::Algebra::join(interner, acc, m);
+                    }
+                    Some(acc)
+                }
+                Type::Nominal { class, args }
+                    if self.index.class_name_for_id(class) == Some("Array") =>
+                {
+                    match args.first() {
+                        Some(t) => Some(*t),
+                        None => Some(interner.untyped()),
+                    }
+                }
+                _ => None,
+            };
+        }
+        if SELF_YIELDERS.contains(&method) {
+            // `yield self` binds the receiver type with literal constants
+            // widened to their class (`2.tap` ⇒ `t : Integer`).
+            return match interner.get(recv) {
+                Type::Constant(_) => Some(
+                    self.index
+                        .class_name_of(interner, recv)
+                        .map(|c| self.nominal_or_untyped(c, interner))
+                        .unwrap_or_else(|| interner.untyped()),
+                ),
+                _ => Some(recv),
+            };
+        }
+        None
     }
 
     /// The merge tail of [`Self::join_arm_writes`]: every name an arm env
