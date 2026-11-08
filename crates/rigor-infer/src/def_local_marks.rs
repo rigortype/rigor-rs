@@ -444,7 +444,7 @@ impl DefLocalMarks {
 
     /// The local names WRITTEN inside `span` (nested `def` / `class` /
     /// `module` scopes excluded) — no mutation, escape or closure marks.
-    pub(crate) fn written_within(&self, span: Span) -> Vec<String> {
+    pub fn written_within(&self, span: Span) -> Vec<String> {
         self.written_outside(span, &[], None)
     }
 

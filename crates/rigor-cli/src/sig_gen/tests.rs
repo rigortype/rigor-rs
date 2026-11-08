@@ -255,14 +255,16 @@ fn tail_return_types_as_its_value_and_dedups() {
 }
 
 #[test]
-fn block_return_is_barriered_and_multi_return_skips() {
-    // A return inside a block is barriered (reference RETURN_BARRIER_NODES —
-    // union is tail-only); a multi-value return skips the method (the
-    // reference silently drops its type, an unsound emit we do not adopt).
+fn block_return_is_collected_and_multi_return_skips() {
+    // A return inside an ORDINARY block exits the method and the reference
+    // collects it (`ReturnBarrier`, issue #1382 — oracle-probed at the pin:
+    // `("s" | 5)`); only a nested def / lambda / define_method body is a
+    // barrier. A multi-value return skips the method (the reference silently
+    // drops its type and emits `"s"`, an unsound emit we do not adopt).
     let src = "class A\n  def b(x)\n    [1].each { return 5 }\n    \"s\"\n  end\n  def m(x)\n    return 1, 2 if x\n    \"s\"\n  end\nend\n";
     let cs = candidates_tagged("blockret", src, false);
-    assert_eq!(cs.len(), 1, "only the block-barriered method emits: {cs:?}");
-    assert_eq!(cs[0].rbs, "def b: (untyped) -> \"s\"");
+    assert_eq!(cs.len(), 1, "only the block-return method emits: {cs:?}");
+    assert_eq!(cs[0].rbs, "def b: (untyped) -> (\"s\" | 5)");
 }
 
 #[test]
@@ -1633,6 +1635,18 @@ fn def_local_env_parameter_shadows_a_file_level_local() {
 }
 
 #[test]
+fn def_local_env_declined_override_demotes_the_base() {
+    // A tail the def-local env declines types as `untyped` — the method skips as
+    // an UNTYPED RETURN (a counted reason), not a silent port-only drop — so the
+    // base-method demotion still reads the override as unsigned. (`for` is
+    // rigor-rs#546 review 3 (B): the reference skips `for x in w; x.go; end`
+    // too, and with it the base `A#e` — oracle: no candidates at all.)
+    let src = "class A\n  def e(w); true; end\n  def f(w); 2; end\nend\nclass S < A\n  def e(w); for x in w; x.go; end; end\n  def f(w); a = 1; raise \"x\" if a.nil?; w.go; end\nend\n";
+    let cs = candidates_tagged("def_local_override", src, false);
+    assert!(cs.is_empty(), "{cs:?}");
+}
+
+#[test]
 fn def_local_env_ensure_is_not_the_tail() {
     // rigor-rs#546 review 3 (A): an `ensure` body's value is discarded — the
     // method returns the protected body's tail; the port typed the ensure's last
@@ -1875,6 +1889,31 @@ def ft11(c); a = {a: 1}; a[:a]; end
     assert_eq!(rows["ft9"], r##"def ft9: (untyped) -> 10"##);
     assert_eq!(rows["ft10"], r##"def ft10: (untyped) -> 2"##);
     assert_eq!(rows["ft11"], r##"def ft11: (untyped) -> 1"##);
+}
+
+#[test]
+fn def_local_env_declines_a_hole_in_a_generic_slot() {
+    // A def-local the replay declines reads `untyped`; inside a non-symbol-key
+    // Hash literal that lands in a generic type-arg slot (`Hash[String,
+    // untyped]`), which the buried-untyped guard exempts as an elaborated form —
+    // the reference has the precise value union
+    // (`Rack::Directory#check_bad_request`: `Hash[String, \"12\" | ...]`). A tail
+    // that reads a def-written local and carries such a hole declines; a literal
+    // tuple of typed locals is kept.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_a_hole_in_a_generic_slot",
+        r##"
+def rk1(p); return if p.x; body = "Bad"; [400, { "ct" => "t", "cl" => body.bytesize.to_s }, [body]]; end
+def rk2(c); a = 1; [a, { "k" => a }]; end
+def rk3(c); a = "s"; [a, a]; end
+"##,
+    );
+    assert!(!rows.contains_key("rk1"), "rk1 must decline: {rows:?}");
+    assert_eq!(rows["rk2"], r##"def rk2: (untyped) -> [1, Hash[String, 1]]"##);
+    assert_eq!(rows["rk3"], r##"def rk3: (untyped) -> ["s", "s"]"##);
 }
 
 #[test]

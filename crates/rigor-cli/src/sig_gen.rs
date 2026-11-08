@@ -2074,11 +2074,11 @@ fn method_candidate(
         push_flat(interner, &mut members, ty);
     }
 
-    // A union INSIDE a tuple / hash-shape slot (`[1 | nil]`, a def-local
-    // typed local joined across a branch) prints in the interner's canonical
-    // member order, not the reference's describe-sorted order — a shared-method
-    // byte mismatch, so the method declines (rigor-rs#546 review).
-    if members.iter().any(|&m| composite_holds_union(interner, m)) {
+    // A union or a bare generic INSIDE a tuple / hash-shape slot (`[1 | nil]`,
+    // a def-local typed local joined across a branch; `[400, Hash, [body]]`) is
+    // not the reference's byte output — a shared-method mismatch, so the
+    // method declines (rigor-rs#546 review).
+    if members.iter().any(|&m| composite_holds_unsound(interner, index, m)) {
         return row(None);
     }
 
@@ -2118,6 +2118,24 @@ fn method_candidate(
             // `Range[untyped]` / `Array[untyped]` are the reference's own
             // elaborated emits (rigor-rs#493 item 7), not inference holes.
             if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
+            // A def-local the replay declined (or a call on one the port does
+            // not fold) reads `untyped`, and that hole lands in a generic's
+            // type-arg slot as `Hash[String, untyped]`, where the reference
+            // has the precise value union (`Rack::Directory#check_bad_request`).
+            // A tail / return that reads a local written in the def cannot be
+            // told apart from an elaborated `Hash[untyped, untyped]` — decline.
+            let marks = typer.def_local_marks(ast);
+            let written = rigor_infer::body_span(ast, sig.body)
+                .map(|sp| marks.written_within(sp))
+                .unwrap_or_default();
+            let reads_local = |sp: rigor_parse::Span| {
+                marks.reads_within(sp).iter().any(|r| written.iter().any(|w| w == r))
+            };
+            let tail_reads = sig.body.last().is_some_and(|&t| reads_local(ast.get(t).span()))
+                || returns.iter().flatten().any(|&v| reads_local(ast.get(v).span()));
+            if tail_reads {
                 return row(None);
             }
         }
@@ -2493,16 +2511,23 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
     Some(collected)
 }
 
-/// Whether a tuple / hash shape holds a union in one of its slots (at any
-/// depth through further tuples and shapes).
-fn composite_holds_union(interner: &Interner, ty: TypeId) -> bool {
+/// Whether a tuple / hash shape holds, in one of its slots (at any depth
+/// through further tuples and shapes), a union — the interner prints it in
+/// canonical member order, not the reference's describe-sorted order — or a
+/// bare generic nominal (`Hash`, `Array`: the reference elaborates it to
+/// `Hash[untyped, ...]` / its value union). Either way the byte output would
+/// differ from the reference's on a method both emit.
+fn composite_holds_unsound(interner: &Interner, index: &CoreIndex, ty: TypeId) -> bool {
+    let slot = |e: TypeId| match interner.get(e) {
+        Type::Union(_) => true,
+        Type::Nominal { class, args } => {
+            args.is_empty() && is_bare_generic_name(index.class_name_for_id(*class).unwrap_or(""))
+        }
+        _ => composite_holds_unsound(interner, index, e),
+    };
     match interner.get(ty) {
-        Type::Tuple(elems) => elems.iter().any(|&e| {
-            matches!(interner.get(e), Type::Union(_)) || composite_holds_union(interner, e)
-        }),
-        Type::HashShape(members) => members.iter().any(|m| {
-            matches!(interner.get(m.value), Type::Union(_)) || composite_holds_union(interner, m.value)
-        }),
+        Type::Tuple(elems) => elems.iter().any(|&e| slot(e)),
+        Type::HashShape(members) => members.iter().any(|m| slot(m.value)),
         _ => false,
     }
 }
@@ -2512,10 +2537,11 @@ fn composite_holds_union(interner: &Interner, ty: TypeId) -> bool {
 /// its RHS value, a `return E` tail to its value (`nil` when bare — the oracle
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
 /// the def-local env (rigor-rs#546).
-/// `Some(Some(ty))` — the tail's type; `Some(None)` — a control tail whose
-/// every value leaf is a `return`, contributing no member; `None` — skip
-/// (empty body, multi-value `return` tail, or a tail shape the def-local env
-/// does not model: see [`control_tail_types`]).
+/// `Some(Some(ty))` — the tail's type (`untyped` for a tail shape the
+/// def-local env does not model, see [`control_tail_types`]: the method skips
+/// as an untyped return); `Some(None)` — a control tail whose every value leaf
+/// is a `return`, contributing no member; `None` — skip (empty body,
+/// multi-value `return` tail).
 #[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
@@ -2528,15 +2554,20 @@ fn def_return_type(
     interner: &mut Interner,
 ) -> Option<Option<TypeId>> {
     let &tail = body.last()?;
+    // A declined tail types as `untyped`: the method skips as an untyped
+    // return (`sig.skipped.untyped-return`, counted — an override the port
+    // declines still reads as unsigned to the base-method demotion, as the
+    // reference's untyped tail does).
+    let declined = Some(Some(interner.untyped()));
     // A tail holding a decision on a typed local (the reference narrows /
     // folds on it) or an unknown-name `=~` binding declines; a write at a
     // position the replay does not walk is widened.
-    let tail_env = typer.tail_env(ast, env, tail, interner)?;
+    let Some(tail_env) = typer.tail_env(ast, env, tail, interner) else { return declined };
     let env = &tail_env;
     match ast.get(tail) {
         // `x op= v`: the lowered node keeps the operand, not the operator —
         // typing the operand (`a = 1; a += 1` → `1`) would be wrong.
-        Node::LocalVariableOpWrite { .. } => None,
+        Node::LocalVariableOpWrite { .. } => declined,
         Node::LocalVariableWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
@@ -2555,7 +2586,7 @@ fn def_return_type(
             // `else` contributes `nil`, a loop tail contributes `nil`.
             let mut members: Vec<TypeId> = Vec::new();
             if !control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members) {
-                return None;
+                return declined;
             }
             match members.len() {
                 0 => Some(None),
