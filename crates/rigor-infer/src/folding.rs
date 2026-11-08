@@ -343,13 +343,19 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
                 Some(Scalar::Int(ruby_mod(a, b)))
             }
         }
-        // Exponent: decline negative exponents (Ruby yields a Rational) and
-        // anything that overflows.
+        // Exponent: decline negative exponents (Ruby yields a Rational).
+        // An overflow promotes to a Bignum — Ruby has arbitrary precision, so
+        // carry the exact decimal spelling (`10 ** 30` -> the 31-digit
+        // literal, rigor-rs#493 item 7). Bounded: an exponent past `MAX_POW`
+        // declines rather than compute a megabyte-long literal.
         "**" => {
-            if b < 0 || b > u32::MAX as i64 {
+            if !(0..=4096).contains(&b) {
                 None
             } else {
-                a.checked_pow(b as u32).map(Scalar::Int)
+                match a.checked_pow(b as u32) {
+                    Some(v) => Some(Scalar::Int(v)),
+                    None => decimal_pow(a, b as u64).map(Scalar::BigInt),
+                }
             }
         }
         "&" => Some(Scalar::Int(a & b)),
@@ -684,6 +690,48 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     }
 }
 
+/// `a ** b` as a decimal-spelled [`Scalar::BigInt`] operand — digit-vector
+/// long multiplication, sign carried separately. Used only for results past
+/// `i64` (the caller tries `checked_pow` first). `a` is small (the foldable
+/// receivers are i64 literals) and `b <= 4096`, so the loop is bounded by
+/// ~19*4096 digits worst-case.
+fn decimal_pow(a: i64, b: u64) -> Option<String> {
+    if a == 0 {
+        return None; // 0 ** b never overflows; unreachable in practice.
+    }
+    let negative = a < 0 && b % 2 == 1;
+    let base: u64 = a.unsigned_abs();
+    // digits little-endian (digits[0] = ones place).
+    let mut digits: Vec<u8> = vec![1];
+    for _ in 0..b {
+        let mut carry: u64 = 0;
+        for d in digits.iter_mut() {
+            let cur = (*d as u64) * base + carry;
+            *d = (cur % 10) as u8;
+            carry = cur / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+        if digits.len() > 80_000 {
+            return None; // paranoia bound — ~80k digits is far past any probe.
+        }
+    }
+    let mut out = String::with_capacity(digits.len() + 1);
+    if negative {
+        out.push('-');
+    }
+    for d in digits.iter().rev() {
+        out.push((b'0' + d) as char);
+    }
+    // The caller only reaches this on checked_pow overflow; guard anyway.
+    if digits.len() <= 19 && !negative {
+        return None;
+    }
+    Some(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -921,3 +969,4 @@ mod tests {
         assert_eq!(scalar_class(&Scalar::Nil), "NilClass");
     }
 }
+

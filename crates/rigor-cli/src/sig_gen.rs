@@ -1530,7 +1530,7 @@ fn method_candidate(
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, sig.body, env, interner) else { return row(None) };
+    let Some(tail_ty) = def_return_type(ast, typer, index, sig.body, env, interner) else { return row(None) };
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -1587,7 +1587,12 @@ fn method_candidate(
             return row(Some("sig.skipped.untyped-return"));
         }
         if e.contains("untyped") {
-            return row(None);
+            // …unless the untyped sits inside a bare generic's type-arg slot:
+            // `Range[untyped]` / `Array[untyped]` are the reference's own
+            // elaborated emits (rigor-rs#493 item 7), not inference holes.
+            if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
         }
         // A bare GENERIC nominal member (`Array` / `Hash` / …) would be
         // `Array[untyped]` after the reference's `TypeElaborator` fill (deferred
@@ -1875,6 +1880,7 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
 fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
+    index: &CoreIndex,
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
@@ -1893,7 +1899,82 @@ fn def_return_type(
         },
         _ => tail,
     };
+    // Literal carriers `type_of` leaves Dynamic — sig-gen still emits their
+    // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
+    // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
+    // through recovery, so no dedicated node exists here).
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, interner) {
+        return Some(lit);
+    }
     Some(typer.type_of(ast, target, env, interner))
+}
+
+/// The sig-gen-side nominal for a literal tail `check` leaves Dynamic
+/// (rigor-rs#493 item 7). `Range[T]` takes the union of its bounds' nominal
+/// CLASS names — `1..2` ⇒ `Integer`, `1...2.5` ⇒ `Float | Integer`; a
+/// `Dynamic` or `nil` bound contributes nothing (`(x..2)` ⇒ `Range[Integer]`,
+/// `(x..)` ⇒ `Range[untyped]`).
+fn literal_tail_nominal(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    interner: &mut Interner,
+) -> Option<TypeId> {
+    let bare = |name: &str, interner: &mut Interner| {
+        index
+            .class_id(name)
+            .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+    };
+    match ast.get(target) {
+        Node::RegexpLit { .. } => bare("Regexp", interner),
+        Node::RationalLit { .. } => bare("Rational", interner),
+        Node::ImaginaryLit { .. } => bare("Complex", interner),
+        Node::Range { left, right, .. } => {
+            let mut arg_members: Vec<TypeId> = Vec::new();
+            for bound in [left, right].into_iter().flatten() {
+                let ty = typer.type_of(ast, *bound, env, interner);
+                let ms: Vec<TypeId> = match interner.get(ty) {
+                    Type::Union(ms) => ms.clone(),
+                    _ => vec![ty],
+                };
+                for m in ms {
+                    // A `nil` bound and a `Dynamic` bound contribute no class.
+                    let Some(cname) = index.class_name_of(interner, m) else { continue };
+                    if cname == "NilClass" {
+                        continue;
+                    }
+                    if let Some(class) = index.class_id(cname) {
+                        let n = interner.intern(Type::Nominal { class, args: vec![] });
+                        if !arg_members.contains(&n) {
+                            arg_members.push(n);
+                        }
+                    }
+                }
+            }
+            // The erased arg lists its members in the reference's sorted union
+            // order (`Float | Integer` for `1...2.5`).
+            arg_members.sort_by_key(|&m| {
+                index
+                    .class_name_of(interner, m)
+                    .unwrap_or("")
+                    .to_string()
+            });
+            let arg = match arg_members.len() {
+                0 => interner.untyped(),
+                1 => arg_members[0],
+                // Mint the union verbatim — `Algebra::join` would re-sort by
+                // the interner's canonical order, but the erased arg follows
+                // the reference's describe-sorted member list.
+                _ => interner.intern(Type::Union(arg_members)),
+            };
+            index
+                .class_id("Range")
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![arg] }))
+        }
+        _ => None,
+    }
 }
 
 /// Whether an erased return is a bare (no type-args) core GENERIC class name —
@@ -3366,3 +3447,25 @@ fn clamp_offset(v: i32, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether `erased` is a bare class nominal carrying only `untyped` type args —
+/// `Range[untyped]`, `Hash[untyped, untyped]` — the reference's elaborated
+/// emit, exempt from the buried-`untyped` skip (rigor-rs#493 item 7).
+fn is_nominal_untyped_args(erased: &str) -> bool {
+    let Some(open) = erased.find('[') else { return false };
+    if !erased.ends_with(']') {
+        return false;
+    }
+    let head = &erased[..open];
+    if head.is_empty()
+        || !head
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
+        || !head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+    {
+        return false;
+    }
+    erased[open + 1..erased.len() - 1]
+        .split(',')
+        .all(|tok| tok.trim() == "untyped")
+}

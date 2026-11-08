@@ -194,6 +194,22 @@ impl<'src> Builder<'src> {
             });
         }
 
+        if let Some(re) = node.as_regular_expression_node() {
+            return self.push(Node::RegexpLit {
+                span: span_of(&re.location()),
+            });
+        }
+        if let Some(r) = node.as_rational_node() {
+            return self.push(Node::RationalLit {
+                span: span_of(&r.location()),
+            });
+        }
+        if let Some(i) = node.as_imaginary_node() {
+            return self.push(Node::ImaginaryLit {
+                span: span_of(&i.location()),
+            });
+        }
+
         if let Some(arr) = node.as_array_node() {
             // Elements are `eval_value_container` operands — TYPED, never
             // `evaluate`d (`x = [h.default ||= 0]` keeps `h`'s indexed
