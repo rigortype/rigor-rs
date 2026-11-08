@@ -1609,7 +1609,12 @@ fn method_candidate(
             return row(Some("sig.skipped.untyped-return"));
         }
         if e.contains("untyped") {
-            return row(None);
+            // …unless every `untyped` sits inside a `ClassName[…]` type-arg
+            // slot — `NameError[untyped]`, `KeyError[untyped, untyped]` are
+            // the reference's own elaborated emits (rigor-rs#548).
+            if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
         }
         // A bare GENERIC nominal member (`Array` / `Hash` / …) would be
         // `Array[untyped]` after the reference's `TypeElaborator` fill (deferred
@@ -3471,3 +3476,44 @@ fn clamp_offset(v: i32, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether every `untyped` in `erased` sits inside a `ClassName[…]` type-arg
+/// slot — `NameError[untyped]`, `KeyError[untyped, untyped]`,
+/// `Range[Array[untyped] | Integer]` — the reference's elaborated emit,
+/// exempt from the buried-`untyped` skip. An `untyped` inside a TUPLE
+/// literal's `[…]` (a bracket not preceded by a class identifier) still
+/// counts as an inference hole.
+fn is_nominal_untyped_args(erased: &str) -> bool {
+    let bytes = erased.as_bytes();
+    let mut found = false;
+    let mut idx = 0;
+    while let Some(off) = erased[idx..].find("untyped") {
+        let pos = idx + off;
+        found = true;
+        // Find the innermost UNCLOSED `[` enclosing this occurrence.
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, &b) in bytes.iter().enumerate().take(pos) {
+            match b {
+                b'[' => stack.push(i),
+                b']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(&open) = stack.last() else { return false };
+        // The `[` must be a generic-args bracket: preceded immediately by a
+        // class-identifier tail (`Foo[`, `Foo::Bar[`).
+        let head: String = erased[..open]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        let head: String = head.chars().rev().collect();
+        if !head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return false;
+        }
+        idx = pos + 7;
+    }
+    found
+}

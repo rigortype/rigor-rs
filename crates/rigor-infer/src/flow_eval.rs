@@ -531,7 +531,17 @@ impl<'i> Typer<'i> {
                 .or_else(|| self.source.class_id(&name));
             match class {
                 Some(class) => {
-                    let n = interner.intern(Type::Nominal { class, args: vec![] });
+                    // A generic exception class elaborates its params to
+                    // `untyped` (`NameError` ⇒ `NameError[untyped]`,
+                    // `KeyError[K, R]` ⇒ `KeyError[untyped, untyped]`) — the
+                    // reference's TypeElaborator fill.
+                    let arity = match name.as_str() {
+                        "KeyError" => 2,
+                        "NameError" | "NoMethodError" => 1,
+                        _ => 0,
+                    };
+                    let args = vec![interner.untyped(); arity];
+                    let n = interner.intern(Type::Nominal { class, args });
                     if !members.contains(&n) {
                         members.push(n);
                     }
