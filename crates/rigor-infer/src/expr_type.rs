@@ -3,7 +3,7 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{Compound, LoweredAst, Node, NodeId, Span};
+use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
