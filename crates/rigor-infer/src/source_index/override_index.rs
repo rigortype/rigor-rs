@@ -321,7 +321,10 @@ impl SourceIndex {
                 Some(slot) => slot.1 = vis,
                 None => per_file.push((file, vis)),
             }
-            if defines || entry.method_visibilities.contains_key(m) {
+            // A re-mark of an ALIAS-ADOPTED name (`private :m` after
+            // `alias_method :m, :z`) also writes the slot — the name is a
+            // definer (rigor-rs#458).
+            if defines || entry.method_visibilities.contains_key(m) || entry.methods.contains(m) {
                 entry.method_visibilities.insert(m.clone(), vis);
             }
         };
@@ -403,10 +406,12 @@ pub(crate) fn collect_override_classes(
                 return;
             }
             let qualified = qualify(prefix, name);
+            let mut methods = methods.to_vec();
+            methods.extend(alias_adopted_methods(ast, body, &methods));
             out.push(HarvestedOverrideClass {
                 qualified: qualified.clone(),
                 superclass: superclass_path.clone(),
-                methods: methods.to_vec(),
+                methods,
                 method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
                 visibility_remarks: visibility_remarks.to_vec(),
                 includes: includes.to_vec(),
@@ -433,10 +438,12 @@ pub(crate) fn collect_override_classes(
                 return;
             }
             let qualified = qualify(prefix, name);
+            let mut methods = methods.to_vec();
+            methods.extend(alias_adopted_methods(ast, body, &methods));
             out.push(HarvestedOverrideClass {
                 qualified: qualified.clone(),
                 superclass: None,
-                methods: methods.to_vec(),
+                methods,
                 method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
                 visibility_remarks: visibility_remarks.to_vec(),
                 includes: includes.to_vec(),
@@ -456,6 +463,81 @@ pub(crate) fn collect_override_classes(
         // bodies / control flow — a def-nested class is out of slice-1 scope.
         _ => {}
     }
+}
+
+/// `alias`/`alias_method` names adopted by the override definer table
+/// (rigor-rs#458): the NEW name joins `methods` when the OLD name is defined
+/// earlier in the same body — a `def` above it, or a name an earlier alias
+/// already adopted (a chained `alias n m`). A dangling or forward-targeted
+/// alias names nothing: `alias m z` alone — or before `def z` — does not
+/// make `M` `m`'s definer, matching the oracle's `overrides B#m` on it.
+fn alias_adopted_methods(
+    ast: &LoweredAst,
+    body: &[NodeId],
+    methods: &[String],
+) -> Vec<String> {
+    // Walk statements in SOURCE order with a running defined set: an alias
+    // whose target has not yet been defined names nothing (`alias m z`
+    // before `def z` still fires `overrides B#m` on the oracle), while a
+    // chained `alias n m` adopts through an `m` adopted above it.
+    let mut defined: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for &child in body {
+        // A `def` counts in source order — directly (`def z`), or as the
+        // ARGUMENT of a visibility call (`private def z` lowers to a Call
+        // carrying the Definition node, rigor-rs#458 review).
+        let def_name_of = |n: &Node| match n {
+            Node::Definition {
+                name: Some(name),
+                receiver_def_name: None,
+                singleton_name: None,
+                ..
+            } => Some(name.clone()),
+            _ => None,
+        };
+        let mut mark_defined = |name: Option<String>| {
+            if let Some(name) = name {
+                if !defined.contains(&name) {
+                    defined.push(name);
+                }
+            }
+        };
+        mark_defined(def_name_of(ast.get(child)));
+        if let Node::Call { args, .. } = ast.get(child) {
+            let arg_defs: Vec<String> = args
+                .iter()
+                .filter_map(|a| def_name_of(ast.get(*a)))
+                .collect();
+            for name in arg_defs {
+                mark_defined(Some(name));
+            }
+        }
+        let (new, old) = match ast.get(child) {
+            Node::Alias {
+                new_name, old_name, ..
+            } => (
+                super::def_attribution::literal_method_name(ast, *new_name),
+                super::def_attribution::literal_method_name(ast, *old_name),
+            ),
+            Node::Call {
+                receiver: None,
+                method,
+                args,
+                ..
+            } if method == "alias_method" && args.len() == 2 => (
+                super::def_attribution::literal_method_name(ast, args[0]),
+                super::def_attribution::literal_method_name(ast, args[1]),
+            ),
+            _ => continue,
+        };
+        if let (Some(new), Some(old)) = (new, old) {
+            let defined_here = defined.contains(&old) || out.contains(&old);
+            if defined_here && !methods.contains(&new) && !out.contains(&new) {
+                out.push(new.clone());
+            }
+        }
+    }
+    out
 }
 
 /// The CONSTANT names a class/module body's direct `extend <Const>` calls

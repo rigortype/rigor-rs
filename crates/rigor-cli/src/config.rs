@@ -96,6 +96,14 @@ pub struct Config {
     /// dispatch rules witness against. A named dir that doesn't exist is inert.
     #[serde(deserialize_with = "de_signature_paths")]
     pub signature_paths: Vec<String>,
+    /// `libraries:` — opt-in stdlib libraries (the reference's
+    /// `Configuration#libraries`). Coerced like `Array()` (a scalar becomes a
+    /// one-element list). The port does not load arbitrary library RBS, but a
+    /// gated VENDORED feature named here (`prime`) activates exactly like a
+    /// source `require` — `RequiredFeatures.tokens(features, libraries)`
+    /// (rigor-rs#463).
+    #[serde(deserialize_with = "de_libraries")]
+    pub libraries: Vec<String>,
     /// ADR-0034: `rbs collection` awareness. Mirrors the reference's
     /// `rbs_collection:` config block (`auto_detect` default `true`, optional
     /// `lockfile` override). Sub-values coerce like the reference's
@@ -278,6 +286,7 @@ impl Default for Config {
             severity_profile: serde_yaml::Value::Null,
             severity_overrides: serde_yaml::Value::Null,
             signature_paths: default_signature_paths(),
+            libraries: Vec::new(),
             rbs_collection: RbsCollectionConfig::default(),
             bundler: BundlerConfig::default(),
             rigor_rs: RigorRsConfig::default(),
@@ -420,6 +429,19 @@ where
 /// `bundler:` — the reference reads it as a Hash (`DEFAULTS.fetch.merge`) and
 /// takes `auto_detect` strictly as `== true`; a non-mapping block crashes
 /// upstream (`Hash#merge`), so it is a load error here.
+/// `libraries:` — `Array()` coercion, like `signature_paths` but with the
+/// empty list as the no-key default (libraries have no default).
+fn de_libraries<'de, D>(d: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = serde_yaml::Value::deserialize(d)?;
+    if value.is_null() {
+        return Ok(Vec::new());
+    }
+    ruby_array(&value).map_err(serde::de::Error::custom)
+}
+
 fn de_bundler<'de, D>(d: D) -> Result<BundlerConfig, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -953,6 +975,12 @@ impl Config {
     #[must_use]
     pub fn rbs_collection_lockfile(&self) -> Option<&str> {
         self.rbs_collection.lockfile.as_deref()
+    }
+
+    /// The `libraries:` entries as configured (`Array()`-coerced at load).
+    #[must_use]
+    pub fn libraries(&self) -> &[String] {
+        &self.libraries
     }
 
     /// The `disable:` tokens, for the config audit's inert-rule-token check.

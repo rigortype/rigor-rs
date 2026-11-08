@@ -440,17 +440,25 @@ impl<'i> Typer<'i> {
                         .iter()
                         .find(|&&s| within_span(site, ast.get(s).span()))
                     {
-                        // Upstream #1837 (rigor #1231): with no `retry` aimed
-                        // at this `begin`, the arm reads each local the
-                        // protected body writes as `Dynamic[top]` — before
-                        // the reference binds, so `rescue => e` still wins.
+                        // Upstream #1837 (rigor #1231): the arm reads each
+                        // local the protected body writes as `Dynamic[top]`
+                        // — before the reference binds, so `rescue => e`
+                        // still wins. Under a retry edge the widening holds
+                        // for EVERY arm (`rescue_writes` is nil; rigor-rs#468)
+                        // plus the retrying clauses' own writes via
+                        // `absorb_retry_rebinds`.
                         if let (Some(&f), Some(&l)) = (main_body.first(), main_body.last()) {
-                            if !clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
-                                let region = (ast.get(f).span().0, ast.get(l).span().1);
-                                widen_clause_entry(
-                                    &flow.rebinds, region, &flow.indexed.scope_spans, env, interner,
-                                );
-                            }
+                            let region = (ast.get(f).span().0, ast.get(l).span().1);
+                            widen_clause_entry(
+                                &flow.rebinds, region, &flow.indexed.scope_spans, env, interner,
+                            );
+                        }
+                        for rs in clauses
+                            .iter()
+                            .filter(|rc| self.clause_retries(ast, rc.span))
+                            .map(|rc| rc.span)
+                        {
+                            widen_flow_writes(&flow.rebinds, rs, env, interner);
                         }
                         // `rescue => e` binds the exception inside the arm —
                         // `bind_rescue_reference` on the oracle
@@ -862,6 +870,11 @@ impl<'i> Typer<'i> {
             if m.span.0 >= span.0
                 && m.span.1 <= span.1
                 && flow.dead.write_reaches(m.span, site)
+                // A slot mutation inside a block body's `break` argument
+                // is a scope effect on a locals-only join — its widening
+                // lands nowhere, not even inside the argument
+                // (rigor-rs#407).
+                && !ast.in_block_break_locals_only_carrier(m.span)
             {
                 self.apply_slot_mutation(ast, id, m, env, interner);
             }
@@ -1027,11 +1040,14 @@ impl<'i> Typer<'i> {
                 && wspan.1 <= span.1
                 && flow.dead.write_reaches(*wspan, site)
                 // A block body's `break` argument lands on the locals-only
-                // break join — its drop applies nowhere (rigor-rs#363).
-                && !(ast.in_locals_only_carrier(*wspan)
-                    && ast.iter().any(|(_, n)| {
-                        matches!(n, Node::AttrWrite { span: s, .. } if s == wspan)
-                    }))
+                // break join — its drop applies nowhere (rigor-rs#363),
+                // and on a block break EVERY scope effect is dropped
+                // (rigor-rs#407), adder widens included.
+                && !(ast.in_block_break_locals_only_carrier(*wspan)
+                    || (ast.in_locals_only_carrier(*wspan)
+                        && ast.iter().any(|(_, n)| {
+                            matches!(n, Node::AttrWrite { span: s, .. } if s == wspan)
+                        })))
             {
                 drop_indexed_narrowings(env, name);
             }
@@ -1750,7 +1766,13 @@ impl<'i> Typer<'i> {
             );
         }
         for m in &indexed.slot_mutations {
-            if span.0 <= m.span.0 && m.span.1 <= span.1 {
+            // A slot mutation inside a block body's `break` argument
+            // widens nothing anywhere — `join_block_break_bindings`
+            // drops every scope effect (rigor-rs#407).
+            if span.0 <= m.span.0
+                && m.span.1 <= span.1
+                && !ast.in_block_break_locals_only_carrier(m.span)
+            {
                 self.apply_slot_mutation(ast, root, m, env, interner);
             }
         }
@@ -1856,7 +1878,19 @@ impl<'i> Typer<'i> {
                     env.insert(stored[i].1.clone(), stored[i].2);
                 }
                 Ev::SlotMut(i) => {
-                    self.apply_slot_mutation(ast, root, &indexed.slot_mutations[i], env, interner);
+                    // `join_block_break_bindings` drops the widening
+                    // (rigor-rs#407).
+                    if !ast.in_block_break_locals_only_carrier(
+                        indexed.slot_mutations[i].span,
+                    ) {
+                        self.apply_slot_mutation(
+                            ast,
+                            root,
+                            &indexed.slot_mutations[i],
+                            env,
+                            interner,
+                        );
+                    }
                 }
             }
         }
@@ -2309,7 +2343,13 @@ impl<'i> Typer<'i> {
                         (Some(&f), Some(&l)) => Some((ast.get(f).span().0, ast.get(l).span().1)),
                         _ => None,
                     };
-                    let retried = clauses.iter().any(|c| self.clause_retries(ast, c.span));
+                    // Spans of the retrying clauses — see the sibling
+                    // widening below (`absorb_retry_rebinds`).
+                    let retry_spans: Vec<(usize, usize)> = clauses
+                        .iter()
+                        .filter(|c| self.clause_retries(ast, c.span))
+                        .map(|c| c.span)
+                        .collect();
                     let mut arm_envs = Vec::with_capacity(clauses.len());
                     for c in &clauses {
                         // The arm's entry scope is the `begin`'s ENTRY scope —
@@ -2332,8 +2372,26 @@ impl<'i> Typer<'i> {
                         let mut cenv = env.clone();
                         if self.clause_retries(ast, c.span) {
                             widen_flow_writes(rebinds, begin_span, &mut cenv, interner);
-                        } else if let (false, Some(region)) = (retried, body_region) {
+                        }
+                        // Under a retry edge the clause-entry widening
+                        // (`rescue_writes`) holds for EVERY arm, not just
+                        // the retrying one — a sibling can re-enter the
+                        // `begin` through the retry too, so `ok = false;
+                        // begin; ok = true; rescue A; retry; rescue B; if ok`
+                        // stays silent on the oracle (rigor-rs#468).
+                        if let Some(region) = body_region {
                             widen_clause_entry(rebinds, region, &indexed.scope_spans, &mut cenv, interner);
+                        }
+                        // …and a NON-retry sibling additionally reads the
+                        // retrying arm's own writes as `Dynamic` — the
+                        // reference's `absorb_retry_rebinds` feeds each
+                        // `edge.retry_scopes` back into the shared `begin`
+                        // env (`ok = false; begin; rescue A; ok = true;
+                        // retry; rescue B; if ok` is silent on the oracle).
+                        if !self.clause_retries(ast, c.span) {
+                            for rs in &retry_spans {
+                                widen_flow_writes(rebinds, *rs, &mut cenv, interner);
+                            }
                         }
                         self.flow_eval_scope(
                             ast, &c.body, &mut cenv, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,

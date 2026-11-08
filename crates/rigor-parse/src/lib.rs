@@ -20,7 +20,7 @@ pub mod mutators;
 pub mod pre_eval;
 
 pub use ast::{
-    lower, lower_with_key, AncestryFacts, BlockParamKind, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, ConstMutation, FileKey, HashKey, HashKeyTag,
+    lower, lower_with_key, AncestryFacts, BlockParamKind, GATED_FEATURES, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, ConstMutation, FileKey, HashKey, HashKeyTag,
     Compound, IndexTargetKey, IndexWrites, JumpKind, LoopKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
     NodeId, ParamShape, RebindFacts, RebindReceiver, RebindSite, REBIND_METHOD_OBJECT_CALLS, RescueClause,
     Span, StatementsKind, Visibility,
@@ -83,6 +83,12 @@ pub fn comment_lines(
 
     let mut out = Vec::new();
     for comment in result.comments() {
+        // `=begin … =end` embedded documents are ignored by the reference —
+        // their text is one big comment, and a `# rigor:disable` inside is
+        // never a directive (rigor-rs#461).
+        if comment.type_() == ruby_prism::CommentType::EmbDocComment {
+            continue;
+        }
         let loc = comment.location();
         let start = loc.start_offset().min(source.len());
         let end = loc.end_offset().min(source.len());

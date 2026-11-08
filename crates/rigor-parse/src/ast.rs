@@ -52,7 +52,7 @@ pub use definitions::{MethodBody, ParamShape, Visibility};
 pub(crate) use definitions::*;
 pub(crate) use recovery::*;
 pub use constants::ConstMutation;
-pub use ancestry_facts::{AncestryFacts, MixinSide, UnpositionedMixin, WILDCARD as MIXIN_WILDCARD};
+pub use ancestry_facts::{AncestryFacts, GATED_FEATURES, MixinSide, UnpositionedMixin, WILDCARD as MIXIN_WILDCARD};
 pub(crate) use ancestry_facts::collect_ancestry_facts;
 pub use singleton_locals::SingletonLocals;
 pub use rebind_sites::{RebindDef, RebindFacts, RebindReceiver, RebindRow, RebindSite, METHOD_OBJECT_CALLS as REBIND_METHOD_OBJECT_CALLS};

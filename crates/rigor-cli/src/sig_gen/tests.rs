@@ -518,6 +518,76 @@ fn bare_module_function_makes_subsequent_defs_dual() {
 }
 
 #[test]
+fn module_function_dup_slots_last_definer_wins() {
+    // rigor-rs#493 item 9 (reference `live_definitions`): a `module_function`
+    // `def u` owns BOTH slots; a later `def self.u` steals the singleton one,
+    // so the dual row is dropped outright — emitting both is an `rbs
+    // validate` duplicate-member failure.
+    let src = "module N15\n  module_function\n  def u = 1\n  def self.u = 2\nend\n";
+    let cs = candidates_tagged("mfdup", src, false);
+    assert_eq!(
+        cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self.u: () -> 2"]
+    );
+    // A later INSTANCE-only redefinition (a `public` reset ends the dual
+    // mode) steals the instance slot; the first def's surviving singleton
+    // copy is written `def self.u` — with the FIRST def's return.
+    let src2 = "module M\n  module_function\n  def u = 1\n  public\n  def u = 9\nend\n";
+    let cs2 = candidates_tagged("mfdup2", src2, false);
+    assert_eq!(
+        cs2.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self.u: () -> 1", "def u: () -> 9"]
+    );
+    // A plain redefinition keeps the LAST def, as before.
+    let src3 = "class C\n  def y = 1\n  def y = 2\nend\n";
+    let cs3 = candidates_tagged("mfdup3", src3, false);
+    assert_eq!(
+        cs3.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def y: () -> 2"]
+    );
+}
+
+#[test]
+fn module_function_def_survives_private_visibility() {
+    // rigor-rs#493 item 10 (reference `visibility_excludes?` returns false for
+    // a @module_function_methods def): `private` marks `h` private in the
+    // visibility table, but the re-armed module_function still writes its
+    // `self?.h` row.
+    let src = "module T\n  module_function\n  private\n  def g = 1\n  module_function\n  def h = 2\nend\n";
+    let cs = candidates_tagged("mfvis", src, false);
+    assert_eq!(
+        cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self?.h: () -> 2"]
+    );
+}
+
+#[test]
+fn module_function_def_survives_later_private_redefinition() {
+    // rigor-rs#523: the name-keyed visibility table reads `u -> private` from
+    // the SECOND def's mark, yet the first (module_function) def's surviving
+    // singleton copy is still written `def self.u` with the FIRST def's return
+    // (reference `visibility_excludes?` exempts @module_function_methods;
+    // #526 added the guard, this pins the issue row). Same for `protected`.
+    for vis in ["private", "protected"] {
+        let src = format!("module M\n  module_function\n  def u = 1\n  {vis}\n  def u = 9\nend\n");
+        let cs = candidates_tagged("mfpriv", &src, false);
+        assert_eq!(
+            cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+            vec!["def self.u: () -> 1"],
+            "{vis}"
+        );
+    }
+    // Must-still-fire controls: a plain class / non-module_function module
+    // keeps skipping the private redefinition.
+    for src in [
+        "class C\n  def u = 1\n  private\n  def u = 9\nend\n",
+        "module M\n  def u = 1\n  private\n  def u = 9\nend\n",
+    ] {
+        assert!(candidates_tagged("mfpriv_ctl", src, false).is_empty(), "{src}");
+    }
+}
+
+#[test]
 fn module_function_with_args_does_not_flip_mode() {
     // `module_function :sym` (args form) neither flips the mode nor marks the
     // method (oracle-probed) — both defs stay plain instance methods.
@@ -582,6 +652,7 @@ fn diff_string_emits_header_and_plus_line_per_candidate() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     let cands = [
         c("Foo", "greeting", "def greeting: () -> \"h\""),
@@ -636,6 +707,7 @@ fn render_new_file_wraps_nested_namespaces_with_kinds_and_super() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     let mut info = NamespaceInfo::default();
     info.kinds.insert("Outer".into(), "module");
@@ -660,6 +732,7 @@ fn render_new_file_appends_data_struct_shells_after_real_children() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     let mut info = NamespaceInfo::default();
     info.kinds.insert("Host".into(), "class");
@@ -699,6 +772,7 @@ fn render_new_file_leaf_class_defaults_to_class_keyword() {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     };
     // No kinds recorded → a leaf with methods defaults to `class`.
     let out = render_new_file(&[cand], &[], &NamespaceInfo::default());
@@ -792,6 +866,22 @@ fn is_bare_generic_name_only_matches_bare_generics() {
 // -- UPDATE/merge + LayoutIndex ------------------------------------------
 
 /// A merge-candidate factory for the `apply_merge` tests.
+#[test]
+fn group_by_class_orders_groups_by_class_name() {
+    // Reference `merge_candidates`: `groups.keys.sort.each { merge_class }` —
+    // class-name order, which is also the `skipped` report's line order
+    // (rigor-rs#493 item 5).
+    let groups = group_by_class(vec![
+        mc("Zebra", "z", "instance", "def z: () -> 1"),
+        mc("Apple", "a", "instance", "def a: () -> 2"),
+        mc("Apple", "b", "instance", "def b: () -> 3"),
+    ]);
+    assert_eq!(
+        groups.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["Apple", "Zebra"]
+    );
+}
+
 fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
     Candidate {
         file: "lib/f.rb".into(),
@@ -804,6 +894,7 @@ fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: None,
     }
 }
 

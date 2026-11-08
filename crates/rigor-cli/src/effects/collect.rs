@@ -761,8 +761,16 @@ impl<'pr> UnitScan<'pr> {
         // dispatcher declined; the port can prove NEITHER negative, so it taints
         // at every such site. Both are strict over-taints — the safe direction
         // (ADR-0043 § 2) — and they are what the residual UNDER column measures.
-        if node.receiver().is_some() {
-            return self.taint(DYNAMIC_RECEIVER, None);
+        if let Some(receiver) = node.receiver() {
+            // The detail is upstream's `record.cause` — the dynamic-origin of
+            // the receiver's type. Without a typer the port can only name the
+            // archetypal one: a bare local read is Dynamic by
+            // `inferred_return_untyped` (rigor-rs#469); every other receiver
+            // shape keeps the bare cause.
+            let detail = receiver
+                .as_local_variable_read_node()
+                .map(|_| "inferred_return_untyped");
+            return self.taint(DYNAMIC_RECEIVER, detail);
         }
         self.push_edge(&selector);
         self.taint(UNRESOLVED_SELF_CALL, Some(&selector));
@@ -1422,7 +1430,11 @@ mod tests {
     fn an_uncatalogued_call_taints_by_its_receiver_shape() {
         // Upstream reads the typer's `dynamic` / `resolved` bits here; the port
         // can prove neither negative, so both sites taint (module docs).
-        assert_eq!(taint("  list.each_slice(2)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(
+            taint("  list.each_slice(2)"),
+            (false, vec![cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped"))]),
+            "a bare local read is Dynamic by `inferred_return_untyped` (rigor-rs#469)"
+        );
         assert_eq!(
             taint("  helper(1)"),
             (false, vec![cause(UNRESOLVED_SELF_CALL, Some("helper"))]),
@@ -1463,7 +1475,10 @@ mod tests {
         );
 
         // (b) `&expr` that is neither a symbol nor this unit's own `&blk`.
-        assert_eq!(taint("  list.each(&blk)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(
+            taint("  list.each(&blk)"),
+            (false, vec![cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped"))])
+        );
         assert_eq!(taint("  send(:each, &blk)"), (true, vec![]), "forwarding the unit's own block");
         assert_eq!(taint("  send(:each, &:to_s)"), (true, vec![]), "a symbol is not opaque");
         assert_eq!(
@@ -1482,7 +1497,10 @@ mod tests {
         // reaches `exhaustive: true` for both because it can see the receiver is
         // a Proc; the port cannot, so it keeps the weaker `dynamic-receiver` —
         // an over-taint, the safe direction.)
-        assert_eq!(taint("  blk.call"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(
+            taint("  blk.call"),
+            (false, vec![cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped"))])
+        );
         assert_eq!(taint("  ->(x) { x }.call(1)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
     }
 
@@ -1565,7 +1583,13 @@ mod tests {
         // and independently, then reads the receiver (`unit_scan.rb:445`).
         assert_eq!(
             taint("  b = list\n  b.name = 1\n  nil"),
-            (false, vec![cause(DYNAMIC_RECEIVER, None), cause(UNKNOWN_OWNERSHIP, None)])
+            (
+                false,
+                vec![
+                    cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped")),
+                    cause(UNKNOWN_OWNERSHIP, None)
+                ]
+            )
         );
         // A provable owner produces the label and no ownership taint.
         assert_eq!(taint("  @x[0] += 1"), (true, vec![]));
@@ -1629,7 +1653,7 @@ mod tests {
         assert_eq!(
             causes,
             vec![
-                cause(DYNAMIC_RECEIVER, None),
+                cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped")),
                 cause(DYNAMIC_SEND, None),
                 cause(OPAQUE_CALLABLE, None),
                 cause(UNRESOLVED_SELF_CALL, Some("helper")),
@@ -1649,7 +1673,10 @@ mod tests {
         let found = bits(
             "class C\n def m\n  puts 1\n end\nend\nclass C\n def m(thing)\n  thing.other\n end\nend",
         );
-        assert_eq!(found["C#m"], (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(
+            found["C#m"],
+            (false, vec![cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped"))])
+        );
     }
 
     #[test]

@@ -1045,6 +1045,43 @@ fn string_index_or_write_slot_narrowing() {
     }
 }
 
+/// rigor-rs#499 — a String compound write's internal `current` read types
+/// like the oracle's. Every expectation below was probed against the reference
+/// (`harness/probe.py`, tuple for tuple): `s[9] ||= nil` records `nil` (the
+/// out-of-range fold), so a later read is `for nil` — not `possible-nil` and
+/// not the flat `for String`; `s.index &&= 1` keeps `Integer | nil`, silent
+/// downstream; the in-range lookup control still fires on its pinned char.
+#[test]
+fn string_compound_write_current_read_edges() {
+    // Item 1: the slot record is exactly `nil`.
+    let src = b"s = \"abc\"; s[9] ||= nil; x = s[9]; x.upcase\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one `for nil` diag, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for nil");
+    assert_eq!(diags[0].start_offset, 37, "reference @1:38");
+
+    // A chained read: the first link (`strip`) is the one that misses on nil.
+    let diags = run(b"s = \"abc\"; s[9] ||= nil; s[9].strip.frobnicate\n");
+    assert_eq!(diags.len(), 1, "expected one `strip for nil` diag, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `strip' for nil");
+
+    // Item 2: `&&=` on a nilable zero-arg lookup types `Integer | nil`, so the
+    // result (`nil | 1`) is silent downstream.
+    assert!(
+        run(b"s = \"abc\"; (s.index &&= 1).to_a\n").is_empty(),
+        "`s.index &&= 1` must not collapse to `1`"
+    );
+    assert!(run(b"s = \"abc\"; (s.slice &&= 1).zz\n").is_empty());
+
+    // Must-still-fire control: the plain in-range read keeps its pinned char.
+    let diags = run(b"s = \"abc\"; s[0].frobnicate\n");
+    assert_eq!(diags.len(), 1, "control must still fire, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `frobnicate' for \"a\"");
+}
+
 /// Methods defined on NilClass (`to_s`, `inspect`, `nil?`) never mint a
 /// possible-nil diagnostic — the call is sound on the nil arm.
 #[test]
@@ -2566,6 +2603,41 @@ fn override_vis_fires_public_to_private_across_superclass() {
     );
     // Anchored on the overriding def's name token.
     assert_eq!(&src[d.start_offset..d.end_offset], b"foo");
+}
+
+#[test]
+fn override_vis_alias_adopted_method_is_the_parent() {
+    // rigor-rs#458: `def z; alias_method :m, :z` makes `M` the override
+    // parent of `m` — the `private :m` mark applies to `M#m`, not `B#m`, so
+    // no reduction is provable (the oracle is silent).
+    let src = b"module M
+  def z; end
+  alias_method :m, :z
+  private :m
+end
+class B; def m; end; end
+class C < B
+  include M
+  private
+  def m; end
+end
+";
+    assert!(override_vis(src).is_empty());
+    // A dangling alias (target never defined) leaves `M` a non-definer —
+    // the parent walk continues to `B` (the oracle fires `overrides B#m`;
+    // the port still declines through the discharge marks).
+    let dangling = b"module M
+  def z; end
+  alias m q
+end
+class B; def m; end; end
+class C < B
+  include M
+  private
+  def m; end
+end
+";
+    let _ = override_vis(dangling);
 }
 
 #[test]
@@ -4094,16 +4166,20 @@ fn issue_146_multi_value_argument_stays_silent() {
     assert!(run(b"v = 1\nv = 2 if $c\n\"abc\"[v].wA\n").is_empty());
     assert!(run(b"def g(c)\n  v = 1\n  v = 2 if c\n  1.fdiv(v).wB\nend\n").is_empty());
     assert!(run(b"def g(c)\n  \"abc\"[c ? 1 : 2].wC\nend\n").is_empty());
-    // CONTROLS — a literal argument still folds (`for "b"`), and a single
-    // reaching value keeps its nominal pin (the reference's `for "b"` there
-    // is the recorded precision gap, not an FP).
+    // CONTROLS — a literal argument still folds (`for "b"`). A single
+    // reaching value no longer answers the nominal: #178 declines every
+    // nilable String lookup the stale-env gate stands down on, so
+    // `"abc"[v]` is silent where the reference folds `v` to `for "b"` —
+    // a recorded coverage loss, never an FP.
     let diags = run(b"\"abc\"[1].wK\n");
     assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
     assert_eq!(diags[0].message, "undefined method `wK' for \"b\"");
     let diags = run(b"def g\n  v = 1\n  \"abc\"[v].wL\nend\n");
-    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
-    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert!(
+        diags.is_empty(),
+        "#178 declines the local-read `[]` lookup, got {diags:?}"
+    );
 }
 
 /// rigor-rs#309, adversarial review — a union of DISTINCT literal
@@ -4422,11 +4498,15 @@ fn issue_436_reaching_write_cap_boundary() {
             .collect()
     }
     // One plain write plus `n` conditional ones: `n + 1` reaching writes.
+    // The probe call is `1.fdiv(v)`, not `"abc"[v]`: #178 declines every
+    // nilable String lookup whose argument reads a local, so `[]` can no
+    // longer observe the cap — `fdiv` folds on the pinned single value and
+    // declines on the same `multi` reach the cap mints.
     let fan_def = |n: usize| {
-        format!("def f(c)\n  v = 1\n{}  \"abc\"[v].zz\nend\n", "  v = 1 if c\n".repeat(n))
+        format!("def f(c)\n  v = 1\n{}  1.fdiv(v).zz\nend\n", "  v = 1 if c\n".repeat(n))
     };
     let fan_top =
-        |n: usize| format!("v = 1\n{}\"abc\"[v].zz\n", "v = 1 if rand > 0.5\n".repeat(n));
+        |n: usize| format!("v = 1\n{}1.fdiv(v).zz\n", "v = 1 if rand > 0.5\n".repeat(n));
     for (shape, fan) in [("def", &fan_def as &dyn Fn(usize) -> String), ("top", &fan_top)] {
         assert_eq!(undefined(&fan(255)).len(), 1, "{shape}: 256 writes must still fire");
         assert!(undefined(&fan(256)).is_empty(), "{shape}: 257 writes must decline");
@@ -4437,7 +4517,7 @@ fn issue_436_reaching_write_cap_boundary() {
     // sees one write and fires. (A literal `if false` arm is no test: its
     // writes are not collector events at all.)
     let writes = "    v = 2\n".repeat(300);
-    let read = "  \"abc\"[v].zz\nend\n";
+    let read = "  1.fdiv(v).zz\nend\n";
     let rescue_dead =
         format!("def f(c)\n  v = 1\n  begin\n    c.g\n  rescue\n{writes}    raise\n  end\n{read}");
     let fold_dead = format!("def f(c)\n  v = 1\n  t = nil\n  if t\n{writes}  end\n{read}");

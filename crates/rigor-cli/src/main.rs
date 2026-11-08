@@ -753,6 +753,9 @@ fn cmd_describe_args(args: &[String], usage: &str) -> ExitCode {
 /// its diagnostics. Exit 1 if any ERROR-severity diagnostic is found (a
 /// warning-only run exits 0, ADR-0040), 64 on a usage error (ADR-0030 exit codes).
 fn cmd_check(args: &[String]) -> ExitCode {
+    // The run-stats `Wall time:` line — the reference's wall clock starts at
+    // the run's start (`Runner#run`), the closest port seam.
+    let wall_start = std::time::Instant::now();
     let items = match CHECK_PARSER.parse(args).items_or_exit() {
         Ok(items) => items,
         Err(code) => return code,
@@ -788,6 +791,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
     let mut instead_of: Option<String> = None;
     // Whether `--workers` was given — the env-var fallback's gate.
     let mut workers_cli = false;
+    // `--stats` (the default) / `--no-stats` — whether the run-stats summary
+    // prints to stderr after the run (rigor-rs#502).
+    let mut run_stats = true;
     // The first unsupported flag in argv order, reported after the semantic
     // validations the reference runs post-parse.
     let mut unsupported: Option<&'static str> = None;
@@ -795,15 +801,16 @@ fn cmd_check(args: &[String]) -> ExitCode {
     for item in &items {
         match item {
             Item::Positional(p) => files.push(p.clone()),
-            Item::Opt { key, value, .. } => match *key {
+            Item::Opt { key, negated, value } => match *key {
                 "config" => match crate::config::checked_config_path(value.as_ref().unwrap().as_str()) {
                     Ok(path) => explicit_config = Some(path),
                     Err(code) => return code,
                 },
                 "format" => format = value.as_ref().unwrap().as_str().to_string(),
                 // Accepted no-ops — the semantics trivially hold for a port
-                // with no persistent cache and no run-stats output.
-                "no-cache" | "clear-cache" | "stats" => {}
+                // with no persistent cache.
+                "no-cache" | "clear-cache" => {}
+                "stats" => run_stats = !negated,
                 // Sequential-only: the worker pool is a performance axis with
                 // identical output, so the (Integer-validated) value is a
                 // no-op — but its presence suppresses the
@@ -995,8 +1002,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `disable:` and the severity pipeline the same way it does upstream (the
     // early return renders `Result.diagnostics` verbatim); it still flows
     // through the baseline filter and `fail_on` below like any result.
-    let (mut findings, had_io_error, expanded_owned, path_errors) = match cfg
-        .target_ruby_failure()
+    let (mut findings, had_io_error, expanded_owned, path_errors, run_stats_data) =
+        match cfg.target_ruby_failure()
     {
         Some(message) => (
             vec![(
@@ -1017,6 +1024,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
             false,
             Vec::new(),
             Vec::new(),
+            // No stats: the reference's `validate_target_ruby` early-return
+            // never builds a `RunStats` (measured — a `configuration-error`
+            // run prints no summary block, rigor-rs#502).
+            None,
         ),
         None => {
             // Upstream v0.4.7 (#2517): a `core_root:` that cannot serve as a
@@ -1058,7 +1069,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     std::env::var_os("POSIXLY_CORRECT").as_deref(),
                     std::env::var_os("RIGOR_RACTOR_WORKERS").as_deref(),
                 );
-            let (findings, had_io_error) = analyze_files(
+            let (findings, had_io_error, (rbs_total, rbs_project)) = analyze_files(
                 &expanded,
                 // `None` on the `paths:` fallback ⇒ `paths ==
                 // configuration.paths` ⇒ the reference never widens discovery
@@ -1074,7 +1085,17 @@ fn cmd_check(args: &[String]) -> ExitCode {
                 &bleeding_edge,
                 ref_has_files,
             );
-            (findings, had_io_error, expanded_owned, path_errors)
+            // The reference's stats build forces the RBS environment at
+            // end-of-run; a run that analyzed ZERO files never built it, so
+            // its snapshot is empty — `RBS classes available: 0` + the loud
+            // empty-env WARNING (measured: `check nonexist.rb` and a
+            // `paths:`-less run). An analyzed file present ⇒ real counts.
+            let stats = if expanded_owned.is_empty() {
+                Some((expanded_owned.len(), 0, 0))
+            } else {
+                Some((expanded_owned.len(), rbs_total, rbs_project))
+            };
+            (findings, had_io_error, expanded_owned, path_errors, stats)
         }
     };
 
@@ -1130,6 +1151,21 @@ fn cmd_check(args: &[String]) -> ExitCode {
         emit_ci_detected_output(&findings);
     }
 
+    // `--stats` (default on): the reference's `write_run_stats` — the summary
+    // block goes to STDERR after the result + CI output, in every format, and
+    // only when the run actually analyzed (a `validate_target_ruby`
+    // early-return produced no `RunStats`). `--no-stats` suppresses it.
+    if run_stats {
+        if let Some((target_files, rbs_total, rbs_project)) = run_stats_data {
+            write_run_stats(
+                target_files,
+                rbs_total,
+                rbs_project,
+                wall_start.elapsed().as_secs_f64(),
+            );
+        }
+    }
+
     // ADR-0040 — exit 1 iff there is a genuine read I/O error OR any run-failing
     // finding (see `finding_fails_run`); a warning-only run — including a
     // warn-and-skip bad path alongside analyzed files — exits 0.
@@ -1157,6 +1193,92 @@ fn cmd_check(args: &[String]) -> ExitCode {
     } else {
         ExitCode::SUCCESS
     }
+}
+
+/// `check`'s `--stats` summary — the reference's `Analysis::RunStats#format`
+/// (rigor-rs#502). Written to STDERR after `write_result` so it never
+/// interleaves with the stdout diagnostic stream; every output format prints
+/// it (the JSON envelope's `stats` member is a separate, unported shape —
+/// ADR-0040's out-of-scope note). `rbs_total == 0` prints the reference's
+/// empty-environment WARNING block; the `Gem source-walk` group never prints
+/// (the port has no `dependencies.source_inference` walk, so its count is
+/// always 0).
+fn write_run_stats(
+    target_files: usize,
+    rbs_total: usize,
+    rbs_project: usize,
+    wall_seconds: f64,
+) {
+    eprintln!();
+    eprintln!("Check targets");
+    eprintln!("  Ruby source files: {target_files}");
+    eprintln!("Type universe (symbol discovery; not analyzed for diagnostics)");
+    eprintln!("  RBS classes available: {rbs_total}");
+    if rbs_total == 0 {
+        eprintln!("  WARNING: the RBS environment is empty — it failed to build or loaded no");
+        eprintln!("           signatures, so type coverage is severely limited (most diagnostics");
+        eprintln!("           and coverage cannot fire). Usually a duplicate declaration in");
+        eprintln!("           `signature_paths:` — fix it and re-run; the rigor-doctor skill helps.");
+    } else {
+        // `rbs_attribution_available` — the reference's caveat covers
+        // Marshal-cached environments whose decl paths read "<cached>"; the
+        // port has no persistent RBS cache, so attribution is always real.
+        eprintln!("    project sig/:        {rbs_project}");
+        eprintln!("    bundled (core+stdlib+gems): {}", rbs_total - rbs_project);
+    }
+    eprintln!("Process");
+    eprintln!("  Wall time:   {wall_seconds:.2}s");
+    eprintln!("  Memory peak: {}", format_rss_bytes(peak_rss_bytes()));
+}
+
+/// The reference's `RunStats.peak_rss_bytes`: `/proc/self/status`'s `VmHWM:`
+/// (the kernel's peak-RSS high-water mark) on Linux; `ps -o rss= -p <pid>`
+/// (CURRENT RSS — the closest proxy) elsewhere. `None` when neither route
+/// answers → the formatter prints `unavailable`.
+fn peak_rss_bytes() -> Option<u64> {
+    match std::fs::read_to_string("/proc/self/status") {
+        Ok(status) => {
+            for line in status.lines() {
+                if let Some(rest) = line.strip_prefix("VmHWM:") {
+                    if let Some(tok) = rest
+                        .split_whitespace()
+                        .find(|t| !t.is_empty() && t.bytes().all(|b| b.is_ascii_digit()))
+                    {
+                        return tok.parse::<u64>().ok().map(|kb| kb * 1024);
+                    }
+                }
+            }
+            None
+        }
+        Err(_) => {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .ok()?;
+            let text = String::from_utf8_lossy(&out.stdout);
+            let text = text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                text.parse::<u64>().ok().map(|kb| kb * 1024)
+            }
+        }
+    }
+}
+
+/// The reference `RunStats#format_bytes`: B/KB/MB/GB/TB, `%.1f`, unit
+/// suffix; `unavailable` for `None`.
+fn format_rss_bytes(bytes: Option<u64>) -> String {
+    let Some(mut size) = bytes.map(|b| b as f64) else {
+        return "unavailable".to_string();
+    };
+    const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
+    let mut index = 0;
+    while size >= 1024.0 && index < UNITS.len() - 1 {
+        size /= 1024.0;
+        index += 1;
+    }
+    format!("{size:.1} {}", UNITS[index])
 }
 
 /// Issue #812 — the `FAIL_ON_RANK` order: `info` (0) < `warning` (1) <
@@ -1295,7 +1417,11 @@ fn finding_fails_run(d: &Diagnostic) -> bool {
 /// The analysis pipeline shared by `check` and `baseline generate`: read +
 /// parse + lower every file (project pass), then analyze each against the
 /// shared project source, applying config `exclude:`/`disable:` and inline
-/// `# rigor:disable` suppression. Returns `(findings, had_io_error)` with
+/// `(findings, had_io_error, (rbs_total, rbs_project_sig))` — the counts
+/// feed the `check` run-stats summary (rigor-rs#502).
+type AnalysisOutcome = (Vec<(usize, String, String, Diagnostic)>, bool, (usize, usize));
+
+/// `# rigor:disable` suppression. Returns [`AnalysisOutcome`] with
 /// findings in input order. The baseline filter is NOT applied here — that is
 /// the LAST stage, applied only by `check` (reference WD6). `verb` labels the
 /// command in error messages (`check` / `baseline`).
@@ -1542,7 +1668,7 @@ fn analyze_files(
     folder: Option<&(dyn rigor_infer::RubyFolder + Sync)>,
     bleeding_edge: &config::BleedingEdgeSelector,
     ref_has_files: bool,
-) -> (Vec<(usize, String, String, Diagnostic)>, bool) {
+) -> AnalysisOutcome {
     let disable_matcher = cfg.disable_matcher();
     // ADR-8 "Severity profile" — the resolution inputs, computed once: the
     // configured profile, the user's per-rule/family overrides, and the merged
@@ -2042,6 +2168,14 @@ fn analyze_files(
     let mut project_source =
         rigor_infer::SourceIndex::merge_with_pre_eval(&files, &index, pre_eval::load(&cfg.pre_eval));
     project_source.set_pre_eval_declared(!cfg.pre_eval.is_empty());
+    // `libraries: [prime]` activates a gated vendored feature the same as a
+    // source `require "prime"` — `RequiredFeatures.tokens(features,
+    // configured_libraries)` (rigor-rs#463).
+    for lib in cfg.libraries() {
+        if rigor_parse::GATED_FEATURES.contains(&lib.as_str()) {
+            project_source.add_required_feature(lib);
+        }
+    }
     let t_stage2 = std::time::Instant::now();
 
     // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen
@@ -2332,7 +2466,7 @@ fn analyze_files(
             threads,
         );
     }
-    (findings, had_io_error)
+    (findings, had_io_error, index.class_decl_counts())
 }
 
 /// Issue #129: whether the reference's run over these positional roots (none
@@ -2628,7 +2762,7 @@ fn baseline_analysis(
     let (expanded_owned, path_errors) =
         expand_check_paths_excluding(roots, &exclude_set(&cfg));
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
-    let (findings, _had_io_error) = analyze_files(
+    let (findings, _had_io_error, _rbs) = analyze_files(
         &expanded,
         // `None` when the roots are the config `paths:` fallback — the
         // reference's baseline always analyzes `paths:` and never widens.

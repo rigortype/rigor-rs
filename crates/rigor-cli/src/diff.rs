@@ -210,7 +210,7 @@ fn run_current(
     let expanded: Vec<&str> = expanded_owned.iter().map(String::as_str).collect();
     // Sound subset (folder = None): diagnostic-identical to full fidelity per
     // ADR-0037, and keeps `diff` Ruby-free / hard-error-free.
-    let (findings, _io) = crate::analyze_files(
+    let (findings, _io, _rbs) = crate::analyze_files(
         &expanded,
         // `None` on the `paths:` fallback — same no-widening rule as
         // `check` (`paths == configuration.paths` upstream).

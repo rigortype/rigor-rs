@@ -70,6 +70,10 @@ fn check(cwd: &Path, args: &[&str]) -> (String, String, i32) {
         .env_remove("RIGOR_RUBY")
         .env_remove("POSIXLY_CORRECT")
         .arg("check")
+        // The expected stderr is empty: these tests cover the stdout
+        // formats, so they run the summary OFF like their captured
+        // reference invocations (`--no-cache --no-stats`).
+        .arg("--no-stats")
         .args(args)
         .output()
         .expect("failed to spawn rigor binary");
@@ -87,6 +91,37 @@ fn check_format(format: &str) -> (String, String, i32) {
     let mut args = vec!["--format", format];
     args.extend(FILES);
     check(dir.path(), &args)
+}
+
+/// The `--stats` default (rigor-rs#502): the run-stats summary lands on
+/// STDERR after the output, matching the reference's block shape — the two
+/// run-dependent lines (`Wall time`, `Memory peak`) compared by format only.
+#[test]
+fn stats_prints_the_run_summary() {
+    let dir = project();
+    let out = Command::new(env!("CARGO_BIN_EXE_rigor"))
+        .current_dir(dir.path())
+        .env("RIGOR_NO_RUBY", "1")
+        .env("RIGOR_CI_DETECT", "0")
+        .env_remove("RIGOR_RUBY")
+        .env_remove("POSIXLY_CORRECT")
+        .arg("check")
+        .args(["a.rb", "b.rb", "c,d:e.rb"])
+        .output()
+        .expect("failed to spawn rigor binary");
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    let body = stderr
+        .lines()
+        .filter(|l| !l.starts_with("  Wall time:") && !l.starts_with("  Memory peak:"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let expected = "\nCheck targets\n  Ruby source files: 3\n\
+        Type universe (symbol discovery; not analyzed for diagnostics)\n  \
+        RBS classes available: 1380\n    project sig/:        0\n    \
+        bundled (core+stdlib+gems): 1380\nProcess";
+    assert_eq!(body, expected, "{stderr}");
+    assert!(stderr.contains("  Wall time:   "), "{stderr}");
+    assert!(stderr.contains("  Memory peak: "), "{stderr}");
 }
 
 const TEXT: &str = r#"a.rb:1:7: error: undefined method `lenght' for "abc" [call.undefined-method]

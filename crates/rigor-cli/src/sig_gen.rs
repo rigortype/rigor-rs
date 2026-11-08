@@ -117,6 +117,8 @@ struct MethodSig<'a> {
     /// same body made dual — rendered `def self?.name` (reference
     /// `method_def_prefix` / `@module_function_methods`). Kind stays `instance`.
     module_function: bool,
+    /// The def node's source offset — the definer-table rank (last wins).
+    offset: usize,
 }
 
 /// One printable RBS skeleton row (the reference's emittable `MethodCandidate`,
@@ -154,6 +156,11 @@ struct Candidate {
     /// share (an equivalent declaration, a port-only confidence skip) are
     /// `"dropped"` with no reason. Neither kind leaves [`generate_run`].
     skip_reason: Option<&'static str>,
+    /// The `def` node this candidate came from: `(source offset, module_function)`.
+    /// `None` for meta members, stubs and skip rows. Feeds the
+    /// [`live_definitions`] slot pass (reference `definer_table` /
+    /// `live_definitions`, #2008/#2023).
+    definer: Option<(usize, bool)>,
 }
 
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
@@ -906,6 +913,23 @@ fn generate_file_with_info(
     // value class's members and constructors read first, ahead of the methods its
     // block body or its `class ... end` body defines.
     let mut out = collect_meta_candidates(path, &layouts, sig_env);
+    let mut definers: Vec<Definer> = Vec::new();
+    // `meta_member_slots` (reference `definer_table`): every member a
+    // `Data.define`/`Struct.new` layout declares is a CERTAIN definer of its
+    // slot at `MEMBER_OFFSET` — a `def x` inside the block (or the class body)
+    // steals it, so `def x: () -> untyped` must not emit beside the real
+    // `def x` (rigor-rs#525 item 1).
+    for (class_name, layout) in layouts.iter() {
+        for member in meta_class::member_decls(layout) {
+            definers.push(Definer {
+                class_name: class_name.to_string(),
+                kind: member.kind,
+                method_name: member.method_name.clone(),
+                offset: META_MEMBER_OFFSET,
+                certain: true,
+            });
+        }
+    }
     let mut info = NamespaceInfo::default();
     // Top-level `def`s join the walk in source order, as `sig.skipped.top-level-def`
     // rows (#1676). None sits inside a namespace the walk enters, so each one
@@ -933,6 +957,7 @@ fn generate_file_with_info(
                 &modes,
                 &mut interner,
                 &mut out,
+                &mut definers,
             );
             collect_namespace_info(&ast, child, &[], &mut info);
         }
@@ -940,6 +965,14 @@ fn generate_file_with_info(
     for (name, _) in top_level {
         out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
     }
+    // `live_definitions` (reference): Ruby keeps the LAST certain definer of a
+    // `(class, kind, name)` slot, and a def is written only when it survives
+    // EVERY slot it defines. A module_function `def u` owns `[instance,u]` and
+    // `[singleton,u]`; a later `def self.u` steals the singleton slot, so the
+    // `self?.u` row is dropped entirely — writing both is the `rbs validate`
+    // duplicate-member failure of rigor-rs#493 item 9. One surviving singleton
+    // slot downgrades the row to `def self.u`; anything else drops it.
+    live_definitions(&mut out, &definers);
     register_meta_classes(&layouts, &mut info);
     info.headers = superclasses::collect(&parsed);
     // `register_core_subclass_shell` (#2224): a subclass of a core or stdlib
@@ -1032,8 +1065,15 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: Some((META_MEMBER_OFFSET, false)),
     }
 }
+
+/// The reference's `MEMBER_OFFSET = -1`: a meta member's definer-table entry
+/// sorts BEFORE every real offset — a `def` anywhere after it steals the slot.
+/// `0` stands in for `-1` (the table holds only class-scoped slots; no
+/// class-level `def` can sit at byte 0).
+const META_MEMBER_OFFSET: usize = 0;
 
 /// The `--print` declaration line for a class group (reference
 /// `declaration_header`). Print mode used to hard-code `class`, which turned a
@@ -1207,6 +1247,22 @@ fn describe_qualified(
     rigor_types::describe_named(interner, ty, &resolve)
 }
 
+/// One `def`'s contribution to the definer table (reference `definer_table` /
+/// `definer_slots`): a module_function instance def defines its instance slot
+/// AND a singleton slot; a def after an uncertain `module_function` reset defines
+/// the singleton slot only `possible`-ly (`certain = false`). Every collected
+/// `def` is a direct statement of a class/module/`class << self`/`Data.define`
+/// body or `class << self` inner def, so the own-kind slot is `certain` — the
+/// reference's `certain_definers` set.
+struct Definer {
+    class_name: String,
+    /// `"instance"` | `"singleton"` slot kind.
+    kind: &'static str,
+    method_name: String,
+    offset: usize,
+    certain: bool,
+}
+
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
 /// instance method and descending into nested namespaces (prefix accumulates the
 /// qualified name, reference `walk_defs`).
@@ -1226,6 +1282,7 @@ fn walk_namespace(
     modes: &HashMap<usize, module_function::Mode>,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
 ) {
     let (name, rooted, visibilities, body) = match ast.get(id) {
         Node::ClassDef { name, rooted, method_visibilities, body, .. } => {
@@ -1277,6 +1334,20 @@ fn walk_namespace(
                 let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
                 if mode == module_function::Mode::Uncertain {
                     uncertain.push((n.as_str(), span.0));
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "instance",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: true,
+                    });
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "singleton",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: false,
+                    });
                     continue;
                 }
                 let mf = mode == module_function::Mode::On;
@@ -1286,20 +1357,127 @@ fn walk_namespace(
                     visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v)
                 };
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf, span.0),
                     vis,
                     span.0,
                 ));
+                definers.push(Definer {
+                    class_name: class_name.clone(),
+                    kind: "instance",
+                    method_name: n.to_string(),
+                    offset: span.0,
+                    certain: true,
+                });
+                if mf {
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "singleton",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: true,
+                    });
+                }
             }
             // `private def x` after an uncertain reset: reported like a direct
             // def (the reference skips it before reading its visibility). In
             // any other mode the port does not walk a def passed to a call.
-            Node::Call { receiver: None, args, .. } => {
+            Node::Call { receiver: None, method, args, span, block_body, .. } => {
+                // `attr_reader :x` / `attr_writer` / `attr_accessor` are
+                // DEFINERS too (reference `record_attr_definers`): the call's
+                // offset ranks them like a `def`, so a later `attr_reader :u`
+                // steals the instance slot a `module_function def u` held.
+                if !class_name.is_empty()
+                    && matches!(method.as_str(), "attr_reader" | "attr_writer" | "attr_accessor")
+                {
+                    for &arg in args {
+                        let Node::SymbolLit { value, .. } = ast.get(arg) else { continue };
+                        let reads = method != "attr_writer";
+                        let writes = method != "attr_reader";
+                        for (mname, emits) in [(value.clone(), reads), (format!("{value}="), writes)] {
+                            if emits {
+                                definers.push(Definer {
+                                    class_name: class_name.clone(),
+                                    kind: "instance",
+                                    method_name: mname,
+                                    offset: span.0,
+                                    certain: true,
+                                });
+                            }
+                        }
+                    }
+                }
                 for &arg in args {
                     if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
-                        if modes.get(&span.0) == Some(&module_function::Mode::Uncertain) {
+                        let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                        if mode == module_function::Mode::Uncertain {
                             uncertain.push((n.as_str(), span.0));
                         }
+                        // A def passed to `private` / `public` / `protected`
+                        // (or `module_function`) still DEFINES its slots — the
+                        // reference records it in `certain_definers` even
+                        // though the port never emits a candidate for it.
+                        definers.push(Definer {
+                            class_name: class_name.clone(),
+                            kind: "instance",
+                            method_name: n.to_string(),
+                            offset: span.0,
+                            certain: true,
+                        });
+                        match mode {
+                            module_function::Mode::On => definers.push(Definer {
+                                class_name: class_name.clone(),
+                                kind: "singleton",
+                                method_name: n.to_string(),
+                                offset: span.0,
+                                certain: true,
+                            }),
+                            module_function::Mode::Uncertain => definers.push(Definer {
+                                class_name: class_name.clone(),
+                                kind: "singleton",
+                                method_name: n.to_string(),
+                                offset: span.0,
+                                certain: false,
+                            }),
+                            _ => {}
+                        }
+                    }
+                }
+                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
+                // definer too (`rigor_each_child` descends arguments).
+                // `Definition` args are already handled above — descending
+                // them would double-count the wrapped def.
+                for &arg in args {
+                    if !matches!(ast.get(arg), Node::Definition { .. }) {
+                        collect_conditional_definers(
+                            ast,
+                            arg,
+                            &qualified,
+                            false,
+                            matches!(ast.get(id), Node::ModuleDef { .. }),
+                            layouts,
+                            modes,
+                            definers,
+                        );
+                    }
+                }
+                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
+                // children are uncertain definers (`walk_attr_calls` descends
+                // call blocks too; a `refine`/`class_methods` block is a DSL
+                // scope and skipped).
+                let dsl_scope = method == "class_methods"
+                    || (method == "refine" && matches!(ast.get(id), Node::ModuleDef { .. }));
+                if !dsl_scope {
+                    for &b in block_body {
+                        collect_conditional_definers(
+                            ast,
+                            b,
+                            &qualified,
+                            false,
+                            matches!(ast.get(id), Node::ModuleDef { .. }),
+                            layouts,
+                            modes,
+                            definers,
+                        );
                     }
                 }
             }
@@ -1307,10 +1485,17 @@ fn walk_namespace(
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false, span.0),
                     None,
                     span.0,
                 ));
+                definers.push(Definer {
+                    class_name: class_name.clone(),
+                    kind: "singleton",
+                    method_name: n.to_string(),
+                    offset: span.0,
+                    certain: true,
+                });
             }
             Node::Definition { is_singleton_class: true, body: sbody, .. } => {
                 for &inner in sbody {
@@ -1319,14 +1504,42 @@ fn walk_namespace(
                     } = ast.get(inner)
                     {
                         sigs.push((
-                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false, span.0),
                             None,
                             span.0,
                         ));
+                        definers.push(Definer {
+                            class_name: class_name.clone(),
+                            kind: "singleton",
+                            method_name: n.to_string(),
+                            offset: span.0,
+                            certain: true,
+                        });
                     }
                 }
             }
-            _ => {}
+            // Any other body statement — an `if`/`case`/`begin`/loop/block
+            // — can still CARRY a `def` or `attr_*`: the reference walks
+            // into every non-`def` child (`walk_attr_calls` +
+            // `walk_def_children`), recording each as an UNCERTAIN definer
+            // (only direct statements are `certain_definers`).
+            // `if cond; attr_reader :x; end` then contests a preceding
+            // `def x` (rigor-rs#525 item 2). Namespace children are walked
+            // by `Emit::Nested` instead — do not double-count them.
+            _ => {
+                if !is_namespace_node(ast, child, &qualified, layouts) {
+                    collect_conditional_definers(
+                        ast,
+                        child,
+                        &qualified,
+                        false,
+                        matches!(ast.get(id), Node::ModuleDef { .. }),
+                        layouts,
+                        modes,
+                        definers,
+                    );
+                }
+            }
         }
     }
     // Emit own methods AND descend into nested classes in ONE source-order
@@ -1395,8 +1608,226 @@ fn walk_namespace(
                 modes,
                 interner,
                 out,
+                definers,
             ),
         }
+    }
+}
+
+/// Reference `walk_attr_calls` + the definer side of `walk_defs`: descend
+/// into every non-`def` node inside a class body — `if`/`case`/`begin`/loop
+/// bodies, call arguments and block bodies — recording each `def` and
+/// `attr_*` it holds as an UNCERTAIN definer (`certain_definers` marks only
+/// direct statements). An uncertain definer after a certain one contests the
+/// slot, so `def x; if c; attr_reader :x; end; end` writes nothing
+/// (rigor-rs#525 item 2). `refine`/`class_methods` block calls are DSL
+/// scopes the reference skips (`skipped_block_call?`).
+#[allow(clippy::too_many_arguments)]
+fn collect_conditional_definers(
+    ast: &LoweredAst,
+    id: NodeId,
+    prefix: &[String],
+    in_singleton_class: bool,
+    in_module: bool,
+    layouts: &MetaLayouts,
+    modes: &HashMap<usize, module_function::Mode>,
+    definers: &mut Vec<Definer>,
+) {
+    let recurse = |ast: &LoweredAst,
+                   child: NodeId,
+                   prefix: &[String],
+                   sclass: bool,
+                   module: bool,
+                   definers: &mut Vec<Definer>| {
+        collect_conditional_definers(ast, child, prefix, sclass, module, layouts, modes, definers);
+    };
+    match ast.get(id) {
+        Node::ClassDef { name, rooted, body, .. } | Node::ModuleDef { name, rooted, body, .. } => {
+            let child_prefix = declaration_prefix(prefix, name, *rooted);
+            let module = matches!(ast.get(id), Node::ModuleDef { .. });
+            for &b in body {
+                recurse(ast, b, &child_prefix, false, module, definers);
+            }
+        }
+        // `Const = Data.define(...) do … end` inside a conditional: the block
+        // is the new class's own body (`meta_block_body`).
+        Node::ConstantWrite { name, value, .. }
+            if layouts.get(&qualify_join(prefix, name)).is_some() =>
+        {
+            if let Node::Call { block_body, .. } = ast.get(*value) {
+                let mut child_prefix = prefix.to_vec();
+                child_prefix.push(name.clone());
+                for &b in block_body {
+                    recurse(ast, b, &child_prefix, false, false, definers);
+                }
+            }
+        }
+        Node::Definition { is_singleton_class: true, body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, true, in_module, definers);
+            }
+        }
+        // A `def` is a definer itself; its BODY is out of bounds
+        // (`walk_attr_calls` returns at DefNode).
+        Node::Definition { name, singleton_name, span, .. } => {
+            if let Some(n) = name.as_ref().or(singleton_name.as_ref()) {
+                let kind = if in_singleton_class || singleton_name.is_some() {
+                    "singleton"
+                } else {
+                    "instance"
+                };
+                definers.push(Definer {
+                    class_name: prefix.join("::"),
+                    kind,
+                    method_name: n.clone(),
+                    offset: span.0,
+                    certain: false,
+                });
+                if !in_singleton_class
+                    && matches!(
+                        modes.get(&span.0),
+                        Some(module_function::Mode::On) | Some(module_function::Mode::Uncertain)
+                    )
+                {
+                    definers.push(Definer {
+                        class_name: prefix.join("::"),
+                        kind: "singleton",
+                        method_name: n.clone(),
+                        offset: span.0,
+                        certain: false,
+                    });
+                }
+            }
+        }
+        Node::Call { receiver, method, args, block_body, span, .. } => {
+            // `class_methods` is a DSL scope only RECEIVERLESS
+            // (`class_methods_block?`); `refine` likewise on a nil or `self`
+            // receiver (`refine_call?`) and only in a MODULE body — `Class`
+            // undefines `refine`, so the same spelling in a `class` body is
+            // the class's own method and its block walks as any other block
+            // (`class_body_refine?` / #1689). A `obj.class_methods` /
+            // `obj.refine` block is an ordinary block and descends.
+            let refine_shaped = method == "refine"
+                && receiver
+                    .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                    .unwrap_or(true);
+            let dsl = (method == "class_methods" && receiver.is_none())
+                || (refine_shaped && in_module);
+            if dsl && !block_body.is_empty() {
+                return;
+            }
+            if !prefix.is_empty()
+                && !in_singleton_class
+                && matches!(method.as_str(), "attr_reader" | "attr_writer" | "attr_accessor")
+            {
+                for &arg in args {
+                    let Node::SymbolLit { value, .. } = ast.get(arg) else { continue };
+                    let reads = method != "attr_writer";
+                    let writes = method != "attr_reader";
+                    for (mname, emits) in [(value.clone(), reads), (format!("{value}="), writes)] {
+                        if emits {
+                            definers.push(Definer {
+                                class_name: prefix.join("::"),
+                                kind: "instance",
+                                method_name: mname,
+                                offset: span.0,
+                                certain: false,
+                            });
+                        }
+                    }
+                }
+            }
+            for &b in args.iter().chain(block_body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::If { predicate, then_body, else_body, .. } => {
+            recurse(ast, *predicate, prefix, in_singleton_class, in_module, definers);
+            for &b in then_body.iter().chain(else_body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Case { predicate, branches, else_body, .. } => {
+            if let Some(p) = predicate {
+                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in branches.iter().chain(else_body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::When { conditions, body, .. } => {
+            for &b in conditions.iter().chain(body.iter()) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Loop { predicate, body, .. } => {
+            if let Some(p) = predicate {
+                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::BeginRescue { body, .. } | Node::Statements { body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        // Expression-level containers carry the same children
+        // (`rigor_each_child` descends everywhere): `_x = if c; attr_reader
+        // :x; end` and `c && attr_reader(:x)` record just the same.
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+        }
+        Node::MultiWrite { value, target_exprs, .. } => {
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            for &b in target_exprs {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::IndexWrite { receiver, indices, value, .. } => {
+            if let Some(r) = receiver {
+                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+            }
+            for &b in indices.iter().chain(std::iter::once(value)) {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            recurse(ast, *left, prefix, in_singleton_class, in_module, definers);
+            recurse(ast, *right, prefix, in_singleton_class, in_module, definers);
+        }
+        Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
+            for &b in body {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            for &b in parts {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &b in elements {
+                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::Range { left, right, .. } => {
+            for bound in [left, right].into_iter().flatten() {
+                recurse(ast, *bound, prefix, in_singleton_class, in_module, definers);
+            }
+        }
+        Node::AttrWrite { receiver, value, .. } => {
+            if let Some(r) = receiver {
+                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+            }
+            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+        }
+        _ => {}
     }
 }
 
@@ -1476,8 +1907,9 @@ fn sig_of<'a>(
     has_explicit_return: bool,
     singleton: bool,
     module_function: bool,
+    offset: usize,
 ) -> MethodSig<'a> {
-    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function }
+    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function, offset }
 }
 
 /// Classify + render one method (instance or singleton), or `None` when skipped
@@ -1499,10 +1931,13 @@ fn method_candidate(
     interner: &mut Interner,
 ) -> Option<Candidate> {
     // Visibility: skip private / protected unless `--include-private` (reference
-    // `visibility_excludes?` — returns false for a singleton, so singletons are
-    // never visibility-skipped).
+    // `visibility_excludes?` — returns false for a singleton AND for a
+    // module_function def, whose `self?.` row writes the singleton half the
+    // running `private` never touched — `mf; private; def g; mf; def h` emits
+    // `self?.h`, rigor-rs#493 item 10).
     if !include_private
         && !sig.singleton
+        && !sig.module_function
         && matches!(visibility, Some(Visibility::Private | Visibility::Protected))
     {
         return None;
@@ -1535,6 +1970,7 @@ fn method_candidate(
             // declared `initialize` is still emitted `new_method`) — keep the stub
             // path exactly as-is, before any classification.
             classification: "new_method",
+            definer: Some((sig.offset, sig.module_function)),
             declared_return_rbs: None,
             decl_header: String::new(),
             skip_reason: None,
@@ -1567,7 +2003,7 @@ fn method_candidate(
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, sig.body, env, interner) else { return row(None) };
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -1624,7 +2060,12 @@ fn method_candidate(
             return row(Some("sig.skipped.untyped-return"));
         }
         if e.contains("untyped") {
-            return row(None);
+            // …unless the untyped sits inside a bare generic's type-arg slot:
+            // `Range[untyped]` / `Array[untyped]` are the reference's own
+            // elaborated emits (rigor-rs#493 item 7), not inference holes.
+            if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
         }
         // A bare GENERIC nominal member (`Array` / `Hash` / …) would be
         // `Array[untyped]` after the reference's `TypeElaborator` fill (deferred
@@ -1728,6 +2169,7 @@ fn method_candidate(
         declared_return_rbs,
         decl_header: String::new(),
         skip_reason: None,
+        definer: Some((sig.offset, sig.module_function)),
     })
 }
 
@@ -1753,7 +2195,68 @@ fn non_emitted(
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: reason,
+        definer: None,
     }
+}
+
+/// Reference `live_definitions` over the candidate rows: `definer_table` is
+/// `definers` (collected alongside the walk), `live_definer?` keeps the LAST
+/// certain entry of a slot unless an uncertain entry sits after it (contested
+/// → nothing is written), and a candidate survives only when its def owns
+/// every slot it defines — except the singleton-only survival, which a
+/// `def self?.u` downgrades to `def self.u`.
+fn live_definitions(out: &mut Vec<Candidate>, definers: &[Definer]) {
+    /// `(class_name, kind, method_name)` — the reference's definer-table key.
+    type Slot = (String, &'static str, String);
+    let mut table: HashMap<Slot, Vec<(usize, bool)>> = HashMap::new();
+    for d in definers {
+        table
+            .entry((d.class_name.clone(), d.kind, d.method_name.clone()))
+            .or_default()
+            .push((d.offset, d.certain));
+    }
+    let live_at = |slot: &Slot, offset: usize| -> bool {
+        let Some(entries) = table.get(slot) else { return true };
+        if entries.len() <= 1 {
+            return true;
+        }
+        let Some(last_certain) = entries.iter().filter(|(_, c)| *c).map(|(o, _)| *o).max() else {
+            return false;
+        };
+        if entries.iter().any(|(o, c)| !*c && *o > last_certain) {
+            return false;
+        }
+        offset == last_certain
+    };
+    for c in out.iter_mut() {
+        let Some((offset, module_function)) = c.definer else { continue };
+
+        let own = (c.class_name.clone(), c.kind, c.method_name.clone());
+        let live = live_at(&own, offset).then_some(own);
+        let mut single = None;
+        if module_function {
+            let s = (c.class_name.clone(), "singleton", c.method_name.clone());
+            if live_at(&s, offset) {
+                single = Some(s);
+            }
+        }
+        let all = live.is_some() && (!module_function || single.is_some());
+        if all {
+            continue;
+        }
+        if live.is_none() && single.is_some() {
+            // The instance half was replaced; the singleton copy Ruby keeps is
+            // written `def self.name` (reference `live_definitions`).
+            c.kind = "singleton";
+            c.rbs = c.rbs.replacen("def self?.", "def self.", 1);
+            continue;
+        }
+        // Nothing survived — mark the row dropped (invisible downstream, as a
+        // `"dropped"` classification already is).
+        c.skip_reason = None;
+        c.classification = "dropped";
+    }
+    out.retain(|c| c.classification != "dropped" || c.skip_reason.is_some());
 }
 
 /// Classify one already-inferred candidate against the project's own RBS
@@ -1983,9 +2486,13 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
 /// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
 /// `annotate` deferral) and is then skipped upstream.
+#[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
@@ -2004,7 +2511,121 @@ fn def_return_type(
         },
         _ => tail,
     };
+    // Literal carriers `type_of` leaves Dynamic — sig-gen still emits their
+    // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
+    // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
+    // through recovery, so no dedicated node exists here).
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
+        return Some(lit);
+    }
     Some(typer.type_of(ast, target, env, interner))
+}
+
+/// The sig-gen-side nominal for a literal tail `check` leaves Dynamic
+/// (rigor-rs#493 item 7). `Range[T]` takes the union of its bounds' nominal
+/// CLASS names — `1..2` ⇒ `Integer`, `1...2.5` ⇒ `Float | Integer`; a
+/// `Dynamic` or `nil` bound contributes nothing (`(x..2)` ⇒ `Range[Integer]`,
+/// `(x..)` ⇒ `Range[untyped]`).
+#[allow(clippy::too_many_arguments)]
+fn literal_tail_nominal(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> Option<TypeId> {
+    let bare = |name: &str, interner: &mut Interner| {
+        index
+            .class_id(name)
+            .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+    };
+    match ast.get(target) {
+        Node::RegexpLit { .. } => bare("Regexp", interner),
+        Node::RationalLit { .. } => bare("Rational", interner),
+        Node::ImaginaryLit { .. } => bare("Complex", interner),
+        Node::Range { left, right, .. } => {
+            // Each bound contributes its ERASED member form: a scalar
+            // `Constant` widens to its class (`1` ⇒ `Integer`), a
+            // Tuple/HashShape keeps its literal shape (`[1]`, `{ a: 1 }`),
+            // and a bare generic nominal elaborates its args to `untyped`
+            // (`Array.new` ⇒ `Array[untyped]`). `nil` and `Dynamic` members
+            // contribute nothing (rigor-rs#493 item 7).
+            let mut arg_members: Vec<TypeId> = Vec::new();
+            for bound in [left, right].into_iter().flatten() {
+                let ty = typer.type_of(ast, *bound, env, interner);
+                // A bound that types DIRECTLY to a scalar Constant widens to
+                // its class; a UNION bound's members contribute as-is —
+                // literal `2` stays `2`, a `nil` member stays `nil` (the
+                // reference's range_endpoint_element_type recurses over the
+                // member list but does not widen inside it).
+                let (ms, widen) = match interner.get(ty) {
+                    Type::Union(ms) => (ms.clone(), false),
+                    _ => (vec![ty], true),
+                };
+                for m in ms {
+                    if matches!(interner.get(m), Type::Dynamic(_)) {
+                        continue;
+                    }
+                    let member = match interner.get(m) {
+                        // `nil` contributes nothing as a WHOLE bound (but a
+                        // union's `nil` member is kept, above).
+                        Type::Constant(rigor_types::Scalar::Nil) if widen => continue,
+                        Type::Constant(_) if widen => {
+                            let Some(cname) = index.class_name_of(interner, m) else {
+                                continue;
+                            };
+                            match index.class_id(cname) {
+                                Some(class) => {
+                                    interner.intern(Type::Nominal { class, args: vec![] })
+                                }
+                                None => continue,
+                            }
+                        }
+                        // A bare generic (`Array`, `Hash`, …) elaborates to
+                        // `Class[untyped]` — the reference's TypeElaborator
+                        // fills the args.
+                        Type::Nominal { class, args }
+                            if args.is_empty()
+                                && is_bare_generic_name(
+                                    index.class_name_for_id(*class).unwrap_or(""),
+                                ) =>
+                        {
+                            let (class, untyped) = (*class, interner.untyped());
+                            interner.intern(Type::Nominal {
+                                class,
+                                args: vec![untyped],
+                            })
+                        }
+                        _ => m,
+                    };
+                    if !arg_members.contains(&member) {
+                        arg_members.push(member);
+                    }
+                }
+            }
+            // The erased arg lists its members in the reference's
+            // describe-sorted union order (`Float | Integer` for `1...2.5`,
+            // `Integer | [1]` for `[1]..2`).
+            arg_members.sort_by_key(|&m| {
+                erase_qualified(interner, index, typer.source(), m, class_name, fqns)
+            });
+            let arg = match arg_members.len() {
+                0 => interner.untyped(),
+                1 => arg_members[0],
+                // Mint the union verbatim — `Algebra::join` would re-sort by
+                // the interner's canonical order, but the erased arg follows
+                // the reference's describe-sorted member list.
+                _ => interner.intern(Type::Union(arg_members)),
+            };
+            index
+                .class_id("Range")
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![arg] }))
+        }
+        _ => None,
+    }
 }
 
 /// Whether an erased return is a bare (no type-args) core GENERIC class name —
@@ -2519,6 +3140,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         declared_return_rbs: c.declared_return_rbs.clone(),
         decl_header: c.decl_header.clone(),
         skip_reason: c.skip_reason,
+        definer: c.definer,
     }
 }
 
@@ -3222,7 +3844,7 @@ struct MergeOutcome {
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
-/// `action: "noop"`; otherwise each class group (first-seen order) is merged or
+/// `action: "noop"`; otherwise each class group (class-name order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
 #[cfg(test)]
 fn apply_merge(
@@ -3383,7 +4005,8 @@ fn names_word(text: &str, name: &str) -> bool {
     false
 }
 
-/// Group candidates by `class_name`, preserving first-seen class order
+/// Group candidates by `class_name` (merged in class-name order, reference
+/// `groups.keys.sort`).
 /// (reference `candidates.group_by(&:class_name)`).
 fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
     let mut order: Vec<String> = Vec::new();
@@ -3394,6 +4017,10 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
         }
         groups.entry(c.class_name.clone()).or_default().push(c);
     }
+    // The reference merges `groups.keys.sort` — class-name order, not first-seen
+    // order — which is what orders the `skipped` report lines too (rigor-rs#493
+    // item 5).
+    order.sort();
     order.into_iter().map(|k| (k.clone(), groups.remove(&k).unwrap())).collect()
 }
 
@@ -4074,3 +4701,44 @@ fn clamp_offset(v: i32, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether every `untyped` in `erased` sits inside a `ClassName[…]` type-arg
+/// slot — `Range[untyped]`, `Hash[untyped, untyped]`, `Range[Array[untyped] |
+/// Integer]` — the reference's elaborated emit, exempt from the
+/// buried-`untyped` skip (rigor-rs#493 item 7). An `untyped` inside a TUPLE
+/// literal's `[…]` (a bracket not preceded by a class identifier) still
+/// counts as an inference hole.
+fn is_nominal_untyped_args(erased: &str) -> bool {
+    let bytes = erased.as_bytes();
+    let mut found = false;
+    let mut idx = 0;
+    while let Some(off) = erased[idx..].find("untyped") {
+        let pos = idx + off;
+        found = true;
+        // Find the innermost UNCLOSED `[` enclosing this occurrence.
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, &b) in bytes.iter().enumerate().take(pos) {
+            match b {
+                b'[' => stack.push(i),
+                b']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(&open) = stack.last() else { return false };
+        // The `[` must be a generic-args bracket: preceded immediately by a
+        // class-identifier tail (`Foo[`, `Foo::Bar[`).
+        let head: String = erased[..open]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        let head: String = head.chars().rev().collect();
+        if !head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return false;
+        }
+        idx = pos + 7;
+    }
+    found
+}
