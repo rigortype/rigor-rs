@@ -1292,6 +1292,10 @@ impl CoreData {
                 nil_marks.insert((q, false));
                 nil_marks.insert((q, true));
                 builder.dup_unbuildable.insert((q, false));
+                // The singleton side of a failed class is nil too
+                // (`Hash.zork` / `Array.zork` silent). Mirrored here because
+                // the closure pass below deliberately skips `def_nil` seeds.
+                builder.dup_unbuildable.insert((q, true));
             }
         }
         // An instance-side build failure takes the singleton side with it on
