@@ -4303,7 +4303,7 @@ fn merge_into_existing(
             m.name == c.method_name
                 && match m.kind {
                     "singleton_instance" => true,
-                    k => !dual && k == c.kind || dual,
+                    k => dual || k == c.kind,
                 }
         };
         match info.members.iter().find(|m| touches(m)) {
