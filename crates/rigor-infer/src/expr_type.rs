@@ -490,7 +490,8 @@ impl<'i> Typer<'i> {
             } => {
                 let (r, read_name, compound, value) =
                     (*r, read_name.clone(), compound.clone(), *value);
-                let current = self.type_call(ast, r, &read_name, &[], env, interner);
+                let current =
+                    self.type_call_for_write_value(ast, r, &read_name, &[], env, interner);
                 let rhs = self.type_of(ast, value, env, interner);
                 match compound {
                     Compound::Or => {
@@ -533,7 +534,8 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
-        let current = self.type_call(ast, receiver, "[]", indices, env, interner);
+        let current =
+            self.type_call_for_write_value(ast, receiver, "[]", indices, env, interner);
         let rhs = self.type_of(ast, value, env, interner);
         match compound {
             Compound::Or => {
@@ -567,7 +569,8 @@ impl<'i> Typer<'i> {
         if !self.fully_tracked_type(*pre, interner) {
             return None;
         }
-        let current = self.type_call(ast, w.receiver, "[]", &[w.key_node], env, interner);
+        let current =
+            self.type_call_for_write_value(ast, w.receiver, "[]", &[w.key_node], env, interner);
         let rhs = self.type_of(ast, w.value, env, interner);
         let truthy = self.narrow_truthy(current, interner);
         Some(rigor_types::Algebra::join(interner, truthy, rhs))
