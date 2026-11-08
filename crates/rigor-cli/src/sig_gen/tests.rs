@@ -553,6 +553,32 @@ fn module_function_def_survives_private_visibility() {
 }
 
 #[test]
+fn module_function_def_survives_later_private_redefinition() {
+    // rigor-rs#523: the name-keyed visibility table reads `u -> private` from
+    // the SECOND def's mark, yet the first (module_function) def's surviving
+    // singleton copy is still written `def self.u` with the FIRST def's return
+    // (reference `visibility_excludes?` exempts @module_function_methods;
+    // #526 added the guard, this pins the issue row). Same for `protected`.
+    for vis in ["private", "protected"] {
+        let src = format!("module M\n  module_function\n  def u = 1\n  {vis}\n  def u = 9\nend\n");
+        let cs = candidates_tagged("mfpriv", &src, false);
+        assert_eq!(
+            cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+            vec!["def self.u: () -> 1"],
+            "{vis}"
+        );
+    }
+    // Must-still-fire controls: a plain class / non-module_function module
+    // keeps skipping the private redefinition.
+    for src in [
+        "class C\n  def u = 1\n  private\n  def u = 9\nend\n",
+        "module M\n  def u = 1\n  private\n  def u = 9\nend\n",
+    ] {
+        assert!(candidates_tagged("mfpriv_ctl", src, false).is_empty(), "{src}");
+    }
+}
+
+#[test]
 fn module_function_with_args_does_not_flip_mode() {
     // `module_function :sym` (args form) neither flips the mode nor marks the
     // method (oracle-probed) — both defs stay plain instance methods.
