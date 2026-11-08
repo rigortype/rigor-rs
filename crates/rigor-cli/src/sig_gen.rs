@@ -1877,6 +1877,7 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
 /// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
 /// `annotate` deferral) and is then skipped upstream.
+#[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
@@ -1916,6 +1917,7 @@ fn def_return_type(
 /// CLASS names — `1..2` ⇒ `Integer`, `1...2.5` ⇒ `Float | Integer`; a
 /// `Dynamic` or `nil` bound contributes nothing (`(x..2)` ⇒ `Range[Integer]`,
 /// `(x..)` ⇒ `Range[untyped]`).
+#[allow(clippy::too_many_arguments)]
 fn literal_tail_nominal(
     ast: &LoweredAst,
     typer: &Typer,
