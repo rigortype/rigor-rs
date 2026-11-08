@@ -95,6 +95,7 @@ mod rbs_parse_error;
 mod superclasses;
 mod sig_env;
 mod module_function;
+mod remarks;
 mod top_level;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -978,7 +979,10 @@ fn generate_file_with_info(
     // rows (#1676). None sits inside a namespace the walk enters, so each one
     // goes in ahead of the first top-level statement that ends after it.
     let mut top_level = top_level::collect(&parsed).into_iter().peekable();
-    let modes = module_function::def_modes(&parsed);
+    let modes = DefFacts {
+        modes: module_function::def_modes(&parsed),
+        slot_visibilities: remarks::def_slot_visibilities(&parsed),
+    };
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
             let end = ast.get(child).span().1;
@@ -1336,6 +1340,22 @@ struct Definer {
     certain: bool,
 }
 
+/// What a Prism pass reads off each `def` before lowering drops it, keyed by
+/// the `def`'s start offset.
+struct DefFacts {
+    /// The module_function mode in force at it ([`module_function::def_modes`]).
+    modes: HashMap<usize, module_function::Mode>,
+    /// The visibility a visibility CALL left on its slot after the `def`
+    /// ([`remarks::def_slot_visibilities`], rigor-rs#535).
+    slot_visibilities: HashMap<usize, Visibility>,
+}
+
+impl DefFacts {
+    fn mode(&self, offset: usize) -> module_function::Mode {
+        self.modes.get(&offset).copied().unwrap_or(module_function::Mode::Off)
+    }
+}
+
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
 /// instance method and descending into nested namespaces (prefix accumulates the
 /// qualified name, reference `walk_defs`).
@@ -1352,7 +1372,7 @@ fn walk_namespace(
     fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     layouts: &MetaLayouts,
-    modes: &HashMap<usize, module_function::Mode>,
+    modes: &DefFacts,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
     definers: &mut Vec<Definer>,
@@ -1405,7 +1425,7 @@ fn walk_namespace(
             Node::Definition {
                 name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
-                let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                let mode = modes.mode(span.0);
                 if mode == module_function::Mode::Uncertain {
                     uncertain.push((n.as_str(), span.0));
                     definers.push(Definer {
@@ -1482,7 +1502,7 @@ fn walk_namespace(
                 }
                 for &arg in args {
                     if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
-                        let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                        let mode = modes.mode(span.0);
                         if mode == module_function::Mode::Uncertain {
                             uncertain.push((n.as_str(), span.0));
                         }
@@ -1762,7 +1782,7 @@ fn collect_conditional_definers(
     fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     layouts: &MetaLayouts,
-    modes: &HashMap<usize, module_function::Mode>,
+    modes: &DefFacts,
     visibilities: &[(String, Visibility)],
     running_vis: Visibility,
     running_mf: bool,
@@ -1928,14 +1948,23 @@ fn collect_conditional_definers(
                     // position — `private; if c; def y` is private on the
                     // oracle, `module_function; if c; def u` is `self?.`
                     // (rigor-rs#535 review).
+                    //
+                    // A visibility CALL that is the LAST write to the slot
+                    // (`if c; def b; end; end; private :b`, in a later
+                    // reopening, or inside another conditional) wins over
+                    // both: the reference reads the slot by name, so a
+                    // re-mark the lowered direct-statement table never saw
+                    // still excludes the def (rigor-rs#535 review item a).
                     let vis = if singleton {
                         None
                     } else {
-                        visibilities
-                            .iter()
-                            .find(|(m, _)| m == n)
-                            .map(|(_, v)| *v)
-                            .or(Some(running_vis))
+                        modes.slot_visibilities.get(&span.0).copied().or_else(|| {
+                            visibilities
+                                .iter()
+                                .find(|(m, _)| m == n)
+                                .map(|(_, v)| *v)
+                                .or(Some(running_vis))
+                        })
                     };
                     emit_conditional_def(
                         ast, n.as_str(), b, params, param_shape, *has_explicit_return, span.0, singleton, vis,
@@ -2012,7 +2041,11 @@ fn collect_conditional_definers(
                         if !class_name.is_empty() {
                             emit_conditional_def(
                                 ast, n.as_str(), b, params, param_shape, *has_explicit_return, dspan.0, singleton,
-                                if singleton { None } else { Some(v) },
+                                if singleton {
+                                    None
+                                } else {
+                                    Some(modes.slot_visibilities.get(&dspan.0).copied().unwrap_or(v))
+                                },
                                 &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
                                 interner, out, definers,
                             );

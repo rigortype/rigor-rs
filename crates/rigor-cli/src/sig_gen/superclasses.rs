@@ -40,7 +40,7 @@ struct HeaderWalker {
 
 /// `Source::ConstantPath.declaration_prefix` over a Prism constant path:
 /// `None` for a path whose base is not a constant (`self::X`, `expr::X`).
-fn declared_path(prefix: &[String], node: &PrismNode<'_>) -> Option<Vec<String>> {
+pub(super) fn declared_path(prefix: &[String], node: &PrismNode<'_>) -> Option<Vec<String>> {
     if let Some(read) = node.as_constant_read_node() {
         let mut out = prefix.to_vec();
         out.push(String::from_utf8_lossy(read.name().as_slice()).into_owned());
