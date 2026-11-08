@@ -1513,6 +1513,21 @@ impl<'i> Typer<'i> {
                 }
             }
         }
+        // The same toplevel `def` SHADOWS the Kernel intrinsic even when its
+        // own tail doesn't fold — `def format(x); return 42; end` keeps
+        // `format(1)` off `Kernel#format`, and an arity miss
+        // (`format("%d", 2)` vs `def format(x)`) types Dynamic on the oracle
+        // (rigor-rs#462 review). Decline so the call widens to untyped —
+        // inside a literal block the Kernel binding still stands, so the
+        // shadow does not reach there.
+        if let Some(site) = span {
+            if !self.inside_block(ast, site)
+                && !self.self_answers(ast, site, method)
+                && self.source.is_toplevel_def(self.file_key(), method)
+            {
+                return None;
+            }
+        }
         // Only a fixed set of Kernel functions is folded on this path; every
         // other implicit-self call declines (a cheap membership test on the hot
         // path). `format`/`sprintf`/`String`/`Hash`/`Integer`/`Float` are the
