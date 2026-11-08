@@ -29,6 +29,82 @@ fn qualified_singleton_return_probe_ladder() {
     assert_eq!(idx.singleton_method_return("No::Such", "hexdigest"), None);
 }
 
+/// rigor-rs#493 item 12: a bare `class Hash` in the project's `sig/`
+/// re-declares `Hash` with a DIFFERENT type-param count than the bundled
+/// `Hash[K, V]` — `GenericParameterMismatchError`, whose instance def is
+/// nil on the reference. Hash's own surface reads silent, the nil def
+/// spreads ONE hop to classes whose instance members name it (`Array#to_h`
+/// fails `Array`), and a descendant with no `Hash` member refs builds fine
+/// (`Integer#wut` still witnesses through a nil `Kernel`).
+#[test]
+fn bare_generic_project_sig_marks_def_nil() {
+    let dir = std::env::temp_dir().join("rigor_bare_generic_sig_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("x.rbs"), "class Hash\nend\n").unwrap();
+    let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+    if !idx.knows_class("Hash") {
+        return; // stub fallback.
+    }
+    // `Hash` itself: the def is nil — its surface is inconclusive (silent),
+    // and no return resolves through the emptied tables.
+    assert!(idx.qualified_class_has_method("Hash", "zzz"));
+    assert_eq!(idx.method_return("Hash", "to_h"), None);
+    // The one-hop spread: `Array` fails (its `to_h` names `Hash`).
+    assert!(idx.qualified_class_has_method("Array", "zork"));
+    assert_eq!(idx.method_return("Array", "to_h"), None);
+    // Descendants build over a nil ancestor: `Integer`/`String` keep their
+    // surfaces — `wut`/`zork` witness absent.
+    assert!(!idx.qualified_class_has_method("Integer", "wut"));
+    assert!(!idx.qualified_class_has_method("String", "nope"));
+    // The singleton side of a failed class is nil too (`Array.zork` silent),
+    // while a surviving class's singleton keeps witnessing.
+    assert!(!idx.class_has_singleton_method("String", "zork"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Same failure family's DEF-BUILD propagation (oracle-measured): a class
+/// SUPERCLASS link needs the superclass's def (`Sub < Failed` fails, `E <
+/// Sub` transitively); a mixin self-type names a real def (`module M :
+/// Hash` fails `M`, and `include M` fails `C`); a def-nil module with no
+/// self-type contributes nothing and its includer builds (`C include MF`
+/// keeps `zork` absent but witnesses — `*has_method` stays `false`).
+#[test]
+fn bare_generic_project_sig_def_nil_propagates_super_and_self_type() {
+    let dir = std::env::temp_dir().join("rigor_bare_generic_prop_test");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(
+        dir.join("x.rbs"),
+        "class Hash\nend\n\
+         class Failed\n  def m: (Hash) -> void\nend\n\
+         class Sub < Failed\nend\n\
+         class E < Sub\nend\n\
+         module MF\n  def m: (Hash) -> void\nend\n\
+         class C\n  include MF\nend\n\
+         class D < C\nend\n\
+         module MH : Hash\n  def mh: () -> void\nend\n\
+         class CM\n  include MH\nend\n",
+    )
+    .unwrap();
+    let idx = CoreData::load_for_project(&[], std::slice::from_ref(&dir));
+    if !idx.knows_qualified_class("Sub") {
+        return; // stub fallback.
+    }
+    // `Sub`'s def fails through the superclass link; `E` transitively.
+    assert!(idx.qualified_class_has_method("Sub", "zork"));
+    assert!(idx.qualified_class_has_method("E", "zork"));
+    // `C include MF` (def-nil mixin, no self-type): `C` builds — `zork`
+    // witnesses absent.
+    assert!(!idx.qualified_class_has_method("C", "zork"));
+    assert!(!idx.qualified_class_has_method("D", "zork"));
+    // `module MH : Hash` — its own self-type names a failed def; `CM`
+    // mixes it in and fails too.
+    assert!(idx.qualified_class_has_method("MH", "zork"));
+    assert!(idx.qualified_class_has_method("CM", "zork"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// Rung 4: the INSTANCE side (`Digest::SHA256.new.hexdigest`) resolves
 /// through the include chain (`Digest::Class include ::Digest::Instance` —
 /// an ABSOLUTE written reference), and `-> self` resolves to the QUALIFIED
