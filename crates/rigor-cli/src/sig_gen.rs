@@ -2109,6 +2109,25 @@ fn method_candidate(
         return row(None);
     };
 
+    // A tighter return changes the return and ONLY the return: the reference
+    // re-spells the class's own declared overload with the new return
+    // (`tighter_return_line`), keeping the author's parameter types, block and
+    // type parameters. The port reuses the declared head when it is a canonical
+    // simple one and DECLINES any other own declaration (rigor-rs#544 review:
+    // `(Integer) -> Numeric` must not become `(untyped) -> Float`). A method
+    // only an ancestor declares keeps the `def`-shaped head, as for a new method.
+    let (rbs, head) = if classification == "tighter_return" {
+        match sig_env.own_head(class_name, sig.name, sig.singleton) {
+            sig_env::OwnHead::NotOwn => (rbs, head),
+            sig_env::OwnHead::Own(sig_env::Head::Reusable(declared)) => {
+                (format!("{prefix}{}: {declared} -> {ret}", sig.name), declared.clone())
+            }
+            sig_env::OwnHead::Own(sig_env::Head::Declined) => return row(None),
+        }
+    } else {
+        (rbs, head)
+    };
+
     // Declared `untyped`: the reference's tighter-return writes the inferred
     // member WIDENED to its nominal — `def i = 1` against `-> untyped` emits
     // `() -> Integer`, not `() -> 1` (rigor-rs#544). Members that erase to a
@@ -2301,6 +2320,15 @@ fn classify(
                 if inferred_erased == "nil" {
                     return None;
                 }
+                // The reference widens a literal nested in a tuple element, a
+                // record value or a covariant generic argument
+                // (`[1, 2]` ⇒ `[Integer, Integer]`, `{ a: 1 }` ⇒
+                // `{ a: Integer }`); the emit here widens top-level members
+                // only. A composite member carrying a nested pinned literal is
+                // declined rather than emitted unwidened.
+                if members.iter().any(|&m| nested_pinned_literal(interner, m, false)) {
+                    return None;
+                }
                 return Some(("tighter_return", Some(decl)));
             }
             // A tightening must be a SINGLE bare carrier whose nominal-of is
@@ -2357,8 +2385,67 @@ fn classify(
             if computed_literal_tightening(interner, inferred_ty, raw_tail) {
                 return None;
             }
+            // The reference folds an all-literal computation (`4.2.to_s`,
+            // `[1].size.to_f`, `Math.sqrt(4)`) to a `Constant` and then drops
+            // it as `computed_literal_tightening?`. The port types such a
+            // tail as the scalar nominal; decline it when the whole tail is a
+            // closed literal expression (no local, ivar, self or parameter
+            // leaf) and the nominal is a foldable scalar class.
+            if matches!(
+                inferred_class,
+                Some(
+                    "Integer" | "Float" | "String" | "Symbol" | "Rational" | "Complex"
+                        | "TrueClass" | "FalseClass" | "NilClass"
+                )
+            ) && closed_literal_expr(ast, *sig.body.last()?)
+            {
+                return None;
+            }
             Some(("tighter_return", Some(decl)))
         }
+    }
+}
+
+/// Whether `ty` is (or, inside a union, contains) a tuple / record / generic
+/// nominal carrying a pinned literal (`Constant`) nested inside — the shapes the
+/// reference's `widen_value_literals` widens element-wise. A top-level
+/// `Constant` is handled by the member-wise widening and does not count
+/// (`nested == false`).
+fn nested_pinned_literal(interner: &Interner, ty: TypeId, nested: bool) -> bool {
+    match interner.get(ty) {
+        Type::Constant(_) => nested,
+        Type::Union(ms) => ms.iter().any(|&m| nested_pinned_literal(interner, m, nested)),
+        Type::Tuple(es) => es.iter().any(|&e| nested_pinned_literal(interner, e, true)),
+        Type::HashShape(ms) => ms.iter().any(|m| nested_pinned_literal(interner, m.value, true)),
+        Type::Nominal { args, .. } => args.iter().any(|&a| nested_pinned_literal(interner, a, true)),
+        _ => false,
+    }
+}
+
+/// A closed literal expression: literals, constant reads and array literals of
+/// them, and block-less calls whose receiver and arguments are closed — an
+/// expression the reference's engine folds to a `Constant` when it can. Any
+/// other leaf (a local, `self`, an ivar, an implicit-self call, a parameter)
+/// is open.
+fn closed_literal_expr(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::IntegerLit { .. }
+        | Node::FloatLit { .. }
+        | Node::StringLit { .. }
+        | Node::SymbolLit { .. }
+        | Node::NilLit { .. }
+        | Node::TrueLit { .. }
+        | Node::FalseLit { .. }
+        | Node::RationalLit { .. }
+        | Node::ImaginaryLit { .. }
+        | Node::ConstantRead { .. } => true,
+        Node::ArrayLit { elements, .. } => elements.iter().all(|&e| closed_literal_expr(ast, e)),
+        Node::Call { receiver: Some(r), args, block_body, .. } => {
+            block_body.is_empty()
+                && closed_literal_expr(ast, *r)
+                && args.iter().all(|&a| closed_literal_expr(ast, a))
+        }
+        _ => false,
     }
 }
 
