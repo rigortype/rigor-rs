@@ -3050,7 +3050,7 @@ struct MergeOutcome {
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
-/// `action: "noop"`; otherwise each class group (first-seen order) is merged or
+/// `action: "noop"`; otherwise each class group (class-name order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
 #[cfg(test)]
 fn apply_merge(
@@ -3200,7 +3200,8 @@ fn names_word(text: &str, name: &str) -> bool {
     false
 }
 
-/// Group candidates by `class_name`, preserving first-seen class order
+/// Group candidates by `class_name` (merged in class-name order, reference
+/// `groups.keys.sort`).
 /// (reference `candidates.group_by(&:class_name)`).
 fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
     let mut order: Vec<String> = Vec::new();
@@ -3211,6 +3212,10 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
         }
         groups.entry(c.class_name.clone()).or_default().push(c);
     }
+    // The reference merges `groups.keys.sort` — class-name order, not first-seen
+    // order — which is what orders the `skipped` report lines too (rigor-rs#493
+    // item 5).
+    order.sort();
     order.into_iter().map(|k| (k.clone(), groups.remove(&k).unwrap())).collect()
 }
 
