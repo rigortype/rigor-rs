@@ -161,6 +161,21 @@ impl MultiTargets {
         }
     }
 
+    /// Whether any slot of this target tree is one the arena does not model
+    /// — an ivar / cvar / gvar / constant / attribute / const-path target,
+    /// an implicit rest, an anonymous `*` ([`MultiTarget::Ignored`]). Such a
+    /// store may rewrite state the def-local replay tracks (`@n, x = …`).
+    pub fn has_unmodeled_target(&self) -> bool {
+        let slot = |t: &MultiTarget| match t {
+            MultiTarget::Ignored { .. } => true,
+            MultiTarget::Nested(n) => n.has_unmodeled_target(),
+            MultiTarget::Local { .. } | MultiTarget::Index { .. } => false,
+        };
+        self.lefts.iter().any(slot)
+            || self.rest.as_deref().is_some_and(slot)
+            || self.rights.iter().any(slot)
+    }
+
     /// Convenience: the bound names of this target tree.
     pub fn bound_names(&self) -> Vec<(String, Span)> {
         let mut out = Vec::new();

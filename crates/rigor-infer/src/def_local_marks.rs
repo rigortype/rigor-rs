@@ -79,6 +79,28 @@ pub struct DefLocalMarks {
     /// `(position, local)` of every type test on a local — `x.nil?`,
     /// `x.is_a?(K)`, `x == v`, `x =~ r`, `case x` — sorted by position.
     narrow_tests: Vec<(usize, String)>,
+    /// Start positions of the constructs that may rewrite ANY instance
+    /// variable of `self` behind the replay's back: an implicit-self or
+    /// `self.` call, a `yield` / `super` / `defined?` / `rescue`-modifier
+    /// carrier or any other non-sequence recovery carrier, a proc call
+    /// on a local (`blk.call`), a compound ivar/cvar/gvar/constant write
+    /// (`@n += 1`), and a multiple assignment with a target the arena does
+    /// not model (`@n, x = …`, `self.a, x = …`). Past one, every typed `@x`
+    /// binding is stale ([`Typer::apply_def_local_marks`]); the reference
+    /// widens each to its class-ivar seed (`InterveningIvarReset`).
+    ivar_resets: Vec<usize>,
+    /// Class / global variable reads `(start, end, name)` and the starts of
+    /// every write that may bind one (`@@n = v`, `$n = v`, a compound write):
+    /// the reference constant-folds a decision on a cvar / gvar bound earlier
+    /// in the method, which the replay never tracks
+    /// ([`Typer::typed_decision_reads`]).
+    cg_reads: Vec<(usize, usize, String)>,
+    cg_writes: Vec<usize>,
+}
+
+/// Whether `name` is an instance variable (`@x`, not `@@x` / `$x`).
+pub(crate) fn is_ivar(name: &str) -> bool {
+    name.starts_with('@') && !name.starts_with("@@")
 }
 
 /// A call the reference narrows its receiver on (`x.nil?`, `x.is_a?(K)`,
@@ -158,6 +180,7 @@ fn passes_argument(method: &str) -> bool {
 fn argument_locals(ast: &LoweredAst, id: rigor_parse::NodeId, out: &mut Vec<String>) {
     match ast.get(id) {
         Node::LocalVariableRead { name, .. } => out.push(name.clone()),
+        Node::VariableRead { name, .. } if is_ivar(name) => out.push(name.clone()),
         Node::Statements { body, .. } => {
             for &b in body {
                 argument_locals(ast, b, out);
@@ -182,8 +205,22 @@ impl DefLocalMarks {
         for (_, n) in ast.iter() {
             match n {
                 Node::LocalVariableRead { name, span } => reads.push((span.0, span.1, name)),
-                Node::LocalVariableWrite { name, span, .. }
-                | Node::LocalVariableOpWrite { name, span, .. } => {
+                // An instance variable is tracked like a local under its
+                // sigilled name (`@x`); class / global variables are not.
+                Node::VariableRead { name, span } if is_ivar(name) => {
+                    reads.push((span.0, span.1, name));
+                }
+                Node::InstanceVariableWrite { name, span, .. } => {
+                    all_writes.push((span.0, name.clone()));
+                }
+                // `a += v` / `a ||= v` READS `a` before rebinding it: a
+                // loop-carried read the replay must not fold from the entry
+                // binding.
+                Node::LocalVariableOpWrite { name, span, .. } => {
+                    reads.push((span.0, span.1, name));
+                    all_writes.push((span.0, name.clone()));
+                }
+                Node::LocalVariableWrite { name, span, .. } => {
                     all_writes.push((span.0, name.clone()));
                 }
                 Node::MultiWrite { targets, span, .. } => {
@@ -220,7 +257,51 @@ impl DefLocalMarks {
         let mut scopes: Vec<(usize, usize)> = Vec::new();
         let mut wild: Vec<usize> = Vec::new();
         let mut narrow_tests: Vec<(usize, String)> = Vec::new();
+        let mut ivar_resets: Vec<usize> = Vec::new();
+        let mut cg_reads: Vec<(usize, usize, String)> = Vec::new();
+        let mut cg_writes: Vec<usize> = Vec::new();
         for (_, n) in ast.iter() {
+            match n {
+                Node::VariableRead { name, span } if !is_ivar(name) => {
+                    cg_reads.push((span.0, span.1, name.clone()));
+                }
+                Node::VariableWrite { span, .. } | Node::UnmodeledWrite { span, .. } => {
+                    cg_writes.push(span.0);
+                }
+                _ => {}
+            }
+            // Anything that may rewrite an instance variable unseen.
+            match n {
+                Node::Call { receiver, method, span, .. } => {
+                    let on_self = match receiver {
+                        None => true,
+                        Some(r) => matches!(ast.get(*r), Node::SelfExpr { .. }),
+                    };
+                    let proc_call = matches!(method.as_str(), "call" | "yield")
+                        && receiver.is_some_and(|r| matches!(ast.get(r), Node::LocalVariableRead { .. }));
+                    if on_self || proc_call {
+                        ivar_resets.push(span.0);
+                    }
+                }
+                Node::IndexWrite { receiver, span, .. } | Node::AttrWrite { receiver, span, .. } => {
+                    if receiver.is_none_or(|r| matches!(ast.get(r), Node::SelfExpr { .. })) {
+                        ivar_resets.push(span.0);
+                    }
+                }
+                // A recovery / jump / inert carrier (`x rescue y`, `yield`,
+                // `super`, `defined?`, a splat) and a bare `Other` leaf (`yield`
+                // / `super` with no operand): the arena drops an ivar write or
+                // read under them, and `yield` / `super` run unseen code.
+                Node::Statements { kind, span, .. } if !matches!(kind, StatementsKind::Sequence) => {
+                    ivar_resets.push(span.0);
+                }
+                Node::Other { span, jump: None } => ivar_resets.push(span.0),
+                Node::UnmodeledWrite { span, .. } => ivar_resets.push(span.0),
+                Node::MultiWrite { targets, span, .. } if targets.has_unmodeled_target() => {
+                    ivar_resets.push(span.0);
+                }
+                _ => {}
+            }
             // Decision positions, exits and nested scopes (see the field docs).
             match n {
                 Node::If { predicate, .. } => decisions.push(ast.get(*predicate).span()),
@@ -423,7 +504,24 @@ impl DefLocalMarks {
         scopes.sort_unstable();
         wild.sort_unstable();
         narrow_tests.sort();
-        DefLocalMarks { mutations, escapes, rebinds, reads, writes: all_writes, decisions, exits, scopes, wild, narrow_tests }
+        ivar_resets.sort_unstable();
+        cg_reads.sort();
+        cg_writes.sort_unstable();
+        DefLocalMarks {
+            mutations,
+            escapes,
+            rebinds,
+            reads,
+            writes: all_writes,
+            decisions,
+            exits,
+            scopes,
+            wild,
+            narrow_tests,
+            ivar_resets,
+            cg_reads,
+            cg_writes,
+        }
     }
 
     /// The names written (rebound) or possibly mutated inside `span`.
@@ -512,6 +610,44 @@ impl DefLocalMarks {
             .iter()
             .take_while(|e| e.0 < span.1)
             .any(|e| kinds.contains(&e.1))
+    }
+
+    /// Whether `span` holds a construct that may rewrite an instance
+    /// variable behind the replay's back (see the field docs).
+    pub(crate) fn ivar_reset_within(&self, span: Span) -> bool {
+        let i = self.ivar_resets.partition_point(|&r| r < span.0);
+        self.ivar_resets.get(i).is_some_and(|&r| r < span.1)
+    }
+
+    /// Whether a decision position inside `span` holds a construct that may
+    /// rewrite an instance variable unseen (`if (@n += 1) > 1`, `if foo`):
+    /// the reference decides the predicate on the post-write binding, which
+    /// the replay does not model — every typed ivar is a decision read then.
+    pub(crate) fn decision_reset_within(&self, span: Span) -> bool {
+        let i = self.decisions.partition_point(|d| d.0 < span.0);
+        self.decisions[i..]
+            .iter()
+            .take_while(|d| d.0 < span.1)
+            .filter(|d| d.1 <= span.1)
+            .any(|d| self.ivar_reset_within((d.0, d.1)))
+    }
+
+    /// The class / global variables a decision position inside `span` reads
+    /// after a write that may bind them within the def at `scope`.
+    pub(crate) fn decision_cg_reads_within(&self, span: Span, scope: Option<Span>) -> Vec<&str> {
+        let Some(scope) = scope else { return Vec::new() };
+        let mut out: Vec<&str> = Vec::new();
+        let i = self.decisions.partition_point(|d| d.0 < span.0);
+        for d in self.decisions[i..].iter().take_while(|d| d.0 < span.1).filter(|d| d.1 <= span.1) {
+            let j = self.cg_reads.partition_point(|r| r.0 < d.0);
+            for r in self.cg_reads[j..].iter().take_while(|r| r.0 < d.1).filter(|r| r.1 <= d.1) {
+                let bound = self.cg_writes.iter().any(|&w| scope.0 <= w && w < r.0);
+                if bound && !out.contains(&r.2.as_str()) {
+                    out.push(r.2.as_str());
+                }
+            }
+        }
+        out
     }
 
     /// Whether `span` holds an `=~` that may bind named captures.
@@ -630,6 +766,19 @@ impl<'i> Typer<'i> {
                 }
             }
         }
+        if marks.ivar_reset_within(span) {
+            Self::widen_ivars(env, interner);
+        }
+    }
+
+    /// Bind every instance variable in `env` to `untyped`.
+    pub(crate) fn widen_ivars(env: &mut TypeEnv, interner: &mut Interner) {
+        let untyped = interner.untyped();
+        for (name, t) in env.iter_mut() {
+            if is_ivar(name) {
+                *t = untyped;
+            }
+        }
     }
 }
 
@@ -676,6 +825,21 @@ impl<'i> Typer<'i> {
             let hot = !typed && scope.is_some_and(|sc| marks.narrowing_hot(sc, n));
             if typed || hot {
                 out.push(n.to_string());
+            }
+        }
+        for n in marks.decision_cg_reads_within(span, scope) {
+            if !out.iter().any(|o| o == n) {
+                out.push(n.to_string());
+            }
+        }
+        if marks.decision_reset_within(span) {
+            for (name, &t) in env.iter() {
+                if is_ivar(name)
+                    && !matches!(interner.get(t), Type::Dynamic(_))
+                    && !out.iter().any(|o| o == name)
+                {
+                    out.push(name.clone());
+                }
             }
         }
         out
@@ -760,7 +924,10 @@ impl<'i> Typer<'i> {
             return;
         }
         let skip = match ast.get(id) {
-            Node::LocalVariableWrite { .. } | Node::MultiWrite { .. } => Some(span.0),
+            Node::LocalVariableWrite { .. }
+            | Node::LocalVariableOpWrite { .. }
+            | Node::InstanceVariableWrite { .. }
+            | Node::MultiWrite { .. } => Some(span.0),
             _ => None,
         };
         let bodies = self.stmt_bodies(ast, id);
@@ -786,6 +953,11 @@ impl<'i> Typer<'i> {
         }
         let mut out = env.clone();
         self.widen_shell(ast, &marks, &mut out, id, interner);
+        // An unseen call inside the tail may rewrite an ivar a later part of
+        // the tail reads (`[reset!, @n]`).
+        if marks.ivar_reset_within(span) {
+            Self::widen_ivars(&mut out, interner);
+        }
         Some(out)
     }
 

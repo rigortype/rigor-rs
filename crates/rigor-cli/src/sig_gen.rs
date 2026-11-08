@@ -3190,6 +3190,15 @@ fn literal_tail_nominal(
             let mut arg_members: Vec<TypeId> = Vec::new();
             for bound in [left, right].into_iter().flatten() {
                 let ty = typer.type_of(ast, *bound, env, interner);
+                // An ivar / cvar / gvar bound the replay holds `untyped`
+                // (unbound, or declined after an unseen write): the reference
+                // reads its seed, `Range[untyped]`, where a Dynamic local
+                // bound contributes nothing. Decline (rigor-rs#548).
+                if matches!(interner.get(ty), Type::Dynamic(_))
+                    && matches!(ast.get(*bound), Node::VariableRead { .. })
+                {
+                    return Some(interner.untyped());
+                }
                 // A bound that types DIRECTLY to a scalar Constant widens to
                 // its class; a UNION bound's members contribute as-is —
                 // literal `2` stays `2`, a `nil` member stays `nil` (the

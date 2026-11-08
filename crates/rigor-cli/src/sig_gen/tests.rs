@@ -1461,7 +1461,6 @@ fn def_local_env_declines_a_literal_the_body_mutates() {
         "def c1(items); r = []; items.each { |i| r << i }; r; end\n\
          def c2(items); r = []; r << 1; r; end\n\
          def c3(items); s = \"\"; s << \"a\"; s; end\n\
-         def c4(items); s = \"\"; s += \"a\"; s; end\n\
          def c5(items); h = {}; h[:a] = 1; h; end\n\
          def c6(items); s = \"abc\"; s.upcase!; s; end\n\
          def c7(items); s = \"x\"; s.concat(\"d\"); s; end\n\
@@ -1756,7 +1755,8 @@ def x10(c); a = 1; begin; c.x; rescue; 0; else; a = 2; end; a; end
     );
     assert!(!rows.contains_key("o1"), "o1 must decline: {rows:?}");
     assert!(!rows.contains_key("o2"), "o2 must decline: {rows:?}");
-    assert!(!rows.contains_key("o3"), "o3 must decline: {rows:?}");
+    // `a = 1; a += 1; a` folds to `2` (rigor-rs#548, oracle-probed).
+    assert_eq!(rows["o3"], "def o3: (untyped) -> 2");
     assert!(!rows.contains_key("x1"), "x1 must decline: {rows:?}");
     assert!(!rows.contains_key("x2"), "x2 must decline: {rows:?}");
     assert_eq!(rows["x3"], r##"def x3: (untyped) -> (1 | 2)"##);
@@ -2260,4 +2260,331 @@ fn defs_and_namespaces_in_call_blocks_emit_in_source_order() {
         emitted_rows("call_block_order2", src),
         ["K: def a: () -> 1", "K::N: def z: () -> 1", "K: def b: () -> 2", "K: def c: () -> 3"]
     );
+}
+
+/// Check one `def_local_*` row table: each row is the body of `def rN(c, xs)`
+/// under `class K`. `Some(t)` asserts the port emits `-> t` (byte-identical to
+/// the oracle's `sig-gen --print`, probed when the row was written); `None`
+/// asserts the port declines (a coverage loss — never a wrong signature).
+fn check_def_local_rows(tag: &str, rows: &[(&str, Option<&str>)]) {
+    let body: String = rows
+        .iter()
+        .enumerate()
+        .map(|(i, (src, _))| format!("def r{i}(c, xs); {src}; end\n"))
+        .collect();
+    let got = def_rows(tag, &body);
+    for (i, (src, want)) in rows.iter().enumerate() {
+        let key = format!("r{i}");
+        match want {
+            Some(ty) => assert_eq!(
+                got.get(&key).map(String::as_str),
+                Some(format!("def {key}: (untyped, untyped) -> {ty}").as_str()),
+                "row `{src}`"
+            ),
+            None => assert!(!got.contains_key(&key), "row `{src}` must decline: {:?}", got.get(&key)),
+        }
+    }
+}
+
+#[test]
+fn def_local_env_folds_operator_writes() {
+    // rigor-rs#548: `a <op>= v` types as the literal-by-literal fold of its entry binding and `v`;
+    // every dispatch the port cannot fold exactly declines the local.
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("a = 1; a += 2; a", Some("3")),
+        ("a = 1; a -= 2; a", Some("-1")),
+        ("a = 3; a *= 2; a", Some("6")),
+        ("a = 7; a /= 2; a", Some("3")),
+        ("a = 7; a %= 4; a", Some("3")),
+        ("a = 2; a **= 10; a", Some("1024")),
+        ("a = 1; a <<= 3; a", Some("8")),
+        ("a = 5; a >>= 1; a", Some("2")),
+        ("a = 6; a &= 3; a", Some("2")),
+        ("a = 6; a |= 3; a", Some("7")),
+        ("a = 6; a ^= 3; a", Some("5")),
+        ("a = \"x\"; a += \"y\"; a", Some("\"xy\"")),
+        ("a = \"x\"; a *= 3; a", Some("\"xxx\"")),
+        ("s = \"\"; s += \"a\"; s", Some("\"a\"")),
+        ("a = 1; a += 1; a += 1; a", Some("3")),
+        ("a = 1; a += 1; b = a; b", Some("2")),
+        ("b = 2; a = 1; a += b; a", Some("3")),
+        ("a = 1; if c; a += 1; end; a", Some("(1 | 2)")),
+        ("a = 1; if c; a += 1; else; a += 2; end; a", Some("(2 | 3)")),
+        ("a = 1; c ? (a += 1) : 3; a", Some("(1 | 2)")),
+        ("a = 1; c && a += 1; a", Some("(1 | 2)")),
+        ("a = 1; case c; when 1 then a += 1; else a += 2; end; a", Some("(2 | 3)")),
+        ("a = 1; begin; foo; rescue; a += 5; end; a", None),  // ref: (1 | 6)
+        ("a = 1; begin; a += 1; ensure; a += 5; end; a", None),  // ref: 7
+        ("a = 7; a /= 0; a", None),  // ref: Integer
+        ("a = 1; a += 1.5; a", None),  // ref: Float
+        ("a = 1.5; a += 1; a", None),  // ref: Float
+        ("a = 1; a += nil; a", None),  // ref: Integer
+        ("a = 1; a += \"x\"; a", None),  // ref: Integer
+        ("a = :s; a += 1; a", None),  // ref: None
+        ("a = nil; a += 1; a", None),  // ref: None
+        ("a = [1]; a += [2]; a", None),  // ref: [1, 2]
+        ("a = 1; a += c; a", None),  // ref: None
+        ("a = c; a += 1; a", None),  // ref: None
+        ("a += 1; a", None),  // ref: None
+        ("a = 1; a += 1", None),  // ref: 2
+        ("a = 1; x = (a += 1); x", None),  // ref: 2
+        ("a = 1; c ? (a += 1) : 0", None),  // ref: (0 | 2)
+        ("a = 1; @n = c ? (a += 1) : 0; @n", None),  // ref: (0 | 2)
+        ("a = 1; x = c ? (a += 1) : 0; x", None),  // ref: (0 | 2)
+        ("a = 2; a **= 100; a", Some("1267650600228229401496703205376")),
+    ];
+    check_def_local_rows("def_local_env_folds_operator_writes", rows);
+}
+
+#[test]
+fn def_local_env_folds_logical_writes() {
+    // rigor-rs#548: `a ||= v` is the truthy part of the entry plus `v`; `a &&= v` the falsy part plus `v`.
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("a = nil; a ||= 1; a", Some("1")),
+        ("a = 1; a ||= \"x\"; a", Some("(\"x\" | 1)")),
+        ("a = false; a ||= \"x\"; a", Some("\"x\"")),
+        ("a = nil; a ||= nil; a", Some("nil")),
+        ("a = nil; a &&= 1; a", Some("(1 | nil)")),
+        ("a = 1; a &&= \"x\"; a", Some("\"x\"")),
+        ("a = false; a &&= 1; a", Some("(1 | false)")),
+        ("a = nil; a ||= c; a", None),  // ref: None
+        ("a = c; a ||= 1; a", None),  // ref: None
+        ("a = 1; a ||= foo; a", None),  // ref: None
+        ("a = 1; if c; a ||= 2; end; a", Some("(1 | 2)")),
+        ("a ||= 1; a", None),  // ref: None
+    ];
+    check_def_local_rows("def_local_env_folds_logical_writes", rows);
+}
+
+#[test]
+fn def_local_env_declines_loop_and_block_carried_op_writes() {
+    // rigor-rs#548 review blocker 1: an operator write in a loop / block body feeds back on the variable
+    // (`s += 1` runs 0..n times); the reference widens it to the class (`Integer`) and the port declines
+    // instead of folding the body as if it ran once (`(0 | 1)`).
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("s = 0; 3.times { s += 1 }; s", None),  // ref: Integer
+        ("s = 0; while true; s += 1; end; s", None),  // ref: Integer
+        ("s = 0; until s > 3; s += 1; end; s", None),  // ref: Integer
+        ("s = 1; [1,2].each { |n| s *= 2 }; s", None),  // ref: Integer
+        ("s = \"\"; [1,2].each { s += \"x\" }; s", None),  // ref: String
+        ("a = 1; [1].each { |e| a += e }; a", None),  // ref: Integer
+        ("s = 0; while c; s += 1; end; s", None),  // ref: Integer
+        ("s = 0; loop { s += 1; break if c }; s", None),  // ref: None
+        ("s = 0; for i in xs; s += 1; end; s", None),  // ref: (0 | 1)
+        ("s = 0; xs.each { |x| s += x }; s", None),  // ref: None
+        ("s = 0; xs.map { s += 1 }; s", None),  // ref: None
+        ("s = 0; 3.times { s ||= 1 }; s", None),  // ref: (0 | 1)
+        ("s = nil; 3.times { s ||= 1 }; s", None),  // ref: (1 | nil)
+        ("s = 0; xs.each { |x| if c; s += 1; end }; s", None),  // ref: None
+        ("s = 0; while c; if xs; s += 1; end; end; s", None),  // ref: Integer
+        ("s = 0; begin; s += 1; end while c; s", None),  // ref: Integer
+        ("s = 0; s += 1 while c; s", None),  // ref: Integer
+        ("s = 0; xs.each { while c; s += 1; end }; s", None),  // ref: None
+        ("s = 0; 1.times { s += 1 }; s", None),  // ref: Integer
+        ("s = 0; xs.each { s += 1; return s if c }; s", None),  // ref: None
+        ("s = 0; while c; return s; s += 1; end; s", None),  // ref: (0 | 1 | 2 | Integer)
+        ("a = 1; xs.each { a = 2 }; a", None),  // ref: None
+        ("a = 1; while c; a = 2; end; a", Some("(1 | 2)")),
+    ];
+    check_def_local_rows("def_local_env_declines_loop_and_block_carried_op_writes", rows);
+}
+
+#[test]
+fn def_local_env_binds_ivar_tails() {
+    // rigor-rs#548: `@i = v` binds the sigilled name — a later read in the same def types as the literal it
+    // was written with; the replay declines everything that may rewrite it unseen.
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("@i = 1; @i", Some("1")),
+        ("@i = \"s\"; @i", Some("\"s\"")),
+        ("@i = [1]; @i", Some("[1]")),
+        ("@i = :a; @i", Some(":a")),
+        ("@i = {a: 1}; @i", Some("{ a: 1 }")),
+        ("@i = nil; @i", Some("nil")),
+        ("@i = 1.5; @i", Some("Float")),
+        ("@i = 1; @i = 2; @i", Some("2")),
+        ("@i = 1; x = @i; x", Some("1")),
+        ("@i = 1; [@i, @i]", Some("[1, 1]")),
+        ("@i = 1; if c; @i = 2; end; @i", Some("(1 | 2)")),
+        ("@i = 1; if c; @i = 2; else; @i = 3; end; @i", Some("(2 | 3)")),
+        ("@i = 1; @i = 2 if c; @i", Some("(1 | 2)")),
+        ("@i = 1; unless c; @i = :s; end; @i", Some("(1 | :s)")),
+        ("@i = 1; case c; when 1 then @i = 2; else @i = 3; end; @i", Some("(2 | 3)")),
+        ("@i = 1; begin; @i = 2; rescue; @i = 3; end; @i", Some("(2 | 3)")),
+        ("@i = 1; begin; foo; rescue; @i = 3; end; @i", None),  // ref: None
+        ("if c; @i = 1; end; @i", None),  // ref: None
+        ("@i = 1 if c; @i", None),  // ref: None
+        ("if c; @i = 1; else; @i = 2; end; @i", Some("(1 | 2)")),
+        ("@i = nil; @i = 3 if c; @i", Some("(3 | nil)")),
+        ("@i = 1; a = @i; a", Some("1")),
+        ("a = 2; @i = a; @i", Some("2")),
+        ("@i = c; @i", None),  // ref: None
+        ("@i = foo; @i", None),  // ref: None
+        ("@i", None),  // ref: None
+        ("x = @i; x", None),  // ref: None
+        ("@i = 1; @j", None),  // ref: None
+        ("@i = 1; @i..2", Some("Range[Integer]")),
+        ("@i = 1; @i.to_s", Some("\"1\"")),
+        ("@i = [1]; @i.to_s", None),  // ref: "[1]"
+        ("@i = 1; @i + 1", Some("2")),
+        ("@i = \"s\"; @i.upcase", Some("\"S\"")),
+    ];
+    check_def_local_rows("def_local_env_binds_ivar_tails", rows);
+}
+
+#[test]
+fn def_local_env_declines_ivar_writes_and_calls_the_replay_does_not_see() {
+    // rigor-rs#548 review blocker 2 + non-blocking rows: an ivar operator write, a multi-assign to an ivar target,
+    // and any call that may rewrite `self`'s ivars (`foo`, `self.foo`, `reset!`, `yield`, `super`, `send`,
+    // `instance_variable_set`, a proc call, an attribute / index write on self) leave the old binding stale — the
+    // reference widens it (`@n = 1; foo; @n` reads the class seed); the port declines it.
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("@n = 0; @n += 1; @n", None),  // ref: 1
+        ("@n = nil; @n ||= 5; @n", None),  // ref: 5
+        ("@n = 0; [1,2].each { @n += 1 }; @n", None),  // ref: Integer
+        ("@n = 1; @n &&= 2; @n", None),  // ref: 2
+        ("@n = 1; x = (@n += 1); @n", None),  // ref: 2
+        ("@n = 0; while c; @n += 1; end; @n", None),  // ref: Integer
+        ("@n = 1; if c; @n += 1; end; @n", None),  // ref: (1 | 2)
+        ("@n, x = \"s\", 2; @n", None),  // ref: "s"
+        ("@n = 1; x, @n = 2, 3; @n", None),  // ref: 3
+        ("@n = 1; @n, = 2; @n", None),  // ref: 2
+        ("@n = 1; (@n, x), y = [2, 3], 4; @n", None),  // ref: 2
+        ("@n = 1; *@n, x = 2, 3; @n", None),  // ref: [2]
+        ("@n = 1; self.a, x = 2, 3; @n", None),  // ref: 1
+        ("@n = 1; foo; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; self.foo; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; reset!; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; yield; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; super; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; super(1); @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; send(:m); @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; instance_variable_set(:@n, \"s\"); @n", None),  // ref: "s"
+        ("@n = 1; c.call; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; c.(); @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; self.n = 5; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; self[:a] = 1; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; self.n += 1; @n", None),  // ref: 1
+        ("@n = 1; puts 1; @n", None),  // ref: 1
+        ("@n = 1; foo(@n); @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; x = (foo; 2); @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; [foo, @n]", None),  // ref: [untyped, 1]
+        ("@n = 1; foo; x = @n; x", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; if c; foo; end; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; xs.each { foo }; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; defined?(@n); @n", None),  // ref: 1
+        ("@n = 1; (@n = 2) rescue nil; @n", None),  // ref: (1 | 2)
+        ("@n = 1; begin; foo; rescue; end; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; while foo; return @n; end; @n = 2; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = \"s\"; @n << \"t\"; @n", None),  // ref: String
+        ("@n = [1]; @n << 2; @n", None),  // ref: Array[untyped]
+        ("@n = {a: 1}; @n[:b] = 2; @n", None),  // ref: Hash[untyped, untyped]
+        ("@n = \"s\"; @n.upcase!; @n", None),  // ref: String
+        ("@n = \"s\"; foo(@n); @n", None),  // ref: ("s" | 0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = \"s\"; xs.foo(@n); @n", None),  // ref: "s"
+        ("@n = [1]; q = @n; q << 2; @n", Some("[1]")),
+        ("@n = 1; xs.each { @n = 2 }; @n", None),  // ref: None
+        ("@n = 1; 3.times { @n = 2 }; @n", None),  // ref: (1 | 2)
+        ("@n = 1; l = -> { @n = 2 }; l.call; @n", None),  // ref: None
+        ("@n = 1; xs.foo; @n", Some("1")),
+        ("@n = 1; xs.foo(self); @n", Some("1")),
+        ("@n = nil; @n = 1 if c; @n", Some("(1 | nil)")),
+        ("if c; @n = 1; end; @n", None),  // ref: (0 | 1 | 2 | 3 | 5 | Array[untyped] | Hash[untyped, untyped] | Integer | String | nil)
+        ("@n = 1; @n = 2 if c; @n", Some("(1 | 2)")),
+        ("@@n = 1; @@n += 1; @@n", None),  // ref: 2
+        ("$n = 1; $n += 1; $n", None),  // ref: 2
+        ("@@n = 1; @@n", None),  // ref: 1
+        ("$n = 1; $n", None),  // ref: 1
+        ("@@n = 1; @@n = 2 if c; @@n", None),  // ref: (1 | 2)
+    ];
+    check_def_local_rows("def_local_env_declines_ivar_writes_and_calls_the_replay_does_not_see", rows);
+}
+
+#[test]
+fn def_local_env_declines_a_decision_on_an_ivar_cvar_or_gvar() {
+    // rigor-rs#548: the reference constant-folds a decision on an ivar / cvar / gvar bound earlier in the
+    // method (`@n = 1; a = 1; if @n; a = 2; end` reads `2`); the port holds no such fold and declines the
+    // names the decision guards.
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("@n = 1; a = 1; if @n == 1; a = 2; else; a = 3; end; a", None),  // ref: 2
+        ("@n = nil; a = 1; if @n; a = 2; end; a", None),  // ref: 1
+        ("@n = 1; @n ? 1 : 2", None),  // ref: 1
+        ("@n = 1; @n.nil? ? 1 : 2", None),  // ref: 2
+        ("@n = 1; a = 1; a = 2 unless @n; a", None),  // ref: 1
+        ("@n = 1; a = 1; while @n < 0; a = 2; end; a", None),  // ref: (1 | 2)
+        ("@n = 1; a = 1; case @n; when 1 then a = 2; else a = 3; end; a", None),  // ref: (2 | 3)
+        ("@n = 1; @n && 3", None),  // ref: 3
+        ("@n = nil; @n || 3", None),  // ref: 3
+        ("@n = 1; @n&.to_s", None),  // ref: "1"
+        ("@n = 1; a = 1; if (@n += 1) > 1; a = 2; end; a", None),  // ref: 2
+        ("@n = 1; a = 1; if foo; a = 2; end; a", None),  // ref: (1 | 2)
+        ("@@n = 1; a = 1; if @@n == 1; a = 2; else; a = 3; end; a", None),  // ref: 2
+        ("$n = 1; a = 1; if $n == 1; a = 2; else; a = 3; end; a", None),  // ref: 2
+        ("@@n = nil; a = 1; if @@n; a = 2; end; a", None),  // ref: 1
+        ("$n = nil; a = 1; if $n; a = 2; end; a", None),  // ref: 1
+        ("@@n = 1; @@n ? 1 : 2", None),  // ref: 1
+        ("$n = 1; $n ? 1 : 2", None),  // ref: 1
+        ("a = 1; if @@n; a = 2; end; a", Some("(1 | 2)")),
+        ("a = 1; if $stdout; a = 2; end; a", Some("(1 | 2)")),
+        ("a = 1; if @n; a = 2; end; a", Some("(1 | 2)")),
+    ];
+    check_def_local_rows("def_local_env_declines_a_decision_on_an_ivar_cvar_or_gvar", rows);
+}
+
+#[test]
+fn def_local_env_binds_a_rescue_reference() {
+    // rigor-rs#548: `rescue => e` binds `e` to StandardError inside its clause, `rescue T1, T2 => e` to the
+    // union of the listed (non-generic) core classes; a generic class (`KeyError[K, R]`), a path, a splat, a
+    // shadowed or unknown name declines. `e` itself past the construct reads `(… | nil)` on the reference: declined.
+    // `Some(t)`: the port emits `-> t`, byte-identical to the reference (oracle-probed);
+    // `None`: the port declines (the reference's answer is noted) — a coverage loss, never a wrong signature.
+    let rows: &[(&str, Option<&str>)] = &[
+        ("a = 1; begin; puts; rescue => e; a = e; end; a", Some("(1 | StandardError)")),
+        ("a = 1; begin; puts; rescue StandardError => e; a = e; end; a", Some("(1 | StandardError)")),
+        ("a = 1; begin; puts; rescue ArgumentError => e; a = e; end; a", Some("(1 | ArgumentError)")),
+        ("a = 1; begin; puts; rescue TypeError, ArgumentError => e; a = e; end; a", Some("(1 | ArgumentError | TypeError)")),
+        ("a = 1; begin; puts; rescue IOError => e; a = e; end; a", Some("(1 | IOError)")),
+        ("a = 1; begin; puts; rescue ZeroDivisionError => e; a = e; end; a", Some("(1 | ZeroDivisionError)")),
+        ("a = 1; begin; puts; rescue RuntimeError => e; a = e; end; a", Some("(1 | RuntimeError)")),
+        ("a = 1; begin; puts; rescue IndexError => e; a = e; end; a", Some("(1 | IndexError)")),
+        ("a = 1; begin; puts; rescue => e; a = e.message; end; a", Some("(1 | String)")),
+        ("a = 1; begin; puts; rescue => e; a = [e]; end; a", Some("(1 | [StandardError])")),
+        ("a = 1; begin; puts; rescue ArgumentError => e; a = e; rescue TypeError => f; a = f; end; a", Some("(1 | ArgumentError | TypeError)")),
+        ("a = 1; begin; puts; rescue ArgumentError => e; a = e; ensure; a = 2; end; a", Some("2")),
+        ("a = 1; begin; puts; rescue KeyError => e; a = e; end; a", None),  // ref: (1 | KeyError[untyped, untyped])
+        ("a = 1; begin; puts; rescue NameError => e; a = e; end; a", None),  // ref: (1 | NameError[untyped])
+        ("a = 1; begin; puts; rescue NoMethodError => e; a = e; end; a", None),  // ref: (1 | NoMethodError[untyped])
+        ("a = 1; begin; puts; rescue FrozenError => e; a = e; end; a", None),  // ref: (1 | FrozenError[untyped])
+        ("a = 1; begin; puts; rescue KeyError, NameError => e; a = e; end; a", None),  // ref: (1 | KeyError[untyped, untyped] | NameError[untyped])
+        ("a = 1; begin; puts; rescue Foo::Bar => e; a = e; end; a", None),  // ref: None
+        ("a = 1; begin; puts; rescue Errno::ENOENT => e; a = e; end; a", None),  // ref: (1 | Errno::ENOENT)
+        ("a = 1; begin; puts; rescue ArgumentError, *c => e; a = e; end; a", None),  // ref: None
+        ("a = 1; begin; puts; rescue (c) => e; a = e; end; a", None),  // ref: None
+        ("a = 1; begin; puts; rescue => e; a = e; end; e", None),  // ref: (StandardError | nil)
+        ("begin; puts; rescue => e; e; end", None),  // ref: None
+        ("begin; puts; 1; rescue => e; e; end", None),  // ref: None
+        ("a = 1; begin; puts; rescue ArgumentError => e; @n = e; end; @n", None),  // ref: None
+        ("a = 1; begin; puts; rescue => e; a = e; retry if c; end; a", None),  // ref: (1 | StandardError)
+        ("a = 1; begin; puts; rescue => e; a = e; else; a = 2; end; a", None),  // ref: (2 | StandardError)
+        ("a = 1; begin; puts; rescue => e; a = e; end while c; a", None),  // ref: (1 | StandardError)
+        ("a = 1; xs.each { begin; puts; rescue => e; a = e; end }; a", None),  // ref: None
+        ("a = 1; while c; begin; puts; rescue => e; a = e; end; end; a", Some("(1 | StandardError)")),
+        ("a = 1; begin; puts; rescue => e; return e; end; a", Some("(1 | StandardError)")),
+        ("e = 5; begin; puts; rescue => e; a = 1; end; e", None),  // ref: (5 | StandardError)
+        ("a = 1; (puts) rescue (a = 3); a", None),  // ref: (1 | 3)
+        ("a = 1; begin; a = 2; rescue => e; a = e; end; a", Some("(2 | StandardError)")),
+        ("a = 1; begin; puts; rescue; a = 2; end; a", Some("(1 | 2)")),
+    ];
+    check_def_local_rows("def_local_env_binds_a_rescue_reference", rows);
 }

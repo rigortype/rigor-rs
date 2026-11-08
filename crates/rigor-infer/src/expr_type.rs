@@ -870,6 +870,11 @@ impl<'i> Typer<'i> {
             // A multi-write evaluates to its RHS, exactly like the single-target
             // writes: `(a, b = [1, 2])` is `[1, 2]` (reference
             // `expression_typer.rb:119` / `eval_multi_write`).
+            // An operator write's value is the dispatch result (`a += 1` is
+            // `a + 1`), not `value`'s type: sig-gen's def-local typing
+            // declines it (rigor-rs#548); `check` keeps the pre-existing
+            // value-type read.
+            Node::LocalVariableOpWrite { .. } if self.def_scope.get().is_some() => interner.untyped(),
             Node::LocalVariableWrite { value, .. }
             | Node::LocalVariableOpWrite { value, .. }
             | Node::MultiWrite { value, .. }
