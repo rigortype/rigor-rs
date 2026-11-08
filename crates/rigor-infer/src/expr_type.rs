@@ -171,6 +171,14 @@ impl<'i> Typer<'i> {
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
+            // `@i` / `@@i` / `$g` reads bind through the same env map — only
+            // `bind_statements_into` (sig-gen's def-local replay) writes these
+            // sigilled keys, so `check`'s envs see `untyped` as before
+            // (rigor-rs#548).
+            Node::VariableRead { name, .. } => env
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| interner.untyped()),
             // `a, b = rhs` AS AN EXPRESSION is its right-hand side (Ruby: `(a, b
             // = [1, 2])` evaluates to `[1, 2]`). The reference routes
             // `Prism::MultiWriteNode` to `type_of_assignment_write`

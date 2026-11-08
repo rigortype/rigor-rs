@@ -126,10 +126,27 @@ impl<'i> Typer<'i> {
                     if clauses.is_empty() {
                         self.replay_statements(ast, env, body, interner, returns);
                     } else {
-                        let mut arms: Vec<Vec<NodeId>> = vec![main_body.clone()];
-                        arms.extend(clauses.iter().map(|c| c.body.clone()));
-                        let arm_refs: Vec<&[NodeId]> = arms.iter().map(Vec::as_slice).collect();
-                        self.join_arm_writes(ast, env, &arm_refs, interner, returns);
+                        let entry = env.clone();
+                        let mut arm_envs: Vec<TypeEnv> = Vec::new();
+                        let mut e = entry.clone();
+                        self.replay_statements(ast, &mut e, main_body, interner, returns);
+                        arm_envs.push(e);
+                        for c in clauses {
+                            let mut e = entry.clone();
+                            // A bare `rescue => e` binds `e : StandardError`
+                            // (a listed exception list is unmodelled — `e`
+                            // stays unbound in that arm, the decline side).
+                            if c.exceptions.is_empty() {
+                                if let Some(name) = &c.bound_name {
+                                    let ty =
+                                        self.nominal_or_untyped("StandardError", interner);
+                                    e.insert(name.clone(), ty);
+                                }
+                            }
+                            self.replay_statements(ast, &mut e, &c.body, interner, returns);
+                            arm_envs.push(e);
+                        }
+                        self.merge_arm_envs(entry, arm_envs, env, interner);
                     }
                     // `ensure` always runs — its writes apply after the join
                     // (`begin; a = 1; rescue; a = 2; ensure; a = 3; end` → 3).
@@ -157,6 +174,20 @@ impl<'i> Typer<'i> {
                 }
                 Node::Statements { body, .. } => {
                     self.replay_statements(ast, env, body, interner, returns);
+                }
+                // `@i = v` binds through the sigilled name — `def ivar;
+                // @i = 1; @i; end` reads `Constant[1]` (rigor-rs#548). Class/
+                // global writes keep the generic VariableWrite path
+                // (unbound — no sigilled read is ever inserted for them).
+                Node::InstanceVariableWrite { name, value, .. } => {
+                    let (name, value) = (name.clone(), *value);
+                    let ty = self.type_of(ast, value, env, interner);
+                    env.insert(name, ty);
+                }
+                Node::VariableWrite { name, value, .. } => {
+                    let (name, value) = (name.clone(), *value);
+                    let ty = self.type_of(ast, value, env, interner);
+                    env.insert(name, ty);
                 }
                 // A `x op= v` write's stored type is the dispatch result
                 // (`a + v` for `+=`, `narrow_truthy(a) | v` for `||=`) —
@@ -201,8 +232,6 @@ impl<'i> Typer<'i> {
         returns: &mut Vec<(NodeId, TypeId)>,
     ) {
         let entry = env.clone();
-        let nil = interner.nil();
-        let mut bound: Vec<String> = Vec::new();
         let mut arm_envs: Vec<TypeEnv> = Vec::new();
         for arm in arms {
             let mut e = entry.clone();
@@ -212,7 +241,22 @@ impl<'i> Typer<'i> {
         // An EMPTY arm contributes the entry env unchanged (the `else_body`
         // of an else-less `if` is `[]`, and the loop body's zero-iteration
         // path is `entry` itself — appended by callers below).
-        let _ = &arm_envs;
+        self.merge_arm_envs(entry, arm_envs, env, interner);
+    }
+
+    /// The merge tail of [`Self::join_arm_writes`]: every name an arm env
+    /// binds differently than `entry` becomes the union of the type each arm
+    /// leaves it at — the entry binding on an arm that does not rebind it,
+    /// `nil` when unbound both there and at entry.
+    fn merge_arm_envs(
+        &self,
+        entry: TypeEnv,
+        arm_envs: Vec<TypeEnv>,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        let nil = interner.nil();
+        let mut bound: Vec<String> = Vec::new();
         for ae in &arm_envs {
             for (name, _) in ae.iter() {
                 if !bound.contains(name) {
