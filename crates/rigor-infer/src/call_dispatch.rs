@@ -319,6 +319,15 @@ impl<'i> Typer<'i> {
         // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
             if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
+                // ConstantFolding `try_fold_self_return`
+                // (constant_folding.rb:318): a no-arg `freeze` / `itself` /
+                // `dup` / `clone` on a value-pinned receiver returns THE PIN
+                // — `"a".dup.zork` witnesses `for "a"` (rigor-rs#489).
+                if arg_scalars.is_empty()
+                    && matches!(method, "freeze" | "itself" | "dup" | "clone")
+                {
+                    return interner.intern(Type::Constant(scalar));
+                }
                 // Upstream v0.4.6 (#2125 / #2247): a String fold past the byte
                 // limit declines whole; the reference's next tier answers a
                 // `literal-string` carrier the port does not model, so the

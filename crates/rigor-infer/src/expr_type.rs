@@ -140,7 +140,24 @@ impl<'i> Typer<'i> {
             // bare `String` Nominal — a typo'd / non-core method on it (e.g.
             // `.squish`, `.constantize`) then resolves against the real String
             // RBS and is witnessed, matching the reference.
-            Node::InterpolatedString { .. } => self.nominal_or_untyped("String", interner),
+            Node::InterpolatedString { parts, .. } => {
+                // An adjacent literal concat `"a" "b"` lowers as an
+                // interpolated string whose every part is a StringLit; the
+                // reference answers the `literal-string` carrier the port does
+                // not model, so decline to `untyped` rather than mis-type it
+                // `String` (an FP source: `("a" "b" << "c").zork` and
+                // `("a" "b").concat("c").zork` both fired `for String` —
+                // rigor-rs#489).
+                let adjacent_literal_concat = !parts.is_empty()
+                    && parts
+                        .iter()
+                        .all(|p| matches!(ast.get(*p), Node::StringLit { .. }));
+                if adjacent_literal_concat {
+                    interner.untyped()
+                } else {
+                    self.nominal_or_untyped("String", interner)
+                }
+            }
             // An interpolated symbol (`:"a#{x}b"`) is always a `Symbol`
             // instance regardless of the interpolated values — a structural
             // twin of `InterpolatedString` above, differing only in the
