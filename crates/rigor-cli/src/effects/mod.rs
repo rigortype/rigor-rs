@@ -162,6 +162,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     };
     let mut format = String::from("text");
     let mut full = false;
+    let mut why = false;
     let mut explicit_config: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
     // The first unsupported report flag, in argv order.
@@ -181,6 +182,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
                 },
                 "format" => format = value.unwrap().as_str().to_string(),
                 "full" => full = true,
+                "why" => why = true,
                 // Accepted and deliberately inert, exactly as upstream accepts
                 // it on the report: an observation is undischarged, and only a
                 // JUDGMENT reads `effects.tolerated:`.
@@ -188,7 +190,7 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
                 // Report filters/expansions the slice-2 surface cannot
                 // compute faithfully (lane-aware label matching, the `why`
                 // expansion, the vocabulary list) — classified unsupported.
-                "label" | "pure" | "limit" | "why" | "list-labels" => {
+                "label" | "pure" | "limit" | "list-labels" => {
                     note(&format!("--{key}"), &mut unsupported);
                 }
                 _ => unreachable!("the switch table is closed"),
@@ -253,6 +255,13 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
 
     let project_root =
         std::env::current_dir().and_then(|dir| dir.canonicalize()).unwrap_or_else(|_| ".".into());
+    // rigor-rs#469: the selection set — the units a POSITIONAL path names —
+    // versus the units the analysis ran over (config `paths:` + positionals),
+    // is what `unselected` and the `showing N of M` header count. `files`
+    // resolves the union; the positional half resolves alone.
+    let pos_raw: Vec<&str> = positional.iter().map(String::as_str).collect();
+    let selected_files: std::collections::BTreeSet<String> =
+        resolve_paths(&pos_raw, &cfg).into_iter().collect();
     let rows = if carries_effect_annotations(&cfg, &config_path, &files, &project_root) {
         Vec::new()
     } else {
@@ -261,13 +270,18 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
         // than hard-coded: the plugin self-defense is a rule about the
         // exhaustiveness bit, not about the declared lane, and it is what
         // remains once the declared lane lands.
-        report_rows(&files, full, configures_plugins(&cfg))
+        report_rows(&files, &selected_files, configures_plugins(&cfg))
     };
 
+    // The header prints only when the user named a selection — a bare
+    // `effects` prints the rule + counts alone (oracle: `0 of 0 units`).
     if format == "json" {
-        println!("{}", render_json(&rows));
+        println!(
+            "{}",
+            render_json(&rows, full, positional.join(", ").as_str(), !positional.is_empty())
+        );
     } else {
-        render_text(&rows);
+        render_text(&rows, full, why, positional.join(", ").as_str(), !positional.is_empty());
     }
     ExitCode::SUCCESS
 }
@@ -427,6 +441,9 @@ fn configures_plugins(cfg: &crate::Config) -> bool {
 
 /// One method's row of the report.
 struct Row {
+    /// Whether any file contributing this unit sat inside the positional
+    /// selection (rigor-rs#469 — `unselected` totals count the rest).
+    selected: bool,
     key: String,
     effects: Vec<String>,
     exhaustive: bool,
@@ -440,15 +457,24 @@ impl Row {
     /// (`effect_table.rb:50`). The declared half is vacuous while the port's
     /// declared lane is always ∅. Reachable from slice 3 on, so the DEFAULT
     /// report now omits rows; the differential always passes `--full`.
+    #[cfg(test)]
     fn trivial(&self) -> bool {
         self.exhaustive && self.effects.iter().all(|label| label == "mutate.local")
     }
 }
 
-fn report_rows(files: &[String], full: bool, plugins: bool) -> Vec<Row> {
+fn report_rows(
+    files: &[String],
+    selected_files: &std::collections::BTreeSet<String>,
+    plugins: bool,
+) -> Vec<Row> {
     let mut merged: std::collections::BTreeMap<String, Summary> = std::collections::BTreeMap::new();
+    let mut selected_keys: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     for path in files {
         for (key, summary) in scan_file(path) {
+            if selected_files.contains(path) {
+                selected_keys.insert(key.clone());
+            }
             merged.entry(key).or_default().join(summary);
         }
     }
@@ -473,6 +499,7 @@ fn report_rows(files: &[String], full: bool, plugins: bool) -> Vec<Row> {
                 causes.push(("plugin-attribution".to_string(), None));
             }
             Row {
+                selected: selected_keys.contains(&key),
                 key,
                 effects: summary.proven(),
                 exhaustive,
@@ -480,8 +507,14 @@ fn report_rows(files: &[String], full: bool, plugins: bool) -> Vec<Row> {
                 direct: summary.bundles().clone(),
             }
         })
-        .filter(|row| full || !row.trivial())
         .collect()
+}
+
+/// The print filter — the reference shows only units whose proven label set
+/// is non-empty (an `[] …?` row is printed only under `--full`; an exhaustive
+/// `[]` row too — `effect_table.rb` selection), on SELECTED units only.
+fn printed(row: &Row, full: bool) -> bool {
+    row.selected && (full || !row.effects.is_empty())
 }
 
 /// One file's units, or nothing at all. Fail-soft per file, matching upstream's
@@ -501,47 +534,168 @@ fn scan_file(path: &str) -> std::collections::BTreeMap<String, Summary> {
     collect::scan(&result.node())
 }
 
-fn render_json(rows: &[Row]) -> String {
-    let mut methods = serde_json::Map::new();
-    for row in rows {
-        let direct: serde_json::Map<String, serde_json::Value> = row
-            .direct
-            .iter()
-            .map(|(origin, labels)| {
-                (origin.clone(), serde_json::Value::from(labels.iter().cloned().collect::<Vec<_>>()))
-            })
-            .collect();
-        // `[[cause, detail], …]` — upstream's spelling exactly: a JSON array of
-        // two-element arrays, `detail` a string or `null`, the pairs
-        // de-duplicated and sorted by `[cause, detail]` (`summary.rb:143`).
-        let causes: Vec<serde_json::Value> = row
-            .causes
-            .iter()
-            .map(|(cause, detail)| {
-                serde_json::json!([cause, detail.as_ref().map(String::as_str)])
-            })
-            .collect();
-        methods.insert(
-            row.key.clone(),
-            serde_json::json!({
-                "effects": row.effects,
-                "declared": Vec::<String>::new(),
-                "exhaustive": row.exhaustive,
-                "causes": causes,
-                "direct": direct,
-            }),
+/// The stderr preamble — the `showing N of M units` notice, or the
+/// `no effect unit is defined` form when the positional selection names no
+/// unit at all (rigor-rs#469, `effect_table.rb`'s report).
+fn header_line(rows: &[Row], full: bool, selection: &str) -> String {
+    if !rows.iter().any(|r| printed(r, full)) {
+        return format!(
+            "rigor: no effect unit is defined in {selection} (a path selects what is printed, not what is analysed)"
         );
     }
-    let doc = serde_json::to_string_pretty(&serde_json::json!({ "methods": methods }))
-        .unwrap_or_else(|_| "{\n  \"methods\": {}\n}".to_string());
-    crate::json_document::stamp_pretty(&doc, None)
+    format!(
+        "rigor: showing {} of {} units, selected by {}; a path narrows the printing and not the analysis, so every label is the one the whole-project run reports",
+        rows.iter().filter(|r| printed(r, full)).count(),
+        rows.len(),
+        selection
+    )
 }
 
-fn render_text(rows: &[Row]) {
-    for row in rows {
-        let suffix = if row.exhaustive { "" } else { " …?" };
-        println!("{}: [{}]{suffix}", row.key, row.effects.join(", "));
+fn render_json(rows: &[Row], full: bool, selection: &str, header: bool) -> String {
+    if header {
+        // The same `rigor: showing …` preamble the text format prints —
+        // a STDERR notice, not part of the document (rigor-rs#469).
+        eprintln!("{}", header_line(rows, full, selection));
     }
+    crate::json_document::stamp_pretty(&render_doc(rows, full), None)
+}
+
+/// The document body in the reference's KEY ORDER (Ruby preserves insertion
+/// order; serde_json sorts, so this renders by hand): `methods` rows carry
+/// `effects`, `declared`, `exhaustive`, `causes`, `direct`, `attribution`;
+/// `totals` carries `units`, `printed`, `omitted`, `unselected`, `proven`,
+/// `declared`, `exhaustive`, `truncated` (rigor-rs#469).
+fn render_doc(rows: &[Row], full: bool) -> String {
+    let esc = |v: &str| serde_json::to_string(v).unwrap_or_else(|_| "\"\"".to_string());
+    let array = |vals: &[String], indent: &str| {
+        if vals.is_empty() {
+            return "[]".to_string();
+        }
+        let inner = vals
+            .iter()
+            .map(|v| format!("{indent}  {}", esc(v)))
+            .collect::<Vec<_>>()
+            .join(",\n");
+        format!("[\n{inner}\n{indent}]")
+    };
+    let mut body = String::from("{\n  \"methods\": {");
+    let mut first_method = true;
+    for row in rows.iter().filter(|r| printed(r, full)) {
+        if first_method {
+            first_method = false;
+        } else {
+            body.push(',');
+        }
+        body.push_str(&format!("\n    {}: {{", esc(&row.key)));
+        body.push_str(&format!(
+            "\n      \"effects\": {},\n      \"declared\": [],\n      \"exhaustive\": {},",
+            array(&row.effects, "      "),
+            row.exhaustive
+        ));
+        if row.causes.is_empty() {
+            body.push_str("\n      \"causes\": [],");
+        } else {
+            body.push_str("\n      \"causes\": [");
+            let pairs = row
+                .causes
+                .iter()
+                .map(|(cause, detail)| {
+                    format!(
+                        "[\n          {},\n          {}\n        ]",
+                        esc(cause),
+                        detail.as_ref().map_or("null".to_string(), |d| esc(d))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",\n        ");
+            body.push_str(&format!("\n        {pairs}\n      ],"));
+        }
+        if row.direct.is_empty() {
+            body.push_str("\n      \"direct\": {},");
+        } else {
+            body.push_str("\n      \"direct\": {");
+            let entries = row
+                .direct
+                .iter()
+                .map(|(origin, labels)| {
+                    format!(
+                        "\n        {}: {}",
+                        esc(origin),
+                        array(&labels.iter().cloned().collect::<Vec<_>>(), "        ")
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            body.push_str(&format!("{entries}\n      }},"));
+        }
+        body.push_str("\n      \"attribution\": {}\n    }");
+    }
+    if first_method {
+        body.push_str("},\n  \"totals\": {");
+    } else {
+        body.push_str("\n  },\n  \"totals\": {");
+    }
+    let units = rows.len();
+    let printed_n = rows.iter().filter(|r| printed(r, full)).count();
+    body.push_str(&format!(
+        "\n    \"units\": {},\n    \"printed\": {},\n    \"omitted\": {},\n    \"unselected\": {},\n    \"proven\": {},\n    \"declared\": 0,\n    \"exhaustive\": {},\n    \"truncated\": 0\n  }}\n}}",
+        units,
+        printed_n,
+        rows.iter().filter(|r| r.selected && !printed(r, full)).count(),
+        rows.iter().filter(|r| !r.selected).count(),
+        rows.iter().filter(|r| printed(r, full) && !r.effects.is_empty()).count(),
+        rows.iter().filter(|r| printed(r, full) && r.exhaustive).count(),
+    ));
+    body
+}
+
+fn render_text(rows: &[Row], full: bool, why: bool, selection: &str, header: bool) {
+    let printed_rows: Vec<&Row> = rows.iter().filter(|r| printed(r, full)).collect();
+    if header {
+        eprintln!("{}", header_line(rows, full, selection));
+    }
+    for row in &printed_rows {
+        let suffix = if row.exhaustive { "" } else { " …?" };
+        // `(N reason, --why)` — the unresolved-cause count, pointing at the
+        // expansion flag; under `--why` the causes print on following lines
+        // instead (`effect_table.rb`'s report).
+        let hint = if !why && !row.causes.is_empty() {
+            format!(
+                " ({} reason{}, --why)",
+                row.causes.len(),
+                if row.causes.len() == 1 { "" } else { "s" }
+            )
+        } else {
+            String::new()
+        };
+        println!("{}: [{}]{suffix}{hint}", row.key, row.effects.join(", "));
+        if why {
+            for (cause, detail) in &row.causes {
+                match detail {
+                    Some(detail) => println!("    {cause} ({detail})"),
+                    None => println!("    {cause}"),
+                }
+            }
+        }
+    }
+    println!("──");
+    let units = rows.len();
+    let omitted = rows.iter().filter(|r| r.selected && !printed(r, full)).count();
+    let unselected = rows.iter().filter(|r| !r.selected).count();
+    let mut counts = format!("{} of {} units printed", printed_rows.len(), units);
+    if omitted > 0 {
+        counts.push_str(&format!("; {omitted} omitted (--full)"));
+    }
+    if unselected > 0 {
+        counts.push_str(&format!("{SEP} {unselected} not selected", SEP = if omitted > 0 { "," } else { ";" }));
+    }
+    println!("{counts}");
+    println!(
+        "{} carry a proven label · {} carry a declared (≤) one · {} are exhaustive",
+        printed_rows.iter().filter(|r| !r.effects.is_empty()).count(),
+        0,
+        printed_rows.iter().filter(|r| r.exhaustive).count(),
+    );
 }
 
 #[cfg(test)]
@@ -567,6 +721,10 @@ pub(crate) mod tests_support {
 
 #[cfg(test)]
 mod tests {
+    fn all_files(files: &[String]) -> std::collections::BTreeSet<String> {
+        files.iter().cloned().collect()
+    }
+
     use super::*;
 
     #[test]
@@ -586,6 +744,7 @@ mod tests {
 
     fn row(key: &str, effects: &[&str], exhaustive: bool, causes: &[(&str, Option<&str>)]) -> Row {
         Row {
+            selected: true,
             key: key.to_string(),
             effects: effects.iter().map(|l| (*l).to_string()).collect(),
             exhaustive,
@@ -607,6 +766,7 @@ mod tests {
     #[test]
     fn the_json_is_the_shape_the_grader_consumes() {
         let rows = vec![Row {
+            selected: true,
             key: "C#m".to_string(),
             effects: vec!["io.fs.read".to_string()],
             exhaustive: false,
@@ -616,7 +776,7 @@ mod tests {
                 .collect(),
         }];
         let payload: serde_json::Value =
-            serde_json::from_str(&render_json(&rows)).expect("valid JSON");
+            serde_json::from_str(&render_json(&rows, true, "", false)).expect("valid JSON");
         let entry = &payload["methods"]["C#m"];
         assert_eq!(entry["effects"], serde_json::json!(["io.fs.read"]));
         assert_eq!(entry["declared"], serde_json::json!([]));
@@ -628,7 +788,7 @@ mod tests {
         // A cause with no detail renders `null`, not the string "null".
         let bare = vec![row("C#n", &[], false, &[("dynamic-send", None)])];
         let payload: serde_json::Value =
-            serde_json::from_str(&render_json(&bare)).expect("valid JSON");
+            serde_json::from_str(&render_json(&bare, true, "", false)).expect("valid JSON");
         assert_eq!(payload["methods"]["C#n"]["causes"], serde_json::json!([["dynamic-send", null]]));
 
         // An exhaustive row carries NO causes — the port's own
@@ -636,14 +796,14 @@ mod tests {
         // marker broke.
         let clean = vec![row("C#o", &[], true, &[])];
         let payload: serde_json::Value =
-            serde_json::from_str(&render_json(&clean)).expect("valid JSON");
+            serde_json::from_str(&render_json(&clean, true, "", false)).expect("valid JSON");
         assert_eq!(payload["methods"]["C#o"]["exhaustive"], serde_json::json!(true));
         assert_eq!(payload["methods"]["C#o"]["causes"], serde_json::json!([]));
 
         // An empty report is still a parseable object — the grader reads
         // `None` as INVALID, not as "0 methods".
         let empty: serde_json::Value =
-            serde_json::from_str(&render_json(&[])).expect("valid JSON");
+            serde_json::from_str(&render_json(&[], true, "", false)).expect("valid JSON");
         assert_eq!(empty["methods"], serde_json::json!({}));
     }
 
@@ -690,7 +850,7 @@ mod tests {
         );
         // THE CONTROL: the same file set, through the same report path, must
         // produce a method. Without this the negative case above proves nothing.
-        let rows = report_rows(&files, true, false);
+        let rows = report_rows(&files, &all_files(&files), false);
         assert_eq!(rows.len(), 1, "the control project must report its method");
         assert_eq!(rows[0].key, "X#m");
         assert_eq!(rows[0].effects, ["io.output.stdout"]);
@@ -720,7 +880,7 @@ mod tests {
         // this method MUST come out exhaustive. If it does not, the taint bit is
         // unreachable and every 0-OVER verdict below is vacuous.
         let files = vec![root.join("lib/x.rb").to_string_lossy().into_owned()];
-        let rows = report_rows(&files, true, false);
+        let rows = report_rows(&files, &all_files(&files), false);
         assert_eq!(rows.len(), 1);
         assert!(rows[0].exhaustive, "a plugin-free project must still reach exhaustiveness");
         assert!(rows[0].causes.is_empty());
@@ -739,7 +899,7 @@ mod tests {
         // rows are still reported, which is what makes this narrower than the
         // annotation self-defense's `methods: {}`.
         let files = vec![root.join("lib/x.rb").to_string_lossy().into_owned()];
-        let rows = report_rows(&files, true, true);
+        let rows = report_rows(&files, &all_files(&files), true);
         assert_eq!(rows.len(), 1, "the rows themselves are NOT withheld");
         assert_eq!(rows[0].effects, ["io.output.stdout"]);
         assert!(!rows[0].exhaustive);
@@ -850,7 +1010,7 @@ mod tests {
         // be reported, and must still produce its method with its real label.
         std::fs::write(&config_path, b"paths:\n  - lib\neffects:\n  tolerated: [io.fs]\n").unwrap();
         assert!(!carries_effect_annotations(&cfg, &config_path, &files, &root));
-        let rows = report_rows(&files, true, false);
+        let rows = report_rows(&files, &all_files(&files), false);
         assert_eq!(rows.len(), 1, "the control project must report its method");
         assert_eq!(rows[0].key, "X#m");
         assert_eq!(rows[0].effects, ["io.output.stdout"]);
@@ -882,7 +1042,7 @@ mod tests {
         // degenerates into "suppress every project".
         let plugin_free = scratch_config(&root);
         assert!(!carries_effect_annotations(&plugin_free, &config_path, &files, &root));
-        let rows = report_rows(&files, true, configures_plugins(&plugin_free));
+        let rows = report_rows(&files, &all_files(&files), configures_plugins(&plugin_free));
         assert_eq!(rows.len(), 1, "the control project must report its method");
         assert_eq!(rows[0].key, "X#m");
         assert_eq!(rows[0].effects, ["io.output.stdout"]);
