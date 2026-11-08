@@ -1505,3 +1505,16 @@ fn def_local_env_declines_a_loop_the_reference_folds() {
     assert_eq!(rows["w2"], "def w2: (untyped) -> (\"s\" | 1)");
     assert_eq!(rows["l4"], "def l4: (untyped) -> (1 | nil)");
 }
+
+#[test]
+fn def_local_env_parameter_shadows_a_file_level_local() {
+    // A parameter is a fresh binding: `x = "top"; def b2(x); x; end` reads the
+    // argument, not the file-level `"top"` (the reference skips it; pre-#546
+    // the port leaked the file env into the def body).
+    let cs = candidates_tagged(
+        "def_local_param_shadow",
+        "x = \"top\"\nclass K\n  def b2(x); x; end\n  def b3(y); x; end\nend\n",
+        false,
+    );
+    assert!(cs.is_empty(), "{cs:?}");
+}

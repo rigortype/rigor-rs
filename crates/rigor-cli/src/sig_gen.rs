@@ -2007,8 +2007,18 @@ fn method_candidate(
     // The replay covers the WHOLE body — a `return` under the tail `if`
     // still types at its position (the tail's own writes bind nothing the
     // tail read needs that a later statement could invalidate).
+    // A parameter SHADOWS a same-named file-level local — the def body is a
+    // fresh scope (`x = "top"; def b2(x); x; end` reads the argument, not
+    // `"top"`; the reference skips it). Bind each to `untyped` first.
+    let mut entry = env.clone();
+    if let Some(names) = sig.params.as_ref() {
+        let untyped = interner.untyped();
+        for name in names {
+            entry.insert(name.clone(), untyped);
+        }
+    }
     let (local, positional_returns) =
-        typer.bind_statements_into_with_returns(ast, env, sig.body, interner);
+        typer.bind_statements_into_with_returns(ast, &entry, sig.body, interner);
     let env = &local;
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
