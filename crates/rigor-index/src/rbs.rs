@@ -3452,7 +3452,10 @@ impl CoreData {
     /// ingestion itself can never recurse, so a self- or mutually-referential
     /// alias (`type a = a`) is retained without any risk of a build-time loop.
     pub fn resolve_type_alias(&self, name: &str) -> Option<&RetainedParamType> {
-        self.type_alias_defs.get(name.strip_prefix("::").unwrap_or(name))
+        let key = name.strip_prefix("::").unwrap_or(name);
+        self.type_alias_defs
+            .get(key)
+            .or_else(|| self.type_alias_defs.get(key.rsplit("::").next().unwrap_or(key)))
     }
 
     /// The declared type-parameter names of a `type` alias (`type range[T] =
@@ -3461,8 +3464,10 @@ impl CoreData {
     /// arguments — the reference `expand_alias2(name, args)` semantics — which
     /// the translated-describe label applies before rendering the expansion.
     pub fn type_alias_params(&self, name: &str) -> Option<&[&'static str]> {
+        let key = name.strip_prefix("::").unwrap_or(name);
         self.type_alias_params
-            .get(name.strip_prefix("::").unwrap_or(name))
+            .get(key)
+            .or_else(|| self.type_alias_params.get(key.rsplit("::").next().unwrap_or(key)))
             .map(|v| v.as_slice())
     }
 
@@ -4986,7 +4991,7 @@ impl Builder {
                 _ => None,
             })
             .collect();
-        let rhs = retained_param_type(&ta.type_(), code, ctx);
+        let rhs = retained_param_type(&ta.type_(), code, ctx, enclosing, &self.known_type_names);
         self.type_alias_defs.entry(name).or_insert(rhs);
         self.type_alias_params.entry(name).or_insert(params);
     }
@@ -5156,6 +5161,7 @@ impl Builder {
 
     /// Upstream v0.4.2 (#1662): the ivar slot a non-singleton attribute
     /// member types (see [`ClassEntry::ivar_types`]).
+    #[allow(clippy::too_many_arguments)]
     fn record_attr_ivar(
         entry: &mut ClassEntry,
         name: &str,
@@ -5163,13 +5169,15 @@ impl Builder {
         ty: &Node,
         code: &str,
         ctx: Option<&FileSigCtx>,
+        enclosing: &[&'static str],
+        known: &HashSet<&'static str>,
     ) {
         let key = match ivar {
             ruby_rbs::node::AttrIvarName::Unspecified => intern(&format!("@{name}")),
             ruby_rbs::node::AttrIvarName::Empty => return,
             ruby_rbs::node::AttrIvarName::Name(_) => "*",
         };
-        let ty = retained_param_type(ty, code, ctx);
+        let ty = retained_param_type(ty, code, ctx, enclosing, known);
         entry.ivar_types.entry(key).or_insert(ty);
     }
 
@@ -5323,12 +5331,12 @@ impl Builder {
                         if md.overloading() {
                             entry
                                 .overloading_method_overloads
-                                .push((mname, method_overloads(&md, code, ctx)));
+                                .push((mname, method_overloads(&md, code, ctx, enclosing, &self.known_type_names)));
                         } else {
                             entry
                                 .method_overloads
                                 .entry(mname)
-                                .or_insert_with(|| method_overloads(&md, code, ctx));
+                                .or_insert_with(|| method_overloads(&md, code, ctx, enclosing, &self.known_type_names));
                         }
                     }
                     if matches!(
@@ -5358,12 +5366,12 @@ impl Builder {
                         if md.overloading() {
                             entry
                                 .overloading_singleton_overloads
-                                .push((mname, method_overloads(&md, code, ctx)));
+                                .push((mname, method_overloads(&md, code, ctx, enclosing, &self.known_type_names)));
                         } else {
                             entry
                                 .singleton_method_overloads
                                 .entry(mname)
-                                .or_insert_with(|| method_overloads(&md, code, ctx));
+                                .or_insert_with(|| method_overloads(&md, code, ctx, enclosing, &self.known_type_names));
                         }
                     }
                 }
@@ -5374,7 +5382,7 @@ impl Builder {
                 // singleton (`attr_reader self.x`).
                 Node::AttrReader(a) => {
                     if a.kind() != AttributeKind::Singleton {
-                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx);
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, &self.known_type_names);
                     }
                     // Issue #168: a non-singleton attribute's TYPE is a
                     // member-level reference (`kind == :singleton` stands it
@@ -5389,7 +5397,7 @@ impl Builder {
                 }
                 Node::AttrWriter(a) => {
                     if a.kind() != AttributeKind::Singleton {
-                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx);
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, &self.known_type_names);
                     }
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
@@ -5401,7 +5409,7 @@ impl Builder {
                 }
                 Node::AttrAccessor(a) => {
                     if a.kind() != AttributeKind::Singleton {
-                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx);
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, &self.known_type_names);
                     }
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
@@ -5412,7 +5420,7 @@ impl Builder {
                     Self::record_attr(entry, a.kind(), name, true, true);
                 }
                 Node::InstanceVariable(iv) => {
-                    let ty = retained_param_type(&iv.type_(), code, ctx);
+                    let ty = retained_param_type(&iv.type_(), code, ctx, enclosing, &self.known_type_names);
                     entry.ivar_types.entry(intern(iv.name().as_str())).or_insert(ty);
                 }
                 Node::Include(inc) => {
@@ -7102,6 +7110,8 @@ fn method_overloads(
     md: &ruby_rbs::node::MethodDefinitionNode,
     code: &str,
     ctx: Option<&FileSigCtx>,
+    enclosing: &[&'static str],
+    known: &HashSet<&'static str>,
 ) -> Vec<OverloadSignature> {
     let mut out: Vec<OverloadSignature> = Vec::new();
     for overload in md.overloads().iter() {
@@ -7123,16 +7133,16 @@ fn method_overloads(
         // while the single-overload channel walks the raw `param.type` — where
         // a bare variable admits `nil` and is never faithfully checkable, so it
         // declines there.
-        let bounds = method_type_param_bounds(&mt, code, ctx);
+        let bounds = method_type_param_bounds(&mt, code, ctx, enclosing, known);
         let required_positionals = ft
             .required_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, ctx))
+            .map(|p| param_node_type(&p, code, ctx, enclosing, known))
             .collect();
         let optional_positionals = ft
             .optional_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, ctx))
+            .map(|p| param_node_type(&p, code, ctx, enclosing, known))
             .collect();
         let required_positional_names = ft
             .required_positionals()
@@ -7187,6 +7197,8 @@ fn method_type_param_bounds(
     mt: &ruby_rbs::node::MethodTypeNode,
     code: &str,
     ctx: Option<&FileSigCtx>,
+    enclosing: &[&'static str],
+    known: &HashSet<&'static str>,
 ) -> Vec<(&'static str, RetainedParamType)> {
     mt.type_params()
         .iter()
@@ -7203,16 +7215,22 @@ fn method_type_param_bounds(
             // The bound is resolved with NO bounds in scope: a bound that
             // itself mentions a sibling variable is not a shape rbs core uses,
             // and resolving it would need fixpoint ordering for no gain.
-            Some((intern(name), retained_param_type(&bound, code, ctx)))
+            Some((intern(name), retained_param_type(&bound, code, ctx, enclosing, known)))
         })
         .collect()
 }
 
 /// Resolve a positional-parameter node (`RBS::Types::Function::Param`, whose
 /// `.type_()` is the parameter's type) into a one-level [`RetainedParamType`].
-fn param_node_type(param: &Node, code: &str, ctx: Option<&FileSigCtx>) -> RetainedParamType {
+fn param_node_type(
+    param: &Node,
+    code: &str,
+    ctx: Option<&FileSigCtx>,
+    enclosing: &[&'static str],
+    known: &HashSet<&'static str>,
+) -> RetainedParamType {
     match param {
-        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, ctx),
+        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, ctx, enclosing, known),
         // Defensive: a positional that isn't a FunctionParam node (shouldn't
         // occur) is retained verbatim as an `Other` leaf.
         other => RetainedParamType::Other(node_written_form(other, code)),
@@ -7240,6 +7258,8 @@ fn retained_param_type(
     node: &Node,
     code: &str,
     ctx: Option<&FileSigCtx>,
+    enclosing: &[&'static str],
+    known: &HashSet<&'static str>,
 ) -> RetainedParamType {
     match node {
         Node::VariableType(v) => {
@@ -7255,19 +7275,32 @@ fn retained_param_type(
                 name,
                 ci.args()
                     .iter()
-                    .map(|a| retained_param_type(&a, code, ctx))
+                    .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
                     .collect(),
             ),
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::AliasType(a) => match retained_name(ctx, &a.name()) {
-            Some(name) => RetainedParamType::Alias(
-                name,
-                a.args()
-                    .iter()
-                    .map(|a| retained_param_type(&a, code, ctx))
-                    .collect(),
-            ),
+            Some(name) => {
+                // A bare alias written inside a declaration resolves to the
+                // alias that declaration defines — `selector` inside
+                // `class String` retains `String::selector`, the reference's
+                // env-qualified name its `expected:` label renders
+                // (rigor-rs#463).
+                let name = if !name.contains("::") && !enclosing.is_empty() {
+                    let qual = format!("{}::{name}", enclosing.join("::"));
+                    known.get(qual.as_str()).copied().unwrap_or(name)
+                } else {
+                    name
+                };
+                RetainedParamType::Alias(
+                    name,
+                    a.args()
+                        .iter()
+                        .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
+                        .collect(),
+                )
+            }
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::InterfaceType(i) => match retained_name(ctx, &i.name()) {
@@ -7275,7 +7308,7 @@ fn retained_param_type(
                 name,
                 i.args()
                     .iter()
-                    .map(|a| retained_param_type(&a, code, ctx))
+                    .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
                     .collect(),
             ),
             None => RetainedParamType::Other(node_written_form(node, code)),
@@ -7283,18 +7316,20 @@ fn retained_param_type(
         Node::UnionType(u) => RetainedParamType::Union(
             u.types()
                 .iter()
-                .map(|t| retained_param_type(&t, code, ctx))
+                .map(|t| retained_param_type(&t, code, ctx, enclosing, known))
                 .collect(),
         ),
         Node::OptionalType(o) => RetainedParamType::Optional(Box::new(retained_param_type(
             &o.type_(),
             code,
             ctx,
+            enclosing,
+            known,
         ))),
         Node::TupleType(t) => RetainedParamType::Tuple(
             t.types()
                 .iter()
-                .map(|e| retained_param_type(&e, code, ctx))
+                .map(|e| retained_param_type(&e, code, ctx, enclosing, known))
                 .collect(),
         ),
         other => RetainedParamType::Other(node_written_form(other, code)),
