@@ -259,9 +259,16 @@ pub fn cmd_effects(args: &[String]) -> ExitCode {
     // versus the units the analysis ran over (config `paths:` + positionals),
     // is what `unselected` and the `showing N of M` header count. `files`
     // resolves the union; the positional half resolves alone.
-    let pos_raw: Vec<&str> = positional.iter().map(String::as_str).collect();
-    let selected_files: std::collections::BTreeSet<String> =
-        resolve_paths(&pos_raw, &cfg).into_iter().collect();
+    // rigor-rs#469 review: an EMPTY positional selects EVERYTHING the
+    // analysis ran over — `effects` bare prints the project, not `0 of N
+    // units; N not selected` (probe-verified: config-free and
+    // config-`paths:` projects alike).
+    let selected_files: std::collections::BTreeSet<String> = if positional.is_empty() {
+        files.iter().cloned().collect()
+    } else {
+        let pos_raw: Vec<&str> = positional.iter().map(String::as_str).collect();
+        resolve_paths(&pos_raw, &cfg).into_iter().collect()
+    };
     let rows = if carries_effect_annotations(&cfg, &config_path, &files, &project_root) {
         Vec::new()
     } else {
