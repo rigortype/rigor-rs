@@ -243,6 +243,39 @@ impl DeadPositions {
         }) {
             return false;
         }
+        // A `for`'s `break` argument is `bare_locals_only` — `eval_for`
+        // runs no writeback and joins the argument's discarded scope for
+        // locals only, so a write inside it lands on the post-loop join
+        // (`for i in [1]; break (h = {}); end; h.frob` reads `1 | {}`
+        // on the oracle) and on the argument's own evaluated scope, but
+        // NEVER on a read the owning `for` body still contains
+        // (`h[:a].inbody` after `break (h = {})` keeps the `"s" | 1`
+        // record — rigor-rs#411). "Owning" is the SMALLEST loop carrier
+        // holding the write: a read later in an OUTER loop's body
+        // (`while c; for i; break (h = {}); end; h.f; end`) does see the
+        // landed scope. A `while`/`until` `break` argument's rebind
+        // still reaches in-body reads — its fixpoint replays it.
+        if self.bare.iter().any(|&b| contains(b, write))
+            // The argument's own evaluated scope is exempt, not ANY
+            // bare span — a sibling `break` argument reads the body's
+            // env, not this argument's discarded one.
+            && !self
+                .bare
+                .iter()
+                .any(|&b| contains(b, write) && contains(b, use_))
+            && self
+                .loops
+                .iter()
+                .filter(|&&l| contains(l, write))
+                .min_by_key(|l| l.1 - l.0)
+                // The use must START inside the owning loop: a zero-width
+                // continuation probe at (end, end) sits at the `for`'s
+                // own end, where the argument's landed scope DOES apply
+                // (the post-loop join carries it).
+                .is_some_and(|&l| l.0 <= use_.0 && use_.0 < l.1)
+        {
+            return false;
+        }
         if let Some(arm) = self.rescue.iter().find(|a| contains(a.span, write)) {
             // "Inside the arm" must start BEFORE its clipped end: the last
             // clause's span runs to the `begin`'s own `end`, so a zero-width
