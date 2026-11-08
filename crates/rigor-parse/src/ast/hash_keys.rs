@@ -129,12 +129,11 @@ fn parse_ruby_integer(raw: &str) -> Option<i128> {
     Some(if neg { -mag } else { mag })
 }
 
-/// Ruby `String#inspect` for the duplicate-hash-key label of a STRING key. Wraps
-/// in double quotes and escapes the characters Ruby escapes in a double-quoted
-/// literal. Covers the ASCII forms that appear as hash-key literals; a byte-exact
-/// match of Ruby's full Unicode escaping is out of scope (string keys with
-/// control/non-ASCII bytes duplicated in one literal do not occur in the probe
-/// matrix or realistic corpora).
+/// Ruby `String#inspect` for the duplicate-hash-key label of a STRING key.
+/// Wraps in double quotes and escapes the characters Ruby escapes in a
+/// double-quoted literal — on the PINNED Ruby (4.x), named escapes plus
+/// `\uNNNN` for every other non-printable (never `\0`/`\xNN`); non-ASCII
+/// printable characters emit raw (rigor-rs#493 item 3).
 fn ruby_inspect_string(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -145,14 +144,25 @@ fn ruby_inspect_string(s: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
-            '\0' => out.push_str("\\0"),
             '\x07' => out.push_str("\\a"),
             '\x08' => out.push_str("\\b"),
             '\x0c' => out.push_str("\\f"),
             '\x0b' => out.push_str("\\v"),
             '\x1b' => out.push_str("\\e"),
             '#' => out.push('#'),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\x{:02X}", c as u32)),
+            c if (c as u32) < 0x20
+                || c == '\x7f'
+                || (0x80..=0x9f).contains(&(c as u32))
+                || (0x200e..=0x200f).contains(&(c as u32))
+                || (0x2028..=0x202e).contains(&(c as u32))
+                || (0x2066..=0x2069).contains(&(c as u32))
+                || (0xfff9..=0xfffb).contains(&(c as u32))
+                || (0xd800..=0xdfff).contains(&(c as u32))
+                || (0x10fffe..=0x10ffff).contains(&(c as u32))
+                || (c as u32) == 0xfeff =>
+            {
+                out.push_str(&format!("\\u{:04X}", c as u32))
+            }
             c => out.push(c),
         }
     }

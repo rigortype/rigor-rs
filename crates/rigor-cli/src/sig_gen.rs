@@ -202,6 +202,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let mut overwrite = false;
     let mut explicit_config: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
+    let mut mode_given = false;
     // The first flag naming machinery this slice does not port (in argv order,
     // so the diagnostic names the first offender).
     let mut deferred: Option<String> = None;
@@ -214,9 +215,17 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => positional.push(p),
             Item::Opt { key, value, .. } => match key {
-                "print" => mode = "print",
-                "diff" => mode = "diff",
-                "write" => mode = "write",
+                "print" | "diff" | "write" | "check" => {
+                    // `select_mode`: a second, different mode flag is a usage
+                    // error, not last-one-wins.
+                    if mode_given && mode != key {
+                        mode = "conflict";
+                    }
+                    mode_given = true;
+                    if mode != "conflict" {
+                        mode = key;
+                    }
+                }
                 "overwrite" => overwrite = true,
                 "include-private" => include_private = true,
                 // No persistent analysis cache exists in the port.
@@ -224,9 +233,6 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 "format" => format = value.unwrap().as_str().to_string(),
                 "params" => params = value.unwrap().as_str().to_string(),
                 "observe" => defer("--observe", &mut deferred),
-                // ADR-112 WD4's dry-run gate — the writer's compare mode is
-                // not ported.
-                "check" => defer("--check", &mut deferred),
                 "effect-envelopes" => defer("--effect-envelopes", &mut deferred),
                 "new-files" => defer("--new-files", &mut deferred),
                 "new-methods" => defer("--new-methods", &mut deferred),
@@ -242,6 +248,10 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
 
     // `validation_error` — inside `parse_options`, before `Configuration.load`,
     // each failure a `sig-gen: <msg>` line + exit 64.
+    if mode == "conflict" {
+        eprintln!("sig-gen: --print, --diff, --write, and --check are mutually exclusive flags; pick one");
+        return ExitCode::from(64);
+    }
     if !matches!(format.as_str(), "text" | "json") {
         eprintln!("sig-gen: unsupported --format={format}");
         return ExitCode::from(64);
@@ -303,8 +313,11 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
 
-    if mode == "write" {
-        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env);
+    if mode == "write" || mode == "check" {
+        // ADR-112 WD4 — `--check` is the writer's dry-run compare mode: same
+        // routing and merge decisions, nothing reaches disk, and the verdict
+        // is the exit status.
+        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env, mode == "check");
         return if path_status != ExitCode::SUCCESS { path_status } else { status };
     }
 
@@ -312,7 +325,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // declaration during merge); on a print/diff run it is inert, exactly like the
     // reference (the flag lives on the Writer).
 
-    let Generated { candidates, unresolvable, skips, .. } =
+    let Generated { candidates, all_rows, unresolvable, skips, .. } =
         generate_run(&files, include_private, &sig_env, &writes);
 
     // `--format json` renders the candidate table regardless of print/diff mode
@@ -321,7 +334,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         ("json", _) if !path_errors.is_empty() => {
             // The reference's key order (`Diagnostic#to_h`), which a
             // `serde_json::Value` map would sort.
-            let head = candidates_json_string(&candidates);
+            let head = candidates_json_string(&all_rows);
             let head = head.strip_suffix("\n}").unwrap_or(&head);
             let q = |v: &str| serde_json::to_string(v).unwrap();
             let rows: Vec<String> = path_errors
@@ -339,7 +352,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 .collect();
             println!("{head},\n  \"diagnostics\": [\n{}\n  ]\n}}", rows.join(",\n"));
         }
-        ("json", _) => render_json(&candidates),
+        ("json", _) => render_json(&all_rows),
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
     }
@@ -514,8 +527,8 @@ fn generate_run(
         candidates.extend(cs);
         info.absorb(i);
     }
-    let (candidates, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
-    Generated { candidates, info, unresolvable: report, skips }
+    let (candidates, all_rows, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
+    Generated { candidates, all_rows, info, unresolvable: report, skips }
 }
 
 /// One run's output: the emittable candidates (`new_method` / `tighter_return`),
@@ -524,6 +537,10 @@ fn generate_run(
 /// [`report_skipped`]).
 struct Generated {
     candidates: Vec<Candidate>,
+    /// Every considered row in candidate order — emittable AND `skipped`
+    /// rows (reference `filter(candidates, with_skipped: true)` for the
+    /// `--print --format json` payload; `dropped` rows stay out).
+    all_rows: Vec<Candidate>,
     info: NamespaceInfo,
     unresolvable: Vec<UnresolvableSuperclass>,
     skips: Vec<&'static str>,
@@ -598,7 +615,7 @@ fn finalize_superclasses(
     info: &mut NamespaceInfo,
     sig_env: &SigEnv,
     written: &dyn Fn(&Candidate) -> bool,
-) -> (Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
+) -> (Vec<Candidate>, Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
     let index = CoreIndex::new();
     let rbs_known = |name: &str| sig_env.class_known(&index, name);
     // Every row counts, emitted or not (`candidates.each_with_object`): the
@@ -724,6 +741,7 @@ fn finalize_superclasses(
     // `unresolvable-superclass` skip, which the summary does not count.
     let mut owners: Vec<(String, String)> = Vec::new();
     let mut out: Vec<Candidate> = Vec::new();
+    let mut all_rows: Vec<Candidate> = Vec::new();
     let mut skips: Vec<&'static str> = Vec::new();
     for mut c in candidates {
         match owner_of(&c.class_name, &unresolvable) {
@@ -731,12 +749,28 @@ fn finalize_superclasses(
                 if !owners.iter().any(|(n, _)| *n == owner.0) {
                     owners.push(owner);
                 }
+                // Demoted by an earlier fixpoint pass already; a class the
+                // SECOND pass (after the override demotion) first marks
+                // unresolvable is demoted here — the JSON payload lists the
+                // row either way.
+                // The reference demotes EVERY row of the class — an earlier
+                // `untyped-return` reason is replaced too.
+                if c.skip_reason != Some("sig.skipped.unresolvable-superclass") {
+                    c = demoted(c, "sig.skipped.unresolvable-superclass");
+                }
+                all_rows.push(c);
             }
             None if emittable(&c) => {
                 c.decl_header = declaration_header(info, &c.class_name);
+                all_rows.push(clone_candidate(&c));
                 out.push(c);
             }
-            None => skips.extend(c.skip_reason),
+            None => {
+                skips.extend(c.skip_reason);
+                if c.skip_reason.is_some() {
+                    all_rows.push(c);
+                }
+            }
         }
     }
 
@@ -767,7 +801,7 @@ fn finalize_superclasses(
             UnresolvableSuperclass { class_name, superclass: if project { token } else { root }, project }
         })
         .collect();
-    (out, skips, report)
+    (out, all_rows, skips, report)
 }
 
 /// Reference `Generator#demote_overridden_base_methods` (#744): a base
@@ -822,6 +856,9 @@ fn demote_overridden_base_methods(
 fn demoted(mut c: Candidate, reason: &'static str) -> Candidate {
     c.classification = "skipped";
     c.skip_reason = Some(reason);
+    // The reference's `demoted_candidate` rebuilds WITHOUT `rbs`, so the
+    // JSON row omits the key.
+    c.rbs = String::new();
     c
 }
 
@@ -2261,9 +2298,9 @@ fn method_candidate(
 ) -> Option<Candidate> {
     // Visibility: skip private / protected unless `--include-private` (reference
     // `visibility_excludes?` — returns false for a singleton AND for a
-    // `module_function` def, whose instance copy's privacy does not exclude
-    // it: `module_function; def u = 1; private; def u = 9` still writes the
-    // singleton copy — rigor-rs#523).
+    // module_function def, whose `self?.` row writes the singleton half the
+    // running `private` never touched — `mf; private; def g; mf; def h` emits
+    // `self?.h`, rigor-rs#493 item 10).
     if !include_private
         && !sig.singleton
         && !sig.module_function
@@ -2332,7 +2369,7 @@ fn method_candidate(
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, sig.body, env, interner) else { return row(None) };
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -2389,7 +2426,12 @@ fn method_candidate(
             return row(Some("sig.skipped.untyped-return"));
         }
         if e.contains("untyped") {
-            return row(None);
+            // …unless the untyped sits inside a bare generic's type-arg slot:
+            // `Range[untyped]` / `Array[untyped]` are the reference's own
+            // elaborated emits (rigor-rs#493 item 7), not inference holes.
+            if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
         }
         // A bare GENERIC nominal member (`Array` / `Hash` / …) would be
         // `Array[untyped]` after the reference's `TypeElaborator` fill (deferred
@@ -2736,9 +2778,13 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
 /// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
 /// `annotate` deferral) and is then skipped upstream.
+#[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
@@ -2757,7 +2803,121 @@ fn def_return_type(
         },
         _ => tail,
     };
+    // Literal carriers `type_of` leaves Dynamic — sig-gen still emits their
+    // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
+    // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
+    // through recovery, so no dedicated node exists here).
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
+        return Some(lit);
+    }
     Some(typer.type_of(ast, target, env, interner))
+}
+
+/// The sig-gen-side nominal for a literal tail `check` leaves Dynamic
+/// (rigor-rs#493 item 7). `Range[T]` takes the union of its bounds' nominal
+/// CLASS names — `1..2` ⇒ `Integer`, `1...2.5` ⇒ `Float | Integer`; a
+/// `Dynamic` or `nil` bound contributes nothing (`(x..2)` ⇒ `Range[Integer]`,
+/// `(x..)` ⇒ `Range[untyped]`).
+#[allow(clippy::too_many_arguments)]
+fn literal_tail_nominal(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> Option<TypeId> {
+    let bare = |name: &str, interner: &mut Interner| {
+        index
+            .class_id(name)
+            .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+    };
+    match ast.get(target) {
+        Node::RegexpLit { .. } => bare("Regexp", interner),
+        Node::RationalLit { .. } => bare("Rational", interner),
+        Node::ImaginaryLit { .. } => bare("Complex", interner),
+        Node::Range { left, right, .. } => {
+            // Each bound contributes its ERASED member form: a scalar
+            // `Constant` widens to its class (`1` ⇒ `Integer`), a
+            // Tuple/HashShape keeps its literal shape (`[1]`, `{ a: 1 }`),
+            // and a bare generic nominal elaborates its args to `untyped`
+            // (`Array.new` ⇒ `Array[untyped]`). `nil` and `Dynamic` members
+            // contribute nothing (rigor-rs#493 item 7).
+            let mut arg_members: Vec<TypeId> = Vec::new();
+            for bound in [left, right].into_iter().flatten() {
+                let ty = typer.type_of(ast, *bound, env, interner);
+                // A bound that types DIRECTLY to a scalar Constant widens to
+                // its class; a UNION bound's members contribute as-is —
+                // literal `2` stays `2`, a `nil` member stays `nil` (the
+                // reference's range_endpoint_element_type recurses over the
+                // member list but does not widen inside it).
+                let (ms, widen) = match interner.get(ty) {
+                    Type::Union(ms) => (ms.clone(), false),
+                    _ => (vec![ty], true),
+                };
+                for m in ms {
+                    if matches!(interner.get(m), Type::Dynamic(_)) {
+                        continue;
+                    }
+                    let member = match interner.get(m) {
+                        // `nil` contributes nothing as a WHOLE bound (but a
+                        // union's `nil` member is kept, above).
+                        Type::Constant(rigor_types::Scalar::Nil) if widen => continue,
+                        Type::Constant(_) if widen => {
+                            let Some(cname) = index.class_name_of(interner, m) else {
+                                continue;
+                            };
+                            match index.class_id(cname) {
+                                Some(class) => {
+                                    interner.intern(Type::Nominal { class, args: vec![] })
+                                }
+                                None => continue,
+                            }
+                        }
+                        // A bare generic (`Array`, `Hash`, …) elaborates to
+                        // `Class[untyped]` — the reference's TypeElaborator
+                        // fills the args.
+                        Type::Nominal { class, args }
+                            if args.is_empty()
+                                && is_bare_generic_name(
+                                    index.class_name_for_id(*class).unwrap_or(""),
+                                ) =>
+                        {
+                            let (class, untyped) = (*class, interner.untyped());
+                            interner.intern(Type::Nominal {
+                                class,
+                                args: vec![untyped],
+                            })
+                        }
+                        _ => m,
+                    };
+                    if !arg_members.contains(&member) {
+                        arg_members.push(member);
+                    }
+                }
+            }
+            // The erased arg lists its members in the reference's
+            // describe-sorted union order (`Float | Integer` for `1...2.5`,
+            // `Integer | [1]` for `[1]..2`).
+            arg_members.sort_by_key(|&m| {
+                erase_qualified(interner, index, typer.source(), m, class_name, fqns)
+            });
+            let arg = match arg_members.len() {
+                0 => interner.untyped(),
+                1 => arg_members[0],
+                // Mint the union verbatim — `Algebra::join` would re-sort by
+                // the interner's canonical order, but the erased arg follows
+                // the reference's describe-sorted member list.
+                _ => interner.intern(Type::Union(arg_members)),
+            };
+            index
+                .class_id("Range")
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![arg] }))
+        }
+        _ => None,
+    }
 }
 
 /// Whether an erased return is a bare (no type-args) core GENERIC class name —
@@ -2951,7 +3111,7 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
-    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).candidates)
+    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).all_rows)
 }
 
 /// One candidate's JSON object (reference `MethodCandidate#to_h`): the per-
@@ -2959,17 +3119,29 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
 /// present ONLY on a `tighter_return` (the reference `.compact`s the nil).
 fn candidate_json(c: &Candidate) -> serde_json::Value {
     use serde_json::json;
-    let mut obj = json!({
-        "file": c.file,
-        "class": c.class_name,
-        "method": c.method_name,
-        "kind": c.kind,
-        "classification": c.classification,
-        "rbs": c.rbs,
-        "inferred_return": c.inferred_return,
-    });
+    // `MethodCandidate#to_h.compact`, in the reference's key order:
+    // `class` is nil for a top-level `def`, and a nil `rbs` /
+    // `inferred_return` (every skipped row) leaves the key out entirely.
+    let mut obj = json!({ "file": c.file });
+    if !c.class_name.is_empty() {
+        obj.as_object_mut().unwrap().insert("class".to_string(), json!(c.class_name));
+    }
+    obj.as_object_mut().unwrap().insert("method".to_string(), json!(c.method_name));
+    obj.as_object_mut().unwrap().insert("kind".to_string(), json!(c.kind));
+    obj.as_object_mut()
+        .unwrap()
+        .insert("classification".to_string(), json!(c.classification));
+    if !c.rbs.is_empty() {
+        obj.as_object_mut().unwrap().insert("rbs".to_string(), json!(c.rbs));
+    }
+    if !c.inferred_return.is_empty() {
+        obj.as_object_mut().unwrap().insert("inferred_return".to_string(), json!(c.inferred_return));
+    }
     if let Some(dr) = &c.declared_return_rbs {
         obj.as_object_mut().unwrap().insert("declared_return_rbs".to_string(), json!(dr));
+    }
+    if let Some(reason) = c.skip_reason {
+        obj.as_object_mut().unwrap().insert("skip_reason".to_string(), json!(reason));
     }
     obj
 }
@@ -2993,6 +3165,9 @@ struct WriteResult {
     /// The refusal detail (reference `WriteResult#error`), on
     /// `skipped_invalid_encoding` / `skipped_unparseable` only.
     error: Option<String>,
+    /// `replaced` (reference `WriteResult#replaced`): applied candidates that
+    /// rewrote an existing member under `--overwrite`, with the old line.
+    replaced: Vec<(Candidate, String)>,
     /// `repaired_headers` (#2580): `Name[params]` per bare header repaired.
     repaired: Vec<String>,
 }
@@ -3024,6 +3199,7 @@ fn cmd_write(
     overwrite: bool,
     cfg: &crate::Config,
     sig_env: &SigEnv,
+    dry_run: bool,
 ) -> ExitCode {
     let project_root = std::env::current_dir()
         .and_then(|d| d.canonicalize())
@@ -3073,7 +3249,7 @@ fn cmd_write(
         writes(c)
             && accepts(&target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout))
     };
-    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips } =
+    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips, .. } =
         generate_run(files, include_private, sig_env, &written);
     for c in all_candidates {
         let target =
@@ -3145,7 +3321,8 @@ fn cmd_write(
                 applied: Vec::new(),
                 skipped: Vec::new(),
                 error: None,
-                repaired: Vec::new(),
+            replaced: Vec::new(),
+        repaired: Vec::new(),
             });
             continue;
         }
@@ -3156,19 +3333,41 @@ fn cmd_write(
                 target_str,
                 group,
                 &shells,
+                &merged.kinds,
                 &merged.supers,
                 &merged.params,
                 overwrite,
+                dry_run,
             ));
             continue;
         }
         let content = render_new_file(&group, &shells, &merged);
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        // Reference `RbsValidity.source_error` on the create path
+        // (writer.rb `create_new`): a render defect never reaches disk — the
+        // whole target is refused (`:skipped_invalid_rbs`), same as a broken
+        // splice on the update path. The check runs BEFORE the dry-run
+        // branch: `--check` reports a refusal the same way `--write` would.
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &content) {
+            results.push(WriteResult {
+                source,
+                target: target_str,
+                action: "skipped_invalid_rbs",
+                applied: Vec::new(),
+                skipped: Vec::new(),
+                error: Some(detail),
+                replaced: Vec::new(),
+                repaired: Vec::new(),
+            });
+            continue;
         }
-        if std::fs::write(&target, content).is_err() {
-            eprintln!("sig-gen: failed to write {target_str}");
-            return ExitCode::from(1);
+        if !dry_run {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&target, content).is_err() {
+                eprintln!("sig-gen: failed to write {target_str}");
+                return ExitCode::from(1);
+            }
         }
         results.push(WriteResult {
             source,
@@ -3177,10 +3376,31 @@ fn cmd_write(
             applied: group,
             skipped: Vec::new(),
             error: None,
+            replaced: Vec::new(),
             repaired: Vec::new(),
         });
     }
 
+    // `out_of_date` — every result a `--write` would change or refuse; only
+    // `noop` / `skipped_outside_sig_root` stay silent under `--check`.
+    let stale: Vec<&WriteResult> = results
+        .iter()
+        .filter(|r| !matches!(r.action, "noop" | "skipped_outside_sig_root"))
+        .collect();
+    if dry_run {
+        match format {
+            "json" => render_check_json(&stale),
+            _ => render_check_text(&stale),
+        }
+        if format == "text" && !stale.is_empty() {
+            report_check_failure(&stale);
+        }
+        if format == "text" {
+            report_skipped(&skips);
+        }
+        report_unresolvable_superclasses(&unresolvable);
+        return if stale.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     match format {
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
@@ -3191,7 +3411,9 @@ fn cmd_write(
     report_unresolvable_superclasses(&unresolvable);
     // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
     // write and did not get one — exit 1.
-    if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
+    if results.iter().any(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    }) {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
@@ -3391,8 +3613,12 @@ fn render_write_text(results: &[WriteResult]) {
         match r.action {
             "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
             "updated" => {
-                // `applied_counts`: `+N`, then the repaired generic headers.
-                let mut counts = format!("+{}", r.applied.len());
+                // `applied_counts`: `+N` added lines, `replaced N` counted
+                // apart (a rewrite is not an addition), then repairs.
+                let mut counts = format!("+{}", r.applied.len() - r.replaced.len());
+                if !r.replaced.is_empty() {
+                    counts.push_str(&format!(", replaced {}", r.replaced.len()));
+                }
                 if !r.repaired.is_empty() {
                     counts.push_str(&format!(
                         ", repaired {} generic header(s): {}",
@@ -3413,22 +3639,194 @@ fn render_write_text(results: &[WriteResult]) {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target);
                 render_write_skips(r);
             }
-            "skipped_invalid_encoding" => {
-                println!(
-                    "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
-                    r.target
-                );
-                println!(
-                    "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
-                     read faithfully."
-                );
-            }
-            "skipped_unparseable" => {
-                println!("REFUSED {} — the existing file was not updated", r.target);
-                println!("  {}", r.error.as_deref().unwrap_or_default());
-                println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+            "skipped_invalid_encoding" | "skipped_unparseable" | "skipped_invalid_rbs" => {
+                render_write_refusal(r)
             }
             _ => {}
+        }
+    }
+}
+
+/// The `REFUSED` block for a target the writer declines — shared by
+/// [`render_write_text`] and [`render_check_text`] (reference
+/// `render_write_invalid*`).
+fn render_write_refusal(r: &WriteResult) {
+    match r.action {
+        "skipped_invalid_encoding" => {
+            println!(
+                "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
+                r.target
+            );
+            println!(
+                "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
+                 read faithfully."
+            );
+        }
+        "skipped_unparseable" => {
+            println!("REFUSED {} — the existing file was not updated", r.target);
+            println!("  {}", r.error.as_deref().unwrap_or_default());
+            println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+        }
+        _ => {
+            println!(
+                "REFUSED {} — the generated RBS does not parse, so it was not written",
+                r.target
+            );
+            println!("  {}", r.error.as_deref().unwrap_or_default());
+            println!("  This is a bug in Rigor's RBS rendering, not in your code — please report it.");
+        }
+    }
+}
+
+/// `applied_counts` (reference `applied_counts`): `+N` added lines, with
+/// `, replaced N` when a rewrite applied and the repaired generic headers.
+fn applied_counts(r: &WriteResult) -> String {
+    let mut counts = format!("+{}", r.applied.len() - r.replaced.len());
+    if !r.replaced.is_empty() {
+        counts.push_str(&format!(", replaced {}", r.replaced.len()));
+    }
+    if !r.repaired.is_empty() {
+        counts.push_str(&format!(
+            ", repaired {} generic header(s): {}",
+            r.repaired.len(),
+            r.repaired.join(", ")
+        ));
+    }
+    counts
+}
+
+/// `--check` text report (reference `render_check_text` /
+/// `render_check_change`): `sig/ is up to date`, else one `would create` /
+/// `would update` line per stale target with the member lines it would add
+/// (`  - ` before `  + ` for a `--overwrite` replacement).
+fn render_check_text(stale: &[&WriteResult]) {
+    if stale.is_empty() {
+        println!("sig/ is up to date");
+        return;
+    }
+    for r in stale {
+        match r.action {
+            "created" => {
+                println!("would create {} ({} method(s))", r.target, r.applied.len());
+                render_check_applied(r);
+            }
+            "updated" => {
+                println!("would update {} ({})", r.target, applied_counts(r));
+                render_check_applied(r);
+            }
+            _ => render_write_refusal(r),
+        }
+    }
+}
+
+/// The `  - declared_rbs` (a replaced member) / `  + rbs` lines of one check
+/// entry (reference `render_check_change`'s per-candidate loop).
+fn render_check_applied(r: &WriteResult) {
+    for c in &r.applied {
+        if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
+            rc.method_name == c.method_name && rc.kind == c.kind
+        }) {
+            println!("  - {old}");
+        }
+        for line in c.rbs.lines() {
+            println!("  + {line}");
+        }
+    }
+}
+
+/// `--check --format json` (reference `render_check`): `{up_to_date, results,
+/// refused}` — the write entries with `created`/`updated` renamed to
+/// `would_*`. The port never produces `sig.skipped.inline-differs` rows (the
+/// inline-declaration feature is unported), so `refused` is always `[]`.
+fn render_check_json(stale: &[&WriteResult]) {
+    use serde_json::json;
+    let rows: Vec<_> = stale
+        .iter()
+        .map(|r| {
+            let applied: Vec<_> = r.applied.iter().map(candidate_json).collect();
+            let skipped: Vec<_> = r
+                .skipped
+                .iter()
+                .map(|s| {
+                    let c = &s.candidate;
+                    let mut obj = json!({
+                        "file": c.file, "class": c.class_name, "method": c.method_name,
+                        "kind": c.kind, "classification": s.classification, "rbs": c.rbs,
+                        "inferred_return": c.inferred_return, "write_skip_reason": "user_authored",
+                    });
+                    if let Some(dr) = &s.declared_return_rbs {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("declared_return_rbs".to_string(), json!(dr));
+                    }
+                    obj
+                })
+                .collect();
+            let action = match r.action {
+                "created" => "would_create",
+                "updated" => "would_update",
+                a => a,
+            };
+            let mut row = json!({
+                "source": r.source, "target": r.target, "action": action,
+                "applied": applied, "skipped": skipped,
+            });
+            if let Some(e) = &r.error {
+                row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            if !r.replaced.is_empty() {
+                let replaced: Vec<_> =
+                    r.replaced.iter().map(|(c, _)| candidate_json(c)).collect();
+                row.as_object_mut().unwrap().insert("replaced".to_string(), json!(replaced));
+            }
+            if !r.repaired.is_empty() {
+                row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
+            }
+            row
+        })
+        .collect();
+    println!(
+        "{}",
+        crate::json_document::stamp_pretty(
+            &serde_json::to_string_pretty(&json!({
+                "up_to_date": stale.is_empty(),
+                "results": rows,
+                "refused": [],
+            }))
+            .unwrap(),
+            None
+        )
+    );
+}
+
+/// The `--check` stderr verdict (reference `report_check_failure` +
+/// `refused_targets_line`): out-of-date targets counted apart from refused
+/// ones, and a refused target is listed as a hand fix unless the refusal was
+/// Rigor's own render.
+fn report_check_failure(stale: &[&WriteResult]) {
+    let (refusals, pending): (Vec<&&WriteResult>, Vec<&&WriteResult>) = stale.iter().partition(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    });
+    if !pending.is_empty() {
+        eprintln!(
+            "rigor sig-gen --check: {} signature file(s) out of date; run `rigor sig-gen --write` with the same options to update them.",
+            pending.len()
+        );
+    }
+    if !refusals.is_empty() {
+        let by_hand: Vec<&str> = refusals
+            .iter()
+            .filter(|r| r.action != "skipped_invalid_rbs")
+            .map(|r| r.target.as_str())
+            .collect();
+        let head = format!(
+            "rigor sig-gen --check: {} signature file(s) refused; `--write` does not update them",
+            refusals.len()
+        );
+        if by_hand.is_empty() {
+            eprintln!("{head}. The generated RBS did not parse: a Rigor bug, see its REFUSED line on stdout.");
+        } else {
+            eprintln!("{head}. Repair by hand: {}.", by_hand.join(", "));
         }
     }
 }
@@ -3467,6 +3865,13 @@ fn render_write_json(results: &[WriteResult]) {
             });
             if let Some(e) = &r.error {
                 row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            // `to_h`: `replaced` is present only when a member was rewritten
+            // (pre-#1076 payloads stay byte-identical without it).
+            if !r.replaced.is_empty() {
+                let replaced: Vec<_> =
+                    r.replaced.iter().map(|(c, _)| candidate_json(c)).collect();
+                row.as_object_mut().unwrap().insert("replaced".to_string(), json!(replaced));
             }
             if !r.repaired.is_empty() {
                 row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
@@ -3641,9 +4046,11 @@ fn update_existing(
     target_str: String,
     candidates: Vec<Candidate>,
     shells: &[String],
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
+    dry_run: bool,
 ) -> WriteResult {
     let Ok(bytes) = std::fs::read(target) else {
         return WriteResult {
@@ -3653,7 +4060,8 @@ fn update_existing(
             applied: Vec::new(),
             skipped: Vec::new(),
             error: None,
-            repaired: Vec::new(),
+            replaced: Vec::new(),
+        repaired: Vec::new(),
         };
     };
     // v0.4.7 (#2480/#2587): an existing target that is not UTF-8, or does not
@@ -3666,6 +4074,7 @@ fn update_existing(
         applied: Vec::new(),
         skipped: Vec::new(),
         error: Some(error),
+            replaced: Vec::new(),
         repaired: Vec::new(),
     };
     let Ok(source) = String::from_utf8(bytes) else {
@@ -3683,17 +4092,25 @@ fn update_existing(
     // `--write` re-run stays idempotent (the shell is present, no conflict). The
     // only uncovered case is merging into a USER-authored sig that lacks a shell
     // for a `Data.define` return — a documented follow-up, not a regression.
-    let _ = shells;
-    let MergeOutcome { source: merged, action, applied, skipped, repaired } =
-        apply_merge_with(source, candidates, supers, params, overwrite);
+    let MergeOutcome { source: merged, action, applied, replaced, skipped, repaired } =
+        apply_merge_with(source, candidates, kinds, supers, params, shells, overwrite);
+    // Reference `RbsValidity.source_error`: a spliced result that does not
+    // re-parse is a writer defect — refuse to write it (`:skipped_invalid_rbs`)
+    // rather than leave the consumer's `rigor check` to quarantine the file.
     if action == "updated" {
-        let _ = std::fs::write(target, &merged);
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &merged) {
+            return refused("skipped_invalid_rbs", detail);
+        }
+        if !dry_run {
+            let _ = std::fs::write(target, &merged);
+        }
     }
     WriteResult {
         source: source_path,
         target: target_str,
         action,
         applied,
+        replaced,
         skipped,
         error: None,
         repaired,
@@ -3706,6 +4123,11 @@ struct MergeOutcome {
     source: String,
     action: &'static str,
     applied: Vec<Candidate>,
+    /// The applied candidates that REPLACED an existing member line
+    /// (`--overwrite`), paired with the replaced line — the
+    /// `applied_counts` `, replaced N` tail and `--check`'s `  - ` diff
+    /// lines (reference `WriteResult#replaced` / `declared_rbs`).
+    replaced: Vec<(Candidate, String)>,
     skipped: Vec<SkipEntry>,
     /// `repaired_headers`: one `Name[params]` per bare generic header given
     /// its parameters (#2580/#2602).
@@ -3714,7 +4136,7 @@ struct MergeOutcome {
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
-/// `action: "noop"`; otherwise each class group (first-seen order) is merged or
+/// `action: "noop"`; otherwise each class group (class-name order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
 #[cfg(test)]
 fn apply_merge(
@@ -3723,7 +4145,7 @@ fn apply_merge(
     supers: &HashMap<String, String>,
     overwrite: bool,
 ) -> MergeOutcome {
-    apply_merge_with(source, candidates, supers, &HashMap::new(), overwrite)
+    apply_merge_with(source, candidates, &HashMap::new(), supers, &HashMap::new(), &[], overwrite)
 }
 
 /// [`apply_merge`] with the run's generic header spellings (`params`): new
@@ -3732,8 +4154,10 @@ fn apply_merge(
 fn apply_merge_with(
     mut source: String,
     candidates: Vec<Candidate>,
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
+    shells: &[String],
     overwrite: bool,
 ) -> MergeOutcome {
     // Parse-failure gate: a malformed target is left byte-untouched (reference
@@ -3743,19 +4167,28 @@ fn apply_merge_with(
             source,
             action: "noop",
             applied: Vec::new(),
+            replaced: Vec::new(),
             skipped: Vec::new(),
             repaired: Vec::new(),
         };
     }
     let mut applied: Vec<Candidate> = Vec::new();
+    let mut replaced: Vec<(Candidate, String)> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
+    let mut touched: Vec<String> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
-        merge_class(&mut source, &class_name, group, supers, params, overwrite, &mut applied, &mut skipped);
+        touched.push(class_name.clone());
+        merge_class(&mut source, &class_name, group, kinds, supers, params, overwrite, &mut applied, &mut replaced, &mut skipped);
     }
+    // `collapse_nested_declarations`: touched `Foo::Bar` decls move under an
+    // existing `Foo` (rigor-rs#530). Runs after every merge so the parents
+    // are in place; `repair_generic_headers` still goes last.
+    touched.extend(shells.iter().cloned());
+    collapse_nested_declarations(&mut source, &touched);
     let repaired = repair_generic_headers(&mut source, params);
     // `state_changed?`: a repaired header is a change too.
     let action = if applied.is_empty() && repaired.is_empty() { "noop" } else { "updated" };
-    MergeOutcome { source, action, applied, skipped, repaired }
+    MergeOutcome { source, action, applied, replaced, skipped, repaired }
 }
 
 /// Reference `Writer#repair_generic_headers` (#2580/#2602): a declaration in
@@ -3864,7 +4297,8 @@ fn names_word(text: &str, name: &str) -> bool {
     false
 }
 
-/// Group candidates by `class_name`, preserving first-seen class order
+/// Group candidates by `class_name` (merged in class-name order, reference
+/// `groups.keys.sort`).
 /// (reference `candidates.group_by(&:class_name)`).
 fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
     let mut order: Vec<String> = Vec::new();
@@ -3875,6 +4309,10 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
         }
         groups.entry(c.class_name.clone()).or_default().push(c);
     }
+    // The reference merges `groups.keys.sort` — class-name order, not first-seen
+    // order — which is what orders the `skipped` report lines too (rigor-rs#493
+    // item 5).
+    order.sort();
     order.into_iter().map(|k| (k.clone(), groups.remove(&k).unwrap())).collect()
 }
 
@@ -3886,10 +4324,12 @@ fn merge_class(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
+    replaced: &mut Vec<(Candidate, String)>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     // Extract owned decl info before mutating (the parsed tree borrows `source`).
@@ -3898,15 +4338,8 @@ fn merge_class(
         Err(_) => None,
     };
     match found {
-        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
-        None => append_new_class(
-            source,
-            class_name,
-            candidates,
-            supers.get(class_name),
-            params.get(class_name).map_or("", String::as_str),
-            applied,
-        ),
+        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, replaced, skipped),
+        None => insert_namespace_chain(source, class_name, candidates, kinds, supers, params, applied),
     }
 }
 
@@ -4042,6 +4475,7 @@ fn merge_into_existing(
     candidates: Vec<Candidate>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
+    replaced: &mut Vec<(Candidate, String)>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     let mut new_methods: Vec<Candidate> = Vec::new();
@@ -4056,18 +4490,27 @@ fn merge_into_existing(
         }
     }
 
-    // Splice NEW members before the class's closing `end` token (fixed 2-space
-    // indent, one `"  {rbs}\n"` per method, concatenated — reference
-    // `insert_into_class`). The token-start splice + fixed indent reproduces the
-    // oracle's nested-case bytes with no special-casing. This runs BEFORE any
-    // replacement: it inserts at `end_start`, after every existing member, so the
-    // captured member spans (all below `end_start`) stay valid (reference order:
+    // Splice NEW members before the class's closing `end` — reference
+    // `insert_into_class` at `member_indent_depth(decl)` (one level below the
+    // `end` token's own column), inserted at the `end` LINE's start when it
+    // carries only whitespace (`insert_before_end`): a nested decl's `end`
+    // sits at col >0, and splicing at the token would eat its indent and
+    // leave `end` at column 0. This runs BEFORE any replacement: it inserts
+    // at `end_start`, after every existing member, so the captured member
+    // spans (all below `end_start`) stay valid (reference order:
     // `insert_into_class` then `replace_eligible_conflicts`).
     if !new_methods.is_empty() {
-        let addition: String =
-            new_methods.iter().map(|c| format!("{INDENT}{}\n", c.rbs)).collect();
         let at = info.end_start.min(source.len());
-        source.insert_str(at, &addition);
+        let depth = (at - line_start_index(source, at)) / INDENT.len() + 1;
+        let member_indent = INDENT.repeat(depth);
+        let addition: String =
+            new_methods.iter().map(|c| format!("{member_indent}{}\n", c.rbs)).collect();
+        let line_start = line_start_index(source, at);
+        if blank_range(source, line_start, at) {
+            source.insert_str(line_start, &addition);
+        } else {
+            source.insert_str(at, &format!("\n{addition}"));
+        }
         applied.extend(new_methods);
     }
 
@@ -4100,6 +4543,7 @@ fn merge_into_existing(
         // leaves earlier offsets valid (reference sorts by `-member_position`).
         eligible.sort_by_key(|(_, (start, _))| std::cmp::Reverse(*start));
         for (c, (start, end)) in eligible {
+            replaced.push((clone_candidate(&c), source[start..end].to_string()));
             source.replace_range(start..end, &c.rbs);
             applied.push(c);
         }
@@ -4154,32 +4598,350 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Append a NEW class block for a class not declared in the file (reference
-/// `append_new_class`): a COMPACT qualified header + `< Super` when known, body
-/// lines at 2-space indent, ONE leading blank line, and a trailing-newline
-/// repair on the original file first. All methods are applied.
-fn append_new_class(
+fn line_start_index(source: &str, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    source[..pos].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Reference `blank_range?`: only spaces/tabs between `from` and `to`.
+fn blank_range(source: &str, from: usize, to: usize) -> bool {
+    source[from..to].chars().all(|c| c == ' ' || c == '\t')
+}
+
+/// Reference `insert_namespace_chain` + `render_chain_snippet`: the part of
+/// `class_name`'s chain the file does not yet declare is rendered as a NESTED
+/// block inside the deepest declared ancestor — `class Sub2 < ::A::Base`
+/// lands inside the existing `module A`, never as a flat top-level
+/// `class A::Sub2` (rigor-rs#493 item 11). With no ancestor the whole chain
+/// appends top-level, still nested.
+#[allow(clippy::too_many_arguments)]
+fn insert_namespace_chain(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
-    superclass: Option<&String>,
-    params: &str,
+    kinds: &HashMap<String, &'static str>,
+    supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     applied: &mut Vec<Candidate>,
 ) {
-    let body = candidates
-        .iter()
-        .map(|c| format!("{INDENT}{}", c.rbs))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let header = match superclass {
-        Some(s) => format!("class {class_name}{params} < {}", superclasses::absolute(s)),
-        None => format!("class {class_name}{params}"),
-    };
-    if !source.ends_with('\n') {
-        source.push('\n');
+    let segments: Vec<&str> = class_name.split("::").collect();
+    // `split_at_existing_ancestor`: the longest leading run the file declares.
+    let mut split = 0usize;
+    let mut anchor: Option<ClassDeclInfo> = None;
+    for i in (1..segments.len()).rev() {
+        let prefix = segments[..i].join("::");
+        let Ok(sig) = ruby_rbs::node::parse(source) else { break };
+        if let Some(info) = find_and_extract(source, sig.declarations().iter(), &[], &prefix) {
+            split = i;
+            anchor = Some(info);
+            break;
+        }
     }
-    source.push_str(&format!("\n{header}\n{body}\nend\n"));
+    let missing = &segments[split.min(segments.len() - 1)..];
+    if missing.is_empty() {
+        return;
+    }
+    // `member_indent_depth`: a member sits one level below the decl's keyword
+    // column — the `end` token's column stands in (canonical RBS keeps them
+    // at the same indent).
+    let depth = anchor.as_ref().map_or(0, |a| {
+        (a.end_start - line_start_index(source, a.end_start)) / INDENT.len() + 1
+    });
+    let mut snippet = String::new();
+    for (j, seg) in missing.iter().enumerate() {
+        let qualified = [segments[..split].join("::"), missing[..=j].join("::")]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("::");
+        let is_leaf = j == missing.len() - 1;
+        // `node_keyword`: kinds first, `class` for a method-bearing leaf,
+        // `module` for an intermediate segment.
+        let keyword = kinds
+            .get(&qualified)
+            .copied()
+            .unwrap_or(if is_leaf { "class" } else { "module" });
+        snippet.push_str(&format!("{}{} {}", INDENT.repeat(depth + j), keyword, seg));
+        if let Some(p) = params.get(&qualified) {
+            snippet.push_str(p);
+        }
+        if keyword == "class" {
+            if let Some(spr) = supers.get(&qualified) {
+                snippet.push_str(&format!(" < {}", superclasses::absolute(spr)));
+            }
+        }
+        snippet.push('\n');
+    }
+    let member_indent = INDENT.repeat(depth + missing.len());
+    for c in &candidates {
+        snippet.push_str(&format!("{member_indent}{}\n", c.rbs));
+    }
+    for j in (0..missing.len()).rev() {
+        snippet.push_str(&format!("{}end\n", INDENT.repeat(depth + j)));
+    }
+    match anchor {
+        Some(a) => {
+            // `insert_before_end`: an `end` starting its own line takes the
+            // snippet at the line's start; otherwise before the token.
+            let line_start = line_start_index(source, a.end_start);
+            if blank_range(source, line_start, a.end_start) {
+                source.insert_str(line_start, &snippet);
+            } else {
+                source.insert_str(a.end_start, &format!("\n{snippet}"));
+            }
+        }
+        None => {
+            // `append_top_level`: separated by exactly one blank line.
+            if !source.is_empty() {
+                if !source.ends_with('\n') {
+                    source.push('\n');
+                }
+                if !source.ends_with("\n\n") {
+                    source.push('\n');
+                }
+            }
+            source.push_str(&snippet);
+        }
+    }
     applied.extend(candidates);
+}
+
+/// Owned snapshot of a class/module declaration for the relocation pass
+/// (reference `collapse_nested_declarations` reads `RBS` locations).
+struct RelocDecl {
+    /// `decl.location` start/end byte offsets.
+    start: usize,
+    end: usize,
+    /// `decl.location[:name]` byte offsets — the head rename's splice region.
+    name_start: usize,
+    name_end: usize,
+    /// `decl.location[:end]` start byte offset (the `insert_before_end` anchor).
+    end_start: usize,
+    /// `decl.location[:keyword].start_column` — drives both indent depths.
+    keyword_col: usize,
+    /// `leading_positions`: annotation + comment start offsets.
+    leading: Vec<usize>,
+    /// `decl.name.to_s.start_with?("::")` — a rooted decl keeps its layout.
+    rooted: bool,
+}
+
+/// [`find_and_extract`] returning the fuller [`RelocDecl`] the relocation
+/// pass needs (reference `find_class_decl` used from `relocate_under_parent`).
+fn find_reloc_decl<'a>(
+    source: &str,
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    target: &str,
+) -> Option<RelocDecl> {
+    for decl in decls {
+        let (local, members, info) = match &decl {
+            RbsNode::Class(c) => (
+                decl_full_name(&c.name()),
+                c.members(),
+                (
+                    c.location(),
+                    c.name_location(),
+                    c.end_location(),
+                    c.keyword_location(),
+                    c.annotations(),
+                    c.comment().map(|cm| cm.location()),
+                ),
+            ),
+            RbsNode::Module(m) => (
+                decl_full_name(&m.name()),
+                m.members(),
+                (
+                    m.location(),
+                    m.name_location(),
+                    m.end_location(),
+                    m.keyword_location(),
+                    m.annotations(),
+                    m.comment().map(|cm| cm.location()),
+                ),
+            ),
+            _ => continue,
+        };
+        let (loc, name_loc, end_loc, kw_loc, annotations, comment_loc) = info;
+        let full = if prefix.is_empty() {
+            local.clone()
+        } else {
+            format!("{}::{}", prefix.join("::"), local)
+        };
+        if full == target {
+            let mut leading: Vec<usize> = annotations
+                .iter()
+                .filter_map(|a| match a {
+                    RbsNode::Annotation(an) => {
+                        Some(clamp_offset(an.location().start(), source.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(cl) = comment_loc {
+                leading.push(clamp_offset(cl.start(), source.len()));
+            }
+            return Some(RelocDecl {
+                start: clamp_offset(loc.start(), source.len()),
+                end: clamp_offset(loc.end(), source.len()),
+                name_start: clamp_offset(name_loc.start(), source.len()),
+                name_end: clamp_offset(name_loc.end(), source.len()),
+                end_start: clamp_offset(end_loc.start(), source.len()),
+                keyword_col: clamp_offset(kw_loc.start(), source.len())
+                    - line_start_index(source, clamp_offset(kw_loc.start(), source.len())),
+                leading,
+                rooted: slice_of(source, name_loc).starts_with("::"),
+            });
+        }
+        let mut child_prefix = prefix.to_vec();
+        child_prefix.push(local);
+        if let Some(found) = find_reloc_decl(source, members.iter(), &child_prefix, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Reference `collapse_nested_declarations`: relocate each touched `A::B`
+/// declaration under an existing `A` in the same file, shallowest first
+/// (rigor-rs#530).
+fn collapse_nested_declarations(source: &mut String, names: &[String]) {
+    let mut uniq: Vec<&String> = names.iter().collect();
+    uniq.sort();
+    uniq.dedup();
+    for name in uniq {
+        relocate_under_parent(source, name);
+    }
+}
+
+/// Reference `relocate_under_parent`: move `qualified`'s own declaration
+/// under its existing parent decl, or leave the file untouched when any
+/// precondition fails (no parent, overlap, `::`-rooted head, non-isolated
+/// region, unparseable intermediate).
+fn relocate_under_parent(source: &mut String, qualified: &str) {
+    let segments: Vec<&str> = qualified.split("::").collect();
+    if segments.len() < 2 {
+        return;
+    }
+    let parent_name = segments[..segments.len() - 1].join("::");
+    let (parent, decl) = match ruby_rbs::node::parse(source) {
+        Ok(sig) => match (
+            find_reloc_decl(source, sig.declarations().iter(), &[], &parent_name),
+            find_reloc_decl(source, sig.declarations().iter(), &[], qualified),
+        ) {
+            (Some(p), Some(d)) => (p, d),
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    // `overlapping?`: either decl already nests the other — nothing to move.
+    if parent.start < decl.end && decl.start < parent.end {
+        return;
+    }
+    if decl.rooted {
+        return;
+    }
+    let Some(region) = decl_region(source, &decl) else { return };
+    let block = relocated_block(source, &decl, &parent, segments[segments.len() - 1], &region);
+    // `apply_relocation`: cut, re-parse for the (shifted) parent anchor,
+    // splice in before its `end`.
+    let spliced = splice_out(source, &region);
+    let anchor = match ruby_rbs::node::parse(&spliced) {
+        Ok(sig) => find_reloc_decl(&spliced, sig.declarations().iter(), &[], &parent_name),
+        Err(_) => None,
+    };
+    let Some(anchor) = anchor else { return };
+    let line_start = line_start_index(&spliced, anchor.end_start);
+    let mut merged = spliced;
+    if blank_range(&merged, line_start, anchor.end_start) {
+        merged.insert_str(line_start, &block);
+    } else {
+        merged.insert_str(anchor.end_start, &format!("\n{block}"));
+    }
+    *source = merged;
+}
+
+/// Reference `decl_region`: the declaration's full source region extended
+/// over its leading comment/annotations, ending just past its closing
+/// newline. `None` when either edge shares its line with other text.
+fn decl_region(source: &str, decl: &RelocDecl) -> Option<(usize, usize)> {
+    let start_pos = decl
+        .leading
+        .iter()
+        .copied()
+        .chain(std::iter::once(decl.start))
+        .min()?;
+    let line_start = line_start_index(source, start_pos);
+    if !blank_range(source, line_start, start_pos) {
+        return None;
+    }
+    let finish = decl.end;
+    let line_end = source[finish..].find('\n').map_or(source.len(), |i| finish + i);
+    if !blank_range(source, finish, line_end) {
+        return None;
+    }
+    Some((line_start, if line_end < source.len() { line_end + 1 } else { line_end }))
+}
+
+/// Reference `relocated_block` + `reindent`: the moved text with the
+/// `Foo::Bar` head shortened to `Bar` and every line pushed in to the
+/// parent's member depth (a non-positive delta leaves the text alone).
+fn relocated_block(
+    source: &str,
+    decl: &RelocDecl,
+    parent: &RelocDecl,
+    short_name: &str,
+    region: &(usize, usize),
+) -> String {
+    let text = &source[region.0..region.1];
+    let head = decl.name_start - region.0;
+    let tail = decl.name_end - region.0;
+    let renamed = format!("{}{}{}", &text[..head], short_name, &text[tail..]);
+    let member_depth = parent.keyword_col / INDENT.len() + 1;
+    let decl_depth = decl.keyword_col / INDENT.len();
+    let Some(delta) = member_depth.checked_sub(decl_depth) else {
+        return renamed;
+    };
+    let prefix = INDENT.repeat(delta);
+    let mut out = String::with_capacity(renamed.len() + prefix.len() * renamed.lines().count());
+    for line in renamed.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(&prefix);
+            out.push_str(line);
+        }
+    }
+    if !renamed.ends_with('\n') && renamed.rsplit('\n').next().is_some_and(|l| !l.trim().is_empty()) {
+        // `split_inclusive` already emitted the trailing unterminated line.
+    }
+    out
+}
+
+/// Reference `splice_out`: remove `region`, collapsing the newline run left
+/// at the seam so the cut never shows as a widening gap (or a trailing blank
+/// line at EOF). Spacing already fine is left exactly as written.
+fn splice_out(source: &str, region: &(usize, usize)) -> String {
+    let before = &source[..region.0];
+    let after = &source[region.1..];
+    if before.trim().is_empty() {
+        return after.trim_start_matches('\n').to_string();
+    }
+    if after.trim().is_empty() {
+        let trimmed = before.trim_end_matches('\n');
+        return format!("{trimmed}\n");
+    }
+    let seam = before.len() - before.trim_end_matches('\n').len()
+        + (after.len() - after.trim_start_matches('\n').len());
+    if seam <= 2 {
+        return format!("{before}{after}");
+    }
+    format!(
+        "{}\n\n{}",
+        before.trim_end_matches('\n'),
+        after.trim_start_matches('\n')
+    )
 }
 
 /// Extract a method's RETURN TEXT: the substring after the LAST `->` at bracket
@@ -4231,3 +4993,44 @@ fn clamp_offset(v: i32, len: usize) -> usize {
 
 #[cfg(test)]
 mod tests;
+
+/// Whether every `untyped` in `erased` sits inside a `ClassName[…]` type-arg
+/// slot — `Range[untyped]`, `Hash[untyped, untyped]`, `Range[Array[untyped] |
+/// Integer]` — the reference's elaborated emit, exempt from the
+/// buried-`untyped` skip (rigor-rs#493 item 7). An `untyped` inside a TUPLE
+/// literal's `[…]` (a bracket not preceded by a class identifier) still
+/// counts as an inference hole.
+fn is_nominal_untyped_args(erased: &str) -> bool {
+    let bytes = erased.as_bytes();
+    let mut found = false;
+    let mut idx = 0;
+    while let Some(off) = erased[idx..].find("untyped") {
+        let pos = idx + off;
+        found = true;
+        // Find the innermost UNCLOSED `[` enclosing this occurrence.
+        let mut stack: Vec<usize> = Vec::new();
+        for (i, &b) in bytes.iter().enumerate().take(pos) {
+            match b {
+                b'[' => stack.push(i),
+                b']' => {
+                    stack.pop();
+                }
+                _ => {}
+            }
+        }
+        let Some(&open) = stack.last() else { return false };
+        // The `[` must be a generic-args bracket: preceded immediately by a
+        // class-identifier tail (`Foo[`, `Foo::Bar[`).
+        let head: String = erased[..open]
+            .chars()
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        let head: String = head.chars().rev().collect();
+        if !head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return false;
+        }
+        idx = pos + 7;
+    }
+    found
+}

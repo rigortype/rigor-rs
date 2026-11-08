@@ -14,6 +14,25 @@ fn coll_snaps(src: &[u8]) -> (LoweredAst, HashMap<NodeId, &'static str>) {
     (ast, snaps.into_iter().map(|(id, snap)| (id, snap.class)).collect())
 }
 
+/// Whether the snap's carrier for `method`'s call is a `Union` — the retry
+/// re-run's joined carrier (rigor-rs#493).
+fn snap_carrier_is_union(src: &[u8], method: &str) -> bool {
+    let ast = lower(&parse(src));
+    let (i, snaps) = {
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let scopes = lexical_scopes(&ast);
+        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let snaps = typer.collection_shape_snapshots(&ast, &mut i);
+        (i, snaps)
+    };
+    let Some(snap) = snaps.get(&call_named(&ast, method)) else {
+        return false;
+    };
+    matches!(i.get(snap.carrier), rigor_types::Type::Union(_))
+}
+
 /// The node id of the first call named `method`, or panic.
 fn call_named(ast: &LoweredAst, method: &str) -> NodeId {
     ast.iter()
@@ -465,6 +484,39 @@ fn coll_rescue_retry_replays_primary() {
             "frobnicate_zzz",
         ),
         None,
+    );
+}
+
+/// The retry RE-RUN re-evaluates the protected body over the arm's scope —
+/// a bare-local call inside the body records its carrier a second time. The
+/// site's true carrier is the JOIN of the two passes (`c` reads `[1] | [2]`
+/// on the reference), so a differing re-run carrier joins the recorded snap
+/// rather than overwriting it: the union declines the collection rule and
+/// `c.nope` stays silent (rigor-rs#493 item 4).
+#[test]
+fn coll_rescue_retry_rebind_joins_site_carrier() {
+    let src =
+        b"def f\n  c = [1]\n  begin\n    c.nope\n  rescue\n    c = [2]\n    retry\n  end\nend\n";
+    assert_eq!(snap(src, "nope"), Some("Array"));
+    assert!(snap_carrier_is_union(src, "nope"));
+    // An arm that leaves the local alone re-records the SAME carrier — the
+    // snap stands (`begin; c.nope; rescue; retry; end` fires `for [1]` on the
+    // reference).
+    assert_eq!(
+        snap(
+            b"def f\n  c = [1]\n  begin\n    c.nope\n  rescue\n    retry\n  end\nend\n",
+            "nope",
+        ),
+        Some("Array"),
+    );
+    // A non-collection re-run value joins too — `c = "s"` arms the site
+    // `"s" | [1]` on the reference (whose UNION rule fires it); the snap
+    // declines the joined carrier rather than keep the stale `[1]`.
+    assert!(
+        snap_carrier_is_union(
+            b"def f\n  c = [1]\n  begin\n    c.zark\n  rescue\n    c = \"s\"\n    retry\n  end\nend\n",
+            "zark",
+        ),
     );
 }
 

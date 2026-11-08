@@ -539,6 +539,46 @@ fn module_function_dup_slots_last_definer_wins() {
 }
 
 #[test]
+fn module_function_def_survives_private_visibility() {
+    // rigor-rs#493 item 10 (reference `visibility_excludes?` returns false for
+    // a @module_function_methods def): `private` marks `h` private in the
+    // visibility table, but the re-armed module_function still writes its
+    // `self?.h` row.
+    let src = "module T\n  module_function\n  private\n  def g = 1\n  module_function\n  def h = 2\nend\n";
+    let cs = candidates_tagged("mfvis", src, false);
+    assert_eq!(
+        cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+        vec!["def self?.h: () -> 2"]
+    );
+}
+
+#[test]
+fn module_function_def_survives_later_private_redefinition() {
+    // rigor-rs#523: the name-keyed visibility table reads `u -> private` from
+    // the SECOND def's mark, yet the first (module_function) def's surviving
+    // singleton copy is still written `def self.u` with the FIRST def's return
+    // (reference `visibility_excludes?` exempts @module_function_methods;
+    // #526 added the guard, this pins the issue row). Same for `protected`.
+    for vis in ["private", "protected"] {
+        let src = format!("module M\n  module_function\n  def u = 1\n  {vis}\n  def u = 9\nend\n");
+        let cs = candidates_tagged("mfpriv", &src, false);
+        assert_eq!(
+            cs.iter().map(|c| c.rbs.as_str()).collect::<Vec<_>>(),
+            vec!["def self.u: () -> 1"],
+            "{vis}"
+        );
+    }
+    // Must-still-fire controls: a plain class / non-module_function module
+    // keeps skipping the private redefinition.
+    for src in [
+        "class C\n  def u = 1\n  private\n  def u = 9\nend\n",
+        "module M\n  def u = 1\n  private\n  def u = 9\nend\n",
+    ] {
+        assert!(candidates_tagged("mfpriv_ctl", src, false).is_empty(), "{src}");
+    }
+}
+
+#[test]
 fn module_function_with_args_does_not_flip_mode() {
     // `module_function :sym` (args form) neither flips the mode nor marks the
     // method (oracle-probed) — both defs stay plain instance methods.
@@ -817,6 +857,22 @@ fn is_bare_generic_name_only_matches_bare_generics() {
 // -- UPDATE/merge + LayoutIndex ------------------------------------------
 
 /// A merge-candidate factory for the `apply_merge` tests.
+#[test]
+fn group_by_class_orders_groups_by_class_name() {
+    // Reference `merge_candidates`: `groups.keys.sort.each { merge_class }` —
+    // class-name order, which is also the `skipped` report's line order
+    // (rigor-rs#493 item 5).
+    let groups = group_by_class(vec![
+        mc("Zebra", "z", "instance", "def z: () -> 1"),
+        mc("Apple", "a", "instance", "def a: () -> 2"),
+        mc("Apple", "b", "instance", "def b: () -> 3"),
+    ]);
+    assert_eq!(
+        groups.iter().map(|(k, _)| k.as_str()).collect::<Vec<_>>(),
+        vec!["Apple", "Zebra"]
+    );
+}
+
 fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
     Candidate {
         file: "lib/f.rb".into(),
@@ -914,9 +970,11 @@ fn merge_inserts_new_method_flat_before_end() {
 }
 
 #[test]
-fn merge_inserts_new_method_nested_reproduces_indent_quirk() {
-    // The token-start splice + fixed 2-space indent: the inserted line renders
-    // 4-space and the inner `end` drops to column 0 (oracle-verified).
+fn merge_inserts_new_method_nested_at_member_depth() {
+    // `insert_into_class` at `member_indent_depth`: the inserted line renders
+    // one level below the inner decl and its `end` keeps its own line
+    // (oracle-verified; an earlier token-start splice stranded `end` at
+    // column 0, rigor-rs#493 item 11 review).
     let src = "module Outer\n  class Inner\n    def existing: () -> String\n  end\nend\n"
         .to_string();
     let out = apply_merge(
@@ -927,7 +985,7 @@ fn merge_inserts_new_method_nested_reproduces_indent_quirk() {
     );
     assert_eq!(
         out.source,
-        "module Outer\n  class Inner\n    def existing: () -> String\n    def newm: () -> 5\nend\nend\n"
+        "module Outer\n  class Inner\n    def existing: () -> String\n    def newm: () -> 5\n  end\nend\n"
     );
 }
 
@@ -1109,9 +1167,10 @@ fn append_new_class_compact_header_and_leading_blank() {
 }
 
 #[test]
-fn append_new_class_qualified_name_stays_compact() {
-    // A class not in the file with a qualified name uses `class A::B`, NOT
-    // nested modules.
+fn append_new_class_qualified_name_nests_the_missing_chain() {
+    // Reference `insert_namespace_chain`: with no declared ancestor the
+    // whole chain renders NESTED, not as a flat `class A::B` header
+    // (rigor-rs#493 item 11).
     let src = "class Foo\nend\n".to_string();
     let out = apply_merge(
         src,
@@ -1119,7 +1178,38 @@ fn append_new_class_qualified_name_stays_compact() {
         &HashMap::new(),
         false,
     );
-    assert_eq!(out.source, "class Foo\nend\n\nclass A::B\n  def m: () -> 1\nend\n");
+    assert_eq!(
+        out.source,
+        "class Foo\nend\n\nmodule A\n  class B\n    def m: () -> 1\n  end\nend\n"
+    );
+}
+
+#[test]
+fn insert_into_existing_ancestor_nests_the_leaf() {
+    // `module A` already declared: `A::Base`/`A::Sub2` merge INSIDE it, at
+    // member depth (rigor-rs#493 item 11 — the reported FP).
+    let src = "module A\nend\n".to_string();
+    let mut supers = HashMap::new();
+    supers.insert("A::Sub2".to_string(), "::A::Base".to_string());
+    let mut kinds: HashMap<String, &'static str> = HashMap::new();
+    kinds.insert("A".to_string(), "module");
+    kinds.insert("A::Sub2".to_string(), "class");
+    let out = apply_merge_with(
+        src,
+        vec![
+            mc("A::Base", "b", "instance", "def b: () -> 1"),
+            mc("A::Sub2", "m", "instance", "def m: () -> 1"),
+        ],
+        &kinds,
+        &supers,
+        &HashMap::new(),
+        &[],
+        false,
+    );
+    assert_eq!(
+        out.source,
+        "module A\n  class Base\n    def b: () -> 1\n  end\n  class Sub2 < ::A::Base\n    def m: () -> 1\n  end\nend\n"
+    );
 }
 
 #[test]
@@ -1197,7 +1287,9 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
         "class Array\n  def old: () -> Integer\nend\n".to_string(),
         vec![mc("Array", "second_elem", "instance", "def second_elem: () -> 1")],
         &HashMap::new(),
+        &HashMap::new(),
         &params,
+        &[],
         false,
     );
     assert_eq!(out.source, "class Array[unchecked out E]\n  def old: () -> Integer\n  def second_elem: () -> 1\nend\n");
@@ -1207,7 +1299,9 @@ fn merge_repairs_a_bare_generic_header_unless_a_body_names_a_parameter() {
         "class Array\n  def old: () -> E\nend\n".to_string(),
         Vec::new(),
         &HashMap::new(),
+        &HashMap::new(),
         &params,
+        &[],
         false,
     );
     assert!(out.repaired.is_empty());
@@ -1298,7 +1392,7 @@ fn bare_core_reopening_reads_every_method_as_new() {
     let src = "# c\nclass Hash\n  def hfoo: () -> 1\nend\n".to_string();
     let mut params = HashMap::new();
     params.insert("Hash".to_string(), "[unchecked out K, unchecked out V]".to_string());
-    let out = apply_merge_with(src, cs, &HashMap::new(), &params, false);
+    let out = apply_merge_with(src, cs, &HashMap::new(), &HashMap::new(), &params, &[], false);
     assert_eq!(out.skipped.len(), 1);
     assert_eq!(out.skipped[0].candidate.method_name, "hfoo");
     assert_eq!(out.repaired, vec!["Hash[unchecked out K, unchecked out V]".to_string()]);

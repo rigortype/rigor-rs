@@ -1,0 +1,7 @@
+module M
+  def nope: () -> Integer | ...
+end
+class Inc
+  include M
+  def self.iok: () -> Integer
+end

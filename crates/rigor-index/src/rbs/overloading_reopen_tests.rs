@@ -74,3 +74,52 @@ fn reopen_without_original_is_unbuildable() {
     assert!(idx.class_has_method("Foo", "zork"));
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// rigor-rs#494: an instance-side build failure that reaches a class through
+/// the ancestor CLOSURE (a cyclic superclass/mixin chain, or an included
+/// module whose own build fails) takes the SINGLETON side with it — the
+/// reference builds the singleton definition on the instance one
+/// (`RecursiveAncestorError`, `InvalidOverloadMethodError`). Only
+/// `(q, singleton)` joins the blanking set; the instance side already
+/// declines these classes at dispatch (`qualified_ancestors` reports the
+/// chain incomplete).
+#[test]
+fn closure_failure_marks_singleton_unbuildable() {
+    // Cyclic chains (fixture 156's sig/, un-reopened): `A < B < A`,
+    // `Self < Self` (with `Sub < Self`), and `M1 ⇄ M2` (with `UsesM`
+    // including `M1`). `Both`'s diamond stays buildable.
+    let (idx, dir) = load(
+        "cyc",
+        &[(
+            "x.rbs",
+            "class A < B\n  def a: () -> Integer\nend\nclass B < A\nend\nclass C\n  def c: () -> Integer\nend\nclass Self < Self\n  def s: () -> Integer\nend\nmodule M1\n  include M2\nend\nmodule M2\n  include M1\nend\nclass UsesM\n  include M1\nend\nclass Sub < Self\nend\nmodule M3\nend\nmodule M4\n  include M3\nend\nclass Both\n  include M3\n  include M4\nend\n",
+        )],
+    );
+    for q in ["A", "B", "Self", "Sub", "M1", "M2", "UsesM"] {
+        assert!(
+            idx.class_has_singleton_method(q, "zork"),
+            "{q}: a cyclic ancestor chain must mark the singleton side unbuildable"
+        );
+    }
+    // Controls: off-cycle `C` and diamond `Both` still witness.
+    assert!(!idx.class_has_singleton_method("C", "zork"));
+    assert!(!idx.class_has_singleton_method("Both", "zork"));
+    let _ = std::fs::remove_dir_all(&dir);
+
+    // An included module whose own instance build fails (`nope` overloads
+    // no original — `InvalidOverloadMethodError`) fails the includer's
+    // singleton through the closure.
+    let (idx, dir) = load(
+        "inc",
+        &[(
+            "i.rbs",
+            "module M\n  def nope: () -> Integer | ...\nend\nclass Inc\n  include M\n  def self.iok: () -> Integer\nend\n",
+        )],
+    );
+    assert!(
+        idx.class_has_singleton_method("Inc", "nosuch"),
+        "Inc: an included module's build failure must reach the singleton side"
+    );
+    assert_eq!(idx.singleton_method_return("Inc", "iok"), None);
+    let _ = std::fs::remove_dir_all(&dir);
+}
