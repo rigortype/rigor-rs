@@ -1947,19 +1947,24 @@ fn literal_tail_nominal(
             let mut arg_members: Vec<TypeId> = Vec::new();
             for bound in [left, right].into_iter().flatten() {
                 let ty = typer.type_of(ast, *bound, env, interner);
-                let ms: Vec<TypeId> = match interner.get(ty) {
-                    Type::Union(ms) => ms.clone(),
-                    _ => vec![ty],
+                // A bound that types DIRECTLY to a scalar Constant widens to
+                // its class; a UNION bound's members contribute as-is —
+                // literal `2` stays `2`, a `nil` member stays `nil` (the
+                // reference's range_endpoint_element_type recurses over the
+                // member list but does not widen inside it).
+                let (ms, widen) = match interner.get(ty) {
+                    Type::Union(ms) => (ms.clone(), false),
+                    _ => (vec![ty], true),
                 };
                 for m in ms {
                     if matches!(interner.get(m), Type::Dynamic(_)) {
                         continue;
                     }
                     let member = match interner.get(m) {
-                        // `nil` contributes nothing.
-                        Type::Constant(rigor_types::Scalar::Nil) => continue,
-                        // A scalar constant widens to its class nominal.
-                        Type::Constant(_) => {
+                        // `nil` contributes nothing as a WHOLE bound (but a
+                        // union's `nil` member is kept, above).
+                        Type::Constant(rigor_types::Scalar::Nil) if widen => continue,
+                        Type::Constant(_) if widen => {
                             let Some(cname) = index.class_name_of(interner, m) else {
                                 continue;
                             };
@@ -3498,15 +3503,18 @@ fn is_nominal_untyped_args(erased: &str) -> bool {
     while let Some(off) = erased[idx..].find("untyped") {
         let pos = idx + off;
         found = true;
-        // Find the innermost `[` enclosing this occurrence: the last `[`
-        // whose `]` has not yet been seen before `pos`.
-        let mut inner: Option<usize> = None;
+        // Find the innermost UNCLOSED `[` enclosing this occurrence.
+        let mut stack: Vec<usize> = Vec::new();
         for (i, &b) in bytes.iter().enumerate().take(pos) {
-            if b == b'[' {
-                inner = Some(i);
+            match b {
+                b'[' => stack.push(i),
+                b']' => {
+                    stack.pop();
+                }
+                _ => {}
             }
         }
-        let Some(open) = inner else { return false };
+        let Some(&open) = stack.last() else { return false };
         // The `[` must be a generic-args bracket: preceded immediately by a
         // class-identifier tail (`Foo[`, `Foo::Bar[`).
         let head: String = erased[..open]
