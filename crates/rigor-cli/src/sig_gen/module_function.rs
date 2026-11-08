@@ -180,7 +180,7 @@ fn meta_constant_receiver(receiver: Option<PrismNode<'_>>, name: &str) -> bool {
 
 /// `ScopeIndexer.meta_new_constant_rvalue?`: `Class.new`, `Module.new`,
 /// `Data.define(:a, …)` or `Struct.new(:a, …)`.
-fn meta_new_call(call: &CallNode<'_>) -> bool {
+pub(super) fn meta_new_call(call: &CallNode<'_>) -> bool {
     let name = name_of(call);
     let receiver = || call.receiver();
     let symbols = |args: Vec<PrismNode<'_>>| args.iter().all(|a| a.as_symbol_node().is_some());

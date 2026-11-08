@@ -1401,3 +1401,118 @@ fn bare_core_reopening_reads_every_method_as_new() {
         "# c\nclass Hash[unchecked out K, unchecked out V]\n  def hfoo: () -> 1\n  def hbar: () -> 2\nend\n"
     );
 }
+
+/// `Class: rbs` per emitted candidate, in emission order.
+fn emitted_rows(tag: &str, src: &str) -> Vec<String> {
+    candidates_tagged(tag, src, false)
+        .iter()
+        .map(|c| format!("{}: {}", c.class_name, c.rbs))
+        .collect()
+}
+
+#[test]
+fn conditional_namespace_defs_emit_candidates() {
+    // rigor-rs#535, oracle (`rigor sig-gen --print`, pinned reference): the
+    // reference's `walk_defs` descends if/case/begin/loop bodies, so a
+    // namespace or def under a conditional emits as a direct one does.
+    let rows: &[(&str, &[&str])] = &[
+        ("class K; if c; class N; def z; 1; end; end; end; end", &["K::N: def z: () -> 1"]),
+        ("class K; if c; module N; def z; 1; end; end; end; end", &["K::N: def z: () -> 1"]),
+        ("class K; unless c; class N; def z; 1; end; end; end; end", &["K::N: def z: () -> 1"]),
+        ("class K; if c; def a; 1; end; else; def b; 2; end; end; end", &["K: def a: () -> 1", "K: def b: () -> 2"]),
+        ("class K; if c; class << self; def s; 1; end; end; end; end", &["K: def self.s: () -> 1"]),
+        ("if c; class N; def z; 1; end; end; end", &["N: def z: () -> 1"]),
+    ];
+    for (i, (src, want)) in rows.iter().enumerate() {
+        assert_eq!(emitted_rows(&format!("cond_ns_{i}"), src), *want, "{src}");
+    }
+}
+
+#[test]
+fn visibility_call_that_last_writes_a_conditional_defs_slot_decides_it() {
+    // rigor-rs#535 review item (a), oracle-verified rows. The reference's table
+    // is keyed `(class, name)` per file and written by a full-depth walk, so a
+    // literal-name visibility call anywhere (after the def, inside another
+    // conditional, a block, a later reopening) re-marks the slot; a `def`
+    // after it writes the slot again; `module_function :b` reads as `private`.
+    let rows: &[(&str, &[&str])] = &[
+        ("class K; if c; def b; 2; end; end; private :b; end", &[]),
+        (
+            "class K; if c; def a; 1; end; def b; 2; end; end; private :a, :b; def z; 1; end; end",
+            &["K: def z: () -> 1"],
+        ),
+        ("module M; if c; def b; 2; end; end; module_function :b; end", &[]),
+        ("module M; if c; def b; 2; end; end; private :b; end", &[]),
+        ("class K; if c; def b; 2; end; private :b; end; end", &[]),
+        ("class K; if c; def b; 2; end; private :b; end; def z; 1; end; end", &["K: def z: () -> 1"]),
+        ("class K; if c; def a; 1; end; private :a; else; def b; 1; end; end; end", &["K: def b: () -> 1"]),
+        ("class K; if c; def b; 2; end; end; private \"b\"; end", &[]),
+        ("class K; if c; def b; 2; end; end; protected :b; end", &[]),
+        ("class K; if c; def b; 2; end; end; private %i[b zz]; end", &[]),
+        ("class K; if c; def b; 2; end; end; private :b, :zz; end", &[]),
+        ("class K; if c; def b; 2; end; end; private(:b); end", &[]),
+        ("class K; if c; def b; 2; end; end; self.private :b; end", &[]),
+        ("class K; if c; def b; 2; end; end; send(:private, :b); end", &[]),
+        ("class K; if c; def b; 2; end; end; __send__(:private, :b); end", &[]),
+        ("class K; if c; def b; 2; end; end; private :b if d; end", &[]),
+        ("class K; if c; def b; 2; end; end; if d; private :b; end; end", &[]),
+        ("class K; if c; def b; 2; end; end; foo { private :b }; end", &[]),
+        ("class K; unless c; def b; 2; end; end; private :b; end", &[]),
+        ("class K; def b; 2; end if c; private :b; end", &[]),
+        ("class K; case x; when 1; def b; 2; end; end; private :b; end", &[]),
+        ("class K; begin; def b; 2; end; rescue; end; private :b; end", &[]),
+        ("class K; while c; def b; 2; end; end; private :b; end", &[]),
+        ("class K; 3.times { def b; 2; end }; private :b; end", &[]),
+        // A reopening shares the slot; a nested one qualifies by path.
+        ("class K; if c; def b; 2; end; end; end; class K; private :b; end", &[]),
+        (
+            "class K; if c; def b; 2; end; end; end; class K; def z; 1; end; private :b; end",
+            &["K: def z: () -> 1"],
+        ),
+        ("module N; class K; if c; def b; 2; end; end; end; end; module N; class K; private :b; end; end", &[]),
+        // The LAST write wins: public after private re-opens the slot, and a
+        // `def` after a call writes it at its running default again.
+        ("class K; if c; def b; 2; end; end; private :b; public :b; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; public :b; private :b; end", &[]),
+        ("class K; if c; def b; 2; end; end; public :b; end", &["K: def b: () -> 2"]),
+        // Review item (b): a re-mark to public overrides the running `private`.
+        ("class K; private; if c; def b; 2; end; end; public :b; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; protected; def z; 1; end; public :b; end", &["K: def b: () -> 2"]),
+        ("class K; private :b; if c; def b; 2; end; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; private :b; def b; 2; end; end; end", &["K: def b: () -> 2"]),
+        // Must-still-fire controls: calls the reference does not apply to this
+        // slot (a splat, a def body, a singleton class, another class's block,
+        // `private_class_method`, `private_constant`) leave the def emitted.
+        ("class K; if c; def b; 2; end; end; private(*names); end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; def d; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; class << self; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; Struct.new(:q) do; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; Class.new { private :b }; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; class L; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; private_class_method :b; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; private_constant :B; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def self.b; 2; end; end; private_class_method :b; end", &["K: def self.b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; private :zz; def z; 1; end; end", &["K: def b: () -> 2", "K: def z: () -> 1"]),
+    ];
+    for (i, (src, want)) in rows.iter().enumerate() {
+        assert_eq!(emitted_rows(&format!("cond_remark_{i}"), src), *want, "{src}");
+    }
+}
+
+#[test]
+fn defs_and_namespaces_in_call_blocks_emit_in_source_order() {
+    // rigor-rs#535 review item (c): the reference's single top-to-bottom walk
+    // emits a call block's defs and namespaces where the call sits, so its
+    // class groups come out in first-seen order (`K` before `K::N`). Printed
+    // order (oracle): `class K` {c, b} then `class K::N`.
+    let src = "class K; def c; 3; end; foo { class N; def z; 1; end; end; def b; 2; end }; end";
+    assert_eq!(
+        emitted_rows("call_block_order", src),
+        ["K: def c: () -> 3", "K::N: def z: () -> 1", "K: def b: () -> 2"]
+    );
+    let src = "class K; foo { def a; 1; end; class N; def z; 1; end; end; def b; 2; end }; def c; 3; end; end";
+    assert_eq!(
+        emitted_rows("call_block_order2", src),
+        ["K: def a: () -> 1", "K::N: def z: () -> 1", "K: def b: () -> 2", "K: def c: () -> 3"]
+    );
+}
