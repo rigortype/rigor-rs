@@ -257,6 +257,16 @@ pub enum Node {
     },
     /// A float literal (`3.14`); `value` is the parsed `f64`.
     FloatLit { value: f64, span: Span },
+    /// A regexp literal (`/re/`). Interpolated regexps lower through the
+    /// generic recovery path (their children stay reachable) — this variant is
+    /// the PLAIN literal only. It carries no value: every consumer needs only
+    /// "is a regexp literal" (sig-gen erases it to the `Regexp` nominal,
+    /// rigor-rs#493 item 7).
+    RegexpLit { span: Span },
+    /// A rational literal (`3r`) — nominal `Rational` (rigor-rs#493 item 7).
+    RationalLit { span: Span },
+    /// An imaginary literal (`3i`) — nominal `Complex` (rigor-rs#493 item 7).
+    ImaginaryLit { span: Span },
     /// A symbol literal (`:foo`); `value` is the symbol name (no leading colon).
     SymbolLit { value: String, span: Span },
     /// The `nil` literal.
@@ -657,6 +667,11 @@ pub enum Node {
         /// `begin` node) `main_body` equals `body`.
         main_body: Vec<NodeId>,
         ensure_body: Vec<NodeId>,
+        /// Whether the `begin` has an `else` clause (even an empty one: the
+        /// `else` value replaces the protected body's value). The `else`
+        /// statements ride `body` after the rescue clauses and before the
+        /// ensure; only a real `begin` node ever sets this (rigor-rs#546).
+        has_else: bool,
         /// The per-clause rescue-chain structure (empty for the reused carriers —
         /// `else`/`when`/`in`/parenthesized groups — and for a `begin` with no
         /// `rescue`). Populated only from a real `BeginNode`'s rescue chain; see
@@ -989,6 +1004,9 @@ impl Node {
             | Node::InterpolatedSymbol { span, .. }
             | Node::IntegerLit { span, .. }
             | Node::FloatLit { span, .. }
+            | Node::RegexpLit { span, .. }
+            | Node::RationalLit { span, .. }
+            | Node::ImaginaryLit { span, .. }
             | Node::SymbolLit { span, .. }
             | Node::NilLit { span }
             | Node::TrueLit { span }

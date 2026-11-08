@@ -9,6 +9,7 @@ use rigor_parse::{FileKey, LoweredAst, Node};
 
 use super::{
     collect_declared_names, collect_literal_constants, collect_override_classes, def_root_cx,
+    DefKind,
     file_orphan_defs, infer_method_returns, invert_definers, mutated_constant_names, walk_defs,
     walk_fold_defs, ConstLit, DefTables, FileDefs, FoldDefs, FoldSite, Harvest, HarvestedClass,
     HarvestedFoldDef, SourceIndex,
@@ -295,6 +296,7 @@ impl SourceIndex {
                     kind: d.kind,
                     tail: d.tail.clone(),
                     has_explicit_return: d.has_explicit_return,
+                    arity: d.arity,
                 })
                 .collect();
             h.fold_defs.extend(adoptions);
@@ -650,12 +652,25 @@ impl SourceIndex {
         for (h, _) in files {
             for d in &h.borrow().fold_defs {
                 defs.entry((d.owner.clone(), d.method.clone(), d.kind)).or_default().push(
-                    FoldSite { tail: &d.tail, has_explicit_return: d.has_explicit_return },
+                    FoldSite {
+                        tail: &d.tail,
+                        has_explicit_return: d.has_explicit_return,
+                        arity: d.arity,
+                    },
                 );
             }
         }
         idx.definers = invert_definers(&defs);
         idx.literal_returns = idx.compute_literal_returns(core, &defs);
+        // rigor-rs#462: the `<toplevel>` call-site arity ranges.
+        for d in files.iter().flat_map(|(h, _)| {
+            let h = h.borrow();
+            h.fold_defs.iter().map(|d| (d.method.clone(), d.owner.clone(), d.kind, d.arity)).collect::<Vec<_>>()
+        }) {
+            if d.2 == DefKind::Instance && d.1 == "<toplevel>" {
+                idx.toplevel_def_arities.entry(d.0).or_default().push(d.3);
+            }
+        }
 
         idx
     }

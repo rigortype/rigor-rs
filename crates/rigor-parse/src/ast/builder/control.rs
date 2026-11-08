@@ -143,6 +143,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
+                has_else: false,
                 clauses: Vec::new(),
                 span: span_of(&else_node.location()),
             });
@@ -293,6 +294,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
+                has_else: false,
                 clauses: Vec::new(),
                 span: span_of(&in_node.location()),
             });
@@ -306,6 +308,7 @@ impl<'src> Builder<'src> {
             // whatever position or jump it sits under (rigor-rs#312).
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
+            self.unmasked_loop += 1;
             let body_span = if let Some(s) = while_node.statements() {
                 let b = span_of(&s.location());
                 self.iterated_body_spans.push(b);
@@ -321,6 +324,7 @@ impl<'src> Builder<'src> {
             self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
             self.lexical_loop -= 1;
+            self.unmasked_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -335,6 +339,7 @@ impl<'src> Builder<'src> {
             let predicate = Some(self.lower_node(&until_node.predicate()));
             self.recovery_iterative += 1;
             self.lexical_loop += 1;
+            self.unmasked_loop += 1;
             let body_span = if let Some(s) = until_node.statements() {
                 let b = span_of(&s.location());
                 self.iterated_body_spans.push(b);
@@ -350,6 +355,7 @@ impl<'src> Builder<'src> {
             self.lexical_loop_bodies.pop();
             self.recovery_iterative -= 1;
             self.lexical_loop -= 1;
+            self.unmasked_loop -= 1;
             return self.push(Node::Loop {
                 predicate,
                 body,
@@ -380,6 +386,7 @@ impl<'src> Builder<'src> {
             // so a `break` argument's scope effects never propagate
             // here either (rigor-rs#363).
             self.lexical_loop += 1;
+            self.unmasked_loop += 1;
             // `for` bodies are NOT `iterated_body_spans` (no writeback
             // scan) — the stack entry exists only to pair a valued
             // `next` inside with the body it lands under.
@@ -397,6 +404,7 @@ impl<'src> Builder<'src> {
             self.recovery_joined -= 1;
             self.recovery_next_sink -= 1;
             self.lexical_loop -= 1;
+            self.unmasked_loop -= 1;
             let (index, index_writes) = for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
@@ -489,15 +497,27 @@ impl<'src> Builder<'src> {
                     .reference()
                     .map(|reference| rescue_reference_index_writes(&reference))
                     .unwrap_or_default();
+                // Prism's RescueNode location runs INTO the following
+                // clause's `rescue` keyword — a `retry` inside the next
+                // arm would otherwise count for this one (`clause_retries`)
+                // and the retry-edge widening would cover the sibling's
+                // own writes (rigor-rs#468 review). Truncate at the
+                // subsequent clause's start.
+                let subsequent = r.subsequent();
+                let clause_end = subsequent
+                    .as_ref()
+                    .map(|s| s.location().start_offset())
+                    .unwrap_or_else(|| r.location().end_offset());
                 clauses.push(RescueClause {
                     exceptions,
                     body: clause_body,
                     bound_name,
                     index_writes,
-                    span: span_of(&r.location()),
+                    span: (r.location().start_offset(), clause_end),
                 });
-                rescue = r.subsequent();
+                rescue = subsequent;
             }
+            let has_else = begin_node.else_clause().is_some();
             if let Some(e) = begin_node.else_clause().and_then(|e| e.statements()) {
                 body.extend(self.lower_body(&e.body()));
             }
@@ -515,6 +535,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body,
+                has_else,
                 clauses,
                 span: span_of(&begin_node.location()),
             });

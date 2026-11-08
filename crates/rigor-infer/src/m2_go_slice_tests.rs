@@ -89,10 +89,14 @@ fn constant_receiver_declines_under_a_multi_value_argument() {
         ty_of_last_recv_call(b"v = 1\nv = 2 if $c\n\"abc\"[v]\n"),
         "Dynamic[top]"
     );
-    // CONTROLS.
+    // CONTROLS — updated by #178: `v = 1` pins, so the stale-env gate
+    // skips the fold and every nilable String lookup now declines rather
+    // than answering the flat `String` (the reference folds the local and
+    // fires `for "b"`; the port cannot reproduce that fold, so silent is
+    // the required direction). A literal argument still folds exactly.
     assert_eq!(
         ty_of_last_recv_call(b"def g\n  v = 1\n  \"abc\"[v]\nend\n"),
-        "Class<0>"
+        "Dynamic[top]"
     );
     assert_eq!(ty_of_last_recv_call(b"\"abc\"[1]\n"), "Constant[\"b\"]");
     // And the Kernel folds keep their answers on the same `1 | 2` local —
@@ -123,11 +127,15 @@ fn nilable_dispatch_declines_under_a_guarded_parameter() {
     // CONTROLS.
     assert_eq!(guarded("\"abc\".center(u)"), "Class<0>");
     assert_ne!(guarded("[1, 2].product(u)"), "Dynamic[top]");
+    // #178: `u = 1` pins and reads a local, so the fold stands down and
+    // the `String?` lookup now declines instead of keeping the flat
+    // `String` (the reference folds the local; silent is the required
+    // direction over the drifted `String`).
     assert_eq!(
         ty_of_last_recv_call(
             b"def f(u)\n  u = 1\n  return unless u.is_a?(Integer)\n  \"abc\"[u]\nend\n"
         ),
-        "Class<0>"
+        "Dynamic[top]"
     );
     // A `case` guard's narrowed `Nominal[Integer]` is not a foldable
     // `Constant` either — the reference's `String | nil` join stands —
@@ -136,6 +144,34 @@ fn nilable_dispatch_declines_under_a_guarded_parameter() {
     assert_eq!(
         ty_of_last_recv_call(b"def f(u)\n  case u\n  when Integer then \"abc\"[u]\n  end\nend\n"),
         "Dynamic[top]"
+    );
+}
+
+/// Issue #178 — every nilable String lookup that tier 1 does not fold
+/// answers `Dynamic`, never the flat `String` / `Integer` that fired
+/// `call.undefined-method` on a chained call where the reference is
+/// silent: a local-read receiver skipped by the stale-env gate
+/// (`x.index("z")`), and an argument that never pins (a Range literal).
+#[test]
+fn str_lookup_declines_unfolded() {
+    // Stale-env row: the receiver reads a local, so the fold stands down
+    // and `index` declines rather than answering `Integer`.
+    assert_eq!(
+        ty_of_last_recv_call(b"x = \"abc\"\nx.index(\"z\")\n"),
+        "Dynamic[top]"
+    );
+    // Range-argument row: the argument cannot pin, so the fold is never
+    // tried — the lookup still declines (was `for String` on `.to_a`).
+    assert_eq!(ty_of_last_recv_call(b"\"abc\"[5..6]\n"), "Dynamic[top]");
+    // CONTROLS: fully pinned calls still fold exactly.
+    assert_eq!(ty_of_last_recv_call(b"\"abc\"[1]\n"), "Constant[\"b\"]");
+    assert_eq!(
+        ty_of_last_recv_call(b"\"abc\".index(\"b\")\n"),
+        "Constant[1]"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"\"abc\".getbyte(0)\n"),
+        "Constant[97]"
     );
 }
 
@@ -282,4 +318,65 @@ fn untyped_argument_roots_beyond_def_locals() {
     assert_eq!(ty(b"def f\n  Array(String)\nend\n"), "Class<4>");
     assert_eq!(ty(b"def f\n  Array(Errno::ENOENT)\nend\n"), "Class<4>");
     assert_eq!(ty(b"def f\n  Array(ENV)\nend\n"), "Class<4>");
+}
+
+/// rigor-rs#462: a bare call resolves a TOPLEVEL `def` in ANOTHER file —
+/// the `<toplevel>` literal-tail fold outranks `Kernel#format`, and the def
+/// shadows the Kernel intrinsic even when its tail doesn't fold.
+#[test]
+fn cross_file_toplevel_def_shadows_kernel_fold() {
+    fn ty_of_format(files: &[&[u8]], call_file: usize, method: &str) -> String {
+        let asts: Vec<_> = files.iter().map(|f| lower(&parse(f))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        let index = CoreIndex::new();
+        let source = SourceIndex::build_project(&refs, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = TypeEnv::new();
+        let ast = &asts[call_file];
+        let call_id = ast
+            .iter()
+            .filter_map(|(id, n)| {
+                matches!(n, Node::Call { receiver: None, method: m, .. } if m == method)
+                    .then_some(id)
+            })
+            .next()
+            .unwrap();
+        let ty = typer.type_of(ast, call_id, &env, &mut i);
+        rigor_types::describe(&i, ty)
+    }
+    // helpers.rb `def format(x) = 42` types `format(1)` to `42`.
+    assert_eq!(
+        ty_of_format(
+            &[b"format(1)\n".as_slice(), b"def format(x) = 42\n".as_slice()],
+            0,
+            "format"
+        ),
+        "Constant[42]"
+    );
+    // An explicit `return` declines the literal but still SHADOWS the
+    // Kernel intrinsic — the call types Dynamic, not String.
+    assert_eq!(
+        ty_of_format(
+            &[
+                b"format(1)\n".as_slice(),
+                b"def format(x); return 42; end\n".as_slice()
+            ],
+            0,
+            "format"
+        ),
+        "Dynamic[top]"
+    );
+    // An arity miss (`format("%d", 2)` vs `def format(x)`) shadows too.
+    assert_eq!(
+        ty_of_format(
+            &[
+                b"format(\"%d\", 2)\n".as_slice(),
+                b"def format(x) = 42\n".as_slice()
+            ],
+            0,
+            "format"
+        ),
+        "Dynamic[top]"
+    );
 }

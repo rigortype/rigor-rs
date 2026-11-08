@@ -1039,7 +1039,33 @@ fn legacy_walk_fold_defs(
     defs: &mut LegacyFoldDefs,
 ) {
     match ast.get(node) {
-        Node::Program { body, .. } | Node::Statements { body, .. } => {
+        Node::Program { body, .. } => {
+            for &child in body {
+                // rigor-rs#462: mirror `walk_fold_defs`' toplevel-def arm.
+                if let Node::Definition {
+                    name: Some(method),
+                    receiver_def_name: None,
+                    singleton_name: None,
+                    body: def_body,
+                    has_explicit_return,
+                    ..
+                } = ast.get(child)
+                {
+                    if let Some(&tail) = def_body.last() {
+                        defs.entry(("<toplevel>".to_string(), method.clone(), DefKind::Instance))
+                            .or_default()
+                            .push(LegacyFoldSite {
+                                ast_idx,
+                                tail,
+                                has_explicit_return: *has_explicit_return,
+                            });
+                    }
+                } else {
+                    legacy_walk_fold_defs(ast_idx, ast, child, prefix, defs);
+                }
+            }
+        }
+        Node::Statements { body, .. } => {
             for &child in body {
                 legacy_walk_fold_defs(ast_idx, ast, child, prefix, defs);
             }

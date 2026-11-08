@@ -95,6 +95,7 @@ mod rbs_parse_error;
 mod superclasses;
 mod sig_env;
 mod module_function;
+mod remarks;
 mod top_level;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -117,6 +118,8 @@ struct MethodSig<'a> {
     /// same body made dual — rendered `def self?.name` (reference
     /// `method_def_prefix` / `@module_function_methods`). Kind stays `instance`.
     module_function: bool,
+    /// The def node's source offset — the definer-table rank (last wins).
+    offset: usize,
 }
 
 /// One printable RBS skeleton row (the reference's emittable `MethodCandidate`,
@@ -154,6 +157,11 @@ struct Candidate {
     /// share (an equivalent declaration, a port-only confidence skip) are
     /// `"dropped"` with no reason. Neither kind leaves [`generate_run`].
     skip_reason: Option<&'static str>,
+    /// The `def` node this candidate came from: `(source offset, module_function)`.
+    /// `None` for meta members, stubs and skip rows. Feeds the
+    /// [`live_definitions`] slot pass (reference `definer_table` /
+    /// `live_definitions`, #2008/#2023).
+    definer: Option<(usize, bool)>,
 }
 
 /// `rigor sig-gen [--print] [--format text|json] [--include-private] [--config PATH] [paths]`.
@@ -195,6 +203,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     let mut overwrite = false;
     let mut explicit_config: Option<String> = None;
     let mut positional: Vec<String> = Vec::new();
+    let mut mode_given = false;
     // The first flag naming machinery this slice does not port (in argv order,
     // so the diagnostic names the first offender).
     let mut deferred: Option<String> = None;
@@ -207,9 +216,17 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         match item {
             Item::Positional(p) => positional.push(p),
             Item::Opt { key, value, .. } => match key {
-                "print" => mode = "print",
-                "diff" => mode = "diff",
-                "write" => mode = "write",
+                "print" | "diff" | "write" | "check" => {
+                    // `select_mode`: a second, different mode flag is a usage
+                    // error, not last-one-wins.
+                    if mode_given && mode != key {
+                        mode = "conflict";
+                    }
+                    mode_given = true;
+                    if mode != "conflict" {
+                        mode = key;
+                    }
+                }
                 "overwrite" => overwrite = true,
                 "include-private" => include_private = true,
                 // No persistent analysis cache exists in the port.
@@ -217,9 +234,6 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 "format" => format = value.unwrap().as_str().to_string(),
                 "params" => params = value.unwrap().as_str().to_string(),
                 "observe" => defer("--observe", &mut deferred),
-                // ADR-112 WD4's dry-run gate — the writer's compare mode is
-                // not ported.
-                "check" => defer("--check", &mut deferred),
                 "effect-envelopes" => defer("--effect-envelopes", &mut deferred),
                 "new-files" => defer("--new-files", &mut deferred),
                 "new-methods" => defer("--new-methods", &mut deferred),
@@ -235,6 +249,10 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
 
     // `validation_error` — inside `parse_options`, before `Configuration.load`,
     // each failure a `sig-gen: <msg>` line + exit 64.
+    if mode == "conflict" {
+        eprintln!("sig-gen: --print, --diff, --write, and --check are mutually exclusive flags; pick one");
+        return ExitCode::from(64);
+    }
     if !matches!(format.as_str(), "text" | "json") {
         eprintln!("sig-gen: unsupported --format={format}");
         return ExitCode::from(64);
@@ -296,8 +314,11 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
 
-    if mode == "write" {
-        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env);
+    if mode == "write" || mode == "check" {
+        // ADR-112 WD4 — `--check` is the writer's dry-run compare mode: same
+        // routing and merge decisions, nothing reaches disk, and the verdict
+        // is the exit status.
+        let status = cmd_write(&files, include_private, &format, overwrite, &cfg, &sig_env, mode == "check");
         return if path_status != ExitCode::SUCCESS { path_status } else { status };
     }
 
@@ -305,7 +326,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
     // declaration during merge); on a print/diff run it is inert, exactly like the
     // reference (the flag lives on the Writer).
 
-    let Generated { candidates, unresolvable, skips, .. } =
+    let Generated { candidates, all_rows, unresolvable, skips, .. } =
         generate_run(&files, include_private, &sig_env, &writes);
 
     // `--format json` renders the candidate table regardless of print/diff mode
@@ -314,7 +335,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
         ("json", _) if !path_errors.is_empty() => {
             // The reference's key order (`Diagnostic#to_h`), which a
             // `serde_json::Value` map would sort.
-            let head = candidates_json_string(&candidates);
+            let head = candidates_json_string(&all_rows);
             let head = head.strip_suffix("\n}").unwrap_or(&head);
             let q = |v: &str| serde_json::to_string(v).unwrap();
             let rows: Vec<String> = path_errors
@@ -332,7 +353,7 @@ pub fn cmd_sig_gen(args: &[String]) -> ExitCode {
                 .collect();
             println!("{head},\n  \"diagnostics\": [\n{}\n  ]\n}}", rows.join(",\n"));
         }
-        ("json", _) => render_json(&candidates),
+        ("json", _) => render_json(&all_rows),
         (_, true) => render_diff(&candidates),
         (_, false) => render_text(&candidates),
     }
@@ -445,6 +466,49 @@ fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info:
     let _ = superclass;
     for &child in body {
         collect_namespace_info(ast, child, &qualified, info);
+        collect_namespace_info_nested(ast, child, &qualified, info);
+    }
+}
+
+/// `if`-/`begin`-carried namespaces still record their kind for the merge
+/// (`module K::M2` inside `if` writes `module`), just as
+/// [`collect_conditional_definers`] walks them for candidates.
+fn collect_namespace_info_nested(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
+    let children: &[NodeId] = match ast.get(id) {
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => return,
+        Node::Definition { is_singleton_class: false, .. } => return,
+        Node::If { then_body, else_body, .. } => {
+            for &b in then_body.iter().chain(else_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &b in branches.iter().chain(else_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        Node::When { body, .. }
+        | Node::Loop { body, .. }
+        | Node::BeginRescue { body, .. }
+        | Node::Statements { body, .. }
+        | Node::Lambda { body, .. }
+        | Node::Definition { is_singleton_class: true, body, .. } => body,
+        Node::Call { args, block_body, .. } => {
+            for &b in args.iter().chain(block_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        _ => return,
+    };
+    for &b in children {
+        collect_namespace_info(ast, b, prefix, info);
+        collect_namespace_info_nested(ast, b, prefix, info);
     }
 }
 
@@ -464,8 +528,8 @@ fn generate_run(
         candidates.extend(cs);
         info.absorb(i);
     }
-    let (candidates, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
-    Generated { candidates, info, unresolvable: report, skips }
+    let (candidates, all_rows, skips, report) = finalize_superclasses(candidates, &mut info, sig_env, written);
+    Generated { candidates, all_rows, info, unresolvable: report, skips }
 }
 
 /// One run's output: the emittable candidates (`new_method` / `tighter_return`),
@@ -474,6 +538,10 @@ fn generate_run(
 /// [`report_skipped`]).
 struct Generated {
     candidates: Vec<Candidate>,
+    /// Every considered row in candidate order — emittable AND `skipped`
+    /// rows (reference `filter(candidates, with_skipped: true)` for the
+    /// `--print --format json` payload; `dropped` rows stay out).
+    all_rows: Vec<Candidate>,
     info: NamespaceInfo,
     unresolvable: Vec<UnresolvableSuperclass>,
     skips: Vec<&'static str>,
@@ -548,7 +616,7 @@ fn finalize_superclasses(
     info: &mut NamespaceInfo,
     sig_env: &SigEnv,
     written: &dyn Fn(&Candidate) -> bool,
-) -> (Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
+) -> (Vec<Candidate>, Vec<Candidate>, Vec<&'static str>, Vec<UnresolvableSuperclass>) {
     let index = CoreIndex::new();
     let rbs_known = |name: &str| sig_env.class_known(&index, name);
     // Every row counts, emitted or not (`candidates.each_with_object`): the
@@ -674,6 +742,7 @@ fn finalize_superclasses(
     // `unresolvable-superclass` skip, which the summary does not count.
     let mut owners: Vec<(String, String)> = Vec::new();
     let mut out: Vec<Candidate> = Vec::new();
+    let mut all_rows: Vec<Candidate> = Vec::new();
     let mut skips: Vec<&'static str> = Vec::new();
     for mut c in candidates {
         match owner_of(&c.class_name, &unresolvable) {
@@ -681,12 +750,28 @@ fn finalize_superclasses(
                 if !owners.iter().any(|(n, _)| *n == owner.0) {
                     owners.push(owner);
                 }
+                // Demoted by an earlier fixpoint pass already; a class the
+                // SECOND pass (after the override demotion) first marks
+                // unresolvable is demoted here — the JSON payload lists the
+                // row either way.
+                // The reference demotes EVERY row of the class — an earlier
+                // `untyped-return` reason is replaced too.
+                if c.skip_reason != Some("sig.skipped.unresolvable-superclass") {
+                    c = demoted(c, "sig.skipped.unresolvable-superclass");
+                }
+                all_rows.push(c);
             }
             None if emittable(&c) => {
                 c.decl_header = declaration_header(info, &c.class_name);
+                all_rows.push(clone_candidate(&c));
                 out.push(c);
             }
-            None => skips.extend(c.skip_reason),
+            None => {
+                skips.extend(c.skip_reason);
+                if c.skip_reason.is_some() {
+                    all_rows.push(c);
+                }
+            }
         }
     }
 
@@ -717,7 +802,7 @@ fn finalize_superclasses(
             UnresolvableSuperclass { class_name, superclass: if project { token } else { root }, project }
         })
         .collect();
-    (out, skips, report)
+    (out, all_rows, skips, report)
 }
 
 /// Reference `Generator#demote_overridden_base_methods` (#744): a base
@@ -772,6 +857,9 @@ fn demote_overridden_base_methods(
 fn demoted(mut c: Candidate, reason: &'static str) -> Candidate {
     c.classification = "skipped";
     c.skip_reason = Some(reason);
+    // The reference's `demoted_candidate` rebuilds WITHOUT `rbs`, so the
+    // JSON row omits the key.
+    c.rbs = String::new();
     c
 }
 
@@ -869,40 +957,99 @@ fn generate_file_with_info(
     // value class's members and constructors read first, ahead of the methods its
     // block body or its `class ... end` body defines.
     let mut out = collect_meta_candidates(path, &layouts, sig_env);
+    let mut definers: Vec<Definer> = Vec::new();
+    // `meta_member_slots` (reference `definer_table`): every member a
+    // `Data.define`/`Struct.new` layout declares is a CERTAIN definer of its
+    // slot at `MEMBER_OFFSET` — a `def x` inside the block (or the class body)
+    // steals it, so `def x: () -> untyped` must not emit beside the real
+    // `def x` (rigor-rs#525 item 1).
+    for (class_name, layout) in layouts.iter() {
+        for member in meta_class::member_decls(layout) {
+            definers.push(Definer {
+                class_name: class_name.to_string(),
+                kind: member.kind,
+                method_name: member.method_name.clone(),
+                offset: META_MEMBER_OFFSET,
+                certain: true,
+            });
+        }
+    }
     let mut info = NamespaceInfo::default();
     // Top-level `def`s join the walk in source order, as `sig.skipped.top-level-def`
     // rows (#1676). None sits inside a namespace the walk enters, so each one
     // goes in ahead of the first top-level statement that ends after it.
     let mut top_level = top_level::collect(&parsed).into_iter().peekable();
-    let modes = module_function::def_modes(&parsed);
+    let modes = DefFacts {
+        modes: module_function::def_modes(&parsed),
+        slot_visibilities: remarks::def_slot_visibilities(&parsed),
+    };
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
             let end = ast.get(child).span().1;
             while let Some((name, _)) = top_level.next_if(|(_, start)| *start < end) {
                 out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
             }
-            walk_namespace(
-                &ast,
-                child,
-                &[],
-                path,
-                include_private,
-                &index,
-                &typer,
-                &env,
-                &fqns,
-                sig_env,
-                &layouts,
-                &modes,
-                &mut interner,
-                &mut out,
-            );
+            if is_namespace_node(&ast, child, &[], &layouts) {
+                walk_namespace(
+                    &ast,
+                    child,
+                    &[],
+                    path,
+                    include_private,
+                    &index,
+                    &typer,
+                    &env,
+                    &fqns,
+                    sig_env,
+                    &layouts,
+                    &modes,
+                    &mut interner,
+                    &mut out,
+                    &mut definers,
+                );
+            } else {
+                // `if c; class N; def z; end; end` at TOP level: the
+                // conditional's namespace children still emit (`walk_defs`
+                // descends) — rigor-rs#535. Plain top-level `def`s are
+                // already reported by `top_level::collect`.
+                collect_conditional_definers(
+                    &ast,
+                    child,
+                    &[],
+                    false,
+                    false,
+                    path,
+                    include_private,
+                    &index,
+                    &typer,
+                    &env,
+                    &fqns,
+                    sig_env,
+                    &layouts,
+                    &modes,
+                    &[],
+                    Visibility::Public,
+                    false,
+                    &mut interner,
+                    &mut out,
+                    &mut definers,
+                );
+            }
             collect_namespace_info(&ast, child, &[], &mut info);
+            collect_namespace_info_nested(&ast, child, &[], &mut info);
         }
     }
     for (name, _) in top_level {
         out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
     }
+    // `live_definitions` (reference): Ruby keeps the LAST certain definer of a
+    // `(class, kind, name)` slot, and a def is written only when it survives
+    // EVERY slot it defines. A module_function `def u` owns `[instance,u]` and
+    // `[singleton,u]`; a later `def self.u` steals the singleton slot, so the
+    // `self?.u` row is dropped entirely — writing both is the `rbs validate`
+    // duplicate-member failure of rigor-rs#493 item 9. One surviving singleton
+    // slot downgrades the row to `def self.u`; anything else drops it.
+    live_definitions(&mut out, &definers);
     register_meta_classes(&layouts, &mut info);
     info.headers = superclasses::collect(&parsed);
     // `register_core_subclass_shell` (#2224): a subclass of a core or stdlib
@@ -995,8 +1142,15 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
+        definer: Some((META_MEMBER_OFFSET, false)),
     }
 }
+
+/// The reference's `MEMBER_OFFSET = -1`: a meta member's definer-table entry
+/// sorts BEFORE every real offset — a `def` anywhere after it steals the slot.
+/// `0` stands in for `-1` (the table holds only class-scoped slots; no
+/// class-level `def` can sit at byte 0).
+const META_MEMBER_OFFSET: usize = 0;
 
 /// The `--print` declaration line for a class group (reference
 /// `declaration_header`). Print mode used to hard-code `class`, which turned a
@@ -1170,6 +1324,38 @@ fn describe_qualified(
     rigor_types::describe_named(interner, ty, &resolve)
 }
 
+/// One `def`'s contribution to the definer table (reference `definer_table` /
+/// `definer_slots`): a module_function instance def defines its instance slot
+/// AND a singleton slot; a def after an uncertain `module_function` reset defines
+/// the singleton slot only `possible`-ly (`certain = false`). Every collected
+/// `def` is a direct statement of a class/module/`class << self`/`Data.define`
+/// body or `class << self` inner def, so the own-kind slot is `certain` — the
+/// reference's `certain_definers` set.
+struct Definer {
+    class_name: String,
+    /// `"instance"` | `"singleton"` slot kind.
+    kind: &'static str,
+    method_name: String,
+    offset: usize,
+    certain: bool,
+}
+
+/// What a Prism pass reads off each `def` before lowering drops it, keyed by
+/// the `def`'s start offset.
+struct DefFacts {
+    /// The module_function mode in force at it ([`module_function::def_modes`]).
+    modes: HashMap<usize, module_function::Mode>,
+    /// The visibility a visibility CALL left on its slot after the `def`
+    /// ([`remarks::def_slot_visibilities`], rigor-rs#535).
+    slot_visibilities: HashMap<usize, Visibility>,
+}
+
+impl DefFacts {
+    fn mode(&self, offset: usize) -> module_function::Mode {
+        self.modes.get(&offset).copied().unwrap_or(module_function::Mode::Off)
+    }
+}
+
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
 /// instance method and descending into nested namespaces (prefix accumulates the
 /// qualified name, reference `walk_defs`).
@@ -1186,9 +1372,10 @@ fn walk_namespace(
     fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     layouts: &MetaLayouts,
-    modes: &HashMap<usize, module_function::Mode>,
+    modes: &DefFacts,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
 ) {
     let (name, rooted, visibilities, body) = match ast.get(id) {
         Node::ClassDef { name, rooted, method_visibilities, body, .. } => {
@@ -1232,14 +1419,30 @@ fn walk_namespace(
     // form does not flip the mode. It applies in a CLASS body too.
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
     let mut uncertain: Vec<(&str, usize)> = Vec::new();
+    let mut conditionals: Vec<(usize, NodeId)> = Vec::new();
+    let mut call_children: Vec<(usize, NodeId)> = Vec::new();
     for &child in body {
         match ast.get(child) {
             Node::Definition {
                 name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
-                let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                let mode = modes.mode(span.0);
                 if mode == module_function::Mode::Uncertain {
                     uncertain.push((n.as_str(), span.0));
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "instance",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: true,
+                    });
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "singleton",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: false,
+                    });
                     continue;
                 }
                 let mf = mode == module_function::Mode::On;
@@ -1249,31 +1452,113 @@ fn walk_namespace(
                     visibilities.iter().find(|(m, _)| m == n).map(|(_, v)| *v)
                 };
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, false, mf, span.0),
                     vis,
                     span.0,
                 ));
+                definers.push(Definer {
+                    class_name: class_name.clone(),
+                    kind: "instance",
+                    method_name: n.to_string(),
+                    offset: span.0,
+                    certain: true,
+                });
+                if mf {
+                    definers.push(Definer {
+                        class_name: class_name.clone(),
+                        kind: "singleton",
+                        method_name: n.to_string(),
+                        offset: span.0,
+                        certain: true,
+                    });
+                }
             }
             // `private def x` after an uncertain reset: reported like a direct
             // def (the reference skips it before reading its visibility). In
             // any other mode the port does not walk a def passed to a call.
-            Node::Call { receiver: None, args, .. } => {
-                for &arg in args {
-                    if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
-                        if modes.get(&span.0) == Some(&module_function::Mode::Uncertain) {
-                            uncertain.push((n.as_str(), span.0));
+            Node::Call { receiver: None, method, args, span, .. } => {
+                // `attr_reader :x` / `attr_writer` / `attr_accessor` are
+                // DEFINERS too (reference `record_attr_definers`): the call's
+                // offset ranks them like a `def`, so a later `attr_reader :u`
+                // steals the instance slot a `module_function def u` held.
+                if !class_name.is_empty()
+                    && matches!(method.as_str(), "attr_reader" | "attr_writer" | "attr_accessor")
+                {
+                    for &arg in args {
+                        let Node::SymbolLit { value, .. } = ast.get(arg) else { continue };
+                        let reads = method != "attr_writer";
+                        let writes = method != "attr_reader";
+                        for (mname, emits) in [(value.clone(), reads), (format!("{value}="), writes)] {
+                            if emits {
+                                definers.push(Definer {
+                                    class_name: class_name.clone(),
+                                    kind: "instance",
+                                    method_name: mname,
+                                    offset: span.0,
+                                    certain: true,
+                                });
+                            }
                         }
                     }
                 }
+                for &arg in args {
+                    if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
+                        let mode = modes.mode(span.0);
+                        if mode == module_function::Mode::Uncertain {
+                            uncertain.push((n.as_str(), span.0));
+                        }
+                        // A def passed to `private` / `public` / `protected`
+                        // (or `module_function`) still DEFINES its slots — the
+                        // reference records it in `certain_definers` even
+                        // though the port never emits a candidate for it.
+                        definers.push(Definer {
+                            class_name: class_name.clone(),
+                            kind: "instance",
+                            method_name: n.to_string(),
+                            offset: span.0,
+                            certain: true,
+                        });
+                        match mode {
+                            module_function::Mode::On => definers.push(Definer {
+                                class_name: class_name.clone(),
+                                kind: "singleton",
+                                method_name: n.to_string(),
+                                offset: span.0,
+                                certain: true,
+                            }),
+                            module_function::Mode::Uncertain => definers.push(Definer {
+                                class_name: class_name.clone(),
+                                kind: "singleton",
+                                method_name: n.to_string(),
+                                offset: span.0,
+                                certain: false,
+                            }),
+                            _ => {}
+                        }
+                    }
+                }
+                // `foo(attr_reader(:x))` and `foo do; def y; end; end`: the
+                // arguments and the block body carry uncertain definers and
+                // candidates of their own. They emit in SOURCE ORDER with the
+                // body's other statements (`Emit::CallChildren`), as the
+                // reference's single top-to-bottom walk does.
+                call_children.push((span.0, child));
             }
             Node::Definition {
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
                 sigs.push((
-                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                    sig_of(n, b, params, param_shape, *has_explicit_return, true, false, span.0),
                     None,
                     span.0,
                 ));
+                definers.push(Definer {
+                    class_name: class_name.clone(),
+                    kind: "singleton",
+                    method_name: n.to_string(),
+                    offset: span.0,
+                    certain: true,
+                });
             }
             Node::Definition { is_singleton_class: true, body: sbody, .. } => {
                 for &inner in sbody {
@@ -1282,14 +1567,34 @@ fn walk_namespace(
                     } = ast.get(inner)
                     {
                         sigs.push((
-                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false),
+                            sig_of(n, b, params, param_shape, *has_explicit_return, true, false, span.0),
                             None,
                             span.0,
                         ));
+                        definers.push(Definer {
+                            class_name: class_name.clone(),
+                            kind: "singleton",
+                            method_name: n.to_string(),
+                            offset: span.0,
+                            certain: true,
+                        });
                     }
                 }
             }
-            _ => {}
+            // Any other body statement — an `if`/`case`/`begin`/loop/block
+            // — can still CARRY a `def` or `attr_*`: the reference walks
+            // into every non-`def` child (`walk_defs`, `walk_attr_calls`),
+            // recording each as an UNCERTAIN definer (only direct statements
+            // are `certain_definers`), so `if cond; attr_reader :x; end`
+            // contests a preceding `def x` (rigor-rs#525 item 2). Their
+            // candidates emit in source order via `Emit::Conditional`
+            // (rigor-rs#535). Namespace children are walked by
+            // `Emit::Nested` instead — do not double-count them.
+            _ => {
+                if !is_namespace_node(ast, child, &qualified, layouts) {
+                    conditionals.push((ast.get(child).span().0, child));
+                }
+            }
         }
     }
     // Emit own methods AND descend into nested classes in ONE source-order
@@ -1302,6 +1607,8 @@ fn walk_namespace(
         Method(&'a MethodSig<'a>, Option<Visibility>),
         Uncertain(&'a str),
         Nested(NodeId),
+        Conditional(NodeId),
+        CallChildren(NodeId),
     }
     let mut items: Vec<(usize, Emit)> = Vec::new();
     for (sig, vis, span) in &sigs {
@@ -1314,6 +1621,12 @@ fn walk_namespace(
         if is_namespace_node(ast, child, &qualified, layouts) {
             items.push((ast.get(child).span().0, Emit::Nested(child)));
         }
+    }
+    for (span, child) in &conditionals {
+        items.push((*span, Emit::Conditional(*child)));
+    }
+    for (span, child) in &call_children {
+        items.push((*span, Emit::CallChildren(*child)));
     }
     items.sort_by_key(|(span, _)| *span);
     for (_, item) in items {
@@ -1358,9 +1671,538 @@ fn walk_namespace(
                 modes,
                 interner,
                 out,
+                definers,
             ),
+            Emit::CallChildren(child) => {
+                let Node::Call { method, args, block_body, span, .. } = ast.get(child) else { continue };
+                let in_module = matches!(ast.get(id), Node::ModuleDef { .. });
+                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
+                // definer too (`rigor_each_child` descends arguments).
+                // `Definition` args are already handled in the collection
+                // loop — descending them would double-count the wrapped def.
+                let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
+                for &arg in args {
+                    if !matches!(ast.get(arg), Node::Definition { .. }) {
+                        collect_conditional_definers(
+                            ast, arg, &qualified, false, in_module, path, include_private, index, typer, env,
+                            fqns, sig_env, layouts, modes, &visibilities, running_vis, running_mf, interner,
+                            out, definers,
+                        );
+                    }
+                }
+                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
+                // children are uncertain definers (`walk_attr_calls` descends
+                // call blocks too; a `refine`/`class_methods` block is a DSL
+                // scope and skipped).
+                let dsl_scope = method == "class_methods" || (method == "refine" && in_module);
+                if !dsl_scope {
+                    for &b in block_body {
+                        collect_conditional_definers(
+                            ast, b, &qualified, false, in_module, path, include_private, index, typer, env,
+                            fqns, sig_env, layouts, modes, &visibilities, running_vis, running_mf, interner,
+                            out, definers,
+                        );
+                    }
+                }
+            }
+            Emit::Conditional(child) => {
+                let (running_vis, running_mf) = running_toggles_at(ast, body, ast.get(child).span().0);
+                collect_conditional_definers(
+                    ast,
+                    child,
+                    &qualified,
+                    false,
+                    matches!(ast.get(id), Node::ModuleDef { .. }),
+                    path,
+                    include_private,
+                    index,
+                    typer,
+                    env,
+                    fqns,
+                    sig_env,
+                    layouts,
+                    modes,
+                    &visibilities,
+                    running_vis,
+                    running_mf,
+                    interner,
+                    out,
+                    definers,
+                );
+            }
         }
     }
+}
+
+/// Reference `walk_attr_calls` + the definer side of `walk_defs`: descend
+/// into every non-`def` node inside a class body — `if`/`case`/`begin`/loop
+/// bodies, call arguments and block bodies — recording each `def` and
+/// `attr_*` it holds as an UNCERTAIN definer (`certain_definers` marks only
+/// direct statements). An uncertain definer after a certain one contests the
+/// slot, so `def x; if c; attr_reader :x; end; end` writes nothing
+/// (rigor-rs#525 item 2). `refine`/`class_methods` block calls are DSL
+/// scopes the reference skips (`skipped_block_call?`).
+#[allow(clippy::too_many_arguments)]
+fn collect_conditional_definers(
+    ast: &LoweredAst,
+    id: NodeId,
+    prefix: &[String],
+    in_singleton_class: bool,
+    in_module: bool,
+    path: &str,
+    include_private: bool,
+    index: &CoreIndex,
+    typer: &Typer,
+    env: &TypeEnv,
+    fqns: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
+    layouts: &MetaLayouts,
+    modes: &DefFacts,
+    visibilities: &[(String, Visibility)],
+    running_vis: Visibility,
+    running_mf: bool,
+    interner: &mut Interner,
+    out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
+) {
+    // A bare `private`/`public`/`protected`/`module_function` STATEMENT sets
+    // the running default for the rest of ITS statements list — so the
+    // per-child loops below pass the current pair and update it on a toggle
+    // (`private; if c; def y` and `if c; private; def y` both read it).
+    macro_rules! descend {
+        ($child:expr, $vis:expr, $mf:expr, $sclass:expr, $module:expr) => {
+            collect_conditional_definers(
+                ast,
+                $child,
+                prefix,
+                $sclass,
+                $module,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                visibilities,
+                $vis,
+                $mf,
+                interner,
+                out,
+                definers,
+            )
+        };
+        ($child:expr, $vis:expr, $mf:expr) => {
+            descend!($child, $vis, $mf, in_singleton_class, in_module)
+        };
+        ($child:expr) => {
+            descend!($child, running_vis, running_mf)
+        };
+    }
+    // Iterate a statements list letting bare visibility toggles update the
+    // running pair for the statements that follow them.
+    macro_rules! descend_list {
+        ($body:expr) => {{
+            let mut vis = running_vis;
+            let mut mf = running_mf;
+            for &b in $body {
+                descend!(b, vis, mf);
+                if let Node::Call { receiver: None, method, args, .. } = ast.get(b) {
+                    if args.is_empty() {
+                        match method.as_str() {
+                            "private" => {
+                                vis = Visibility::Private;
+                                mf = false;
+                            }
+                            "protected" => {
+                                vis = Visibility::Protected;
+                                mf = false;
+                            }
+                            "public" => {
+                                vis = Visibility::Public;
+                                mf = false;
+                            }
+                            "module_function" => mf = true,
+                            _ => {}
+                        }
+                    }
+                }
+            }
+        }};
+    }
+    match ast.get(id) {
+        // A nested `class`/`module`/layout-carrying `Const =` inside a
+        // conditional is a REAL namespace: its body's direct statements are
+        // `certain_definers` and candidates — the same walk the top level
+        // takes (`Emit::Nested`), so hand the whole node to
+        // `walk_namespace` (rigor-rs#535).
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => walk_namespace(
+            ast,
+            id,
+            prefix,
+            path,
+            include_private,
+            index,
+            typer,
+            env,
+            fqns,
+            sig_env,
+            layouts,
+            modes,
+            interner,
+            out,
+            definers,
+        ),
+        Node::ConstantWrite { name, .. }
+            if layouts.get(&qualify_join(prefix, name)).is_some() =>
+        {
+            walk_namespace(
+                ast,
+                id,
+                prefix,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                interner,
+                out,
+                definers,
+            );
+        }
+        Node::Definition { is_singleton_class: true, body, .. } => {
+            // `class << self` under a conditional: its direct defs are
+            // certain singleton definers AND candidates; deeper children
+            // recurse as uncertain (`mark_certain_body` marks the body's
+            // direct statements wherever the body sits).
+            for &inner in body {
+                match ast.get(inner) {
+                    Node::Definition {
+                        name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
+                    } => {
+                        // The top level has no enclosing cref — a
+                        // `class << self` there defines on `main`'s
+                        // singleton, which the reference does not emit.
+                        if !prefix.is_empty() {
+                            let sig = sig_of(
+                                n.as_str(), b, params, param_shape, *has_explicit_return, true, false, span.0,
+                            );
+                            if let Some(c) = method_candidate(
+                                ast, &sig, None, &prefix.join("::"), path, include_private, index, typer, env, fqns, sig_env, interner,
+                            ) {
+                                out.push(c);
+                            }
+                            definers.push(Definer {
+                                class_name: prefix.join("::"),
+                                kind: "singleton",
+                                method_name: n.clone(),
+                                offset: span.0,
+                                certain: true,
+                            });
+                        }
+                    }
+                    _ => descend!(inner, Visibility::Public, false, true, in_module),
+                }
+            }
+        }
+        // A `def` is a definer itself; its BODY is out of bounds
+        // (`walk_attr_calls` returns at DefNode).
+        Node::Definition { name, singleton_name, body: b, params, param_shape, has_explicit_return, span, .. } => {
+            if let Some(n) = name.as_ref().or(singleton_name.as_ref()) {
+                let singleton = in_singleton_class || singleton_name.is_some();
+                let class_name = prefix.join("::");
+                if !class_name.is_empty() {
+                    // A named table entry wins (`private :y` re-marks); else
+                    // the body's RUNNING default at the conditional's
+                    // position — `private; if c; def y` is private on the
+                    // oracle, `module_function; if c; def u` is `self?.`
+                    // (rigor-rs#535 review).
+                    //
+                    // A visibility CALL that is the LAST write to the slot
+                    // (`if c; def b; end; end; private :b`, in a later
+                    // reopening, or inside another conditional) wins over
+                    // both: the reference reads the slot by name, so a
+                    // re-mark the lowered direct-statement table never saw
+                    // still excludes the def (rigor-rs#535 review item a).
+                    let vis = if singleton {
+                        None
+                    } else {
+                        modes.slot_visibilities.get(&span.0).copied().or_else(|| {
+                            visibilities
+                                .iter()
+                                .find(|(m, _)| m == n)
+                                .map(|(_, v)| *v)
+                                .or(Some(running_vis))
+                        })
+                    };
+                    emit_conditional_def(
+                        ast, n.as_str(), b, params, param_shape, *has_explicit_return, span.0, singleton, vis,
+                        &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
+                        interner, out, definers,
+                    );
+                }
+            }
+        }
+        Node::Call { receiver, method, args, block_body, span, .. } => {
+            // `class_methods` is a DSL scope only RECEIVERLESS
+            // (`class_methods_block?`); `refine` likewise on a nil or `self`
+            // receiver (`refine_call?`) and only in a MODULE body — `Class`
+            // undefines `refine`, so the same spelling in a `class` body is
+            // the class's own method and its block walks as any other block
+            // (`class_body_refine?` / #1689). A `obj.class_methods` /
+            // `obj.refine` block is an ordinary block and descends.
+            let refine_shaped = method == "refine"
+                && receiver
+                    .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                    .unwrap_or(true);
+            let dsl = (method == "class_methods" && receiver.is_none())
+                || (refine_shaped && in_module);
+            if dsl && !block_body.is_empty() {
+                return;
+            }
+            if !prefix.is_empty()
+                && !in_singleton_class
+                && matches!(method.as_str(), "attr_reader" | "attr_writer" | "attr_accessor")
+            {
+                for &arg in args {
+                    let Node::SymbolLit { value, .. } = ast.get(arg) else { continue };
+                    let reads = method != "attr_writer";
+                    let writes = method != "attr_reader";
+                    for (mname, emits) in [(value.clone(), reads), (format!("{value}="), writes)] {
+                        if emits {
+                            definers.push(Definer {
+                                class_name: prefix.join("::"),
+                                kind: "instance",
+                                method_name: mname,
+                                offset: span.0,
+                                certain: false,
+                            });
+                        }
+                    }
+                }
+            }
+            // `private def y` inside a conditional: a `Definition` argument
+            // of a receiverless/self visibility modifier takes the modifier
+            // (`apply_visibility_argument`). Symbol re-marks are a contested
+            // slot on the oracle — not modelled.
+            let arg_vis = if receiver
+                .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                .unwrap_or(true)
+                && !args.is_empty()
+            {
+                match method.as_str() {
+                    "private" => Some(Visibility::Private),
+                    "protected" => Some(Visibility::Protected),
+                    "public" => Some(Visibility::Public),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            for &arg in args {
+                match (arg_vis, ast.get(arg)) {
+                    (
+                        Some(v),
+                        Node::Definition { name: Some(n), body: b, params, param_shape, has_explicit_return, span: dspan, .. },
+                    ) => {
+                        let singleton = in_singleton_class;
+                        let class_name = prefix.join("::");
+                        if !class_name.is_empty() {
+                            emit_conditional_def(
+                                ast, n.as_str(), b, params, param_shape, *has_explicit_return, dspan.0, singleton,
+                                if singleton {
+                                    None
+                                } else {
+                                    Some(modes.slot_visibilities.get(&dspan.0).copied().unwrap_or(v))
+                                },
+                                &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
+                                interner, out, definers,
+                            );
+                        }
+                    }
+                    _ => descend!(arg),
+                }
+            }
+            // A block body is a fresh statements list: it inherits the
+            // running state but a toggle inside it does not flow back out.
+            descend_list!(block_body);
+        }
+        Node::If { predicate, then_body, else_body, .. } => {
+            descend!(*predicate);
+            descend_list!(then_body);
+            descend_list!(else_body);
+        }
+        Node::Case { predicate, branches, else_body, .. } => {
+            if let Some(p) = predicate {
+                descend!(*p);
+            }
+            for &b in branches.iter().chain(else_body.iter()) {
+                descend!(b);
+            }
+        }
+        Node::When { conditions, body, .. } => {
+            for &b in conditions {
+                descend!(b);
+            }
+            descend_list!(body);
+        }
+        Node::Loop { predicate, body, .. } => {
+            if let Some(p) = predicate {
+                descend!(*p);
+            }
+            descend_list!(body);
+        }
+        Node::BeginRescue { body, .. } | Node::Statements { body, .. } => {
+            descend_list!(body);
+        }
+        // Expression-level containers carry the same children
+        // (`rigor_each_child` descends everywhere): `_x = if c; attr_reader
+        // :x; end` and `c && attr_reader(:x)` record just the same.
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            descend!(*value);
+        }
+        Node::MultiWrite { value, target_exprs, .. } => {
+            descend!(*value);
+            for &b in target_exprs {
+                descend!(b);
+            }
+        }
+        Node::IndexWrite { receiver, indices, value, .. } => {
+            if let Some(r) = receiver {
+                descend!(*r);
+            }
+            for &b in indices.iter().chain(std::iter::once(value)) {
+                descend!(b);
+            }
+        }
+        Node::AttrWrite { receiver, value, .. } => {
+            if let Some(r) = receiver {
+                descend!(*r);
+            }
+            descend!(*value);
+        }
+        Node::Logical { left, right, .. } => {
+            descend!(*left);
+            descend!(*right);
+        }
+        Node::Lambda { body, .. } => descend_list!(body),
+        Node::Return { values: body, .. } => {
+            for &b in body {
+                descend!(b);
+            }
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            for &b in parts {
+                descend!(b);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &b in elements {
+                descend!(b);
+            }
+        }
+        Node::Range { left, right, .. } => {
+            for bound in [left, right].into_iter().flatten() {
+                descend!(*bound);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Emit one conditional-carried `def` as a candidate + uncertain definer —
+/// the shared tail of the `Definition` and `private`-call-arg arms of
+/// [`collect_conditional_definers`].
+#[allow(clippy::too_many_arguments)]
+fn emit_conditional_def(
+    ast: &LoweredAst,
+    name: &str,
+    body: &[NodeId],
+    params: &Option<Vec<String>>,
+    param_shape: &rigor_parse::ParamShape,
+    has_explicit_return: bool,
+    offset: usize,
+    singleton: bool,
+    vis: Option<Visibility>,
+    class_name: &str,
+    running_mf: bool,
+    path: &str,
+    include_private: bool,
+    index: &CoreIndex,
+    typer: &Typer,
+    env: &TypeEnv,
+    fqns: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
+    interner: &mut Interner,
+    out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
+) {
+    let sig = sig_of(name, body, params, param_shape, has_explicit_return, singleton, running_mf, offset);
+    if let Some(c) = method_candidate(
+        ast, &sig, vis, class_name, path, include_private, index, typer, env, fqns, sig_env, interner,
+    ) {
+        out.push(c);
+    }
+    definers.push(Definer {
+        class_name: class_name.to_string(),
+        kind: if singleton { "singleton" } else { "instance" },
+        method_name: name.to_string(),
+        offset,
+        certain: false,
+    });
+    if running_mf && !singleton {
+        definers.push(Definer {
+            class_name: class_name.to_string(),
+            kind: "singleton",
+            method_name: name.to_string(),
+            offset,
+            certain: false,
+        });
+    }
+}
+
+/// The `(running visibility, running module_function)` state at `offset`
+/// inside `body` — the bare `private`/`protected`/`public` toggles before it
+/// set the default a conditional `def` there reads, and a bare
+/// `module_function` marks it dual (`self?.`). `module_function` does not
+/// itself flip the visibility default the sig-gen table reads (that is the
+/// separate `module_function_visibilities` table's job).
+fn running_toggles_at(ast: &LoweredAst, body: &[NodeId], offset: usize) -> (Visibility, bool) {
+    let mut vis = Visibility::Public;
+    let mut mf = false;
+    for &child in body {
+        let Node::Call { receiver: None, method, args, span, .. } = ast.get(child) else { continue };
+        if span.0 >= offset || !args.is_empty() {
+            continue;
+        }
+        match method.as_str() {
+            "private" => {
+                vis = Visibility::Private;
+                mf = false;
+            }
+            "protected" => {
+                vis = Visibility::Protected;
+                mf = false;
+            }
+            "public" => {
+                vis = Visibility::Public;
+                mf = false;
+            }
+            "module_function" => mf = true,
+            _ => {}
+        }
+    }
+    (vis, mf)
 }
 
 /// Whether `id` opens a namespace [`walk_namespace`] descends into: a real
@@ -1439,8 +2281,9 @@ fn sig_of<'a>(
     has_explicit_return: bool,
     singleton: bool,
     module_function: bool,
+    offset: usize,
 ) -> MethodSig<'a> {
-    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function }
+    MethodSig { name, body, params, param_shape, has_explicit_return, singleton, module_function, offset }
 }
 
 /// Classify + render one method (instance or singleton), or `None` when skipped
@@ -1462,10 +2305,13 @@ fn method_candidate(
     interner: &mut Interner,
 ) -> Option<Candidate> {
     // Visibility: skip private / protected unless `--include-private` (reference
-    // `visibility_excludes?` — returns false for a singleton, so singletons are
-    // never visibility-skipped).
+    // `visibility_excludes?` — returns false for a singleton AND for a
+    // module_function def, whose `self?.` row writes the singleton half the
+    // running `private` never touched — `mf; private; def g; mf; def h` emits
+    // `self?.h`, rigor-rs#493 item 10).
     if !include_private
         && !sig.singleton
+        && !sig.module_function
         && matches!(visibility, Some(Visibility::Private | Visibility::Protected))
     {
         return None;
@@ -1498,6 +2344,7 @@ fn method_candidate(
             // declared `initialize` is still emitted `new_method`) — keep the stub
             // path exactly as-is, before any classification.
             classification: "new_method",
+            definer: Some((sig.offset, sig.module_function)),
             declared_return_rbs: None,
             decl_header: String::new(),
             skip_reason: None,
@@ -1534,8 +2381,27 @@ fn method_candidate(
     // The replay covers the WHOLE body — a `return` under the tail `if`
     // still types at its position (the tail's own writes bind nothing the
     // tail read needs that a later statement could invalidate).
-    let (local, positional_returns) =
-        typer.bind_statements_into_with_returns(ast, env, sig.body, interner);
+    // A parameter SHADOWS a same-named file-level local — the def body is a
+    // fresh scope (`x = "top"; def b2(x); x; end` reads the argument, not
+    // `"top"`; the reference skips it). Bind each to `untyped` first.
+    let mut entry = env.clone();
+    if let Some(names) = sig.params.as_ref() {
+        let untyped = interner.untyped();
+        for name in names {
+            entry.insert(name.clone(), untyped);
+        }
+    }
+    // The def's own decisions: a Dynamic local narrowed by a type test and
+    // read in a second decision may be constant-folded by the reference.
+    struct ScopeGuard<'a>(&'a std::cell::Cell<Option<rigor_parse::Span>>);
+    impl Drop for ScopeGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(None);
+        }
+    }
+    typer.def_scope.set(rigor_infer::body_span(ast, sig.body));
+    let _scope_guard = ScopeGuard(&typer.def_scope);
+    let (local, positional_returns) = typer.bind_body_for_tail(ast, &entry, sig.body, interner);
     let env = &local;
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
@@ -1558,7 +2424,7 @@ fn method_candidate(
     // tail evaluates to its value (`nil` when bare). A control tail whose
     // every leaf is a `return` contributes NOTHING — `if c; return 1; else;
     // return "s"; end` yields `("s" | 1)` from the returns alone.
-    let Some(tail_ty) = def_return_type(ast, typer, sig.body, env, interner) else { return row(None) };
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
     if let Some(tail_ty) = tail_ty {
         push_flat(interner, &mut members, tail_ty);
     }
@@ -1567,14 +2433,27 @@ fn method_candidate(
         // reads may be rebound later (`a = :initial; if c; return a; end;
         // a = 100` → `(100 | :initial)`).
         let ty = match ret {
-            Some(v) => positional_returns
-                .iter()
-                .find(|(id, _)| id == v)
-                .map(|(_, t)| *t)
-                .unwrap_or_else(|| typer.type_of(ast, *v, env, interner)),
+            Some(v) => match positional_returns.iter().find(|(id, _)| id == v) {
+                Some((_, t)) => *t,
+                // A `return` the replay never reached (inside a value
+                // position — `x = c.map { |i| return i }`): it reads locals
+                // the replay cannot place, so a read declines.
+                None if !typer.def_local_marks(ast).reads_within(ast.get(*v).span()).is_empty() => {
+                    interner.untyped()
+                }
+                None => typer.type_of(ast, *v, env, interner),
+            },
             None => interner.nil(),
         };
         push_flat(interner, &mut members, ty);
+    }
+
+    // A union or a bare generic INSIDE a tuple / hash-shape slot (`[1 | nil]`,
+    // a def-local typed local joined across a branch; `[400, Hash, [body]]`) is
+    // not the reference's byte output — a shared-method mismatch, so the
+    // method declines (rigor-rs#546 review).
+    if members.iter().any(|&m| composite_holds_unsound(interner, index, m)) {
+        return row(None);
     }
 
     // `dynamic_top?` (a reference PERMANENT skip): any Top/Dynamic member — or any
@@ -1609,10 +2488,28 @@ fn method_candidate(
             return row(Some("sig.skipped.untyped-return"));
         }
         if e.contains("untyped") {
-            // …unless every `untyped` sits inside a `ClassName[…]` type-arg
-            // slot — `NameError[untyped]`, `KeyError[untyped, untyped]` are
-            // the reference's own elaborated emits (rigor-rs#548).
+            // …unless the untyped sits inside a bare generic's type-arg slot:
+            // `Range[untyped]` / `Array[untyped]` are the reference's own
+            // elaborated emits (rigor-rs#493 item 7), not inference holes.
             if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
+            // A def-local the replay declined (or a call on one the port does
+            // not fold) reads `untyped`, and that hole lands in a generic's
+            // type-arg slot as `Hash[String, untyped]`, where the reference
+            // has the precise value union (`Rack::Directory#check_bad_request`).
+            // A tail / return that reads a local written in the def cannot be
+            // told apart from an elaborated `Hash[untyped, untyped]` — decline.
+            let marks = typer.def_local_marks(ast);
+            let written = rigor_infer::body_span(ast, sig.body)
+                .map(|sp| marks.written_within(sp))
+                .unwrap_or_default();
+            let reads_local = |sp: rigor_parse::Span| {
+                marks.reads_within(sp).iter().any(|r| written.iter().any(|w| w == r))
+            };
+            let tail_reads = sig.body.last().is_some_and(|&t| reads_local(ast.get(t).span()))
+                || returns.iter().flatten().any(|&v| reads_local(ast.get(v).span()));
+            if tail_reads {
                 return row(None);
             }
         }
@@ -1669,6 +2566,7 @@ fn method_candidate(
         declared_return_rbs,
         decl_header: String::new(),
         skip_reason: None,
+        definer: Some((sig.offset, sig.module_function)),
     })
 }
 
@@ -1694,7 +2592,68 @@ fn non_emitted(
         declared_return_rbs: None,
         decl_header: String::new(),
         skip_reason: reason,
+        definer: None,
     }
+}
+
+/// Reference `live_definitions` over the candidate rows: `definer_table` is
+/// `definers` (collected alongside the walk), `live_definer?` keeps the LAST
+/// certain entry of a slot unless an uncertain entry sits after it (contested
+/// → nothing is written), and a candidate survives only when its def owns
+/// every slot it defines — except the singleton-only survival, which a
+/// `def self?.u` downgrades to `def self.u`.
+fn live_definitions(out: &mut Vec<Candidate>, definers: &[Definer]) {
+    /// `(class_name, kind, method_name)` — the reference's definer-table key.
+    type Slot = (String, &'static str, String);
+    let mut table: HashMap<Slot, Vec<(usize, bool)>> = HashMap::new();
+    for d in definers {
+        table
+            .entry((d.class_name.clone(), d.kind, d.method_name.clone()))
+            .or_default()
+            .push((d.offset, d.certain));
+    }
+    let live_at = |slot: &Slot, offset: usize| -> bool {
+        let Some(entries) = table.get(slot) else { return true };
+        if entries.len() <= 1 {
+            return true;
+        }
+        let Some(last_certain) = entries.iter().filter(|(_, c)| *c).map(|(o, _)| *o).max() else {
+            return false;
+        };
+        if entries.iter().any(|(o, c)| !*c && *o > last_certain) {
+            return false;
+        }
+        offset == last_certain
+    };
+    for c in out.iter_mut() {
+        let Some((offset, module_function)) = c.definer else { continue };
+
+        let own = (c.class_name.clone(), c.kind, c.method_name.clone());
+        let live = live_at(&own, offset).then_some(own);
+        let mut single = None;
+        if module_function {
+            let s = (c.class_name.clone(), "singleton", c.method_name.clone());
+            if live_at(&s, offset) {
+                single = Some(s);
+            }
+        }
+        let all = live.is_some() && (!module_function || single.is_some());
+        if all {
+            continue;
+        }
+        if live.is_none() && single.is_some() {
+            // The instance half was replaced; the singleton copy Ruby keeps is
+            // written `def self.name` (reference `live_definitions`).
+            c.kind = "singleton";
+            c.rbs = c.rbs.replacen("def self?.", "def self.", 1);
+            continue;
+        }
+        // Nothing survived — mark the row dropped (invisible downstream, as a
+        // `"dropped"` classification already is).
+        c.skip_reason = None;
+        c.classification = "dropped";
+    }
+    out.retain(|c| c.classification != "dropped" || c.skip_reason.is_some());
 }
 
 /// Classify one already-inferred candidate against the project's own RBS
@@ -1809,25 +2768,49 @@ fn computed_literal_tightening(interner: &Interner, inferred: TypeId, raw_tail: 
     )
 }
 
+/// Whether a call's block body is a return barrier: the reference
+/// `ReturnBarrier.block_call?` — a `define_method` / `define_singleton_method`
+/// block on any receiver (also through `send` / `public_send` / `__send__`
+/// with a literal symbol first argument), and `Kernel#lambda` (bare, on
+/// `self` or on `Kernel`).
+fn return_barrier_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str, args: &[NodeId]) -> bool {
+    let mut name = method.to_string();
+    if matches!(method, "send" | "public_send" | "__send__") {
+        match args.first().map(|&a| ast.get(a)) {
+            Some(Node::SymbolLit { value, .. }) => name = value.clone(),
+            _ => return false,
+        }
+    }
+    if matches!(name.as_str(), "define_method" | "define_singleton_method") {
+        return true;
+    }
+    name == "lambda"
+        && match receiver.map(|r| ast.get(r)) {
+            None | Some(Node::SelfExpr { .. }) => true,
+            Some(Node::ConstantRead { name, .. }) => name == "Kernel",
+            _ => false,
+        }
+}
+
 /// Collect the def's collectible explicit-return value expressions, or `None`
 /// when the method must be SKIPPED. Each element is `Some(value NodeId)` for a
 /// single-value `return e` / `None` for a bare `return` (→ `nil`). Ports the
 /// reference `DefReturnTyper#collect_return_types` semantics over the lowered
 /// arena:
 ///
-/// - **Barriers** (reference `RETURN_BARRIER_NODES` = block / lambda / def): a
-///   `return` inside a `Call`'s `block_body` or a nested def/class/module is NOT
-///   collected. A lambda's `return` never lowers to [`Node::Return`] at all (the
-///   lambda routes through the recovered-children fallthrough), so the lambda
-///   barrier holds structurally.
+/// - **Barriers** (reference `ReturnBarrier`, issue #1382): a `return` inside a
+///   nested `def` / class / module, a `->` lambda, or the block of a
+///   `define_method` / `define_singleton_method` / `Kernel#lambda` call
+///   ([`return_barrier_call`]) is NOT collected. A `return` in an ORDINARY
+///   block exits the method and IS collected (rigor-rs#546 review 3: the port
+///   treated every block as a barrier, so `a = nil; c.each { return "s" }; a`
+///   lost its `"s"` once the local env typed `a`).
 /// - **Multi-value** `return a, b`: the reference silently contributes NOTHING
 ///   (emitting a signature that misses the tuple — an unsound emit); rigor-rs
 ///   SKIPS the method instead (under-emit, FP-safe, no shared-method mismatch).
 /// - **Residual ambiguity**: `has_explicit_return` trips on returns inside
-///   lambdas AND inside unhandled wrappers; the former the reference barriers
-///   (safe to emit) but the latter it collects. When the flag is set yet NO
-///   [`Node::Return`] exists anywhere in the def, the two are indistinguishable
-///   → skip (rare, FP-safe).
+///   unhandled wrappers; when the flag is set yet NO [`Node::Return`] exists
+///   anywhere in the def, skip (rare, FP-safe).
 ///
 /// Membership is by span containment against the def's body-statement spans
 /// (the arena is flat; spans nest strictly), mirroring how outline/flow walks
@@ -1843,23 +2826,32 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
         regions.iter().any(|&(rs, re)| rs <= s.0 && s.1 <= re)
     };
 
-    // Barrier regions inside this def: block bodies + nested class-like scopes.
-    // (The def's own body statements are the regions, so any Definition matched
-    // within them is a NESTED def, never the def itself.)
+    // Barrier regions inside this def: a barrier call's block body, lambdas
+    // and nested class-like scopes. (The def's own body statements are the
+    // regions, so any Definition matched within them is a NESTED def, never
+    // the def itself.)
     let mut barriers: Vec<(usize, usize)> = Vec::new();
     for (_, node) in ast.iter() {
         match node {
-            Node::Call { block_body, span, .. }
-                if !block_body.is_empty() && within(*span, &regions) =>
+            Node::Call { receiver, method, args, block_body, block_span: Some(_), span, .. }
+                if !block_body.is_empty()
+                    && within(*span, &regions)
+                    && return_barrier_call(ast, *receiver, method, args) =>
             {
                 for &b in block_body {
                     barriers.push(ast.get(b).span());
                 }
             }
+            Node::Lambda { span, .. } if within(*span, &regions) => barriers.push(*span),
+            // A def whose body is a `rescue` / `ensure` chain lowers to one
+            // `BeginRescue` region spanning the whole def, so the def ITSELF
+            // would match as a "nested" barrier and swallow every `return`
+            // (rigor-rs#546 review 3: `def f; 5; ensure; return 3; end`
+            // lost its `3`). The def's own start offset identifies it.
             Node::Definition { span, .. }
             | Node::ClassDef { span, .. }
             | Node::ModuleDef { span, .. }
-                if within(*span, &regions) =>
+                if within(*span, &regions) && span.0 != sig.offset =>
             {
                 barriers.push(*span);
             }
@@ -1876,7 +2868,7 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
             }
             found_any = true;
             if within(*span, &barriers) {
-                continue; // block / nested-def barrier (reference design)
+                continue; // lambda / nested-def / define_method barrier (reference design)
             }
             match values.len() {
                 0 => collected.push(None),
@@ -1893,34 +2885,72 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
     Some(collected)
 }
 
+/// Whether a tuple / hash shape holds, in one of its slots (at any depth
+/// through further tuples and shapes), a union — the interner prints it in
+/// canonical member order, not the reference's describe-sorted order — or a
+/// bare generic nominal (`Hash`, `Array`: the reference elaborates it to
+/// `Hash[untyped, ...]` / its value union). Either way the byte output would
+/// differ from the reference's on a method both emit.
+fn composite_holds_unsound(interner: &Interner, index: &CoreIndex, ty: TypeId) -> bool {
+    let slot = |e: TypeId| match interner.get(e) {
+        Type::Union(_) => true,
+        Type::Nominal { class, args } => {
+            args.is_empty() && is_bare_generic_name(index.class_name_for_id(*class).unwrap_or(""))
+        }
+        _ => composite_holds_unsound(interner, index, e),
+    };
+    match interner.get(ty) {
+        Type::Tuple(elems) => elems.iter().any(|&e| slot(e)),
+        Type::HashShape(members) => members.iter().any(|m| slot(m.value)),
+        _ => false,
+    }
+}
+
 /// A method's inferred return type, or `None` for an empty body (reference
 /// `DefReturnTyper`): the last statement's type, an assignment tail evaluating to
 /// its RHS value, a `return E` tail to its value (`nil` when bare — the oracle
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
-/// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
-/// `annotate` deferral) and is then skipped upstream.
-/// `Some(Some(ty))` — the tail's type; `Some(None)` — a control tail whose
-/// every value leaf is a `return`, contributing no member; `None` — skip
-/// (empty body, multi-value `return` tail).
+/// the def-local env (rigor-rs#546).
+/// `Some(Some(ty))` — the tail's type (`untyped` for a tail shape the
+/// def-local env does not model, see [`control_tail_types`]: the method skips
+/// as an untyped return); `Some(None)` — a control tail whose every value leaf
+/// is a `return`, contributing no member; `None` — skip (empty body,
+/// multi-value `return` tail).
+#[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
 ) -> Option<Option<TypeId>> {
     let &tail = body.last()?;
+    // A declined tail types as `untyped`: the method skips as an untyped
+    // return (`sig.skipped.untyped-return`, counted — an override the port
+    // declines still reads as unsigned to the base-method demotion, as the
+    // reference's untyped tail does).
+    let declined = Some(Some(interner.untyped()));
+    // A tail holding a decision on a typed local (the reference narrows /
+    // folds on it) or an unknown-name `=~` binding declines; a write at a
+    // position the replay does not walk is widened.
+    let Some(tail_env) = typer.tail_env(ast, env, tail, interner) else { return declined };
+    let env = &tail_env;
     match ast.get(tail) {
+        // `x op= v`: the lowered node keeps the operand, not the operator —
+        // typing the operand (`a = 1; a += 1` → `1`) would be wrong.
+        Node::LocalVariableOpWrite { .. } => declined,
         Node::LocalVariableWrite { value, .. }
-        | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => {
-            Some(Some(typer.type_of(ast, *value, env, interner)))
+            Some(Some(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner)))
         }
         Node::Return { values, .. } => match values.len() {
             0 => Some(Some(interner.nil())),
-            1 => Some(Some(typer.type_of(ast, values[0], env, interner))),
+            1 => Some(Some(tail_value_type(ast, typer, env, values[0], index, class_name, fqns, interner))),
             _ => None,
         },
         Node::If { .. } | Node::Case { .. } | Node::BeginRescue { .. } | Node::Loop { .. } => {
@@ -1929,7 +2959,9 @@ fn def_return_type(
             // exits the method — it is already in `returns`), an absent
             // `else` contributes `nil`, a loop tail contributes `nil`.
             let mut members: Vec<TypeId> = Vec::new();
-            control_tail_types(ast, typer, tail, env, interner, &mut members);
+            if !control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members) {
+                return declined;
+            }
             match members.len() {
                 0 => Some(None),
                 _ => Some(Some(
@@ -1939,70 +2971,294 @@ fn def_return_type(
                 )),
             }
         }
-        _ => Some(Some(typer.type_of(ast, tail, env, interner))),
+        _ => Some(Some(tail_value_type(ast, typer, env, tail, index, class_name, fqns, interner))),
     }
 }
 
 /// Push the value-contributing tail types of a control expression onto
 /// `out` — each arm's last non-`return` statement typed under the ARM's env
 /// (an arm's earlier writes bind there: `if c; a = 1; a; end` contributes
-/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else` and
-/// a loop tail contribute `nil`.
+/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else`
+/// contributes `nil`, and so does a loop tail that cannot carry a value.
+///
+/// Returns `false` to DECLINE the whole tail — the reference types these
+/// shapes by rules the def-local env does not model, so any typed answer
+/// would be a guess (rigor-rs#546 review 3):
+///
+/// - a `begin` with an `else` (the `else` value replaces the body's) or a
+///   `retry`; an ensure's value is discarded — `begin; 5; ensure; @m =
+///   false; end` is `5`, the protected body's tail;
+/// - a `for` loop (its value is the collection) and a `while` / `until` that
+///   holds a `break` (the break value joins `nil`) or runs its body first
+///   (`begin … end while`);
+/// - a `case`/`in` (no-match raises; patterns bind), a `rescue` modifier and
+///   the other non-sequence carriers;
+/// - a decision on a typed local, a named-capture `=~` ([`Typer::tail_env`]).
+#[allow(clippy::too_many_arguments)]
 fn control_tail_types(
     ast: &LoweredAst,
     typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
     id: NodeId,
     env: &TypeEnv,
     interner: &mut Interner,
     out: &mut Vec<TypeId>,
-) {
+) -> bool {
+    #[allow(clippy::too_many_arguments)]
     fn body_tail(
         ast: &LoweredAst,
         typer: &Typer,
+        index: &CoreIndex,
+        class_name: &str,
+        fqns: &std::collections::HashSet<String>,
         body: &[NodeId],
         env: &TypeEnv,
         interner: &mut Interner,
         out: &mut Vec<TypeId>,
-    ) {
+    ) -> bool {
         let Some(&tail) = body.last() else {
             out.push(interner.nil());
-            return;
+            return true;
         };
+        // An arm whose tail follows a statement that always leaves is dead
+        // code: the reference types it in a scope the replay cannot reproduce.
+        if body[..body.len() - 1].iter().any(|&s| typer.always_exits(ast, s)) {
+            return false;
+        }
         // The arm's own writes bind before its tail is read.
         let arm = typer.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
-        control_tail_types(ast, typer, tail, &arm, interner, out);
+        control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out)
     }
+    use rigor_infer::ExitKind;
+    let Some(env) = typer.tail_env(ast, env, id, interner) else { return false };
+    let env = &env;
+    let marks = typer.def_local_marks(ast);
     match ast.get(id) {
-        Node::Return { .. } => {}
-        Node::If { then_body, else_body, .. } => {
-            body_tail(ast, typer, then_body, env, interner, out);
-            body_tail(ast, typer, else_body, env, interner, out);
+        Node::Return { .. } => true,
+        Node::If { predicate, then_body, else_body, is_unless, .. } => {
+            // A predicate whose type decides it elides the dead arm
+            // (`type_of(If)`; `if true; 1; else; 2; end` is `1`); a
+            // literal-only predicate the port cannot decide
+            // (`if true && false`) is folded by the reference — decline.
+            match typer.known_polarity(ast, env, *predicate, interner) {
+                Some(b) => {
+                    let live = if b != *is_unless { then_body } else { else_body };
+                    body_tail(ast, typer, index, class_name, fqns, live, env, interner, out)
+                }
+                None if rigor_infer::literal_like(ast, *predicate) => false,
+                None => {
+                    body_tail(ast, typer, index, class_name, fqns, then_body, env, interner, out)
+                        && body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
+                }
+            }
         }
         Node::Case { branches, else_body, .. } => {
             for &b in branches {
                 match ast.get(b) {
-                    Node::When { body, .. } => body_tail(ast, typer, body, env, interner, out),
-                    _ => out.push(typer.type_of(ast, b, env, interner)),
+                    Node::When { body, .. } => {
+                        if !body_tail(ast, typer, index, class_name, fqns, body, env, interner, out) {
+                            return false;
+                        }
+                    }
+                    // `case`/`in`: not modelled.
+                    _ => return false,
                 }
             }
-            body_tail(ast, typer, else_body, env, interner, out);
+            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
         }
-        Node::BeginRescue { main_body, body, clauses, .. } => {
-            // An `else`/`in`/paren carrier (empty clauses) is a statements
-            // wrapper — its tail is the body's. A real begin/rescue's value is
-            // the protected tail OR a clause tail.
+        Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, span, .. } => {
+            if *has_else || marks.has_exit_within(*span, &[ExitKind::Retry]) {
+                return false;
+            }
             if clauses.is_empty() {
-                body_tail(ast, typer, body, env, interner, out);
+                // A statements / `else` / `in` / paren carrier (nothing to
+                // protect) is its body's tail; an ensure-only `begin`'s value
+                // is the protected body's, never the ensure's.
+                let tail_body = if ensure_body.is_empty() { body } else { main_body };
+                body_tail(ast, typer, index, class_name, fqns, tail_body, env, interner, out)
             } else {
-                body_tail(ast, typer, main_body, env, interner, out);
-                for c in clauses {
-                    body_tail(ast, typer, &c.body, env, interner, out);
+                // The protected tail, or a clause's: a clause enters from any
+                // point of the body, so it reads the names the body writes
+                // as `untyped`.
+                if !body_tail(ast, typer, index, class_name, fqns, main_body, env, interner, out) {
+                    return false;
                 }
+                let mut clause_env = env.clone();
+                if let Some(sp) = rigor_infer::body_span(ast, main_body) {
+                    rigor_infer::Typer::widen_names(&mut clause_env, &marks.changed_within(sp), interner);
+                }
+                for c in clauses {
+                    if !body_tail(ast, typer, index, class_name, fqns, &c.body, &clause_env, interner, out) {
+                        return false;
+                    }
+                }
+                true
             }
         }
-        Node::Loop { .. } => out.push(interner.nil()),
-        Node::Statements { body, .. } => body_tail(ast, typer, body, env, interner, out),
-        _ => out.push(typer.type_of(ast, id, env, interner)),
+        Node::Loop { kind, span, .. } => {
+            let once = matches!(
+                kind,
+                rigor_parse::LoopKind::While { begin_modifier: true }
+                    | rigor_parse::LoopKind::Until { begin_modifier: true }
+            );
+            if once
+                || matches!(kind, rigor_parse::LoopKind::For)
+                || marks.has_exit_within(*span, &[ExitKind::Break, ExitKind::Redo, ExitKind::Retry])
+            {
+                return false;
+            }
+            out.push(interner.nil());
+            true
+        }
+        Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
+            body_tail(ast, typer, index, class_name, fqns, body, env, interner, out)
+        }
+        // A `rescue` modifier, `super(…)`, `yield(…)`, `defined?`: no
+        // sequence order to read a tail from.
+        Node::Statements { .. } => false,
+        // `x op= v` keeps the operand, not the operator.
+        Node::LocalVariableOpWrite { .. } => false,
+        Node::LocalVariableWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            out.push(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner));
+            true
+        }
+        _ => {
+            out.push(tail_value_type(ast, typer, env, id, index, class_name, fqns, interner));
+            true
+        }
+    }
+}
+
+/// A tail value's type: the literal carriers `type_of` leaves Dynamic — sig-gen
+/// still emits their nominal (rigor-rs#493 item 7): `Range[bound-class-union]`,
+/// `Regexp`, `Rational`, `Complex` (interpolated regexps stay declined: they
+/// lower through recovery, so no dedicated node exists here) — else `type_of`.
+#[allow(clippy::too_many_arguments)]
+fn tail_value_type(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> TypeId {
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
+        return lit;
+    }
+    typer.type_of(ast, target, env, interner)
+}
+
+/// The sig-gen-side nominal for a literal tail `check` leaves Dynamic
+/// (rigor-rs#493 item 7). `Range[T]` takes the union of its bounds' nominal
+/// CLASS names — `1..2` ⇒ `Integer`, `1...2.5` ⇒ `Float | Integer`; a
+/// `Dynamic` or `nil` bound contributes nothing (`(x..2)` ⇒ `Range[Integer]`,
+/// `(x..)` ⇒ `Range[untyped]`).
+#[allow(clippy::too_many_arguments)]
+fn literal_tail_nominal(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> Option<TypeId> {
+    let bare = |name: &str, interner: &mut Interner| {
+        index
+            .class_id(name)
+            .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
+    };
+    match ast.get(target) {
+        Node::RegexpLit { .. } => bare("Regexp", interner),
+        Node::RationalLit { .. } => bare("Rational", interner),
+        Node::ImaginaryLit { .. } => bare("Complex", interner),
+        Node::Range { left, right, .. } => {
+            // Each bound contributes its ERASED member form: a scalar
+            // `Constant` widens to its class (`1` ⇒ `Integer`), a
+            // Tuple/HashShape keeps its literal shape (`[1]`, `{ a: 1 }`),
+            // and a bare generic nominal elaborates its args to `untyped`
+            // (`Array.new` ⇒ `Array[untyped]`). `nil` and `Dynamic` members
+            // contribute nothing (rigor-rs#493 item 7).
+            let mut arg_members: Vec<TypeId> = Vec::new();
+            for bound in [left, right].into_iter().flatten() {
+                let ty = typer.type_of(ast, *bound, env, interner);
+                // A bound that types DIRECTLY to a scalar Constant widens to
+                // its class; a UNION bound's members contribute as-is —
+                // literal `2` stays `2`, a `nil` member stays `nil` (the
+                // reference's range_endpoint_element_type recurses over the
+                // member list but does not widen inside it).
+                let (ms, widen) = match interner.get(ty) {
+                    Type::Union(ms) => (ms.clone(), false),
+                    _ => (vec![ty], true),
+                };
+                for m in ms {
+                    if matches!(interner.get(m), Type::Dynamic(_)) {
+                        continue;
+                    }
+                    let member = match interner.get(m) {
+                        // `nil` contributes nothing as a WHOLE bound (but a
+                        // union's `nil` member is kept, above).
+                        Type::Constant(rigor_types::Scalar::Nil) if widen => continue,
+                        Type::Constant(_) if widen => {
+                            let Some(cname) = index.class_name_of(interner, m) else {
+                                continue;
+                            };
+                            match index.class_id(cname) {
+                                Some(class) => {
+                                    interner.intern(Type::Nominal { class, args: vec![] })
+                                }
+                                None => continue,
+                            }
+                        }
+                        // A bare generic (`Array`, `Hash`, …) elaborates to
+                        // `Class[untyped]` — the reference's TypeElaborator
+                        // fills the args.
+                        Type::Nominal { class, args }
+                            if args.is_empty()
+                                && is_bare_generic_name(
+                                    index.class_name_for_id(*class).unwrap_or(""),
+                                ) =>
+                        {
+                            let (class, untyped) = (*class, interner.untyped());
+                            interner.intern(Type::Nominal {
+                                class,
+                                args: vec![untyped],
+                            })
+                        }
+                        _ => m,
+                    };
+                    if !arg_members.contains(&member) {
+                        arg_members.push(member);
+                    }
+                }
+            }
+            // The erased arg lists its members in the reference's
+            // describe-sorted union order (`Float | Integer` for `1...2.5`,
+            // `Integer | [1]` for `[1]..2`).
+            arg_members.sort_by_key(|&m| {
+                erase_qualified(interner, index, typer.source(), m, class_name, fqns)
+            });
+            let arg = match arg_members.len() {
+                0 => interner.untyped(),
+                1 => arg_members[0],
+                // Mint the union verbatim — `Algebra::join` would re-sort by
+                // the interner's canonical order, but the erased arg follows
+                // the reference's describe-sorted member list.
+                _ => interner.intern(Type::Union(arg_members)),
+            };
+            index
+                .class_id("Range")
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![arg] }))
+        }
+        _ => None,
     }
 }
 
@@ -2197,7 +3453,7 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
         .and_then(|d| d.canonicalize())
         .unwrap_or_else(|_| PathBuf::from("."));
     let sig_env = SigEnv::build(&cfg.all_signature_dirs(&project_root));
-    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).candidates)
+    candidates_json_string(&generate_run(&files, false, &sig_env, &writes).all_rows)
 }
 
 /// One candidate's JSON object (reference `MethodCandidate#to_h`): the per-
@@ -2205,17 +3461,29 @@ pub fn mcp_report_json(raw_paths: &[&str], explicit_config: Option<&Path>) -> St
 /// present ONLY on a `tighter_return` (the reference `.compact`s the nil).
 fn candidate_json(c: &Candidate) -> serde_json::Value {
     use serde_json::json;
-    let mut obj = json!({
-        "file": c.file,
-        "class": c.class_name,
-        "method": c.method_name,
-        "kind": c.kind,
-        "classification": c.classification,
-        "rbs": c.rbs,
-        "inferred_return": c.inferred_return,
-    });
+    // `MethodCandidate#to_h.compact`, in the reference's key order:
+    // `class` is nil for a top-level `def`, and a nil `rbs` /
+    // `inferred_return` (every skipped row) leaves the key out entirely.
+    let mut obj = json!({ "file": c.file });
+    if !c.class_name.is_empty() {
+        obj.as_object_mut().unwrap().insert("class".to_string(), json!(c.class_name));
+    }
+    obj.as_object_mut().unwrap().insert("method".to_string(), json!(c.method_name));
+    obj.as_object_mut().unwrap().insert("kind".to_string(), json!(c.kind));
+    obj.as_object_mut()
+        .unwrap()
+        .insert("classification".to_string(), json!(c.classification));
+    if !c.rbs.is_empty() {
+        obj.as_object_mut().unwrap().insert("rbs".to_string(), json!(c.rbs));
+    }
+    if !c.inferred_return.is_empty() {
+        obj.as_object_mut().unwrap().insert("inferred_return".to_string(), json!(c.inferred_return));
+    }
     if let Some(dr) = &c.declared_return_rbs {
         obj.as_object_mut().unwrap().insert("declared_return_rbs".to_string(), json!(dr));
+    }
+    if let Some(reason) = c.skip_reason {
+        obj.as_object_mut().unwrap().insert("skip_reason".to_string(), json!(reason));
     }
     obj
 }
@@ -2239,6 +3507,9 @@ struct WriteResult {
     /// The refusal detail (reference `WriteResult#error`), on
     /// `skipped_invalid_encoding` / `skipped_unparseable` only.
     error: Option<String>,
+    /// `replaced` (reference `WriteResult#replaced`): applied candidates that
+    /// rewrote an existing member under `--overwrite`, with the old line.
+    replaced: Vec<(Candidate, String)>,
     /// `repaired_headers` (#2580): `Name[params]` per bare header repaired.
     repaired: Vec<String>,
 }
@@ -2270,6 +3541,7 @@ fn cmd_write(
     overwrite: bool,
     cfg: &crate::Config,
     sig_env: &SigEnv,
+    dry_run: bool,
 ) -> ExitCode {
     let project_root = std::env::current_dir()
         .and_then(|d| d.canonicalize())
@@ -2319,7 +3591,7 @@ fn cmd_write(
         writes(c)
             && accepts(&target_for(&c.file, &c.class_name, &source_root, &sig_root, &project_root, &layout))
     };
-    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips } =
+    let Generated { candidates: all_candidates, info: run_info, unresolvable, skips, .. } =
         generate_run(files, include_private, sig_env, &written);
     for c in all_candidates {
         let target =
@@ -2391,7 +3663,8 @@ fn cmd_write(
                 applied: Vec::new(),
                 skipped: Vec::new(),
                 error: None,
-                repaired: Vec::new(),
+            replaced: Vec::new(),
+        repaired: Vec::new(),
             });
             continue;
         }
@@ -2402,19 +3675,41 @@ fn cmd_write(
                 target_str,
                 group,
                 &shells,
+                &merged.kinds,
                 &merged.supers,
                 &merged.params,
                 overwrite,
+                dry_run,
             ));
             continue;
         }
         let content = render_new_file(&group, &shells, &merged);
-        if let Some(parent) = target.parent() {
-            let _ = std::fs::create_dir_all(parent);
+        // Reference `RbsValidity.source_error` on the create path
+        // (writer.rb `create_new`): a render defect never reaches disk — the
+        // whole target is refused (`:skipped_invalid_rbs`), same as a broken
+        // splice on the update path. The check runs BEFORE the dry-run
+        // branch: `--check` reports a refusal the same way `--write` would.
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &content) {
+            results.push(WriteResult {
+                source,
+                target: target_str,
+                action: "skipped_invalid_rbs",
+                applied: Vec::new(),
+                skipped: Vec::new(),
+                error: Some(detail),
+                replaced: Vec::new(),
+                repaired: Vec::new(),
+            });
+            continue;
         }
-        if std::fs::write(&target, content).is_err() {
-            eprintln!("sig-gen: failed to write {target_str}");
-            return ExitCode::from(1);
+        if !dry_run {
+            if let Some(parent) = target.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::write(&target, content).is_err() {
+                eprintln!("sig-gen: failed to write {target_str}");
+                return ExitCode::from(1);
+            }
         }
         results.push(WriteResult {
             source,
@@ -2423,10 +3718,31 @@ fn cmd_write(
             applied: group,
             skipped: Vec::new(),
             error: None,
+            replaced: Vec::new(),
             repaired: Vec::new(),
         });
     }
 
+    // `out_of_date` — every result a `--write` would change or refuse; only
+    // `noop` / `skipped_outside_sig_root` stay silent under `--check`.
+    let stale: Vec<&WriteResult> = results
+        .iter()
+        .filter(|r| !matches!(r.action, "noop" | "skipped_outside_sig_root"))
+        .collect();
+    if dry_run {
+        match format {
+            "json" => render_check_json(&stale),
+            _ => render_check_text(&stale),
+        }
+        if format == "text" && !stale.is_empty() {
+            report_check_failure(&stale);
+        }
+        if format == "text" {
+            report_skipped(&skips);
+        }
+        report_unresolvable_superclasses(&unresolvable);
+        return if stale.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) };
+    }
     match format {
         "json" => render_write_json(&results),
         _ => render_write_text(&results),
@@ -2437,7 +3753,9 @@ fn cmd_write(
     report_unresolvable_superclasses(&unresolvable);
     // v0.4.7 `TARGET_REFUSALS`: a refused target means the user asked for a
     // write and did not get one — exit 1.
-    if results.iter().any(|r| matches!(r.action, "skipped_invalid_encoding" | "skipped_unparseable")) {
+    if results.iter().any(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    }) {
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
@@ -2456,6 +3774,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         declared_return_rbs: c.declared_return_rbs.clone(),
         decl_header: c.decl_header.clone(),
         skip_reason: c.skip_reason,
+        definer: c.definer,
     }
 }
 
@@ -2636,8 +3955,12 @@ fn render_write_text(results: &[WriteResult]) {
         match r.action {
             "created" => println!("created {} ({} method(s))", r.target, r.applied.len()),
             "updated" => {
-                // `applied_counts`: `+N`, then the repaired generic headers.
-                let mut counts = format!("+{}", r.applied.len());
+                // `applied_counts`: `+N` added lines, `replaced N` counted
+                // apart (a rewrite is not an addition), then repairs.
+                let mut counts = format!("+{}", r.applied.len() - r.replaced.len());
+                if !r.replaced.is_empty() {
+                    counts.push_str(&format!(", replaced {}", r.replaced.len()));
+                }
                 if !r.repaired.is_empty() {
                     counts.push_str(&format!(
                         ", repaired {} generic header(s): {}",
@@ -2658,22 +3981,194 @@ fn render_write_text(results: &[WriteResult]) {
                 println!("skipped {} -> {} (outside sig root)", r.source, r.target);
                 render_write_skips(r);
             }
-            "skipped_invalid_encoding" => {
-                println!(
-                    "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
-                    r.target
-                );
-                println!(
-                    "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
-                     read faithfully."
-                );
-            }
-            "skipped_unparseable" => {
-                println!("REFUSED {} — the existing file was not updated", r.target);
-                println!("  {}", r.error.as_deref().unwrap_or_default());
-                println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+            "skipped_invalid_encoding" | "skipped_unparseable" | "skipped_invalid_rbs" => {
+                render_write_refusal(r)
             }
             _ => {}
+        }
+    }
+}
+
+/// The `REFUSED` block for a target the writer declines — shared by
+/// [`render_write_text`] and [`render_check_text`] (reference
+/// `render_write_invalid*`).
+fn render_write_refusal(r: &WriteResult) {
+    match r.action {
+        "skipped_invalid_encoding" => {
+            println!(
+                "REFUSED {} — the existing file is not valid UTF-8, so it was not updated",
+                r.target
+            );
+            println!(
+                "  Re-save the file as UTF-8 and re-run; sig-gen never modifies a file it cannot \
+                 read faithfully."
+            );
+        }
+        "skipped_unparseable" => {
+            println!("REFUSED {} — the existing file was not updated", r.target);
+            println!("  {}", r.error.as_deref().unwrap_or_default());
+            println!("  Fix the syntax error and re-run; sig-gen never modifies a file it cannot parse.");
+        }
+        _ => {
+            println!(
+                "REFUSED {} — the generated RBS does not parse, so it was not written",
+                r.target
+            );
+            println!("  {}", r.error.as_deref().unwrap_or_default());
+            println!("  This is a bug in Rigor's RBS rendering, not in your code — please report it.");
+        }
+    }
+}
+
+/// `applied_counts` (reference `applied_counts`): `+N` added lines, with
+/// `, replaced N` when a rewrite applied and the repaired generic headers.
+fn applied_counts(r: &WriteResult) -> String {
+    let mut counts = format!("+{}", r.applied.len() - r.replaced.len());
+    if !r.replaced.is_empty() {
+        counts.push_str(&format!(", replaced {}", r.replaced.len()));
+    }
+    if !r.repaired.is_empty() {
+        counts.push_str(&format!(
+            ", repaired {} generic header(s): {}",
+            r.repaired.len(),
+            r.repaired.join(", ")
+        ));
+    }
+    counts
+}
+
+/// `--check` text report (reference `render_check_text` /
+/// `render_check_change`): `sig/ is up to date`, else one `would create` /
+/// `would update` line per stale target with the member lines it would add
+/// (`  - ` before `  + ` for a `--overwrite` replacement).
+fn render_check_text(stale: &[&WriteResult]) {
+    if stale.is_empty() {
+        println!("sig/ is up to date");
+        return;
+    }
+    for r in stale {
+        match r.action {
+            "created" => {
+                println!("would create {} ({} method(s))", r.target, r.applied.len());
+                render_check_applied(r);
+            }
+            "updated" => {
+                println!("would update {} ({})", r.target, applied_counts(r));
+                render_check_applied(r);
+            }
+            _ => render_write_refusal(r),
+        }
+    }
+}
+
+/// The `  - declared_rbs` (a replaced member) / `  + rbs` lines of one check
+/// entry (reference `render_check_change`'s per-candidate loop).
+fn render_check_applied(r: &WriteResult) {
+    for c in &r.applied {
+        if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
+            rc.method_name == c.method_name && rc.kind == c.kind
+        }) {
+            println!("  - {old}");
+        }
+        for line in c.rbs.lines() {
+            println!("  + {line}");
+        }
+    }
+}
+
+/// `--check --format json` (reference `render_check`): `{up_to_date, results,
+/// refused}` — the write entries with `created`/`updated` renamed to
+/// `would_*`. The port never produces `sig.skipped.inline-differs` rows (the
+/// inline-declaration feature is unported), so `refused` is always `[]`.
+fn render_check_json(stale: &[&WriteResult]) {
+    use serde_json::json;
+    let rows: Vec<_> = stale
+        .iter()
+        .map(|r| {
+            let applied: Vec<_> = r.applied.iter().map(candidate_json).collect();
+            let skipped: Vec<_> = r
+                .skipped
+                .iter()
+                .map(|s| {
+                    let c = &s.candidate;
+                    let mut obj = json!({
+                        "file": c.file, "class": c.class_name, "method": c.method_name,
+                        "kind": c.kind, "classification": s.classification, "rbs": c.rbs,
+                        "inferred_return": c.inferred_return, "write_skip_reason": "user_authored",
+                    });
+                    if let Some(dr) = &s.declared_return_rbs {
+                        obj.as_object_mut()
+                            .unwrap()
+                            .insert("declared_return_rbs".to_string(), json!(dr));
+                    }
+                    obj
+                })
+                .collect();
+            let action = match r.action {
+                "created" => "would_create",
+                "updated" => "would_update",
+                a => a,
+            };
+            let mut row = json!({
+                "source": r.source, "target": r.target, "action": action,
+                "applied": applied, "skipped": skipped,
+            });
+            if let Some(e) = &r.error {
+                row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            if !r.replaced.is_empty() {
+                let replaced: Vec<_> =
+                    r.replaced.iter().map(|(c, _)| candidate_json(c)).collect();
+                row.as_object_mut().unwrap().insert("replaced".to_string(), json!(replaced));
+            }
+            if !r.repaired.is_empty() {
+                row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
+            }
+            row
+        })
+        .collect();
+    println!(
+        "{}",
+        crate::json_document::stamp_pretty(
+            &serde_json::to_string_pretty(&json!({
+                "up_to_date": stale.is_empty(),
+                "results": rows,
+                "refused": [],
+            }))
+            .unwrap(),
+            None
+        )
+    );
+}
+
+/// The `--check` stderr verdict (reference `report_check_failure` +
+/// `refused_targets_line`): out-of-date targets counted apart from refused
+/// ones, and a refused target is listed as a hand fix unless the refusal was
+/// Rigor's own render.
+fn report_check_failure(stale: &[&WriteResult]) {
+    let (refusals, pending): (Vec<&&WriteResult>, Vec<&&WriteResult>) = stale.iter().partition(|r| {
+        matches!(r.action, "skipped_invalid_rbs" | "skipped_invalid_encoding" | "skipped_unparseable")
+    });
+    if !pending.is_empty() {
+        eprintln!(
+            "rigor sig-gen --check: {} signature file(s) out of date; run `rigor sig-gen --write` with the same options to update them.",
+            pending.len()
+        );
+    }
+    if !refusals.is_empty() {
+        let by_hand: Vec<&str> = refusals
+            .iter()
+            .filter(|r| r.action != "skipped_invalid_rbs")
+            .map(|r| r.target.as_str())
+            .collect();
+        let head = format!(
+            "rigor sig-gen --check: {} signature file(s) refused; `--write` does not update them",
+            refusals.len()
+        );
+        if by_hand.is_empty() {
+            eprintln!("{head}. The generated RBS did not parse: a Rigor bug, see its REFUSED line on stdout.");
+        } else {
+            eprintln!("{head}. Repair by hand: {}.", by_hand.join(", "));
         }
     }
 }
@@ -2712,6 +4207,13 @@ fn render_write_json(results: &[WriteResult]) {
             });
             if let Some(e) = &r.error {
                 row.as_object_mut().unwrap().insert("error".to_string(), json!(e));
+            }
+            // `to_h`: `replaced` is present only when a member was rewritten
+            // (pre-#1076 payloads stay byte-identical without it).
+            if !r.replaced.is_empty() {
+                let replaced: Vec<_> =
+                    r.replaced.iter().map(|(c, _)| candidate_json(c)).collect();
+                row.as_object_mut().unwrap().insert("replaced".to_string(), json!(replaced));
             }
             if !r.repaired.is_empty() {
                 row.as_object_mut().unwrap().insert("repaired_headers".to_string(), json!(r.repaired));
@@ -2886,9 +4388,11 @@ fn update_existing(
     target_str: String,
     candidates: Vec<Candidate>,
     shells: &[String],
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
+    dry_run: bool,
 ) -> WriteResult {
     let Ok(bytes) = std::fs::read(target) else {
         return WriteResult {
@@ -2898,7 +4402,8 @@ fn update_existing(
             applied: Vec::new(),
             skipped: Vec::new(),
             error: None,
-            repaired: Vec::new(),
+            replaced: Vec::new(),
+        repaired: Vec::new(),
         };
     };
     // v0.4.7 (#2480/#2587): an existing target that is not UTF-8, or does not
@@ -2911,6 +4416,7 @@ fn update_existing(
         applied: Vec::new(),
         skipped: Vec::new(),
         error: Some(error),
+            replaced: Vec::new(),
         repaired: Vec::new(),
     };
     let Ok(source) = String::from_utf8(bytes) else {
@@ -2928,17 +4434,25 @@ fn update_existing(
     // `--write` re-run stays idempotent (the shell is present, no conflict). The
     // only uncovered case is merging into a USER-authored sig that lacks a shell
     // for a `Data.define` return — a documented follow-up, not a regression.
-    let _ = shells;
-    let MergeOutcome { source: merged, action, applied, skipped, repaired } =
-        apply_merge_with(source, candidates, supers, params, overwrite);
+    let MergeOutcome { source: merged, action, applied, replaced, skipped, repaired } =
+        apply_merge_with(source, candidates, kinds, supers, params, shells, overwrite);
+    // Reference `RbsValidity.source_error`: a spliced result that does not
+    // re-parse is a writer defect — refuse to write it (`:skipped_invalid_rbs`)
+    // rather than leave the consumer's `rigor check` to quarantine the file.
     if action == "updated" {
-        let _ = std::fs::write(target, &merged);
+        if let Some(detail) = rbs_parse_error::parsing_error_message("(rigor sig-gen)", &merged) {
+            return refused("skipped_invalid_rbs", detail);
+        }
+        if !dry_run {
+            let _ = std::fs::write(target, &merged);
+        }
     }
     WriteResult {
         source: source_path,
         target: target_str,
         action,
         applied,
+        replaced,
         skipped,
         error: None,
         repaired,
@@ -2951,6 +4465,11 @@ struct MergeOutcome {
     source: String,
     action: &'static str,
     applied: Vec<Candidate>,
+    /// The applied candidates that REPLACED an existing member line
+    /// (`--overwrite`), paired with the replaced line — the
+    /// `applied_counts` `, replaced N` tail and `--check`'s `  - ` diff
+    /// lines (reference `WriteResult#replaced` / `declared_rbs`).
+    replaced: Vec<(Candidate, String)>,
     skipped: Vec<SkipEntry>,
     /// `repaired_headers`: one `Name[params]` per bare generic header given
     /// its parameters (#2580/#2602).
@@ -2959,7 +4478,7 @@ struct MergeOutcome {
 
 /// Merge a candidate group into `source` (reference `Writer#update_existing`
 /// minus disk I/O). A parse-failure gate leaves the source byte-untouched with
-/// `action: "noop"`; otherwise each class group (first-seen order) is merged or
+/// `action: "noop"`; otherwise each class group (class-name order) is merged or
 /// appended, re-parsing fresh before each so offsets are never stale.
 #[cfg(test)]
 fn apply_merge(
@@ -2968,7 +4487,7 @@ fn apply_merge(
     supers: &HashMap<String, String>,
     overwrite: bool,
 ) -> MergeOutcome {
-    apply_merge_with(source, candidates, supers, &HashMap::new(), overwrite)
+    apply_merge_with(source, candidates, &HashMap::new(), supers, &HashMap::new(), &[], overwrite)
 }
 
 /// [`apply_merge`] with the run's generic header spellings (`params`): new
@@ -2977,8 +4496,10 @@ fn apply_merge(
 fn apply_merge_with(
     mut source: String,
     candidates: Vec<Candidate>,
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
+    shells: &[String],
     overwrite: bool,
 ) -> MergeOutcome {
     // Parse-failure gate: a malformed target is left byte-untouched (reference
@@ -2988,19 +4509,28 @@ fn apply_merge_with(
             source,
             action: "noop",
             applied: Vec::new(),
+            replaced: Vec::new(),
             skipped: Vec::new(),
             repaired: Vec::new(),
         };
     }
     let mut applied: Vec<Candidate> = Vec::new();
+    let mut replaced: Vec<(Candidate, String)> = Vec::new();
     let mut skipped: Vec<SkipEntry> = Vec::new();
+    let mut touched: Vec<String> = Vec::new();
     for (class_name, group) in group_by_class(candidates) {
-        merge_class(&mut source, &class_name, group, supers, params, overwrite, &mut applied, &mut skipped);
+        touched.push(class_name.clone());
+        merge_class(&mut source, &class_name, group, kinds, supers, params, overwrite, &mut applied, &mut replaced, &mut skipped);
     }
+    // `collapse_nested_declarations`: touched `Foo::Bar` decls move under an
+    // existing `Foo` (rigor-rs#530). Runs after every merge so the parents
+    // are in place; `repair_generic_headers` still goes last.
+    touched.extend(shells.iter().cloned());
+    collapse_nested_declarations(&mut source, &touched);
     let repaired = repair_generic_headers(&mut source, params);
     // `state_changed?`: a repaired header is a change too.
     let action = if applied.is_empty() && repaired.is_empty() { "noop" } else { "updated" };
-    MergeOutcome { source, action, applied, skipped, repaired }
+    MergeOutcome { source, action, applied, replaced, skipped, repaired }
 }
 
 /// Reference `Writer#repair_generic_headers` (#2580/#2602): a declaration in
@@ -3109,7 +4639,8 @@ fn names_word(text: &str, name: &str) -> bool {
     false
 }
 
-/// Group candidates by `class_name`, preserving first-seen class order
+/// Group candidates by `class_name` (merged in class-name order, reference
+/// `groups.keys.sort`).
 /// (reference `candidates.group_by(&:class_name)`).
 fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
     let mut order: Vec<String> = Vec::new();
@@ -3120,6 +4651,10 @@ fn group_by_class(candidates: Vec<Candidate>) -> Vec<(String, Vec<Candidate>)> {
         }
         groups.entry(c.class_name.clone()).or_default().push(c);
     }
+    // The reference merges `groups.keys.sort` — class-name order, not first-seen
+    // order — which is what orders the `skipped` report lines too (rigor-rs#493
+    // item 5).
+    order.sort();
     order.into_iter().map(|k| (k.clone(), groups.remove(&k).unwrap())).collect()
 }
 
@@ -3131,10 +4666,12 @@ fn merge_class(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
+    kinds: &HashMap<String, &'static str>,
     supers: &HashMap<String, String>,
     params: &HashMap<String, String>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
+    replaced: &mut Vec<(Candidate, String)>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     // Extract owned decl info before mutating (the parsed tree borrows `source`).
@@ -3143,15 +4680,8 @@ fn merge_class(
         Err(_) => None,
     };
     match found {
-        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, skipped),
-        None => append_new_class(
-            source,
-            class_name,
-            candidates,
-            supers.get(class_name),
-            params.get(class_name).map_or("", String::as_str),
-            applied,
-        ),
+        Some(info) => merge_into_existing(source, &info, candidates, overwrite, applied, replaced, skipped),
+        None => insert_namespace_chain(source, class_name, candidates, kinds, supers, params, applied),
     }
 }
 
@@ -3287,6 +4817,7 @@ fn merge_into_existing(
     candidates: Vec<Candidate>,
     overwrite: bool,
     applied: &mut Vec<Candidate>,
+    replaced: &mut Vec<(Candidate, String)>,
     skipped: &mut Vec<SkipEntry>,
 ) {
     let mut new_methods: Vec<Candidate> = Vec::new();
@@ -3301,18 +4832,27 @@ fn merge_into_existing(
         }
     }
 
-    // Splice NEW members before the class's closing `end` token (fixed 2-space
-    // indent, one `"  {rbs}\n"` per method, concatenated — reference
-    // `insert_into_class`). The token-start splice + fixed indent reproduces the
-    // oracle's nested-case bytes with no special-casing. This runs BEFORE any
-    // replacement: it inserts at `end_start`, after every existing member, so the
-    // captured member spans (all below `end_start`) stay valid (reference order:
+    // Splice NEW members before the class's closing `end` — reference
+    // `insert_into_class` at `member_indent_depth(decl)` (one level below the
+    // `end` token's own column), inserted at the `end` LINE's start when it
+    // carries only whitespace (`insert_before_end`): a nested decl's `end`
+    // sits at col >0, and splicing at the token would eat its indent and
+    // leave `end` at column 0. This runs BEFORE any replacement: it inserts
+    // at `end_start`, after every existing member, so the captured member
+    // spans (all below `end_start`) stay valid (reference order:
     // `insert_into_class` then `replace_eligible_conflicts`).
     if !new_methods.is_empty() {
-        let addition: String =
-            new_methods.iter().map(|c| format!("{INDENT}{}\n", c.rbs)).collect();
         let at = info.end_start.min(source.len());
-        source.insert_str(at, &addition);
+        let depth = (at - line_start_index(source, at)) / INDENT.len() + 1;
+        let member_indent = INDENT.repeat(depth);
+        let addition: String =
+            new_methods.iter().map(|c| format!("{member_indent}{}\n", c.rbs)).collect();
+        let line_start = line_start_index(source, at);
+        if blank_range(source, line_start, at) {
+            source.insert_str(line_start, &addition);
+        } else {
+            source.insert_str(at, &format!("\n{addition}"));
+        }
         applied.extend(new_methods);
     }
 
@@ -3345,6 +4885,7 @@ fn merge_into_existing(
         // leaves earlier offsets valid (reference sorts by `-member_position`).
         eligible.sort_by_key(|(_, (start, _))| std::cmp::Reverse(*start));
         for (c, (start, end)) in eligible {
+            replaced.push((clone_candidate(&c), source[start..end].to_string()));
             source.replace_range(start..end, &c.rbs);
             applied.push(c);
         }
@@ -3399,32 +4940,350 @@ fn is_word_byte(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b == b'_'
 }
 
-/// Append a NEW class block for a class not declared in the file (reference
-/// `append_new_class`): a COMPACT qualified header + `< Super` when known, body
-/// lines at 2-space indent, ONE leading blank line, and a trailing-newline
-/// repair on the original file first. All methods are applied.
-fn append_new_class(
+fn line_start_index(source: &str, pos: usize) -> usize {
+    if pos == 0 {
+        return 0;
+    }
+    source[..pos].rfind('\n').map_or(0, |i| i + 1)
+}
+
+/// Reference `blank_range?`: only spaces/tabs between `from` and `to`.
+fn blank_range(source: &str, from: usize, to: usize) -> bool {
+    source[from..to].chars().all(|c| c == ' ' || c == '\t')
+}
+
+/// Reference `insert_namespace_chain` + `render_chain_snippet`: the part of
+/// `class_name`'s chain the file does not yet declare is rendered as a NESTED
+/// block inside the deepest declared ancestor — `class Sub2 < ::A::Base`
+/// lands inside the existing `module A`, never as a flat top-level
+/// `class A::Sub2` (rigor-rs#493 item 11). With no ancestor the whole chain
+/// appends top-level, still nested.
+#[allow(clippy::too_many_arguments)]
+fn insert_namespace_chain(
     source: &mut String,
     class_name: &str,
     candidates: Vec<Candidate>,
-    superclass: Option<&String>,
-    params: &str,
+    kinds: &HashMap<String, &'static str>,
+    supers: &HashMap<String, String>,
+    params: &HashMap<String, String>,
     applied: &mut Vec<Candidate>,
 ) {
-    let body = candidates
-        .iter()
-        .map(|c| format!("{INDENT}{}", c.rbs))
-        .collect::<Vec<_>>()
-        .join("\n");
-    let header = match superclass {
-        Some(s) => format!("class {class_name}{params} < {}", superclasses::absolute(s)),
-        None => format!("class {class_name}{params}"),
-    };
-    if !source.ends_with('\n') {
-        source.push('\n');
+    let segments: Vec<&str> = class_name.split("::").collect();
+    // `split_at_existing_ancestor`: the longest leading run the file declares.
+    let mut split = 0usize;
+    let mut anchor: Option<ClassDeclInfo> = None;
+    for i in (1..segments.len()).rev() {
+        let prefix = segments[..i].join("::");
+        let Ok(sig) = ruby_rbs::node::parse(source) else { break };
+        if let Some(info) = find_and_extract(source, sig.declarations().iter(), &[], &prefix) {
+            split = i;
+            anchor = Some(info);
+            break;
+        }
     }
-    source.push_str(&format!("\n{header}\n{body}\nend\n"));
+    let missing = &segments[split.min(segments.len() - 1)..];
+    if missing.is_empty() {
+        return;
+    }
+    // `member_indent_depth`: a member sits one level below the decl's keyword
+    // column — the `end` token's column stands in (canonical RBS keeps them
+    // at the same indent).
+    let depth = anchor.as_ref().map_or(0, |a| {
+        (a.end_start - line_start_index(source, a.end_start)) / INDENT.len() + 1
+    });
+    let mut snippet = String::new();
+    for (j, seg) in missing.iter().enumerate() {
+        let qualified = [segments[..split].join("::"), missing[..=j].join("::")]
+            .into_iter()
+            .filter(|p| !p.is_empty())
+            .collect::<Vec<_>>()
+            .join("::");
+        let is_leaf = j == missing.len() - 1;
+        // `node_keyword`: kinds first, `class` for a method-bearing leaf,
+        // `module` for an intermediate segment.
+        let keyword = kinds
+            .get(&qualified)
+            .copied()
+            .unwrap_or(if is_leaf { "class" } else { "module" });
+        snippet.push_str(&format!("{}{} {}", INDENT.repeat(depth + j), keyword, seg));
+        if let Some(p) = params.get(&qualified) {
+            snippet.push_str(p);
+        }
+        if keyword == "class" {
+            if let Some(spr) = supers.get(&qualified) {
+                snippet.push_str(&format!(" < {}", superclasses::absolute(spr)));
+            }
+        }
+        snippet.push('\n');
+    }
+    let member_indent = INDENT.repeat(depth + missing.len());
+    for c in &candidates {
+        snippet.push_str(&format!("{member_indent}{}\n", c.rbs));
+    }
+    for j in (0..missing.len()).rev() {
+        snippet.push_str(&format!("{}end\n", INDENT.repeat(depth + j)));
+    }
+    match anchor {
+        Some(a) => {
+            // `insert_before_end`: an `end` starting its own line takes the
+            // snippet at the line's start; otherwise before the token.
+            let line_start = line_start_index(source, a.end_start);
+            if blank_range(source, line_start, a.end_start) {
+                source.insert_str(line_start, &snippet);
+            } else {
+                source.insert_str(a.end_start, &format!("\n{snippet}"));
+            }
+        }
+        None => {
+            // `append_top_level`: separated by exactly one blank line.
+            if !source.is_empty() {
+                if !source.ends_with('\n') {
+                    source.push('\n');
+                }
+                if !source.ends_with("\n\n") {
+                    source.push('\n');
+                }
+            }
+            source.push_str(&snippet);
+        }
+    }
     applied.extend(candidates);
+}
+
+/// Owned snapshot of a class/module declaration for the relocation pass
+/// (reference `collapse_nested_declarations` reads `RBS` locations).
+struct RelocDecl {
+    /// `decl.location` start/end byte offsets.
+    start: usize,
+    end: usize,
+    /// `decl.location[:name]` byte offsets — the head rename's splice region.
+    name_start: usize,
+    name_end: usize,
+    /// `decl.location[:end]` start byte offset (the `insert_before_end` anchor).
+    end_start: usize,
+    /// `decl.location[:keyword].start_column` — drives both indent depths.
+    keyword_col: usize,
+    /// `leading_positions`: annotation + comment start offsets.
+    leading: Vec<usize>,
+    /// `decl.name.to_s.start_with?("::")` — a rooted decl keeps its layout.
+    rooted: bool,
+}
+
+/// [`find_and_extract`] returning the fuller [`RelocDecl`] the relocation
+/// pass needs (reference `find_class_decl` used from `relocate_under_parent`).
+fn find_reloc_decl<'a>(
+    source: &str,
+    decls: impl Iterator<Item = RbsNode<'a>>,
+    prefix: &[String],
+    target: &str,
+) -> Option<RelocDecl> {
+    for decl in decls {
+        let (local, members, info) = match &decl {
+            RbsNode::Class(c) => (
+                decl_full_name(&c.name()),
+                c.members(),
+                (
+                    c.location(),
+                    c.name_location(),
+                    c.end_location(),
+                    c.keyword_location(),
+                    c.annotations(),
+                    c.comment().map(|cm| cm.location()),
+                ),
+            ),
+            RbsNode::Module(m) => (
+                decl_full_name(&m.name()),
+                m.members(),
+                (
+                    m.location(),
+                    m.name_location(),
+                    m.end_location(),
+                    m.keyword_location(),
+                    m.annotations(),
+                    m.comment().map(|cm| cm.location()),
+                ),
+            ),
+            _ => continue,
+        };
+        let (loc, name_loc, end_loc, kw_loc, annotations, comment_loc) = info;
+        let full = if prefix.is_empty() {
+            local.clone()
+        } else {
+            format!("{}::{}", prefix.join("::"), local)
+        };
+        if full == target {
+            let mut leading: Vec<usize> = annotations
+                .iter()
+                .filter_map(|a| match a {
+                    RbsNode::Annotation(an) => {
+                        Some(clamp_offset(an.location().start(), source.len()))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if let Some(cl) = comment_loc {
+                leading.push(clamp_offset(cl.start(), source.len()));
+            }
+            return Some(RelocDecl {
+                start: clamp_offset(loc.start(), source.len()),
+                end: clamp_offset(loc.end(), source.len()),
+                name_start: clamp_offset(name_loc.start(), source.len()),
+                name_end: clamp_offset(name_loc.end(), source.len()),
+                end_start: clamp_offset(end_loc.start(), source.len()),
+                keyword_col: clamp_offset(kw_loc.start(), source.len())
+                    - line_start_index(source, clamp_offset(kw_loc.start(), source.len())),
+                leading,
+                rooted: slice_of(source, name_loc).starts_with("::"),
+            });
+        }
+        let mut child_prefix = prefix.to_vec();
+        child_prefix.push(local);
+        if let Some(found) = find_reloc_decl(source, members.iter(), &child_prefix, target) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Reference `collapse_nested_declarations`: relocate each touched `A::B`
+/// declaration under an existing `A` in the same file, shallowest first
+/// (rigor-rs#530).
+fn collapse_nested_declarations(source: &mut String, names: &[String]) {
+    let mut uniq: Vec<&String> = names.iter().collect();
+    uniq.sort();
+    uniq.dedup();
+    for name in uniq {
+        relocate_under_parent(source, name);
+    }
+}
+
+/// Reference `relocate_under_parent`: move `qualified`'s own declaration
+/// under its existing parent decl, or leave the file untouched when any
+/// precondition fails (no parent, overlap, `::`-rooted head, non-isolated
+/// region, unparseable intermediate).
+fn relocate_under_parent(source: &mut String, qualified: &str) {
+    let segments: Vec<&str> = qualified.split("::").collect();
+    if segments.len() < 2 {
+        return;
+    }
+    let parent_name = segments[..segments.len() - 1].join("::");
+    let (parent, decl) = match ruby_rbs::node::parse(source) {
+        Ok(sig) => match (
+            find_reloc_decl(source, sig.declarations().iter(), &[], &parent_name),
+            find_reloc_decl(source, sig.declarations().iter(), &[], qualified),
+        ) {
+            (Some(p), Some(d)) => (p, d),
+            _ => return,
+        },
+        Err(_) => return,
+    };
+    // `overlapping?`: either decl already nests the other — nothing to move.
+    if parent.start < decl.end && decl.start < parent.end {
+        return;
+    }
+    if decl.rooted {
+        return;
+    }
+    let Some(region) = decl_region(source, &decl) else { return };
+    let block = relocated_block(source, &decl, &parent, segments[segments.len() - 1], &region);
+    // `apply_relocation`: cut, re-parse for the (shifted) parent anchor,
+    // splice in before its `end`.
+    let spliced = splice_out(source, &region);
+    let anchor = match ruby_rbs::node::parse(&spliced) {
+        Ok(sig) => find_reloc_decl(&spliced, sig.declarations().iter(), &[], &parent_name),
+        Err(_) => None,
+    };
+    let Some(anchor) = anchor else { return };
+    let line_start = line_start_index(&spliced, anchor.end_start);
+    let mut merged = spliced;
+    if blank_range(&merged, line_start, anchor.end_start) {
+        merged.insert_str(line_start, &block);
+    } else {
+        merged.insert_str(anchor.end_start, &format!("\n{block}"));
+    }
+    *source = merged;
+}
+
+/// Reference `decl_region`: the declaration's full source region extended
+/// over its leading comment/annotations, ending just past its closing
+/// newline. `None` when either edge shares its line with other text.
+fn decl_region(source: &str, decl: &RelocDecl) -> Option<(usize, usize)> {
+    let start_pos = decl
+        .leading
+        .iter()
+        .copied()
+        .chain(std::iter::once(decl.start))
+        .min()?;
+    let line_start = line_start_index(source, start_pos);
+    if !blank_range(source, line_start, start_pos) {
+        return None;
+    }
+    let finish = decl.end;
+    let line_end = source[finish..].find('\n').map_or(source.len(), |i| finish + i);
+    if !blank_range(source, finish, line_end) {
+        return None;
+    }
+    Some((line_start, if line_end < source.len() { line_end + 1 } else { line_end }))
+}
+
+/// Reference `relocated_block` + `reindent`: the moved text with the
+/// `Foo::Bar` head shortened to `Bar` and every line pushed in to the
+/// parent's member depth (a non-positive delta leaves the text alone).
+fn relocated_block(
+    source: &str,
+    decl: &RelocDecl,
+    parent: &RelocDecl,
+    short_name: &str,
+    region: &(usize, usize),
+) -> String {
+    let text = &source[region.0..region.1];
+    let head = decl.name_start - region.0;
+    let tail = decl.name_end - region.0;
+    let renamed = format!("{}{}{}", &text[..head], short_name, &text[tail..]);
+    let member_depth = parent.keyword_col / INDENT.len() + 1;
+    let decl_depth = decl.keyword_col / INDENT.len();
+    let Some(delta) = member_depth.checked_sub(decl_depth) else {
+        return renamed;
+    };
+    let prefix = INDENT.repeat(delta);
+    let mut out = String::with_capacity(renamed.len() + prefix.len() * renamed.lines().count());
+    for line in renamed.split_inclusive('\n') {
+        if line.trim().is_empty() {
+            out.push_str(line);
+        } else {
+            out.push_str(&prefix);
+            out.push_str(line);
+        }
+    }
+    if !renamed.ends_with('\n') && renamed.rsplit('\n').next().is_some_and(|l| !l.trim().is_empty()) {
+        // `split_inclusive` already emitted the trailing unterminated line.
+    }
+    out
+}
+
+/// Reference `splice_out`: remove `region`, collapsing the newline run left
+/// at the seam so the cut never shows as a widening gap (or a trailing blank
+/// line at EOF). Spacing already fine is left exactly as written.
+fn splice_out(source: &str, region: &(usize, usize)) -> String {
+    let before = &source[..region.0];
+    let after = &source[region.1..];
+    if before.trim().is_empty() {
+        return after.trim_start_matches('\n').to_string();
+    }
+    if after.trim().is_empty() {
+        let trimmed = before.trim_end_matches('\n');
+        return format!("{trimmed}\n");
+    }
+    let seam = before.len() - before.trim_end_matches('\n').len()
+        + (after.len() - after.trim_start_matches('\n').len());
+    if seam <= 2 {
+        return format!("{before}{after}");
+    }
+    format!(
+        "{}\n\n{}",
+        before.trim_end_matches('\n'),
+        after.trim_start_matches('\n')
+    )
 }
 
 /// Extract a method's RETURN TEXT: the substring after the LAST `->` at bracket
@@ -3478,9 +5337,9 @@ fn clamp_offset(v: i32, len: usize) -> usize {
 mod tests;
 
 /// Whether every `untyped` in `erased` sits inside a `ClassName[…]` type-arg
-/// slot — `NameError[untyped]`, `KeyError[untyped, untyped]`,
-/// `Range[Array[untyped] | Integer]` — the reference's elaborated emit,
-/// exempt from the buried-`untyped` skip. An `untyped` inside a TUPLE
+/// slot — `Range[untyped]`, `Hash[untyped, untyped]`, `Range[Array[untyped] |
+/// Integer]` — the reference's elaborated emit, exempt from the
+/// buried-`untyped` skip (rigor-rs#493 item 7). An `untyped` inside a TUPLE
 /// literal's `[…]` (a bracket not preceded by a class identifier) still
 /// counts as an inference hole.
 fn is_nominal_untyped_args(erased: &str) -> bool {

@@ -166,10 +166,12 @@ pub fn required_vendored_features(source: &[u8]) -> Vec<String> {
             }
             let at = i;
             i += 1;
-            // `(?:(?<![\w.$@])|(?<=Kernel\.))`
+            // `(?:(?<![\w.$@])|(?<=Kernel\.))` — the reference scans raw bytes
+            // (`.b`), where `\w` is ASCII-only: a byte >= 0x80 is NOT a word
+            // character (`p 1 # érequire "prime"` still activates, rigor-rs#463).
             let ok_prefix = at == 0 || {
                 let b = source[at - 1];
-                !(b.is_ascii_alphanumeric() || b == b'_' || b >= 0x80 || b == b'.' || b == b'$' || b == b'@')
+                !(b.is_ascii_alphanumeric() || b == b'_' || b == b'.' || b == b'$' || b == b'@')
                     || source[..at].ends_with(b"Kernel.")
             };
             if !ok_prefix {
@@ -229,7 +231,9 @@ pub fn required_feature_segments(source: &[u8]) -> Vec<String> {
             continue;
         }
         let at = i;
-        // `(?:(?<![\w.$@])|(?<=Kernel\.))`
+        // `(?:(?<![\w.$@])|(?<=Kernel\.))` — the reference scans raw bytes
+            // (`.b`), where `\w` is ASCII-only: a byte >= 0x80 is NOT a word
+            // character (`p 1 # érequire "prime"` still activates, rigor-rs#463).
         let ok_prefix = at == 0 || {
             let b = source[at - 1];
             !(word(b) || b == b'.' || b == b'$' || b == b'@') || source[..at].ends_with(b"Kernel.")

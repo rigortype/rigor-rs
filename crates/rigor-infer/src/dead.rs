@@ -170,6 +170,13 @@ pub(crate) struct DeadPositions {
     /// (`break h.merge!(…)`, `h.clear`) reaches it like a scanned one
     /// (`flow_writes::break_join_suppresses`).
     locals_only_attr_writes: Vec<Span>,
+    /// `break` argument spans inside a BLOCK/LAMBDA body —
+    /// `join_block_break_bindings` drops every scope effect (a slot
+    /// mutation's widening, a mutator's record drop) while a rebind
+    /// still unions into the post-call scope and a scan-visible
+    /// mutation lands past the block's join through
+    /// `content_writeback_block_captures` (rigor-rs#407).
+    block_break: Vec<Span>,
     /// The `scanned_inert` carriers — `END { }`/`BEGIN { }`/`super(…)`/
     /// `yield(…)` operands inside an iterated body: never evaluated (the
     /// write's own position lands nothing) but covered by the body's
@@ -243,6 +250,58 @@ impl DeadPositions {
         }) {
             return false;
         }
+        // A `for`'s `break` argument is `bare_locals_only` — `eval_for`
+        // runs no writeback and joins the argument's discarded scope for
+        // locals only, so a write inside it lands on the post-loop join
+        // (`for i in [1]; break (h = {}); end; h.frob` reads `1 | {}`
+        // on the oracle) and on the argument's own evaluated scope, but
+        // NEVER on a read the owning `for` body still contains
+        // (`h[:a].inbody` after `break (h = {})` keeps the `"s" | 1`
+        // record — rigor-rs#411). "Owning" is the SMALLEST loop carrier
+        // holding the write: a read later in an OUTER loop's body
+        // (`while c; for i; break (h = {}); end; h.f; end`) does see the
+        // landed scope. A `while`/`until` `break` argument's rebind
+        // still reaches in-body reads — its fixpoint replays it.
+        if self.bare.iter().any(|&b| contains(b, write))
+            // The argument's own evaluated scope is exempt, not ANY
+            // bare span — a sibling `break` argument reads the body's
+            // env, not this argument's discarded one.
+            && !self
+                .bare
+                .iter()
+                .any(|&b| contains(b, write) && contains(b, use_))
+            && self
+                .loops
+                .iter()
+                .filter(|&&l| contains(l, write))
+                .min_by_key(|l| l.1 - l.0)
+                // The use must START inside the owning loop: a zero-width
+                // continuation probe at (end, end) sits at the `for`'s
+                // own end, where the argument's landed scope DOES apply
+                // (the post-loop join carries it).
+                .is_some_and(|&l| l.0 <= use_.0 && use_.0 < l.1)
+        {
+            return false;
+        }
+        // A rebind inside a BLOCK/LAMBDA body's `break` argument joins
+        // `join_block_break_bindings` — locals-only, so it lands on the
+        // post-call scope (and nowhere inside the block body that holds
+        // the argument, not even inside the argument's own tail — the
+        // reference reads the pre-`break` env there: `each { break
+        // (h = {}; h.m) }` fires `m` for the OLD `h`, rigor-rs#407).
+        // The owning carrier is the SMALLEST iterated body holding the
+        // write — the block body itself; a read later in an OUTER
+        // loop's body still sees the landed scope.
+        if self.block_break.iter().any(|&b| contains(b, write))
+            && self
+                .iterated
+                .iter()
+                .filter(|&&b| contains(b, write))
+                .min_by_key(|b| b.1 - b.0)
+                .is_some_and(|&b| b.0 <= use_.0 && use_.0 < b.1)
+        {
+            return false;
+        }
         if let Some(arm) = self.rescue.iter().find(|a| contains(a.span, write)) {
             // "Inside the arm" must start BEFORE its clipped end: the last
             // clause's span runs to the `begin`'s own `end`, so a zero-width
@@ -278,6 +337,26 @@ impl DeadPositions {
         // h[:a].n); end` fires `m` and `n` on the oracle, declines
         // post-loop — rigor-rs#363 review). A non-scanned write's drop
         // lands nowhere at all.
+        // A mutation inside a BLOCK/LAMBDA body's `break` argument:
+        // `join_block_break_bindings` drops every scope effect — the
+        // widening lands NOWHERE (`each { break h.merge!(…) }` keeps
+        // `h[:a]`'s record on the oracle — rigor-rs#407) — except a
+        // scan-visible mutation, whose drop `content_writeback_block_
+        // captures` still applies past the SMALLEST iterated body
+        // holding the write (the block body: `each { break h[:a] = 9 }`
+        // declines post-call). A nested iterated body inside the
+        // argument does not widen the reach — the owning block body
+        // bound is the minimum, so a `for` inside the argument keeps
+        // the suppression.
+        if self.block_break.iter().any(|&b| contains(b, write)) {
+            return scanned
+                && self
+                    .iterated
+                    .iter()
+                    .filter(|&&b| contains(b, write))
+                    .min_by_key(|b| b.1 - b.0)
+                    .is_some_and(|&b| !(b.0 <= use_.0 && use_.0 < b.1));
+        }
         if self.locals_only.iter().any(|&l| contains(l, write)) {
             return (scanned || !self.locals_only_attr_writes.contains(&write))
                 && self
@@ -414,6 +493,7 @@ impl<'i> Typer<'i> {
             iterated: ast.iterated_body_spans().to_vec(),
             bare: ast.bare_locals_only_spans().to_vec(),
             locals_only: ast.locals_only_spans().to_vec(),
+            block_break: ast.block_break_locals_only_spans().to_vec(),
             scanned_inert: ast.scanned_inert_spans().to_vec(),
             next_args: ast.next_arg_spans().to_vec(),
             ..Default::default()
@@ -779,7 +859,7 @@ impl<'i> Typer<'i> {
     /// site's own `self` answers `name`, in which case a same-named toplevel
     /// `def` never binds there. `false` at file top level, where
     /// `self_type` is nil.
-    fn self_answers(&self, ast: &LoweredAst, site: Span, name: &str) -> bool {
+    pub(crate) fn self_answers(&self, ast: &LoweredAst, site: Span, name: &str) -> bool {
         match self.call_self(ast, site) {
             CallSelf::Singleton(qual) => {
                 !qual.is_empty() && self.singleton_answers(&qual, name)
@@ -792,6 +872,21 @@ impl<'i> Typer<'i> {
             // `def helper` even when `Foo.self.helper` exists — probed).
             CallSelf::Unmodelled => false,
         }
+    }
+
+    /// Whether `site` sits inside a literal BLOCK (`{ … }` / `do … end`) or
+    /// `->` lambda body — the whole block node, parameters included. The
+    /// cross-file toplevel-def fold declines there: a block-local self keeps
+    /// the Kernel binding on the reference (rigor-rs#462, probed).
+    pub(crate) fn inside_block(&self, ast: &LoweredAst, site: Span) -> bool {
+        ast.iter().any(|(_, n)| match n {
+            Node::Call {
+                block_span: Some(block),
+                ..
+            } => contains(*block, site),
+            Node::Lambda { span, .. } => contains(*span, site),
+            _ => false,
+        })
     }
 
     /// The `self` a call at `site` dispatches on — the `scope.self_type`

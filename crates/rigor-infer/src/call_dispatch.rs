@@ -4,7 +4,7 @@
 //! bare-nominal-join declines and in-source parameter bounds.
 
 use rigor_parse::{LoweredAst, Node, NodeId};
-use rigor_types::{Interner, Type, TypeId};
+use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{folding, ParamBoundReturn, TypeEnv, Typer};
 
@@ -31,6 +31,94 @@ impl<'i> Typer<'i> {
         args: &[NodeId],
         env: &TypeEnv,
         interner: &mut Interner,
+    ) -> TypeId {
+        let ty = self.type_call_declines(ast, receiver, method, args, env, interner, true);
+        self.decline_fold_gap(ast, receiver, env, ty, interner)
+    }
+
+    /// sig-gen's def-local typing (rigor-rs#546): a call on a def-local
+    /// constant-carrier (`a = 1.5; a.to_s`, `s = "ab"; s.strip`, `t = [1, 2];
+    /// t.join`) that the port does not fold types to the method's RBS nominal
+    /// (`String`, `Integer`, `Array[..]`), where the reference folds it to a
+    /// constant (`"1.5"`, `"ab"`, `"12"`). The fold tables differ, so the
+    /// answer is not the reference's — decline (`untyped`; the method is
+    /// skipped). A folded result (a `Constant`) is kept. A literal receiver
+    /// (`1.5.to_s`) is the pre-existing fold gap master shares and is left alone.
+    fn decline_fold_gap(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        env: &TypeEnv,
+        ty: TypeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        if self.def_scope.get().is_none()
+            || !matches!(ast.get(receiver), Node::LocalVariableRead { .. })
+            || !self.is_scalar_nominal_result(interner, ty)
+        {
+            return ty;
+        }
+        let recv = self.type_of(ast, receiver, env, interner);
+        if Self::is_constant_carrier(interner, recv) {
+            interner.untyped()
+        } else {
+            ty
+        }
+    }
+
+    fn is_constant_carrier(interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty) {
+            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) | Type::IntegerRange { .. } => true,
+            Type::Union(ms) => ms.iter().all(|&m| Self::is_constant_carrier(interner, m)),
+            _ => false,
+        }
+    }
+
+    fn is_scalar_nominal_result(&self, interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty) {
+            Type::Nominal { class, .. } => matches!(
+                self.index.class_name_for_id(*class),
+                Some(
+                    "String" | "Integer" | "Float" | "Symbol" | "Rational" | "Complex" | "Array" | "Hash"
+                        | "TrueClass" | "FalseClass"
+                )
+            ),
+            Type::Union(ms) => ms.iter().all(|&m| {
+                matches!(interner.get(m), Type::Constant(Scalar::Bool(_)))
+                    || self.is_scalar_nominal_result(interner, m)
+            }),
+            _ => false,
+        }
+    }
+
+    /// `type_call` for the internal `recv[k]` / `recv.attr` current-read a
+    /// compound write performs (rigor-rs#178). A user-facing `x[9]`
+    /// declines the nilable lookup, but declining here would erase the
+    /// stored-slot record to `Dynamic` (`s = "abc"; s[0] ||= nil; x =
+    /// s[0]; x.upcase` lost its `possible-nil` row); the read keeps the
+    /// flat nominal so the record's join stands as on master.
+    pub(crate) fn type_call_for_write_value(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        self.type_call_declines(ast, receiver, method, args, env, interner, false)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn type_call_declines(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+        user_facing: bool,
     ) -> TypeId {
         // Tier 4 (in-source / RBS `.new`): `X.new` where `X` is a constant
         // naming a class known to the RBS index OR the SourceIndex types to a
@@ -100,6 +188,25 @@ impl<'i> Typer<'i> {
         }
 
         let recv_ty = self.type_of(ast, receiver, env, interner);
+
+        // Upstream v0.4.3 (#1836, rigor #1752): a class-object call whose
+        // name a root refinement in scope defines types `Dynamic` — so a
+        // call chained after `Integer.name` stays silent (rigor-rs#467). The
+        // rules driver's `refinement_reaches` decline withholds the
+        // diagnostic on the refined call itself but left the `String` typing
+        // for `.zz_chain` to witness on.
+        if let Type::Singleton(class) = interner.get(recv_ty) {
+            let recv_name = self
+                .index
+                .class_name_for_id(*class)
+                .or_else(|| self.source.class_name_for_id(*class));
+            if let Some(recv_name) = recv_name {
+                let site = ast.get(receiver).span();
+                if self.refined_class_object_method(ast, site, recv_name, method) {
+                    return interner.untyped();
+                }
+            }
+        }
 
         if self.literal_concat_declines(ast, receiver, recv_ty, method, args, env, interner) {
             return interner.untyped();
@@ -178,7 +285,9 @@ impl<'i> Typer<'i> {
             Type::Singleton(class) if self.source.class_name_for_id(*class) == Some("Kernel")
         );
         if kernel_module_receiver {
-            if let Some(ty) = self.type_implicit_self_call(ast, method, args, env, interner) {
+            if let Some(ty) =
+                self.type_implicit_self_call(ast, method, args, None, env, interner)
+            {
                 return ty;
             }
         }
@@ -319,6 +428,15 @@ impl<'i> Typer<'i> {
         // guess). The nullary case (`args` empty) folds the no-arg core.
         if let Type::Constant(scalar) = interner.get(recv_ty).clone() {
             if let Some(arg_scalars) = self.pin_arg_scalars(ast, args, env, interner) {
+                // ConstantFolding `try_fold_self_return`
+                // (constant_folding.rb:318): a no-arg `freeze` / `itself` /
+                // `dup` / `clone` on a value-pinned receiver returns THE PIN
+                // — `"a".dup.zork` witnesses `for "a"` (rigor-rs#489).
+                if arg_scalars.is_empty()
+                    && matches!(method, "freeze" | "itself" | "dup" | "clone")
+                {
+                    return interner.intern(Type::Constant(scalar));
+                }
                 // Upstream v0.4.6 (#2125 / #2247): a String fold past the byte
                 // limit declines whole; the reference's next tier answers a
                 // `literal-string` carrier the port does not model, so the
@@ -333,10 +451,23 @@ impl<'i> Typer<'i> {
                 // that reads a local declines to the RBS answer (#149 review:
                 // `buf = ""; buf << "x"; buf[0].upcase` fired `for nil`).
                 // `Float#<=>` joins them: its `nil` arm has the same problem.
+                // rigor-rs#499: the risk is a STALE pin, not a local read —
+                // `s = "abc"; s[9]` folds to `nil` on the oracle because its
+                // env tracks the literal through the binding. A local whose
+                // only mark is the seeding write still proves its pin
+                // (`stale_local` counts a second rebind or any content
+                // mutation); a composite expression reading any local keeps
+                // the old any-read decline — the port cannot see which of
+                // its names the value pinned on.
                 let stale_risk = folding::is_nilable_fold(&scalar, method)
                     && std::iter::once(receiver)
                         .chain(args.iter().copied())
-                        .any(|id| ast.reads_local_within(ast.get(id).span()));
+                        .any(|id| match ast.get(id) {
+                            Node::LocalVariableRead { name, .. } => {
+                                self.stale_local(ast, name)
+                            }
+                            _ => ast.reads_local_within(ast.get(id).span()),
+                        });
                 if let Some(folded) =
                     (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
                 {
@@ -345,9 +476,42 @@ impl<'i> Typer<'i> {
                     }
                     return interner.intern(Type::Constant(folded));
                 }
+                // rigor-rs#499 — a STALE pin cannot fold (the env literal is
+                // not the runtime value) but the oracle still answers the RBS
+                // signature: `s << "x"; s[9]` types `String?`, `s.index` types
+                // `Integer?`. A bare untyped loses the nil (`x = s[0]; x.upcase`
+                // keeps its `possible-nil` row on the oracle), and a bare
+                // nominal would invent the flat `String` the pin's decline was
+                // introduced to erase — so the fallback is the SAME
+                // `method_return_nilable` answer tier 3 gives a Nominal
+                // receiver: `T | nil` for a nilable return, the flat nominal
+                // otherwise, untyped only when the class does not define the
+                // method at all.
+                if stale_risk {
+                    return match self
+                        .index
+                        .method_return_nilable(folding::scalar_class(&scalar), method)
+                    {
+                        Some((ret, nilable)) => {
+                            let nominal = self.nominal_or_untyped(ret, interner);
+                            if nilable {
+                                rigor_types::Algebra::join(interner, nominal, interner.nil())
+                            } else {
+                                nominal
+                            }
+                        }
+                        None => interner.untyped(),
+                    };
+                }
                 // Issue #164: for these `Integer?` lookups an unfolded literal
                 // call must not reach tier 3's bare `Integer` (see the predicate).
-                if folding::declines_unfolded(&scalar, method) {
+                // Issue #178 widened the set to the whole `is_str_lookup` family,
+                // but only for the user-facing read: a compound write's internal
+                // `current` read keeps the flat nominal (its slot record joins
+                // `String | nil` / `Integer | nil` from it).
+                if folding::declines_unfolded(&scalar, method)
+                    && (user_facing || !folding::declines_str_index_family(&scalar, method))
+                {
                     return interner.untyped();
                 }
                 // ADR-0008 sidecar fallback: the Rust core declined, but if this
@@ -366,6 +530,15 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
+            } else if user_facing && folding::is_str_lookup(&scalar, method) {
+                // Issue #178: the fold never runs when an argument does not
+                // pin (a Range or Regexp literal, a local bound to one), but
+                // a nilable String lookup can still answer `nil` — the
+                // reference folds the real call and is silent on the miss,
+                // where tier 3's bare `String` / `Integer` fires on the
+                // chained call. Decline as `declines_unfolded` does for the
+                // pinned-but-unfolded path.
+                return interner.untyped();
             }
         }
 
@@ -814,6 +987,113 @@ impl<'i> Typer<'i> {
         }
         Some(class_name)
     }
+    /// Whether a refinement in effect at `site` (a `using M` of a project
+    /// module, whose lexical region runs from the call to the end of its
+    /// innermost class/module scope — or of the file) defines `method` on a
+    /// root a class object reaches — `Object` / `Module` / `Kernel` /
+    /// `BasicObject`, `Class` when the receiver is not itself a module
+    /// (`refine(Class)` does not reach `Comparable.name` — rigor-rs#467's
+    /// control), or a module the object may extend (an unreadable term
+    /// answers `true` — the decline side). Mirrors the rules driver's
+    /// `refinement_reaches` / `refined_using_regions` scan.
+    fn refined_class_object_method(
+        &self,
+        ast: &LoweredAst,
+        site: rigor_parse::Span,
+        receiver_class: &str,
+        method: &str,
+    ) -> bool {
+        // Prefer the driver-populated scope table; recompute only when this
+        // Typer was built without one (sig-gen / annotate paths).
+        let owned_scopes;
+        let scopes: &[(rigor_parse::Span, Vec<String>)] = if self.lexical_scopes.is_empty() {
+            owned_scopes = crate::lexical_scopes(ast);
+            &owned_scopes
+        } else {
+            self.lexical_scopes
+        };
+        let file_end = ast.iter().map(|(_, n)| n.span().1).max().unwrap_or(0);
+        // A QUALIFIED name (`File::Constants`) needs the qualified lookup —
+        // `refine(Class)` must not silence a module object's `name`
+        // (rigor-rs#467 review).
+        let recv_is_module: bool = self.index.is_module(receiver_class)
+            || self.index.is_qualified_module(receiver_class);
+        for (_, n) in ast.iter() {
+            let Node::Call {
+                receiver: None,
+                method: m,
+                args,
+                span,
+                ..
+            } = n
+            else {
+                continue;
+            };
+            if m != "using" || args.len() != 1 || span.1 > site.0 {
+                continue;
+            }
+            let Node::ConstantRead {
+                name,
+                dynamic_base: false,
+                self_anchored: false,
+                rooted,
+                ..
+            } = ast.get(args[0])
+            else {
+                continue;
+            };
+            let enclosing = scopes
+                .iter()
+                .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+                .min_by_key(|(s, _)| s.1 - s.0);
+            let (end, prefix): (usize, &[String]) = match enclosing {
+                Some((s, p)) => (s.1, p.as_slice()),
+                None => (file_end, &[]),
+            };
+            if !(span.1 <= site.0 && site.0 < end) {
+                continue;
+            }
+            let raw = if *rooted { format!("::{name}") } else { name.clone() };
+            let Some(module) = self.source.resolve_declared_constant_at(prefix, &raw) else {
+                continue;
+            };
+            for (target, names) in self.source.refinements_of(&module) {
+                if !names.iter().any(|x| x == method) {
+                    continue;
+                }
+                match target {
+                    None => return true,
+                    Some(t)
+                        if ["Object", "Module", "Kernel", "BasicObject"].contains(&t) =>
+                    {
+                        return true
+                    }
+                    Some("Class") => {
+                        if !recv_is_module {
+                            return true;
+                        }
+                    }
+                    // A module the class object may extend; an unknown
+                    // constant may be one.
+                    Some(t) => {
+                        let known_not_module =
+                            match self.source.resolve_declared_constant_at(prefix, t) {
+                                Some(q) => self.source.project_declares_module(&q) == Some(false),
+                                None => {
+                                    self.index.knows_class(t)
+                                        || self.index.knows_qualified_class(t)
+                                }
+                            };
+                        if !known_not_module {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+        false
+    }
+
     /// Issue #479 — reference `LiteralStringFolding.fold_concat`
     /// (`literal_string_folding.rb`, the tier after ConstantFolding, which
     /// never folds these two mutators): `<<` / `concat` with one argument, a

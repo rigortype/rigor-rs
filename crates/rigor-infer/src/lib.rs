@@ -52,6 +52,7 @@ mod call_dispatch;
 mod class_narrowing;
 mod collection_shape;
 mod dead;
+mod def_local_marks;
 mod expr_type;
 mod flow_eval;
 mod flow_writes;
@@ -80,6 +81,7 @@ pub use source_index::{
     lexical_scopes, method_body_spans, ConstLit, DefKind, Harvest, ParamBoundReturn, PatchCall, PreEvalPatches, SourceIndex,
     SOURCE_CLASS_BASE,
 };
+pub use def_local_marks::{body_span, literal_like, DefLocalMarks, ExitKind};
 pub use typer::Typer;
 
 // Crate-internal names the sibling modules and `source_index.rs` reach as

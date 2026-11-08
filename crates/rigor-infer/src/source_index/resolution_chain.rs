@@ -565,6 +565,14 @@ impl SourceIndex {
         self.ancestry.required_features.contains(feature)
     }
 
+    /// A gated vendored feature the project CONFIG names — `libraries:
+    /// [prime]` activates exactly like a source `require "prime"`
+    /// (`RequiredFeatures.tokens(features, configured_libraries)`,
+    /// rigor-rs#463).
+    pub fn add_required_feature(&mut self, feature: &str) {
+        self.ancestry.required_features.insert(feature.to_string());
+    }
+
     /// Upstream v0.4.6 (#2264 / issue #2174, `RbsLoader#ruby_library_reopen?`)
     /// — whether `class_name`'s every RBS declaration is the project's own,
     /// its first `::` segment is the root of a library Ruby ships, and some

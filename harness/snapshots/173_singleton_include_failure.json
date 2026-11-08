@@ -1,0 +1,4 @@
+{
+  "fixture": "harness/corpus/173_singleton_include_failure.rb",
+  "diagnostics": []
+}

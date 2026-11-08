@@ -24,7 +24,9 @@
 //! returns, so a second one is dead code, and the test fails on it even
 //! within one family. It also fails on a fall-through arm followed by a
 //! second arm for its type: that is by design. `lower_node` itself claims
-//! no type: its body holds no `as_x_node()` call.
+//! no type: every use of `node` in its body is `node.location()` or the
+//! argument of a `self.lower_*` / `self.check_families_disjoint` call, and
+//! the body names no `PrismNode::` variant.
 //!
 //! Only COND and the `node.as_x_node()` heads of a `let` chain count. Arm
 //! bodies, `.map` closures, comments and literals are skipped. Any other
@@ -37,7 +39,7 @@ use std::collections::BTreeMap;
 /// fails an extraction that silently finds nothing.
 const FAMILY_FILES: [(&str, &str, &str, usize, usize); 5] = [
     ("lower_calls", "calls.rs", include_str!("calls.rs"), 7, 3),
-    ("lower_expressions", "expressions.rs", include_str!("expressions.rs"), 35, 35),
+    ("lower_expressions", "expressions.rs", include_str!("expressions.rs"), 38, 38),
     ("lower_control", "control.rs", include_str!("control.rs"), 13, 13),
     ("lower_definitions", "definitions.rs", include_str!("definitions.rs"), 4, 4),
     ("lower_jumps", "jumps.rs", include_str!("jumps.rs"), 31, 9),
@@ -121,21 +123,12 @@ fn blank_reads_literal_prefixes() {
 }
 
 /// The `self.lower_*` methods `lower_node`'s body calls, in order. The body
-/// may hold no `as_x_node()` call: a claim there escapes this test and the
-/// debug check alike.
+/// is allow-listed by `check_lower_node_body`: a claim there escapes the
+/// arm audit and the debug check alike.
 fn dispatched_families() -> Vec<&'static str> {
     let text = blank(BUILDER);
     let (open, close) = fn_body(&text, "lower_node", "builder.rs");
-    for (at, _) in text[open..close].match_indices("as_") {
-        let at = open + at;
-        let name = ident_at(&text, at);
-        let downcast = name.strip_prefix("as_").and_then(|s| s.strip_suffix("_node")).is_some();
-        let line = text[..at].matches('\n').count() + 1;
-        assert!(
-            is_ident_byte(text.as_bytes()[at - 1]) || !downcast,
-            "builder.rs:{line}: lower_node calls `{name}` itself: a type's arm goes in a family"
-        );
-    }
+    check_lower_node_body(&text, open, close, "builder.rs");
     let body = &BUILDER[open..close];
     let mut called: Vec<&str> = Vec::new();
     for (at, _) in text[open..close].match_indices("self.lower_") {
@@ -145,6 +138,223 @@ fn dispatched_families() -> Vec<&'static str> {
         }
     }
     called
+}
+
+/// `lower_node`'s body is an allow-list, not a deny-list (#425): it names
+/// no `PrismNode::` variant, and every use of `node` is `node.location()`
+/// or an argument of a `self.lower_*` / `self.check_families_disjoint`
+/// call. A claim by `matches!`, an `if let` pattern, a `match` arm, or a
+/// helper (`is_nil(node)`, `self.try_nil(node, span)`) escapes the arm
+/// audit and the debug check alike. `text` is `blank`ed, so a comment or
+/// string naming a Prism type is fine.
+fn check_lower_node_body(text: &str, open: usize, close: usize, file: &str) {
+    let b = text.as_bytes();
+    if let Some((rel, _)) = text[open..close].match_indices("PrismNode::").next() {
+        let line = text[..open + rel].matches('\n').count() + 1;
+        panic!("{file}:{line}: `lower_node`'s body names `PrismNode::`: a type's arm goes in a family");
+    }
+    for (rel, _) in text[open..close].match_indices("node") {
+        let at = open + rel;
+        let part_of_ident =
+            (at > open && is_ident_byte(b[at - 1])) || is_ident_byte(*b.get(at + 4).unwrap_or(&b' '));
+        if part_of_ident {
+            continue;
+        }
+        let line = text[..at].matches('\n').count() + 1;
+        let mut j = at + "node".len();
+        while j < close && b[j].is_ascii_whitespace() {
+            j += 1;
+        }
+        if b.get(j) == Some(&b'.') {
+            // `node.location()` is the one method `lower_node` may call.
+            let mut k = j + 1;
+            while k < close && b[k].is_ascii_whitespace() {
+                k += 1;
+            }
+            let method = ident_at(text, k);
+            let mut m = k + method.len();
+            while m < close && b[m].is_ascii_whitespace() {
+                m += 1;
+            }
+            assert!(
+                method == "location" && b.get(m) == Some(&b'('),
+                "{file}:{line}: `node.{method}` — `lower_node` may call `node.location()` only"
+            );
+            continue;
+        }
+        // `node` must BE the argument, not a sub-expression of one (#497):
+        // `self.lower_calls(match node { n if n.as_nil_node().is_some() =>
+        // …, n => n }, span)` passes `node` through a renamed binding, so
+        // the scrutinee escapes the `node` scan entirely. Only `(`/`,`
+        // (allowing `&`/`*` borrows and spreads) may precede `node`, and
+        // only `,`/`)` may follow it.
+        let mut i = at;
+        loop {
+            while i > open && b[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            if i > open && (b[i - 1] == b'&' || b[i - 1] == b'*') {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut j2 = at + "node".len();
+        while j2 < close && b[j2].is_ascii_whitespace() {
+            j2 += 1;
+        }
+        assert!(
+            i > open
+                && (b[i - 1] == b'(' || b[i - 1] == b',')
+                && j2 < close
+                && (b[j2] == b',' || b[j2] == b')'),
+            "{file}:{line}: `node` is not a bare call argument — `lower_node` may pass `node` \
+             whole to a family call only"
+        );
+        let paren = enclosing_paren(b, open, at).unwrap_or_else(|| {
+            panic!("{file}:{line}: `node` is neither `node.location()` nor a family-call argument")
+        });
+        let mut k = paren;
+        while k > open && b[k - 1].is_ascii_whitespace() {
+            k -= 1;
+        }
+        let mut s = k;
+        while s > open && is_ident_byte(b[s - 1]) {
+            s -= 1;
+        }
+        let callee = &text[s..k];
+        let mut t = s;
+        while t > open && b[t - 1].is_ascii_whitespace() {
+            t -= 1;
+        }
+        let self_call = t > open
+            && b[t - 1] == b'.'
+            && {
+                let mut u = t - 1;
+                while u > open && b[u - 1].is_ascii_whitespace() {
+                    u -= 1;
+                }
+                let mut v = u;
+                while v > open && is_ident_byte(b[v - 1]) {
+                    v -= 1;
+                }
+                &text[v..u] == "self"
+            };
+        // The callee is the exact dispatch list, not a `lower_` prefix
+        // (#497): `dispatched_families` matches the literal text
+        // `self.lower_`, so a whitespace-tolerant `self . lower_x` would
+        // pass a broad allow-list while escaping the family audit — and
+        // any unlisted `self.lower_x(node, …)` never reaches
+        // FAMILY_FILES at all.
+        assert!(
+            self_call
+                && (FAMILY_FILES.iter().any(|f| callee == f.0)
+                    || callee == "lower_fallback"
+                    || callee == "check_families_disjoint"),
+            "{file}:{line}: `node` reaches `{callee}` — `lower_node` may pass it to a \
+             dispatch family, `lower_fallback` or `check_families_disjoint` only"
+        );
+    }
+}
+
+/// The index of the `(` enclosing byte `at`, scanning back to `open` (the
+/// body's `{`). `None` when a `{`/`[` — or the body start — comes first:
+/// `node` is then a bare expression like `match node {` or `= node`.
+fn enclosing_paren(b: &[u8], open: usize, at: usize) -> Option<usize> {
+    let mut depth = 0usize;
+    let mut i = at;
+    while i > open {
+        i -= 1;
+        match b[i] {
+            b')' | b']' | b'}' => depth += 1,
+            b'(' => {
+                if depth == 0 {
+                    return Some(i);
+                }
+                depth -= 1;
+            }
+            b'[' | b'{' => {
+                if depth == 0 {
+                    return None;
+                }
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Each shape the `as_x_node()` deny-list missed (#425) trips the
+/// allow-list, while the real body — and a comment or string naming a
+/// Prism type — still pass.
+#[test]
+fn lower_node_body_allows_only_dispatch() {
+    for (src, fragment) in [
+        ("if matches!(node, PrismNode::NilNode { .. }) { return id; }", "PrismNode::"),
+        ("if let PrismNode::NilNode { .. } = node { return id; }", "PrismNode::"),
+        ("match node { PrismNode::NilNode { .. } => return id, _ => {} }", "PrismNode::"),
+        ("let _ = PrismNode::IntegerNode;", "PrismNode::"),
+        ("if is_nil(node) { return id; }", "dispatch family"),
+        ("return self.try_nil(node, span);", "dispatch family"),
+        // #497 A: `node` must BE the argument — a `match`/`if` scrutinee
+        // inside the call's parens renames it away from the scan.
+        (
+            "self.lower_fallback(match node { n if n.as_nil_node().is_some() => return 0, n => n }, span)",
+            "bare call argument",
+        ),
+        (
+            "self.lower_fallback(match node { n => { if n.as_nil_node().is_some() { return 0; } n } }, span)",
+            "bare call argument",
+        ),
+        (
+            "self.lower_fallback((node).clone(), span)",
+            "dispatch family",
+        ),
+        (
+            "self.lower_fallback(node && true, span)",
+            "bare call argument",
+        ),
+        // #497 B: the callee is the exact dispatch list — a `lower_`
+        // prefix alone, whitespace or not, does not qualify.
+        ("self.lower_not_a_family(node, span)", "dispatch family"),
+        ("self . lower_unlisted(node, span)", "dispatch family"),
+        ("self\n    .lower_unlisted(node, span)", "dispatch family"),
+    ] {
+        let wrapped =
+            format!("fn lower_node(&mut self, node: &PrismNode<'_>) -> NodeId {{\n{src}\n}}");
+        let text = blank(&wrapped);
+        let (open, close) = fn_body(&text, "lower_node", "synthetic");
+        let err =
+            std::panic::catch_unwind(|| check_lower_node_body(&text, open, close, "synthetic"))
+                .expect_err(&format!("check_lower_node_body accepted `{src}`"));
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&'static str>().copied())
+            .unwrap_or_default();
+        assert!(
+            msg.contains(fragment),
+            "panic for `{src}` must name the rule it tripped (`{fragment}`): got `{msg}`"
+        );
+    }
+    // The control body mirrors `lower_node`'s real one, plus a comment and
+    // a string naming a Prism type: `blank` wipes both, so they pass.
+    let ok = "fn lower_node(&mut self, node: &PrismNode<'_>) -> NodeId {\n\
+        // `lower_node` claims no type: PrismNode::NilNode here is a comment.\n\
+        let span = span_of(&node.location());\n\
+        let mut id = self.lower_calls(node, span);\n\
+        if id != UNMATCHED {\n\
+            #[cfg(debug_assertions)]\n\
+            self.check_families_disjoint(node, span, 0, id);\n\
+            return id;\n\
+        }\n\
+        let _label = \"claims no PrismNode::NilNode\";\n\
+        self.lower_fallback(node, span)\n\
+    }";
+    let text = blank(ok);
+    let (open, close) = fn_body(&text, "lower_node", "synthetic");
+    check_lower_node_body(&text, open, close, "synthetic");
 }
 
 /// Each top-level arm of family `method` as (line, the Prism types it claims).

@@ -29,6 +29,7 @@ use std::sync::OnceLock;
 use rigor_types::{ClassId, Interner, Scalar, Type, TypeId};
 
 pub mod plugins;
+mod gem_sig_census;
 mod rbs;
 
 pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
@@ -50,7 +51,7 @@ pub use rbs::{
 // the carrier for nominal round-tripping in the current slice (ADR-0004). It is
 // the surface the inference engine mints `Nominal { class }` ids against, so it
 // only lists the concrete value classes a return type can resolve TO.
-const CORE_CLASSES: [&str; 20] = [
+const CORE_CLASSES: [&str; 14] = [
     "String",
     "Integer",
     "Float",
@@ -61,19 +62,13 @@ const CORE_CLASSES: [&str; 20] = [
     "TrueClass",
     "FalseClass",
     "Proc",
-    // `rescue [TypeError, …] => e` binds `e` to the union of the listed
-    // exception classes (rigor-rs#548). Appended so every earlier ClassId
-    // keeps its number.
-    "StandardError",
-    "TypeError",
-    "ArgumentError",
-    "RuntimeError",
-    "NameError",
-    "NoMethodError",
-    "IOError",
-    "KeyError",
-    "IndexError",
-    "ZeroDivisionError",
+    // Literal-carrier classes the sig-gen tail typer mints nominals for
+    // (rigor-rs#493 item 7). Appended so every earlier ClassId keeps its
+    // number; none of these feed `check` witnessing today.
+    "Range",
+    "Regexp",
+    "Rational",
+    "Complex",
 ];
 
 /// A real, RBS-backed core index. For each loaded class it holds the resolved
@@ -202,6 +197,17 @@ impl CoreIndex {
     /// coverage signal reported by `rigor doctor`.
     pub fn class_count(&self) -> usize {
         self.data.class_count()
+    }
+
+    /// The `(total, project_sig)` class-declaration counts the `check`
+    /// run-stats summary reports (`env.class_decls` partitioned by whether the
+    /// primary declaration's source lives under `signature_paths:`). See
+    /// [`rbs::CoreData::class_decl_count`] (rigor-rs#502).
+    pub fn class_decl_counts(&self) -> (usize, usize) {
+        (
+            self.data.class_decl_count(),
+            self.data.project_sig_class_decl_count(),
+        )
     }
 
     /// Whether `class_name` is one this index models at all. The rule must stay

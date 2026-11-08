@@ -171,6 +171,7 @@ pub enum DefKind {
 pub(crate) struct FoldSite<'a> {
     tail: &'a FoldTail,
     has_explicit_return: bool,
+    arity: (usize, usize),
 }
 
 /// The merged def table Pass 4b folds: `(qualified owner, method, kind) -> every
@@ -333,6 +334,11 @@ pub(crate) struct HarvestedFoldDef {
     kind: DefKind,
     tail: FoldTail,
     has_explicit_return: bool,
+    /// Accepted positional-arg count range `[min, max]` (`usize::MAX` =
+    /// unbounded — rest/kwrest) from `param_shape`. A bare call binds the
+    /// toplevel def only inside it (`format("%d", 2)` vs `def format(x)`
+    /// stays on `Kernel#format`, rigor-rs#462).
+    arity: (usize, usize),
 }
 
 /// One file's slice of the def-attribution tables — the reference's per-file
@@ -504,6 +510,9 @@ pub struct SourceIndex {
     /// (silent). Keyed by NAME (cross-file safe). SEPARATE from `method_returns`
     /// (which widens to Nominal and drops the value pin).
     literal_returns: HashMap<(String, String, DefKind), Scalar>,
+    /// Positional-arg ranges the `<toplevel>` fold defs of each method name
+    /// accept — populated only for the toplevel-owner rows (rigor-rs#462).
+    toplevel_def_arities: HashMap<String, Vec<(usize, usize)>>,
     /// ADR-0038 interprocedural literal-tail fold: the inverted `(method, kind)
     /// -> [qualified owners that define it]` index over the project's own `def`
     /// bodies. Drives the overridable-method degrade gate (a value-pinned base

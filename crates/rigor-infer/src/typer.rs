@@ -48,7 +48,7 @@ pub struct Typer<'i> {
     /// that do not set it (unit tests / pre-C1 entry points) — with no scopes
     /// every use site reads as toplevel, so only TOPLEVEL project definitions
     /// suppress, matching the conservative default.
-    lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
+    pub(crate) lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
     /// The analyzed file's [`rigor_parse::FileKey`] — the per-file
     /// def-attribution overlay index (`SourceIndex::project_declares_method`
     /// / `is_toplevel_def` consult `file_defs` through it). `None` for callers
@@ -104,6 +104,15 @@ pub struct Typer<'i> {
     /// They read only the syntax tree, so one build serves every reach
     /// query on that AST — see [`crate::reach_index::ReachIndex`].
     pub(crate) reach_index: RefCell<crate::reach_index::ReachIndexCache>,
+    /// rigor-rs#546: the def-local env's mutation / closure-write marks,
+    /// memoized by `(ast identity, arena length)` like `reach_index` — see
+    /// [`crate::def_local_marks`].
+    pub(crate) def_marks: crate::def_local_marks::DefMarksCache,
+    /// The `def` span sig-gen is typing the return of (rigor-rs#546), when
+    /// any: a Dynamic local narrowed by a type test and read in two decisions
+    /// of that `def` may be constant-folded by the reference
+    /// ([`crate::def_local_marks::DefLocalMarks::narrowing_hot`]).
+    pub def_scope: Cell<Option<rigor_parse::Span>>,
     /// rigor-rs#422: the `local_reach` memo — entries keyed by the read and
     /// `seen.len()`, guarded by the `seen` membership answers they depend
     /// on, valid for one `(AST, dead-set object)` pair (see
@@ -114,6 +123,9 @@ pub struct Typer<'i> {
     /// membership test on the reach path records itself here through
     /// [`Typer::seen_contains`].
     pub(crate) reach_frames: RefCell<crate::reach_memo::MemoFrames>,
+    /// Memoized [`crate::flow_writes::stale_local_names`] — computed once per
+    /// file on the first nilable fold that reads a local (rigor-rs#499).
+    pub(crate) stale_locals: RefCell<Option<std::rc::Rc<crate::flow_writes::StaleLocals>>>,
 }
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
@@ -124,13 +136,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()) }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()) }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -141,7 +153,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()) }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from
@@ -168,6 +180,36 @@ impl<'i> Typer<'i> {
     /// The analyzed file's [`rigor_parse::FileKey`], `None` when unset.
     pub fn file_key(&self) -> Option<&rigor_parse::FileKey> {
         self.file_key
+    }
+
+    /// Whether `name` is a local whose pinned literal the fold can no longer
+    /// trust — a content mutation (`local.<mutator>`, `local[k] =`, a
+    /// pattern/index-target store) or a second rebind lands on it anywhere
+    /// in the file (rigor-rs#499). Computed once per file via
+    /// [`crate::flow_writes::stale_local_names`].
+    pub(crate) fn stale_local(&self, ast: &rigor_parse::LoweredAst, name: &str) -> bool {
+        self.stale_table(ast).stale(name)
+    }
+
+    /// [`Self::stale_local`] ignoring mutation marks AT `except` — the read
+    /// a write statement performs on its own receiver precedes that write's
+    /// mutation (rigor-rs#499's `s[9] ||= nil` current read).
+    pub(crate) fn stale_local_except(
+        &self,
+        ast: &rigor_parse::LoweredAst,
+        name: &str,
+        except: rigor_parse::Span,
+    ) -> bool {
+        self.stale_table(ast).stale_except(name, except)
+    }
+
+    fn stale_table(&self, ast: &rigor_parse::LoweredAst) -> std::rc::Rc<crate::flow_writes::StaleLocals> {
+        let mut guard = self.stale_locals.borrow_mut();
+        guard
+            .get_or_insert_with(|| {
+                std::rc::Rc::new(crate::flow_writes::stale_local_names(ast))
+            })
+            .clone()
     }
 
     /// C1: the use-site lexical prefix (enclosing class/module qualified segments)
