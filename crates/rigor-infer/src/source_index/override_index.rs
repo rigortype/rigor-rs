@@ -466,18 +466,34 @@ pub(crate) fn collect_override_classes(
 }
 
 /// `alias`/`alias_method` names adopted by the override definer table
-/// (rigor-rs#458): the NEW name joins `methods` when the OLD name is a `def`
-/// the same body records — the reference's `apply_alias_def_nodes` per-file
-/// adoption ("an alias may precede its target"). A dangling alias (its target
-/// never defined in the body) names nothing: `alias m z` alone does not make
-/// `M` `m`'s definer, matching the oracle's `overrides B#m` on it.
+/// (rigor-rs#458): the NEW name joins `methods` when the OLD name is defined
+/// earlier in the same body — a `def` above it, or a name an earlier alias
+/// already adopted (a chained `alias n m`). A dangling or forward-targeted
+/// alias names nothing: `alias m z` alone — or before `def z` — does not
+/// make `M` `m`'s definer, matching the oracle's `overrides B#m` on it.
 fn alias_adopted_methods(
     ast: &LoweredAst,
     body: &[NodeId],
     methods: &[String],
 ) -> Vec<String> {
+    // Walk statements in SOURCE order with a running defined set: an alias
+    // whose target has not yet been defined names nothing (`alias m z`
+    // before `def z` still fires `overrides B#m` on the oracle), while a
+    // chained `alias n m` adopts through an `m` adopted above it.
+    let mut defined: Vec<String> = Vec::new();
     let mut out = Vec::new();
     for &child in body {
+        if let Node::Definition {
+            name: Some(name),
+            receiver_def_name: None,
+            singleton_name: None,
+            ..
+        } = ast.get(child)
+        {
+            if !defined.contains(name) {
+                defined.push(name.clone());
+            }
+        }
         let (new, old) = match ast.get(child) {
             Node::Alias {
                 new_name, old_name, ..
@@ -490,15 +506,16 @@ fn alias_adopted_methods(
                 method,
                 args,
                 ..
-            } if method == "alias_method" && args.len() >= 2 => (
+            } if method == "alias_method" && args.len() == 2 => (
                 super::def_attribution::literal_method_name(ast, args[0]),
                 super::def_attribution::literal_method_name(ast, args[1]),
             ),
             _ => continue,
         };
         if let (Some(new), Some(old)) = (new, old) {
-            if methods.contains(&old) && !methods.contains(&new) && !out.contains(&new) {
-                out.push(new);
+            let defined_here = defined.contains(&old) || out.contains(&old);
+            if defined_here && !methods.contains(&new) && !out.contains(&new) {
+                out.push(new.clone());
             }
         }
     }
