@@ -194,6 +194,22 @@ impl<'src> Builder<'src> {
             });
         }
 
+        if let Some(re) = node.as_regular_expression_node() {
+            return self.push(Node::RegexpLit {
+                span: span_of(&re.location()),
+            });
+        }
+        if let Some(r) = node.as_rational_node() {
+            return self.push(Node::RationalLit {
+                span: span_of(&r.location()),
+            });
+        }
+        if let Some(i) = node.as_imaginary_node() {
+            return self.push(Node::ImaginaryLit {
+                span: span_of(&i.location()),
+            });
+        }
+
         if let Some(arr) = node.as_array_node() {
             // Elements are `eval_value_container` operands — TYPED, never
             // `evaluate`d (`x = [h.default ||= 0]` keeps `h`'s indexed
@@ -300,6 +316,7 @@ impl<'src> Builder<'src> {
                 // reference's syntax-level reading, so the `nil&.m` literal
                 // fold must not see through the parens.
                 self.paren_unwrapped.push(only.0);
+                self.paren_spans.insert(only.0, span_of(&parens.location()));
                 return only;
             }
             let main_body = body.clone();

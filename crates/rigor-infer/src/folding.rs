@@ -343,13 +343,19 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
                 Some(Scalar::Int(ruby_mod(a, b)))
             }
         }
-        // Exponent: decline negative exponents (Ruby yields a Rational) and
-        // anything that overflows.
+        // Exponent: decline negative exponents (Ruby yields a Rational).
+        // An overflow promotes to a Bignum — Ruby has arbitrary precision, so
+        // carry the exact decimal spelling (`10 ** 30` -> the 31-digit
+        // literal, rigor-rs#493 item 7). Bounded: an exponent past `MAX_POW`
+        // declines rather than compute a megabyte-long literal.
         "**" => {
-            if b < 0 || b > u32::MAX as i64 {
+            if !(0..=4096).contains(&b) {
                 None
             } else {
-                a.checked_pow(b as u32).map(Scalar::Int)
+                match a.checked_pow(b as u32) {
+                    Some(v) => Some(Scalar::Int(v)),
+                    None => decimal_pow(a, b as u64).map(Scalar::BigInt),
+                }
             }
         }
         "&" => Some(Scalar::Int(a & b)),
@@ -566,30 +572,34 @@ pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
         )
 }
 
-/// Issue #164 — the literal calls whose tier-1 fold OWNS the answer: a call
-/// that pins every argument but does not fold must not fall through to the
-/// tier-3 flat slot. Each returns `Integer?`, and the reference, which folds
-/// these by running the method, either lands on a value the port does not model
-/// (a multibyte receiver, a Float index) or, when Ruby raises (`"abc".getbyte("a")`,
-/// a wrong arity), declines to the `Integer | nil` RBS join no rule fires on.
-/// The flat slot's bare `Integer` is wrong both ways, so the caller answers
+/// Issues #164/#178 — the literal calls whose tier-1 fold OWNS the answer:
+/// a call that pins every argument but does not fold must not fall through
+/// to the tier-3 flat slot. Each nilable String lookup (`String?` for `[]` /
+/// `slice` / `byteslice`, `Integer?` for `index` / `getbyte` / `rindex` /
+/// `byteindex` / `byterindex`) can answer `nil` — a substring miss, an
+/// out-of-range index or Range — and the reference, which folds these by
+/// running the method, is silent downstream where the flat slot's bare
+/// `String` / `Integer` fires `call.undefined-method` on the chained call.
+/// The same for a fold the port cannot reproduce (a multibyte receiver, a
+/// Float index) or where Ruby raises (a wrong arity) and the reference
+/// declines to the `String | nil` / `Integer | nil` join. The caller answers
 /// `Dynamic` instead: a coverage loss, never a false positive.
-/// rigor-rs#499 — the whole `is_str_lookup` family declines, not only the
-/// `#164` four: `s[9] ||= nil` read its `current` from a stale-risk-skipped
-/// fold (the receiver reads a local the flat env may have lost a mutation
-/// on) and fell through to `method_return`'s bare `String`, minting a
-/// `String` the reference knows is `nil` — `s[9].frobnicate` then fired
-/// `for String` where the oracle fires `for nil` (or declines); and
-/// zero-arg `s.index` landed on bare `Integer`, collapsing under
+/// rigor-rs#499 — an unfolded lookup answers `Dynamic`, never the flat
+/// nominal: zero-arg `s.index` landed on bare `Integer`, collapsing under
 /// `narrow_falsey` in `s.index &&= 1` to `1` where the oracle keeps
-/// `Integer | nil` → `1 | nil`. An unf folded lookup answers `Dynamic` on
-/// both counts — the flat nominal is never the right fallback.
+/// `Integer | nil` and stays silent downstream.
 pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
-    match recv {
-        Scalar::Str(_) => is_str_lookup(recv, method),
-        Scalar::Float(_) => method == "<=>",
-        _ => false,
-    }
+    is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
+}
+
+/// The lookups #178 added to `declines_unfolded`. A compound index/attr
+/// write's internal `current` read (`s[0] ||= nil`'s `s[0]`) keeps the
+/// flat nominal instead — the stored-slot record joins it with the rhs
+/// (`String | nil`), which the `[]` interception then hands to later
+/// reads. Declining it would erase the record to `Dynamic`.
+pub fn declines_str_index_family(recv: &Scalar, method: &str) -> bool {
+    matches!(recv, Scalar::Str(_))
+        && matches!(method, "[]" | "slice" | "byteslice" | "index")
 }
 
 /// Whether a stale pinned value could change the fold's CLASS (a lookup's
@@ -692,6 +702,48 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
         }
         _ => None,
     }
+}
+
+/// `a ** b` as a decimal-spelled [`Scalar::BigInt`] operand — digit-vector
+/// long multiplication, sign carried separately. Used only for results past
+/// `i64` (the caller tries `checked_pow` first). `a` is small (the foldable
+/// receivers are i64 literals) and `b <= 4096`, so the loop is bounded by
+/// ~19*4096 digits worst-case.
+fn decimal_pow(a: i64, b: u64) -> Option<String> {
+    if a == 0 {
+        return None; // 0 ** b never overflows; unreachable in practice.
+    }
+    let negative = a < 0 && b % 2 == 1;
+    let base: u64 = a.unsigned_abs();
+    // digits little-endian (digits[0] = ones place).
+    let mut digits: Vec<u8> = vec![1];
+    for _ in 0..b {
+        let mut carry: u64 = 0;
+        for d in digits.iter_mut() {
+            let cur = (*d as u64) * base + carry;
+            *d = (cur % 10) as u8;
+            carry = cur / 10;
+        }
+        while carry > 0 {
+            digits.push((carry % 10) as u8);
+            carry /= 10;
+        }
+        if digits.len() > 80_000 {
+            return None; // paranoia bound — ~80k digits is far past any probe.
+        }
+    }
+    let mut out = String::with_capacity(digits.len() + 1);
+    if negative {
+        out.push('-');
+    }
+    for d in digits.iter().rev() {
+        out.push((b'0' + d) as char);
+    }
+    // The caller only reaches this on checked_pow overflow; guard anyway.
+    if digits.len() <= 19 && !negative {
+        return None;
+    }
+    Some(out)
 }
 
 #[cfg(test)]
@@ -931,3 +983,4 @@ mod tests {
         assert_eq!(scalar_class(&Scalar::Nil), "NilClass");
     }
 }
+

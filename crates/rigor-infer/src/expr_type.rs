@@ -6,7 +6,7 @@
 use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
-use crate::{folding, kernel_fold, ConstLit, TypeEnv, Typer};
+use crate::{folding, kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
 
 /// The value-pinned scalar key a hash-literal key NODE carries, or `None` when
 /// the key is dynamic (a computed expression, an interpolated string, a
@@ -140,7 +140,24 @@ impl<'i> Typer<'i> {
             // bare `String` Nominal — a typo'd / non-core method on it (e.g.
             // `.squish`, `.constantize`) then resolves against the real String
             // RBS and is witnessed, matching the reference.
-            Node::InterpolatedString { .. } => self.nominal_or_untyped("String", interner),
+            Node::InterpolatedString { parts, .. } => {
+                // An adjacent literal concat `"a" "b"` lowers as an
+                // interpolated string whose every part is a StringLit; the
+                // reference answers the `literal-string` carrier the port does
+                // not model, so decline to `untyped` rather than mis-type it
+                // `String` (an FP source: `("a" "b" << "c").zork` and
+                // `("a" "b").concat("c").zork` both fired `for String` —
+                // rigor-rs#489).
+                let adjacent_literal_concat = !parts.is_empty()
+                    && parts
+                        .iter()
+                        .all(|p| matches!(ast.get(*p), Node::StringLit { .. }));
+                if adjacent_literal_concat {
+                    interner.untyped()
+                } else {
+                    self.nominal_or_untyped("String", interner)
+                }
+            }
             // An interpolated symbol (`:"a#{x}b"`) is always a `Symbol`
             // instance regardless of the interpolated values — a structural
             // twin of `InterpolatedString` above, differing only in the
@@ -165,6 +182,22 @@ impl<'i> Typer<'i> {
                 interner.intern(Type::Constant(Scalar::Sym(value.clone())))
             }
             Node::NilLit { .. } => interner.intern(Type::Constant(Scalar::Nil)),
+            // A `def` expression evaluates to its method name as a Symbol —
+            // `def y = 1` is `:y`, `def self.t` / `def obj.t` are `:t`, so
+            // `def x; def y = 1; end` returns `:y` (and under a branch
+            // `(:y | nil)`). A `class << self` body evaluates to its LAST
+            // statement's type (reference `type_of_class_or_module`), `nil`
+            // when empty (rigor-rs#539).
+            Node::Definition { is_singleton_class: true, body, .. } => match body.last() {
+                Some(&tail) => self.type_of(ast, tail, env, interner),
+                None => interner.nil(),
+            },
+            Node::Definition { name, singleton_name, receiver_def_name, .. } => name
+                .as_ref()
+                .or(singleton_name.as_ref())
+                .or(receiver_def_name.as_ref())
+                .map(|n| interner.intern(Type::Constant(Scalar::Sym(n.clone()))))
+                .unwrap_or_else(|| interner.untyped()),
             Node::TrueLit { .. } => interner.intern(Type::Constant(Scalar::Bool(true))),
             Node::FalseLit { .. } => interner.intern(Type::Constant(Scalar::Bool(false))),
             Node::LocalVariableRead { name, .. } => env
@@ -279,9 +312,9 @@ impl<'i> Typer<'i> {
             // change off the `p`/`pp` path). A block does NOT block the fold —
             // `p(x) { }` still types to `x` — because block reachability is the
             // rule walk's concern, not this value query.
-            Node::Call { receiver: None, method, args, .. } => {
-                let (method, args) = (method.clone(), args.clone());
-                self.type_implicit_self_call(ast, &method, &args, env, interner)
+            Node::Call { receiver: None, method, args, span, .. } => {
+                let (method, args, span) = (method.clone(), args.clone(), *span);
+                self.type_implicit_self_call(ast, &method, &args, Some(span), env, interner)
                     .unwrap_or_else(|| interner.untyped())
             }
             // A bare constant read (`Time`, `Array`) types to the CLASS OBJECT
@@ -490,7 +523,17 @@ impl<'i> Typer<'i> {
             } => {
                 let (r, read_name, compound, value) =
                     (*r, read_name.clone(), compound.clone(), *value);
-                let current = self.type_call(ast, r, &read_name, &[], env, interner);
+                // rigor-rs#499: `&&=` reads its current as a user-facing call,
+                // so the nilable String lookup declines (`s.index &&= 1`): the
+                // flat `Integer` the write-value read keeps collapses under
+                // `narrow_falsey` to `1`, where the oracle keeps
+                // `Integer | nil` and stays silent downstream. `||=` keeps the
+                // write-value read (#178): `narrow_truthy` is sound on it.
+                let current = if matches!(compound, Compound::And) {
+                    self.type_call(ast, r, &read_name, &[], env, interner)
+                } else {
+                    self.type_call_for_write_value(ast, r, &read_name, &[], env, interner)
+                };
                 let rhs = self.type_of(ast, value, env, interner);
                 match compound {
                     Compound::Or => {
@@ -533,7 +576,8 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
-        let current = self.type_call(ast, receiver, "[]", indices, env, interner);
+        let current =
+            self.type_call_for_write_value(ast, receiver, "[]", indices, env, interner);
         let rhs = self.type_of(ast, value, env, interner);
         match compound {
             Compound::Or => {
@@ -598,7 +642,9 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
-            _ => self.type_call(ast, w.receiver, "[]", &[w.key_node], env, interner),
+            _ => self.type_call_for_write_value(
+                ast, w.receiver, "[]", &[w.key_node], env, interner,
+            ),
         };
         let rhs = self.type_of(ast, w.value, env, interner);
         let truthy = self.narrow_truthy(current, interner);
@@ -1459,9 +1505,40 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         method: &str,
         args: &[NodeId],
+        span: Option<rigor_parse::Span>,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
+        // A bare `e` resolves to the enclosing scope's own zero-arg method —
+        // the reference's implicit-self literal-tail fold pins `def e = "m";
+        // e` to `Constant["m"]`, so `e.nope` witnesses `for "m"`
+        // (rigor-rs#553). Own-surface only inside `implicit_self_literal`;
+        // `None` for unresolvable names falls through to the Kernel folds.
+        if args.is_empty() {
+            if let Some(span) = span {
+                let (qual, kind) = match self.call_self(ast, span) {
+                    crate::dead::CallSelf::Singleton(q) => (q, DefKind::Singleton),
+                    crate::dead::CallSelf::Instance(q) => (q, DefKind::Instance),
+                    crate::dead::CallSelf::Unmodelled => {
+                        (String::new(), DefKind::Instance)
+                    }
+                };
+                if let Some(scalar) =
+                    self.source.implicit_self_literal(self.index, &qual, kind, method)
+                {
+                    return Some(interner.intern(Type::Constant(scalar)));
+                }
+                // A same-file TOPLEVEL `def helper = "top"` folds the same
+                // way (rigor-rs#368's predicate-path precedent;
+                // `self_type_answers?` still vetoes inside a scope that
+                // defines the name).
+                if let Some(scalar) =
+                    self.file_def_literal(ast, method, span, &mut Vec::new())
+                {
+                    return Some(interner.intern(Type::Constant(scalar)));
+                }
+            }
+        }
         // Only a fixed set of Kernel functions is folded on this path; every
         // other implicit-self call declines (a cheap membership test on the hot
         // path). `format`/`sprintf`/`String`/`Hash`/`Integer`/`Float` are the

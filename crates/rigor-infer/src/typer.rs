@@ -48,7 +48,7 @@ pub struct Typer<'i> {
     /// that do not set it (unit tests / pre-C1 entry points) — with no scopes
     /// every use site reads as toplevel, so only TOPLEVEL project definitions
     /// suppress, matching the conservative default.
-    lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
+    pub(crate) lexical_scopes: &'i [(rigor_parse::Span, Vec<String>)],
     /// The analyzed file's [`rigor_parse::FileKey`] — the per-file
     /// def-attribution overlay index (`SourceIndex::project_declares_method`
     /// / `is_toplevel_def` consult `file_defs` through it). `None` for callers

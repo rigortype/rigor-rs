@@ -370,11 +370,15 @@ pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
 
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
     let mut out = raw_flow_writes(ast);
+    // rigor-rs#409: a scan-visible mark inside a `while`/`until` body
+    // survives a deeper shadow scope — see [`loop_body_spans`].
+    let iterated_bodies = loop_body_spans(ast);
     let shadow_scopes = closure_shadow_scopes(ast);
-    out.retain(|(id, _, name, _)| {
-        !shadow_scopes.iter().any(|(descendants, bound)| {
-            descendants.contains(id) && bound.contains(name)
-        })
+    out.retain(|(id, w, name, scan)| {
+        (*scan && iterated_bodies.iter().any(|s| s.0 <= w.0 && w.1 <= s.1))
+            || !shadow_scopes.iter().any(|(descendants, bound)| {
+                descendants.contains(id) && bound.contains(name)
+            })
     });
     // The inert filter: a write inside a never-evaluated operand binds
     // nothing, so its mark always drops — EXCEPT a scan-visible content
@@ -487,6 +491,34 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
         }
     }
     out
+}
+
+/// The statement spans of every `while`/`until` body — the region
+/// `loop_content_writeback` text-scans by receiver name at ANY depth
+/// (`content_mutation_target { |_r| true }`), so a `|h|` bound inside
+/// one still marks the OUTER `h` and the shadow filters must not drop
+/// the mark (rigor-rs#409). Outside an iterated body the closure's own
+/// binding wins: `{ |h| h[:a] = 9 }` at top level shadows `h` on the
+/// oracle too — `content_writeback_block_captures` honors the param
+/// binding. A `for` body is no iterated body — it joins scopes rather
+/// than writing back (same shape test as
+/// `flow_eval::Typer::path_content_writeback`).
+fn loop_body_spans(ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+    ast.iter()
+        .flat_map(|(_, n)| match n {
+            Node::Loop {
+                predicate: Some(_),
+                index,
+                index_writes,
+                body,
+                ..
+            } if index.is_empty() && index_writes.is_empty() => body
+                .iter()
+                .map(|b| ast.get(*b).span())
+                .collect(),
+            _ => Vec::new(),
+        })
+        .collect()
 }
 
 /// [`toplevel_rebinds`] WITHOUT the `def`/`class`/`module` scope exclusion —
@@ -706,6 +738,7 @@ pub(crate) fn toplevel_mutations(
             }
         }
     }
+    let iterated_bodies = loop_body_spans(ast);
     out.retain(|(id, w, name, method, _)| {
         (!ast.in_inert_carrier(*w)
             // …unless an iterated body's writeback TEXT SCAN covers the
@@ -725,9 +758,18 @@ pub(crate) fn toplevel_mutations(
                 || ast.in_iterative_blocked_carrier(*w)
                 || matches!(ast.get(*id), Node::AttrWrite { .. }))
             && !scopes.iter().any(|s| s.0 <= w.0 && w.1 <= s.1)
-            && !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.contains(name)
-            })
+            // rigor-rs#409: a content-mutation mark inside a `while`/`until`
+            // body survives a deeper shadow scope — the iterated body's
+            // writeback text scan matches the receiver name at any depth,
+            // so `|h|`'s own `h[:a] = 9` still rejoins the OUTER `h`.
+            // Compound ATTRIBUTE writes are not scanned
+            // (`content_mutation_target` reads mutator CallNodes and index
+            // writes only), so they keep the shadow filter.
+            && ((is_content_mutator(method)
+                && iterated_bodies.iter().any(|s| s.0 <= w.0 && w.1 <= s.1))
+                || !shadow_scopes.iter().any(|(descendants, bound)| {
+                    descendants.contains(id) && bound.contains(name)
+                }))
     });
     out.into_iter()
         .map(|(_, s, n, m, k)| (s, n, m, k))

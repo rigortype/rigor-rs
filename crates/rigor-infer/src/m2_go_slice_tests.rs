@@ -89,10 +89,14 @@ fn constant_receiver_declines_under_a_multi_value_argument() {
         ty_of_last_recv_call(b"v = 1\nv = 2 if $c\n\"abc\"[v]\n"),
         "Dynamic[top]"
     );
-    // CONTROLS.
+    // CONTROLS — updated by #178: `v = 1` pins, so the stale-env gate
+    // skips the fold and every nilable String lookup now declines rather
+    // than answering the flat `String` (the reference folds the local and
+    // fires `for "b"`; the port cannot reproduce that fold, so silent is
+    // the required direction). A literal argument still folds exactly.
     assert_eq!(
         ty_of_last_recv_call(b"def g\n  v = 1\n  \"abc\"[v]\nend\n"),
-        "Class<0>"
+        "Dynamic[top]"
     );
     assert_eq!(ty_of_last_recv_call(b"\"abc\"[1]\n"), "Constant[\"b\"]");
     // And the Kernel folds keep their answers on the same `1 | 2` local —
@@ -123,11 +127,15 @@ fn nilable_dispatch_declines_under_a_guarded_parameter() {
     // CONTROLS.
     assert_eq!(guarded("\"abc\".center(u)"), "Class<0>");
     assert_ne!(guarded("[1, 2].product(u)"), "Dynamic[top]");
+    // #178: `u = 1` pins and reads a local, so the fold stands down and
+    // the `String?` lookup now declines instead of keeping the flat
+    // `String` (the reference folds the local; silent is the required
+    // direction over the drifted `String`).
     assert_eq!(
         ty_of_last_recv_call(
             b"def f(u)\n  u = 1\n  return unless u.is_a?(Integer)\n  \"abc\"[u]\nend\n"
         ),
-        "Class<0>"
+        "Dynamic[top]"
     );
     // A `case` guard's narrowed `Nominal[Integer]` is not a foldable
     // `Constant` either — the reference's `String | nil` join stands —
@@ -136,6 +144,34 @@ fn nilable_dispatch_declines_under_a_guarded_parameter() {
     assert_eq!(
         ty_of_last_recv_call(b"def f(u)\n  case u\n  when Integer then \"abc\"[u]\n  end\nend\n"),
         "Dynamic[top]"
+    );
+}
+
+/// Issue #178 — every nilable String lookup that tier 1 does not fold
+/// answers `Dynamic`, never the flat `String` / `Integer` that fired
+/// `call.undefined-method` on a chained call where the reference is
+/// silent: a local-read receiver skipped by the stale-env gate
+/// (`x.index("z")`), and an argument that never pins (a Range literal).
+#[test]
+fn str_lookup_declines_unfolded() {
+    // Stale-env row: the receiver reads a local, so the fold stands down
+    // and `index` declines rather than answering `Integer`.
+    assert_eq!(
+        ty_of_last_recv_call(b"x = \"abc\"\nx.index(\"z\")\n"),
+        "Dynamic[top]"
+    );
+    // Range-argument row: the argument cannot pin, so the fold is never
+    // tried — the lookup still declines (was `for String` on `.to_a`).
+    assert_eq!(ty_of_last_recv_call(b"\"abc\"[5..6]\n"), "Dynamic[top]");
+    // CONTROLS: fully pinned calls still fold exactly.
+    assert_eq!(ty_of_last_recv_call(b"\"abc\"[1]\n"), "Constant[\"b\"]");
+    assert_eq!(
+        ty_of_last_recv_call(b"\"abc\".index(\"b\")\n"),
+        "Constant[1]"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"\"abc\".getbyte(0)\n"),
+        "Constant[97]"
     );
 }
 

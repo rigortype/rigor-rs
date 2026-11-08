@@ -610,7 +610,7 @@ fn analyze_files_discovers_config_paths_declarations() {
     let mut cfg = Config::default();
     cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
     let a_rb = root.join("a.rb").to_string_lossy().into_owned();
-    let (findings, io_err) = analyze_files(
+    let (findings, io_err, _rbs) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -668,7 +668,7 @@ fn analyze_files_declared_paths_resolve_against_config_dir() {
     };
     assert!(cfg.paths_explicitly_declared());
     let a_rb = root.join("a.rb").to_string_lossy().into_owned();
-    let (findings, io_err) = analyze_files(
+    let (findings, io_err, _rbs) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -717,7 +717,7 @@ fn analyze_files_dup_argv_does_not_widen() {
 
     // Single arg: widened = [lib/foo.rb, a.rb] > [a.rb] ⇒ widens ⇒
     // `Foo#bar` resolves to Integer ⇒ `upcase` fires (oracle: `for 1`).
-    let (one, _) = analyze_files(
+    let (one, _, _rbs1) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -733,7 +733,7 @@ fn analyze_files_dup_argv_does_not_widen() {
 
     // Dup arg: widened = expand(paths | [a.rb]) — the repeat dedups —
     // same size as the expansion ⇒ no widen ⇒ Foo unseen ⇒ silent.
-    let (two, _) = analyze_files(
+    let (two, _, _rbs2) = analyze_files(
         &[a_rb.as_str(), a_rb.as_str()],
         Some(&[a_rb.as_str(), a_rb.as_str()]),
         &cfg,
@@ -776,7 +776,7 @@ fn analyze_files_no_widen_on_config_fallback() {
     // there must be NO discovery widening: `Foo` stays unresolved and
     // `upcase` cannot fire.
     let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
-    let (findings, io_err) = analyze_files(
+    let (findings, io_err, _rbs) = analyze_files(
         &[a_rb.as_str()],
         None,
         &cfg,
@@ -823,7 +823,7 @@ fn analyze_files_exclude_shrinks_widened_count() {
     let a_rb = root.join("a.rb").to_string_lossy().into_owned();
 
     // Single arg: widened = [foo.rb, a.rb] > [a.rb] ⇒ widens ⇒ fires.
-    let (one, _) = analyze_files(
+    let (one, _, _rbs1) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -839,7 +839,7 @@ fn analyze_files_exclude_shrinks_widened_count() {
 
     // Dup arg: widened = [foo.rb, a.rb] (zz.rb excluded inside the
     // expansion) — same size as [a.rb, a.rb] ⇒ no widen ⇒ silent.
-    let (two, _) = analyze_files(
+    let (two, _, _rbs2) = analyze_files(
         &[a_rb.as_str(), a_rb.as_str()],
         Some(&[a_rb.as_str(), a_rb.as_str()]),
         &cfg,
@@ -879,7 +879,7 @@ fn analyze_files_builtin_excludes_drop_discovery_items() {
     cfg.paths = vec![root.join("lib").to_string_lossy().into_owned()];
     let a_rb = root.join("a.rb").to_string_lossy().into_owned();
 
-    let (findings, _) = analyze_files(
+    let (findings, _, _rbs) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -931,7 +931,7 @@ fn analyze_files_repeated_paths_dedup_in_union() {
     // Dup argv with a deduped union: widened = [foo.rb, a.rb] == size of
     // the [a.rb, a.rb] expansion ⇒ no widen ⇒ silent. (Without the
     // receiver-side dedup the triple `lib` roots count foo.rb thrice.)
-    let (two, _) = analyze_files(
+    let (two, _, _rbs2) = analyze_files(
         &[a_rb.as_str(), a_rb.as_str()],
         Some(&[a_rb.as_str(), a_rb.as_str()]),
         &cfg,
@@ -946,7 +946,7 @@ fn analyze_files_repeated_paths_dedup_in_union() {
     );
 
     // Control: the single-arg row still widens and fires.
-    let (one, _) = analyze_files(
+    let (one, _, _rbs1) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -990,7 +990,7 @@ fn analyze_files_class_pattern_decided_exactly() {
         panic!("config must parse");
     };
     let a_rb = root.join("a.rb").to_string_lossy().into_owned();
-    let (findings, _) = analyze_files(
+    let (findings, _, _rbs) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -1041,7 +1041,7 @@ fn analyze_files_class_pattern_no_match_on_dup_argv() {
         panic!("config must parse");
     };
     let a_rb = root.join("app/a.rb").to_string_lossy().into_owned();
-    let (findings, _) = analyze_files(
+    let (findings, _, _rbs) = analyze_files(
         &[a_rb.as_str(), a_rb.as_str()],
         Some(&[a_rb.as_str(), a_rb.as_str()]),
         &cfg,
@@ -1146,7 +1146,7 @@ fn a_real_panic_keeps_the_internal_panic_wording() {
     // and the LSP tests move the process cwd into projects of their own.
     let mut cfg = Config::default();
     cfg.paths = vec![root.to_string_lossy().into_owned()];
-    let (findings, _) = analyze_files(
+    let (findings, _, _rbs) = analyze_files(
         &[a_rb.as_str()],
         Some(&[a_rb.as_str()]),
         &cfg,
@@ -1196,7 +1196,7 @@ fn a_file_past_the_depth_bound_carries_the_refusal_message() {
             // move the deep file onto a 2 MiB test-pool worker.
             let mut cfg = Config::default();
             cfg.paths = vec![root.to_string_lossy().into_owned()];
-            let (findings, _) = analyze_files(
+            let (findings, _, _rbs) = analyze_files(
                 &[a_rb.as_str()],
                 Some(&[a_rb.as_str()]),
                 &cfg,
