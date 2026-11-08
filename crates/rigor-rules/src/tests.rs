@@ -1045,6 +1045,43 @@ fn string_index_or_write_slot_narrowing() {
     }
 }
 
+/// rigor-rs#499 — a String compound write's internal `current` read types
+/// like the oracle's. Every expectation below was probed against the reference
+/// (`harness/probe.py`, tuple for tuple): `s[9] ||= nil` records `nil` (the
+/// out-of-range fold), so a later read is `for nil` — not `possible-nil` and
+/// not the flat `for String`; `s.index &&= 1` keeps `Integer | nil`, silent
+/// downstream; the in-range lookup control still fires on its pinned char.
+#[test]
+fn string_compound_write_current_read_edges() {
+    // Item 1: the slot record is exactly `nil`.
+    let src = b"s = \"abc\"; s[9] ||= nil; x = s[9]; x.upcase\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one `for nil` diag, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for nil");
+    assert_eq!(diags[0].start_offset, 37, "reference @1:38");
+
+    // A chained read: the first link (`strip`) is the one that misses on nil.
+    let diags = run(b"s = \"abc\"; s[9] ||= nil; s[9].strip.frobnicate\n");
+    assert_eq!(diags.len(), 1, "expected one `strip for nil` diag, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `strip' for nil");
+
+    // Item 2: `&&=` on a nilable zero-arg lookup types `Integer | nil`, so the
+    // result (`nil | 1`) is silent downstream.
+    assert!(
+        run(b"s = \"abc\"; (s.index &&= 1).to_a\n").is_empty(),
+        "`s.index &&= 1` must not collapse to `1`"
+    );
+    assert!(run(b"s = \"abc\"; (s.slice &&= 1).zz\n").is_empty());
+
+    // Must-still-fire control: the plain in-range read keeps its pinned char.
+    let diags = run(b"s = \"abc\"; s[0].frobnicate\n");
+    assert_eq!(diags.len(), 1, "control must still fire, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `frobnicate' for \"a\"");
+}
+
 /// Methods defined on NilClass (`to_s`, `inspect`, `nil?`) never mint a
 /// possible-nil diagnostic — the call is sound on the nil arm.
 #[test]

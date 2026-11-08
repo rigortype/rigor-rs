@@ -121,6 +121,30 @@ impl SourceIndex {
             .cloned()
     }
 
+    /// A bare call folds a TOPLEVEL `def`'s literal tail across files
+    /// (rigor-rs#462): `helpers.rb` `def format(x) = 42` types `script.rb`'s
+    /// `format(1)` to `42`, which outranks `Kernel#format`'s `String` return —
+    /// the `def_nodes["<toplevel>"]` merge is project-wide on the oracle.
+    /// `None` when no toplevel def of the name folds a scalar.
+    pub fn toplevel_def_literal(&self, method: &str, arg_count: usize) -> Option<Scalar> {
+        // The call must satisfy SOME def site's arity — `format("%d", 2)`
+        // against `def format(x)` keeps `Kernel#format` on the reference.
+        let arity_ok = self
+            .toplevel_def_arities
+            .get(method)
+            .is_some_and(|ranges| ranges.iter().any(|(lo, hi)| arg_count >= *lo && arg_count <= *hi));
+        if !arity_ok {
+            return None;
+        }
+        self.literal_returns
+            .get(&(
+                TOPLEVEL_FOLD_OWNER.to_string(),
+                method.to_string(),
+                DefKind::Instance,
+            ))
+            .cloned()
+    }
+
     /// The `(owner, kind)` an implicit-self call inside a SINGLETON self
     /// (`def self.x`, `class <<`, a class/module body statement) resolves
     /// `method` against — the reference's `singleton_def_through_ancestors`
@@ -529,6 +553,23 @@ impl SourceIndex {
 ///
 /// Issue #113: each site's tail is CAPTURED here into an owned [`FoldTail`], so
 /// nothing downstream needs this file's AST (or its slice position) again.
+/// The `def_nodes` key a bare toplevel `def` files under — mirrors the
+/// reference's `"<toplevel>"` table entry (rigor-rs#462).
+const TOPLEVEL_FOLD_OWNER: &str = "<toplevel>";
+
+/// `[min, max]` positional args `param_shape` accepts — `usize::MAX` for
+/// `*rest`; each keyword slot may also arrive as one trailing positional
+/// hash, so `keywords` and `**kwrest` widen the upper bound.
+fn fold_arity(shape: &rigor_parse::ParamShape) -> (usize, usize) {
+    let min = shape.required;
+    let max = if shape.has_rest || shape.has_kwrest {
+        usize::MAX
+    } else {
+        shape.required + shape.optional + shape.keywords.len()
+    };
+    (min, max)
+}
+
 pub(crate) fn walk_fold_defs(
     ast: &LoweredAst,
     node: NodeId,
@@ -560,6 +601,32 @@ pub(crate) fn walk_fold_defs(
                     };
                     if let Some(sowner) = sowner {
                         walk_singleton_fold_defs(ast, sclass_body, &sowner, out);
+                    }
+                } else if let Node::Definition {
+                    name: Some(method),
+                    receiver_def_name: None,
+                    singleton_name: None,
+                    body: def_body,
+                    has_explicit_return,
+                    param_shape,
+                    ..
+                } = ast.get(child)
+                {
+                    // A bare TOPLEVEL `def` — the `<toplevel>` slot the
+                    // reference's `def_nodes` files these under, so a call in
+                    // ANOTHER file can fold its tail (rigor-rs#462: a
+                    // cross-file `def format(x) = 42` types `format(1)` to
+                    // `42`, shadowing `Kernel#format` — both engines silent
+                    // at top level and inside a `def`).
+                    if let Some(&tail) = def_body.last() {
+                        out.push(HarvestedFoldDef {
+                            owner: TOPLEVEL_FOLD_OWNER.to_string(),
+                            method: method.clone(),
+                            kind: DefKind::Instance,
+                            tail: capture_fold_tail(ast, tail, 0),
+                            has_explicit_return: *has_explicit_return,
+                            arity: fold_arity(param_shape),
+                        });
                     }
                 } else {
                     walk_fold_defs(ast, child, prefix, out);
@@ -604,6 +671,7 @@ pub(crate) fn walk_fold_defs(
                         singleton_name,
                         body: def_body,
                         has_explicit_return,
+                        param_shape,
                         ..
                     } => {
                         let entry = match (name, singleton_name) {
@@ -622,6 +690,7 @@ pub(crate) fn walk_fold_defs(
                                     // exactly as it did per key.
                                     tail: capture_fold_tail(ast, tail, 0),
                                     has_explicit_return: *has_explicit_return,
+                                    arity: fold_arity(param_shape),
                                 });
                             }
                         }
@@ -1054,6 +1123,7 @@ fn walk_singleton_fold_defs(
                 name: Some(m),
                 body: def_body,
                 has_explicit_return,
+                param_shape,
                 ..
             } => {
                 if let Some(&tail) = def_body.last() {
@@ -1063,6 +1133,7 @@ fn walk_singleton_fold_defs(
                         kind: DefKind::Singleton,
                         tail: capture_fold_tail(ast, tail, 0),
                         has_explicit_return: *has_explicit_return,
+                        arity: fold_arity(param_shape),
                     });
                 }
             }
