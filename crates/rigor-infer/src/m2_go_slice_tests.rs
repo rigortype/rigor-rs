@@ -319,3 +319,64 @@ fn untyped_argument_roots_beyond_def_locals() {
     assert_eq!(ty(b"def f\n  Array(Errno::ENOENT)\nend\n"), "Class<4>");
     assert_eq!(ty(b"def f\n  Array(ENV)\nend\n"), "Class<4>");
 }
+
+/// rigor-rs#462: a bare call resolves a TOPLEVEL `def` in ANOTHER file —
+/// the `<toplevel>` literal-tail fold outranks `Kernel#format`, and the def
+/// shadows the Kernel intrinsic even when its tail doesn't fold.
+#[test]
+fn cross_file_toplevel_def_shadows_kernel_fold() {
+    fn ty_of_format(files: &[&[u8]], call_file: usize, method: &str) -> String {
+        let asts: Vec<_> = files.iter().map(|f| lower(&parse(f))).collect();
+        let refs: Vec<&LoweredAst> = asts.iter().collect();
+        let index = CoreIndex::new();
+        let source = SourceIndex::build_project(&refs, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = TypeEnv::new();
+        let ast = &asts[call_file];
+        let call_id = ast
+            .iter()
+            .filter_map(|(id, n)| {
+                matches!(n, Node::Call { receiver: None, method: m, .. } if m == method)
+                    .then_some(id)
+            })
+            .next()
+            .unwrap();
+        let ty = typer.type_of(ast, call_id, &env, &mut i);
+        rigor_types::describe(&i, ty)
+    }
+    // helpers.rb `def format(x) = 42` types `format(1)` to `42`.
+    assert_eq!(
+        ty_of_format(
+            &[b"format(1)\n".as_slice(), b"def format(x) = 42\n".as_slice()],
+            0,
+            "format"
+        ),
+        "Constant[42]"
+    );
+    // An explicit `return` declines the literal but still SHADOWS the
+    // Kernel intrinsic — the call types Dynamic, not String.
+    assert_eq!(
+        ty_of_format(
+            &[
+                b"format(1)\n".as_slice(),
+                b"def format(x); return 42; end\n".as_slice()
+            ],
+            0,
+            "format"
+        ),
+        "Dynamic[top]"
+    );
+    // An arity miss (`format("%d", 2)` vs `def format(x)`) shadows too.
+    assert_eq!(
+        ty_of_format(
+            &[
+                b"format(\"%d\", 2)\n".as_slice(),
+                b"def format(x) = 42\n".as_slice()
+            ],
+            0,
+            "format"
+        ),
+        "Dynamic[top]"
+    );
+}

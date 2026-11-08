@@ -1497,6 +1497,37 @@ impl<'i> Typer<'i> {
                 }
             }
         }
+        // rigor-rs#462: a bare call resolves a TOPLEVEL `def` (the
+        // `def_nodes["<toplevel>"]` table merges project-wide on the oracle —
+        // `helpers.rb` `def format(x) = 42` types `script.rb`'s `format(1)`
+        // to `42`, outranking `Kernel#format`'s `String` return). The
+        // `self_answers` veto is `file_def_literal`'s (a `self` that already
+        // answers the name binds first). Inside a BLOCK / lambda body the
+        // reference keeps the Kernel binding — probed: `[1].each {
+        // format(1).bit_length }` fires `for String` on BOTH engines — so the
+        // fold declines there and the call falls through to the Kernel path.
+        if let Some(scalar) = self.source.toplevel_def_literal(method, args.len()) {
+            if let Some(site) = span {
+                if !self.self_answers(ast, site, method) && !self.inside_block(ast, site) {
+                    return Some(interner.intern(Type::Constant(scalar)));
+                }
+            }
+        }
+        // The same toplevel `def` SHADOWS the Kernel intrinsic even when its
+        // own tail doesn't fold — `def format(x); return 42; end` keeps
+        // `format(1)` off `Kernel#format`, and an arity miss
+        // (`format("%d", 2)` vs `def format(x)`) types Dynamic on the oracle
+        // (rigor-rs#462 review). Decline so the call widens to untyped —
+        // inside a literal block the Kernel binding still stands, so the
+        // shadow does not reach there.
+        if let Some(site) = span {
+            if !self.inside_block(ast, site)
+                && !self.self_answers(ast, site, method)
+                && self.source.is_toplevel_def(self.file_key(), method)
+            {
+                return None;
+            }
+        }
         // Only a fixed set of Kernel functions is folded on this path; every
         // other implicit-self call declines (a cheap membership test on the hot
         // path). `format`/`sprintf`/`String`/`Hash`/`Integer`/`Float` are the

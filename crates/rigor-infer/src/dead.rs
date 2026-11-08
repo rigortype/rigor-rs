@@ -859,7 +859,7 @@ impl<'i> Typer<'i> {
     /// site's own `self` answers `name`, in which case a same-named toplevel
     /// `def` never binds there. `false` at file top level, where
     /// `self_type` is nil.
-    fn self_answers(&self, ast: &LoweredAst, site: Span, name: &str) -> bool {
+    pub(crate) fn self_answers(&self, ast: &LoweredAst, site: Span, name: &str) -> bool {
         match self.call_self(ast, site) {
             CallSelf::Singleton(qual) => {
                 !qual.is_empty() && self.singleton_answers(&qual, name)
@@ -872,6 +872,21 @@ impl<'i> Typer<'i> {
             // `def helper` even when `Foo.self.helper` exists — probed).
             CallSelf::Unmodelled => false,
         }
+    }
+
+    /// Whether `site` sits inside a literal BLOCK (`{ … }` / `do … end`) or
+    /// `->` lambda body — the whole block node, parameters included. The
+    /// cross-file toplevel-def fold declines there: a block-local self keeps
+    /// the Kernel binding on the reference (rigor-rs#462, probed).
+    pub(crate) fn inside_block(&self, ast: &LoweredAst, site: Span) -> bool {
+        ast.iter().any(|(_, n)| match n {
+            Node::Call {
+                block_span: Some(block),
+                ..
+            } => contains(*block, site),
+            Node::Lambda { span, .. } => contains(*span, site),
+            _ => false,
+        })
     }
 
     /// The `self` a call at `site` dispatches on — the `scope.self_type`

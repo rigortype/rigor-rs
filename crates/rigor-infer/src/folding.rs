@@ -82,10 +82,12 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
             "+" | "-" | "*" | "/" | "%" | "**" | "&" | "|" | "^" | "<<" | ">>"
                 | "<" | "<=" | ">" | ">=" | "=="
                 | "abs" | "succ" | "pred" | "even?" | "odd?" | "zero?" | "to_s"
+                | "+@" | "-@"
         ),
         "Float" => matches!(
             method,
             "+" | "-" | "*" | "<" | "<=" | ">" | ">=" | "==" | "abs" | "<=>"
+                | "+@" | "-@"
         ),
         "TrueClass" | "FalseClass" => matches!(method, "!" | "&" | "|" | "=="),
         "NilClass" => matches!(method, "!" | "&" | "|" | "=="),
@@ -94,7 +96,8 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
             method,
             "upcase" | "downcase" | "reverse" | "length" | "size" | "+" | "*"
                 | "==" | "empty?" | "[]" | "slice" | "byteslice" | "index"
-                | "getbyte" | "rindex" | "byteindex" | "byterindex"
+                | "getbyte" | "rindex" | "byteindex" | "byterindex" | "+@"
+                | "-@" | "to_s" | "to_str"
         ),
         _ => false,
     }
@@ -311,6 +314,10 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         // `to_s` with no radix only (a radix arg changes the base — not folded
         // here to keep the core trivially byte-exact with Ruby's decimal form).
         ("to_s", []) => return Some(Scalar::Str(a.to_string())),
+        // Unary `+x` / `-x` — the literal stays pinned (rigor-rs#462: `+"ab"`,
+        // `-1` still read the nominal where the reference folds the scalar).
+        ("+@", []) => return Some(Scalar::Int(a)),
+        ("-@", []) => return a.checked_neg().map(Scalar::Int),
         _ => {}
     }
 
@@ -398,6 +405,11 @@ fn ruby_mod(a: i64, b: i64) -> i64 {
 // --- Float ------------------------------------------------------------------
 
 fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
+    match (method, args) {
+        ("+@", []) => return Some(Scalar::Float(a)),
+        ("-@", []) => return Some(Scalar::Float(-a)),
+        _ => {}
+    }
     if method == "abs" && args.is_empty() {
         return Some(Scalar::Float(a.abs()));
     }
@@ -526,6 +538,11 @@ fn fold_str(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     // route it to the sidecar (ADR-0008).
     match (method, args) {
         ("length" | "size", []) => return Some(Scalar::Int(a.chars().count() as i64)),
+        // `+s`/`-s`/`to_s`/`to_str` keep the string carrier — the literal
+        // stays pinned for the message (`for "ab"`, rigor-rs#462).
+        ("+@" | "-@" | "to_s" | "to_str", []) => {
+            return Some(Scalar::Str(a.to_string()))
+        }
         ("empty?", []) => return Some(Scalar::Bool(a.is_empty())),
         ("upcase", []) if a.is_ascii() => return Some(Scalar::Str(a.to_ascii_uppercase())),
         ("downcase", []) if a.is_ascii() => return Some(Scalar::Str(a.to_ascii_lowercase())),
