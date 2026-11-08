@@ -1486,12 +1486,11 @@ fn def_local_env_declines_a_literal_the_body_mutates() {
 #[test]
 fn def_local_env_keeps_what_a_call_cannot_invalidate() {
     // Controls that still match the reference byte for byte: a non-mutating
-    // call on the local, an alias / pass-through the reference does not widen
-    // either, an immutable scalar, and a bare `String` nominal.
+    // call on the local, an alias the reference does not widen either, an
+    // immutable scalar, and a bare `String` nominal.
     let rows = def_rows(
         "def_local_controls",
         "def c11(items); s = String.new; s << \"a\"; s; end\n\
-         def e2(c); a = [1]; foo(a); a; end\n\
          def e3(c); a = [1]; a.each { |x| x }; a; end\n\
          def e5(c); s = \"a\"; t = s.upcase; s; end\n\
          def e6(c); a = [1]; a.freeze; a; end\n\
@@ -1501,10 +1500,98 @@ fn def_local_env_keeps_what_a_call_cannot_invalidate() {
          def n1(c); x = 1; x.succ!; x; end",
     );
     assert_eq!(rows["c11"], "def c11: (untyped) -> String");
-    for name in ["e2", "e3", "e6", "e7", "e8", "e28"] {
+    for name in ["e3", "e6", "e7", "e8", "e28"] {
         assert_eq!(rows[name], format!("def {name}: (untyped) -> [1]"), "{name}");
     }
     assert_eq!(rows["e5"], "def e5: (untyped) -> \"a\"");
+}
+
+#[test]
+fn def_local_env_declines_a_local_handed_to_a_callee() {
+    // rigor-rs#546 review 2: the reference's callee-mutated-parameter
+    // analysis (`StatementEvaluator#argument_mutating_callees`) widens a
+    // local passed to a project def (self-call, `Const.m`, `Const.new.m`),
+    // to a lambda / proc / `method(:x)` run through `call` / `.()`, and to
+    // a `send` hand-off (`Array[untyped]`, `String`, `Hash[untyped,
+    // untyped]`, `Integer` for `r.size`). The port does not resolve callees:
+    // a stale-able literal local passed as an argument (positional, keyword
+    // value, splat, `&blk`) to any call declines. The reference emits the
+    // widened type for every `r*` / `a1`, `a3`..`a8`-style row (probed); on
+    // `a2` it emits `Array[untyped] | [1]`, and on `a9` (splat), `b4`
+    // (`i[a]`), `b7` (undefined `foo`) and `b8` (unknown receiver) it keeps
+    // `[1]` — those four are disclosed over-declines (a coverage loss).
+    let src = "class K\n\
+        class Helper\n\
+          def self.fill(acc); acc << 1; end\n\
+          def add(acc); acc << 1; end\n\
+        end\n\
+        def collect(acc, n); acc << n; end\n\
+        def kw(a:, b: 1); a << b; end\n\
+        def r1(items); r = []; collect(r, 1); r; end\n\
+        def r2(items); r = []; items.each { |i| collect(r, i) }; r; end\n\
+        def r3(items); r = []; Helper.fill(r); r; end\n\
+        def r4(items); r = []; Helper.new.add(r); r; end\n\
+        def r5(items); r = \"\"; collect(r, 1); r; end\n\
+        def r6(items); r = {}; collect(r, 1); r; end\n\
+        def r7(items); r = [1]; collect(r, 1); r.size; end\n\
+        def r8(items); a = [1]; helper = ->(z) { z << 2 }; helper.(a); a; end\n\
+        def r9(items); r = []; pr = proc { |x| x << 1 }; pr.call(r); r; end\n\
+        def r10(items); r = []; send(:collect, r, 1); r; end\n\
+        def a1(i); a = [1]; b = a; collect(b, 1); b; end\n\
+        def a2(i); a = [1]; collect(a, 1) if i; a; end\n\
+        def a3(i); a = [1]; kw(a: a); a; end\n\
+        def a4(i); a = [1]; collect(a, &:x); a; end\n\
+        def a5(i); a = [1]; method(:collect).call(a, 1); a; end\n\
+        def a6(i); a = [1]; i.each { collect(a, 1) }; a; end\n\
+        def a7(i); a = [1]; self.collect(a, 1); a; end\n\
+        def a8(i); a = [1]; kw(a:); a; end\n\
+        def a9(i); a = [1]; collect(*a); a; end\n\
+        def b1(i); a = [1]; l = ->(x) { x }; l.call(a); a; end\n\
+        def b2(i); a = [1]; i.call(a); a; end\n\
+        def b3(i); a = [1]; i.(a); a; end\n\
+        def b4(i); a = [1]; i[a]; a; end\n\
+        def b5(i); a = [1]; send(:collect, a, 1); a; end\n\
+        def b6(i); a = [1]; public_send(:collect, a, 1); a; end\n\
+        def b7(i); a = [1]; foo(a); a; end\n\
+        def b8(i); a = [1]; i.m(a); a; end\n\
+      end\n";
+    let rows: HashMap<String, String> = candidates_tagged("def_local_callee_args", src, false)
+        .into_iter()
+        .map(|c| (c.method_name, c.rbs))
+        .collect();
+    for n in [
+        "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "a1", "a2", "a3", "a4", "a5",
+        "a6", "a7", "a8", "a9", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8",
+    ] {
+        assert!(!rows.contains_key(n), "{n} must decline: {rows:?}");
+    }
+}
+
+#[test]
+fn def_local_env_keeps_what_no_callee_receives() {
+    // Controls that still match the reference byte for byte: the local is a
+    // receiver (`a.size`), an operand of an operator, a container element
+    // (`[a, 1]`, `{k: a}`), interpolated, or the argument of an immutable
+    // type (`Integer`); a nested call is judged on its own arguments.
+    let rows = def_rows(
+        "def_local_callee_controls",
+        "def collect(acc, n = 0); acc << n; end\n\
+         def k1(i); a = [1]; x = a.size; a; end\n\
+         def k2(i); a = [1]; x = [1] + a; a; end\n\
+         def k3(i); a = [1]; x = [a, 1]; a; end\n\
+         def k4(i); a = [1]; x = {k: a}; a; end\n\
+         def k5(i); a = [1]; x = \"#{a}\"; a; end\n\
+         def k6(i); a = [1]; x = a == a; a; end\n\
+         def k7(i); n = 1; collect(n); n; end\n\
+         def k8(i); a = [1]; collect(a.dup); a; end\n\
+         def k9(i); a = [1]; collect(a.size); a; end\n\
+         def k10(i); a = [1]; collect(i, a.first); a; end\n\
+         def k11(i); a = [1]; b = [2]; collect(b); a; end",
+    );
+    for n in ["k1", "k2", "k3", "k4", "k5", "k6", "k8", "k9", "k10", "k11"] {
+        assert_eq!(rows[n], format!("def {n}: (untyped) -> [1]"), "{n}");
+    }
+    assert_eq!(rows["k7"], "def k7: (untyped) -> 1");
 }
 
 #[test]

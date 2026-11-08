@@ -36,6 +36,12 @@ use crate::TypeEnv;
 #[derive(Default)]
 pub(crate) struct DefLocalMarks {
     mutations: Vec<(Span, Vec<String>)>,
+    /// Locals handed to a call as an argument (see [`passes_argument`]):
+    /// the callee may mutate the object in place. Applied like `mutations`,
+    /// but kept apart — a block call whose body merely passes its own
+    /// parameter on (`a.each { |x| puts(x) }`) does not make the receiver's
+    /// locals candidates (the reference keeps `a` there).
+    escapes: Vec<(Span, Vec<String>)>,
     rebinds: Vec<(Span, Vec<String>)>,
     /// Every local read `(start, end, name)` and write `(start, name)`,
     /// sorted by start — the loop-carried-return scan asks what a span
@@ -55,6 +61,46 @@ fn mutating_call(method: &str) -> bool {
     MUTATOR_METHODS.contains(&method)
         || rigor_parse::mutators::is_shape_mutator(method)
         || (method.len() > 1 && method.ends_with('!'))
+}
+
+/// Whether a call named `method` hands its arguments to code that may
+/// mutate them in place. The reference's callee-mutated-parameter analysis
+/// (`StatementEvaluator#argument_mutating_callees`) widens a local passed to
+/// a project def (self-call, `Const.m`, `Const.new.m`), to the opaque sinks
+/// (`call`, `.()`, `send`, `instance_exec`, ...) and through `&blk`; the
+/// marks do not resolve callees, so EVERY call passing a local counts —
+/// except an arithmetic / comparison operator, which no callee is expected
+/// to use for an in-place change of its operand. Over-declining a local
+/// passed to a core method (`puts(a)`) is a coverage loss, never a wrong
+/// signature.
+fn passes_argument(method: &str) -> bool {
+    !matches!(
+        method,
+        "+" | "-" | "*" | "/" | "%" | "**" | "==" | "!=" | "<" | ">" | "<=" | ">=" | "<=>" | "==="
+            | "=~" | "!~" | "&" | "|" | "^" | ">>" | "!" | "-@" | "+@" | "~"
+    )
+}
+
+/// The local names an argument expression hands over BY REFERENCE: a bare
+/// local read, looking through the carriers an argument position lowers
+/// splats / parentheses / keyword hashes into. A nested call (`f(a.dup)`,
+/// `f(g(a))`) is judged on its own arguments; a container literal
+/// (`f([a])`) is not followed, as in the reference.
+fn argument_locals(ast: &LoweredAst, id: rigor_parse::NodeId, out: &mut Vec<String>) {
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. } => out.push(name.clone()),
+        Node::Statements { body, .. } => {
+            for &b in body {
+                argument_locals(ast, b, out);
+            }
+        }
+        Node::HashLit { elements, .. } => {
+            for &e in elements {
+                argument_locals(ast, e, out);
+            }
+        }
+        _ => {}
+    }
 }
 
 impl DefLocalMarks {
@@ -97,11 +143,30 @@ impl DefLocalMarks {
         };
 
         let mut mutations: Vec<(Span, Vec<String>)> = Vec::new();
+        let mut escapes: Vec<(Span, Vec<String>)> = Vec::new();
         let mut closures: Vec<Span> = Vec::new();
         let mut block_calls: Vec<Span> = Vec::new();
         for (_, n) in ast.iter() {
             match n {
-                Node::Call { receiver, method, span, block_span, .. } => {
+                Node::Call { receiver, method, args, block_body, span, block_span, .. } => {
+                    if passes_argument(method) {
+                        let mut names: Vec<String> = Vec::new();
+                        for &a in args {
+                            argument_locals(ast, a, &mut names);
+                        }
+                        // `&expr` block-pass: the expression rides `block_body`
+                        // of a call with no literal block.
+                        if block_span.is_none() {
+                            for &b in block_body {
+                                argument_locals(ast, b, &mut names);
+                            }
+                        }
+                        if !names.is_empty() {
+                            names.sort();
+                            names.dedup();
+                            escapes.push((*span, names));
+                        }
+                    }
                     if let Some(r) = receiver {
                         if mutating_call(method) {
                             let rs = ast.get(*r).span();
@@ -183,6 +248,7 @@ impl DefLocalMarks {
         }
         mutations.extend(extra);
         mutations.sort_by_key(|m| m.0 .0);
+        escapes.sort_by_key(|m| m.0 .0);
 
         // Closure writes: every local written inside a block / lambda body.
         all_writes.sort_by_key(|w| w.0);
@@ -200,7 +266,7 @@ impl DefLocalMarks {
         }
         rebinds.sort_by_key(|m| m.0 .0);
         let reads = reads.into_iter().map(|(a, b, n)| (a, b, n.to_string())).collect();
-        DefLocalMarks { mutations, rebinds, reads, writes: all_writes }
+        DefLocalMarks { mutations, escapes, rebinds, reads, writes: all_writes }
     }
 
     /// The names written (rebound) or possibly mutated inside `span`.
@@ -208,7 +274,10 @@ impl DefLocalMarks {
         let mut out: Vec<String> = Vec::new();
         let i = self.writes.partition_point(|w| w.0 < span.0);
         out.extend(self.writes[i..].iter().take_while(|w| w.0 < span.1).map(|w| w.1.clone()));
-        for names in Self::within(&self.mutations, span).chain(Self::within(&self.rebinds, span)) {
+        for names in Self::within(&self.mutations, span)
+            .chain(Self::within(&self.escapes, span))
+            .chain(Self::within(&self.rebinds, span))
+        {
             out.extend(names.iter().cloned());
         }
         out.sort();
@@ -293,7 +362,9 @@ impl<'i> Typer<'i> {
     ) {
         let marks = self.def_local_marks(ast);
         let untyped = interner.untyped();
-        for names in DefLocalMarks::within(&marks.mutations, span) {
+        for names in
+            DefLocalMarks::within(&marks.mutations, span).chain(DefLocalMarks::within(&marks.escapes, span))
+        {
             for name in names {
                 if let Some(&ty) = env.get(name) {
                     if !mutation_stable(interner, ty) {
