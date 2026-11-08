@@ -107,7 +107,7 @@ pub struct Typer<'i> {
     /// rigor-rs#546: the def-local env's mutation / closure-write marks,
     /// memoized by `(ast identity, arena length)` like `reach_index` — see
     /// [`crate::def_local_marks`].
-    pub(crate) def_marks: RefCell<Option<((usize, usize), std::rc::Rc<crate::def_local_marks::DefLocalMarks>)>>,
+    pub(crate) def_marks: crate::def_local_marks::DefMarksCache,
     /// rigor-rs#422: the `local_reach` memo — entries keyed by the read and
     /// `seen.len()`, guarded by the `seen` membership answers they depend
     /// on, valid for one `(AST, dead-set object)` pair (see

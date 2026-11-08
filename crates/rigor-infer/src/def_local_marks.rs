@@ -44,6 +44,9 @@ pub(crate) struct DefLocalMarks {
     writes: Vec<(usize, String)>,
 }
 
+/// The [`Typer`]'s memo of [`DefLocalMarks`], keyed by `(ast identity, arena length)`.
+pub(crate) type DefMarksCache = std::cell::RefCell<Option<((usize, usize), Rc<DefLocalMarks>)>>;
+
 /// A call name that may change its receiver in place: the reference's
 /// `SHAPE_MUTATORS` tables (the port's [`MUTATOR_METHODS`] plus the hash
 /// lookup mutators) and every bang method — a user- or core-defined `foo!`
@@ -233,10 +236,7 @@ impl DefLocalMarks {
             .any(|r| r.1 <= span.1 && names.contains(&r.2))
     }
 
-    fn within<'a>(
-        marks: &'a [(Span, Vec<String>)],
-        (lo, hi): Span,
-    ) -> impl Iterator<Item = &'a Vec<String>> {
+    fn within(marks: &[(Span, Vec<String>)], (lo, hi): Span) -> impl Iterator<Item = &Vec<String>> {
         let i = marks.partition_point(|m| m.0 .0 < lo);
         marks[i..]
             .iter()
