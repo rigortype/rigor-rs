@@ -1420,6 +1420,7 @@ fn walk_namespace(
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
     let mut uncertain: Vec<(&str, usize)> = Vec::new();
     let mut conditionals: Vec<(usize, NodeId)> = Vec::new();
+    let mut call_children: Vec<(usize, NodeId)> = Vec::new();
     for &child in body {
         match ast.get(child) {
             Node::Definition {
@@ -1475,7 +1476,7 @@ fn walk_namespace(
             // `private def x` after an uncertain reset: reported like a direct
             // def (the reference skips it before reading its visibility). In
             // any other mode the port does not walk a def passed to a call.
-            Node::Call { receiver: None, method, args, span, block_body, .. } => {
+            Node::Call { receiver: None, method, args, span, .. } => {
                 // `attr_reader :x` / `attr_writer` / `attr_accessor` are
                 // DEFINERS too (reference `record_attr_definers`): the call's
                 // offset ranks them like a `def`, so a later `attr_reader :u`
@@ -1536,70 +1537,12 @@ fn walk_namespace(
                         }
                     }
                 }
-                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
-                // definer too (`rigor_each_child` descends arguments).
-                // `Definition` args are already handled above — descending
-                // them would double-count the wrapped def.
-                let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
-                for &arg in args {
-                    if !matches!(ast.get(arg), Node::Definition { .. }) {
-                        collect_conditional_definers(
-                            ast,
-                            arg,
-                            &qualified,
-                            false,
-                            matches!(ast.get(id), Node::ModuleDef { .. }),
-                            path,
-                            include_private,
-                            index,
-                            typer,
-                            env,
-                            fqns,
-                            sig_env,
-                            layouts,
-                            modes,
-                            &visibilities,
-                            running_vis,
-                            running_mf,
-                            interner,
-                            out,
-                            definers,
-                        );
-                    }
-                }
-                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
-                // children are uncertain definers (`walk_attr_calls` descends
-                // call blocks too; a `refine`/`class_methods` block is a DSL
-                // scope and skipped).
-                let dsl_scope = method == "class_methods"
-                    || (method == "refine" && matches!(ast.get(id), Node::ModuleDef { .. }));
-                if !dsl_scope {
-                    let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
-                    for &b in block_body {
-                        collect_conditional_definers(
-                            ast,
-                            b,
-                            &qualified,
-                            false,
-                            matches!(ast.get(id), Node::ModuleDef { .. }),
-                            path,
-                            include_private,
-                            index,
-                            typer,
-                            env,
-                            fqns,
-                            sig_env,
-                            layouts,
-                            modes,
-                            &visibilities,
-                            running_vis,
-                            running_mf,
-                            interner,
-                            out,
-                            definers,
-                        );
-                    }
-                }
+                // `foo(attr_reader(:x))` and `foo do; def y; end; end`: the
+                // arguments and the block body carry uncertain definers and
+                // candidates of their own. They emit in SOURCE ORDER with the
+                // body's other statements (`Emit::CallChildren`), as the
+                // reference's single top-to-bottom walk does.
+                call_children.push((span.0, child));
             }
             Node::Definition {
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
@@ -1640,17 +1583,13 @@ fn walk_namespace(
             }
             // Any other body statement — an `if`/`case`/`begin`/loop/block
             // — can still CARRY a `def` or `attr_*`: the reference walks
-            // into every non-`def` child (`walk_attr_calls` +
-            // `walk_def_children`), recording each as an UNCERTAIN definer
-            // (only direct statements are `certain_definers`).
-            // `if cond; attr_reader :x; end` then contests a preceding
-            // `def x` (rigor-rs#525 item 2). Namespace children are walked
-            // by `Emit::Nested` instead — do not double-count them.
-            // Any other body statement — an `if`/`case`/`begin`/loop/block
-            // — can still CARRY a `def` or `attr_*` (`walk_defs` descends).
-            // Their candidates emit in source order via `Emit::Conditional`;
-            // the uncertain definers they register ride along
-            // (rigor-rs#525 item 2, rigor-rs#535).
+            // into every non-`def` child (`walk_defs`, `walk_attr_calls`),
+            // recording each as an UNCERTAIN definer (only direct statements
+            // are `certain_definers`), so `if cond; attr_reader :x; end`
+            // contests a preceding `def x` (rigor-rs#525 item 2). Their
+            // candidates emit in source order via `Emit::Conditional`
+            // (rigor-rs#535). Namespace children are walked by
+            // `Emit::Nested` instead — do not double-count them.
             _ => {
                 if !is_namespace_node(ast, child, &qualified, layouts) {
                     conditionals.push((ast.get(child).span().0, child));
@@ -1669,6 +1608,7 @@ fn walk_namespace(
         Uncertain(&'a str),
         Nested(NodeId),
         Conditional(NodeId),
+        CallChildren(NodeId),
     }
     let mut items: Vec<(usize, Emit)> = Vec::new();
     for (sig, vis, span) in &sigs {
@@ -1684,6 +1624,9 @@ fn walk_namespace(
     }
     for (span, child) in &conditionals {
         items.push((*span, Emit::Conditional(*child)));
+    }
+    for (span, child) in &call_children {
+        items.push((*span, Emit::CallChildren(*child)));
     }
     items.sort_by_key(|(span, _)| *span);
     for (_, item) in items {
@@ -1730,6 +1673,38 @@ fn walk_namespace(
                 out,
                 definers,
             ),
+            Emit::CallChildren(child) => {
+                let Node::Call { method, args, block_body, span, .. } = ast.get(child) else { continue };
+                let in_module = matches!(ast.get(id), Node::ModuleDef { .. });
+                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
+                // definer too (`rigor_each_child` descends arguments).
+                // `Definition` args are already handled in the collection
+                // loop — descending them would double-count the wrapped def.
+                let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
+                for &arg in args {
+                    if !matches!(ast.get(arg), Node::Definition { .. }) {
+                        collect_conditional_definers(
+                            ast, arg, &qualified, false, in_module, path, include_private, index, typer, env,
+                            fqns, sig_env, layouts, modes, &visibilities, running_vis, running_mf, interner,
+                            out, definers,
+                        );
+                    }
+                }
+                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
+                // children are uncertain definers (`walk_attr_calls` descends
+                // call blocks too; a `refine`/`class_methods` block is a DSL
+                // scope and skipped).
+                let dsl_scope = method == "class_methods" || (method == "refine" && in_module);
+                if !dsl_scope {
+                    for &b in block_body {
+                        collect_conditional_definers(
+                            ast, b, &qualified, false, in_module, path, include_private, index, typer, env,
+                            fqns, sig_env, layouts, modes, &visibilities, running_vis, running_mf, interner,
+                            out, definers,
+                        );
+                    }
+                }
+            }
             Emit::Conditional(child) => {
                 let (running_vis, running_mf) = running_toggles_at(ast, body, ast.get(child).span().0);
                 collect_conditional_definers(
