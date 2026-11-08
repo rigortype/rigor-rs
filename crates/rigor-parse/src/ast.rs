@@ -58,7 +58,7 @@ pub use singleton_locals::SingletonLocals;
 pub use rebind_sites::{RebindDef, RebindFacts, RebindReceiver, RebindRow, RebindSite, METHOD_OBJECT_CALLS as REBIND_METHOD_OBJECT_CALLS};
 pub(crate) use constants::*;
 pub use lowered_ast::{lower, lower_with_key, FileKey, LoweredAst};
-pub use node::{Compound, JumpKind, LoopKind, Node, RescueClause, StatementsKind};
+pub use node::{Compound, JumpKind, LoopKind, Node, OpWriteKind, RescueClause, StatementsKind};
 pub(crate) use builder::*;
 
 /// A dense handle into [`LoweredAst::nodes`]. Cheap to copy; stable for the

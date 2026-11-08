@@ -7,7 +7,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{LoweredAst, Node, NodeId, OpWriteKind, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
@@ -195,8 +195,35 @@ impl<'i> Typer<'i> {
                 // local to `untyped` declines the method (the tail then
                 // reads `Dynamic`) rather than emit the stale pre-write type
                 // — `a = nil; a ||= "default"; a` must not emit `-> nil`.
-                Node::LocalVariableOpWrite { name, .. } => {
-                    env.insert(name.clone(), interner.untyped());
+                Node::LocalVariableOpWrite { name, value, op, .. } => {
+                    let (name, value, op) = (name.clone(), *value, op.clone());
+                    let v_ty = self.type_of(ast, value, env, interner);
+                    let untyped = interner.untyped();
+                    let entry = env.get(&name).copied().unwrap_or(untyped);
+                    let new_ty = match &op {
+                        // `a ||= v` ⇒ `a = a || v`: the truthy part of the
+                        // entry union plus typeof(v) — `a = nil; a ||=
+                        // "default"; a` emits `"default"`, `a = 1; a ||=
+                        // "x"; a` emits `("x" | 1)` (rigor-rs#548).
+                        OpWriteKind::Or => match self.truthy_part(entry, interner) {
+                            Some(t) => rigor_types::Algebra::join(interner, t, v_ty),
+                            None => v_ty,
+                        },
+                        // `a &&= v` ⇒ `a = a && v`: the falsy part of the entry
+                        // union plus typeof(v) — `a = 1; a &&= "x"; a` emits
+                        // `"x"`.
+                        OpWriteKind::And => match self.falsy_part(entry, interner) {
+                            Some(f) => rigor_types::Algebra::join(interner, f, v_ty),
+                            None => v_ty,
+                        },
+                        // `a <op>= v` ⇒ `a = a.<op>(v)`: fold literal receiver
+                        // + arg, else the core method's RBS return on the
+                        // entry's nominal class — `a = 1; a += 2; a` emits `3`.
+                        OpWriteKind::Operator(opname) => {
+                            self.op_write_dispatch(entry, opname, v_ty, interner)
+                        }
+                    };
+                    env.insert(name, new_ty);
                 }
                 Node::Call { block_body, .. } if !block_body.is_empty() => {
                     // A block may run and rebind a captured local — its
@@ -242,6 +269,118 @@ impl<'i> Typer<'i> {
         // of an else-less `if` is `[]`, and the loop body's zero-iteration
         // path is `entry` itself — appended by callers below).
         self.merge_arm_envs(entry, arm_envs, env, interner);
+    }
+
+    /// The truthy part of `ty` — `Some(joined)` of the members that are not
+    /// statically falsy (`Constant` nil/false, `nil`), `None` when every
+    /// member is statically falsy. Used by `||=` replay.
+    fn truthy_part(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+        let mut keep: Vec<TypeId> = Vec::new();
+        let members: Vec<TypeId> = match interner.get(ty) {
+            Type::Union(ms) => ms.clone(),
+            _ => vec![ty],
+        };
+        for m in members {
+            let falsy = matches!(
+                interner.get(m),
+                Type::Constant(rigor_types::Scalar::Nil)
+                    | Type::Constant(rigor_types::Scalar::Bool(false))
+            );
+            if !falsy {
+                keep.push(m);
+            }
+        }
+        if keep.is_empty() {
+            return None;
+        }
+        Some(
+            keep.iter()
+                .skip(1)
+                .fold(keep[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m)),
+        )
+    }
+
+    /// The falsy part of `ty` — the mirror of [`Self::truthy_part`] for
+    /// `&&=`.
+    fn falsy_part(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+        let mut keep: Vec<TypeId> = Vec::new();
+        let members: Vec<TypeId> = match interner.get(ty) {
+            Type::Union(ms) => ms.clone(),
+            _ => vec![ty],
+        };
+        for m in members {
+            if matches!(
+                interner.get(m),
+                Type::Constant(rigor_types::Scalar::Nil)
+                    | Type::Constant(rigor_types::Scalar::Bool(false))
+            ) {
+                keep.push(m);
+            }
+        }
+        if keep.is_empty() {
+            return None;
+        }
+        Some(
+            keep.iter()
+                .skip(1)
+                .fold(keep[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m)),
+        )
+    }
+
+    /// `a = a.<op>(v)` for the def-local replay: fold when both sides are
+    /// `Constant` scalars (`1 + 2` → `3`, `"x" + "y"` → `"xy"`), else the
+    /// core RBS return of `<op>` on the entry's nominal class (`a : Array;
+    /// a += x` → `Array`). A union entry declines to `untyped`.
+    fn op_write_dispatch(
+        &self,
+        entry: TypeId,
+        op: &str,
+        v_ty: TypeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        // A union entry dispatches member-wise and keeps only the members the
+        // op resolves — `(1 | "s") += 1` folds the Integer arm to `2` and
+        // drops `"s"` (the reference's optimistic union dispatch).
+        if let Type::Union(ms) = interner.get(entry) {
+            let mut keep: Vec<TypeId> = Vec::new();
+            for m in ms.clone() {
+                let t = if let Type::Constant(r) = interner.get(m) {
+                    // A Constant member participates only through the literal
+                    // fold — `(1 | "s") += 1` keeps `2` and drops `"s"` (the
+                    // `"s".+(Integer)` nominal fallback does not apply inside
+                    // a union dispatch).
+                    match interner.get(v_ty) {
+                        Type::Constant(a) => crate::folding::fold(r, op, &[a.clone()])
+                            .map(|sc| interner.intern(Type::Constant(sc)))
+                            .unwrap_or_else(|| interner.untyped()),
+                        _ => interner.untyped(),
+                    }
+                } else {
+                    self.op_write_dispatch(m, op, v_ty, interner)
+                };
+                if !matches!(interner.get(t), Type::Dynamic(_)) {
+                    keep.push(t);
+                }
+            }
+            return match keep.len() {
+                0 => interner.untyped(),
+                _ => keep.iter().skip(1).fold(keep[0], |acc, &m| {
+                    rigor_types::Algebra::join(interner, acc, m)
+                }),
+            };
+        }
+        if let (Type::Constant(r), Type::Constant(a)) =
+            (interner.get(entry), interner.get(v_ty))
+        {
+            if let Some(scalar) = crate::folding::fold(r, op, &[a.clone()]) {
+                return interner.intern(Type::Constant(scalar));
+            }
+        }
+        let class = self.index.class_name_of(interner, entry);
+        match class.and_then(|c| rigor_index::method_return(c, op)) {
+            Some(ret) => self.nominal_or_untyped(ret, interner),
+            None => interner.untyped(),
+        }
     }
 
     /// The merge tail of [`Self::join_arm_writes`]: every name an arm env

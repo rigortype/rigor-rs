@@ -22,7 +22,7 @@ pub mod pre_eval;
 pub use ast::{
     lower, lower_with_key, AncestryFacts, BlockParamKind, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, ConstMutation, FileKey, HashKey, HashKeyTag,
     Compound, IndexTargetKey, IndexWrites, JumpKind, LoopKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
-    NodeId, ParamShape, RebindFacts, RebindReceiver, RebindSite, REBIND_METHOD_OBJECT_CALLS, RescueClause,
+    NodeId, OpWriteKind, ParamShape, RebindFacts, RebindReceiver, RebindSite, REBIND_METHOD_OBJECT_CALLS, RescueClause,
     Span, StatementsKind, Visibility,
 };
 

@@ -72,8 +72,16 @@ pub enum Node {
     /// READS its target (it reads-then-writes), so the dead-assignment walk counts
     /// this `name` as a READ — and it is NOT itself a fireable dead-write candidate
     /// (the reference's collector fires only on plain `LocalVariableWriteNode`).
-    /// `value` is lowered for call reachability.
-    LocalVariableOpWrite { name: String, value: NodeId, span: Span },
+    /// `value` is lowered for call reachability. `op` records which of the
+    /// three write kinds it was — the sig-gen def-local replay folds `a ||= v`
+    /// / `a &&= v` as their logical unions and `a <binop>= v` as a `binop`
+    /// dispatch (rigor-rs#548).
+    LocalVariableOpWrite {
+        name: String,
+        value: NodeId,
+        op: OpWriteKind,
+        span: Span,
+    },
     /// A multiple assignment (`a, b = rhs`, `a, (b, c), *rest = rhs`) — Prism's
     /// `MultiWriteNode`. `targets` is the `lefts`/`rest`/`rights` triple; `value`
     /// is the lowered right-hand side.
@@ -1011,4 +1019,16 @@ impl Node {
             | Node::Alias { span, .. } => *span,
         }
     }
+}
+
+/// Which operator-write a [`Node::LocalVariableOpWrite`] lowered from.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum OpWriteKind {
+    /// `a &&= v` — writes `v` only when `a` was truthy.
+    And,
+    /// `a ||= v` — writes `v` only when `a` was falsy.
+    Or,
+    /// `a <binop>= v` — `a = a.<binop>(v)`; `binop` is the operator method name
+    /// (`"+"`, `"-"`, …).
+    Operator(String),
 }
