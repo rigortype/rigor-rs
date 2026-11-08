@@ -264,14 +264,16 @@ fn tail_return_types_as_its_value_and_dedups() {
 }
 
 #[test]
-fn block_return_is_barriered_and_multi_return_skips() {
-    // A return inside a block is barriered (reference RETURN_BARRIER_NODES —
-    // union is tail-only); a multi-value return skips the method (the
-    // reference silently drops its type, an unsound emit we do not adopt).
+fn block_return_is_collected_and_multi_return_skips() {
+    // A return inside an ORDINARY block exits the method and the reference
+    // collects it (`ReturnBarrier`, issue #1382 — oracle-probed at the pin:
+    // `("s" | 5)`); only a nested def / lambda / define_method body is a
+    // barrier. A multi-value return skips the method (the reference silently
+    // drops its type and emits `"s"`, an unsound emit we do not adopt).
     let src = "class A\n  def b(x)\n    [1].each { return 5 }\n    \"s\"\n  end\n  def m(x)\n    return 1, 2 if x\n    \"s\"\n  end\nend\n";
     let cs = candidates_tagged("blockret", src, false);
-    assert_eq!(cs.len(), 1, "only the block-barriered method emits: {cs:?}");
-    assert_eq!(cs[0].rbs, "def b: (untyped) -> \"s\"");
+    assert_eq!(cs.len(), 1, "only the block-return method emits: {cs:?}");
+    assert_eq!(cs[0].rbs, "def b: (untyped) -> (\"s\" | 5)");
 }
 
 #[test]
@@ -1590,4 +1592,862 @@ fn tighter_return_declines_closed_literal_computations() {
     let cs = tighter_rows("c4", "def n = 4.2", "def n: () -> Numeric");
     assert_eq!(cs.len(), 1, "{cs:?}");
     assert_eq!(cs[0].rbs, "def n: () -> Float");
+}
+
+/// `method name -> emitted rbs` for every def in `body` the port EMITS, under
+/// `class K` (a declined method has no entry).
+fn def_rows(tag: &str, body: &str) -> HashMap<String, String> {
+    let src = format!("class K\n{body}\nend\n");
+    candidates_tagged(tag, &src, false)
+        .into_iter()
+        .map(|c| (c.method_name, c.rbs))
+        .collect()
+}
+
+#[test]
+fn def_local_env_binds_straight_line_writes() {
+    // rigor-rs#546 brief rows — byte-identical to the reference
+    // (`sig-gen --print`, oracle-probed): a method-local read in the tail binds
+    // the literal it was written with; branches join (an unrun arm adds the
+    // entry binding, `nil` when the name was unbound).
+    let rows = def_rows(
+        "def_local_brief",
+        "def z; a = 1; a; end\n\
+         def j1(c); x = if c; 1; end; x; end\n\
+         def j2(c); a = 1; if c; a = \"s\"; end; a; end\n\
+         def j3(c); a = 1; unless c; a = :s; end; a; end\n\
+         def j4(c); a = c ? 1 : 2; a; end\n\
+         def j6(c); a = 1; a = \"s\" if c; a; end\n\
+         def j9(c); a = 1; while c; a = \"s\"; end; a; end\n\
+         def j11(c); a = 1; return a if c; a = 2; a; end\n\
+         def j15(c); a = :initial; if c; return a; end; a = 100; a; end\n\
+         def q5(c); a = \"x\"; a = a.upcase; a; end\n\
+         def q6(c); r = []; r << 1; r = [2]; r; end",
+    );
+    assert_eq!(rows["z"], "def z: () -> 1");
+    assert_eq!(rows["j1"], "def j1: (untyped) -> (1 | nil)");
+    assert_eq!(rows["j2"], "def j2: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["j3"], "def j3: (untyped) -> (1 | :s)");
+    assert_eq!(rows["j4"], "def j4: (untyped) -> (1 | 2)");
+    assert_eq!(rows["j6"], "def j6: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["j9"], "def j9: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["j11"], "def j11: (untyped) -> (1 | 2)");
+    assert_eq!(rows["j15"], "def j15: (untyped) -> (100 | :initial)");
+    assert_eq!(rows["q5"], "def q5: (untyped) -> \"X\"");
+    // A fresh literal after the mutation is a fresh carrier again.
+    assert_eq!(rows["q6"], "def q6: (untyped) -> [2]");
+}
+
+#[test]
+fn def_local_env_declines_a_literal_the_body_mutates() {
+    // rigor-rs#546 review: the reference WIDENS a literal-bound local after an
+    // in-place mutation (`Array[untyped]`, `String`, `Hash[untyped, untyped]`);
+    // the port declines it (the stale `[]` / `"abc"` would be an unsound
+    // signature — master skipped every one). A coverage loss, never a wrong
+    // type. Every row below is a method the reference emits with the widened
+    // type (`Array[untyped]`, `String`, `Hash[untyped, untyped]`, ...).
+    let rows = def_rows(
+        "def_local_mutated",
+        "def c1(items); r = []; items.each { |i| r << i }; r; end\n\
+         def c2(items); r = []; r << 1; r; end\n\
+         def c3(items); s = \"\"; s << \"a\"; s; end\n\
+         def c4(items); s = \"\"; s += \"a\"; s; end\n\
+         def c5(items); h = {}; h[:a] = 1; h; end\n\
+         def c6(items); s = \"abc\"; s.upcase!; s; end\n\
+         def c7(items); s = \"x\"; s.concat(\"d\"); s; end\n\
+         def c8(items); a = [1]; a.push(2); a; end\n\
+         def c9(items); a = [1]; a.map!(&:to_s); a; end\n\
+         def c10(items); s = \"x\"; s[0] = \"y\"; s; end\n\
+         def c13(items); s = \"x\"; items.each { |i| s << i }; s; end\n\
+         def c14(items); a = [1, 2]; a.clear; a; end\n\
+         def c15(items); h = {a: 1}; h.delete(:a); h; end\n\
+         def c16(items); s = \"x\"; s.replace(\"yy\"); s; end\n\
+         def e10(c); a = [[1]]; a[0] << 2; a; end\n\
+         def e11(c); a = [1]; l = -> { a << 2 }; l.call; a; end\n\
+         def e12(c); h = {a: 1}; h[:a] += 1; h; end\n\
+         def e13(c); h = {a: 1}; h[:b] ||= 2; h; end\n\
+         def e17(c); a = [1]; a.push(2) if c; a; end\n\
+         def e18(c); a = [1]; while c; a << 2; end; a; end\n\
+         def e32(c); a = [1]; a.concat([2]).size; a; end\n\
+         def e34(c); a = [1]; a.tap { |t| t << 2 }; a; end\n\
+         def e36(c); a = [1]; a&.push(2); a; end",
+    );
+    assert!(rows.is_empty(), "every mutated local must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_keeps_what_a_call_cannot_invalidate() {
+    // Controls that still match the reference byte for byte: a non-mutating
+    // call on the local, an alias the reference does not widen either, an
+    // immutable scalar, and a bare `String` nominal.
+    let rows = def_rows(
+        "def_local_controls",
+        "def c11(items); s = String.new; s << \"a\"; s; end\n\
+         def e3(c); a = [1]; a.each { |x| x }; a; end\n\
+         def e5(c); s = \"a\"; t = s.upcase; s; end\n\
+         def e6(c); a = [1]; a.freeze; a; end\n\
+         def e7(c); a = [1]; x = a.size; a; end\n\
+         def e8(c); a = [1]; b = a.map { |i| i }; a; end\n\
+         def e28(c); a = [1]; a.first; a; end\n\
+         def n1(c); x = 1; x.succ!; x; end",
+    );
+    assert_eq!(rows["c11"], "def c11: (untyped) -> String");
+    for name in ["e3", "e6", "e7", "e8", "e28"] {
+        assert_eq!(rows[name], format!("def {name}: (untyped) -> [1]"), "{name}");
+    }
+    assert_eq!(rows["e5"], "def e5: (untyped) -> \"a\"");
+}
+
+#[test]
+fn def_local_env_declines_a_local_handed_to_a_callee() {
+    // rigor-rs#546 review 2: the reference's callee-mutated-parameter
+    // analysis (`StatementEvaluator#argument_mutating_callees`) widens a
+    // local passed to a project def (self-call, `Const.m`, `Const.new.m`),
+    // to a lambda / proc / `method(:x)` run through `call` / `.()`, and to
+    // a `send` hand-off (`Array[untyped]`, `String`, `Hash[untyped,
+    // untyped]`, `Integer` for `r.size`). The port does not resolve callees:
+    // a stale-able literal local passed as an argument (positional, keyword
+    // value, splat, `&blk`) to any call declines. The reference emits the
+    // widened type for every `r*` / `a1`, `a3`..`a8`-style row (probed); on
+    // `a2` it emits `Array[untyped] | [1]`, and on `a9` (splat), `b4`
+    // (`i[a]`), `b7` (undefined `foo`) and `b8` (unknown receiver) it keeps
+    // `[1]` — those four are disclosed over-declines (a coverage loss).
+    let src = "class K\n\
+        class Helper\n\
+          def self.fill(acc); acc << 1; end\n\
+          def add(acc); acc << 1; end\n\
+        end\n\
+        def collect(acc, n); acc << n; end\n\
+        def kw(a:, b: 1); a << b; end\n\
+        def r1(items); r = []; collect(r, 1); r; end\n\
+        def r2(items); r = []; items.each { |i| collect(r, i) }; r; end\n\
+        def r3(items); r = []; Helper.fill(r); r; end\n\
+        def r4(items); r = []; Helper.new.add(r); r; end\n\
+        def r5(items); r = \"\"; collect(r, 1); r; end\n\
+        def r6(items); r = {}; collect(r, 1); r; end\n\
+        def r7(items); r = [1]; collect(r, 1); r.size; end\n\
+        def r8(items); a = [1]; helper = ->(z) { z << 2 }; helper.(a); a; end\n\
+        def r9(items); r = []; pr = proc { |x| x << 1 }; pr.call(r); r; end\n\
+        def r10(items); r = []; send(:collect, r, 1); r; end\n\
+        def a1(i); a = [1]; b = a; collect(b, 1); b; end\n\
+        def a2(i); a = [1]; collect(a, 1) if i; a; end\n\
+        def a3(i); a = [1]; kw(a: a); a; end\n\
+        def a4(i); a = [1]; collect(a, &:x); a; end\n\
+        def a5(i); a = [1]; method(:collect).call(a, 1); a; end\n\
+        def a6(i); a = [1]; i.each { collect(a, 1) }; a; end\n\
+        def a7(i); a = [1]; self.collect(a, 1); a; end\n\
+        def a8(i); a = [1]; kw(a:); a; end\n\
+        def a9(i); a = [1]; collect(*a); a; end\n\
+        def b1(i); a = [1]; l = ->(x) { x }; l.call(a); a; end\n\
+        def b2(i); a = [1]; i.call(a); a; end\n\
+        def b3(i); a = [1]; i.(a); a; end\n\
+        def b4(i); a = [1]; i[a]; a; end\n\
+        def b5(i); a = [1]; send(:collect, a, 1); a; end\n\
+        def b6(i); a = [1]; public_send(:collect, a, 1); a; end\n\
+        def b7(i); a = [1]; foo(a); a; end\n\
+        def b8(i); a = [1]; i.m(a); a; end\n\
+      end\n";
+    let rows: HashMap<String, String> = candidates_tagged("def_local_callee_args", src, false)
+        .into_iter()
+        .map(|c| (c.method_name, c.rbs))
+        .collect();
+    for n in [
+        "r1", "r2", "r3", "r4", "r5", "r6", "r7", "r8", "r9", "r10", "a1", "a2", "a3", "a4", "a5",
+        "a6", "a7", "a8", "a9", "b1", "b2", "b3", "b4", "b5", "b6", "b7", "b8",
+    ] {
+        assert!(!rows.contains_key(n), "{n} must decline: {rows:?}");
+    }
+}
+
+#[test]
+fn def_local_env_keeps_what_no_callee_receives() {
+    // Controls that still match the reference byte for byte: the local is a
+    // receiver (`a.size`), an operand of an operator, a container element
+    // (`[a, 1]`, `{k: a}`), interpolated, or the argument of an immutable
+    // type (`Integer`); a nested call is judged on its own arguments.
+    let rows = def_rows(
+        "def_local_callee_controls",
+        "def collect(acc, n = 0); acc << n; end\n\
+         def k1(i); a = [1]; x = a.size; a; end\n\
+         def k2(i); a = [1]; x = [1] + a; a; end\n\
+         def k3(i); a = [1]; x = [a, 1]; a; end\n\
+         def k4(i); a = [1]; x = {k: a}; a; end\n\
+         def k5(i); a = [1]; x = \"#{a}\"; a; end\n\
+         def k6(i); a = [1]; x = a == a; a; end\n\
+         def k7(i); n = 1; collect(n); n; end\n\
+         def k8(i); a = [1]; collect(a.dup); a; end\n\
+         def k9(i); a = [1]; collect(a.size); a; end\n\
+         def k10(i); a = [1]; collect(i, a.first); a; end\n\
+         def k11(i); a = [1]; b = [2]; collect(b); a; end",
+    );
+    for n in ["k1", "k2", "k3", "k4", "k5", "k6", "k8", "k9", "k10", "k11"] {
+        assert_eq!(rows[n], format!("def {n}: (untyped) -> [1]"), "{n}");
+    }
+    assert_eq!(rows["k7"], "def k7: (untyped) -> 1");
+}
+
+#[test]
+fn def_local_env_declines_a_loop_the_reference_folds() {
+    // The reference folds a loop predicate over constant-bound locals
+    // (`while i < 3` over `i = 0` is `bot`; `while i > 3` never enters and
+    // keeps `i`); the zero-or-more join would emit `("s" | 0)`. A bare literal
+    // predicate is not folded there, so the join stays. A `return` in a loop
+    // body that reads a name the loop later writes or mutates is typed against
+    // the loop-carried binding — declined, not the entry literal.
+    let rows = def_rows(
+        "def_local_loops",
+        "def m14; i = 0; while i < 3; i = \"s\"; end; i; end\n\
+         def w4(c); i = 0; while i > 3; i = \"s\"; end; i; end\n\
+         def w2(c); a = 1; while true; a = \"s\"; end; a; end\n\
+         def l1(c); a = 1; while c; return a if c.x; a = \"s\"; end; nil; end\n\
+         def l2(c); a = [1]; while c; return a if c.x; a << 2; end; nil; end\n\
+         def l4(c); a = 1; while c; return a if c.x; end; nil; end\n\
+         def d1(c); x = 1; l = -> { x = \"s\" }; l.call; x; end",
+    );
+    for name in ["m14", "w4", "l1", "l2", "d1"] {
+        assert!(!rows.contains_key(name), "{name} must decline: {rows:?}");
+    }
+    assert_eq!(rows["w2"], "def w2: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["l4"], "def l4: (untyped) -> (1 | nil)");
+}
+
+#[test]
+fn def_local_env_parameter_shadows_a_file_level_local() {
+    // A parameter is a fresh binding: `x = "top"; def b2(x); x; end` reads the
+    // argument, not the file-level `"top"` (the reference skips it; pre-#546
+    // the port leaked the file env into the def body).
+    let cs = candidates_tagged(
+        "def_local_param_shadow",
+        "x = \"top\"\nclass K\n  def b2(x); x; end\n  def b3(y); x; end\nend\n",
+        false,
+    );
+    assert!(cs.is_empty(), "{cs:?}");
+}
+
+#[test]
+fn def_local_env_declined_override_demotes_the_base() {
+    // A tail the def-local env declines types as `untyped` — the method skips as
+    // an UNTYPED RETURN (a counted reason), not a silent port-only drop — so the
+    // base-method demotion still reads the override as unsigned. (`for` is
+    // rigor-rs#546 review 3 (B): the reference skips `for x in w; x.go; end`
+    // too, and with it the base `A#e` — oracle: no candidates at all.)
+    let src = "class A\n  def e(w); true; end\n  def f(w); 2; end\nend\nclass S < A\n  def e(w); for x in w; x.go; end; end\n  def f(w); a = 1; raise \"x\" if a.nil?; w.go; end\nend\n";
+    let cs = candidates_tagged("def_local_override", src, false);
+    assert!(cs.is_empty(), "{cs:?}");
+}
+
+#[test]
+fn def_local_env_ensure_is_not_the_tail() {
+    // rigor-rs#546 review 3 (A): an `ensure` body's value is discarded — the
+    // method returns the protected body's tail; the port typed the ensure's last
+    // statement (`def e3(v); 5; ensure; @m = false; end` → `false`). A tail that
+    // reads an unmodelled protected body declines.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_ensure_is_not_the_tail",
+        r##"
+def e3(v); 5; ensure; @m = false; end
+def e6(v); begin; 5; ensure; @m = false; end; end
+def e1; @m = true; yield; ensure; @m = false; end
+def e2(v); v.foo; ensure; @m = false; end
+def e4(v); begin; 1; ensure; return 2; end; end
+def e5(v); begin; begin; 1; ensure; 2; end; ensure; 3; end; end
+def e7(v); a = 1; begin; a = 2; ensure; a = 3; end; a; end
+def e8(c); a = 1; begin; a = 2; c.x; ensure; a; end; end
+def e9(c); 5; rescue; 6; ensure; 7; end
+def mute(v); @mute, old = true, @mute; v.go; ensure; @mute = old; end
+def use(v); @in_use = true; yield v; ensure; @in_use = false; end
+"##,
+    );
+    assert_eq!(rows["e3"], r##"def e3: (untyped) -> 5"##);
+    assert_eq!(rows["e6"], r##"def e6: (untyped) -> 5"##);
+    assert!(!rows.contains_key("e1"), "e1 must decline: {rows:?}");
+    assert!(!rows.contains_key("e2"), "e2 must decline: {rows:?}");
+    assert_eq!(rows["e4"], r##"def e4: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["e5"], r##"def e5: (untyped) -> 1"##);
+    assert_eq!(rows["e7"], r##"def e7: (untyped) -> 3"##);
+    assert!(!rows.contains_key("e8"), "e8 must decline: {rows:?}");
+    assert_eq!(rows["e9"], r##"def e9: (untyped) -> (5 | 6)"##);
+    assert!(!rows.contains_key("mute"), "mute must decline: {rows:?}");
+    assert!(!rows.contains_key("use"), "use must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_loop_tail_values() {
+    // rigor-rs#546 review 3 (B): a loop tail is `nil` only for a plain
+    // `while`/`until` — `break v` joins its value, `for` returns its collection.
+    // The port typed every loop `nil`.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_loop_tail_values",
+        r##"
+def w0(v); while v; v.x; end; end
+def w3(v); until v; v.x; end; end
+def w9(v); while v; [1].each { |x| break }; end; end
+def w1(v); while v; break 1; end; end
+def w2(v); i = 0; while i < 3; i += 1; break :x if v; end; end
+def w4(v); until v; break "s"; end; end
+def w5(v); while v; break; end; end
+def w8(v); a = [1]; for x in a; x; end; end
+def w6(v); for x in [1, 2]; end; end
+def w7(v); for x in 1..3; x; end; end
+def w10(v); if v; for x in [1]; end; else; 2; end; end
+def p1(v); for x in v do; x; end; end
+def w11(v); begin; v.x; end while v; end
+def w12(v); v.x while v; end
+def dfs(v); v.each { |i| i }; for i in v; i.x; end; end
+"##,
+    );
+    assert_eq!(rows["w0"], r##"def w0: (untyped) -> nil"##);
+    assert_eq!(rows["w3"], r##"def w3: (untyped) -> nil"##);
+    assert!(!rows.contains_key("w9"), "w9 must decline: {rows:?}");
+    assert!(!rows.contains_key("w1"), "w1 must decline: {rows:?}");
+    assert!(!rows.contains_key("w2"), "w2 must decline: {rows:?}");
+    assert!(!rows.contains_key("w4"), "w4 must decline: {rows:?}");
+    assert!(!rows.contains_key("w5"), "w5 must decline: {rows:?}");
+    assert!(!rows.contains_key("w8"), "w8 must decline: {rows:?}");
+    assert!(!rows.contains_key("w6"), "w6 must decline: {rows:?}");
+    assert!(!rows.contains_key("w7"), "w7 must decline: {rows:?}");
+    assert!(!rows.contains_key("w10"), "w10 must decline: {rows:?}");
+    assert!(!rows.contains_key("p1"), "p1 must decline: {rows:?}");
+    assert!(!rows.contains_key("w11"), "w11 must decline: {rows:?}");
+    assert_eq!(rows["w12"], r##"def w12: (untyped) -> nil"##);
+    assert!(!rows.contains_key("dfs"), "dfs must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_op_write_and_else_tails() {
+    // A tail `a += 1` keeps the operand, not the operator (the reference folds `a
+    // + 1`); a `begin` with an `else` returns the else's value.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_op_write_and_else_tails",
+        r##"
+def o1(c); a = 1; a += 1; end
+def o2(c); a = 1; a -= 1; end
+def o3(c); a = 1; a += 1; a; end
+def x1(c); begin; 1; rescue; 2; else; 3; end; end
+def x2(c); begin; 1; rescue; 2; else; end; end
+def x3(c); begin; 1; rescue; 2; end; end
+def x4(c); a = 1; begin; c.x; rescue; a = 2; end; a; end
+def x5(c); a = 1; begin; a = 2; c.x; rescue; end; a; end
+def x6(c); a = 1; begin; a = 2; c.x; rescue; a; end; end
+def x7(c); a = 1; begin; c.x; rescue; a; end; end
+def x8(c); begin; c.x; rescue => e; e; end; end
+def x9(c); n = 0; begin; n += 1; c.x; 2; rescue; retry if n < 3; 3; end; end
+def x10(c); a = 1; begin; c.x; rescue; 0; else; a = 2; end; a; end
+"##,
+    );
+    assert!(!rows.contains_key("o1"), "o1 must decline: {rows:?}");
+    assert!(!rows.contains_key("o2"), "o2 must decline: {rows:?}");
+    assert!(!rows.contains_key("o3"), "o3 must decline: {rows:?}");
+    assert!(!rows.contains_key("x1"), "x1 must decline: {rows:?}");
+    assert!(!rows.contains_key("x2"), "x2 must decline: {rows:?}");
+    assert_eq!(rows["x3"], r##"def x3: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["x4"], r##"def x4: (untyped) -> (1 | 2)"##);
+    assert!(!rows.contains_key("x5"), "x5 must decline: {rows:?}");
+    assert!(!rows.contains_key("x6"), "x6 must decline: {rows:?}");
+    assert!(!rows.contains_key("x7"), "x7 must decline: {rows:?}");
+    assert!(!rows.contains_key("x8"), "x8 must decline: {rows:?}");
+    assert!(!rows.contains_key("x9"), "x9 must decline: {rows:?}");
+    assert!(!rows.contains_key("x10"), "x10 must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_def_level_rescue_and_ensure_returns() {
+    // A def whose body is a `rescue` / `ensure` chain lowers to one region
+    // spanning the whole def; `collect_explicit_returns` took the def itself for a
+    // nested barrier and dropped every `return` (master hid it: a BeginRescue tail
+    // typed untyped). `def g1(c); 5; ensure; return 3; end` is `(3 | 5)`.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_def_level_rescue_and_ensure_returns",
+        r##"
+def g1(c); 5; ensure; return 3; end
+def g2(c); begin; return; 7; rescue; 8; end; end
+def g3(c); 5; rescue; return 4 if c; 6; end
+def g4(c); begin; 5; ensure; return 3; end; end
+def g5(c); return 1 if c; 5; ensure; 7; end
+def g6(c); 5; rescue; return; end
+def g7(c); begin; return 2; ensure; 3; end; end
+def g8(c); a = 1; a = 2 if c; a; rescue; a; end
+def g9(c); a = 1; a + 1; ensure; return (a || 3); end
+"##,
+    );
+    assert_eq!(rows["g1"], r##"def g1: (untyped) -> (3 | 5)"##);
+    assert!(!rows.contains_key("g2"), "g2 must decline: {rows:?}");
+    assert_eq!(rows["g3"], r##"def g3: (untyped) -> (4 | 5 | 6)"##);
+    assert_eq!(rows["g4"], r##"def g4: (untyped) -> (3 | 5)"##);
+    assert_eq!(rows["g5"], r##"def g5: (untyped) -> (1 | 5)"##);
+    assert_eq!(rows["g6"], r##"def g6: (untyped) -> (5 | nil)"##);
+    assert_eq!(rows["g7"], r##"def g7: (untyped) -> 2"##);
+    assert!(!rows.contains_key("g8"), "g8 must decline: {rows:?}");
+    assert!(!rows.contains_key("g9"), "g9 must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_block_returns_tail_env_and_loop_carried() {
+    // A `return` in an ORDINARY block exits the method and the reference collects
+    // it (ReturnBarrier, #1382: only a nested `def`, a lambda and `define_method`
+    // / `Kernel#lambda` bodies are barriers) — the port treated every block as a
+    // barrier and took a lambda's `return` for the method's. The tail is typed in
+    // the env BEFORE the tail statement runs (the whole-body env already carried
+    // the tail construct's own writes). A name a loop both reads and writes is
+    // carried to the next iteration.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_block_returns_tail_env_and_loop_carried",
+        r##"
+def rb1(c); c.each { |i| return "s" }; 1; end
+def rb3(c); l = -> { return "s" }; 1; end
+def rb7(c); a = nil; c.each { |i| return "s" }; a; end
+def rb10(c); x = c.map { |i| return 7 }; 2; end
+def rb11(c); lambda { return 1 }; 2; end
+def rb12(c); proc { return 1 }; 2; end
+def rb13(c); c.send(:define_method, :x) { return 1 }; 2; end
+def rb15(c); foo.lambda { return 1 }; 2; end
+def rb8(c); i = 1; c.each { |i| return i }; 2; end
+def tt1(c); a = 1; if c; a = "s"; 5; else; a; end; end
+def tt2(c); a = 1; case c; when 1; a = "s"; 5; else; a; end; end
+def lc1(c); a = :s; until c.x; a = [a]; end; a; end
+def lc2(c); a = 1; while c; a = "s"; end; a; end
+def dd1(c); begin; a = []; return []; @i = a; ensure; ; end; end
+"##,
+    );
+    assert_eq!(rows["rb1"], r##"def rb1: (untyped) -> ("s" | 1)"##);
+    assert_eq!(rows["rb3"], r##"def rb3: (untyped) -> 1"##);
+    assert_eq!(rows["rb7"], r##"def rb7: (untyped) -> ("s" | nil)"##);
+    assert_eq!(rows["rb10"], r##"def rb10: (untyped) -> (2 | 7)"##);
+    assert_eq!(rows["rb11"], r##"def rb11: (untyped) -> 2"##);
+    assert_eq!(rows["rb12"], r##"def rb12: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["rb13"], r##"def rb13: (untyped) -> 2"##);
+    assert_eq!(rows["rb15"], r##"def rb15: (untyped) -> (1 | 2)"##);
+    assert!(!rows.contains_key("rb8"), "rb8 must decline: {rows:?}");
+    assert_eq!(rows["tt1"], r##"def tt1: (untyped) -> (1 | 5)"##);
+    assert_eq!(rows["tt2"], r##"def tt2: (untyped) -> (1 | 5)"##);
+    assert!(!rows.contains_key("lc1"), "lc1 must decline: {rows:?}");
+    assert_eq!(rows["lc2"], r##"def lc2: (untyped) -> ("s" | 1)"##);
+    assert!(!rows.contains_key("dd1"), "dd1 must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_declines_a_call_the_port_does_not_fold() {
+    // The reference folds a pure call on a constant receiver to a constant (`a =
+    // 1.5; a.to_s` is the string 1.5); the port folds only some and types the rest
+    // as the RBS nominal (`String`) — a shared-method byte mismatch the def-local
+    // env exposed through locals (a literal receiver, `1.5.to_s`, is the pre-
+    // existing gap master shares). A call on a def-local constant carrier whose
+    // result is a scalar / array / hash nominal declines; a folded `Constant`
+    // result is kept.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_a_call_the_port_does_not_fold",
+        r##"
+def ft1(c); a = 1.5; a.to_s; end
+def ft2(c); a = [1]; a.to_s; end
+def ft3(c); a = {a: 1}; a.size; end
+def ft4(c); a = "ab"; a.strip; end
+def ft5(c); a = :s; a.upcase; end
+def ft6(c); a = 1; a.to_s; end
+def ft7(c); a = "x"; a.upcase; end
+def ft8(c); a = [1, 2]; a.size; end
+def ft9(c); a = 5; a * 2; end
+def ft10(c); a = "ab"; a.length; end
+def ft11(c); a = {a: 1}; a[:a]; end
+"##,
+    );
+    assert!(!rows.contains_key("ft1"), "ft1 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft2"), "ft2 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft3"), "ft3 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft4"), "ft4 must decline: {rows:?}");
+    assert!(!rows.contains_key("ft5"), "ft5 must decline: {rows:?}");
+    assert_eq!(rows["ft6"], r##"def ft6: (untyped) -> "1""##);
+    assert_eq!(rows["ft7"], r##"def ft7: (untyped) -> "X""##);
+    assert_eq!(rows["ft8"], r##"def ft8: (untyped) -> 2"##);
+    assert_eq!(rows["ft9"], r##"def ft9: (untyped) -> 10"##);
+    assert_eq!(rows["ft10"], r##"def ft10: (untyped) -> 2"##);
+    assert_eq!(rows["ft11"], r##"def ft11: (untyped) -> 1"##);
+}
+
+#[test]
+fn def_local_env_declines_a_hole_in_a_generic_slot() {
+    // A def-local the replay declines reads `untyped`; inside a non-symbol-key
+    // Hash literal that lands in a generic type-arg slot (`Hash[String,
+    // untyped]`), which the buried-untyped guard exempts as an elaborated form —
+    // the reference has the precise value union
+    // (`Rack::Directory#check_bad_request`: `Hash[String, \"12\" | ...]`). A tail
+    // that reads a def-written local and carries such a hole declines; a literal
+    // tuple of typed locals is kept.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_a_hole_in_a_generic_slot",
+        r##"
+def rk1(p); return if p.x; body = "Bad"; [400, { "ct" => "t", "cl" => body.bytesize.to_s }, [body]]; end
+def rk2(c); a = 1; [a, { "k" => a }]; end
+def rk3(c); a = "s"; [a, a]; end
+"##,
+    );
+    assert!(!rows.contains_key("rk1"), "rk1 must decline: {rows:?}");
+    assert_eq!(rows["rk2"], r##"def rk2: (untyped) -> [1, Hash[String, 1]]"##);
+    assert_eq!(rows["rk3"], r##"def rk3: (untyped) -> ["s", "s"]"##);
+}
+
+#[test]
+fn def_local_env_folds_a_literal_decision() {
+    // The reference constant-folds a decision built from literals (`if true`, `if
+    // 1 > 2`, `x = 5 if (y = 3)`); `type_of(If)` elides the dead arm, so the tail
+    // replay and the statement replay must too — master emitted `1` for `if true;
+    // 1; else; 2; end`, the replay joined both arms.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_folds_a_literal_decision",
+        r##"
+def k1(c); if true; 1; else; 2; end; end
+def k2(c); if nil; 1; else; 2; end; end
+def k3(c); if 1; 1; else; 2; end; end
+def k4(c); if (a = 2); 1; else; 2; end; end
+def k6(c); 1 if true; end
+def k7(c); x = nil; x = 5 if true; x; end
+def k8(c); x = nil; x = 5 if nil; x; end
+def k9(c); x = nil; x = 5 if (y = 3); x; end
+def k12(c); x = 1; x = 5 if 1 == 1; x; end
+def k16(c); x = 1; x = 5 if 1 > 2; x; end
+def k17(c); x = 1; if "a" == "b"; x = 2; end; x; end
+def k18(c); true ? 1 : 2; end
+def k19(c); (c; 1) ? 3 : 4; end
+def k20(c); x = 1; x = 2 if (c; true); x; end
+def k22(c); x = 1; x = 2 if true && false; x; end
+def k23(c); x = 1; x = 2 if [1]; x; end
+def k24(c); x = 1; x = 2 if "s"; x; end
+def k31(c); x = 1; x = 2 if c; x; end
+"##,
+    );
+    assert_eq!(rows["k1"], r##"def k1: (untyped) -> 1"##);
+    assert_eq!(rows["k2"], r##"def k2: (untyped) -> 2"##);
+    assert_eq!(rows["k3"], r##"def k3: (untyped) -> 1"##);
+    assert_eq!(rows["k4"], r##"def k4: (untyped) -> 1"##);
+    assert_eq!(rows["k6"], r##"def k6: (untyped) -> 1"##);
+    assert_eq!(rows["k7"], r##"def k7: (untyped) -> 5"##);
+    assert_eq!(rows["k8"], r##"def k8: (untyped) -> nil"##);
+    assert_eq!(rows["k9"], r##"def k9: (untyped) -> 5"##);
+    assert_eq!(rows["k12"], r##"def k12: (untyped) -> 5"##);
+    assert_eq!(rows["k16"], r##"def k16: (untyped) -> 1"##);
+    assert_eq!(rows["k17"], r##"def k17: (untyped) -> 1"##);
+    assert_eq!(rows["k18"], r##"def k18: (untyped) -> 1"##);
+    assert!(!rows.contains_key("k19"), "k19 must decline: {rows:?}");
+    assert!(!rows.contains_key("k20"), "k20 must decline: {rows:?}");
+    assert!(!rows.contains_key("k22"), "k22 must decline: {rows:?}");
+    assert_eq!(rows["k23"], r##"def k23: (untyped) -> 2"##);
+    assert_eq!(rows["k24"], r##"def k24: (untyped) -> 2"##);
+    assert_eq!(rows["k31"], r##"def k31: (untyped) -> (1 | 2)"##);
+}
+
+#[test]
+fn def_local_env_declines_writes_the_replay_does_not_walk() {
+    // A local written in a predicate, argument, interpolation, value operand,
+    // `for` index, `rescue => e` or pattern is stale after the statement; the
+    // reference re-types it (`a = 1; if (a = "s"); end; a` → `"s"`).
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_writes_the_replay_does_not_walk",
+        r##"
+def s1(c); a = 1; if (a = "s"); end; a; end
+def s2(c); a = 1; case (a = "s"); when 1; end; a; end
+def s3(c); a = 1; while (a = "s"); break; end; a; end
+def s4(c); a = 1; foo(a = "s"); a; end
+def s5(c); a = 1; c.foo(a = "s"); a; end
+def s6(c); a = 1; [a = "s"]; a; end
+def s7(c); a = 1; "#{a = "s"}"; a; end
+def s8(c); a = 1; x = (a = "s"); a; end
+def s9(c); a = 1; @i = (a = "s"); a; end
+def s10(c); a = 1; x, y = (a = "s"), 1; a; end
+def s11(c); a = 1; c[a = "s"] = 1; a; end
+def s12(c); a = 1; ((a = "s") && c); a; end
+def s13(c); a = 1; !(a = "s"); a; end
+def s14(c); a = 1; p(a = "s"); a; end
+def s15(c); a = 1; (a = "s") rescue 1; a; end
+def s16(c); a = 1; c.foo rescue (a = "s"); a; end
+def s17(c); a = 1; for a in c; end; a; end
+def s18(c); a = 1; for i, a in c; end; a; end
+def s19(c); a = 1; begin; c.x; rescue => a; end; a; end
+def s20(c); a = 1; case c; in Integer => a; end; a; end
+def s21(c); a = 1; case [c]; in [a]; end; a; end
+def s22(c); a = 1; c => a; a; end
+def s23(c); a = 1; c in [a]; a; end
+def s24(c); a = 1; /(?<a>x)/ =~ c; a; end
+def s25(c); a = 1; x = (a = 2) if c; a; end
+def s26(c); a = 1; a = 2 and c; a; end
+def s27(c); a = 1; case c; in Integer; a = "s"; end; a; end
+def s28(c); a = 1; c ? (a = 2) : 3; a; end
+def s29(c); a = 1; c.each { |a| a }; a; end
+def s30(c); a = 1; def foo; a = 2; end; a; end
+def s31(c); a = 1; b = a; b = 2 if c; b; end
+"##,
+    );
+    assert!(!rows.contains_key("s1"), "s1 must decline: {rows:?}");
+    assert!(!rows.contains_key("s2"), "s2 must decline: {rows:?}");
+    assert!(!rows.contains_key("s3"), "s3 must decline: {rows:?}");
+    assert!(!rows.contains_key("s4"), "s4 must decline: {rows:?}");
+    assert!(!rows.contains_key("s5"), "s5 must decline: {rows:?}");
+    assert!(!rows.contains_key("s6"), "s6 must decline: {rows:?}");
+    assert!(!rows.contains_key("s7"), "s7 must decline: {rows:?}");
+    assert!(!rows.contains_key("s8"), "s8 must decline: {rows:?}");
+    assert!(!rows.contains_key("s9"), "s9 must decline: {rows:?}");
+    assert!(!rows.contains_key("s10"), "s10 must decline: {rows:?}");
+    assert!(!rows.contains_key("s11"), "s11 must decline: {rows:?}");
+    assert!(!rows.contains_key("s12"), "s12 must decline: {rows:?}");
+    assert!(!rows.contains_key("s13"), "s13 must decline: {rows:?}");
+    assert!(!rows.contains_key("s14"), "s14 must decline: {rows:?}");
+    assert!(!rows.contains_key("s15"), "s15 must decline: {rows:?}");
+    assert!(!rows.contains_key("s16"), "s16 must decline: {rows:?}");
+    assert!(!rows.contains_key("s17"), "s17 must decline: {rows:?}");
+    assert!(!rows.contains_key("s18"), "s18 must decline: {rows:?}");
+    assert!(!rows.contains_key("s19"), "s19 must decline: {rows:?}");
+    assert!(!rows.contains_key("s20"), "s20 must decline: {rows:?}");
+    assert!(!rows.contains_key("s21"), "s21 must decline: {rows:?}");
+    assert!(!rows.contains_key("s22"), "s22 must decline: {rows:?}");
+    assert!(!rows.contains_key("s23"), "s23 must decline: {rows:?}");
+    assert!(!rows.contains_key("s24"), "s24 must decline: {rows:?}");
+    assert!(!rows.contains_key("s25"), "s25 must decline: {rows:?}");
+    assert!(!rows.contains_key("s26"), "s26 must decline: {rows:?}");
+    assert!(!rows.contains_key("s27"), "s27 must decline: {rows:?}");
+    assert_eq!(rows["s28"], r##"def s28: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["s29"], r##"def s29: (untyped) -> 1"##);
+    assert_eq!(rows["s30"], r##"def s30: (untyped) -> 1"##);
+    assert_eq!(rows["s31"], r##"def s31: (untyped) -> (1 | 2)"##);
+}
+
+#[test]
+fn def_local_env_declines_a_decision_on_a_typed_local() {
+    // The reference narrows (and constant-folds) on a decision that reads a local
+    // it has typed (`a.nil?`, `a == 1`, `a ? a : 0`, `a&.succ`); the replay does
+    // not narrow, so it declined-nothing and emitted the looser `(1 | 5 | nil)` /
+    // a wrong `2`. Any statement or tail holding such a decision declines what it
+    // writes.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_a_decision_on_a_typed_local",
+        r##"
+def n1(c); a = nil; a = 1 if c; return 5 if a.nil?; a; end
+def n2(c); a = nil; a = 1 if c; return 5 unless a; a; end
+def n3(c); a = nil; a = 1 if c; if a; a; else; 0; end; end
+def n4(c); a = nil; a = 1 if c; a.nil? ? 0 : a; end
+def n5(c); a = nil; a = "s" if c; return 0 unless a.is_a?(String); a; end
+def n6(c); a = nil; a = 1 if c; a&.succ; end
+def n7(c); a = nil; a = 1 if c; raise "x" if a.nil?; a; end
+def n8(c); a = 1; if a == 1; a; else; "s"; end; end
+def n9(c); a = nil; a = 1 if c; x = (a.nil? ? 0 : a); x; end
+def n10(c); a = nil; a = 1 if c; case a; when nil; 0; else; a; end; end
+def n11(c); a = nil; a = 1 if c; while a.nil?; a = 2; end; a; end
+def n12(c); a = 1; case c; in Integer; 1; end; a = 2 if c; a; end
+def n13(c); a = 1; raise unless c.is_a?(Integer); a = 2 if c; a; end
+def n14(c); a = nil; a = 1 if c; a; end
+def n15(c); r = nil; r = 1 if c.a; r = 2 if c.b; r; end
+def n16(c); a = nil; a = 1 if c; x = a; x; end
+"##,
+    );
+    assert!(!rows.contains_key("n1"), "n1 must decline: {rows:?}");
+    assert!(!rows.contains_key("n2"), "n2 must decline: {rows:?}");
+    assert!(!rows.contains_key("n3"), "n3 must decline: {rows:?}");
+    assert!(!rows.contains_key("n4"), "n4 must decline: {rows:?}");
+    assert!(!rows.contains_key("n5"), "n5 must decline: {rows:?}");
+    assert!(!rows.contains_key("n6"), "n6 must decline: {rows:?}");
+    assert!(!rows.contains_key("n7"), "n7 must decline: {rows:?}");
+    assert!(!rows.contains_key("n8"), "n8 must decline: {rows:?}");
+    assert!(!rows.contains_key("n9"), "n9 must decline: {rows:?}");
+    assert!(!rows.contains_key("n10"), "n10 must decline: {rows:?}");
+    assert!(!rows.contains_key("n11"), "n11 must decline: {rows:?}");
+    assert!(!rows.contains_key("n12"), "n12 must decline: {rows:?}");
+    assert!(!rows.contains_key("n13"), "n13 must decline: {rows:?}");
+    assert_eq!(rows["n14"], r##"def n14: (untyped) -> (1 | nil)"##);
+    assert_eq!(rows["n15"], r##"def n15: (untyped) -> (1 | 2 | nil)"##);
+    assert_eq!(rows["n16"], r##"def n16: (untyped) -> (1 | nil)"##);
+}
+
+#[test]
+fn def_local_env_declines_a_terminating_arm() {
+    // The reference drops an arm that exits (`return`, `raise`, `exit`, a
+    // `bot`-typed helper) from the join; the port joined it (`if c; a = 2; raise;
+    // end; a` → `1`).
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_declines_a_terminating_arm",
+        r##"
+def t1(c); a = 1; if c; a = 2; raise "x"; end; a; end
+def t2(c); a = 1; if c; a = 2; return; end; a; end
+def t3(c); a = 1; if c; a = 2; return 7; end; a; end
+def t4(c); a = 1; unless c; a = 2; raise "x"; end; a; end
+def t5(c); a = 1; if c; a = 2; else; raise "x"; end; a; end
+def t6(c); a = 1; case c; when 1; a = 2; raise "x"; else; a = 3; end; a; end
+def t7(c); a = 1; if c; a = 2; exit; end; a; end
+def t8(c); a = 1; if c; a = 2; abort; end; a; end
+def t9(c); a = 1; if c; a = 2; throw :x; end; a; end
+def t10(c); a = 1; if c; a = 2; fail "x"; end; a; end
+def t11(c); a = 1; if c; a = 2; die; end; a; end
+def t12(c); a = 1; if c; a = 2; self.die; end; a; end
+def t13(c); a = 1; if c; a = 2; Kernel.exit; end; a; end
+def t14(c); a = 1; c && (a = 2; raise "x"); a; end
+def t15(c); a = 1; begin; c.x; rescue; a = 2; raise "x"; end; a; end
+def t16(c); a = 1; while c; a = 2; break; end; a; end
+def t17(c); a = 1; if c; a = 2; puts a; end; a; end
+def t18(c); a = 1; if c; return a; end; a = 2; a; end
+def t19(c); a = 1; if c; a = 2; else; a = 3; end; a; end
+"##,
+    );
+    assert!(!rows.contains_key("t1"), "t1 must decline: {rows:?}");
+    assert!(!rows.contains_key("t2"), "t2 must decline: {rows:?}");
+    assert!(!rows.contains_key("t3"), "t3 must decline: {rows:?}");
+    assert!(!rows.contains_key("t4"), "t4 must decline: {rows:?}");
+    assert!(!rows.contains_key("t5"), "t5 must decline: {rows:?}");
+    assert!(!rows.contains_key("t6"), "t6 must decline: {rows:?}");
+    assert!(!rows.contains_key("t7"), "t7 must decline: {rows:?}");
+    assert!(!rows.contains_key("t8"), "t8 must decline: {rows:?}");
+    assert!(!rows.contains_key("t9"), "t9 must decline: {rows:?}");
+    assert!(!rows.contains_key("t10"), "t10 must decline: {rows:?}");
+    assert!(!rows.contains_key("t11"), "t11 must decline: {rows:?}");
+    assert!(!rows.contains_key("t12"), "t12 must decline: {rows:?}");
+    assert!(!rows.contains_key("t13"), "t13 must decline: {rows:?}");
+    assert!(!rows.contains_key("t14"), "t14 must decline: {rows:?}");
+    assert!(!rows.contains_key("t15"), "t15 must decline: {rows:?}");
+    assert!(!rows.contains_key("t16"), "t16 must decline: {rows:?}");
+    assert_eq!(rows["t17"], r##"def t17: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["t18"], r##"def t18: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["t19"], r##"def t19: (untyped) -> (2 | 3)"##);
+}
+
+/// `Class: rbs` per emitted candidate, in emission order.
+fn emitted_rows(tag: &str, src: &str) -> Vec<String> {
+    candidates_tagged(tag, src, false)
+        .iter()
+        .map(|c| format!("{}: {}", c.class_name, c.rbs))
+        .collect()
+}
+
+#[test]
+fn conditional_namespace_defs_emit_candidates() {
+    // rigor-rs#535, oracle (`rigor sig-gen --print`, pinned reference): the
+    // reference's `walk_defs` descends if/case/begin/loop bodies, so a
+    // namespace or def under a conditional emits as a direct one does.
+    let rows: &[(&str, &[&str])] = &[
+        ("class K; if c; class N; def z; 1; end; end; end; end", &["K::N: def z: () -> 1"]),
+        ("class K; if c; module N; def z; 1; end; end; end; end", &["K::N: def z: () -> 1"]),
+        ("class K; unless c; class N; def z; 1; end; end; end; end", &["K::N: def z: () -> 1"]),
+        ("class K; if c; def a; 1; end; else; def b; 2; end; end; end", &["K: def a: () -> 1", "K: def b: () -> 2"]),
+        ("class K; if c; class << self; def s; 1; end; end; end; end", &["K: def self.s: () -> 1"]),
+        ("if c; class N; def z; 1; end; end; end", &["N: def z: () -> 1"]),
+    ];
+    for (i, (src, want)) in rows.iter().enumerate() {
+        assert_eq!(emitted_rows(&format!("cond_ns_{i}"), src), *want, "{src}");
+    }
+}
+
+#[test]
+fn visibility_call_that_last_writes_a_conditional_defs_slot_decides_it() {
+    // rigor-rs#535 review item (a), oracle-verified rows. The reference's table
+    // is keyed `(class, name)` per file and written by a full-depth walk, so a
+    // literal-name visibility call anywhere (after the def, inside another
+    // conditional, a block, a later reopening) re-marks the slot; a `def`
+    // after it writes the slot again; `module_function :b` reads as `private`.
+    let rows: &[(&str, &[&str])] = &[
+        ("class K; if c; def b; 2; end; end; private :b; end", &[]),
+        (
+            "class K; if c; def a; 1; end; def b; 2; end; end; private :a, :b; def z; 1; end; end",
+            &["K: def z: () -> 1"],
+        ),
+        ("module M; if c; def b; 2; end; end; module_function :b; end", &[]),
+        ("module M; if c; def b; 2; end; end; private :b; end", &[]),
+        ("class K; if c; def b; 2; end; private :b; end; end", &[]),
+        ("class K; if c; def b; 2; end; private :b; end; def z; 1; end; end", &["K: def z: () -> 1"]),
+        ("class K; if c; def a; 1; end; private :a; else; def b; 1; end; end; end", &["K: def b: () -> 1"]),
+        ("class K; if c; def b; 2; end; end; private \"b\"; end", &[]),
+        ("class K; if c; def b; 2; end; end; protected :b; end", &[]),
+        ("class K; if c; def b; 2; end; end; private %i[b zz]; end", &[]),
+        ("class K; if c; def b; 2; end; end; private :b, :zz; end", &[]),
+        ("class K; if c; def b; 2; end; end; private(:b); end", &[]),
+        ("class K; if c; def b; 2; end; end; self.private :b; end", &[]),
+        ("class K; if c; def b; 2; end; end; send(:private, :b); end", &[]),
+        ("class K; if c; def b; 2; end; end; __send__(:private, :b); end", &[]),
+        ("class K; if c; def b; 2; end; end; private :b if d; end", &[]),
+        ("class K; if c; def b; 2; end; end; if d; private :b; end; end", &[]),
+        ("class K; if c; def b; 2; end; end; foo { private :b }; end", &[]),
+        ("class K; unless c; def b; 2; end; end; private :b; end", &[]),
+        ("class K; def b; 2; end if c; private :b; end", &[]),
+        ("class K; case x; when 1; def b; 2; end; end; private :b; end", &[]),
+        ("class K; begin; def b; 2; end; rescue; end; private :b; end", &[]),
+        ("class K; while c; def b; 2; end; end; private :b; end", &[]),
+        ("class K; 3.times { def b; 2; end }; private :b; end", &[]),
+        // A reopening shares the slot; a nested one qualifies by path.
+        ("class K; if c; def b; 2; end; end; end; class K; private :b; end", &[]),
+        (
+            "class K; if c; def b; 2; end; end; end; class K; def z; 1; end; private :b; end",
+            &["K: def z: () -> 1"],
+        ),
+        ("module N; class K; if c; def b; 2; end; end; end; end; module N; class K; private :b; end; end", &[]),
+        // The LAST write wins: public after private re-opens the slot, and a
+        // `def` after a call writes it at its running default again.
+        ("class K; if c; def b; 2; end; end; private :b; public :b; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; public :b; private :b; end", &[]),
+        ("class K; if c; def b; 2; end; end; public :b; end", &["K: def b: () -> 2"]),
+        // Review item (b): a re-mark to public overrides the running `private`.
+        ("class K; private; if c; def b; 2; end; end; public :b; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; protected; def z; 1; end; public :b; end", &["K: def b: () -> 2"]),
+        ("class K; private :b; if c; def b; 2; end; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; private :b; def b; 2; end; end; end", &["K: def b: () -> 2"]),
+        // Must-still-fire controls: calls the reference does not apply to this
+        // slot (a splat, a def body, a singleton class, another class's block,
+        // `private_class_method`, `private_constant`) leave the def emitted.
+        ("class K; if c; def b; 2; end; end; private(*names); end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; def d; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; class << self; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; Struct.new(:q) do; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; Class.new { private :b }; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; class L; private :b; end; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; private_class_method :b; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; private_constant :B; end", &["K: def b: () -> 2"]),
+        ("class K; if c; def self.b; 2; end; end; private_class_method :b; end", &["K: def self.b: () -> 2"]),
+        ("class K; if c; def b; 2; end; end; private :zz; def z; 1; end; end", &["K: def b: () -> 2", "K: def z: () -> 1"]),
+    ];
+    for (i, (src, want)) in rows.iter().enumerate() {
+        assert_eq!(emitted_rows(&format!("cond_remark_{i}"), src), *want, "{src}");
+    }
+}
+
+#[test]
+fn defs_and_namespaces_in_call_blocks_emit_in_source_order() {
+    // rigor-rs#535 review item (c): the reference's single top-to-bottom walk
+    // emits a call block's defs and namespaces where the call sits, so its
+    // class groups come out in first-seen order (`K` before `K::N`). Printed
+    // order (oracle): `class K` {c, b} then `class K::N`.
+    let src = "class K; def c; 3; end; foo { class N; def z; 1; end; end; def b; 2; end }; end";
+    assert_eq!(
+        emitted_rows("call_block_order", src),
+        ["K: def c: () -> 3", "K::N: def z: () -> 1", "K: def b: () -> 2"]
+    );
+    let src = "class K; foo { def a; 1; end; class N; def z; 1; end; end; def b; 2; end }; def c; 3; end; end";
+    assert_eq!(
+        emitted_rows("call_block_order2", src),
+        ["K: def a: () -> 1", "K::N: def z: () -> 1", "K: def b: () -> 2", "K: def c: () -> 3"]
+    );
 }

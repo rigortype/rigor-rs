@@ -104,6 +104,15 @@ pub struct Typer<'i> {
     /// They read only the syntax tree, so one build serves every reach
     /// query on that AST — see [`crate::reach_index::ReachIndex`].
     pub(crate) reach_index: RefCell<crate::reach_index::ReachIndexCache>,
+    /// rigor-rs#546: the def-local env's mutation / closure-write marks,
+    /// memoized by `(ast identity, arena length)` like `reach_index` — see
+    /// [`crate::def_local_marks`].
+    pub(crate) def_marks: crate::def_local_marks::DefMarksCache,
+    /// The `def` span sig-gen is typing the return of (rigor-rs#546), when
+    /// any: a Dynamic local narrowed by a type test and read in two decisions
+    /// of that `def` may be constant-folded by the reference
+    /// ([`crate::def_local_marks::DefLocalMarks::narrowing_hot`]).
+    pub def_scope: Cell<Option<rigor_parse::Span>>,
     /// rigor-rs#422: the `local_reach` memo — entries keyed by the read and
     /// `seen.len()`, guarded by the `seen` membership answers they depend
     /// on, valid for one `(AST, dead-set object)` pair (see
@@ -127,13 +136,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -144,7 +153,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from

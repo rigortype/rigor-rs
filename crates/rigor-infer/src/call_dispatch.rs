@@ -4,7 +4,7 @@
 //! bare-nominal-join declines and in-source parameter bounds.
 
 use rigor_parse::{LoweredAst, Node, NodeId};
-use rigor_types::{Interner, Type, TypeId};
+use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{folding, ParamBoundReturn, TypeEnv, Typer};
 
@@ -32,7 +32,63 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
-        self.type_call_declines(ast, receiver, method, args, env, interner, true)
+        let ty = self.type_call_declines(ast, receiver, method, args, env, interner, true);
+        self.decline_fold_gap(ast, receiver, env, ty, interner)
+    }
+
+    /// sig-gen's def-local typing (rigor-rs#546): a call on a def-local
+    /// constant-carrier (`a = 1.5; a.to_s`, `s = "ab"; s.strip`, `t = [1, 2];
+    /// t.join`) that the port does not fold types to the method's RBS nominal
+    /// (`String`, `Integer`, `Array[..]`), where the reference folds it to a
+    /// constant (`"1.5"`, `"ab"`, `"12"`). The fold tables differ, so the
+    /// answer is not the reference's — decline (`untyped`; the method is
+    /// skipped). A folded result (a `Constant`) is kept. A literal receiver
+    /// (`1.5.to_s`) is the pre-existing fold gap master shares and is left alone.
+    fn decline_fold_gap(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        env: &TypeEnv,
+        ty: TypeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        if self.def_scope.get().is_none()
+            || !matches!(ast.get(receiver), Node::LocalVariableRead { .. })
+            || !self.is_scalar_nominal_result(interner, ty)
+        {
+            return ty;
+        }
+        let recv = self.type_of(ast, receiver, env, interner);
+        if Self::is_constant_carrier(interner, recv) {
+            interner.untyped()
+        } else {
+            ty
+        }
+    }
+
+    fn is_constant_carrier(interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty) {
+            Type::Constant(_) | Type::Tuple(_) | Type::HashShape(_) | Type::IntegerRange { .. } => true,
+            Type::Union(ms) => ms.iter().all(|&m| Self::is_constant_carrier(interner, m)),
+            _ => false,
+        }
+    }
+
+    fn is_scalar_nominal_result(&self, interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty) {
+            Type::Nominal { class, .. } => matches!(
+                self.index.class_name_for_id(*class),
+                Some(
+                    "String" | "Integer" | "Float" | "Symbol" | "Rational" | "Complex" | "Array" | "Hash"
+                        | "TrueClass" | "FalseClass"
+                )
+            ),
+            Type::Union(ms) => ms.iter().all(|&m| {
+                matches!(interner.get(m), Type::Constant(Scalar::Bool(_)))
+                    || self.is_scalar_nominal_result(interner, m)
+            }),
+            _ => false,
+        }
     }
 
     /// `type_call` for the internal `recv[k]` / `recv.attr` current-read a

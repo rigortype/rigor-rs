@@ -143,6 +143,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
+                has_else: false,
                 clauses: Vec::new(),
                 span: span_of(&else_node.location()),
             });
@@ -293,6 +294,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
+                has_else: false,
                 clauses: Vec::new(),
                 span: span_of(&in_node.location()),
             });
@@ -515,6 +517,7 @@ impl<'src> Builder<'src> {
                 });
                 rescue = subsequent;
             }
+            let has_else = begin_node.else_clause().is_some();
             if let Some(e) = begin_node.else_clause().and_then(|e| e.statements()) {
                 body.extend(self.lower_body(&e.body()));
             }
@@ -532,6 +535,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body,
+                has_else,
                 clauses,
                 span: span_of(&begin_node.location()),
             });

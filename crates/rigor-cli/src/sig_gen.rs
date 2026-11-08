@@ -95,6 +95,7 @@ mod rbs_parse_error;
 mod superclasses;
 mod sig_env;
 mod module_function;
+mod remarks;
 mod top_level;
 use meta_class::{MetaLayouts, MetaMember};
 use sig_env::{Lookup, SigEnv};
@@ -470,6 +471,49 @@ fn collect_namespace_info(ast: &LoweredAst, id: NodeId, prefix: &[String], info:
     let _ = superclass;
     for &child in body {
         collect_namespace_info(ast, child, &qualified, info);
+        collect_namespace_info_nested(ast, child, &qualified, info);
+    }
+}
+
+/// `if`-/`begin`-carried namespaces still record their kind for the merge
+/// (`module K::M2` inside `if` writes `module`), just as
+/// [`collect_conditional_definers`] walks them for candidates.
+fn collect_namespace_info_nested(ast: &LoweredAst, id: NodeId, prefix: &[String], info: &mut NamespaceInfo) {
+    let children: &[NodeId] = match ast.get(id) {
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => return,
+        Node::Definition { is_singleton_class: false, .. } => return,
+        Node::If { then_body, else_body, .. } => {
+            for &b in then_body.iter().chain(else_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &b in branches.iter().chain(else_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        Node::When { body, .. }
+        | Node::Loop { body, .. }
+        | Node::BeginRescue { body, .. }
+        | Node::Statements { body, .. }
+        | Node::Lambda { body, .. }
+        | Node::Definition { is_singleton_class: true, body, .. } => body,
+        Node::Call { args, block_body, .. } => {
+            for &b in args.iter().chain(block_body.iter()) {
+                collect_namespace_info(ast, b, prefix, info);
+                collect_namespace_info_nested(ast, b, prefix, info);
+            }
+            return;
+        }
+        _ => return,
+    };
+    for &b in children {
+        collect_namespace_info(ast, b, prefix, info);
+        collect_namespace_info_nested(ast, b, prefix, info);
     }
 }
 
@@ -940,31 +984,64 @@ fn generate_file_with_info(
     // rows (#1676). None sits inside a namespace the walk enters, so each one
     // goes in ahead of the first top-level statement that ends after it.
     let mut top_level = top_level::collect(&parsed).into_iter().peekable();
-    let modes = module_function::def_modes(&parsed);
+    let modes = DefFacts {
+        modes: module_function::def_modes(&parsed),
+        slot_visibilities: remarks::def_slot_visibilities(&parsed),
+    };
     if let Node::Program { body, .. } = ast.get(root) {
         for &child in body {
             let end = ast.get(child).span().1;
             while let Some((name, _)) = top_level.next_if(|(_, start)| *start < end) {
                 out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
             }
-            walk_namespace(
-                &ast,
-                child,
-                &[],
-                path,
-                include_private,
-                &index,
-                &typer,
-                &env,
-                &fqns,
-                sig_env,
-                &layouts,
-                &modes,
-                &mut interner,
-                &mut out,
-                &mut definers,
-            );
+            if is_namespace_node(&ast, child, &[], &layouts) {
+                walk_namespace(
+                    &ast,
+                    child,
+                    &[],
+                    path,
+                    include_private,
+                    &index,
+                    &typer,
+                    &env,
+                    &fqns,
+                    sig_env,
+                    &layouts,
+                    &modes,
+                    &mut interner,
+                    &mut out,
+                    &mut definers,
+                );
+            } else {
+                // `if c; class N; def z; end; end` at TOP level: the
+                // conditional's namespace children still emit (`walk_defs`
+                // descends) — rigor-rs#535. Plain top-level `def`s are
+                // already reported by `top_level::collect`.
+                collect_conditional_definers(
+                    &ast,
+                    child,
+                    &[],
+                    false,
+                    false,
+                    path,
+                    include_private,
+                    &index,
+                    &typer,
+                    &env,
+                    &fqns,
+                    sig_env,
+                    &layouts,
+                    &modes,
+                    &[],
+                    Visibility::Public,
+                    false,
+                    &mut interner,
+                    &mut out,
+                    &mut definers,
+                );
+            }
             collect_namespace_info(&ast, child, &[], &mut info);
+            collect_namespace_info_nested(&ast, child, &[], &mut info);
         }
     }
     for (name, _) in top_level {
@@ -1269,6 +1346,22 @@ struct Definer {
     certain: bool,
 }
 
+/// What a Prism pass reads off each `def` before lowering drops it, keyed by
+/// the `def`'s start offset.
+struct DefFacts {
+    /// The module_function mode in force at it ([`module_function::def_modes`]).
+    modes: HashMap<usize, module_function::Mode>,
+    /// The visibility a visibility CALL left on its slot after the `def`
+    /// ([`remarks::def_slot_visibilities`], rigor-rs#535).
+    slot_visibilities: HashMap<usize, Visibility>,
+}
+
+impl DefFacts {
+    fn mode(&self, offset: usize) -> module_function::Mode {
+        self.modes.get(&offset).copied().unwrap_or(module_function::Mode::Off)
+    }
+}
+
 /// Recurse a `class` / `module` node, emitting a candidate per qualifying direct
 /// instance method and descending into nested namespaces (prefix accumulates the
 /// qualified name, reference `walk_defs`).
@@ -1285,7 +1378,7 @@ fn walk_namespace(
     fqns: &std::collections::HashSet<String>,
     sig_env: &SigEnv,
     layouts: &MetaLayouts,
-    modes: &HashMap<usize, module_function::Mode>,
+    modes: &DefFacts,
     interner: &mut Interner,
     out: &mut Vec<Candidate>,
     definers: &mut Vec<Definer>,
@@ -1332,12 +1425,14 @@ fn walk_namespace(
     // form does not flip the mode. It applies in a CLASS body too.
     let mut sigs: Vec<(MethodSig, Option<Visibility>, usize)> = Vec::new();
     let mut uncertain: Vec<(&str, usize)> = Vec::new();
+    let mut conditionals: Vec<(usize, NodeId)> = Vec::new();
+    let mut call_children: Vec<(usize, NodeId)> = Vec::new();
     for &child in body {
         match ast.get(child) {
             Node::Definition {
                 name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
             } => {
-                let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                let mode = modes.mode(span.0);
                 if mode == module_function::Mode::Uncertain {
                     uncertain.push((n.as_str(), span.0));
                     definers.push(Definer {
@@ -1387,7 +1482,7 @@ fn walk_namespace(
             // `private def x` after an uncertain reset: reported like a direct
             // def (the reference skips it before reading its visibility). In
             // any other mode the port does not walk a def passed to a call.
-            Node::Call { receiver: None, method, args, span, block_body, .. } => {
+            Node::Call { receiver: None, method, args, span, .. } => {
                 // `attr_reader :x` / `attr_writer` / `attr_accessor` are
                 // DEFINERS too (reference `record_attr_definers`): the call's
                 // offset ranks them like a `def`, so a later `attr_reader :u`
@@ -1414,7 +1509,7 @@ fn walk_namespace(
                 }
                 for &arg in args {
                     if let Node::Definition { name: Some(n), span, .. } = ast.get(arg) {
-                        let mode = modes.get(&span.0).copied().unwrap_or(module_function::Mode::Off);
+                        let mode = modes.mode(span.0);
                         if mode == module_function::Mode::Uncertain {
                             uncertain.push((n.as_str(), span.0));
                         }
@@ -1448,44 +1543,12 @@ fn walk_namespace(
                         }
                     }
                 }
-                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
-                // definer too (`rigor_each_child` descends arguments).
-                // `Definition` args are already handled above — descending
-                // them would double-count the wrapped def.
-                for &arg in args {
-                    if !matches!(ast.get(arg), Node::Definition { .. }) {
-                        collect_conditional_definers(
-                            ast,
-                            arg,
-                            &qualified,
-                            false,
-                            matches!(ast.get(id), Node::ModuleDef { .. }),
-                            layouts,
-                            modes,
-                            definers,
-                        );
-                    }
-                }
-                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
-                // children are uncertain definers (`walk_attr_calls` descends
-                // call blocks too; a `refine`/`class_methods` block is a DSL
-                // scope and skipped).
-                let dsl_scope = method == "class_methods"
-                    || (method == "refine" && matches!(ast.get(id), Node::ModuleDef { .. }));
-                if !dsl_scope {
-                    for &b in block_body {
-                        collect_conditional_definers(
-                            ast,
-                            b,
-                            &qualified,
-                            false,
-                            matches!(ast.get(id), Node::ModuleDef { .. }),
-                            layouts,
-                            modes,
-                            definers,
-                        );
-                    }
-                }
+                // `foo(attr_reader(:x))` and `foo do; def y; end; end`: the
+                // arguments and the block body carry uncertain definers and
+                // candidates of their own. They emit in SOURCE ORDER with the
+                // body's other statements (`Emit::CallChildren`), as the
+                // reference's single top-to-bottom walk does.
+                call_children.push((span.0, child));
             }
             Node::Definition {
                 singleton_name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
@@ -1526,24 +1589,16 @@ fn walk_namespace(
             }
             // Any other body statement — an `if`/`case`/`begin`/loop/block
             // — can still CARRY a `def` or `attr_*`: the reference walks
-            // into every non-`def` child (`walk_attr_calls` +
-            // `walk_def_children`), recording each as an UNCERTAIN definer
-            // (only direct statements are `certain_definers`).
-            // `if cond; attr_reader :x; end` then contests a preceding
-            // `def x` (rigor-rs#525 item 2). Namespace children are walked
-            // by `Emit::Nested` instead — do not double-count them.
+            // into every non-`def` child (`walk_defs`, `walk_attr_calls`),
+            // recording each as an UNCERTAIN definer (only direct statements
+            // are `certain_definers`), so `if cond; attr_reader :x; end`
+            // contests a preceding `def x` (rigor-rs#525 item 2). Their
+            // candidates emit in source order via `Emit::Conditional`
+            // (rigor-rs#535). Namespace children are walked by
+            // `Emit::Nested` instead — do not double-count them.
             _ => {
                 if !is_namespace_node(ast, child, &qualified, layouts) {
-                    collect_conditional_definers(
-                        ast,
-                        child,
-                        &qualified,
-                        false,
-                        matches!(ast.get(id), Node::ModuleDef { .. }),
-                        layouts,
-                        modes,
-                        definers,
-                    );
+                    conditionals.push((ast.get(child).span().0, child));
                 }
             }
         }
@@ -1558,6 +1613,8 @@ fn walk_namespace(
         Method(&'a MethodSig<'a>, Option<Visibility>),
         Uncertain(&'a str),
         Nested(NodeId),
+        Conditional(NodeId),
+        CallChildren(NodeId),
     }
     let mut items: Vec<(usize, Emit)> = Vec::new();
     for (sig, vis, span) in &sigs {
@@ -1570,6 +1627,12 @@ fn walk_namespace(
         if is_namespace_node(ast, child, &qualified, layouts) {
             items.push((ast.get(child).span().0, Emit::Nested(child)));
         }
+    }
+    for (span, child) in &conditionals {
+        items.push((*span, Emit::Conditional(*child)));
+    }
+    for (span, child) in &call_children {
+        items.push((*span, Emit::CallChildren(*child)));
     }
     items.sort_by_key(|(span, _)| *span);
     for (_, item) in items {
@@ -1616,6 +1679,63 @@ fn walk_namespace(
                 out,
                 definers,
             ),
+            Emit::CallChildren(child) => {
+                let Node::Call { method, args, block_body, span, .. } = ast.get(child) else { continue };
+                let in_module = matches!(ast.get(id), Node::ModuleDef { .. });
+                // `foo(attr_reader(:x))` — a call-arg attr is an uncertain
+                // definer too (`rigor_each_child` descends arguments).
+                // `Definition` args are already handled in the collection
+                // loop — descending them would double-count the wrapped def.
+                let (running_vis, running_mf) = running_toggles_at(ast, body, span.0);
+                for &arg in args {
+                    if !matches!(ast.get(arg), Node::Definition { .. }) {
+                        collect_conditional_definers(
+                            ast, arg, &qualified, false, in_module, path, include_private, index, typer, env,
+                            fqns, sig_env, layouts, modes, &visibilities, running_vis, running_mf, interner,
+                            out, definers,
+                        );
+                    }
+                }
+                // `foo do; attr_reader :x; end` — the block's `def`/`attr`
+                // children are uncertain definers (`walk_attr_calls` descends
+                // call blocks too; a `refine`/`class_methods` block is a DSL
+                // scope and skipped).
+                let dsl_scope = method == "class_methods" || (method == "refine" && in_module);
+                if !dsl_scope {
+                    for &b in block_body {
+                        collect_conditional_definers(
+                            ast, b, &qualified, false, in_module, path, include_private, index, typer, env,
+                            fqns, sig_env, layouts, modes, &visibilities, running_vis, running_mf, interner,
+                            out, definers,
+                        );
+                    }
+                }
+            }
+            Emit::Conditional(child) => {
+                let (running_vis, running_mf) = running_toggles_at(ast, body, ast.get(child).span().0);
+                collect_conditional_definers(
+                    ast,
+                    child,
+                    &qualified,
+                    false,
+                    matches!(ast.get(id), Node::ModuleDef { .. }),
+                    path,
+                    include_private,
+                    index,
+                    typer,
+                    env,
+                    fqns,
+                    sig_env,
+                    layouts,
+                    modes,
+                    &visibilities,
+                    running_vis,
+                    running_mf,
+                    interner,
+                    out,
+                    definers,
+                );
+            }
         }
     }
 }
@@ -1635,73 +1755,203 @@ fn collect_conditional_definers(
     prefix: &[String],
     in_singleton_class: bool,
     in_module: bool,
+    path: &str,
+    include_private: bool,
+    index: &CoreIndex,
+    typer: &Typer,
+    env: &TypeEnv,
+    fqns: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
     layouts: &MetaLayouts,
-    modes: &HashMap<usize, module_function::Mode>,
+    modes: &DefFacts,
+    visibilities: &[(String, Visibility)],
+    running_vis: Visibility,
+    running_mf: bool,
+    interner: &mut Interner,
+    out: &mut Vec<Candidate>,
     definers: &mut Vec<Definer>,
 ) {
-    let recurse = |ast: &LoweredAst,
-                   child: NodeId,
-                   prefix: &[String],
-                   sclass: bool,
-                   module: bool,
-                   definers: &mut Vec<Definer>| {
-        collect_conditional_definers(ast, child, prefix, sclass, module, layouts, modes, definers);
-    };
-    match ast.get(id) {
-        Node::ClassDef { name, rooted, body, .. } | Node::ModuleDef { name, rooted, body, .. } => {
-            let child_prefix = declaration_prefix(prefix, name, *rooted);
-            let module = matches!(ast.get(id), Node::ModuleDef { .. });
-            for &b in body {
-                recurse(ast, b, &child_prefix, false, module, definers);
-            }
-        }
-        // `Const = Data.define(...) do … end` inside a conditional: the block
-        // is the new class's own body (`meta_block_body`).
-        Node::ConstantWrite { name, value, .. }
-            if layouts.get(&qualify_join(prefix, name)).is_some() =>
-        {
-            if let Node::Call { block_body, .. } = ast.get(*value) {
-                let mut child_prefix = prefix.to_vec();
-                child_prefix.push(name.clone());
-                for &b in block_body {
-                    recurse(ast, b, &child_prefix, false, false, definers);
+    // A bare `private`/`public`/`protected`/`module_function` STATEMENT sets
+    // the running default for the rest of ITS statements list — so the
+    // per-child loops below pass the current pair and update it on a toggle
+    // (`private; if c; def y` and `if c; private; def y` both read it).
+    macro_rules! descend {
+        ($child:expr, $vis:expr, $mf:expr, $sclass:expr, $module:expr) => {
+            collect_conditional_definers(
+                ast,
+                $child,
+                prefix,
+                $sclass,
+                $module,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                visibilities,
+                $vis,
+                $mf,
+                interner,
+                out,
+                definers,
+            )
+        };
+        ($child:expr, $vis:expr, $mf:expr) => {
+            descend!($child, $vis, $mf, in_singleton_class, in_module)
+        };
+        ($child:expr) => {
+            descend!($child, running_vis, running_mf)
+        };
+    }
+    // Iterate a statements list letting bare visibility toggles update the
+    // running pair for the statements that follow them.
+    macro_rules! descend_list {
+        ($body:expr) => {{
+            let mut vis = running_vis;
+            let mut mf = running_mf;
+            for &b in $body {
+                descend!(b, vis, mf);
+                if let Node::Call { receiver: None, method, args, .. } = ast.get(b) {
+                    if args.is_empty() {
+                        match method.as_str() {
+                            "private" => {
+                                vis = Visibility::Private;
+                                mf = false;
+                            }
+                            "protected" => {
+                                vis = Visibility::Protected;
+                                mf = false;
+                            }
+                            "public" => {
+                                vis = Visibility::Public;
+                                mf = false;
+                            }
+                            "module_function" => mf = true,
+                            _ => {}
+                        }
+                    }
                 }
             }
+        }};
+    }
+    match ast.get(id) {
+        // A nested `class`/`module`/layout-carrying `Const =` inside a
+        // conditional is a REAL namespace: its body's direct statements are
+        // `certain_definers` and candidates — the same walk the top level
+        // takes (`Emit::Nested`), so hand the whole node to
+        // `walk_namespace` (rigor-rs#535).
+        Node::ClassDef { .. } | Node::ModuleDef { .. } => walk_namespace(
+            ast,
+            id,
+            prefix,
+            path,
+            include_private,
+            index,
+            typer,
+            env,
+            fqns,
+            sig_env,
+            layouts,
+            modes,
+            interner,
+            out,
+            definers,
+        ),
+        Node::ConstantWrite { name, .. }
+            if layouts.get(&qualify_join(prefix, name)).is_some() =>
+        {
+            walk_namespace(
+                ast,
+                id,
+                prefix,
+                path,
+                include_private,
+                index,
+                typer,
+                env,
+                fqns,
+                sig_env,
+                layouts,
+                modes,
+                interner,
+                out,
+                definers,
+            );
         }
         Node::Definition { is_singleton_class: true, body, .. } => {
-            for &b in body {
-                recurse(ast, b, prefix, true, in_module, definers);
+            // `class << self` under a conditional: its direct defs are
+            // certain singleton definers AND candidates; deeper children
+            // recurse as uncertain (`mark_certain_body` marks the body's
+            // direct statements wherever the body sits).
+            for &inner in body {
+                match ast.get(inner) {
+                    Node::Definition {
+                        name: Some(n), body: b, params, param_shape, has_explicit_return, span, ..
+                    } => {
+                        // The top level has no enclosing cref — a
+                        // `class << self` there defines on `main`'s
+                        // singleton, which the reference does not emit.
+                        if !prefix.is_empty() {
+                            let sig = sig_of(
+                                n.as_str(), b, params, param_shape, *has_explicit_return, true, false, span.0,
+                            );
+                            if let Some(c) = method_candidate(
+                                ast, &sig, None, &prefix.join("::"), path, include_private, index, typer, env, fqns, sig_env, interner,
+                            ) {
+                                out.push(c);
+                            }
+                            definers.push(Definer {
+                                class_name: prefix.join("::"),
+                                kind: "singleton",
+                                method_name: n.clone(),
+                                offset: span.0,
+                                certain: true,
+                            });
+                        }
+                    }
+                    _ => descend!(inner, Visibility::Public, false, true, in_module),
+                }
             }
         }
         // A `def` is a definer itself; its BODY is out of bounds
         // (`walk_attr_calls` returns at DefNode).
-        Node::Definition { name, singleton_name, span, .. } => {
+        Node::Definition { name, singleton_name, body: b, params, param_shape, has_explicit_return, span, .. } => {
             if let Some(n) = name.as_ref().or(singleton_name.as_ref()) {
-                let kind = if in_singleton_class || singleton_name.is_some() {
-                    "singleton"
-                } else {
-                    "instance"
-                };
-                definers.push(Definer {
-                    class_name: prefix.join("::"),
-                    kind,
-                    method_name: n.clone(),
-                    offset: span.0,
-                    certain: false,
-                });
-                if !in_singleton_class
-                    && matches!(
-                        modes.get(&span.0),
-                        Some(module_function::Mode::On) | Some(module_function::Mode::Uncertain)
-                    )
-                {
-                    definers.push(Definer {
-                        class_name: prefix.join("::"),
-                        kind: "singleton",
-                        method_name: n.clone(),
-                        offset: span.0,
-                        certain: false,
-                    });
+                let singleton = in_singleton_class || singleton_name.is_some();
+                let class_name = prefix.join("::");
+                if !class_name.is_empty() {
+                    // A named table entry wins (`private :y` re-marks); else
+                    // the body's RUNNING default at the conditional's
+                    // position — `private; if c; def y` is private on the
+                    // oracle, `module_function; if c; def u` is `self?.`
+                    // (rigor-rs#535 review).
+                    //
+                    // A visibility CALL that is the LAST write to the slot
+                    // (`if c; def b; end; end; private :b`, in a later
+                    // reopening, or inside another conditional) wins over
+                    // both: the reference reads the slot by name, so a
+                    // re-mark the lowered direct-statement table never saw
+                    // still excludes the def (rigor-rs#535 review item a).
+                    let vis = if singleton {
+                        None
+                    } else {
+                        modes.slot_visibilities.get(&span.0).copied().or_else(|| {
+                            visibilities
+                                .iter()
+                                .find(|(m, _)| m == n)
+                                .map(|(_, v)| *v)
+                                .or(Some(running_vis))
+                        })
+                    };
+                    emit_conditional_def(
+                        ast, n.as_str(), b, params, param_shape, *has_explicit_return, span.0, singleton, vis,
+                        &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
+                        interner, out, definers,
+                    );
                 }
             }
         }
@@ -1743,41 +1993,79 @@ fn collect_conditional_definers(
                     }
                 }
             }
-            for &b in args.iter().chain(block_body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            // `private def y` inside a conditional: a `Definition` argument
+            // of a receiverless/self visibility modifier takes the modifier
+            // (`apply_visibility_argument`). Symbol re-marks are a contested
+            // slot on the oracle — not modelled.
+            let arg_vis = if receiver
+                .map(|r| matches!(ast.get(r), Node::SelfExpr { .. }))
+                .unwrap_or(true)
+                && !args.is_empty()
+            {
+                match method.as_str() {
+                    "private" => Some(Visibility::Private),
+                    "protected" => Some(Visibility::Protected),
+                    "public" => Some(Visibility::Public),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+            for &arg in args {
+                match (arg_vis, ast.get(arg)) {
+                    (
+                        Some(v),
+                        Node::Definition { name: Some(n), body: b, params, param_shape, has_explicit_return, span: dspan, .. },
+                    ) => {
+                        let singleton = in_singleton_class;
+                        let class_name = prefix.join("::");
+                        if !class_name.is_empty() {
+                            emit_conditional_def(
+                                ast, n.as_str(), b, params, param_shape, *has_explicit_return, dspan.0, singleton,
+                                if singleton {
+                                    None
+                                } else {
+                                    Some(modes.slot_visibilities.get(&dspan.0).copied().unwrap_or(v))
+                                },
+                                &class_name, running_mf, path, include_private, index, typer, env, fqns, sig_env,
+                                interner, out, definers,
+                            );
+                        }
+                    }
+                    _ => descend!(arg),
+                }
             }
+            // A block body is a fresh statements list: it inherits the
+            // running state but a toggle inside it does not flow back out.
+            descend_list!(block_body);
         }
         Node::If { predicate, then_body, else_body, .. } => {
-            recurse(ast, *predicate, prefix, in_singleton_class, in_module, definers);
-            for &b in then_body.iter().chain(else_body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
+            descend!(*predicate);
+            descend_list!(then_body);
+            descend_list!(else_body);
         }
         Node::Case { predicate, branches, else_body, .. } => {
             if let Some(p) = predicate {
-                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+                descend!(*p);
             }
             for &b in branches.iter().chain(else_body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::When { conditions, body, .. } => {
-            for &b in conditions.iter().chain(body.iter()) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+            for &b in conditions {
+                descend!(b);
             }
+            descend_list!(body);
         }
         Node::Loop { predicate, body, .. } => {
             if let Some(p) = predicate {
-                recurse(ast, *p, prefix, in_singleton_class, in_module, definers);
+                descend!(*p);
             }
-            for &b in body {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
+            descend_list!(body);
         }
         Node::BeginRescue { body, .. } | Node::Statements { body, .. } => {
-            for &b in body {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
+            descend_list!(body);
         }
         // Expression-level containers carry the same children
         // (`rigor_each_child` descends everywhere): `_x = if c; attr_reader
@@ -1787,54 +2075,140 @@ fn collect_conditional_definers(
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
         | Node::ConstantWrite { value, .. } => {
-            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            descend!(*value);
         }
         Node::MultiWrite { value, target_exprs, .. } => {
-            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            descend!(*value);
             for &b in target_exprs {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::IndexWrite { receiver, indices, value, .. } => {
             if let Some(r) = receiver {
-                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+                descend!(*r);
             }
             for &b in indices.iter().chain(std::iter::once(value)) {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::Logical { left, right, .. } => {
-            recurse(ast, *left, prefix, in_singleton_class, in_module, definers);
-            recurse(ast, *right, prefix, in_singleton_class, in_module, definers);
-        }
-        Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
-            for &b in body {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
-            for &b in parts {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
-            for &b in elements {
-                recurse(ast, b, prefix, in_singleton_class, in_module, definers);
-            }
-        }
-        Node::Range { left, right, .. } => {
-            for bound in [left, right].into_iter().flatten() {
-                recurse(ast, *bound, prefix, in_singleton_class, in_module, definers);
+                descend!(b);
             }
         }
         Node::AttrWrite { receiver, value, .. } => {
             if let Some(r) = receiver {
-                recurse(ast, *r, prefix, in_singleton_class, in_module, definers);
+                descend!(*r);
             }
-            recurse(ast, *value, prefix, in_singleton_class, in_module, definers);
+            descend!(*value);
+        }
+        Node::Logical { left, right, .. } => {
+            descend!(*left);
+            descend!(*right);
+        }
+        Node::Lambda { body, .. } => descend_list!(body),
+        Node::Return { values: body, .. } => {
+            for &b in body {
+                descend!(b);
+            }
+        }
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            for &b in parts {
+                descend!(b);
+            }
+        }
+        Node::ArrayLit { elements, .. } | Node::HashLit { elements, .. } => {
+            for &b in elements {
+                descend!(b);
+            }
+        }
+        Node::Range { left, right, .. } => {
+            for bound in [left, right].into_iter().flatten() {
+                descend!(*bound);
+            }
         }
         _ => {}
     }
+}
+
+/// Emit one conditional-carried `def` as a candidate + uncertain definer —
+/// the shared tail of the `Definition` and `private`-call-arg arms of
+/// [`collect_conditional_definers`].
+#[allow(clippy::too_many_arguments)]
+fn emit_conditional_def(
+    ast: &LoweredAst,
+    name: &str,
+    body: &[NodeId],
+    params: &Option<Vec<String>>,
+    param_shape: &rigor_parse::ParamShape,
+    has_explicit_return: bool,
+    offset: usize,
+    singleton: bool,
+    vis: Option<Visibility>,
+    class_name: &str,
+    running_mf: bool,
+    path: &str,
+    include_private: bool,
+    index: &CoreIndex,
+    typer: &Typer,
+    env: &TypeEnv,
+    fqns: &std::collections::HashSet<String>,
+    sig_env: &SigEnv,
+    interner: &mut Interner,
+    out: &mut Vec<Candidate>,
+    definers: &mut Vec<Definer>,
+) {
+    let sig = sig_of(name, body, params, param_shape, has_explicit_return, singleton, running_mf, offset);
+    if let Some(c) = method_candidate(
+        ast, &sig, vis, class_name, path, include_private, index, typer, env, fqns, sig_env, interner,
+    ) {
+        out.push(c);
+    }
+    definers.push(Definer {
+        class_name: class_name.to_string(),
+        kind: if singleton { "singleton" } else { "instance" },
+        method_name: name.to_string(),
+        offset,
+        certain: false,
+    });
+    if running_mf && !singleton {
+        definers.push(Definer {
+            class_name: class_name.to_string(),
+            kind: "singleton",
+            method_name: name.to_string(),
+            offset,
+            certain: false,
+        });
+    }
+}
+
+/// The `(running visibility, running module_function)` state at `offset`
+/// inside `body` — the bare `private`/`protected`/`public` toggles before it
+/// set the default a conditional `def` there reads, and a bare
+/// `module_function` marks it dual (`self?.`). `module_function` does not
+/// itself flip the visibility default the sig-gen table reads (that is the
+/// separate `module_function_visibilities` table's job).
+fn running_toggles_at(ast: &LoweredAst, body: &[NodeId], offset: usize) -> (Visibility, bool) {
+    let mut vis = Visibility::Public;
+    let mut mf = false;
+    for &child in body {
+        let Node::Call { receiver: None, method, args, span, .. } = ast.get(child) else { continue };
+        if span.0 >= offset || !args.is_empty() {
+            continue;
+        }
+        match method.as_str() {
+            "private" => {
+                vis = Visibility::Private;
+                mf = false;
+            }
+            "protected" => {
+                vis = Visibility::Protected;
+                mf = false;
+            }
+            "public" => {
+                vis = Visibility::Public;
+                mf = false;
+            }
+            "module_function" => mf = true,
+            _ => {}
+        }
+    }
+    (vis, mf)
 }
 
 /// Whether `id` opens a namespace [`walk_namespace`] descends into: a real
@@ -2007,10 +2381,35 @@ fn method_candidate(
     // erased union).
     let Some(returns) = collect_explicit_returns(ast, sig) else { return row(None) };
 
-    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
-    // statement's type; an assignment tail evaluates to its RHS; a `return E`
-    // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
+    // A def-LOCAL env (rigor-rs#546): the body's straight-line writes replayed
+    // on top of the file env, so a tail/return read of a method-local sees its
+    // binding (the reference types the body's env). Statements the binder
+    // declines leave the env alone — a coverage loss, never a wrong type.
+    // The replay covers the WHOLE body — a `return` under the tail `if`
+    // still types at its position (the tail's own writes bind nothing the
+    // tail read needs that a later statement could invalidate).
+    // A parameter SHADOWS a same-named file-level local — the def body is a
+    // fresh scope (`x = "top"; def b2(x); x; end` reads the argument, not
+    // `"top"`; the reference skips it). Bind each to `untyped` first.
+    let mut entry = env.clone();
+    if let Some(names) = sig.params.as_ref() {
+        let untyped = interner.untyped();
+        for name in names {
+            entry.insert(name.clone(), untyped);
+        }
+    }
+    // The def's own decisions: a Dynamic local narrowed by a type test and
+    // read in a second decision may be constant-folded by the reference.
+    struct ScopeGuard<'a>(&'a std::cell::Cell<Option<rigor_parse::Span>>);
+    impl Drop for ScopeGuard<'_> {
+        fn drop(&mut self) {
+            self.0.set(None);
+        }
+    }
+    typer.def_scope.set(rigor_infer::body_span(ast, sig.body));
+    let _scope_guard = ScopeGuard(&typer.def_scope);
+    let (local, positional_returns) = typer.bind_body_for_tail(ast, &entry, sig.body, interner);
+    let env = &local;
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -2026,13 +2425,42 @@ fn method_candidate(
             }
         }
     };
-    push_flat(interner, &mut members, tail_ty);
+
+    // Tail type (reference `body_last_expression` + `safe_type_of`): the last
+    // statement's type; an assignment tail evaluates to its RHS; a `return E`
+    // tail evaluates to its value (`nil` when bare). A control tail whose
+    // every leaf is a `return` contributes NOTHING — `if c; return 1; else;
+    // return "s"; end` yields `("s" | 1)` from the returns alone.
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
+    if let Some(tail_ty) = tail_ty {
+        push_flat(interner, &mut members, tail_ty);
+    }
     for ret in &returns {
+        // A `return`'s value types at ITS position in the body — a name it
+        // reads may be rebound later (`a = :initial; if c; return a; end;
+        // a = 100` → `(100 | :initial)`).
         let ty = match ret {
-            Some(v) => typer.type_of(ast, *v, env, interner),
+            Some(v) => match positional_returns.iter().find(|(id, _)| id == v) {
+                Some((_, t)) => *t,
+                // A `return` the replay never reached (inside a value
+                // position — `x = c.map { |i| return i }`): it reads locals
+                // the replay cannot place, so a read declines.
+                None if !typer.def_local_marks(ast).reads_within(ast.get(*v).span()).is_empty() => {
+                    interner.untyped()
+                }
+                None => typer.type_of(ast, *v, env, interner),
+            },
             None => interner.nil(),
         };
         push_flat(interner, &mut members, ty);
+    }
+
+    // A union or a bare generic INSIDE a tuple / hash-shape slot (`[1 | nil]`,
+    // a def-local typed local joined across a branch; `[400, Hash, [body]]`) is
+    // not the reference's byte output — a shared-method mismatch, so the
+    // method declines (rigor-rs#546 review).
+    if members.iter().any(|&m| composite_holds_unsound(interner, index, m)) {
+        return row(None);
     }
 
     // `dynamic_top?` (a reference PERMANENT skip): any Top/Dynamic member — or any
@@ -2071,6 +2499,24 @@ fn method_candidate(
             // `Range[untyped]` / `Array[untyped]` are the reference's own
             // elaborated emits (rigor-rs#493 item 7), not inference holes.
             if !is_nominal_untyped_args(&e) {
+                return row(None);
+            }
+            // A def-local the replay declined (or a call on one the port does
+            // not fold) reads `untyped`, and that hole lands in a generic's
+            // type-arg slot as `Hash[String, untyped]`, where the reference
+            // has the precise value union (`Rack::Directory#check_bad_request`).
+            // A tail / return that reads a local written in the def cannot be
+            // told apart from an elaborated `Hash[untyped, untyped]` — decline.
+            let marks = typer.def_local_marks(ast);
+            let written = rigor_infer::body_span(ast, sig.body)
+                .map(|sp| marks.written_within(sp))
+                .unwrap_or_default();
+            let reads_local = |sp: rigor_parse::Span| {
+                marks.reads_within(sp).iter().any(|r| written.iter().any(|w| w == r))
+            };
+            let tail_reads = sig.body.last().is_some_and(|&t| reads_local(ast.get(t).span()))
+                || returns.iter().flatten().any(|&v| reads_local(ast.get(v).span()));
+            if tail_reads {
                 return row(None);
             }
         }
@@ -2495,25 +2941,49 @@ fn computed_literal_tightening(interner: &Interner, inferred: TypeId, raw_tail: 
     )
 }
 
+/// Whether a call's block body is a return barrier: the reference
+/// `ReturnBarrier.block_call?` — a `define_method` / `define_singleton_method`
+/// block on any receiver (also through `send` / `public_send` / `__send__`
+/// with a literal symbol first argument), and `Kernel#lambda` (bare, on
+/// `self` or on `Kernel`).
+fn return_barrier_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str, args: &[NodeId]) -> bool {
+    let mut name = method.to_string();
+    if matches!(method, "send" | "public_send" | "__send__") {
+        match args.first().map(|&a| ast.get(a)) {
+            Some(Node::SymbolLit { value, .. }) => name = value.clone(),
+            _ => return false,
+        }
+    }
+    if matches!(name.as_str(), "define_method" | "define_singleton_method") {
+        return true;
+    }
+    name == "lambda"
+        && match receiver.map(|r| ast.get(r)) {
+            None | Some(Node::SelfExpr { .. }) => true,
+            Some(Node::ConstantRead { name, .. }) => name == "Kernel",
+            _ => false,
+        }
+}
+
 /// Collect the def's collectible explicit-return value expressions, or `None`
 /// when the method must be SKIPPED. Each element is `Some(value NodeId)` for a
 /// single-value `return e` / `None` for a bare `return` (→ `nil`). Ports the
 /// reference `DefReturnTyper#collect_return_types` semantics over the lowered
 /// arena:
 ///
-/// - **Barriers** (reference `RETURN_BARRIER_NODES` = block / lambda / def): a
-///   `return` inside a `Call`'s `block_body` or a nested def/class/module is NOT
-///   collected. A lambda's `return` never lowers to [`Node::Return`] at all (the
-///   lambda routes through the recovered-children fallthrough), so the lambda
-///   barrier holds structurally.
+/// - **Barriers** (reference `ReturnBarrier`, issue #1382): a `return` inside a
+///   nested `def` / class / module, a `->` lambda, or the block of a
+///   `define_method` / `define_singleton_method` / `Kernel#lambda` call
+///   ([`return_barrier_call`]) is NOT collected. A `return` in an ORDINARY
+///   block exits the method and IS collected (rigor-rs#546 review 3: the port
+///   treated every block as a barrier, so `a = nil; c.each { return "s" }; a`
+///   lost its `"s"` once the local env typed `a`).
 /// - **Multi-value** `return a, b`: the reference silently contributes NOTHING
 ///   (emitting a signature that misses the tuple — an unsound emit); rigor-rs
 ///   SKIPS the method instead (under-emit, FP-safe, no shared-method mismatch).
 /// - **Residual ambiguity**: `has_explicit_return` trips on returns inside
-///   lambdas AND inside unhandled wrappers; the former the reference barriers
-///   (safe to emit) but the latter it collects. When the flag is set yet NO
-///   [`Node::Return`] exists anywhere in the def, the two are indistinguishable
-///   → skip (rare, FP-safe).
+///   unhandled wrappers; when the flag is set yet NO [`Node::Return`] exists
+///   anywhere in the def, skip (rare, FP-safe).
 ///
 /// Membership is by span containment against the def's body-statement spans
 /// (the arena is flat; spans nest strictly), mirroring how outline/flow walks
@@ -2529,23 +2999,32 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
         regions.iter().any(|&(rs, re)| rs <= s.0 && s.1 <= re)
     };
 
-    // Barrier regions inside this def: block bodies + nested class-like scopes.
-    // (The def's own body statements are the regions, so any Definition matched
-    // within them is a NESTED def, never the def itself.)
+    // Barrier regions inside this def: a barrier call's block body, lambdas
+    // and nested class-like scopes. (The def's own body statements are the
+    // regions, so any Definition matched within them is a NESTED def, never
+    // the def itself.)
     let mut barriers: Vec<(usize, usize)> = Vec::new();
     for (_, node) in ast.iter() {
         match node {
-            Node::Call { block_body, span, .. }
-                if !block_body.is_empty() && within(*span, &regions) =>
+            Node::Call { receiver, method, args, block_body, block_span: Some(_), span, .. }
+                if !block_body.is_empty()
+                    && within(*span, &regions)
+                    && return_barrier_call(ast, *receiver, method, args) =>
             {
                 for &b in block_body {
                     barriers.push(ast.get(b).span());
                 }
             }
+            Node::Lambda { span, .. } if within(*span, &regions) => barriers.push(*span),
+            // A def whose body is a `rescue` / `ensure` chain lowers to one
+            // `BeginRescue` region spanning the whole def, so the def ITSELF
+            // would match as a "nested" barrier and swallow every `return`
+            // (rigor-rs#546 review 3: `def f; 5; ensure; return 3; end`
+            // lost its `3`). The def's own start offset identifies it.
             Node::Definition { span, .. }
             | Node::ClassDef { span, .. }
             | Node::ModuleDef { span, .. }
-                if within(*span, &regions) =>
+                if within(*span, &regions) && span.0 != sig.offset =>
             {
                 barriers.push(*span);
             }
@@ -2562,7 +3041,7 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
             }
             found_any = true;
             if within(*span, &barriers) {
-                continue; // block / nested-def barrier (reference design)
+                continue; // lambda / nested-def / define_method barrier (reference design)
             }
             match values.len() {
                 0 => collected.push(None),
@@ -2579,12 +3058,37 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
     Some(collected)
 }
 
+/// Whether a tuple / hash shape holds, in one of its slots (at any depth
+/// through further tuples and shapes), a union — the interner prints it in
+/// canonical member order, not the reference's describe-sorted order — or a
+/// bare generic nominal (`Hash`, `Array`: the reference elaborates it to
+/// `Hash[untyped, ...]` / its value union). Either way the byte output would
+/// differ from the reference's on a method both emit.
+fn composite_holds_unsound(interner: &Interner, index: &CoreIndex, ty: TypeId) -> bool {
+    let slot = |e: TypeId| match interner.get(e) {
+        Type::Union(_) => true,
+        Type::Nominal { class, args } => {
+            args.is_empty() && is_bare_generic_name(index.class_name_for_id(*class).unwrap_or(""))
+        }
+        _ => composite_holds_unsound(interner, index, e),
+    };
+    match interner.get(ty) {
+        Type::Tuple(elems) => elems.iter().any(|&e| slot(e)),
+        Type::HashShape(members) => members.iter().any(|m| slot(m.value)),
+        _ => false,
+    }
+}
+
 /// A method's inferred return type, or `None` for an empty body (reference
 /// `DefReturnTyper`): the last statement's type, an assignment tail evaluating to
 /// its RHS value, a `return E` tail to its value (`nil` when bare — the oracle
 /// types a tail `return 42` as `42`; a multi-value tail declines). Typed against
-/// the top-level env — a def-LOCAL binding types `Dynamic` (the documented
-/// `annotate` deferral) and is then skipped upstream.
+/// the def-local env (rigor-rs#546).
+/// `Some(Some(ty))` — the tail's type (`untyped` for a tail shape the
+/// def-local env does not model, see [`control_tail_types`]: the method skips
+/// as an untyped return); `Some(None)` — a control tail whose every value leaf
+/// is a `return`, contributing no member; `None` — skip (empty body,
+/// multi-value `return` tail).
 #[allow(clippy::too_many_arguments)]
 fn def_return_type(
     ast: &LoweredAst,
@@ -2595,29 +3099,233 @@ fn def_return_type(
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
-) -> Option<TypeId> {
+) -> Option<Option<TypeId>> {
     let &tail = body.last()?;
-    let target = match ast.get(tail) {
+    // A declined tail types as `untyped`: the method skips as an untyped
+    // return (`sig.skipped.untyped-return`, counted — an override the port
+    // declines still reads as unsigned to the base-method demotion, as the
+    // reference's untyped tail does).
+    let declined = Some(Some(interner.untyped()));
+    // A tail holding a decision on a typed local (the reference narrows /
+    // folds on it) or an unknown-name `=~` binding declines; a write at a
+    // position the replay does not walk is widened.
+    let Some(tail_env) = typer.tail_env(ast, env, tail, interner) else { return declined };
+    let env = &tail_env;
+    match ast.get(tail) {
+        // `x op= v`: the lowered node keeps the operand, not the operator —
+        // typing the operand (`a = 1; a += 1` → `1`) would be wrong.
+        Node::LocalVariableOpWrite { .. } => declined,
         Node::LocalVariableWrite { value, .. }
-        | Node::LocalVariableOpWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::InstanceVariableWrite { value, .. }
-        | Node::ConstantWrite { value, .. } => *value,
+        | Node::ConstantWrite { value, .. } => {
+            Some(Some(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner)))
+        }
         Node::Return { values, .. } => match values.len() {
-            0 => return Some(interner.nil()),
-            1 => values[0],
-            _ => return None,
+            0 => Some(Some(interner.nil())),
+            1 => Some(Some(tail_value_type(ast, typer, env, values[0], index, class_name, fqns, interner))),
+            _ => None,
         },
-        _ => tail,
-    };
-    // Literal carriers `type_of` leaves Dynamic — sig-gen still emits their
-    // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
-    // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
-    // through recovery, so no dedicated node exists here).
-    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
-        return Some(lit);
+        Node::If { .. } | Node::Case { .. } | Node::BeginRescue { .. } | Node::Loop { .. } => {
+            // The tail's VALUE leaves, each typed under ITS arm's env: an
+            // arm's last statement that is not a `return` (a `return` leaf
+            // exits the method — it is already in `returns`), an absent
+            // `else` contributes `nil`, a loop tail contributes `nil`.
+            let mut members: Vec<TypeId> = Vec::new();
+            if !control_tail_types(ast, typer, index, class_name, fqns, tail, env, interner, &mut members) {
+                return declined;
+            }
+            match members.len() {
+                0 => Some(None),
+                _ => Some(Some(
+                    members.iter().skip(1).fold(members[0], |acc, &m| {
+                        rigor_types::Algebra::join(interner, acc, m)
+                    }),
+                )),
+            }
+        }
+        _ => Some(Some(tail_value_type(ast, typer, env, tail, index, class_name, fqns, interner))),
     }
-    Some(typer.type_of(ast, target, env, interner))
+}
+
+/// Push the value-contributing tail types of a control expression onto
+/// `out` — each arm's last non-`return` statement typed under the ARM's env
+/// (an arm's earlier writes bind there: `if c; a = 1; a; end` contributes
+/// `Constant[1]`). A `return` leaf contributes nothing; an absent `else`
+/// contributes `nil`, and so does a loop tail that cannot carry a value.
+///
+/// Returns `false` to DECLINE the whole tail — the reference types these
+/// shapes by rules the def-local env does not model, so any typed answer
+/// would be a guess (rigor-rs#546 review 3):
+///
+/// - a `begin` with an `else` (the `else` value replaces the body's) or a
+///   `retry`; an ensure's value is discarded — `begin; 5; ensure; @m =
+///   false; end` is `5`, the protected body's tail;
+/// - a `for` loop (its value is the collection) and a `while` / `until` that
+///   holds a `break` (the break value joins `nil`) or runs its body first
+///   (`begin … end while`);
+/// - a `case`/`in` (no-match raises; patterns bind), a `rescue` modifier and
+///   the other non-sequence carriers;
+/// - a decision on a typed local, a named-capture `=~` ([`Typer::tail_env`]).
+#[allow(clippy::too_many_arguments)]
+fn control_tail_types(
+    ast: &LoweredAst,
+    typer: &Typer,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    id: NodeId,
+    env: &TypeEnv,
+    interner: &mut Interner,
+    out: &mut Vec<TypeId>,
+) -> bool {
+    #[allow(clippy::too_many_arguments)]
+    fn body_tail(
+        ast: &LoweredAst,
+        typer: &Typer,
+        index: &CoreIndex,
+        class_name: &str,
+        fqns: &std::collections::HashSet<String>,
+        body: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+        out: &mut Vec<TypeId>,
+    ) -> bool {
+        let Some(&tail) = body.last() else {
+            out.push(interner.nil());
+            return true;
+        };
+        // An arm whose tail follows a statement that always leaves is dead
+        // code: the reference types it in a scope the replay cannot reproduce.
+        if body[..body.len() - 1].iter().any(|&s| typer.always_exits(ast, s)) {
+            return false;
+        }
+        // The arm's own writes bind before its tail is read.
+        let arm = typer.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
+        control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out)
+    }
+    use rigor_infer::ExitKind;
+    let Some(env) = typer.tail_env(ast, env, id, interner) else { return false };
+    let env = &env;
+    let marks = typer.def_local_marks(ast);
+    match ast.get(id) {
+        Node::Return { .. } => true,
+        Node::If { predicate, then_body, else_body, is_unless, .. } => {
+            // A predicate whose type decides it elides the dead arm
+            // (`type_of(If)`; `if true; 1; else; 2; end` is `1`); a
+            // literal-only predicate the port cannot decide
+            // (`if true && false`) is folded by the reference — decline.
+            match typer.known_polarity(ast, env, *predicate, interner) {
+                Some(b) => {
+                    let live = if b != *is_unless { then_body } else { else_body };
+                    body_tail(ast, typer, index, class_name, fqns, live, env, interner, out)
+                }
+                None if rigor_infer::literal_like(ast, *predicate) => false,
+                None => {
+                    body_tail(ast, typer, index, class_name, fqns, then_body, env, interner, out)
+                        && body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
+                }
+            }
+        }
+        Node::Case { branches, else_body, .. } => {
+            for &b in branches {
+                match ast.get(b) {
+                    Node::When { body, .. } => {
+                        if !body_tail(ast, typer, index, class_name, fqns, body, env, interner, out) {
+                            return false;
+                        }
+                    }
+                    // `case`/`in`: not modelled.
+                    _ => return false,
+                }
+            }
+            body_tail(ast, typer, index, class_name, fqns, else_body, env, interner, out)
+        }
+        Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, span, .. } => {
+            if *has_else || marks.has_exit_within(*span, &[ExitKind::Retry]) {
+                return false;
+            }
+            if clauses.is_empty() {
+                // A statements / `else` / `in` / paren carrier (nothing to
+                // protect) is its body's tail; an ensure-only `begin`'s value
+                // is the protected body's, never the ensure's.
+                let tail_body = if ensure_body.is_empty() { body } else { main_body };
+                body_tail(ast, typer, index, class_name, fqns, tail_body, env, interner, out)
+            } else {
+                // The protected tail, or a clause's: a clause enters from any
+                // point of the body, so it reads the names the body writes
+                // as `untyped`.
+                if !body_tail(ast, typer, index, class_name, fqns, main_body, env, interner, out) {
+                    return false;
+                }
+                let mut clause_env = env.clone();
+                if let Some(sp) = rigor_infer::body_span(ast, main_body) {
+                    rigor_infer::Typer::widen_names(&mut clause_env, &marks.changed_within(sp), interner);
+                }
+                for c in clauses {
+                    if !body_tail(ast, typer, index, class_name, fqns, &c.body, &clause_env, interner, out) {
+                        return false;
+                    }
+                }
+                true
+            }
+        }
+        Node::Loop { kind, span, .. } => {
+            let once = matches!(
+                kind,
+                rigor_parse::LoopKind::While { begin_modifier: true }
+                    | rigor_parse::LoopKind::Until { begin_modifier: true }
+            );
+            if once
+                || matches!(kind, rigor_parse::LoopKind::For)
+                || marks.has_exit_within(*span, &[ExitKind::Break, ExitKind::Redo, ExitKind::Retry])
+            {
+                return false;
+            }
+            out.push(interner.nil());
+            true
+        }
+        Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
+            body_tail(ast, typer, index, class_name, fqns, body, env, interner, out)
+        }
+        // A `rescue` modifier, `super(…)`, `yield(…)`, `defined?`: no
+        // sequence order to read a tail from.
+        Node::Statements { .. } => false,
+        // `x op= v` keeps the operand, not the operator.
+        Node::LocalVariableOpWrite { .. } => false,
+        Node::LocalVariableWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. } => {
+            out.push(tail_value_type(ast, typer, env, *value, index, class_name, fqns, interner));
+            true
+        }
+        _ => {
+            out.push(tail_value_type(ast, typer, env, id, index, class_name, fqns, interner));
+            true
+        }
+    }
+}
+
+/// A tail value's type: the literal carriers `type_of` leaves Dynamic — sig-gen
+/// still emits their nominal (rigor-rs#493 item 7): `Range[bound-class-union]`,
+/// `Regexp`, `Rational`, `Complex` (interpolated regexps stay declined: they
+/// lower through recovery, so no dedicated node exists here) — else `type_of`.
+#[allow(clippy::too_many_arguments)]
+fn tail_value_type(
+    ast: &LoweredAst,
+    typer: &Typer,
+    env: &TypeEnv,
+    target: NodeId,
+    index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
+    interner: &mut Interner,
+) -> TypeId {
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
+        return lit;
+    }
+    typer.type_of(ast, target, env, interner)
 }
 
 /// The sig-gen-side nominal for a literal tail `check` leaves Dynamic

@@ -324,6 +324,7 @@ impl<'src> Builder<'src> {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
+                has_else: false,
                 clauses: Vec::new(),
                 span: span_of(&parens.location()),
             });
