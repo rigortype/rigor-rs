@@ -849,9 +849,21 @@ impl<'i> Typer<'i> {
         receiver_class: &str,
         method: &str,
     ) -> bool {
-        let scopes = crate::lexical_scopes(ast);
+        // Prefer the driver-populated scope table; recompute only when this
+        // Typer was built without one (sig-gen / annotate paths).
+        let owned_scopes;
+        let scopes: &[(rigor_parse::Span, Vec<String>)] = if self.lexical_scopes.is_empty() {
+            owned_scopes = crate::lexical_scopes(ast);
+            &owned_scopes
+        } else {
+            self.lexical_scopes
+        };
         let file_end = ast.iter().map(|(_, n)| n.span().1).max().unwrap_or(0);
-        let recv_is_module: bool = self.index.is_module(receiver_class);
+        // A QUALIFIED name (`File::Constants`) needs the qualified lookup —
+        // `refine(Class)` must not silence a module object's `name`
+        // (rigor-rs#467 review).
+        let recv_is_module: bool = self.index.is_module(receiver_class)
+            || self.index.is_qualified_module(receiver_class);
         for (_, n) in ast.iter() {
             let Node::Call {
                 receiver: None,
