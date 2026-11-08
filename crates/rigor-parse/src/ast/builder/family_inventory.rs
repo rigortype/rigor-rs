@@ -39,7 +39,7 @@ use std::collections::BTreeMap;
 /// fails an extraction that silently finds nothing.
 const FAMILY_FILES: [(&str, &str, &str, usize, usize); 5] = [
     ("lower_calls", "calls.rs", include_str!("calls.rs"), 7, 3),
-    ("lower_expressions", "expressions.rs", include_str!("expressions.rs"), 35, 35),
+    ("lower_expressions", "expressions.rs", include_str!("expressions.rs"), 38, 38),
     ("lower_control", "control.rs", include_str!("control.rs"), 13, 13),
     ("lower_definitions", "definitions.rs", include_str!("definitions.rs"), 4, 4),
     ("lower_jumps", "jumps.rs", include_str!("jumps.rs"), 31, 9),
