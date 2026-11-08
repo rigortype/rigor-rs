@@ -2168,6 +2168,14 @@ fn analyze_files(
     let mut project_source =
         rigor_infer::SourceIndex::merge_with_pre_eval(&files, &index, pre_eval::load(&cfg.pre_eval));
     project_source.set_pre_eval_declared(!cfg.pre_eval.is_empty());
+    // `libraries: [prime]` activates a gated vendored feature the same as a
+    // source `require "prime"` — `RequiredFeatures.tokens(features,
+    // configured_libraries)` (rigor-rs#463).
+    for lib in cfg.libraries() {
+        if rigor_parse::GATED_FEATURES.contains(&lib.as_str()) {
+            project_source.add_required_feature(lib);
+        }
+    }
     let t_stage2 = std::time::Instant::now();
 
     // STAGE 3 (file-parallel): analyze each file against the shared, now-frozen
