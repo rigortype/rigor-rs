@@ -182,6 +182,35 @@ fn check_lower_node_body(text: &str, open: usize, close: usize, file: &str) {
             );
             continue;
         }
+        // `node` must BE the argument, not a sub-expression of one (#497):
+        // `self.lower_calls(match node { n if n.as_nil_node().is_some() =>
+        // …, n => n }, span)` passes `node` through a renamed binding, so
+        // the scrutinee escapes the `node` scan entirely. Only `(`/`,`
+        // (allowing `&`/`*` borrows and spreads) may precede `node`, and
+        // only `,`/`)` may follow it.
+        let mut i = at;
+        loop {
+            while i > open && b[i - 1].is_ascii_whitespace() {
+                i -= 1;
+            }
+            if i > open && (b[i - 1] == b'&' || b[i - 1] == b'*') {
+                i -= 1;
+            } else {
+                break;
+            }
+        }
+        let mut j2 = at + "node".len();
+        while j2 < close && b[j2].is_ascii_whitespace() {
+            j2 += 1;
+        }
+        assert!(
+            i > open
+                && (b[i - 1] == b'(' || b[i - 1] == b',')
+                && j2 < close
+                && (b[j2] == b',' || b[j2] == b')'),
+            "{file}:{line}: `node` is not a bare call argument — `lower_node` may pass `node` \
+             whole to a family call only"
+        );
         let paren = enclosing_paren(b, open, at).unwrap_or_else(|| {
             panic!("{file}:{line}: `node` is neither `node.location()` nor a family-call argument")
         });
@@ -211,10 +240,19 @@ fn check_lower_node_body(text: &str, open: usize, close: usize, file: &str) {
                 }
                 &text[v..u] == "self"
             };
+        // The callee is the exact dispatch list, not a `lower_` prefix
+        // (#497): `dispatched_families` matches the literal text
+        // `self.lower_`, so a whitespace-tolerant `self . lower_x` would
+        // pass a broad allow-list while escaping the family audit — and
+        // any unlisted `self.lower_x(node, …)` never reaches
+        // FAMILY_FILES at all.
         assert!(
-            self_call && (callee.starts_with("lower_") || callee == "check_families_disjoint"),
-            "{file}:{line}: `node` reaches `{callee}` — `lower_node` may pass it to \
-             `self.lower_*` or `self.check_families_disjoint` only"
+            self_call
+                && (FAMILY_FILES.iter().any(|f| callee == f.0)
+                    || callee == "lower_fallback"
+                    || callee == "check_families_disjoint"),
+            "{file}:{line}: `node` reaches `{callee}` — `lower_node` may pass it to a \
+             dispatch family, `lower_fallback` or `check_families_disjoint` only"
         );
     }
 }
@@ -252,21 +290,52 @@ fn enclosing_paren(b: &[u8], open: usize, at: usize) -> Option<usize> {
 /// Prism type — still pass.
 #[test]
 fn lower_node_body_allows_only_dispatch() {
-    for src in [
-        "if matches!(node, PrismNode::NilNode { .. }) { return id; }",
-        "if let PrismNode::NilNode { .. } = node { return id; }",
-        "match node { PrismNode::NilNode { .. } => return id, _ => {} }",
-        "if is_nil(node) { return id; }",
-        "return self.try_nil(node, span);",
+    for (src, fragment) in [
+        ("if matches!(node, PrismNode::NilNode { .. }) { return id; }", "PrismNode::"),
+        ("if let PrismNode::NilNode { .. } = node { return id; }", "PrismNode::"),
+        ("match node { PrismNode::NilNode { .. } => return id, _ => {} }", "PrismNode::"),
+        ("let _ = PrismNode::IntegerNode;", "PrismNode::"),
+        ("if is_nil(node) { return id; }", "dispatch family"),
+        ("return self.try_nil(node, span);", "dispatch family"),
+        // #497 A: `node` must BE the argument — a `match`/`if` scrutinee
+        // inside the call's parens renames it away from the scan.
+        (
+            "self.lower_fallback(match node { n if n.as_nil_node().is_some() => return 0, n => n }, span)",
+            "bare call argument",
+        ),
+        (
+            "self.lower_fallback(match node { n => { if n.as_nil_node().is_some() { return 0; } n } }, span)",
+            "bare call argument",
+        ),
+        (
+            "self.lower_fallback((node).clone(), span)",
+            "dispatch family",
+        ),
+        (
+            "self.lower_fallback(node && true, span)",
+            "bare call argument",
+        ),
+        // #497 B: the callee is the exact dispatch list — a `lower_`
+        // prefix alone, whitespace or not, does not qualify.
+        ("self.lower_not_a_family(node, span)", "dispatch family"),
+        ("self . lower_unlisted(node, span)", "dispatch family"),
+        ("self\n    .lower_unlisted(node, span)", "dispatch family"),
     ] {
         let wrapped =
             format!("fn lower_node(&mut self, node: &PrismNode<'_>) -> NodeId {{\n{src}\n}}");
         let text = blank(&wrapped);
         let (open, close) = fn_body(&text, "lower_node", "synthetic");
-        assert!(
+        let err =
             std::panic::catch_unwind(|| check_lower_node_body(&text, open, close, "synthetic"))
-                .is_err(),
-            "check_lower_node_body accepted `{src}`"
+                .expect_err(&format!("check_lower_node_body accepted `{src}`"));
+        let msg = err
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| err.downcast_ref::<&'static str>().copied())
+            .unwrap_or_default();
+        assert!(
+            msg.contains(fragment),
+            "panic for `{src}` must name the rule it tripped (`{fragment}`): got `{msg}`"
         );
     }
     // The control body mirrors `lower_node`'s real one, plus a comment and
