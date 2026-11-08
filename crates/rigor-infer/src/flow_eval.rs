@@ -80,6 +80,31 @@ impl<'i> Typer<'i> {
         (env, returns)
     }
 
+    /// A method body for return typing: the env the LAST statement runs in
+    /// (the replay of every statement before it — the tail's own writes and
+    /// decisions must not already be applied when its value is typed) plus the
+    /// type of every `return`'s value at its position, tail construct
+    /// included (rigor-rs#546 review 3).
+    pub fn bind_body_for_tail(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        stmts: &[NodeId],
+        interner: &mut Interner,
+    ) -> (TypeEnv, Vec<(NodeId, TypeId)>) {
+        let mut env = env.clone();
+        let mut returns = Vec::new();
+        let split = stmts.len().saturating_sub(1);
+        self.replay_statements(ast, &mut env, &stmts[..split], interner, &mut returns);
+        // A tail after a statement that always leaves is dead code.
+        if stmts[..split].last().is_some_and(|&s| self.always_exits(ast, s)) {
+            Self::widen_all(&mut env, interner);
+        }
+        let before_tail = env.clone();
+        self.replay_statements(ast, &mut env, &stmts[split..], interner, &mut returns);
+        (before_tail, returns)
+    }
+
     /// The straight-line statement replay behind [`bind_statements_into`]:
     /// `bind_statement` per statement, plus shallow branch JOINS for the
     /// conditional bodies sig-gen return typing reads (`if c; a = 1; end; a`
@@ -113,7 +138,7 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
         returns: &mut Vec<(NodeId, TypeId)>,
     ) {
-        for &stmt in stmts {
+        for (idx, &stmt) in stmts.iter().enumerate() {
             let marks = self.def_local_marks(ast);
             let span = ast.get(stmt).span();
             let guards = self.typed_decision_reads(&marks, env, span, interner);
@@ -128,6 +153,25 @@ impl<'i> Typer<'i> {
             // `s = "a"; items.each { |i| s << i }`): the reference widens it,
             // the replay declines it (`def_local_marks`).
             self.apply_def_local_marks(ast, env, span, interner);
+            // Code after a statement that always leaves (`return`, `raise`,
+            // `break`) is unreachable: the reference types it in a scope the
+            // replay cannot reproduce, so it reads every local as unknown.
+            if idx + 1 < stmts.len() && self.always_exits(ast, stmt) {
+                Self::widen_all(env, interner);
+            }
+        }
+    }
+
+    /// Whether `stmt` always leaves its sequence: `return`, a jump, or a
+    /// receiver-less `raise` / `exit` / `abort` / `throw` / `fail`.
+    pub fn always_exits(&self, ast: &LoweredAst, stmt: NodeId) -> bool {
+        match ast.get(stmt) {
+            Node::Return { .. } | Node::Other { jump: Some(_), .. } => true,
+            Node::Statements { kind: StatementsKind::Jump(_), .. } => true,
+            Node::Call { receiver: None, method, .. } => {
+                matches!(method.as_str(), "raise" | "fail" | "exit" | "abort" | "throw")
+            }
+            _ => false,
         }
     }
 
@@ -326,8 +370,18 @@ impl<'i> Typer<'i> {
                     Self::widen_names(env, &marks.written_within(span), interner);
                 } else {
                     // The body runs zero or more times: the empty arm below
-                    // is the zero-iteration path (entry env).
-                    self.join_arm_writes(ast, env, &[(body, &[]), (&[], &[])], interner, returns);
+                    // is the zero-iteration path (entry env). A name the loop
+                    // both reads and writes is carried round to the next
+                    // iteration (`a = [a]`): the body must not read the entry
+                    // binding of it.
+                    let written = marks.written_within(span);
+                    let carried: Vec<String> = marks
+                        .reads_within(span)
+                        .into_iter()
+                        .filter(|r| written.iter().any(|w| w == r))
+                        .map(str::to_string)
+                        .collect();
+                    self.join_arm_writes(ast, env, &[(body, &carried), (&[], &[])], interner, returns);
                 }
                 // A `return` recorded inside the body typed its value at
                 // its source position, but the loop carries later writes
@@ -358,7 +412,7 @@ impl<'i> Typer<'i> {
             Node::LocalVariableOpWrite { name, .. } => {
                 env.insert(name.clone(), interner.untyped());
             }
-            Node::Call { block_body, .. } if !block_body.is_empty() => {
+            Node::Call { block_body, block_params, block_locals, .. } if !block_body.is_empty() => {
                 // A block may run and rebind a captured local — its
                 // writes are not modelled (block params are unbindable
                 // here), so every name the block could rebind widens to
@@ -366,9 +420,21 @@ impl<'i> Typer<'i> {
                 // end; a` kept `:s` (review).
                 self.bind_statement(ast, stmt, env, interner);
                 let mut block_env = env.clone();
+                // A block parameter / block-local SHADOWS the outer local of
+                // the same name: the body reads the argument, not the binding
+                // (`i = 1; c.each { |i| return i }` returns the argument).
+                let shadowed: Vec<String> = block_params
+                    .iter()
+                    .map(|(n, _)| n.clone())
+                    .chain(block_locals.iter().cloned())
+                    .collect();
+                Self::widen_names(&mut block_env, &shadowed, interner);
                 self.replay_statements(ast, &mut block_env, block_body, interner, returns);
                 let untyped = interner.untyped();
                 for (name, ty) in block_env.iter() {
+                    if shadowed.contains(name) {
+                        continue;
+                    }
                     if env.get(name) != Some(ty) {
                         env.insert(name.clone(), untyped);
                     }

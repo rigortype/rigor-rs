@@ -2027,8 +2027,7 @@ fn method_candidate(
     }
     typer.def_scope.set(rigor_infer::body_span(ast, sig.body));
     let _scope_guard = ScopeGuard(&typer.def_scope);
-    let (local, positional_returns) =
-        typer.bind_statements_into_with_returns(ast, &entry, sig.body, interner);
+    let (local, positional_returns) = typer.bind_body_for_tail(ast, &entry, sig.body, interner);
     let env = &local;
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
@@ -2060,11 +2059,16 @@ fn method_candidate(
         // reads may be rebound later (`a = :initial; if c; return a; end;
         // a = 100` → `(100 | :initial)`).
         let ty = match ret {
-            Some(v) => positional_returns
-                .iter()
-                .find(|(id, _)| id == v)
-                .map(|(_, t)| *t)
-                .unwrap_or_else(|| typer.type_of(ast, *v, env, interner)),
+            Some(v) => match positional_returns.iter().find(|(id, _)| id == v) {
+                Some((_, t)) => *t,
+                // A `return` the replay never reached (inside a value
+                // position — `x = c.map { |i| return i }`): it reads locals
+                // the replay cannot place, so a read declines.
+                None if !typer.def_local_marks(ast).reads_within(ast.get(*v).span()).is_empty() => {
+                    interner.untyped()
+                }
+                None => typer.type_of(ast, *v, env, interner),
+            },
             None => interner.nil(),
         };
         push_flat(interner, &mut members, ty);
@@ -2372,25 +2376,49 @@ fn computed_literal_tightening(interner: &Interner, inferred: TypeId, raw_tail: 
     )
 }
 
+/// Whether a call's block body is a return barrier: the reference
+/// `ReturnBarrier.block_call?` — a `define_method` / `define_singleton_method`
+/// block on any receiver (also through `send` / `public_send` / `__send__`
+/// with a literal symbol first argument), and `Kernel#lambda` (bare, on
+/// `self` or on `Kernel`).
+fn return_barrier_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str, args: &[NodeId]) -> bool {
+    let mut name = method.to_string();
+    if matches!(method, "send" | "public_send" | "__send__") {
+        match args.first().map(|&a| ast.get(a)) {
+            Some(Node::SymbolLit { value, .. }) => name = value.clone(),
+            _ => return false,
+        }
+    }
+    if matches!(name.as_str(), "define_method" | "define_singleton_method") {
+        return true;
+    }
+    name == "lambda"
+        && match receiver.map(|r| ast.get(r)) {
+            None | Some(Node::SelfExpr { .. }) => true,
+            Some(Node::ConstantRead { name, .. }) => name == "Kernel",
+            _ => false,
+        }
+}
+
 /// Collect the def's collectible explicit-return value expressions, or `None`
 /// when the method must be SKIPPED. Each element is `Some(value NodeId)` for a
 /// single-value `return e` / `None` for a bare `return` (→ `nil`). Ports the
 /// reference `DefReturnTyper#collect_return_types` semantics over the lowered
 /// arena:
 ///
-/// - **Barriers** (reference `RETURN_BARRIER_NODES` = block / lambda / def): a
-///   `return` inside a `Call`'s `block_body` or a nested def/class/module is NOT
-///   collected. A lambda's `return` never lowers to [`Node::Return`] at all (the
-///   lambda routes through the recovered-children fallthrough), so the lambda
-///   barrier holds structurally.
+/// - **Barriers** (reference `ReturnBarrier`, issue #1382): a `return` inside a
+///   nested `def` / class / module, a `->` lambda, or the block of a
+///   `define_method` / `define_singleton_method` / `Kernel#lambda` call
+///   ([`return_barrier_call`]) is NOT collected. A `return` in an ORDINARY
+///   block exits the method and IS collected (rigor-rs#546 review 3: the port
+///   treated every block as a barrier, so `a = nil; c.each { return "s" }; a`
+///   lost its `"s"` once the local env typed `a`).
 /// - **Multi-value** `return a, b`: the reference silently contributes NOTHING
 ///   (emitting a signature that misses the tuple — an unsound emit); rigor-rs
 ///   SKIPS the method instead (under-emit, FP-safe, no shared-method mismatch).
 /// - **Residual ambiguity**: `has_explicit_return` trips on returns inside
-///   lambdas AND inside unhandled wrappers; the former the reference barriers
-///   (safe to emit) but the latter it collects. When the flag is set yet NO
-///   [`Node::Return`] exists anywhere in the def, the two are indistinguishable
-///   → skip (rare, FP-safe).
+///   unhandled wrappers; when the flag is set yet NO [`Node::Return`] exists
+///   anywhere in the def, skip (rare, FP-safe).
 ///
 /// Membership is by span containment against the def's body-statement spans
 /// (the arena is flat; spans nest strictly), mirroring how outline/flow walks
@@ -2406,19 +2434,23 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
         regions.iter().any(|&(rs, re)| rs <= s.0 && s.1 <= re)
     };
 
-    // Barrier regions inside this def: block bodies + nested class-like scopes.
-    // (The def's own body statements are the regions, so any Definition matched
-    // within them is a NESTED def, never the def itself.)
+    // Barrier regions inside this def: a barrier call's block body, lambdas
+    // and nested class-like scopes. (The def's own body statements are the
+    // regions, so any Definition matched within them is a NESTED def, never
+    // the def itself.)
     let mut barriers: Vec<(usize, usize)> = Vec::new();
     for (_, node) in ast.iter() {
         match node {
-            Node::Call { block_body, span, .. }
-                if !block_body.is_empty() && within(*span, &regions) =>
+            Node::Call { receiver, method, args, block_body, block_span: Some(_), span, .. }
+                if !block_body.is_empty()
+                    && within(*span, &regions)
+                    && return_barrier_call(ast, *receiver, method, args) =>
             {
                 for &b in block_body {
                     barriers.push(ast.get(b).span());
                 }
             }
+            Node::Lambda { span, .. } if within(*span, &regions) => barriers.push(*span),
             // A def whose body is a `rescue` / `ensure` chain lowers to one
             // `BeginRescue` region spanning the whole def, so the def ITSELF
             // would match as a "nested" barrier and swallow every `return`
@@ -2444,7 +2476,7 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
             }
             found_any = true;
             if within(*span, &barriers) {
-                continue; // block / nested-def barrier (reference design)
+                continue; // lambda / nested-def / define_method barrier (reference design)
             }
             match values.len() {
                 0 => collected.push(None),
@@ -2585,6 +2617,11 @@ fn control_tail_types(
             out.push(interner.nil());
             return true;
         };
+        // An arm whose tail follows a statement that always leaves is dead
+        // code: the reference types it in a scope the replay cannot reproduce.
+        if body[..body.len() - 1].iter().any(|&s| typer.always_exits(ast, s)) {
+            return false;
+        }
         // The arm's own writes bind before its tail is read.
         let arm = typer.bind_statements_into(ast, env, &body[..body.len() - 1], interner);
         control_tail_types(ast, typer, index, class_name, fqns, tail, &arm, interner, out)

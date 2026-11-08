@@ -1659,15 +1659,15 @@ def use(v); @in_use = true; yield v; ensure; @in_use = false; end
     );
     assert_eq!(rows["e3"], r##"def e3: (untyped) -> 5"##);
     assert_eq!(rows["e6"], r##"def e6: (untyped) -> 5"##);
-    assert!(!rows.contains_key("e1"), "e1 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("e2"), "e2 must decline (reference: skipped): {rows:?}");
+    assert!(!rows.contains_key("e1"), "e1 must decline: {rows:?}");
+    assert!(!rows.contains_key("e2"), "e2 must decline: {rows:?}");
     assert_eq!(rows["e4"], r##"def e4: (untyped) -> (1 | 2)"##);
     assert_eq!(rows["e5"], r##"def e5: (untyped) -> 1"##);
     assert_eq!(rows["e7"], r##"def e7: (untyped) -> 3"##);
-    assert!(!rows.contains_key("e8"), "e8 must decline (reference: skipped): {rows:?}");
+    assert!(!rows.contains_key("e8"), "e8 must decline: {rows:?}");
     assert_eq!(rows["e9"], r##"def e9: (untyped) -> (5 | 6)"##);
-    assert!(!rows.contains_key("mute"), "mute must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("use"), "use must decline (reference: skipped): {rows:?}");
+    assert!(!rows.contains_key("mute"), "mute must decline: {rows:?}");
+    assert!(!rows.contains_key("use"), "use must decline: {rows:?}");
 }
 
 #[test]
@@ -1700,19 +1700,19 @@ def dfs(v); v.each { |i| i }; for i in v; i.x; end; end
     );
     assert_eq!(rows["w0"], r##"def w0: (untyped) -> nil"##);
     assert_eq!(rows["w3"], r##"def w3: (untyped) -> nil"##);
-    assert!(!rows.contains_key("w9"), "w9 must decline (reference: def w9: (untyped) -> nil): {rows:?}");
-    assert!(!rows.contains_key("w1"), "w1 must decline (reference: def w1: (untyped) -> (1 | nil)): {rows:?}");
-    assert!(!rows.contains_key("w2"), "w2 must decline (reference: def w2: (untyped) -> (:x | nil)): {rows:?}");
+    assert!(!rows.contains_key("w9"), "w9 must decline: {rows:?}");
+    assert!(!rows.contains_key("w1"), "w1 must decline: {rows:?}");
+    assert!(!rows.contains_key("w2"), "w2 must decline: {rows:?}");
     assert!(!rows.contains_key("w4"), "w4 must decline: {rows:?}");
-    assert!(!rows.contains_key("w5"), "w5 must decline (reference: def w5: (untyped) -> nil): {rows:?}");
-    assert!(!rows.contains_key("w8"), "w8 must decline (reference: def w8: (untyped) -> [1]): {rows:?}");
-    assert!(!rows.contains_key("w6"), "w6 must decline (reference: def w6: (untyped) -> [1, 2]): {rows:?}");
-    assert!(!rows.contains_key("w7"), "w7 must decline (reference: def w7: (untyped) -> Range[Integer]): {rows:?}");
-    assert!(!rows.contains_key("w10"), "w10 must decline (reference: def w10: (untyped) -> (2 | [1])): {rows:?}");
-    assert!(!rows.contains_key("p1"), "p1 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("w11"), "w11 must decline (reference: def w11: (untyped) -> nil): {rows:?}");
+    assert!(!rows.contains_key("w5"), "w5 must decline: {rows:?}");
+    assert!(!rows.contains_key("w8"), "w8 must decline: {rows:?}");
+    assert!(!rows.contains_key("w6"), "w6 must decline: {rows:?}");
+    assert!(!rows.contains_key("w7"), "w7 must decline: {rows:?}");
+    assert!(!rows.contains_key("w10"), "w10 must decline: {rows:?}");
+    assert!(!rows.contains_key("p1"), "p1 must decline: {rows:?}");
+    assert!(!rows.contains_key("w11"), "w11 must decline: {rows:?}");
     assert_eq!(rows["w12"], r##"def w12: (untyped) -> nil"##);
-    assert!(!rows.contains_key("dfs"), "dfs must decline (reference: skipped): {rows:?}");
+    assert!(!rows.contains_key("dfs"), "dfs must decline: {rows:?}");
 }
 
 #[test]
@@ -1740,19 +1740,19 @@ def x9(c); n = 0; begin; n += 1; c.x; 2; rescue; retry if n < 3; 3; end; end
 def x10(c); a = 1; begin; c.x; rescue; 0; else; a = 2; end; a; end
 "##,
     );
-    assert!(!rows.contains_key("o1"), "o1 must decline (reference: def o1: (untyped) -> 2): {rows:?}");
-    assert!(!rows.contains_key("o2"), "o2 must decline (reference: def o2: (untyped) -> 0): {rows:?}");
-    assert!(!rows.contains_key("o3"), "o3 must decline (reference: def o3: (untyped) -> 2): {rows:?}");
-    assert!(!rows.contains_key("x1"), "x1 must decline (reference: def x1: (untyped) -> (2 | 3)): {rows:?}");
-    assert!(!rows.contains_key("x2"), "x2 must decline (reference: def x2: (untyped) -> (2 | nil)): {rows:?}");
+    assert!(!rows.contains_key("o1"), "o1 must decline: {rows:?}");
+    assert!(!rows.contains_key("o2"), "o2 must decline: {rows:?}");
+    assert!(!rows.contains_key("o3"), "o3 must decline: {rows:?}");
+    assert!(!rows.contains_key("x1"), "x1 must decline: {rows:?}");
+    assert!(!rows.contains_key("x2"), "x2 must decline: {rows:?}");
     assert_eq!(rows["x3"], r##"def x3: (untyped) -> (1 | 2)"##);
     assert_eq!(rows["x4"], r##"def x4: (untyped) -> (1 | 2)"##);
-    assert!(!rows.contains_key("x5"), "x5 must decline (reference: def x5: (untyped) -> (1 | 2)): {rows:?}");
-    assert!(!rows.contains_key("x6"), "x6 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("x7"), "x7 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("x8"), "x8 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("x9"), "x9 must decline (reference: def x9: (untyped) -> (2 | 3)): {rows:?}");
-    assert!(!rows.contains_key("x10"), "x10 must decline (reference: def x10: (untyped) -> (1 | 2)): {rows:?}");
+    assert!(!rows.contains_key("x5"), "x5 must decline: {rows:?}");
+    assert!(!rows.contains_key("x6"), "x6 must decline: {rows:?}");
+    assert!(!rows.contains_key("x7"), "x7 must decline: {rows:?}");
+    assert!(!rows.contains_key("x8"), "x8 must decline: {rows:?}");
+    assert!(!rows.contains_key("x9"), "x9 must decline: {rows:?}");
+    assert!(!rows.contains_key("x10"), "x10 must decline: {rows:?}");
 }
 
 #[test]
@@ -1779,14 +1779,61 @@ def g9(c); a = 1; a + 1; ensure; return (a || 3); end
 "##,
     );
     assert_eq!(rows["g1"], r##"def g1: (untyped) -> (3 | 5)"##);
-    assert_eq!(rows["g2"], r##"def g2: (untyped) -> (7 | 8 | nil)"##);
+    assert!(!rows.contains_key("g2"), "g2 must decline: {rows:?}");
     assert_eq!(rows["g3"], r##"def g3: (untyped) -> (4 | 5 | 6)"##);
     assert_eq!(rows["g4"], r##"def g4: (untyped) -> (3 | 5)"##);
     assert_eq!(rows["g5"], r##"def g5: (untyped) -> (1 | 5)"##);
     assert_eq!(rows["g6"], r##"def g6: (untyped) -> (5 | nil)"##);
     assert_eq!(rows["g7"], r##"def g7: (untyped) -> 2"##);
-    assert!(!rows.contains_key("g8"), "g8 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("g9"), "g9 must decline (reference: def g9: (untyped) -> (1 | 2)): {rows:?}");
+    assert!(!rows.contains_key("g8"), "g8 must decline: {rows:?}");
+    assert!(!rows.contains_key("g9"), "g9 must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_block_returns_tail_env_and_loop_carried() {
+    // A `return` in an ORDINARY block exits the method and the reference collects
+    // it (ReturnBarrier, #1382: only a nested `def`, a lambda and `define_method`
+    // / `Kernel#lambda` bodies are barriers) — the port treated every block as a
+    // barrier and took a lambda's `return` for the method's. The tail is typed in
+    // the env BEFORE the tail statement runs (the whole-body env already carried
+    // the tail construct's own writes). A name a loop both reads and writes is
+    // carried to the next iteration.
+    // Rows marked `match` are byte-identical to the reference's `sig-gen --print`
+    // (oracle-probed); rows marked `decline` the reference emits (or skips) and the
+    // port declines — a coverage loss, never a wrong signature.
+    let rows = def_rows(
+        "def_local_env_block_returns_tail_env_and_loop_carried",
+        r##"
+def rb1(c); c.each { |i| return "s" }; 1; end
+def rb3(c); l = -> { return "s" }; 1; end
+def rb7(c); a = nil; c.each { |i| return "s" }; a; end
+def rb10(c); x = c.map { |i| return 7 }; 2; end
+def rb11(c); lambda { return 1 }; 2; end
+def rb12(c); proc { return 1 }; 2; end
+def rb13(c); c.send(:define_method, :x) { return 1 }; 2; end
+def rb15(c); foo.lambda { return 1 }; 2; end
+def rb8(c); i = 1; c.each { |i| return i }; 2; end
+def tt1(c); a = 1; if c; a = "s"; 5; else; a; end; end
+def tt2(c); a = 1; case c; when 1; a = "s"; 5; else; a; end; end
+def lc1(c); a = :s; until c.x; a = [a]; end; a; end
+def lc2(c); a = 1; while c; a = "s"; end; a; end
+def dd1(c); begin; a = []; return []; @i = a; ensure; ; end; end
+"##,
+    );
+    assert_eq!(rows["rb1"], r##"def rb1: (untyped) -> ("s" | 1)"##);
+    assert_eq!(rows["rb3"], r##"def rb3: (untyped) -> 1"##);
+    assert_eq!(rows["rb7"], r##"def rb7: (untyped) -> ("s" | nil)"##);
+    assert_eq!(rows["rb10"], r##"def rb10: (untyped) -> (2 | 7)"##);
+    assert_eq!(rows["rb11"], r##"def rb11: (untyped) -> 2"##);
+    assert_eq!(rows["rb12"], r##"def rb12: (untyped) -> (1 | 2)"##);
+    assert_eq!(rows["rb13"], r##"def rb13: (untyped) -> 2"##);
+    assert_eq!(rows["rb15"], r##"def rb15: (untyped) -> (1 | 2)"##);
+    assert!(!rows.contains_key("rb8"), "rb8 must decline: {rows:?}");
+    assert_eq!(rows["tt1"], r##"def tt1: (untyped) -> (1 | 5)"##);
+    assert_eq!(rows["tt2"], r##"def tt2: (untyped) -> (1 | 5)"##);
+    assert!(!rows.contains_key("lc1"), "lc1 must decline: {rows:?}");
+    assert_eq!(rows["lc2"], r##"def lc2: (untyped) -> ("s" | 1)"##);
+    assert!(!rows.contains_key("dd1"), "dd1 must decline: {rows:?}");
 }
 
 #[test]
@@ -1833,9 +1880,9 @@ def k31(c); x = 1; x = 2 if c; x; end
     assert_eq!(rows["k16"], r##"def k16: (untyped) -> 1"##);
     assert_eq!(rows["k17"], r##"def k17: (untyped) -> 1"##);
     assert_eq!(rows["k18"], r##"def k18: (untyped) -> 1"##);
-    assert!(!rows.contains_key("k19"), "k19 must decline (reference: def k19: (untyped) -> 3): {rows:?}");
-    assert!(!rows.contains_key("k20"), "k20 must decline (reference: def k20: (untyped) -> 2): {rows:?}");
-    assert!(!rows.contains_key("k22"), "k22 must decline (reference: def k22: (untyped) -> 1): {rows:?}");
+    assert!(!rows.contains_key("k19"), "k19 must decline: {rows:?}");
+    assert!(!rows.contains_key("k20"), "k20 must decline: {rows:?}");
+    assert!(!rows.contains_key("k22"), "k22 must decline: {rows:?}");
     assert_eq!(rows["k23"], r##"def k23: (untyped) -> 2"##);
     assert_eq!(rows["k24"], r##"def k24: (untyped) -> 2"##);
     assert_eq!(rows["k31"], r##"def k31: (untyped) -> (1 | 2)"##);
@@ -1901,16 +1948,16 @@ def s31(c); a = 1; b = a; b = 2 if c; b; end
     assert!(!rows.contains_key("s14"), "s14 must decline: {rows:?}");
     assert!(!rows.contains_key("s15"), "s15 must decline: {rows:?}");
     assert!(!rows.contains_key("s16"), "s16 must decline: {rows:?}");
-    assert!(!rows.contains_key("s17"), "s17 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("s18"), "s18 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("s19"), "s19 must decline (reference: def s19: (untyped) -> (1 | StandardError)): {rows:?}");
-    assert!(!rows.contains_key("s20"), "s20 must decline (reference: def s20: (untyped) -> Integer): {rows:?}");
-    assert!(!rows.contains_key("s21"), "s21 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("s22"), "s22 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("s23"), "s23 must decline (reference: skipped): {rows:?}");
-    assert!(!rows.contains_key("s24"), "s24 must decline (reference: def s24: (untyped) -> (String | nil)): {rows:?}");
-    assert!(!rows.contains_key("s25"), "s25 must decline (reference: def s25: (untyped) -> (1 | 2)): {rows:?}");
-    assert!(!rows.contains_key("s26"), "s26 must decline (reference: def s26: (untyped) -> 2): {rows:?}");
+    assert!(!rows.contains_key("s17"), "s17 must decline: {rows:?}");
+    assert!(!rows.contains_key("s18"), "s18 must decline: {rows:?}");
+    assert!(!rows.contains_key("s19"), "s19 must decline: {rows:?}");
+    assert!(!rows.contains_key("s20"), "s20 must decline: {rows:?}");
+    assert!(!rows.contains_key("s21"), "s21 must decline: {rows:?}");
+    assert!(!rows.contains_key("s22"), "s22 must decline: {rows:?}");
+    assert!(!rows.contains_key("s23"), "s23 must decline: {rows:?}");
+    assert!(!rows.contains_key("s24"), "s24 must decline: {rows:?}");
+    assert!(!rows.contains_key("s25"), "s25 must decline: {rows:?}");
+    assert!(!rows.contains_key("s26"), "s26 must decline: {rows:?}");
     assert!(!rows.contains_key("s27"), "s27 must decline: {rows:?}");
     assert_eq!(rows["s28"], r##"def s28: (untyped) -> (1 | 2)"##);
     assert_eq!(rows["s29"], r##"def s29: (untyped) -> 1"##);
@@ -1949,19 +1996,19 @@ def n15(c); r = nil; r = 1 if c.a; r = 2 if c.b; r; end
 def n16(c); a = nil; a = 1 if c; x = a; x; end
 "##,
     );
-    assert!(!rows.contains_key("n1"), "n1 must decline (reference: def n1: (untyped) -> (1 | 5)): {rows:?}");
-    assert!(!rows.contains_key("n2"), "n2 must decline (reference: def n2: (untyped) -> (1 | 5)): {rows:?}");
-    assert!(!rows.contains_key("n3"), "n3 must decline (reference: def n3: (untyped) -> (0 | 1)): {rows:?}");
-    assert!(!rows.contains_key("n4"), "n4 must decline (reference: def n4: (untyped) -> (0 | 1)): {rows:?}");
+    assert!(!rows.contains_key("n1"), "n1 must decline: {rows:?}");
+    assert!(!rows.contains_key("n2"), "n2 must decline: {rows:?}");
+    assert!(!rows.contains_key("n3"), "n3 must decline: {rows:?}");
+    assert!(!rows.contains_key("n4"), "n4 must decline: {rows:?}");
     assert!(!rows.contains_key("n5"), "n5 must decline: {rows:?}");
-    assert!(!rows.contains_key("n6"), "n6 must decline (reference: def n6: (untyped) -> (2 | nil)): {rows:?}");
-    assert!(!rows.contains_key("n7"), "n7 must decline (reference: def n7: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("n8"), "n8 must decline (reference: def n8: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("n9"), "n9 must decline (reference: def n9: (untyped) -> (0 | 1)): {rows:?}");
-    assert!(!rows.contains_key("n10"), "n10 must decline (reference: def n10: (untyped) -> (0 | 1)): {rows:?}");
-    assert!(!rows.contains_key("n11"), "n11 must decline (reference: def n11: (untyped) -> (1 | 2)): {rows:?}");
-    assert!(!rows.contains_key("n12"), "n12 must decline (reference: def n12: (untyped) -> 2): {rows:?}");
-    assert!(!rows.contains_key("n13"), "n13 must decline (reference: def n13: (untyped) -> 2): {rows:?}");
+    assert!(!rows.contains_key("n6"), "n6 must decline: {rows:?}");
+    assert!(!rows.contains_key("n7"), "n7 must decline: {rows:?}");
+    assert!(!rows.contains_key("n8"), "n8 must decline: {rows:?}");
+    assert!(!rows.contains_key("n9"), "n9 must decline: {rows:?}");
+    assert!(!rows.contains_key("n10"), "n10 must decline: {rows:?}");
+    assert!(!rows.contains_key("n11"), "n11 must decline: {rows:?}");
+    assert!(!rows.contains_key("n12"), "n12 must decline: {rows:?}");
+    assert!(!rows.contains_key("n13"), "n13 must decline: {rows:?}");
     assert_eq!(rows["n14"], r##"def n14: (untyped) -> (1 | nil)"##);
     assert_eq!(rows["n15"], r##"def n15: (untyped) -> (1 | 2 | nil)"##);
     assert_eq!(rows["n16"], r##"def n16: (untyped) -> (1 | nil)"##);
@@ -1999,22 +2046,22 @@ def t18(c); a = 1; if c; return a; end; a = 2; a; end
 def t19(c); a = 1; if c; a = 2; else; a = 3; end; a; end
 "##,
     );
-    assert!(!rows.contains_key("t1"), "t1 must decline (reference: def t1: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t2"), "t2 must decline (reference: def t2: (untyped) -> (1 | nil)): {rows:?}");
-    assert!(!rows.contains_key("t3"), "t3 must decline (reference: def t3: (untyped) -> (1 | 7)): {rows:?}");
-    assert!(!rows.contains_key("t4"), "t4 must decline (reference: def t4: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t5"), "t5 must decline (reference: def t5: (untyped) -> 2): {rows:?}");
-    assert!(!rows.contains_key("t6"), "t6 must decline (reference: def t6: (untyped) -> 3): {rows:?}");
-    assert!(!rows.contains_key("t7"), "t7 must decline (reference: def t7: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t8"), "t8 must decline (reference: def t8: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t9"), "t9 must decline (reference: def t9: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t10"), "t10 must decline (reference: def t10: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t11"), "t11 must decline (reference: def t11: (untyped) -> (1 | 2)): {rows:?}");
-    assert!(!rows.contains_key("t12"), "t12 must decline (reference: def t12: (untyped) -> (1 | 2)): {rows:?}");
-    assert!(!rows.contains_key("t13"), "t13 must decline (reference: def t13: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t14"), "t14 must decline (reference: def t14: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t15"), "t15 must decline (reference: def t15: (untyped) -> 1): {rows:?}");
-    assert!(!rows.contains_key("t16"), "t16 must decline (reference: def t16: (untyped) -> (1 | 2)): {rows:?}");
+    assert!(!rows.contains_key("t1"), "t1 must decline: {rows:?}");
+    assert!(!rows.contains_key("t2"), "t2 must decline: {rows:?}");
+    assert!(!rows.contains_key("t3"), "t3 must decline: {rows:?}");
+    assert!(!rows.contains_key("t4"), "t4 must decline: {rows:?}");
+    assert!(!rows.contains_key("t5"), "t5 must decline: {rows:?}");
+    assert!(!rows.contains_key("t6"), "t6 must decline: {rows:?}");
+    assert!(!rows.contains_key("t7"), "t7 must decline: {rows:?}");
+    assert!(!rows.contains_key("t8"), "t8 must decline: {rows:?}");
+    assert!(!rows.contains_key("t9"), "t9 must decline: {rows:?}");
+    assert!(!rows.contains_key("t10"), "t10 must decline: {rows:?}");
+    assert!(!rows.contains_key("t11"), "t11 must decline: {rows:?}");
+    assert!(!rows.contains_key("t12"), "t12 must decline: {rows:?}");
+    assert!(!rows.contains_key("t13"), "t13 must decline: {rows:?}");
+    assert!(!rows.contains_key("t14"), "t14 must decline: {rows:?}");
+    assert!(!rows.contains_key("t15"), "t15 must decline: {rows:?}");
+    assert!(!rows.contains_key("t16"), "t16 must decline: {rows:?}");
     assert_eq!(rows["t17"], r##"def t17: (untyped) -> (1 | 2)"##);
     assert_eq!(rows["t18"], r##"def t18: (untyped) -> (1 | 2)"##);
     assert_eq!(rows["t19"], r##"def t19: (untyped) -> (2 | 3)"##);

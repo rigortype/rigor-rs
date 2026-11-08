@@ -439,7 +439,7 @@ impl DefLocalMarks {
     }
 
     /// The local names read inside `span`.
-    pub(crate) fn reads_within(&self, span: Span) -> Vec<&str> {
+    pub fn reads_within(&self, span: Span) -> Vec<&str> {
         let i = self.reads.partition_point(|r| r.0 < span.0);
         self.reads[i..]
             .iter()
