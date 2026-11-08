@@ -1375,3 +1375,133 @@ fn bare_core_reopening_reads_every_method_as_new() {
         "# c\nclass Hash[unchecked out K, unchecked out V]\n  def hfoo: () -> 1\n  def hbar: () -> 2\nend\n"
     );
 }
+
+/// `method name -> emitted rbs` for every def in `body` the port EMITS, under
+/// `class K` (a declined method has no entry).
+fn def_rows(tag: &str, body: &str) -> HashMap<String, String> {
+    let src = format!("class K\n{body}\nend\n");
+    candidates_tagged(tag, &src, false)
+        .into_iter()
+        .map(|c| (c.method_name, c.rbs))
+        .collect()
+}
+
+#[test]
+fn def_local_env_binds_straight_line_writes() {
+    // rigor-rs#546 brief rows — byte-identical to the reference
+    // (`sig-gen --print`, oracle-probed): a method-local read in the tail binds
+    // the literal it was written with; branches join (an unrun arm adds the
+    // entry binding, `nil` when the name was unbound).
+    let rows = def_rows(
+        "def_local_brief",
+        "def z; a = 1; a; end\n\
+         def j1(c); x = if c; 1; end; x; end\n\
+         def j2(c); a = 1; if c; a = \"s\"; end; a; end\n\
+         def j3(c); a = 1; unless c; a = :s; end; a; end\n\
+         def j4(c); a = c ? 1 : 2; a; end\n\
+         def j6(c); a = 1; a = \"s\" if c; a; end\n\
+         def j9(c); a = 1; while c; a = \"s\"; end; a; end\n\
+         def j11(c); a = 1; return a if c; a = 2; a; end\n\
+         def j15(c); a = :initial; if c; return a; end; a = 100; a; end\n\
+         def q5(c); a = \"x\"; a = a.upcase; a; end\n\
+         def q6(c); r = []; r << 1; r = [2]; r; end",
+    );
+    assert_eq!(rows["z"], "def z: () -> 1");
+    assert_eq!(rows["j1"], "def j1: (untyped) -> (1 | nil)");
+    assert_eq!(rows["j2"], "def j2: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["j3"], "def j3: (untyped) -> (1 | :s)");
+    assert_eq!(rows["j4"], "def j4: (untyped) -> (1 | 2)");
+    assert_eq!(rows["j6"], "def j6: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["j9"], "def j9: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["j11"], "def j11: (untyped) -> (1 | 2)");
+    assert_eq!(rows["j15"], "def j15: (untyped) -> (100 | :initial)");
+    assert_eq!(rows["q5"], "def q5: (untyped) -> \"X\"");
+    // A fresh literal after the mutation is a fresh carrier again.
+    assert_eq!(rows["q6"], "def q6: (untyped) -> [2]");
+}
+
+#[test]
+fn def_local_env_declines_a_literal_the_body_mutates() {
+    // rigor-rs#546 review: the reference WIDENS a literal-bound local after an
+    // in-place mutation (`Array[untyped]`, `String`, `Hash[untyped, untyped]`);
+    // the port declines it (the stale `[]` / `"abc"` would be an unsound
+    // signature — master skipped every one). A coverage loss, never a wrong
+    // type. Every row below is a method the reference emits with the widened
+    // type (`Array[untyped]`, `String`, `Hash[untyped, untyped]`, ...).
+    let rows = def_rows(
+        "def_local_mutated",
+        "def c1(items); r = []; items.each { |i| r << i }; r; end\n\
+         def c2(items); r = []; r << 1; r; end\n\
+         def c3(items); s = \"\"; s << \"a\"; s; end\n\
+         def c4(items); s = \"\"; s += \"a\"; s; end\n\
+         def c5(items); h = {}; h[:a] = 1; h; end\n\
+         def c6(items); s = \"abc\"; s.upcase!; s; end\n\
+         def c7(items); s = \"x\"; s.concat(\"d\"); s; end\n\
+         def c8(items); a = [1]; a.push(2); a; end\n\
+         def c9(items); a = [1]; a.map!(&:to_s); a; end\n\
+         def c10(items); s = \"x\"; s[0] = \"y\"; s; end\n\
+         def c13(items); s = \"x\"; items.each { |i| s << i }; s; end\n\
+         def c14(items); a = [1, 2]; a.clear; a; end\n\
+         def c15(items); h = {a: 1}; h.delete(:a); h; end\n\
+         def c16(items); s = \"x\"; s.replace(\"yy\"); s; end\n\
+         def e10(c); a = [[1]]; a[0] << 2; a; end\n\
+         def e11(c); a = [1]; l = -> { a << 2 }; l.call; a; end\n\
+         def e12(c); h = {a: 1}; h[:a] += 1; h; end\n\
+         def e13(c); h = {a: 1}; h[:b] ||= 2; h; end\n\
+         def e17(c); a = [1]; a.push(2) if c; a; end\n\
+         def e18(c); a = [1]; while c; a << 2; end; a; end\n\
+         def e32(c); a = [1]; a.concat([2]).size; a; end\n\
+         def e34(c); a = [1]; a.tap { |t| t << 2 }; a; end\n\
+         def e36(c); a = [1]; a&.push(2); a; end",
+    );
+    assert!(rows.is_empty(), "every mutated local must decline: {rows:?}");
+}
+
+#[test]
+fn def_local_env_keeps_what_a_call_cannot_invalidate() {
+    // Controls that still match the reference byte for byte: a non-mutating
+    // call on the local, an alias / pass-through the reference does not widen
+    // either, an immutable scalar, and a bare `String` nominal.
+    let rows = def_rows(
+        "def_local_controls",
+        "def c11(items); s = String.new; s << \"a\"; s; end\n\
+         def e2(c); a = [1]; foo(a); a; end\n\
+         def e3(c); a = [1]; a.each { |x| x }; a; end\n\
+         def e5(c); s = \"a\"; t = s.upcase; s; end\n\
+         def e6(c); a = [1]; a.freeze; a; end\n\
+         def e7(c); a = [1]; x = a.size; a; end\n\
+         def e8(c); a = [1]; b = a.map { |i| i }; a; end\n\
+         def e28(c); a = [1]; a.first; a; end\n\
+         def n1(c); x = 1; x.succ!; x; end",
+    );
+    assert_eq!(rows["c11"], "def c11: (untyped) -> String");
+    for name in ["e2", "e3", "e6", "e7", "e8", "e28"] {
+        assert_eq!(rows[name], format!("def {name}: (untyped) -> [1]"), "{name}");
+    }
+    assert_eq!(rows["e5"], "def e5: (untyped) -> \"a\"");
+}
+
+#[test]
+fn def_local_env_declines_a_loop_the_reference_folds() {
+    // The reference folds a loop predicate over constant-bound locals
+    // (`while i < 3` over `i = 0` is `bot`; `while i > 3` never enters and
+    // keeps `i`); the zero-or-more join would emit `("s" | 0)`. A bare literal
+    // predicate is not folded there, so the join stays. A `return` in a loop
+    // body that reads a name the loop later writes or mutates is typed against
+    // the loop-carried binding — declined, not the entry literal.
+    let rows = def_rows(
+        "def_local_loops",
+        "def m14; i = 0; while i < 3; i = \"s\"; end; i; end\n\
+         def w4(c); i = 0; while i > 3; i = \"s\"; end; i; end\n\
+         def w2(c); a = 1; while true; a = \"s\"; end; a; end\n\
+         def l1(c); a = 1; while c; return a if c.x; a = \"s\"; end; nil; end\n\
+         def l2(c); a = [1]; while c; return a if c.x; a << 2; end; nil; end\n\
+         def l4(c); a = 1; while c; return a if c.x; end; nil; end\n\
+         def d1(c); x = 1; l = -> { x = \"s\" }; l.call; x; end",
+    );
+    for name in ["m14", "w4", "l1", "l2", "d1"] {
+        assert!(!rows.contains_key(name), "{name} must decline: {rows:?}");
+    }
+    assert_eq!(rows["w2"], "def w2: (untyped) -> (\"s\" | 1)");
+    assert_eq!(rows["l4"], "def l4: (untyped) -> (1 | nil)");
+}
