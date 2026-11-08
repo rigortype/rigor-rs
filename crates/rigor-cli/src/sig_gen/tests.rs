@@ -650,6 +650,7 @@ fn diff_string_emits_header_and_plus_line_per_candidate() {
         inferred_return: String::new(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: None,
@@ -705,6 +706,7 @@ fn render_new_file_wraps_nested_namespaces_with_kinds_and_super() {
         inferred_return: String::new(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: None,
@@ -730,6 +732,7 @@ fn render_new_file_appends_data_struct_shells_after_real_children() {
         inferred_return: String::new(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: None,
@@ -770,6 +773,7 @@ fn render_new_file_leaf_class_defaults_to_class_keyword() {
         inferred_return: String::new(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: None,
@@ -892,6 +896,7 @@ fn mc(class: &str, method: &str, kind: &'static str, rbs: &str) -> Candidate {
         inferred_return: String::new(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: None,
@@ -1409,4 +1414,180 @@ fn bare_core_reopening_reads_every_method_as_new() {
         out.source,
         "# c\nclass Hash[unchecked out K, unchecked out V]\n  def hfoo: () -> 1\n  def hbar: () -> 2\nend\n"
     );
+}
+
+// ---------------------------------------------------------------------------
+// rigor-rs#544 review: a tighter return changes the return and ONLY the return.
+// The reference re-spells the class's own declared overload with the new
+// return (`tighter_return_line`); every row below is oracle-verified
+// (`harness/probe.py --dir PROJ -- sig-gen --print / --diff`).
+// ---------------------------------------------------------------------------
+
+/// One tighter-return probe: `def NAME ... = BODY` against the sig member
+/// `DECL`, inside `class Foo`. Returns the emitted rows.
+fn tighter_rows(tag: &str, def_src: &str, decl: &str) -> Vec<Candidate> {
+    candidates_with_sig(
+        tag,
+        &format!("class Foo\n  {def_src}\nend\n"),
+        &format!("class Foo\n  {decl}\nend\n"),
+    )
+}
+
+#[test]
+fn tighter_return_keeps_declared_parameters() {
+    // `def n(x) = 4.2` against `(Integer) -> Numeric`: reference
+    // `def n: (Integer) -> Float`, NOT the def-shaped `(untyped) -> Float`.
+    for (tag, decl, want) in [
+        ("hp1", "def n: (Integer) -> Numeric", "def n: (Integer) -> Float"),
+        ("hp2", "def n: (Integer) -> untyped", "def n: (Integer) -> Float"),
+        ("hp3", "def n: (Integer x) -> Numeric", "def n: (Integer x) -> Float"),
+        ("hp4", "def n: (?Integer) -> Numeric", "def n: (?Integer) -> Float"),
+        ("hp5", "def n: (untyped x) -> untyped", "def n: (untyped x) -> Float"),
+        ("hp6", "def n: (::Integer) -> Numeric", "def n: (::Integer) -> Float"),
+    ] {
+        let cs = tighter_rows(tag, "def n(x) = 4.2", decl);
+        assert_eq!(cs.len(), 1, "{tag}: {cs:?}");
+        assert_eq!(cs[0].classification, "tighter_return", "{tag}");
+        assert_eq!(cs[0].rbs, want, "{tag}");
+    }
+    // The declared parameters win over the def's own arity.
+    let cs = tighter_rows("hp_arity", "def n = 4.2", "def n: (Integer) -> Numeric");
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    assert_eq!(cs[0].rbs, "def n: (Integer) -> Float");
+}
+
+#[test]
+fn tighter_return_diff_shows_the_declared_line() {
+    // `--diff`'s `- ` line is the class's own member, squished — not the
+    // hard-coded `() -> <return>` (reference `declared_rbs`).
+    let cs = tighter_rows("diff_decl", "def n(x) = 4.2", "def n: (Integer) -> Numeric");
+    assert_eq!(
+        diff_string(&cs),
+        "--- lib/foo.rb: Foo#n\n- def n: (Integer) -> Numeric\n+ def n: (Integer) -> Float\n\n"
+            .replace("lib/foo.rb", &cs[0].file),
+    );
+    // An ancestor-only declaration has no own line: the fallback `- def n: () -> T`.
+    let cs = candidates_with_sig(
+        "diff_anc",
+        "class Base\nend\nclass Foo < Base\n  def n(x) = 4.2\nend\n",
+        "class Base\n  def n: (Integer) -> Numeric\nend\nclass Foo < Base\nend\n",
+    );
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    // The override is rendered from the def (`(untyped)`), as for a new method.
+    assert_eq!(cs[0].rbs, "def n: (untyped) -> Float");
+    assert_eq!(cs[0].declared_rbs, None);
+    assert!(diff_string(&cs).contains("\n- def n: () -> Numeric\n"), "{}", diff_string(&cs));
+}
+
+#[test]
+fn tighter_return_declines_heads_it_cannot_respell() {
+    // The reference keeps a block, type parameters, visibility, annotations
+    // and any non-trivial parameter spelling (`{ () -> void }`, `[T] (T)`,
+    // `private def`, `%a{pure}`, `Integer?`); the port re-spells only a
+    // canonical simple head and DECLINES the rest (the decline side).
+    for (tag, decl) in [
+        ("blk", "def n: () { () -> void } -> Numeric"),
+        ("blkopt", "def n: () ?{ () -> void } -> Numeric"),
+        ("tp", "def n: [T] (T) -> Numeric"),
+        ("tpn", "def n: [T] (T x) -> Numeric"),
+        ("priv", "private def n: (Integer) -> Numeric"),
+        ("anno", "%a{pure} def n: (Integer) -> Numeric"),
+        ("ovl", "def n: (Integer) -> Numeric | (String) -> Numeric"),
+        ("opt", "def n: (Integer?) -> Numeric"),
+        ("uni", "def n: (Integer | String) -> Numeric"),
+        ("gen", "def n: (Array[Integer]) -> Numeric"),
+        ("kw", "def n: (**Integer) -> Numeric"),
+        ("space", "def n: (Integer  x) -> Numeric"),
+        ("multi", "def n:\n    (Integer\n     x)\n    -> Numeric"),
+    ] {
+        let cs = tighter_rows(tag, "def n(x) = 4.2", decl);
+        assert!(cs.is_empty(), "{tag}: expected DECLINE, got {cs:?}");
+    }
+}
+
+#[test]
+fn tighter_return_overloading_member_declines() {
+    // `def n: (String) -> Numeric` plus a second `def n: ... | ...`: the
+    // reference sees two overloads and declines; the port must not tighten the
+    // first member alone.
+    let cs = candidates_with_sig(
+        "ovlpp",
+        "class Foo\n  def n(x) = 4.2\nend\n",
+        "class Foo\n  def n: (String) -> Numeric\n  def n: (Integer) -> Numeric | ...\nend\n",
+    );
+    assert!(cs.is_empty(), "{cs:?}");
+}
+
+#[test]
+fn tighter_return_reopened_class_member_is_declared() {
+    // A method declared in a second `class Foo` body is the class's own
+    // declaration: the reference tightens it with its declared head.
+    let cs = candidates_with_sig(
+        "reopen",
+        "class Foo\n  def n(x) = 4.2\nend\n",
+        "class Foo\nend\nclass Foo\n  def n: (Integer) -> Numeric\nend\n",
+    );
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    assert_eq!(cs[0].rbs, "def n: (Integer) -> Float");
+}
+
+#[test]
+fn tighter_return_singleton_and_attr_heads() {
+    let cs = candidates_with_sig(
+        "sing_head",
+        "class Foo\n  def self.n(x) = 4.2\nend\n",
+        "class Foo\n  def self.n: (Integer) -> Numeric\nend\n",
+    );
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    assert_eq!(cs[0].rbs, "def self.n: (Integer) -> Float");
+    // An attr reader's head is `()`; the diff line is the attr member.
+    let cs = candidates_with_sig(
+        "attr_head",
+        "class Foo\n  def n = 4.2\nend\n",
+        "class Foo\n  attr_reader n: Numeric\nend\n",
+    );
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    assert_eq!(cs[0].rbs, "def n: () -> Float");
+    assert_eq!(cs[0].declared_rbs.as_deref(), Some("attr_reader n: Numeric"));
+    // An attr writer's head is `(T) -> T` (reference: `wr=: (::Numeric)`): declined.
+    let cs = candidates_with_sig(
+        "attr_writer",
+        "class Foo\n  def n=(v); 4.2; end\nend\n",
+        "class Foo\n  attr_accessor n: Numeric\nend\n",
+    );
+    assert!(cs.is_empty(), "{cs:?}");
+}
+
+#[test]
+fn untyped_tighten_declines_nested_pinned_literals() {
+    // The reference widens a literal nested in a tuple / record
+    // (`[Integer, Integer]`, `{ a: Integer }`); the port widens top-level
+    // members only, so it declines rather than emit `[1, 2]` / `{ a: 1 }`.
+    for (tag, def_src) in [("tup", "def n = [1, 2]"), ("rec", "def n = {a: 1}")] {
+        let cs = tighter_rows(tag, def_src, "def n: () -> untyped");
+        assert!(cs.is_empty(), "{tag}: {cs:?}");
+    }
+    // Must-still-fire controls: top-level literals widen.
+    let cs = tighter_rows("ctl1", "def n = 1", "def n: () -> untyped");
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    assert_eq!(cs[0].rbs, "def n: () -> Integer");
+}
+
+#[test]
+fn tighter_return_declines_closed_literal_computations() {
+    // The reference folds an all-literal computation to a constant and drops it
+    // (`computed_literal_tightening?`): `4.2.to_s` against `-> Comparable`,
+    // `[1].size.to_f` / `Math.sqrt(4)` against `-> Numeric`.
+    for (tag, def_src, decl) in [
+        ("c1", "def n = 4.2.to_s", "def n: () -> Comparable"),
+        ("c2", "def n = [1].size.to_f", "def n: () -> Numeric"),
+        ("c3", "def n = Math.sqrt(4)", "def n: () -> Numeric"),
+    ] {
+        let cs = tighter_rows(tag, def_src, decl);
+        assert!(cs.is_empty(), "{tag}: {cs:?}");
+    }
+    // Control: a directly authored literal still tightens (brief row).
+    let cs = tighter_rows("c4", "def n = 4.2", "def n: () -> Numeric");
+    assert_eq!(cs.len(), 1, "{cs:?}");
+    assert_eq!(cs[0].rbs, "def n: () -> Float");
 }

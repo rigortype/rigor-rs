@@ -143,6 +143,11 @@ struct Candidate {
     /// `# [tighter, was: X]` tag / `- def …` diff line / JSON `declared_return_rbs`);
     /// `None` for a `new_method`.
     declared_return_rbs: Option<String>,
+    /// For a `tighter_return` over the class's OWN declaration, that member's
+    /// whitespace-squished source — the `--diff` `- ` line (reference
+    /// `MethodCandidate#declared_rbs`). `None` when only an ancestor declares
+    /// the method; the diff then falls back to `- def <name>: () -> <declared>`.
+    declared_rbs: Option<String>,
     /// The `--print` declaration line for this candidate's class group
     /// (`module Geometry`, `class Geometry::Pair < ::Data`) — see
     /// [`declaration_header`]. Stamped once the whole file's [`NamespaceInfo`] is
@@ -1063,6 +1068,7 @@ fn meta_candidate(path: &str, class_name: &str, member: &MetaMember) -> Candidat
         inferred_return: "untyped".to_string(),
         classification: "new_method",
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: None,
         definer: Some((META_MEMBER_OFFSET, false)),
@@ -1972,6 +1978,7 @@ fn method_candidate(
             classification: "new_method",
             definer: Some((sig.offset, sig.module_function)),
             declared_return_rbs: None,
+            declared_rbs: None,
             decl_header: String::new(),
             skip_reason: None,
         });
@@ -2116,16 +2123,18 @@ fn method_candidate(
     // simple one and DECLINES any other own declaration (rigor-rs#544 review:
     // `(Integer) -> Numeric` must not become `(untyped) -> Float`). A method
     // only an ancestor declares keeps the `def`-shaped head, as for a new method.
-    let (rbs, head) = if classification == "tighter_return" {
+    let (rbs, head, declared_rbs) = if classification == "tighter_return" {
         match sig_env.own_head(class_name, sig.name, sig.singleton) {
-            sig_env::OwnHead::NotOwn => (rbs, head),
-            sig_env::OwnHead::Own(sig_env::Head::Reusable(declared)) => {
-                (format!("{prefix}{}: {declared} -> {ret}", sig.name), declared.clone())
-            }
+            sig_env::OwnHead::NotOwn => (rbs, head, None),
+            sig_env::OwnHead::Own(sig_env::Head::Reusable { head: declared, source }) => (
+                format!("{prefix}{}: {declared} -> {ret}", sig.name),
+                declared.clone(),
+                Some(source.clone()),
+            ),
             sig_env::OwnHead::Own(sig_env::Head::Declined) => return row(None),
         }
     } else {
-        (rbs, head)
+        (rbs, head, None)
     };
 
     // Declared `untyped`: the reference's tighter-return writes the inferred
@@ -2186,6 +2195,7 @@ fn method_candidate(
         inferred_return: erased,
         classification,
         declared_return_rbs,
+        declared_rbs,
         decl_header: String::new(),
         skip_reason: None,
         definer: Some((sig.offset, sig.module_function)),
@@ -2212,6 +2222,7 @@ fn non_emitted(
         inferred_return: String::new(),
         classification: if reason.is_some() { "skipped" } else { "dropped" },
         declared_return_rbs: None,
+        declared_rbs: None,
         decl_header: String::new(),
         skip_reason: reason,
         definer: None,
@@ -2391,7 +2402,8 @@ fn classify(
             // tail as the scalar nominal; decline it when the whole tail is a
             // closed literal expression (no local, ivar, self or parameter
             // leaf) and the nominal is a foldable scalar class.
-            if matches!(
+            if matches!(interner.get(inferred_ty), Type::Nominal { .. })
+                && matches!(
                 inferred_class,
                 Some(
                     "Integer" | "Float" | "String" | "Symbol" | "Rational" | "Complex"
@@ -2857,7 +2869,9 @@ fn diff_string(candidates: &[Candidate]) -> String {
     let mut out = String::new();
     for c in candidates {
         out.push_str(&format!("--- {}: {}#{}\n", c.file, c.class_name, c.method_name));
-        if let Some(declared) = &c.declared_return_rbs {
+        if let Some(own) = &c.declared_rbs {
+            out.push_str(&format!("- {own}\n"));
+        } else if let Some(declared) = &c.declared_return_rbs {
             out.push_str(&format!("- def {}: () -> {declared}\n", c.method_name));
         }
         out.push_str(&format!("+ {}\n\n", c.rbs));
@@ -3225,6 +3239,7 @@ fn clone_candidate(c: &Candidate) -> Candidate {
         inferred_return: c.inferred_return.clone(),
         classification: c.classification,
         declared_return_rbs: c.declared_return_rbs.clone(),
+        declared_rbs: c.declared_rbs.clone(),
         decl_header: c.decl_header.clone(),
         skip_reason: c.skip_reason,
         definer: c.definer,
@@ -3518,8 +3533,10 @@ fn render_check_text(stale: &[&WriteResult]) {
 /// entry (reference `render_check_change`'s per-candidate loop).
 fn render_check_applied(r: &WriteResult) {
     for c in &r.applied {
-        if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
-            rc.method_name == c.method_name && rc.kind == c.kind
+        if let Some(own) = &c.declared_rbs {
+            println!("  - {own}");
+        } else if let Some((_, old)) = r.replaced.iter().find(|(rc, _)| {
+            rc.class_name == c.class_name && rc.method_name == c.method_name && rc.kind == c.kind
         }) {
             println!("  - {old}");
         }
@@ -4276,12 +4293,32 @@ fn merge_into_existing(
     let mut new_methods: Vec<Candidate> = Vec::new();
     let mut conflicting: Vec<(Candidate, Conflict)> = Vec::new();
     for c in candidates {
-        match info.members.iter().find(|m| m.name == c.method_name && m.kind == c.kind) {
+        // A `def self?.f` candidate conflicts with a declared instance OR
+        // singleton `f` (and a plain candidate with a declared `self?.f`):
+        // inserting it would declare that half twice (reference
+        // `partition_against_existing`, #1488). Only a member of the candidate's
+        // EXACT kind is replaceable (`find_method_member`).
+        let dual = c.rbs.starts_with("def self?.");
+        let touches = |m: &MemberInfo| {
+            m.name == c.method_name
+                && match m.kind {
+                    "singleton_instance" => true,
+                    k => !dual && k == c.kind || dual,
+                }
+        };
+        match info.members.iter().find(|m| touches(m)) {
             None => new_methods.push(c),
-            Some(m) => conflicting.push((
-                c,
-                Conflict { return_text: m.return_text.clone(), span: m.span, text: m.text.clone() },
-            )),
+            Some(m) => {
+                let exact = if dual { m.kind == "singleton_instance" } else { m.kind == c.kind };
+                conflicting.push((
+                    c,
+                    Conflict {
+                        return_text: m.return_text.clone(),
+                        span: m.span.filter(|_| exact),
+                        text: m.text.clone(),
+                    },
+                ))
+            }
         }
     }
 

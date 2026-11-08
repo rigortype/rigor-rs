@@ -92,8 +92,9 @@ struct Decl {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Head {
     /// A canonical, single-overload, unannotated, visibility-free head the row
-    /// can reuse verbatim: the text before `-> `, e.g. `(Integer x)`.
-    Reusable(String),
+    /// can reuse verbatim: `head` is the text before `-> ` (e.g. `(Integer x)`),
+    /// `source` the member's whitespace-squished source (the `--diff` `- ` line).
+    Reusable { head: String, source: String },
     /// Declared on the class itself in a shape the port cannot re-spell
     /// byte-identically (block, type params, annotations, visibility,
     /// non-trivial parameter types, attr writer): the tighter row is DECLINED.
@@ -154,6 +155,7 @@ impl SigEnv {
         let mut raw_supers: HashMap<String, RawRef> = HashMap::new();
         let mut raw_includes: HashMap<String, Vec<RawRef>> = HashMap::new();
         let mut raw_extends: HashMap<String, Vec<RawRef>> = HashMap::new();
+        let mut seen_files: HashSet<std::path::PathBuf> = HashSet::new();
 
         for dir in signature_dirs {
             if !dir.is_dir() {
@@ -163,6 +165,12 @@ impl SigEnv {
             collect_rbs_files(dir, &mut files);
             files.sort();
             for f in files {
+                // An overlapping signature dir must not read one file twice: the
+                // second read would merge every method with itself.
+                let canon = f.canonicalize().unwrap_or_else(|_| f.clone());
+                if !seen_files.insert(canon) {
+                    continue;
+                }
                 let Ok(src) = std::fs::read_to_string(&f) else { continue };
                 let Ok(sig) = ruby_rbs::node::parse(&src) else { continue };
                 harvest_decls(
@@ -465,8 +473,19 @@ fn harvest_decls<'a>(
 
         collect_members(source, members.iter(), prefix, &mut decl, &mut includes, &mut extends);
 
-        // First-found-wins on a duplicated decl (sorted walk).
-        if !decls.contains_key(&fqn) {
+        // A reopened class: its methods join the first body's (a name in both
+        // is a multi-overload method — unresolvable); everything else stays
+        // first-found-wins (sorted walk).
+        if let Some(existing) = decls.get_mut(&fqn) {
+            for (name, ret) in decl.instance {
+                let head = decl.instance_heads.remove(&name).unwrap_or(Head::Declined);
+                put_method(&mut existing.instance, &mut existing.instance_heads, name, ret, head);
+            }
+            for (name, ret) in decl.singleton {
+                let head = decl.singleton_heads.remove(&name).unwrap_or(Head::Declined);
+                put_method(&mut existing.singleton, &mut existing.singleton_heads, name, ret, head);
+            }
+        } else {
             decls.insert(fqn.clone(), decl);
             if let Some(s) = super_ref {
                 raw_supers.insert(fqn.clone(), s);
@@ -513,36 +532,40 @@ fn collect_members<'a>(
                 let head = method_head(&md, source);
                 match md.kind() {
                     MethodDefinitionKind::Instance => {
-                        decl.instance_heads.entry(name.clone()).or_insert(head);
-                        decl.instance.entry(name).or_insert(ret);
+                        put_method(&mut decl.instance, &mut decl.instance_heads, name, ret, head);
                     }
                     MethodDefinitionKind::Singleton => {
-                        decl.singleton_heads.entry(name.clone()).or_insert(head);
-                        decl.singleton.entry(name).or_insert(ret);
+                        put_method(&mut decl.singleton, &mut decl.singleton_heads, name, ret, head);
                     }
                     MethodDefinitionKind::SingletonInstance => {
                         // `def self?.x` is BOTH a class and an instance method.
-                        decl.instance_heads.entry(name.clone()).or_insert(head.clone());
-                        decl.singleton_heads.entry(name.clone()).or_insert(head);
-                        decl.instance.entry(name.clone()).or_insert(ret.clone());
-                        decl.singleton.entry(name).or_insert(ret);
+                        put_method(
+                            &mut decl.instance,
+                            &mut decl.instance_heads,
+                            name.clone(),
+                            ret.clone(),
+                            head.clone(),
+                        );
+                        put_method(&mut decl.singleton, &mut decl.singleton_heads, name, ret, head);
                     }
                 }
             }
             RbsNode::AttrReader(a) => {
                 let ret = resolve_type_node_return(&a.type_());
                 let plain = a.visibility_location().is_none() && a.annotations().iter().next().is_none();
-                attr_insert(decl, a.name().as_str(), a.kind(), ret, false, plain);
+                let src = squished_source(source, &a.location());
+                attr_insert(decl, a.name().as_str(), a.kind(), ret, false, plain, src);
             }
             RbsNode::AttrWriter(a) => {
                 let ret = resolve_type_node_return(&a.type_());
-                attr_insert(decl, a.name().as_str(), a.kind(), ret, true, false);
+                attr_insert(decl, a.name().as_str(), a.kind(), ret, true, false, None);
             }
             RbsNode::AttrAccessor(a) => {
                 let ret = resolve_type_node_return(&a.type_());
                 let plain = a.visibility_location().is_none() && a.annotations().iter().next().is_none();
-                attr_insert(decl, a.name().as_str(), a.kind(), ret.clone(), false, plain);
-                attr_insert(decl, a.name().as_str(), a.kind(), ret, true, false);
+                let src = squished_source(source, &a.location());
+                attr_insert(decl, a.name().as_str(), a.kind(), ret.clone(), false, plain, src);
+                attr_insert(decl, a.name().as_str(), a.kind(), ret, true, false, None);
             }
             RbsNode::Include(inc) => {
                 includes.push(RawRef {
@@ -568,6 +591,7 @@ fn collect_members<'a>(
 ///
 /// `plain` marks a reader with no visibility keyword or annotation: its head is
 /// the reference's `() -> T` shape. A writer's head (`(T) -> T`) is declined.
+/// `source` is the member's squished text.
 fn attr_insert(
     decl: &mut Decl,
     name: &str,
@@ -575,15 +599,38 @@ fn attr_insert(
     ret: Option<String>,
     writer: bool,
     plain: bool,
+    source: Option<String>,
 ) {
     let key = if writer { format!("{name}=") } else { name.to_string() };
     let (table, heads) = match kind {
         AttributeKind::Singleton => (&mut decl.singleton, &mut decl.singleton_heads),
         AttributeKind::Instance => (&mut decl.instance, &mut decl.instance_heads),
     };
-    let head = if plain && !writer { Head::Reusable("()".to_string()) } else { Head::Declined };
-    heads.entry(key.clone()).or_insert(head);
-    table.entry(key).or_insert(ret);
+    let head = match source {
+        Some(src) if plain && !writer => Head::Reusable { head: "()".to_string(), source: src },
+        _ => Head::Declined,
+    };
+    put_method(table, heads, key, ret, head);
+}
+
+/// Record one declared member. A name declared TWICE in the same class (an
+/// `| ...` overloading member beside the base `def`, a reopened body) has
+/// several definitions the reference merges into one multi-overload method: it
+/// is unresolvable here (`None`, DROP) and its head is [`Head::Declined`].
+fn put_method(
+    table: &mut HashMap<String, Option<String>>,
+    heads: &mut HashMap<String, Head>,
+    name: String,
+    ret: Option<String>,
+    head: Head,
+) {
+    if table.contains_key(&name) {
+        table.insert(name.clone(), None);
+        heads.insert(name, Head::Declined);
+    } else {
+        heads.insert(name.clone(), head);
+        table.insert(name, ret);
+    }
 }
 
 /// The head of a `def` member, for a tighter-return row.
@@ -618,11 +665,21 @@ fn method_head(md: &ruby_rbs::node::MethodDefinitionNode, source: &str) -> Head 
     let ret_start = usize::try_from(ft.return_type().location().start()).unwrap_or(0);
     let Some(slice) = source.get(start..ret_start) else { return Head::Declined };
     let Some(params) = slice.strip_suffix(" -> ") else { return Head::Declined };
+    let Some(member) = squished_source(source, &md.location()) else { return Head::Declined };
     if canonical_param_list(params) {
-        Head::Reusable(params.to_string())
+        Head::Reusable { head: params.to_string(), source: member }
     } else {
         Head::Declined
     }
+}
+
+/// A member's source text with whitespace runs collapsed to one space (the
+/// reference's `squish`).
+fn squished_source(source: &str, loc: &ruby_rbs::node::RBSLocationRange) -> Option<String> {
+    let start = usize::try_from(loc.start()).ok()?;
+    let end = usize::try_from(loc.end()).ok()?;
+    let text = source.get(start..end)?;
+    Some(text.split_whitespace().collect::<Vec<_>>().join(" "))
 }
 
 /// `()` or `(item, item, ...)` with each item canonical (see [`method_head`]).
