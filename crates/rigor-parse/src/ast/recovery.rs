@@ -89,6 +89,15 @@ pub(crate) struct Recovered<'pr> {
     /// excludes `Call*WriteNode`s, so `x.each { h.default ||= 0 }` keeps
     /// `h`'s indexed narrowings (rigor-rs#343).
     pub(crate) closure: bool,
+    /// Whether the walk reached this node inside a `while`/`until`/`for`
+    /// BODY — the unmasked enclosing loop [`Builder::unmasked_loop`]
+    /// tracks through owned lowering. Recovery flattens the loop node
+    /// itself into its recoverable children, so the flag must ride the
+    /// child for the `block_break_locals_only` classification to see the
+    /// enclosing loop (rigor-rs#407 review).
+    ///
+    /// [`Builder::unmasked_loop`]: crate::ast::Builder
+    pub(crate) inside_loop: bool,
 }
 
 /// Collect the OUTERMOST "recoverable" descendant Prism nodes of an unhandled
@@ -139,6 +148,8 @@ pub(crate) struct ScopeMarks {
     pub(crate) typed: bool,
     /// Inside a never-evaluated operand position — [`Recovered::dead`].
     pub(crate) dead: bool,
+    /// Inside a `while`/`until`/`for` body — [`Recovered::inside_loop`].
+    pub(crate) inside_loop: bool,
     /// Inside a deferred block/lambda body — [`Recovered::closure`].
     pub(crate) closure: bool,
 }
@@ -211,6 +222,9 @@ fn collect_recoverable<'pr>(
         /// Depth of deferred block/lambda bodies the walk is inside —
         /// see [`Recovered::closure`].
         closure: u32,
+        /// Depth of `while`/`until`/`for` bodies the walk is inside —
+        /// see [`Recovered::inside_loop`].
+        inside_loop: u32,
     }
     impl<'pr> Collector<'_, 'pr> {
         fn push(&mut self, node: PrismNode<'pr>) {
@@ -228,6 +242,7 @@ fn collect_recoverable<'pr>(
                 typed: self.typed > 0,
                 dead: self.dead > 0,
                 closure: self.closure > 0,
+                inside_loop: self.inside_loop > 0,
             });
         }
 
@@ -845,19 +860,23 @@ fn collect_recoverable<'pr>(
         // index write's `[]=` widening lands regardless of position or jump.
         fn visit_while_node(&mut self, node: &ruby_prism::WhileNode<'pr>) {
             self.visit(&node.predicate());
+            self.inside_loop += 1;
             self.under_iterative(|c| {
                 if let Some(statements) = node.statements() {
                     c.visit(&statements.as_node());
                 }
             });
+            self.inside_loop -= 1;
         }
         fn visit_until_node(&mut self, node: &ruby_prism::UntilNode<'pr>) {
             self.visit(&node.predicate());
+            self.inside_loop += 1;
             self.under_iterative(|c| {
                 if let Some(statements) = node.statements() {
                     c.visit(&statements.as_node());
                 }
             });
+            self.inside_loop -= 1;
         }
         // `eval_for` has NO `loop_content_writeback` — a `break`/`raise` arm
         // is dropped like any unjoined scope — but its single
@@ -867,12 +886,14 @@ fn collect_recoverable<'pr>(
         fn visit_for_node(&mut self, node: &ruby_prism::ForNode<'pr>) {
             self.visit(&node.collection());
             self.next_sink += 1;
+            self.inside_loop += 1;
             self.under_join(|c| {
                 c.visit(&node.index());
                 if let Some(statements) = node.statements() {
                     c.visit(&statements.as_node());
                 }
             });
+            self.inside_loop -= 1;
             self.next_sink -= 1;
         }
         // `eval_case`: the subject evaluates once, straight-line. Each arm's
@@ -1063,6 +1084,7 @@ fn collect_recoverable<'pr>(
         typed: u32::from(marks.typed),
         dead: u32::from(marks.dead),
         closure: u32::from(marks.closure),
+        inside_loop: u32::from(marks.inside_loop),
     };
     // Visit the wrapper's CHILDREN (not the wrapper itself), so we don't re-handle
     // the unhandled root. The default `visit` dispatches the root to its own

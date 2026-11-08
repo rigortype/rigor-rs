@@ -164,6 +164,13 @@ struct CarrierSpans {
     /// anything. Every scope effect is suppressed here, adders included
     /// (rigor-rs#363).
     bare_locals_only: Vec<Span>,
+    /// `break` argument spans inside a BLOCK/LAMBDA body — the yielding
+    /// call's `join_block_break_bindings` is locals-only for scope
+    /// effects the way `join_break_scopes` is, and the enclosing
+    /// iterated carrier is the block body itself (`iterated_bodies`
+    /// already holds it), which `content_writeback_block_captures`
+    /// text-scans (rigor-rs#407).
+    block_break_locals_only: Vec<Span>,
     /// Every body span lowered under `Recovered::iterative` —
     /// `while`/`until` bodies and block/lambda bodies: the regions the
     /// reference's content-writeback TEXT scans cover
@@ -319,7 +326,27 @@ impl LoweredAst {
             .locals_only
             .iter()
             .chain(self.carrier_spans.bare_locals_only.iter())
+            .chain(self.carrier_spans.block_break_locals_only.iter())
             .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+    /// Whether `span` lies inside a BLOCK/LAMBDA body's `break` argument
+    /// — the `block_break_locals_only` half where the yielding call's
+    /// `join_block_break_bindings` drops every scope effect, while a
+    /// scan-visible mutation's drop still lands past the block's join
+    /// through `content_writeback_block_captures` (rigor-rs#407).
+    pub fn in_block_break_locals_only_carrier(&self, span: Span) -> bool {
+        self.carrier_spans
+            .block_break_locals_only
+            .iter()
+            .any(|s| s.0 <= span.0 && span.1 <= s.1)
+    }
+
+    /// The `block_break_locals_only` spans — `DeadPositions` consumes
+    /// them for the reach gates a block `break` argument needs
+    /// (rigor-rs#407).
+    pub fn block_break_locals_only_spans(&self) -> &[Span] {
+        &self.carrier_spans.block_break_locals_only
     }
 
     /// Whether `span` lies inside a `for`-only `break` argument — the
@@ -516,8 +543,10 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         discarded_spans: Vec::new(),
         blocked_iterative_spans: Vec::new(),
         lexical_loop: 0,
+        unmasked_loop: 0,
         locals_only_spans: Vec::new(),
         bare_locals_only_spans: Vec::new(),
+        block_break_locals_only_spans: Vec::new(),
         iterated_body_spans: Vec::new(),
         lexical_loop_bodies: Vec::new(),
         next_arg_spans: Vec::new(),
@@ -553,6 +582,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         discarded: builder.discarded_spans,
         locals_only: builder.locals_only_spans,
         bare_locals_only: builder.bare_locals_only_spans,
+        block_break_locals_only: builder.block_break_locals_only_spans,
         iterated_bodies: builder.iterated_body_spans,
         next_args: builder.next_arg_spans,
     });
