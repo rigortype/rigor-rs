@@ -1530,7 +1530,7 @@ fn method_candidate(
     // Tail type (reference `body_last_expression` + `safe_type_of`): the last
     // statement's type; an assignment tail evaluates to its RHS; a `return E`
     // tail evaluates to its value (`nil` when bare).
-    let Some(tail_ty) = def_return_type(ast, typer, index, sig.body, env, interner) else { return row(None) };
+    let Some(tail_ty) = def_return_type(ast, typer, index, class_name, fqns, sig.body, env, interner) else { return row(None) };
 
     // Assemble the member list: flatten(tail) + each return's type (bare → nil),
     // dedup by TypeId (structural identity via the hash-consing interner).
@@ -1881,6 +1881,8 @@ fn def_return_type(
     ast: &LoweredAst,
     typer: &Typer,
     index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
     body: &[NodeId],
     env: &TypeEnv,
     interner: &mut Interner,
@@ -1903,7 +1905,7 @@ fn def_return_type(
     // nominal (rigor-rs#493 item 7): `Range[bound-class-union]`, `Regexp`,
     // `Rational`, `Complex`. Interpolated regexps stay declined (they lower
     // through recovery, so no dedicated node exists here).
-    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, interner) {
+    if let Some(lit) = literal_tail_nominal(ast, typer, env, target, index, class_name, fqns, interner) {
         return Some(lit);
     }
     Some(typer.type_of(ast, target, env, interner))
@@ -1920,6 +1922,8 @@ fn literal_tail_nominal(
     env: &TypeEnv,
     target: NodeId,
     index: &CoreIndex,
+    class_name: &str,
+    fqns: &std::collections::HashSet<String>,
     interner: &mut Interner,
 ) -> Option<TypeId> {
     let bare = |name: &str, interner: &mut Interner| {
@@ -1932,6 +1936,12 @@ fn literal_tail_nominal(
         Node::RationalLit { .. } => bare("Rational", interner),
         Node::ImaginaryLit { .. } => bare("Complex", interner),
         Node::Range { left, right, .. } => {
+            // Each bound contributes its ERASED member form: a scalar
+            // `Constant` widens to its class (`1` ⇒ `Integer`), a
+            // Tuple/HashShape keeps its literal shape (`[1]`, `{ a: 1 }`),
+            // and a bare generic nominal elaborates its args to `untyped`
+            // (`Array.new` ⇒ `Array[untyped]`). `nil` and `Dynamic` members
+            // contribute nothing (rigor-rs#493 item 7).
             let mut arg_members: Vec<TypeId> = Vec::new();
             for bound in [left, right].into_iter().flatten() {
                 let ty = typer.type_of(ast, *bound, env, interner);
@@ -1940,26 +1950,51 @@ fn literal_tail_nominal(
                     _ => vec![ty],
                 };
                 for m in ms {
-                    // A `nil` bound and a `Dynamic` bound contribute no class.
-                    let Some(cname) = index.class_name_of(interner, m) else { continue };
-                    if cname == "NilClass" {
+                    if matches!(interner.get(m), Type::Dynamic(_)) {
                         continue;
                     }
-                    if let Some(class) = index.class_id(cname) {
-                        let n = interner.intern(Type::Nominal { class, args: vec![] });
-                        if !arg_members.contains(&n) {
-                            arg_members.push(n);
+                    let member = match interner.get(m) {
+                        // `nil` contributes nothing.
+                        Type::Constant(rigor_types::Scalar::Nil) => continue,
+                        // A scalar constant widens to its class nominal.
+                        Type::Constant(_) => {
+                            let Some(cname) = index.class_name_of(interner, m) else {
+                                continue;
+                            };
+                            match index.class_id(cname) {
+                                Some(class) => {
+                                    interner.intern(Type::Nominal { class, args: vec![] })
+                                }
+                                None => continue,
+                            }
                         }
+                        // A bare generic (`Array`, `Hash`, …) elaborates to
+                        // `Class[untyped]` — the reference's TypeElaborator
+                        // fills the args.
+                        Type::Nominal { class, args }
+                            if args.is_empty()
+                                && is_bare_generic_name(
+                                    index.class_name_for_id(*class).unwrap_or(""),
+                                ) =>
+                        {
+                            let (class, untyped) = (*class, interner.untyped());
+                            interner.intern(Type::Nominal {
+                                class,
+                                args: vec![untyped],
+                            })
+                        }
+                        _ => m,
+                    };
+                    if !arg_members.contains(&member) {
+                        arg_members.push(member);
                     }
                 }
             }
-            // The erased arg lists its members in the reference's sorted union
-            // order (`Float | Integer` for `1...2.5`).
+            // The erased arg lists its members in the reference's
+            // describe-sorted union order (`Float | Integer` for `1...2.5`,
+            // `Integer | [1]` for `[1]..2`).
             arg_members.sort_by_key(|&m| {
-                index
-                    .class_name_of(interner, m)
-                    .unwrap_or("")
-                    .to_string()
+                erase_qualified(interner, index, typer.source(), m, class_name, fqns)
             });
             let arg = match arg_members.len() {
                 0 => interner.untyped(),
@@ -3448,24 +3483,40 @@ fn clamp_offset(v: i32, len: usize) -> usize {
 #[cfg(test)]
 mod tests;
 
-/// Whether `erased` is a bare class nominal carrying only `untyped` type args —
-/// `Range[untyped]`, `Hash[untyped, untyped]` — the reference's elaborated
-/// emit, exempt from the buried-`untyped` skip (rigor-rs#493 item 7).
+/// Whether every `untyped` in `erased` sits inside a `ClassName[…]` type-arg
+/// slot — `Range[untyped]`, `Hash[untyped, untyped]`, `Range[Array[untyped] |
+/// Integer]` — the reference's elaborated emit, exempt from the
+/// buried-`untyped` skip (rigor-rs#493 item 7). An `untyped` inside a TUPLE
+/// literal's `[…]` (a bracket not preceded by a class identifier) still
+/// counts as an inference hole.
 fn is_nominal_untyped_args(erased: &str) -> bool {
-    let Some(open) = erased.find('[') else { return false };
-    if !erased.ends_with(']') {
-        return false;
-    }
-    let head = &erased[..open];
-    if head.is_empty()
-        || !head
+    let bytes = erased.as_bytes();
+    let mut found = false;
+    let mut idx = 0;
+    while let Some(off) = erased[idx..].find("untyped") {
+        let pos = idx + off;
+        found = true;
+        // Find the innermost `[` enclosing this occurrence: the last `[`
+        // whose `]` has not yet been seen before `pos`.
+        let mut inner: Option<usize> = None;
+        for (i, &b) in bytes.iter().enumerate().take(pos) {
+            if b == b'[' {
+                inner = Some(i);
+            }
+        }
+        let Some(open) = inner else { return false };
+        // The `[` must be a generic-args bracket: preceded immediately by a
+        // class-identifier tail (`Foo[`, `Foo::Bar[`).
+        let head: String = erased[..open]
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':')
-        || !head.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-    {
-        return false;
+            .rev()
+            .take_while(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == ':')
+            .collect();
+        let head: String = head.chars().rev().collect();
+        if !head.chars().next().is_some_and(|c| c.is_ascii_uppercase()) {
+            return false;
+        }
+        idx = pos + 7;
     }
-    erased[open + 1..erased.len() - 1]
-        .split(',')
-        .all(|tok| tok.trim() == "untyped")
+    found
 }
