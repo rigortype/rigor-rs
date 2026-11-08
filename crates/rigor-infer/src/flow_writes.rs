@@ -321,10 +321,28 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
     let iterated_bodies = loop_body_spans(ast);
     let shadow_scopes = closure_shadow_scopes(ast);
     out.retain(|(id, w, name, scan)| {
-        (*scan && iterated_bodies.iter().any(|s| s.0 <= w.0 && w.1 <= s.1))
-            || !shadow_scopes.iter().any(|(descendants, bound)| {
-                descendants.contains(id) && bound.contains(name)
-            })
+        !shadow_scopes.iter().any(|(descendants, bound)| {
+            descendants.contains(id)
+                && bound.contains(name)
+                // rigor-rs#409/#501: a scan-visible mark inside a
+                // `while`/`until` body survives a deeper shadow scope
+                // (`each { |h| h[:a] = 9 }` under `while` still rejoins
+                // the OUTER `h` — `loop_content_writeback`'s textual
+                // name match sees any depth) — but ONLY when the scope
+                // sits inside the iterated body. A shadow scope
+                // ENCLOSING the loop still wins:
+                // `captured_content_mutations` tests `receiver.depth >
+                // scope_nesting(ancestors)`, so the writeback rejoins
+                // `h` in the block's own scope only and the outer
+                // narrowing survives.
+                && !(*scan
+                    && iterated_bodies.iter().any(|b| {
+                        contains_span(*b, *w)
+                            && descendants
+                                .iter()
+                                .all(|&d| contains_span(*b, ast.get(d).span()))
+                    }))
+        })
     });
     // The inert filter: a write inside a never-evaluated operand binds
     // nothing, so its mark always drops — EXCEPT a scan-visible content
@@ -437,6 +455,11 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
         }
     }
     out
+}
+
+/// `outer` contains `inner`.
+fn contains_span(outer: rigor_parse::Span, inner: rigor_parse::Span) -> bool {
+    outer.0 <= inner.0 && inner.1 <= outer.1
 }
 
 /// The statement spans of every `while`/`until` body — the region
@@ -711,11 +734,23 @@ pub(crate) fn toplevel_mutations(
             // Compound ATTRIBUTE writes are not scanned
             // (`content_mutation_target` reads mutator CallNodes and index
             // writes only), so they keep the shadow filter.
-            && ((is_content_mutator(method)
-                && iterated_bodies.iter().any(|s| s.0 <= w.0 && w.1 <= s.1))
-                || !shadow_scopes.iter().any(|(descendants, bound)| {
-                    descendants.contains(id) && bound.contains(name)
-                }))
+            && !shadow_scopes.iter().any(|(descendants, bound)| {
+                descendants.contains(id)
+                    && bound.contains(name)
+                    // rigor-rs#501: same depth pairing as
+                    // `collect_flow_writes` — the iterated body
+                    // rescues the mark from the shadow only when the
+                    // shadow scope sits inside it — and only for a
+                    // scanned (content-mutator) mark, never a compound
+                    // attribute write.
+                    && !(is_content_mutator(method)
+                        && iterated_bodies.iter().any(|b| {
+                            contains_span(*b, *w)
+                                && descendants.iter().all(|&d| {
+                                    contains_span(*b, ast.get(d).span())
+                                })
+                        }))
+            })
     });
     out.into_iter()
         .map(|(_, s, n, m, k)| (s, n, m, k))
