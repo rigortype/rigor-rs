@@ -123,3 +123,26 @@ fn closure_failure_marks_singleton_unbuildable() {
     assert_eq!(idx.singleton_method_return("Inc", "iok"), None);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// rigor-rs#494 x #493 item 12: a param-mismatch (`def_nil`) class — a bare
+/// `class Hash` — must NOT seed the closure-failure singleton mirror. Its nil
+/// def is traversable-empty for descendants (`Kernel` fails one hop through
+/// `Kernel#Hash`, yet `String.zork` / `C.zork` still fire, oracle-measured),
+/// while a genuine cyclic chain in the same sig still blanks its singleton.
+#[test]
+fn def_nil_class_is_not_a_closure_seed() {
+    let (idx, dir) = load(
+        "defnil_seed",
+        &[(
+            "x.rbs",
+            "class Hash\nend\nclass C\n  def c: () -> Integer\nend\nclass A < B\nend\nclass B < A\nend\n",
+        )],
+    );
+    // Controls: surviving singletons keep witnessing past a nil `Kernel`.
+    assert!(!idx.class_has_singleton_method("String", "zork"));
+    assert!(!idx.class_has_singleton_method("C", "zork"));
+    // The genuine cycle still fails its singleton (#494).
+    assert!(idx.class_has_singleton_method("A", "zork"));
+    assert!(idx.class_has_singleton_method("B", "zork"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
