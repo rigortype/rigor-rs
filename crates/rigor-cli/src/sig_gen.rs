@@ -1596,10 +1596,13 @@ fn method_candidate(
     interner: &mut Interner,
 ) -> Option<Candidate> {
     // Visibility: skip private / protected unless `--include-private` (reference
-    // `visibility_excludes?` — returns false for a singleton, so singletons are
-    // never visibility-skipped).
+    // `visibility_excludes?` — returns false for a singleton AND for a
+    // module_function def, whose `self?.` row writes the singleton half the
+    // running `private` never touched — `mf; private; def g; mf; def h` emits
+    // `self?.h`, rigor-rs#493 item 10).
     if !include_private
         && !sig.singleton
+        && !sig.module_function
         && matches!(visibility, Some(Visibility::Private | Visibility::Protected))
     {
         return None;
