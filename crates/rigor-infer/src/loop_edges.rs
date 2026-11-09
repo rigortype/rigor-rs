@@ -220,7 +220,12 @@ impl<'i> Typer<'i> {
         match side {
             LoopSide::Body => entry == Edge::Keep,
             LoopSide::Exit => {
-                entry != Edge::Other
+                // An EMPTY body joins no narrowed body pass — a widened
+                // entry edge cannot poison the join (`while h.is_a?
+                // (Unknown); end` keeps `Array` at `h.frob`,
+                // rigor-rs#454).
+                let Node::Loop { body, .. } = ast.get(id) else { unreachable!() };
+                (body.is_empty() || entry != Edge::Other)
                     && self.edge_effect(ast, p, local, ty, !entry_truthy, interner) == Edge::Keep
             }
         }
@@ -318,11 +323,37 @@ impl<'i> Typer<'i> {
                         Some(_) => Edge::Empty,
                         None => Edge::Other,
                     }),
-                    ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => atom(
-                        self.class_edge(ast, *c, span, method == "instance_of?", ty, edge, interner),
-                    ),
+                    ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => {
+                        // A guard whose class operand is not a constant
+                        // (`h.is_a?(k)` with a local `k`) cannot narrow —
+                        // a CONSTANT subject keeps its carrier on both
+                        // edges (`if LIM.is_a?(k); LIM.inside; end` fires
+                        // `for 1` inside AND after, rigor-rs#454); a local
+                        // still declines (widens).
+                        if self.guard_constant(ast, *c, span).is_none()
+                            && matches!(subject, Subject::Const(..))
+                        {
+                            Edge::Keep
+                        } else {
+                            atom(self.class_edge(
+                                ast,
+                                *c,
+                                span,
+                                method == "instance_of?",
+                                ty,
+                                edge,
+                                interner,
+                            ))
+                        }
+                    }
                     ("===", [arg]) if subject.is_read(ast, *arg) && !self.reads_subject(ast, r, subject) => {
-                        atom(self.class_edge(ast, r, span, false, ty, edge, interner))
+                        if self.guard_constant(ast, r, span).is_none()
+                            && matches!(subject, Subject::Const(..))
+                        {
+                            Edge::Keep
+                        } else {
+                            atom(self.class_edge(ast, r, span, false, ty, edge, interner))
+                        }
                     }
                     ("respond_to?", [m]) if recv_is_subject => {
                         let name = match ast.get(*m) {
@@ -333,6 +364,11 @@ impl<'i> Typer<'i> {
                         };
                         match name {
                             Some(m) => self.respond_edge(ty, m, edge, interner),
+                            // A dynamic `respond_to?` name cannot narrow a
+                            // CONSTANT (`if File.respond_to?(m); File.frob;
+                            // end` fires `for singleton(File)` inside AND
+                            // after, rigor-rs#454); a local still declines.
+                            None if matches!(subject, Subject::Const(..)) => Edge::Keep,
                             None => Edge::Other,
                         }
                     }
@@ -365,10 +401,14 @@ impl<'i> Typer<'i> {
                 .map(|n| self.index.class_has_method(n, method)),
             _ => None,
         };
-        if has == Some(true) {
-            Edge::Keep
-        } else {
-            Edge::Other
+        match has {
+            Some(true) => Edge::Keep,
+            // A carrier whose class provably lacks `m` cannot reach the
+            // truthy arm at all — `v.respond_to?(:upcase)` on `v = 1` deads
+            // the arm, so the join restores `1` and `v.upcase` fires `for
+            // 1` (rigor-rs#454). `None` still declines (widens).
+            Some(false) => Edge::Empty,
+            None => Edge::Other,
         }
     }
 
@@ -392,13 +432,21 @@ impl<'i> Typer<'i> {
         edge: bool,
         interner: &Interner,
     ) -> Edge {
-        if !matches!(interner.get(ty), Type::Constant(_) | Type::Nominal { .. }) {
-            return Edge::Other;
-        }
+        // The carrier the class test sees: a `Singleton[C]` is the CLASS
+        // OBJECT `C`, which answers `is_a?`/`===` as `Class` (`File.is_a?
+        // (Class)` keeps `singleton(File)`, rigor-rs#454); a `Constant` or
+        // `Nominal` reads its own class. Anything else declines.
+        let carrier = match interner.get(ty) {
+            Type::Singleton(_) => Some("Class".to_string()),
+            Type::Constant(_) | Type::Nominal { .. } => {
+                self.index.class_name_of(interner, ty).map(|s| s.to_string())
+            }
+            _ => None,
+        };
         let Some((class, true)) = self.guard_constant(ast, class_node, use_span) else {
             return Edge::Other;
         };
-        let Some(carrier) = self.index.class_name_of(interner, ty) else {
+        let Some(carrier) = carrier else {
             return Edge::Other;
         };
         if exact {
@@ -412,7 +460,7 @@ impl<'i> Typer<'i> {
                 (false, false) => Edge::Keep,
             };
         }
-        match (self.index.class_ordering(carrier, &class), edge) {
+        match (self.index.class_ordering(&carrier, &class), edge) {
             (ClassOrdering::Subclass | ClassOrdering::Equal, true) => Edge::Keep,
             (ClassOrdering::Subclass | ClassOrdering::Equal, false) => Edge::Empty,
             (ClassOrdering::Disjoint, true) => Edge::Empty,

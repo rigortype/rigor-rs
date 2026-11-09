@@ -104,6 +104,9 @@ struct Walk<'a, 'i> {
     dead: HashSet<NodeId>,
     /// A constant subject's carrier, typed once per spelling.
     const_types: HashMap<Subject, TypeId>,
+    /// A local's carrier, typed at its write (`v = 1` pins `1` so a
+    /// `respond_to?` guard on it can decide — rigor-rs#454).
+    local_types: HashMap<String, TypeId>,
 }
 
 impl<'i> Typer<'i> {
@@ -115,7 +118,14 @@ impl<'i> Typer<'i> {
             Node::Program { body, .. } => body.clone(),
             _ => return HashSet::new(),
         };
-        let mut w = Walk { typer: self, ast, interner, dead: HashSet::new(), const_types: HashMap::new() };
+        let mut w = Walk {
+            typer: self,
+            ast,
+            interner,
+            dead: HashSet::new(),
+            const_types: HashMap::new(),
+            local_types: HashMap::new(),
+        };
         w.list(&body, Sup::default());
         w.dead
     }
@@ -205,7 +215,13 @@ impl Walk<'_, '_> {
         let mut out = Vec::new();
         for (subject, read) in self.typer.subjects_within(self.ast, pred) {
             let (ty, respond_only) = match &subject {
-                Subject::Local(_) => (self.interner.untyped(), true),
+                Subject::Local(name) => (
+                    self.local_types
+                        .get(name)
+                        .copied()
+                        .unwrap_or_else(|| self.interner.untyped()),
+                    true,
+                ),
                 Subject::Const(..) => {
                     let ty = match self.const_types.get(&subject) {
                         Some(&t) => t,
@@ -281,7 +297,15 @@ impl Walk<'_, '_> {
                 let sup = self.node(p, sup);
                 let body_in = if begin_modifier { sup.clone() } else { sup.apply(&self.effects(p, entry)) };
                 let body_out = self.list(&body, body_in);
-                let joined = Sup::join(vec![sup.clone(), body_out], &sup);
+                // An EMPTY body joins no narrowed body pass — the entry
+                // edge's widening (`while h.is_a?(Unknown); end`) cannot
+                // poison the exit (`h.frob` fires `for Array`,
+                // rigor-rs#454).
+                let joined = if body.is_empty() {
+                    sup.clone()
+                } else {
+                    Sup::join(vec![sup.clone(), body_out], &sup)
+                };
                 joined.apply(&self.effects(p, !entry))
             }
             Node::Call { receiver, args, block_body, .. } => {
@@ -305,6 +329,8 @@ impl Walk<'_, '_> {
             Node::LocalVariableWrite { name, value, .. }
             | Node::LocalVariableOpWrite { name, value, .. } => {
                 let name = name.clone();
+                let ty = self.typer.type_of(ast, *value, &TypeEnv::new(), self.interner);
+                self.local_types.insert(name.clone(), ty);
                 let mut sup = self.node(*value, sup);
                 sup.kill(&Subject::Local(name));
                 sup

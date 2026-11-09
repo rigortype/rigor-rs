@@ -787,3 +787,9 @@ fn integer_decimal(int: &ruby_prism::Integer<'_>) -> String {
     }
     out
 }
+#[test]
+fn dump_while() {
+    let src = b"h = Array.new\nwhile h.is_a?(Unknown); end\nh.frob\n";
+    let ast = crate::lower(&crate::parse(src));
+    for (id, n) in ast.iter() { eprintln!("{id:?} {n:?}"); }
+}
