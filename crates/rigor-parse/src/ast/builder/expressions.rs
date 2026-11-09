@@ -62,9 +62,13 @@ impl<'src> Builder<'src> {
         if let Some(opw) = node.as_local_variable_operator_write_node() {
             let name = constant_string(opw.name().as_slice());
             let value = self.lower_node(&opw.value());
+            let op = crate::OpWriteKind::Operator(constant_string(
+                opw.binary_operator().as_slice(),
+            ));
             return self.push(Node::LocalVariableOpWrite {
                 name,
                 value,
+                op,
                 span: span_of(&opw.location()),
             });
         }
@@ -74,6 +78,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::LocalVariableOpWrite {
                 name,
                 value,
+                op: crate::OpWriteKind::And,
                 span: span_of(&andw.location()),
             });
         }
@@ -83,6 +88,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::LocalVariableOpWrite {
                 name,
                 value,
+                op: crate::OpWriteKind::Or,
                 span: span_of(&orw.location()),
             });
         }

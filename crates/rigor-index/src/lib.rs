@@ -51,7 +51,7 @@ pub use rbs::{
 // the carrier for nominal round-tripping in the current slice (ADR-0004). It is
 // the surface the inference engine mints `Nominal { class }` ids against, so it
 // only lists the concrete value classes a return type can resolve TO.
-const CORE_CLASSES: [&str; 14] = [
+const CORE_CLASSES: [&str; 21] = [
     "String",
     "Integer",
     "Float",
@@ -69,6 +69,17 @@ const CORE_CLASSES: [&str; 14] = [
     "Regexp",
     "Rational",
     "Complex",
+    // The NON-generic exception classes `rescue [T, …] => e` binds `e` to
+    // (rigor-rs#548). A generic one (`KeyError[K, R]`, `NameError[T]`,
+    // `FrozenError[T]`) is left out on purpose: the reference prints it
+    // elaborated (`KeyError[untyped, untyped]`), so its binding declines.
+    "StandardError",
+    "TypeError",
+    "ArgumentError",
+    "RuntimeError",
+    "IOError",
+    "IndexError",
+    "ZeroDivisionError",
 ];
 
 /// A real, RBS-backed core index. For each loaded class it holds the resolved

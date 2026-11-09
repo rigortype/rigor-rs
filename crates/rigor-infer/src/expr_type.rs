@@ -204,6 +204,14 @@ impl<'i> Typer<'i> {
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
+            // `@i` / `@@i` / `$g` reads bind through the same env map — only
+            // `bind_statements_into` (sig-gen's def-local replay) writes these
+            // sigilled keys, so `check`'s envs see `untyped` as before
+            // (rigor-rs#548).
+            Node::VariableRead { name, .. } => env
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| interner.untyped()),
             // `a, b = rhs` AS AN EXPRESSION is its right-hand side (Ruby: `(a, b
             // = [1, 2])` evaluates to `[1, 2]`). The reference routes
             // `Prism::MultiWriteNode` to `type_of_assignment_write`
@@ -862,6 +870,11 @@ impl<'i> Typer<'i> {
             // A multi-write evaluates to its RHS, exactly like the single-target
             // writes: `(a, b = [1, 2])` is `[1, 2]` (reference
             // `expression_typer.rb:119` / `eval_multi_write`).
+            // An operator write's value is the dispatch result (`a += 1` is
+            // `a + 1`), not `value`'s type: sig-gen's def-local typing
+            // declines it (rigor-rs#548); `check` keeps the pre-existing
+            // value-type read.
+            Node::LocalVariableOpWrite { .. } if self.def_scope.get().is_some() => interner.untyped(),
             Node::LocalVariableWrite { value, .. }
             | Node::LocalVariableOpWrite { value, .. }
             | Node::MultiWrite { value, .. }

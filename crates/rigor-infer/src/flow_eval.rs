@@ -143,6 +143,12 @@ impl<'i> Typer<'i> {
             let span = ast.get(stmt).span();
             let guards = self.typed_decision_reads(&marks, env, span, interner);
             let wild = marks.wild_within(span);
+            // An unseen call / write in the statement may rewrite an instance
+            // variable before a later part of it reads it (`while foo; return
+            // @n; end`): the statement runs against declined ivars.
+            if marks.ivar_reset_within(span) {
+                Self::widen_ivars(env, interner);
+            }
             if guards.is_empty() && !wild {
                 self.replay_one(ast, &marks, env, stmt, interner, returns);
             } else {
@@ -313,7 +319,12 @@ impl<'i> Typer<'i> {
                         .unwrap_or_default();
                     let mut arms: Vec<(&[NodeId], &[String])> = vec![(main_body.as_slice(), &[])];
                     arms.extend(clauses.iter().map(|c| (c.body.as_slice(), stale.as_slice())));
-                    self.join_arm_writes(ast, env, &arms, interner, returns);
+                    // `rescue [T, …] => e` binds `e` inside its clause only
+                    // (rigor-rs#548); past the construct `e` joins with the
+                    // entry's decline and stays `untyped`.
+                    let mut binds: Vec<Vec<(String, TypeId)>> = vec![Vec::new()];
+                    binds.extend(clauses.iter().map(|c| self.rescue_binding(ast, c, interner)));
+                    self.join_arm_writes_bound(ast, env, &arms, &binds, interner, returns);
                     if !ensure_body.is_empty() {
                         Self::widen_names(env, &marks.changed_within(span), interner);
                         self.replay_statements(ast, env, ensure_body, interner, returns);
@@ -400,16 +411,38 @@ impl<'i> Typer<'i> {
             // `super(…)`, `yield(…)`, `defined?`, `BEGIN` / `END`): its
             // writes were declined by `widen_shell`; nothing binds.
             Node::Statements { .. } => {}
-            // A `x op= v` write's stored type is the dispatch result
-            // (`a + v` for `+=`, `narrow_truthy(a) | v` for `||=`) —
-            // the lowered node does not keep the operator. Widening the
-            // local to `untyped` declines the method (the tail then
-            // reads `Dynamic`) rather than emit the stale pre-write type
-            // — `a = nil; a ||= "default"; a` must not emit `-> nil`.
-            Node::LocalVariableOpWrite { name, .. } => {
-                env.insert(name.clone(), interner.untyped());
+            // `@x = v` binds the sigilled name — `def m; @i = 1; @i; end` reads
+            // `1` (rigor-rs#548). A class / global variable write is not
+            // tracked: the name stays unbound, so a read declines.
+            Node::InstanceVariableWrite { name, value, .. } => {
+                if ast.in_blocked_carrier(ast.get(stmt).span()) {
+                    return;
+                }
+                let (name, value) = (name.clone(), *value);
+                let ty = self.type_of(ast, value, env, interner);
+                env.insert(name, ty);
             }
-            Node::Call { block_body, block_params, block_locals, .. } if !block_body.is_empty() => {
+            // `a op= v` rebinds `a` to the fold of its entry binding and `v`:
+            // `a = 1; a += 2` ⇒ `3`, `a = nil; a ||= 5` ⇒ `5`. Anything the
+            // fold cannot decide exactly (an unbound / `untyped` entry, a
+            // non-constant operand, a fold the port lacks) declines the local
+            // to `untyped`. Inside a loop / block body the entry binding is
+            // already `untyped` when the name is read-and-written there
+            // (`Self::replay_one`'s `Loop` and block arms carry it round).
+            Node::LocalVariableOpWrite { name, value, op, .. } => {
+                if ast.in_blocked_carrier(ast.get(stmt).span()) || ast.closure_bound_names(stmt).contains(name) {
+                    return;
+                }
+                let (name, value, op) = (name.clone(), *value, op.clone());
+                let v_ty = self.type_of(ast, value, env, interner);
+                let new_ty = match env.get(&name).copied() {
+                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    None => interner.untyped(),
+                };
+                drop_indexed_narrowings(env, &name);
+                env.insert(name, new_ty);
+            }
+            Node::Call { block_body, block_params, block_locals, block_span, .. } if !block_body.is_empty() => {
                 // A block may run and rebind a captured local — its
                 // writes are not modelled (block params are unbindable
                 // here), so every name the block could rebind widens to
@@ -426,6 +459,18 @@ impl<'i> Typer<'i> {
                     .chain(block_locals.iter().cloned())
                     .collect();
                 Self::widen_names(&mut block_env, &shadowed, interner);
+                // A block runs zero or more times: a name it both reads and
+                // writes (`s += 1`, `a = [a]`) is carried round to the next
+                // run, so the body must not read the entry binding of it.
+                let bspan = block_span.unwrap_or(span);
+                let written = marks.written_within(bspan);
+                let carried: Vec<String> = marks
+                    .reads_within(bspan)
+                    .into_iter()
+                    .filter(|r| written.iter().any(|w| w == r))
+                    .map(str::to_string)
+                    .collect();
+                Self::widen_names(&mut block_env, &carried, interner);
                 self.replay_statements(ast, &mut block_env, block_body, interner, returns);
                 let untyped = interner.untyped();
                 for (name, ty) in block_env.iter() {
@@ -439,6 +484,143 @@ impl<'i> Typer<'i> {
             }
             _ => self.bind_statement(ast, stmt, env, interner),
         }
+    }
+
+    /// The binding a `rescue` clause gives its `=> e` reference, as
+    /// `(name, type)` pairs (empty when the clause binds nothing or the type
+    /// is not known exactly): a bare clause binds `StandardError`, a listed
+    /// one the union of the listed classes.
+    fn rescue_binding(
+        &self,
+        ast: &LoweredAst,
+        clause: &rigor_parse::RescueClause,
+        interner: &mut Interner,
+    ) -> Vec<(String, TypeId)> {
+        let Some(name) = &clause.bound_name else { return Vec::new() };
+        let ty = if clause.exceptions.is_empty() {
+            self.nominal_or_untyped("StandardError", interner)
+        } else {
+            self.exception_union(ast, &clause.exceptions, interner)
+        };
+        if matches!(interner.get(ty), Type::Dynamic(_)) {
+            return Vec::new();
+        }
+        vec![(name.clone(), ty)]
+    }
+
+    /// The union of the (non-generic) core exception classes a `rescue T1,
+    /// T2` list names. A name the core index does not register, a project
+    /// definition that may shadow it, a path (`Errno::ENOENT`), a splat or
+    /// any other expression declines the WHOLE binding to `untyped`.
+    fn exception_union(
+        &self,
+        ast: &LoweredAst,
+        exceptions: &[NodeId],
+        interner: &mut Interner,
+    ) -> TypeId {
+        let mut members: Vec<TypeId> = Vec::new();
+        for &ex in exceptions {
+            let Node::ConstantRead { name, span, .. } = ast.get(ex) else {
+                return interner.untyped();
+            };
+            let Some(class) = self.index.class_id(name) else { return interner.untyped() };
+            if self.source.knows_class(name)
+                || self.source.constant_shadowed(name, self.enclosing_prefix(*span))
+            {
+                return interner.untyped();
+            }
+            let n = interner.intern(Type::Nominal { class, args: Vec::new() });
+            if !members.contains(&n) {
+                members.push(n);
+            }
+        }
+        match members.len() {
+            0 => interner.untyped(),
+            1 => members[0],
+            _ => members
+                .iter()
+                .skip(1)
+                .fold(members[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m)),
+        }
+    }
+
+    /// The new binding of `a` after `a <op>= v`, from `a`'s entry binding and
+    /// `v`'s type (`untyped` declines).
+    fn op_write_result(
+        &self,
+        entry: TypeId,
+        op: &rigor_parse::OpWriteKind,
+        v_ty: TypeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        use rigor_parse::OpWriteKind;
+        let untyped = interner.untyped();
+        if matches!(interner.get(entry), Type::Dynamic(_)) || matches!(interner.get(v_ty), Type::Dynamic(_)) {
+            return untyped;
+        }
+        match op {
+            // `a ||= v` ⇒ `a = a || v`: the truthy part of the entry plus
+            // `v` — `a = nil; a ||= 5` ⇒ `5`, `a = 1; a ||= "x"` ⇒
+            // `("x" | 1)`.
+            OpWriteKind::Or => match self.split_truthiness(entry, interner) {
+                Some((Some(truthy), _)) => rigor_types::Algebra::join(interner, truthy, v_ty),
+                Some((None, _)) => v_ty,
+                None => untyped,
+            },
+            // `a &&= v` ⇒ `a = a && v`: the falsy part of the entry plus `v`.
+            OpWriteKind::And => match self.split_truthiness(entry, interner) {
+                Some((_, Some(falsy))) => rigor_types::Algebra::join(interner, falsy, v_ty),
+                Some((_, None)) => v_ty,
+                None => untyped,
+            },
+            // `a <binop>= v` ⇒ `a = a.<binop>(v)`: only a literal-by-literal
+            // fold is exact; every other dispatch declines.
+            OpWriteKind::Operator(opname) => {
+                if let (Type::Constant(r), Type::Constant(a)) = (interner.get(entry), interner.get(v_ty)) {
+                    if let Some(sc) = crate::folding::fold(r, opname, &[a.clone()]) {
+                        return interner.intern(Type::Constant(sc));
+                    }
+                }
+                untyped
+            }
+        }
+    }
+
+    /// Split `ty` into its `(truthy, falsy)` parts, each the join of the
+    /// members on that side (`None` when empty). `None` when any member's
+    /// truthiness is not statically known.
+    fn split_truthiness(
+        &self,
+        ty: TypeId,
+        interner: &mut Interner,
+    ) -> Option<(Option<TypeId>, Option<TypeId>)> {
+        let members: Vec<TypeId> = match interner.get(ty) {
+            Type::Union(ms) => ms.clone(),
+            _ => vec![ty],
+        };
+        let (mut truthy, mut falsy): (Vec<TypeId>, Vec<TypeId>) = (Vec::new(), Vec::new());
+        for m in members {
+            let falsy_member = match interner.get(m) {
+                Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => true,
+                Type::Constant(_)
+                | Type::Tuple(_)
+                | Type::HashShape(_)
+                | Type::IntegerRange { .. } => false,
+                Type::Nominal { class, .. } => match self.index.class_name_for_id(*class)? {
+                    "NilClass" | "FalseClass" => true,
+                    "String" | "Integer" | "Float" | "Symbol" | "Array" | "Hash" | "Range" | "Regexp"
+                    | "Rational" | "Complex" | "Proc" | "TrueClass" => false,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            if falsy_member { falsy.push(m) } else { truthy.push(m) }
+        }
+        let join = |v: Vec<TypeId>, interner: &mut Interner| -> Option<TypeId> {
+            let first = *v.first()?;
+            Some(v.iter().skip(1).fold(first, |acc, &m| rigor_types::Algebra::join(interner, acc, m)))
+        };
+        Some((join(truthy, interner), join(falsy, interner)))
     }
 
     /// Replay each arm on its own clone of `env` and discard the result —
@@ -472,6 +654,21 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
         returns: &mut Vec<(NodeId, TypeId)>,
     ) {
+        self.join_arm_writes_bound(ast, env, arms, &[], interner, returns);
+    }
+
+    /// [`Self::join_arm_writes`] where arm `i` additionally starts with the
+    /// `(name, type)` bindings in `binds[i]` (a `rescue => e` clause binds
+    /// `e`; a missing entry binds nothing).
+    fn join_arm_writes_bound(
+        &self,
+        ast: &LoweredAst,
+        env: &mut TypeEnv,
+        arms: &[(&[NodeId], &[String])],
+        binds: &[Vec<(String, TypeId)>],
+        interner: &mut Interner,
+        returns: &mut Vec<(NodeId, TypeId)>,
+    ) {
         let entry = env.clone();
         let nil = interner.nil();
         let marks = self.def_local_marks(ast);
@@ -479,9 +676,12 @@ impl<'i> Typer<'i> {
         let mut arm_envs: Vec<TypeEnv> = Vec::new();
         let mut written: Vec<String> = Vec::new();
         let mut any_suspect = false;
-        for (arm, entry_stale) in arms {
+        for (i, (arm, entry_stale)) in arms.iter().enumerate() {
             let mut e = entry.clone();
             Self::widen_names(&mut e, entry_stale, interner);
+            for (name, ty) in binds.get(i).into_iter().flatten() {
+                e.insert(name.clone(), *ty);
+            }
             self.replay_statements(ast, &mut e, arm, interner, returns);
             arm_envs.push(e);
             if let Some(sp) = crate::def_local_marks::body_span(ast, arm) {
@@ -510,9 +710,12 @@ impl<'i> Typer<'i> {
             if arm_envs.iter().all(|ae| ae.get(&name) == entry.get(&name)) {
                 continue;
             }
+            // An ivar unbound at entry reads its class seed there, not
+            // `nil`: the join declines it.
+            let absent = if crate::def_local_marks::is_ivar(&name) { interner.untyped() } else { nil };
             let mut members: Vec<TypeId> = Vec::new();
             for ae in &arm_envs {
-                let ty = ae.get(&name).or_else(|| entry.get(&name)).copied().unwrap_or(nil);
+                let ty = ae.get(&name).or_else(|| entry.get(&name)).copied().unwrap_or(absent);
                 if !members.contains(&ty) {
                     members.push(ty);
                 }

@@ -53,7 +53,11 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         if self.def_scope.get().is_none()
-            || !matches!(ast.get(receiver), Node::LocalVariableRead { .. })
+            || !match ast.get(receiver) {
+                Node::LocalVariableRead { .. } => true,
+                Node::VariableRead { name, .. } => crate::def_local_marks::is_ivar(name),
+                _ => false,
+            }
             || !self.is_scalar_nominal_result(interner, ty)
         {
             return ty;

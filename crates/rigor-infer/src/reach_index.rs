@@ -597,7 +597,7 @@ impl ReachIndex {
                         out.push(LocalEvent::ForIndex(spans));
                     }
                 }
-                Node::LocalVariableOpWrite { name, value, span }
+                Node::LocalVariableOpWrite { name, value, span, .. }
                     if name == root && in_region(*span) =>
                 {
                     out.push(LocalEvent::Write {
