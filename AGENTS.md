@@ -48,7 +48,10 @@ thing that stops two agents taking the same issue.
 7. **Review, then ready.** Once CI is green on the final head, run the
    pre-ready gates, then get the review (`docs/agents/review.md`), whose
    reviewers re-probe the parity claims themselves. Only on `Approved` run
-   `gh pr ready`. A non-draft PR means "reviewed, mergeable".
+   `gh pr ready`. A non-draft PR means "reviewed, mergeable". The agent that
+   owns the PR then merges it itself, under the conditions in
+   `docs/agents/review.md` → "Self-merge"; anything outside them waits for a
+   human.
 8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
    an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
 

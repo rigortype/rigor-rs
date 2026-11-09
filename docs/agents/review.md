@@ -61,6 +61,39 @@ the implementer gets a fix that closes the family, not the instance. Bounce
 the companion's proposal against the adversarial findings before it reaches
 the implementer.
 
+## Self-merge
+
+An `Approved` PR is merged by the agent that owns it; a reviewer never merges.
+Every condition below holds at the moment of `gh pr merge N --merge`, or the PR
+waits for a human:
+
+- **Verdict.** `Verdict: Approved` from a read-only reviewer other than the
+  implementer, on the current head SHA, with the PR body revised as the verdict
+  asked. `Needs fix` and `Blocked — need human` never self-merge. After the
+  two-round cap, a human decides.
+- **No drift since approval.** The head is the approved SHA, or the only
+  commits after it are merges of `origin/master`. Compare the PR's own diff
+  before and after (`git diff <base>...<head>`, test files aside); any other
+  change goes back for a fix-confirmation review.
+- **Green on the head, mergeable on today's master.** `gh pr checks` passes on
+  that head and `gh pr view N --json mergeStateStatus` says `CLEAN`. If master
+  moved since that CI run, `gh pr update-branch N` and wait for CI again.
+- **Merge one at a time, oldest first.** Two PRs that are each green can break
+  master together: #517 and #522 did on 2026-11-08, and master went red until
+  #565. Before the next self-merge, `gh run list --branch master` shows CI
+  passing on the previous merge commit. PRs whose changed files do not overlap
+  may go out of order.
+- **Stacks.** Merge the parent first, then `gh pr edit N --base master`, wait for
+  `CLEAN`, and treat a conflict as a needed rebase, not a merge.
+- **Human-only, whatever the verdict:** a pin bump or change under
+  `reference/`, `.github/`, `harness/gate.sh` or `harness/docs_check.py`, an
+  ADR, and a slice whose measured outcome is "0 gaps closed" (AGENTS.md →
+  Probing, "Measure before you build").
+
+After the merge: the fold step (AGENTS.md step 8), then release the PR's
+worktree (`git worktree remove`; `--force` for a populated submodule once
+`git status` is clean).
+
 ## Input
 
 - The PR number and head SHA.

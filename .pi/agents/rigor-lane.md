@@ -54,7 +54,8 @@ If the task is incomplete or acceptance is uncheckable, escalate via
 - Finish exactly: `Head SHA <sha> — lane done` or `Blocked — need human`
 
 Open a Draft PR with `--body-file`; do not merge it and do not return CI
-status.
+status. The lane never self-merges: after `Approved`, the parent/orchestrator
+that owns the PR merges it under `docs/agents/review.md` → "Self-merge".
 
 ## Hard rules (ADR-115)
 
