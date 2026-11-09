@@ -709,6 +709,11 @@ impl<'i> Typer<'i> {
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped());
+            // An untyped carrier is the guard map's domain — `subject_edge`
+            // only speaks for a resolved one (rigor-rs#451).
+            if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                continue;
+            }
             let e = self.subject_edge(
                 ast,
                 pred,
@@ -1081,7 +1086,7 @@ impl<'i> Typer<'i> {
                         let t = self.subject_edge(ast, i.predicate, &crate::loop_edges::Subject::Local(name.clone()), ty, !i.is_unless, false, interner);
                         let f = self.subject_edge(ast, i.predicate, &crate::loop_edges::Subject::Local(name.clone()), ty, i.is_unless, false, interner);
                         use crate::loop_edges::Edge;
-                        if t != Edge::Keep || f != Edge::Keep {
+                        if t == Edge::Other || f == Edge::Other {
                             let u = interner.untyped();
                             env.to_mut().insert(name.clone(), u);
                             drop_indexed_narrowings(env.to_mut(), name);
@@ -3560,6 +3565,9 @@ impl<'i> Typer<'i> {
                             .get(name)
                             .copied()
                             .unwrap_or_else(|| interner.untyped());
+                        if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                            continue;
+                        }
                         let t = self.subject_edge(
                             ast,
                             *predicate,

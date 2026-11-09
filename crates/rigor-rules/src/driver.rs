@@ -166,9 +166,6 @@ pub fn analyze_with_source_and_folder(
         let gate_env = env.gate_at(message_span);
         let site_env = env.at(ast, &typer, message_span, call_id, interner);
         let env = site_env.as_ref();
-        if let rigor_parse::Node::LocalVariableRead { name, .. } = ast.get(recv) {
-            eprintln!("driver site={message_span:?} name={name} site_env={:?} gate={:?}", env.get(name.as_str()), gate_env.get(name.as_str()));
-        }
         // `nil&.m` never dispatches: the reference's `safe_navigation_receiver`
         // turns a receiver that is exactly nil into `bot` for undefined-method.
         // A `T | nil` union still flows through unchanged, as it does there.

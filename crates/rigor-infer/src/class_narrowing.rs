@@ -1185,6 +1185,12 @@ impl<'i> Typer<'i> {
                     .get(name)
                     .copied()
                     .unwrap_or_else(|| interner.untyped());
+                // An untyped carrier is the GUARD map's domain — `rule
+                // .is_a?(Hash)` narrows the param to `Hash` there while
+                // `subject_edge` only speaks for a resolved carrier.
+                if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                    continue;
+                }
                 let e = self.subject_edge(
                     ast,
                     predicate,
@@ -1200,16 +1206,28 @@ impl<'i> Typer<'i> {
             }
             out
         };
-        // The FACT twin: a subject whose edge does not keep is `Widened`
-        // inside that arm — the join of narrowed edges is never the bare
-        // nominal the oracle's join leaves (`non-empty-array[top]` is the
-        // shape the port declines).
-        let edge_facts = |cenv: &mut Facts, tenv: &TypeEnv, edge: bool, interner: &mut Interner| {
+        // The FACT twin: inside an arm, a `Keep` edge RESTORES the entry
+        // fact (`[1, 2].is_a?(Array)` is decided — the guard narrows
+        // nothing, and `h.zz1` inside still witnesses `for [1, 2]`); a
+        // non-Keep edge widens, the join of narrowed edges never being the
+        // bare nominal the oracle leaves (`non-empty-array[top]` is the
+        // shape the port declines) — rigor-rs#451.
+        let edge_facts = |arm: &mut Facts,
+                          saved: &HashMap<String, ClassFact>,
+                          tenv: &TypeEnv,
+                          edge: bool,
+                          interner: &mut Interner| {
             for name in &predicate_subjects {
                 let ty = tenv
                     .get(name)
                     .copied()
                     .unwrap_or_else(|| interner.untyped());
+                // An untyped carrier is the GUARD map's domain — `rule
+                // .is_a?(Hash)` narrows the param to `Hash` there while
+                // `subject_edge` only speaks for a resolved carrier.
+                if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                    continue;
+                }
                 let e = self.subject_edge(
                     ast,
                     predicate,
@@ -1219,11 +1237,33 @@ impl<'i> Typer<'i> {
                     false,
                     interner,
                 );
-                if e != crate::loop_edges::Edge::Keep {
-                    cenv.locals.insert(name.clone(), ClassFact::Widened);
+                match e {
+                    // A DEAD edge carries `Bot` — calls inside the arm are
+                    // suppressed, and `propagate_widened` (which reads only
+                    // `Widened`) never leaks it past the `if`
+                    // (rigor-rs#451).
+                    crate::loop_edges::Edge::Empty => {
+                        arm.locals.insert(name.clone(), ClassFact::Bot);
+                    }
+                    crate::loop_edges::Edge::Keep => {
+                        match saved.get(name) {
+                            Some(fact) => {
+                                arm.locals.insert(name.clone(), fact.clone());
+                            }
+                            None => {
+                                arm.locals.remove(name);
+                            }
+                        }
+                    }
+                    _ => {
+                        arm.locals.insert(name.clone(), ClassFact::Widened);
+                    }
                 }
             }
         };
+        // The subject facts as they stood at `if` entry — `Keep` arms
+        // restore from here (`apply_guards` rewrites a guard-named fact).
+        let saved_facts = cenv.locals.clone();
         // Stage 3a-1: the predicate yields a guard map for EACH edge (`&&`/`||`
         // /`!` recursion — [`Typer::analyse_predicate`]). A plain class guard
         // still yields facts on the truthy edge only, so the pre-3a-1 behavior
@@ -1239,7 +1279,7 @@ impl<'i> Typer<'i> {
             }
             let mut c = cenv.clone();
             self.apply_guards(&truthy_g, ast, tenv, &mut c, coarse, interner);
-            edge_facts(&mut c, tenv, true, interner);
+            edge_facts(&mut c, &saved_facts, tenv, true, interner);
             // The branch bodies INHERIT the conditional's own position: a block
             // inside an expression-position ternary branch narrows nothing
             // (probe x2), while a statement `if`'s branches stay statement
@@ -1262,7 +1302,7 @@ impl<'i> Typer<'i> {
             }
             let mut c = cenv.clone();
             self.apply_guards(&falsey_g, ast, tenv, &mut c, coarse, interner);
-            edge_facts(&mut c, tenv, false, interner);
+            edge_facts(&mut c, &saved_facts, tenv, false, interner);
             self.class_flow_scope(ast, falsey, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
             c
         };
@@ -1283,6 +1323,9 @@ impl<'i> Typer<'i> {
                 .get(name)
                 .copied()
                 .unwrap_or_else(|| interner.untyped());
+            if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                continue;
+            }
             let t = self.subject_edge(
                 ast,
                 predicate,
@@ -1301,10 +1344,28 @@ impl<'i> Typer<'i> {
                 false,
                 interner,
             );
-            if t != crate::loop_edges::Edge::Keep || f != crate::loop_edges::Edge::Keep {
+            use crate::loop_edges::Edge;
+            // An `Empty` edge cannot carry this subject at all — it
+            // contributes nothing to the join (`if h.is_a?(Hash)` on
+            // `[1, 2]` re-joins the falsey `[1, 2]` alone, firing after);
+            // only a live `Other` widens.
+            let widen = t == Edge::Other || f == Edge::Other;
+            if widen {
                 let u = interner.untyped();
                 tenv.insert(name.clone(), u);
                 cenv.locals.insert(name.clone(), ClassFact::Widened);
+            } else {
+                // `Keep ∪ Empty`: the decided edge contributes nothing —
+                // the subject re-joins on its entry type and its entry
+                // FACT (`[1, 2].is_a?(Array)` keeps `[1, 2]` after).
+                match saved_facts.get(name) {
+                    Some(fact) => {
+                        cenv.locals.insert(name.clone(), fact.clone());
+                    }
+                    None => {
+                        cenv.locals.remove(name);
+                    }
+                }
             }
         }
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for

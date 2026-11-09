@@ -39,14 +39,45 @@ pub(crate) enum Edge {
 /// `a` then `b` on the same edge (`&&`'s truthy edge): an unreachable or
 /// unmodelled first step decides alone.
 pub(crate) fn seq(a: Edge, b: impl FnOnce() -> Edge) -> Edge {
-    match a {
-        Edge::Keep => b(),
-        other => other,
+    // Conjunction of two sequential guards: `Empty` absorbs — the second
+    // guard's path cannot hold the carrier (`h.frozen? || h.is_a?(Hash)`
+    // enters its arm only through `frozen?`, which keeps `Array`,
+    // rigor-rs#451) — `Keep` is the identity, `Other` is anything undecided.
+    match (a, b()) {
+        (Edge::Empty, _) | (_, Edge::Empty) => Edge::Empty,
+        (Edge::Keep, x) | (x, Edge::Keep) => x,
+        _ => Edge::Other,
     }
 }
 
-/// The join of two edges' scopes. `T ∪ Bot` is `T`.
+/// Extract a [`Scalar`] from a literal node (`nil`, ints, floats, strings,
+/// symbols, booleans) — `None` for anything else.
+fn scalar_literal(ast: &LoweredAst, id: NodeId) -> Option<rigor_types::Scalar> {
+    use rigor_types::Scalar;
+    match ast.get(id) {
+        Node::NilLit { .. } => Some(Scalar::Nil),
+        Node::IntegerLit { value, digits, .. } => value
+            .map(Scalar::Int)
+            .or_else(|| digits.clone().map(Scalar::BigInt)),
+        Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
+        Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
+        Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+        Node::TrueLit { .. } => Some(Scalar::Bool(true)),
+        Node::FalseLit { .. } => Some(Scalar::Bool(false)),
+        _ => None,
+    }
+}
+
+/// The join of two edges' scopes. `T ∪ Bot` is `T`, and `Bot ∪ T` is
+/// `T` — the undecidable disjunct carries the subject through unchanged
+/// (`if h.is_a?(Hash) || h.frozen?; h.or1` fires `for Array` inside,
+/// rigor-rs#451), so `Empty ∪ Other` keeps rather than widening.
 pub(crate) fn join(a: Edge, b: Edge) -> Edge {
+    // `T ∪ Bot` is `T`: `Empty` is the identity — an undecidable disjunct
+    // (`unknown`, `Keep`) carries the subject through unchanged (`if
+    // h.is_a?(Hash) || h.frozen?` fires `for Array` inside) while a
+    // disjunct that NARROWS elsewhere (`h.is_a?(UnknownZzz) ||
+    // h.is_a?(Hash)` on `Array`) widens the whole arm — rigor-rs#451.
     match (a, b) {
         (Edge::Other, _) | (_, Edge::Other) => Edge::Other,
         (Edge::Keep, _) | (_, Edge::Keep) => Edge::Keep,
@@ -289,10 +320,10 @@ impl<'i> Typer<'i> {
         // (`1be2fd0b`), so `Hash === x`, `C.critical = v` or `n < LIMIT` keep
         // it (rspec-mocks `Hash.ruby2_keywords_hash?` under `Hash === x`
         // fires on the oracle).
-        let unknown = match subject {
-            Subject::Const(..) => Edge::Keep,
-            Subject::Local(_) => atom(Edge::Other),
-        };
+        // A predicate this table does not model cannot narrow its subject —
+        // `if h.frozen?` keeps `Array` inside AND after on the oracle
+        // (rigor-rs#451) — so a local keeps exactly as a constant does.
+        let unknown = Edge::Keep;
         match ast.get(pred) {
             Node::Statements { body, kind: StatementsKind::Sequence, .. } if body.len() == 1 => {
                 eff(body[0], edge)
@@ -341,6 +372,26 @@ impl<'i> Typer<'i> {
                         true => Edge::Keep,
                         false => Edge::Other,
                     }),
+                    // `v == nil` / `v != nil`: only the nil comparison
+                    // collapses (`narrow_nil` / `narrow_non_nil` — `v ==
+                    // nil` truthy on `[1, 2]` is unreachable, `!= nil`
+                    // keeps). Other scalar `==`s don't narrow — `v == 1`
+                    // on `[1, 2]` still fires inside (rigor-rs#451).
+                    ("==" | "!=", [arg]) if recv_is_subject => {
+                        let nil_arg = matches!(
+                            scalar_literal(ast, *arg),
+                            Some(Scalar::Nil)
+                        );
+                        if nil_arg {
+                            atom(match self.nilness(interner, ty) {
+                                Some(is_nil) if (is_nil == (method == "==")) == edge => Edge::Keep,
+                                Some(_) => Edge::Empty,
+                                None => Edge::Other,
+                            })
+                        } else {
+                            unknown
+                        }
+                    }
                     ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => {
                         // A guard whose class operand is not a constant
                         // (`h.is_a?(k)` with a local `k`) cannot narrow —
@@ -486,10 +537,11 @@ impl<'i> Typer<'i> {
         };
         if !mintable {
             // A guard constant the walk cannot mint a class for
-            // (`File.is_a?(SubClass)` on a project-defined `SubClass`) is
+            // (`File.is_a?(SubClass)` on a project-defined `SubClass`,
+            // `h.is_a?(UnknownZzzClass)` on `[1, 2]` — rigor-rs#451) is
             // unorderable: the truthy edge widens, the falsey edge keeps
             // (`unless …; File.frob` fires `for singleton(File)`,
-            // rigor-rs#454 review).
+            // rigor-rs#454 review; fixture `b15b` stays silent).
             return match edge {
                 true => Edge::Other,
                 false => Edge::Keep,
@@ -511,7 +563,20 @@ impl<'i> Typer<'i> {
         }
         match (self.index.class_ordering(&carrier, &class), edge) {
             (ClassOrdering::Subclass | ClassOrdering::Equal, true) => Edge::Keep,
-            (ClassOrdering::Subclass | ClassOrdering::Equal, false) => Edge::Empty,
+            // A COVERING guard's falsey edge: a LITERAL carrier is decided
+            // (`[1, 2].is_a?(Array)` can only be true — the else arm is
+            // dead and the join keeps `[1, 2]`), while a nominal mints the
+            // complement (`non-empty-array[top]` fires on the oracle —
+            // `Other`, the port's decline, stays silent) — rigor-rs#451.
+            (ClassOrdering::Subclass | ClassOrdering::Equal, false)
+                if matches!(
+                    interner.get(ty),
+                    Type::Tuple(_) | Type::HashShape(_) | Type::Constant(_)
+                ) =>
+            {
+                Edge::Empty
+            }
+            (ClassOrdering::Subclass | ClassOrdering::Equal, false) => Edge::Other,
             (ClassOrdering::Disjoint, true) => Edge::Empty,
             (ClassOrdering::Disjoint, false) => Edge::Keep,
             // The falsey edge of an unorderable guard keeps the carrier
