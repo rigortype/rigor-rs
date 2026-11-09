@@ -331,6 +331,16 @@ impl<'i> Typer<'i> {
                         Some(_) => Edge::Empty,
                         None => Edge::Other,
                     }),
+                    // `h.empty?`: the truthy edge keeps the carrier (`if
+                    // h.empty?; h.inside; end` fires `for Array`), the
+                    // falsey edge narrows to the non-empty shape — the port
+                    // declines that to a widen (`non-empty-array[top]`'s
+                    // firing is a coverage loss, never an FP —
+                    // rigor-rs#451).
+                    ("empty?", []) if recv_is_subject => atom(match edge {
+                        true => Edge::Keep,
+                        false => Edge::Other,
+                    }),
                     ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => {
                         // A guard whose class operand is not a constant
                         // (`h.is_a?(k)` with a local `k`) cannot narrow —
