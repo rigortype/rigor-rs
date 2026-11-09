@@ -382,7 +382,7 @@ impl<'i> Typer<'i> {
     /// answer — a proper subclass guard that narrows, an unorderable guard's
     /// widening truthy edge — declines.
     #[allow(clippy::too_many_arguments)]
-    fn class_edge(
+    pub(crate) fn class_edge(
         &self,
         ast: &LoweredAst,
         class_node: NodeId,
