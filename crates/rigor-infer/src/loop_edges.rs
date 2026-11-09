@@ -243,7 +243,15 @@ impl<'i> Typer<'i> {
         edge: bool,
         interner: &Interner,
     ) -> Edge {
-        self.subject_edge(ast, pred, &Subject::Local(local.to_string()), ty, edge, false, interner)
+        self.subject_edge(
+            ast,
+            pred,
+            &Subject::Local(local.to_string()),
+            ty,
+            edge,
+            false,
+            interner,
+        )
     }
 
     /// [`Typer::edge_effect`] over any guard [`Subject`]. With
@@ -352,23 +360,38 @@ impl<'i> Typer<'i> {
                         {
                             Edge::Keep
                         } else {
-                            atom(self.class_edge(ast, r, span, false, ty, edge, interner))
+                            atom(self.class_edge(
+                                ast,
+                                r,
+                                span,
+                                false,
+                                ty,
+                                edge,
+                                interner,
+                            ))
                         }
                     }
                     ("respond_to?", [m]) if recv_is_subject => {
                         let name = match ast.get(*m) {
                             Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => {
-                                Some(value.as_str())
+                                Some(value.clone())
                             }
                             _ => None,
                         };
                         match name {
-                            Some(m) => self.respond_edge(ty, m, edge, interner),
+                            Some(m) => self.respond_edge(ty, &m, edge, interner),
                             // A dynamic `respond_to?` name cannot narrow a
-                            // CONSTANT (`if File.respond_to?(m); File.frob;
-                            // end` fires `for singleton(File)` inside AND
-                            // after, rigor-rs#454); a local still declines.
-                            None if matches!(subject, Subject::Const(..)) => Edge::Keep,
+                            // CONSTANT or a literal-pinned local (`if
+                            // File.respond_to?(m); File.frob; end` and
+                            // `v = 1; if v.respond_to?(m); v.inside; end`
+                            // fire inside AND after, rigor-rs#454); an
+                            // unresolvable local still declines (widens).
+                            None
+                                if matches!(subject, Subject::Const(..))
+                                    || matches!(interner.get(ty), Type::Constant(_)) =>
+                            {
+                                Edge::Keep
+                            }
                             None => Edge::Other,
                         }
                     }
@@ -438,14 +461,30 @@ impl<'i> Typer<'i> {
         // `Nominal` reads its own class. Anything else declines.
         let carrier = match interner.get(ty) {
             Type::Singleton(_) => Some("Class".to_string()),
+            // A shape carrier reads its own class — `h = []` answers
+            // `is_a?` as `Array` (`while h.is_a?(Unknown); end` keeps `[]`
+            // at `h.frob`, rigor-rs#454 review).
+            Type::Tuple(_) => Some("Array".to_string()),
+            Type::HashShape(_) => Some("Hash".to_string()),
             Type::Constant(_) | Type::Nominal { .. } => {
                 self.index.class_name_of(interner, ty).map(|s| s.to_string())
             }
             _ => None,
         };
-        let Some((class, true)) = self.guard_constant(ast, class_node, use_span) else {
+        let Some((class, mintable)) = self.guard_constant(ast, class_node, use_span) else {
             return Edge::Other;
         };
+        if !mintable {
+            // A guard constant the walk cannot mint a class for
+            // (`File.is_a?(SubClass)` on a project-defined `SubClass`) is
+            // unorderable: the truthy edge widens, the falsey edge keeps
+            // (`unless …; File.frob` fires `for singleton(File)`,
+            // rigor-rs#454 review).
+            return match edge {
+                true => Edge::Other,
+                false => Edge::Keep,
+            };
+        }
         let Some(carrier) = carrier else {
             return Edge::Other;
         };
@@ -467,8 +506,11 @@ impl<'i> Typer<'i> {
             (ClassOrdering::Disjoint, false) => Edge::Keep,
             // The falsey edge of an unorderable guard keeps the carrier
             // (`begin … end while h.is_a?(Unknown)` fires `for Array` after
-            // the loop) — only its truthy edge widens.
-            (ClassOrdering::Unknown, false) => Edge::Keep,
+            // the loop) — only its truthy edge widens. A PROPER-SUBCLASS
+            // guard's falsey edge also keeps (`unless File.is_a?
+            // (SubOfClass); File.frob` fires `for singleton(File)`,
+            // rigor-rs#454 review) — the truthy edge still narrows.
+            (ClassOrdering::Unknown | ClassOrdering::Superclass, false) => Edge::Keep,
             _ => Edge::Other,
         }
     }

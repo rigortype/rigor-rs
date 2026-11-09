@@ -329,7 +329,17 @@ impl Walk<'_, '_> {
             Node::LocalVariableWrite { name, value, .. }
             | Node::LocalVariableOpWrite { name, value, .. } => {
                 let name = name.clone();
-                let ty = self.typer.type_of(ast, *value, &TypeEnv::new(), self.interner);
+                // `v = x` carries `x`'s pin — `type_of` with an empty env
+                // cannot see it (`v.respond_to?(:m)` still decides,
+                // rigor-rs#454 review).
+                let ty = match ast.get(*value) {
+                    Node::LocalVariableRead { name: src, .. } => self
+                        .local_types
+                        .get(src)
+                        .copied()
+                        .unwrap_or_else(|| self.interner.untyped()),
+                    _ => self.typer.type_of(ast, *value, &TypeEnv::new(), self.interner),
+                };
                 self.local_types.insert(name.clone(), ty);
                 let mut sup = self.node(*value, sup);
                 sup.kill(&Subject::Local(name));
