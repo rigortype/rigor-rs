@@ -36,8 +36,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rigor_parse::{LoopKind, LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, TypeId};
+use rigor_parse::{LoopKind, LoweredAst, Node, NodeId, Span, StatementsKind};
+use rigor_types::{Interner, Type, TypeId};
 
 use crate::loop_edges::{Edge, Subject};
 use crate::{TypeEnv, Typer};
@@ -127,6 +127,77 @@ impl Walk<'_, '_> {
             sup = self.node(s, sup);
         }
         sup
+    }
+
+    /// The truthy edge `cond` gives a `case`/`when` or `case`/`in` subject:
+    /// `cond === subject`, where a `ConstantRead` condition maps to the class
+    /// test (`C === x`). An `in` pattern also narrows on a literal
+    /// (`lit === subject`); a `when` literal never does — `when "lit"` on
+    /// `FOO = "x"` still fires `for "x"` (rigor-rs#452 review).
+    fn case_condition_edge(
+        &mut self,
+        cond: NodeId,
+        subject: &Subject,
+        use_span: Span,
+        in_arm: bool,
+    ) -> Edge {
+        let ty = match self.const_types.get(subject) {
+            Some(&t) => t,
+            None => self.interner.untyped(),
+        };
+        if !matches!(self.interner.get(ty), Type::Constant(_) | Type::Nominal { .. }) {
+            return Edge::Keep;
+        }
+        match self.ast.get(cond) {
+            Node::ConstantRead { .. } => self.typer.class_edge(
+                self.ast,
+                cond,
+                use_span,
+                false,
+                ty,
+                true,
+                self.interner,
+            ),
+            // `when` conditions narrow only on a class constant.
+            _ if !in_arm => Edge::Keep,
+            // A literal `in` pattern narrows by `lit === subject` — only a
+            // pinned constant subject has a decidable value; a Nominal keeps
+            // the arm undecided.
+            Node::NilLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Nil),
+            Node::IntegerLit { value, digits, .. } => {
+                let lit = value
+                    .map(rigor_types::Scalar::Int)
+                    .or_else(|| digits.clone().map(rigor_types::Scalar::BigInt));
+                match lit {
+                    Some(lit) => self.literal_edge(ty, &lit),
+                    None => Edge::Keep,
+                }
+            }
+            Node::FloatLit { value, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Float(*value))
+            }
+            Node::StringLit { value, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Str(value.clone()))
+            }
+            Node::SymbolLit { value, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Sym(value.clone()))
+            }
+            Node::TrueLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Bool(true)),
+            Node::FalseLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Bool(false)),
+            _ => Edge::Keep,
+        }
+    }
+
+    /// `lit === subject` on a pinned scalar — Keep iff the literal is the
+    /// subject's own value (`in "x"` on `FOO = "x"` keeps the carrier and
+    /// the arm's calls still fire `for "x"`); anything else is unreachable.
+    /// A non-Constant carrier declines.
+    fn literal_edge(&self, ty: TypeId, lit: &rigor_types::Scalar) -> Edge {
+        match self.interner.get(ty) {
+            Type::Constant(s) if s == lit => Edge::Keep,
+            Type::Constant(_) => Edge::Empty,
+            _ => Edge::Keep,
+        }
     }
 
     /// `pred`'s per-subject effects on its `edge`.
@@ -283,16 +354,91 @@ impl Walk<'_, '_> {
                 self.list(&body, sup)
             }
             // `case`: every clause is an alternative entered from the
-            // post-subject state; the no-match path keeps that state.
+            // post-subject state; the no-match path keeps that state. A
+            // CONSTANT subject narrows inside a `when`/`in` arm whose
+            // patterns all disprove its carrier (`1be2fd0b`, rigor-rs#452):
+            // `case FOO when Integer` enters the arm on the `Integer === FOO`
+            // truthy edge. A mixed list keeps the carrier when ANY condition
+            // could match it (`when String, Integer` on `FOO = "x"` still
+            // fires `for "x"`), and a pattern the class test cannot decide
+            // (`in [x]`) declines rather than suppress.
             Node::Case { predicate, branches, else_body, .. } => {
                 let (p, branches, else_body) = (*predicate, branches.clone(), else_body.clone());
+                let subject = p.and_then(|id| Subject::of(ast, id));
+                // Prime the carrier — `effects()` types a Const subject at
+                // its read site lazily; the case predicate IS the read.
+                if let (Some(Subject::Const(..)), Some(p)) = (&subject, p) {
+                    self.const_types
+                        .entry(subject.clone().unwrap())
+                        .or_insert_with(|| {
+                            self.typer.type_of(ast, p, &TypeEnv::new(), self.interner)
+                        });
+                }
                 let sup = match p {
                     Some(p) => self.node(p, sup),
                     None => sup,
                 };
                 let mut paths = vec![sup.clone()];
                 for b in branches {
-                    paths.push(self.node(b, sup.clone()));
+                    let b_sup = match (subject.clone(), ast.get(b)) {
+                        (
+                            Some(Subject::Const(name, rooted)),
+                            Node::When { conditions, body, .. },
+                        ) => {
+                            let (conditions, body) = (conditions.clone(), body.clone());
+                            let mut edge = Edge::Empty;
+                            for c in &conditions {
+                                edge = match edge {
+                                    Edge::Keep => Edge::Keep,
+                                    _ => self.case_condition_edge(
+                                        *c,
+                                        &Subject::Const(name.clone(), rooted),
+                                        ast.get(*c).span(),
+                                        false,
+                                    ),
+                                };
+                            }
+                            let arm =
+                                sup.apply(&[(Subject::Const(name, rooted), edge)]);
+                            let mut cur = arm;
+                            for c in &conditions {
+                                cur = self.node(*c, cur);
+                            }
+                            self.list(&body, cur)
+                        }
+                        (
+                            Some(Subject::Const(name, rooted)),
+                            Node::BeginRescue { main_body, body, .. },
+                        ) => {
+                            // A `case`/`in` arm: `main_body[0]` is the
+                            // lowered PATTERN — a `ConstantRead` is the
+                            // `in C` class test (`C === subject`), every
+                            // other shape declines.
+                            let (main_body, body) = (main_body.clone(), body.clone());
+                            let (pattern, arm_body) = main_body
+                                .split_first()
+                                .map(|(p, r)| (*p, r))
+                                .unwrap_or((b, &[][..]));
+                            let edge = self.case_condition_edge(
+                                pattern,
+                                &Subject::Const(name.clone(), rooted),
+                                ast.get(pattern).span(),
+                                true,
+                            );
+                            let cur = self.node(
+                                pattern,
+                                sup.apply(&[(Subject::Const(name, rooted), edge)]),
+                            );
+                            let cur = self.list(arm_body, cur);
+                            let covered: HashSet<NodeId> =
+                                main_body.iter().copied().collect();
+                            let rest: Vec<NodeId> =
+                                body.into_iter().filter(|n| !covered.contains(n)).collect();
+                            self.list(&rest, cur)
+                        }
+                        _ => self.node(b, sup.clone()),
+                    };
+                    paths.push(b_sup);
                 }
                 paths.push(self.list(&else_body, sup.clone()));
                 Sup::join(paths, &sup)

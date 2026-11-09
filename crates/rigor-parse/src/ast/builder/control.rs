@@ -282,8 +282,33 @@ impl<'src> Builder<'src> {
             // gate — `Narrowing.case_when_scopes` types it only, so no
             // `OperandEffects.any?` rescues a write inside (rigor-rs#361).
             // Also `blocked`, the Collector's mark for the same position.
+            // `in C => x`: the reference's `bare_class_pattern_node`
+            // unwraps a capture around a constant to the CONSTANT — the
+            // class test `C === subject` — so the capture's value is what
+            // is lowered here (rigor-rs#452 review); the `x` binding still
+            // rides `UnmodeledWrite.names` above. A literal pattern
+            // (`in "s"`, `in nil`, `in 1`) also narrows — by `===` value
+            // match on the pinned subject (rigor-rs#452 review). An
+            // alternation (`in A | B`) narrows nothing the guard can name —
+            // probed: every alternation leaf pair on a String constant still
+            // fires `for "x"` — but lowers normally (a guard or write inside
+            // still lands its nodes); only a parenthesised pattern
+            // (`in (C)`, `ParenthesesNode` on the oracle, never a bare class
+            // pattern) lowers to `Other` so no consumer reads it as the
+            // class test.
             self.dead_operand += 1;
-            let pattern = self.lower_blocked(&in_node.pattern());
+            let prism_pattern = in_node.pattern();
+            let pattern = if prism_pattern.as_parentheses_node().is_some() {
+                self.push(Node::Other {
+                    span: span_of(&prism_pattern.location()),
+                    jump: None,
+                })
+            } else {
+                match in_pattern_edge_source(&prism_pattern) {
+                    Some(source) => self.lower_blocked(&source),
+                    None => self.lower_blocked(&prism_pattern),
+                }
+            };
             self.dead_operand -= 1;
             let mut body = vec![pattern];
             if let Some(s) = in_node.statements() {
@@ -578,4 +603,35 @@ impl<'src> Builder<'src> {
 
         UNMATCHED
     }
+}
+
+/// The ONE node a `case`/`in` arm narrows its subject by — the reference's
+/// `bare_class_pattern_node` (a bare constant, or a capture around one —
+/// `in C`, `in C::D`, `in C => x`) plus a literal pattern (`in "s"`,
+/// `in nil`, `in 1`, `in :s`, `in true`), whose match is `lit === subject`
+/// on the pinned carrier. `None` for everything else — alternations,
+/// parenthesised patterns, destructures, bound names — which the probes
+/// show keep the subject untested (their arm still fires `for "x"`).
+fn in_pattern_edge_source<'p>(pattern: &PrismNode<'p>) -> Option<PrismNode<'p>> {
+    let bare_node = |n: &PrismNode<'p>| {
+        n.as_constant_read_node()
+            .map(|c| c.as_node())
+            .or_else(|| n.as_constant_path_node().map(|c| c.as_node()))
+    };
+    if let Some(c) = bare_node(pattern) {
+        return Some(c);
+    }
+    if let Some(cap) = pattern.as_capture_pattern_node() {
+        let value = cap.value();
+        return bare_node(&value);
+    }
+    pattern
+        .as_string_node()
+        .map(|c| c.as_node())
+        .or_else(|| pattern.as_integer_node().map(|c| c.as_node()))
+        .or_else(|| pattern.as_float_node().map(|c| c.as_node()))
+        .or_else(|| pattern.as_symbol_node().map(|c| c.as_node()))
+        .or_else(|| pattern.as_nil_node().map(|c| c.as_node()))
+        .or_else(|| pattern.as_true_node().map(|c| c.as_node()))
+        .or_else(|| pattern.as_false_node().map(|c| c.as_node()))
 }
