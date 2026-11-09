@@ -130,10 +130,17 @@ impl Walk<'_, '_> {
     }
 
     /// The truthy edge `cond` gives a `case`/`when` or `case`/`in` subject:
-    /// `cond === subject`, where only a `ConstantRead` condition maps to the
-    /// class test (`C === x`); a literal or other expression can't narrow the
-    /// subject the reference's `case_when_scopes` does (rigor-rs#452).
-    fn case_condition_edge(&mut self, cond: NodeId, subject: &Subject, use_span: Span) -> Edge {
+    /// `cond === subject`, where a `ConstantRead` condition maps to the class
+    /// test (`C === x`). An `in` pattern also narrows on a literal
+    /// (`lit === subject`); a `when` literal never does — `when "lit"` on
+    /// `FOO = "x"` still fires `for "x"` (rigor-rs#452 review).
+    fn case_condition_edge(
+        &mut self,
+        cond: NodeId,
+        subject: &Subject,
+        use_span: Span,
+        in_arm: bool,
+    ) -> Edge {
         let ty = match self.const_types.get(subject) {
             Some(&t) => t,
             None => self.interner.untyped(),
@@ -151,6 +158,44 @@ impl Walk<'_, '_> {
                 true,
                 self.interner,
             ),
+            // `when` conditions narrow only on a class constant.
+            _ if !in_arm => Edge::Keep,
+            // A literal `in` pattern narrows by `lit === subject` — only a
+            // pinned constant subject has a decidable value; a Nominal keeps
+            // the arm undecided.
+            Node::NilLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Nil),
+            Node::IntegerLit { value, digits, .. } => {
+                let lit = value
+                    .map(rigor_types::Scalar::Int)
+                    .or_else(|| digits.clone().map(rigor_types::Scalar::BigInt));
+                match lit {
+                    Some(lit) => self.literal_edge(ty, &lit),
+                    None => Edge::Keep,
+                }
+            }
+            Node::FloatLit { value, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Float(*value))
+            }
+            Node::StringLit { value, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Str(value.clone()))
+            }
+            Node::SymbolLit { value, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Sym(value.clone()))
+            }
+            Node::TrueLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Bool(true)),
+            Node::FalseLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Bool(false)),
+            _ => Edge::Keep,
+        }
+    }
+
+    /// `lit === subject` on a pinned scalar — Keep iff the literal is the
+    /// subject's own value (`in "x"` on `FOO = "x"` keeps the carrier and
+    /// the arm's calls still fire `for "x"`); anything else is unreachable.
+    /// A non-Constant carrier declines.
+    fn literal_edge(&self, ty: TypeId, lit: &rigor_types::Scalar) -> Edge {
+        match self.interner.get(ty) {
+            Type::Constant(s) if s == lit => Edge::Keep,
+            Type::Constant(_) => Edge::Empty,
             _ => Edge::Keep,
         }
     }
@@ -349,6 +394,7 @@ impl Walk<'_, '_> {
                                         *c,
                                         &Subject::Const(name.clone(), rooted),
                                         ast.get(*c).span(),
+                                        false,
                                     ),
                                 };
                             }
@@ -377,6 +423,7 @@ impl Walk<'_, '_> {
                                 pattern,
                                 &Subject::Const(name.clone(), rooted),
                                 ast.get(pattern).span(),
+                                true,
                             );
                             let cur = self.node(
                                 pattern,
