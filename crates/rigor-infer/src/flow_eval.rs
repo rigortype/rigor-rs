@@ -2578,23 +2578,61 @@ impl<'i> Typer<'i> {
                         // unions into a decline-side type. Each arm
                         // contributes the LAST write of the name inside its
                         // span, or the entry binding when it wrote nothing.
-                        let arm_write_ty = |this: &Self, body: &[NodeId], name: &str| -> Option<NodeId> {
+                        // The LAST write of `name` in an arm, typed from its
+                        // node kind: a plain `v = e` yields `type_of(e)`, an
+                        // `op=` yields `op_write_result(entry, op, e)` (`v +=
+                        // 2` on `v = 1` is `3`, unioning to `1 | 3` — the
+                        // oracle's own answer), and a `v, w = rhs` yields the
+                        // destructure's bound type for `name` (`"a" | 1` on
+                        // `v, w = "a", "b"` — rigor-rs#443 review).
+                        #[allow(clippy::too_many_arguments)]
+                        fn arm_write_ty(
+                            this: &Typer<'_>,
+                            ast: &LoweredAst,
+                            env: &TypeEnv,
+                            body: &[NodeId],
+                            name: &str,
+                            entry: TypeId,
+                            interner: &mut Interner,
+                        ) -> Option<TypeId> {
                             let idx = this.reach_index(ast);
-                            let mut last: Option<(rigor_parse::Span, NodeId)> = None;
+                            let mut last: Option<(rigor_parse::Span, TypeId)> = None;
+                            let mut consider = |wspan: rigor_parse::Span, ty: TypeId| {
+                                if last.is_none_or(|(ls, _)| ls.0 < wspan.0) {
+                                    last = Some((wspan, ty));
+                                }
+                            };
                             for s in body {
                                 for n in idx.nodes_within(ast, ast.get(*s).span()) {
-                                    if let Node::LocalVariableWrite { name: n2, value, .. } = ast.get(n) {
-                                        if n2 == name {
-                                            let wspan = ast.get(n).span();
-                                            if last.is_none_or(|(ls, _)| ls.0 < wspan.0) {
-                                                last = Some((wspan, *value));
+                                    let wspan = ast.get(n).span();
+                                    match ast.get(n) {
+                                        Node::LocalVariableWrite { name: n2, value, .. }
+                                            if n2 == name =>
+                                        {
+                                            let ty = this.type_of(ast, *value, env, interner);
+                                            consider(wspan, ty);
+                                        }
+                                        Node::LocalVariableOpWrite { name: n2, value, op, .. }
+                                            if n2 == name =>
+                                        {
+                                            let v_ty = this.type_of(ast, *value, env, interner);
+                                            let ty = this.op_write_result(entry, op, v_ty, interner);
+                                            consider(wspan, ty);
+                                        }
+                                        Node::MultiWrite { targets, value, .. } => {
+                                            let rhs = this.type_of(ast, *value, env, interner);
+                                            for (n2, ty) in crate::multi_target_binder::bind(targets, rhs, interner) {
+                                                if n2 == name {
+                                                    consider(wspan, ty);
+                                                }
                                             }
                                         }
+                                        _ => {}
                                     }
                                 }
                             }
-                            last.map(|(_, v)| v)
-                        };
+                            last.map(|(_, ty)| ty)
+                        }
                         let mut seen_names = Vec::new();
                         for (wspan, name) in &live_rebinds {
                             if !(span.0 <= wspan.0 && wspan.1 <= span.1) {
@@ -2609,8 +2647,9 @@ impl<'i> Typer<'i> {
                             } else {
                                 (then_body, else_body)
                             };
-                            let t_write = arm_write_ty(self, truthy_body, name);
-                            let f_write = arm_write_ty(self, falsey_body, name);
+                            let entry_for_write = env.get(name).copied().unwrap_or_else(|| interner.untyped());
+                            let t_write = arm_write_ty(self, ast, env, truthy_body, name, entry_for_write, interner);
+                            let f_write = arm_write_ty(self, ast, env, falsey_body, name, entry_for_write, interner);
                             // A terminating arm contributes the entry type —
                             // its writes never reach the join (rigor-rs#451
                             // review; `dead.write_reaches` above already
@@ -2622,12 +2661,12 @@ impl<'i> Typer<'i> {
                             let entry_ty = env.get(name).copied().unwrap_or(u);
                             let t_ty = match (t_term, t_write) {
                                 (true, _) => entry_ty,
-                                (false, Some(v)) => self.type_of(ast, v, env, interner),
+                                (false, Some(v)) => v,
                                 (false, None) => entry_ty,
                             };
                             let f_ty = match (f_term, f_write) {
                                 (true, _) => entry_ty,
-                                (false, Some(v)) => self.type_of(ast, v, env, interner),
+                                (false, Some(v)) => v,
                                 (false, None) => entry_ty,
                             };
                             let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
