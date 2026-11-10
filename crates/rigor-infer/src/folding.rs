@@ -311,6 +311,8 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ("even?", []) => return Some(Scalar::Bool(a % 2 == 0)),
         ("odd?", []) => return Some(Scalar::Bool(a % 2 != 0)),
         ("zero?", []) => return Some(Scalar::Bool(a == 0)),
+        ("positive?", []) => return Some(Scalar::Bool(a > 0)),
+        ("negative?", []) => return Some(Scalar::Bool(a < 0)),
         // `to_s` with no radix only (a radix arg changes the base — not folded
         // here to keep the core trivially byte-exact with Ruby's decimal form).
         ("to_s", []) => return Some(Scalar::Str(a.to_string())),
@@ -408,6 +410,9 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
     match (method, args) {
         ("+@", []) => return Some(Scalar::Float(a)),
         ("-@", []) => return Some(Scalar::Float(-a)),
+        ("zero?", []) => return Some(Scalar::Bool(a == 0.0)),
+        ("positive?", []) => return Some(Scalar::Bool(a > 0.0)),
+        ("negative?", []) => return Some(Scalar::Bool(a < 0.0)),
         _ => {}
     }
     if method == "abs" && args.is_empty() {

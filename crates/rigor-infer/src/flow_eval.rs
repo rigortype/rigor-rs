@@ -270,7 +270,32 @@ impl<'i> Typer<'i> {
                 } else {
                     // An empty `else` IS an arm that leaves every name at its
                     // entry binding — `if c; a = 1; end` joins `a` with `nil`.
-                    self.join_arm_writes(ast, env, &[(then_body, &[]), (else_body, &[])], interner, returns);
+                    // The predicate also narrows its subject locals per
+                    // edge, and the join keeps the narrowed arm types
+                    // (`if h.empty?; end; h.frob` — `h` is `Dynamic` after,
+                    // not `Array`, rigor-rs#451): a decided predicate —
+                    // `[1].empty?` — is the reference's folded `if`, which
+                    // narrows nothing, so its arm keeps the pin (`h.frob`
+                    // fires `for [1]`).
+                    let binds: [Vec<(String, TypeId)>; 2] = if self
+                        .known_polarity(ast, env, *predicate, interner)
+                        .is_some()
+                    {
+                        [Vec::new(), Vec::new()]
+                    } else {
+                        [
+                            self.predicate_edge_binds(ast, *predicate, env, !*is_unless, interner),
+                            self.predicate_edge_binds(ast, *predicate, env, *is_unless, interner),
+                        ]
+                    };
+                    self.join_arm_writes_bound(
+                        ast,
+                        env,
+                        &[(then_body, &[]), (else_body, &[])],
+                        &binds,
+                        interner,
+                        returns,
+                    );
                 }
             }
             Node::Logical { left, right, .. } if crate::def_local_marks::literal_like(ast, *left) => {
@@ -657,6 +682,54 @@ impl<'i> Typer<'i> {
         self.join_arm_writes_bound(ast, env, arms, &[], interner, returns);
     }
 
+    /// The `(name, type)` bindings a predicate's `edge` gives its subject
+    /// locals — the same edge map `while`/`until` uses
+    /// ([`Typer::subject_edge`]): a subject the edge keeps is absent; every
+    /// other answer (a widened guard member, a dead edge's `Bot` — the port
+    /// has no `non-empty-array` shape to mint, rigor-rs#451) binds
+    /// `Dynamic`, which is never an FP: the oracle's joined arm types never
+    /// leave the pre-`if` nominal either (`if h.empty?; end; h.frob` is
+    /// reference-silent, and `if h.is_a?(Array); else; h.frob`'s
+    /// `non-empty-array[top]` is a shape this port declines instead).
+    fn predicate_edge_binds(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+        env: &TypeEnv,
+        edge: bool,
+        interner: &mut Interner,
+    ) -> Vec<(String, TypeId)> {
+        let mut out = Vec::new();
+        for (subject, _read) in self.subjects_within(ast, pred) {
+            let crate::loop_edges::Subject::Local(name) = &subject else { continue };
+            if out.iter().any(|(n, _)| n == name) {
+                continue;
+            }
+            let ty = env
+                .get(name)
+                .copied()
+                .unwrap_or_else(|| interner.untyped());
+            // An untyped carrier is the guard map's domain — `subject_edge`
+            // only speaks for a resolved one (rigor-rs#451).
+            if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                continue;
+            }
+            let e = self.subject_edge(
+                ast,
+                pred,
+                &subject,
+                ty,
+                edge,
+                false,
+                interner,
+            );
+            if e != crate::loop_edges::Edge::Keep {
+                out.push((name.clone(), interner.untyped()));
+            }
+        }
+        out
+    }
+
     /// [`Self::join_arm_writes`] where arm `i` additionally starts with the
     /// `(name, type)` bindings in `binds[i]` (a `rescue => e` clause binds
     /// `e`; a missing entry binds nothing).
@@ -775,6 +848,7 @@ impl<'i> Typer<'i> {
                     indexed: IndexedFlow::default(),
                     dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
                     loops: Vec::new(),
+                    ifs: Vec::new(),
                 }
             }
         };
@@ -833,6 +907,7 @@ impl<'i> Typer<'i> {
             indexed,
             dead,
             loops: self.collect_loop_edges(ast),
+            ifs: self.collect_if_edges(ast),
         }
     }
 
@@ -883,6 +958,143 @@ impl<'i> Typer<'i> {
             });
         }
         out
+    }
+
+    /// [`CheckFlow::ifs`]: every `if`/`unless` whose predicate reads a
+    /// local, each arm's hull, its innermost `def`, and per local the first
+    /// write after the `if` (a later binding the overlay must not cover).
+    fn collect_if_edges(&self, ast: &LoweredAst) -> Vec<IfEdges> {
+        let writes = collect_flow_writes(ast);
+        let defs = crate::method_body_spans(ast);
+        let closures: Vec<rigor_parse::Span> =
+            ast.iter().filter_map(|(_, n)| crate::loop_edges::closure_extent(n)).collect();
+        let mut out = Vec::new();
+        for (_id, n) in ast.iter() {
+            let Node::If { predicate, span, then_body, else_body, is_unless, .. } = n else {
+                continue;
+            };
+            let (predicate, span, is_unless) = (*predicate, *span, *is_unless);
+            let names: Vec<String> = self
+                .subjects_within(ast, predicate)
+                .into_iter()
+                .filter_map(|(s, _)| match s {
+                    crate::loop_edges::Subject::Local(n) => Some(n),
+                    _ => None,
+                })
+                .collect();
+            if names.is_empty() {
+                continue;
+            }
+            let locals = names
+                .into_iter()
+                .map(|name| {
+                    let next = writes
+                        .iter()
+                        .filter(|(w, n)| *n == name && w.0 >= span.1)
+                        .map(|(w, _)| w.0)
+                        .min();
+                    (name, next)
+                })
+                .collect();
+            let def = defs
+                .iter()
+                .filter(|d| d.0 <= span.0 && span.1 <= d.1)
+                .min_by_key(|d| d.1 - d.0)
+                .copied();
+            let closure = closures
+                .iter()
+                .filter(|c| c.0 <= span.0 && span.1 <= c.1)
+                .min_by_key(|c| c.1 - c.0)
+                .copied();
+            out.push(IfEdges {
+                predicate,
+                span,
+                then_hull: crate::dead::body_hull(ast, then_body),
+                else_hull: crate::dead::body_hull(ast, else_body),
+                is_unless,
+                def,
+                closure,
+                locals,
+            });
+        }
+        out
+    }
+
+    /// [`Typer::loop_edge_overlay`] for `if`/`unless` statements
+    /// (rigor-rs#451): a site AFTER an `if` whose predicate narrows a local
+    /// reads the join of the arms' edge types (`if h.empty?; end; h.frob`
+    /// is reference-silent — `h` is `Dynamic` after, not `Array`), and a
+    /// site INSIDE an arm reads that edge's narrowing. A decided
+    /// predicate — `[1].empty?` — is the reference's folded `if` and
+    /// narrows nothing.
+    fn if_edge_overlay(
+        &self,
+        ast: &LoweredAst,
+        flow: &CheckFlow,
+        site: rigor_parse::Span,
+        env: &mut Cow<'_, TypeEnv>,
+        interner: &mut Interner,
+    ) {
+        for i in &flow.ifs {
+
+            let outside = |c: Option<rigor_parse::Span>| {
+                c.is_some_and(|c| !(c.0 <= site.0 && site.1 <= c.1))
+            };
+            if outside(i.def) || outside(i.closure) {
+                continue;
+            }
+            let edge_in_arm = if i.then_hull.is_some_and(|b| b.0 <= site.0 && site.1 <= b.1) {
+                Some(!i.is_unless)
+            } else if i.else_hull.is_some_and(|b| b.0 <= site.0 && site.1 <= b.1) {
+                Some(i.is_unless)
+            } else {
+                None
+            };
+            let after = edge_in_arm.is_none() && site.0 >= i.span.1;
+            if edge_in_arm.is_none() && !after {
+                continue;
+            }
+            for (name, next) in &i.locals {
+                if next.is_some_and(|w| w < site.0) {
+                    continue;
+                }
+                let Some(&ty) = env.get(name.as_str()) else { continue };
+                if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                    continue;
+                }
+                if self.known_polarity(ast, env, i.predicate, interner).is_some() {
+                    continue;
+                }
+                match edge_in_arm {
+                    Some(edge) => {
+                        let e = self.subject_edge(
+                            ast,
+                            i.predicate,
+                            &crate::loop_edges::Subject::Local(name.clone()),
+                            ty,
+                            edge,
+                            false,
+                            interner,
+                        );
+                        if e != crate::loop_edges::Edge::Keep {
+                            let u = interner.untyped();
+                            env.to_mut().insert(name.clone(), u);
+                            drop_indexed_narrowings(env.to_mut(), name);
+                        }
+                    }
+                    None => {
+                        let t = self.subject_edge(ast, i.predicate, &crate::loop_edges::Subject::Local(name.clone()), ty, !i.is_unless, false, interner);
+                        let f = self.subject_edge(ast, i.predicate, &crate::loop_edges::Subject::Local(name.clone()), ty, i.is_unless, false, interner);
+                        use crate::loop_edges::Edge;
+                        if t == Edge::Other || f == Edge::Other {
+                            let u = interner.untyped();
+                            env.to_mut().insert(name.clone(), u);
+                            drop_indexed_narrowings(env.to_mut(), name);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Upstream #1359 (`eval_loop`'s `loop_pass_entry` /
@@ -989,6 +1201,7 @@ impl<'i> Typer<'i> {
         // `Case` — `apply_subtree_effects` is flat there).
         let mut base = base;
         self.loop_edge_overlay(ast, flow, site, &mut base, interner);
+        self.if_edge_overlay(ast, flow, site, &mut base, interner);
         if let Some(subjects) = flow.dead.subjects_at(site) {
             let mut env = base.into_owned();
             for (name, op) in subjects {
@@ -1040,29 +1253,47 @@ impl<'i> Typer<'i> {
                 predicate,
                 then_body,
                 else_body,
+                is_unless,
                 ..
             } => {
-                let (predicate, then_body, else_body) =
-                    (*predicate, then_body.clone(), else_body.clone());
+                let (predicate, then_body, else_body, is_unless) = (
+                    *predicate,
+                    then_body.clone(),
+                    else_body.clone(),
+                    *is_unless,
+                );
                 let pspan = ast.get(predicate).span();
                 if pspan.0 <= site.0 && site.1 <= pspan.1 {
                     self.entry_descend(ast, predicate, site, uncond, preserve_env, env, flow, interner);
                     return;
                 }
                 self.apply_subtree_effects(ast, predicate, site, uncond, env, flow, interner);
-                let branch: &[NodeId] = if then_body
+                let (branch, edge) = if then_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
                 {
-                    &then_body
+                    (&then_body[..], !is_unless)
                 } else if else_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
                 {
-                    &else_body
+                    (&else_body[..], is_unless)
                 } else {
                     return; // the site is the `if`'s own span, no child holds it
                 };
+                // A site inside the arm reads the predicate's edge-narrowed
+                // locals — `if h.is_a?(Array); else; h.frob` keeps `h`
+                // `Dynamic` inside on the oracle (rigor-rs#451).
+                if self
+                    .known_polarity(ast, env, predicate, interner)
+                    .is_none()
+                {
+                    for (name, ty) in
+                        self.predicate_edge_binds(ast, predicate, env, edge, interner)
+                    {
+                        env.insert(name, ty);
+                    }
+                }
                 // rigor-rs#368 — a folded-dead arm never runs: the site reads
                 // the arm's ENTRY scope (the post-predicate env), so neither
                 // its own earlier writes nor any nested effect replay. The
@@ -3317,6 +3548,53 @@ impl<'i> Typer<'i> {
             // `recv.attr op= v` — a compound ATTRIBUTE write binds no local
             // itself; nested writes in its operands (`h.default ||= (x = 1)`)
             // bind as they did under the recovered carrier (rigor-rs#343).
+            Node::If { predicate, .. } => {
+                // rigor-rs#451 — an `if`/`unless` whose predicate narrows a
+                // local joins the arms' edge types on the reference, so the
+                // post-`if` name is `Dynamic` unless BOTH edges keep the
+                // carrier (`if h.empty?; end; h.frob` is silent there; this
+                // binder's plain answer, `Array`, is the FP). A decided
+                // predicate is the folded `if` the dead-arm machinery owns
+                // — it narrows nothing.
+                if self.known_polarity(ast, env, *predicate, interner).is_none() {
+                    for (subject, _) in self.subjects_within(ast, *predicate) {
+                        let crate::loop_edges::Subject::Local(name) = &subject else {
+                            continue;
+                        };
+                        let ty = env
+                            .get(name)
+                            .copied()
+                            .unwrap_or_else(|| interner.untyped());
+                        if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                            continue;
+                        }
+                        let t = self.subject_edge(
+                            ast,
+                            *predicate,
+                            &subject,
+                            ty,
+                            true,
+                            false,
+                            interner,
+                        );
+                        let f = self.subject_edge(
+                            ast,
+                            *predicate,
+                            &subject,
+                            ty,
+                            false,
+                            false,
+                            interner,
+                        );
+                        if t == crate::loop_edges::Edge::Other
+                            || f == crate::loop_edges::Edge::Other
+                        {
+                            let u = interner.untyped();
+                            env.insert(name.clone(), u);
+                        }
+                    }
+                }
+            }
             Node::AttrWrite {
                 receiver, value, ..
             } => {
@@ -3392,6 +3670,9 @@ pub struct CheckFlow {
     /// Upstream #1359 — every `while`/`until` loop whose predicate reads a
     /// local, with the data [`Typer::loop_edge_overlay`] needs.
     loops: Vec<LoopEdges>,
+    /// Every `if`/`unless` whose predicate reads a local — the per-edge
+    /// narrowing an inside-arm or post-`if` site reads (rigor-rs#451).
+    ifs: Vec<IfEdges>,
 }
 
 /// One `while`/`until` loop for [`Typer::loop_edge_overlay`].
@@ -3406,5 +3687,21 @@ struct LoopEdges {
     /// narrows that closure's scope only.
     closure: Option<rigor_parse::Span>,
     /// `(predicate local, first write of it after the loop)`.
+    locals: Vec<(String, Option<usize>)>,
+}
+
+/// One `if`/`unless` for [`Typer::if_edge_overlay`].
+struct IfEdges {
+    predicate: NodeId,
+    span: rigor_parse::Span,
+    /// `then_body`'s hull / `else_body`'s hull — a site inside one reads its
+    /// edge's narrowed locals.
+    then_hull: Option<rigor_parse::Span>,
+    else_hull: Option<rigor_parse::Span>,
+    is_unless: bool,
+    def: Option<rigor_parse::Span>,
+    closure: Option<rigor_parse::Span>,
+    /// `(predicate local, first write of it inside or after the if)` — a
+    /// later binding the overlay must not cover.
     locals: Vec<(String, Option<usize>)>,
 }
