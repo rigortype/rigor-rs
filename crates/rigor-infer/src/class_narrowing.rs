@@ -1272,7 +1272,7 @@ impl<'i> Typer<'i> {
         // Truthy edge: then-branch for `if`/ternary, else-branch for `unless`.
         let (truthy, falsey) =
             if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
-        let truthy_edge = {
+        let (truthy_edge, truthy_t_env) = {
             let mut t = tenv.clone();
             for (name, ty) in edge_binds(tenv, true, interner) {
                 t.insert(name, ty);
@@ -1286,10 +1286,10 @@ impl<'i> Typer<'i> {
             // position (probe x5). The branch-internal narrowing itself is
             // never position-gated (p4, p8).
             self.class_flow_scope(ast, truthy, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
-            c
+            (c, t)
         };
         let falsey_edge_binds = edge_binds(tenv, false, interner);
-        let falsey_edge = {
+        let (falsey_edge, falsey_t_env) = {
             // 3a-1: the falsey edge is no longer categorically unnarrowed. It
             // carries facts exactly when the predicate SWAPPED one onto it —
             // `!guard` (probes c4d/c4f), an `||` whose disjuncts' falsey maps
@@ -1304,19 +1304,46 @@ impl<'i> Typer<'i> {
             self.apply_guards(&falsey_g, ast, tenv, &mut c, coarse, interner);
             edge_facts(&mut c, &saved_facts, tenv, false, interner);
             self.class_flow_scope(ast, falsey, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
-            c
+            (c, t)
         };
-        // Conservative join: widen every local written inside the conditional
-        // and clear the branch-established facts (a `Narrowed` fact never
-        // survives a branch merge in this slice; an entry `Bot` does, unless an
-        // edge rebound the local) …
-        widen_flow_writes(writes, if_span, tenv, interner);
-        // A terminated arm never reaches the join — read by the subject
-        // join below and by `propagate_widened` (`return if h.is_a?(Array)`
-        // leaves `h` unreachable on `[1, 2]` — oracle-silent, rigor-rs#451
-        // review).
+        // A terminated arm never reaches the join — read by the write and
+        // subject joins below and by `propagate_widened` (`return if
+        // h.is_a?(Array)` leaves `h` unreachable on `[1, 2]` — oracle-silent,
+        // rigor-rs#451 review).
         let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
         let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
+        // Post-`if` TYPE join for the locals the arms wrote: the reference
+        // unions the arm values (`v = nil if p` on `v = nil` keeps `nil`,
+        // and `v.zz` fires `for nil` — rigor-rs#443), so each written name
+        // joins its truthy-edge and falsey-edge env entries; a terminated
+        // arm contributes the ENTRY type (its writes never ran), and a name
+        // absent from one env was never bound on that edge (`untyped`, the
+        // decline) — never the blanket `widen_flow_writes`, which threw the
+        // joined type away. The FACT side stays conservative: a
+        // branch-established `Narrowed` fact never survives a merge below.
+        {
+            let entry = tenv.clone();
+            for (wspan, name) in writes {
+                if !(if_span.0 <= wspan.0 && wspan.1 <= if_span.1) {
+                    continue;
+                }
+                let mut absent = |env: &TypeEnv| {
+                    env.get(name).copied().unwrap_or_else(|| interner.untyped())
+                };
+                let t_ty = if truthy_terminates {
+                    absent(&entry)
+                } else {
+                    absent(&truthy_t_env)
+                };
+                let f_ty = if falsey_terminates {
+                    absent(&entry)
+                } else {
+                    absent(&falsey_t_env)
+                };
+                let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
+                tenv.insert(name.clone(), j);
+            }
+        }
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
         // the propagation's re-seed below (see there for why).
         // S2: the LOCAL twin of the same snapshot. See the re-seed below.

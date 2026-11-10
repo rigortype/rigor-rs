@@ -2570,7 +2570,109 @@ impl<'i> Typer<'i> {
                             })
                             .cloned()
                             .collect();
-                        widen_flow_writes(&live_rebinds, span, env, interner);
+                        // rigor-rs#443 — the post-`if` env JOINS a conditional
+                        // write's value with the entry type, not a blanket
+                        // `Dynamic`: `v = nil if p` on `v = nil` keeps `nil`
+                        // and `v.zz` fires `for nil` on the oracle; a write
+                        // whose value disagrees with the entry (`v = "s"`)
+                        // unions into a decline-side type. Each arm
+                        // contributes the LAST write of the name inside its
+                        // span, or the entry binding when it wrote nothing.
+                        // The LAST write of `name` in an arm, typed from its
+                        // node kind: a plain `v = e` yields `type_of(e)`, an
+                        // `op=` yields `op_write_result(entry, op, e)` (`v +=
+                        // 2` on `v = 1` is `3`, unioning to `1 | 3` — the
+                        // oracle's own answer), and a `v, w = rhs` yields the
+                        // destructure's bound type for `name` (`"a" | 1` on
+                        // `v, w = "a", "b"` — rigor-rs#443 review).
+                        #[allow(clippy::too_many_arguments)]
+                        fn arm_write_ty(
+                            this: &Typer<'_>,
+                            ast: &LoweredAst,
+                            env: &TypeEnv,
+                            body: &[NodeId],
+                            name: &str,
+                            entry: TypeId,
+                            interner: &mut Interner,
+                        ) -> Option<TypeId> {
+                            let idx = this.reach_index(ast);
+                            let mut last: Option<(rigor_parse::Span, TypeId)> = None;
+                            let mut consider = |wspan: rigor_parse::Span, ty: TypeId| {
+                                if last.is_none_or(|(ls, _)| ls.0 < wspan.0) {
+                                    last = Some((wspan, ty));
+                                }
+                            };
+                            for s in body {
+                                for n in idx.nodes_within(ast, ast.get(*s).span()) {
+                                    let wspan = ast.get(n).span();
+                                    match ast.get(n) {
+                                        Node::LocalVariableWrite { name: n2, value, .. }
+                                            if n2 == name =>
+                                        {
+                                            let ty = this.type_of(ast, *value, env, interner);
+                                            consider(wspan, ty);
+                                        }
+                                        Node::LocalVariableOpWrite { name: n2, value, op, .. }
+                                            if n2 == name =>
+                                        {
+                                            let v_ty = this.type_of(ast, *value, env, interner);
+                                            let ty = this.op_write_result(entry, op, v_ty, interner);
+                                            consider(wspan, ty);
+                                        }
+                                        Node::MultiWrite { targets, value, .. } => {
+                                            let rhs = this.type_of(ast, *value, env, interner);
+                                            for (n2, ty) in crate::multi_target_binder::bind(targets, rhs, interner) {
+                                                if n2 == name {
+                                                    consider(wspan, ty);
+                                                }
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                }
+                            }
+                            last.map(|(_, ty)| ty)
+                        }
+                        let mut seen_names = Vec::new();
+                        for (wspan, name) in &live_rebinds {
+                            if !(span.0 <= wspan.0 && wspan.1 <= span.1) {
+                                continue;
+                            }
+                            if seen_names.iter().any(|n| n == name) {
+                                continue;
+                            }
+                            seen_names.push(name.clone());
+                            let (truthy_body, falsey_body) = if *is_unless {
+                                (else_body, then_body)
+                            } else {
+                                (then_body, else_body)
+                            };
+                            let entry_for_write = env.get(name).copied().unwrap_or_else(|| interner.untyped());
+                            let t_write = arm_write_ty(self, ast, env, truthy_body, name, entry_for_write, interner);
+                            let f_write = arm_write_ty(self, ast, env, falsey_body, name, entry_for_write, interner);
+                            // A terminating arm contributes the entry type —
+                            // its writes never reach the join (rigor-rs#451
+                            // review; `dead.write_reaches` above already
+                            // drops the write itself, but a name written in
+                            // BOTH arms needs the terminated edge floored).
+                            let t_term = !truthy_body.is_empty() && crate::class_narrowing::branch_terminates(ast, truthy_body);
+                            let f_term = !falsey_body.is_empty() && crate::class_narrowing::branch_terminates(ast, falsey_body);
+                            let u = interner.untyped();
+                            let entry_ty = env.get(name).copied().unwrap_or(u);
+                            let t_ty = match (t_term, t_write) {
+                                (true, _) => entry_ty,
+                                (false, Some(v)) => v,
+                                (false, None) => entry_ty,
+                            };
+                            let f_ty = match (f_term, f_write) {
+                                (true, _) => entry_ty,
+                                (false, Some(v)) => v,
+                                (false, None) => entry_ty,
+                            };
+                            let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
+                            drop_indexed_narrowings(env, name);
+                            env.insert(name.clone(), j);
+                        }
                         self.drop_indexed_rebinds(&live_rebinds, span, env);
                         self.widen_mutated_locals(
                             ast, &live_mutations, indexed, id, span, env, interner,
