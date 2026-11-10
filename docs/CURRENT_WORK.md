@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-08-10 `if`-edge narrowing: join per-edge narrowed types for predicate subjects** (issue #451 → PR #571) — `Empty` join semantics (`T ∪ Bot`), terminating-arm liveness (`return`/`throw`/`exit`/`abort`/`fail`), `expr_truthiness` on unmodeled predicates, `&.` on nil carriers, `bind_statement`/`if_edge_overlay` widened-on-`Other` only. 4 review rounds; 0 FP. [note](notes/20260810-if-edge-narrowing.md)
 - **2026-11-06 `run_corpus.rb` REMOVED** (PR #495): a first-80-files sample of `fp_audit.py --sweep`; its one unique input, the reference's own trees, measures identically by path (examples 32 files, 0 FP). [PR](https://github.com/rigortype/rigor-rs/pull/495) / [CORPUS.md](../harness/CORPUS.md)
 - **2026-11-05 walk follow-ups** (#483–#488): port-only rows fixed, `pre_eval:` declines; 0 FP / 623. [note](notes/20261105-walk-followups.md)
 - **2026-11-05 re-pin walk → `v0.4.7` DONE** (#445…#481): 0 FP / 623 gaps. Last tag: callee floor, `core_root:`, CLI. [notes](notes/20261105-repin-v047.md)
