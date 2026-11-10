@@ -331,6 +331,23 @@ impl<'i> Typer<'i> {
             Some(_) => Edge::Empty,
             None => Edge::Keep,
         };
+        // …except on a provably-nil safe-nav receiver: `nil&.m` is `nil`,
+        // so an unmodeled `&.` call's truthy edge is dead (`if
+        // foo&.blank?; foo.bad` — oracle-silent, rigor-rs#451 review).
+        let nil_safe_nav = match ast.get(pred) {
+            Node::Call { safe_nav: true, .. } => {
+                matches!(self.nilness(interner, ty), Some(true))
+            }
+            _ => false,
+        };
+        let unknown = if nil_safe_nav {
+            match edge {
+                true => Edge::Empty,
+                false => Edge::Keep,
+            }
+        } else {
+            unknown
+        };
         match ast.get(pred) {
             Node::Statements { body, kind: StatementsKind::Sequence, .. } if body.len() == 1 => {
                 eff(body[0], edge)
@@ -357,11 +374,13 @@ impl<'i> Typer<'i> {
                     (false, false) => seq(eff(l, false), || eff(r, false)),
                 }
             }
-            // `h&.m` narrows exactly like `h.m` here: a decided carrier is
-            // never nil, so `&.` only changes the answer where `nilness`
-            // already declines (`FOO = nil; FOO&.empty?` is the same
-            // uncovered corner as `FOO.empty?`) — rigor-rs#451 review.
-            Node::Call { receiver: Some(r), method, args, block_body, span, .. }
+            // `h&.m` narrows exactly like `h.m` for the ATOMS that already
+            // decide by class/nilness (`nil.is_a?(S)` is false, `nil.nil?`
+            // is true). Where an atom would blindly KEEP on a nil carrier
+            // (`foo&.empty?`, `foo&.blank?`), `nil&.m` evaluates to `nil` —
+            // the truthy edge is dead on the oracle (`foo = nil; if
+            // foo&.empty?; foo.bad` is silent) — rigor-rs#451 review.
+            Node::Call { receiver: Some(r), method, args, block_body, safe_nav: _, span, .. }
                 if block_body.is_empty() =>
             {
                 let (r, span) = (*r, *span);
@@ -380,6 +399,7 @@ impl<'i> Typer<'i> {
                     // firing is a coverage loss, never an FP —
                     // rigor-rs#451).
                     ("empty?", []) if recv_is_subject => atom(match edge {
+                        true if nil_safe_nav => Edge::Empty,
                         true => Edge::Keep,
                         false => Edge::Other,
                     }),

@@ -1311,10 +1311,52 @@ impl<'i> Typer<'i> {
         // survives a branch merge in this slice; an entry `Bot` does, unless an
         // edge rebound the local) …
         widen_flow_writes(writes, if_span, tenv, interner);
+        // A terminated arm never reaches the join — read by the subject
+        // join below and by `propagate_widened` (`return if h.is_a?(Array)`
+        // leaves `h` unreachable on `[1, 2]` — oracle-silent, rigor-rs#451
+        // review).
+        let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
+        let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
+        // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
+        // the propagation's re-seed below (see there for why).
+        // S2: the LOCAL twin of the same snapshot. See the re-seed below.
+        let pre_join = cenv.clone();
+        let (pre_join_chains, pre_join_locals) = (&pre_join.chains, &pre_join.locals);
+        let edges = [truthy_edge, falsey_edge];
+        join_cenv(cenv, &edges);
+        // Join-retention slice: put back every pre-join fact BOTH edges left
+        // untouched. Runs BEFORE the propagation below, so a restored fact is
+        // what the carried guard map MEETS against (the propagation re-reads the
+        // same snapshot for its own targets — idempotent on top of this). Both
+        // branch bodies are always descended here, so the chain edges carry real
+        // evidence and the chain half is enabled — gated on the predicate's own
+        // local mentions (see `locals_in_span`).
+        let predicate_locals = locals_in_span(ast, ast.get(predicate).span());
+        retain_joined_facts(cenv, &pre_join, &edges, writes, if_span, Some(&predicate_locals));
+        // … PLUS the #533 widening, which is the one fact that flows the other
+        // way through the join: `untyped ∪ anything` is `untyped`, so a branch
+        // that widened a local widens it for everything after the `if` (row
+        // b2b). A TERMINATING edge is excluded — the code after the `if` never
+        // runs on it (rows b24/b29/b33, all firing on both engines).
+        let [truthy_edge, falsey_edge] = &edges;
+        propagate_widened(
+            cenv,
+            &[
+                (truthy_edge.clone(), truthy_terminates),
+                (falsey_edge.clone(), falsey_terminates),
+            ],
+            writes,
+            if_span,
+        );
+
         // … and the predicate's subject locals join their edge types: unless
         // BOTH edges keep the carrier, the post-`if` env widens it (`if
         // h.empty?; end; h.frob` is reference-silent). A local the arms
         // themselves rewrote keeps the write join's own answer.
+        //
+        // A terminated arm never reaches the join — for the subject its
+        // edge reads `Empty` (`return if h.is_a?(Array)` leaves `h`
+        // unreachable on `[1, 2]` — oracle-silent, rigor-rs#451 review).
         for name in &predicate_subjects {
             if writes.iter().any(|(ws, n)| n == name && if_span.0 <= ws.0 && ws.1 <= if_span.1) {
                 continue;
@@ -1345,62 +1387,39 @@ impl<'i> Typer<'i> {
                 interner,
             );
             use crate::loop_edges::Edge;
-            // An `Empty` edge cannot carry this subject at all — it
-            // contributes nothing to the join (`if h.is_a?(Hash)` on
-            // `[1, 2]` re-joins the falsey `[1, 2]` alone, firing after);
-            // only a live `Other` widens.
-            let widen = t == Edge::Other || f == Edge::Other;
-            if widen {
-                let u = interner.untyped();
-                tenv.insert(name.clone(), u);
-                cenv.locals.insert(name.clone(), ClassFact::Widened);
-            } else {
-                // `Keep ∪ Empty`: the decided edge contributes nothing —
-                // the subject re-joins on its entry type and its entry
-                // FACT (`[1, 2].is_a?(Array)` keeps `[1, 2]` after).
-                match saved_facts.get(name) {
-                    Some(fact) => {
-                        cenv.locals.insert(name.clone(), fact.clone());
+            let t_live = if truthy_terminates { Edge::Empty } else { t };
+            let f_live = if falsey_terminates { Edge::Empty } else { f };
+            // `T ∪ Bot = T`: an `Empty` edge — decided-away, or a
+            // terminating arm — contributes nothing (`if h.is_a?(Hash)`
+            // on `[1, 2]` re-joins the falsey `[1, 2]` alone, firing
+            // after); only a live `Other` widens, and `Empty ∪ Empty`
+            // makes the subject unreachable.
+            match crate::loop_edges::join(t_live, f_live) {
+                Edge::Other => {
+                    let u = interner.untyped();
+                    tenv.insert(name.clone(), u);
+                    cenv.locals.insert(name.clone(), ClassFact::Widened);
+                }
+                Edge::Keep => {
+                    // `Keep ∪ Empty`: the decided edge contributes
+                    // nothing — the subject re-joins on its entry type
+                    // and its entry FACT (`[1, 2].is_a?(Array)` keeps
+                    // `[1, 2]` after).
+                    match saved_facts.get(name) {
+                        Some(fact) => {
+                            cenv.locals.insert(name.clone(), fact.clone());
+                        }
+                        None => {
+                            cenv.locals.remove(name);
+                        }
                     }
-                    None => {
-                        cenv.locals.remove(name);
-                    }
+                }
+                Edge::Empty => {
+                    cenv.locals.insert(name.clone(), ClassFact::Bot);
                 }
             }
         }
-        // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
-        // the propagation's re-seed below (see there for why).
-        // S2: the LOCAL twin of the same snapshot. See the re-seed below.
-        let pre_join = cenv.clone();
-        let (pre_join_chains, pre_join_locals) = (&pre_join.chains, &pre_join.locals);
-        let edges = [truthy_edge, falsey_edge];
-        join_cenv(cenv, &edges);
-        // Join-retention slice: put back every pre-join fact BOTH edges left
-        // untouched. Runs BEFORE the propagation below, so a restored fact is
-        // what the carried guard map MEETS against (the propagation re-reads the
-        // same snapshot for its own targets — idempotent on top of this). Both
-        // branch bodies are always descended here, so the chain edges carry real
-        // evidence and the chain half is enabled — gated on the predicate's own
-        // local mentions (see `locals_in_span`).
-        let predicate_locals = locals_in_span(ast, ast.get(predicate).span());
-        retain_joined_facts(cenv, &pre_join, &edges, writes, if_span, Some(&predicate_locals));
-        let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
-        let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
-        // … PLUS the #533 widening, which is the one fact that flows the other
-        // way through the join: `untyped ∪ anything` is `untyped`, so a branch
-        // that widened a local widens it for everything after the `if` (row
-        // b2b). A TERMINATING edge is excluded — the code after the `if` never
-        // runs on it (rows b24/b29/b33, all firing on both engines).
-        let [truthy_edge, falsey_edge] = &edges;
-        propagate_widened(
-            cenv,
-            &[
-                (truthy_edge.clone(), truthy_terminates),
-                (falsey_edge.clone(), falsey_terminates),
-            ],
-            writes,
-            if_span,
-        );
+
         // … EXCEPT the early-return propagation (`eval_if:486`/`:495`), which
         // 3a-1 runs in BOTH directions: a terminating FALSEY branch propagates
         // the truthy map (the `return unless guard` idiom a5/c1d), a
