@@ -350,7 +350,11 @@ impl<'i> Typer<'i> {
                     (false, false) => seq(eff(l, false), || eff(r, false)),
                 }
             }
-            Node::Call { receiver: Some(r), method, args, block_body, safe_nav: false, span, .. }
+            // `h&.m` narrows exactly like `h.m` here: a decided carrier is
+            // never nil, so `&.` only changes the answer where `nilness`
+            // already declines (`FOO = nil; FOO&.empty?` is the same
+            // uncovered corner as `FOO.empty?`) — rigor-rs#451 review.
+            Node::Call { receiver: Some(r), method, args, block_body, span, .. }
                 if block_body.is_empty() =>
             {
                 let (r, span) = (*r, *span);
@@ -391,6 +395,21 @@ impl<'i> Typer<'i> {
                         } else {
                             unknown
                         }
+                    }
+                    // `nil == v` / `nil != v` is the asymmetric twin: the
+                    // oracle narrows the subject to its NON-nil shape
+                    // (`non-empty-array[top]` fires inside `if nil == h`
+                    // on `Array.new`), where `v == nil` deads. The port
+                    // declines that mint — `Other`, silent (rigor-rs#451
+                    // review).
+                    ("==" | "!=", [arg])
+                        if subject.is_read(ast, *arg)
+                            && matches!(ast.get(r), Node::NilLit { .. }) =>
+                    {
+                        atom(match self.nilness(interner, ty) {
+                            Some(is_nil) if (is_nil == (method == "==")) == edge => Edge::Keep,
+                            _ => Edge::Other,
+                        })
                     }
                     ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => {
                         // A guard whose class operand is not a constant

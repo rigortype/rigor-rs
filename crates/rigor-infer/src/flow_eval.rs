@@ -3586,8 +3586,8 @@ impl<'i> Typer<'i> {
                             false,
                             interner,
                         );
-                        if t != crate::loop_edges::Edge::Keep
-                            || f != crate::loop_edges::Edge::Keep
+                        if t == crate::loop_edges::Edge::Other
+                            || f == crate::loop_edges::Edge::Other
                         {
                             let u = interner.untyped();
                             env.insert(name.clone(), u);
