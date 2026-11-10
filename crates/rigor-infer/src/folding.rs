@@ -311,6 +311,8 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         ("even?", []) => return Some(Scalar::Bool(a % 2 == 0)),
         ("odd?", []) => return Some(Scalar::Bool(a % 2 != 0)),
         ("zero?", []) => return Some(Scalar::Bool(a == 0)),
+        ("positive?", []) => return Some(Scalar::Bool(a > 0)),
+        ("negative?", []) => return Some(Scalar::Bool(a < 0)),
         // `to_s` with no radix only (a radix arg changes the base — not folded
         // here to keep the core trivially byte-exact with Ruby's decimal form).
         ("to_s", []) => return Some(Scalar::Str(a.to_string())),

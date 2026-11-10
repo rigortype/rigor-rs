@@ -322,8 +322,15 @@ impl<'i> Typer<'i> {
         // fires on the oracle).
         // A predicate this table does not model cannot narrow its subject —
         // `if h.frozen?` keeps `Array` inside AND after on the oracle
-        // (rigor-rs#451) — so a local keeps exactly as a constant does.
-        let unknown = Edge::Keep;
+        // (rigor-rs#451) — so a local keeps exactly as a constant does —
+        // UNLESS the whole predicate folds: `if 5.negative?` deads its arm
+        // on the oracle (`folding` covers `zero?`/`positive?`/`negative?`),
+        // and a `Keep` there would revive a dead arm (rigor-rs#451 review).
+        let unknown = match self.expr_truthiness(ast, pred, &mut Vec::new()) {
+            Some(holds) if holds == edge => Edge::Keep,
+            Some(_) => Edge::Empty,
+            None => Edge::Keep,
+        };
         match ast.get(pred) {
             Node::Statements { body, kind: StatementsKind::Sequence, .. } if body.len() == 1 => {
                 eff(body[0], edge)
