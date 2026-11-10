@@ -2472,7 +2472,11 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
             matches!(kind, JumpKind::Next | JumpKind::Break)
         }
-        Node::Call { receiver: None, method, .. } if method == "raise" => true,
+        Node::Call { receiver: None, method, .. }
+            if matches!(method.as_str(), "raise" | "throw" | "exit" | "abort" | "fail") =>
+        {
+            true
+        }
         Node::BeginRescue { body, ensure_body, clauses, .. }
             if clauses.is_empty() && ensure_body.is_empty() =>
         {

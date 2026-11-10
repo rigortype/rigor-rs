@@ -1047,9 +1047,14 @@ fn class_narrowing_next_break_termination_matrix() {
             format!("def f(v, n)\n  while n > 0\n    next unless {G}\n    {USE}\n  end\nend\n"),
             None,
         ),
-        // `throw` / `exit` / `abort` / `fail` / `redo` all terminate on the
-        // reference; only `raise` is ported (out of this slice).
-        ("p15_throw", blk(&format!("    throw :done unless {G}\n    {USE}")), None),
+        // `throw` / `exit` / `abort` / `fail` terminate on the reference
+        // exactly like `raise` — `stmt_terminates` accepts them all
+        // (rigor-rs#451 review); `redo` remains unmodelled.
+        ("p15_throw", blk(&format!("    throw :done unless {G}\n    {USE}")), Some("String")),
+        // `exit` / `abort` / `fail` / `redo` terminate on the reference
+        // exactly like `raise` and `throw` (probed: `for String` after
+        // each) — `stmt_terminates` accepts them all (rigor-rs#451
+        // review). `redo` remains unmodelled.
         ("p8_redo", blk(&format!("    redo unless {G}\n    {USE}")), None),
         // BOTH branches jumping: the reference propagates the TRUTHY map
         // (`eval_if:495` needs only a present then-branch), we decline —
