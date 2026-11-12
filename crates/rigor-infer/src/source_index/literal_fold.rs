@@ -227,6 +227,21 @@ impl SourceIndex {
         if self.pre_eval_defines_name(&key.1) {
             return None;
         }
+        // rigor-rs#450: a project-`sig/` class whose singleton surface
+        // answers the name types the call from its signature — the
+        // reference's `RbsDispatch` tier sits above the body-inference
+        // tiers, so `def self.one(_x) = nil` under `def self.one: (Integer)
+        // -> String` answers `String`, not the folded `nil`. The same
+        // precedence the instance path already gives a project-sig receiver
+        // (tier 4b's `receiver_method_return` ahead of `method_return`).
+        // `class_has_singleton_method` answers "present" on an incomplete
+        // surface too, so an unresolvable chain declines the fold (silent).
+        if key.2 == DefKind::Singleton
+            && core.is_qualified_project_sig_class(&key.0)
+            && core.class_has_singleton_method(&key.0, &key.1)
+        {
+            return None;
+        }
         if visiting.contains(key) {
             return None; // cycle (recursive method) ⇒ decline, don't memoize.
         }

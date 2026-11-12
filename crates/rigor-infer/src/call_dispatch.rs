@@ -154,6 +154,11 @@ impl<'i> Typer<'i> {
                 if let Some(scalar) = self.source.const_singleton_literal(name, method) {
                     return interner.intern(Type::Constant(scalar));
                 }
+                if let Some(ty) =
+                    self.project_sig_singleton_return(ast, receiver, name, method, interner)
+                {
+                    return ty;
+                }
             }
         }
 
@@ -991,6 +996,62 @@ impl<'i> Typer<'i> {
         }
         Some(class_name)
     }
+
+    /// rigor-rs#450: the project-`sig/` return of a `Const.method` singleton
+    /// call whose receiver constant names a class or module the PROJECT
+    /// declares — the singleton twin of tier 4b's project-sig arm, in the
+    /// same order (signature ahead of the body), as the reference's
+    /// `RbsDispatch` tier sits above its body-inference tiers.
+    ///
+    /// A project-declared constant types `Dynamic` (the C1 shadow gate), so
+    /// the `Singleton` arm below never sees it; this resolves the receiver
+    /// NAME lexically instead (longest enclosing prefix first, as Ruby's
+    /// lookup does) and types only the call's return, never the class
+    /// object. Gated like the instance arm: the qualified name must be a
+    /// project-sig class whose chain the reference can build
+    /// (`project_sig_chain_ok`). A non-bare return (`String?`, a union, a
+    /// generic) is `None` in the flat slot ⇒ decline. A root refinement of
+    /// the name in scope declines too (`refined_class_object_method`).
+    fn project_sig_singleton_return(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        name: &str,
+        method: &str,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let site = ast.get(receiver).span();
+        let owned_scopes;
+        let scopes: &[(rigor_parse::Span, Vec<String>)] = if self.lexical_scopes.is_empty() {
+            owned_scopes = crate::lexical_scopes(ast);
+            &owned_scopes
+        } else {
+            self.lexical_scopes
+        };
+        let prefix: &[String] = scopes
+            .iter()
+            .filter(|(sp, _)| sp.0 <= site.0 && site.1 <= sp.1)
+            .min_by_key(|(sp, _)| sp.1 - sp.0)
+            .map(|(_, p)| p.as_slice())
+            .unwrap_or(&[]);
+        let qualified = self.source.resolve_declared_constant_at(prefix, name)?;
+        if !self.index.is_qualified_project_sig_class(&qualified)
+            || !self.index.project_sig_chain_ok(&qualified)
+            || self.index.is_synthesized_stub(&qualified)
+        {
+            return None;
+        }
+        if self.refined_class_object_method(ast, site, &qualified, method) {
+            return None;
+        }
+        if let Some(shapes) = self.index.receiver_singleton_tuple_return(&qualified, method) {
+            return Some(self.intern_rbs_tuple(&shapes, interner));
+        }
+        let ret = self.index.receiver_singleton_method_return(&qualified, method)?;
+        let class_id = self.index.class_id(ret).or_else(|| self.source.class_id(ret))?;
+        Some(interner.intern(Type::Nominal { class: class_id, args: vec![] }))
+    }
+
     /// Whether a refinement in effect at `site` (a `using M` of a project
     /// module, whose lexical region runs from the call to the end of its
     /// innermost class/module scope — or of the file) defines `method` on a
