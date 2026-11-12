@@ -112,7 +112,9 @@ impl<'i> Typer<'i> {
     ) {
         if let Some(groups) = self.guard_match_edge(ast, id, tenv, interner) {
             record(tenv, &groups, interner);
-        } else if !match_free(ast, id) {
+        } else if proven(tenv) && !match_free(ast, id) {
+            // Only a recorded match has anything to forget, so the scan runs
+            // only while one is.
             forget(tenv);
         }
     }
@@ -131,27 +133,31 @@ impl<'i> Typer<'i> {
         tenv: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<BTreeSet<i64>> {
-        let (predicate, falls_through_truthy) = match ast.get(id) {
+        // The cheap shape test (a regex `=~` / `!~` predicate) runs before
+        // the exit analysis, so a non-guard statement costs a match on its
+        // node kind.
+        match ast.get(id) {
             Node::If { predicate, then_body, else_body, is_unless, .. } => {
-                let mut seen = Vec::new();
-                if else_body.is_empty() && self.arm_exits(ast, then_body, &mut seen) {
-                    (*predicate, *is_unless)
-                } else if then_body.is_empty() && self.arm_exits(ast, else_body, &mut seen) {
-                    (*predicate, !*is_unless)
+                let (exit_arm, falls_through_truthy) = if else_body.is_empty() {
+                    (then_body, *is_unless)
+                } else if then_body.is_empty() {
+                    (else_body, !*is_unless)
                 } else {
                     return None;
-                }
+                };
+                let (match_is_truthy, groups) =
+                    self.regex_match_edge(ast, *predicate, tenv, interner)?;
+                (match_is_truthy == falls_through_truthy
+                    && self.arm_exits(ast, exit_arm, &mut Vec::new()))
+                .then_some(groups)
             }
             Node::Logical { left, right, is_and, .. } => {
-                if !self.stmt_exits(ast, *right, &mut Vec::new()) {
-                    return None;
-                }
-                (*left, !*is_and)
+                let (match_is_truthy, groups) = self.regex_match_edge(ast, *left, tenv, interner)?;
+                (match_is_truthy == !*is_and && self.stmt_exits(ast, *right, &mut Vec::new()))
+                    .then_some(groups)
             }
-            _ => return None,
-        };
-        let (match_is_truthy, groups) = self.regex_match_edge(ast, predicate, tenv, interner)?;
-        (match_is_truthy == falls_through_truthy).then_some(groups)
+            _ => None,
+        }
     }
 
     /// `Narrowing#gated_regex_match_edges`, reduced to what the guard needs:
@@ -282,6 +288,9 @@ fn match_free(ast: &LoweredAst, id: NodeId) -> bool {
             ..
         } => {
             let name = method.as_str();
+            if !block_body.is_empty() || MAY_MATCH_CALLS.contains(&name) {
+                return false;
+            }
             let args_ok = if LOOKUP_CALLS.contains(&name) {
                 let checked = if name == "[]=" {
                     &args[..args.len().saturating_sub(1)]
@@ -294,10 +303,7 @@ fn match_free(ast: &LoweredAst, id: NodeId) -> bool {
             } else {
                 all(args)
             };
-            block_body.is_empty()
-                && !MAY_MATCH_CALLS.contains(&name)
-                && args_ok
-                && receiver.is_none_or(|r| match_free(ast, r))
+            args_ok && receiver.is_none_or(|r| match_free(ast, r))
         }
         _ => false,
     }
