@@ -4699,3 +4699,69 @@ fn issue_473_closure_reads_binding_at_the_closure() {
     assert_eq!(undefined(b"y = 1\nl = -> { y.upcase }\ny = \"s\"\nl.call\n").len(), 1);
     assert!(undefined(b"y = 1\n[1].each { y.upcase; y = \"s\" }\n").is_empty());
 }
+
+// --- call.argument-type-mismatch: `describe(:short)` expected labels (#384) --
+//
+// Each row's message is the live reference's byte-for-byte output (probed
+// with `harness/probe.py --dir` on a project `sig/` holding these methods).
+
+/// The ATM messages for `src` analysed against a project `sig/` holding
+/// `sig` (written to a per-test temp dir; see `run_with_widget_sig`).
+fn atm_messages_with_sig(label: &str, sig: &str, src: &[u8]) -> Vec<String> {
+    let dir = std::env::temp_dir()
+        .join(format!("rigor-rules-atm-sig-{}-{label}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp sig dir");
+    std::fs::write(dir.join("box.rbs"), sig).expect("write sig");
+    let index = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
+    let ast = lower(&parse(src));
+    let refs = [&ast];
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut interner = Interner::new();
+    let msgs = analyze_with_source(&ast, &mut interner, &index, &source)
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_ARGUMENT_TYPE_MISMATCH)
+        .map(|d| d.message)
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    msgs
+}
+
+#[test]
+fn atm_describe_label_flattens_nested_optionals_and_keeps_inner_separators() {
+    let sig = "module MyClass\n  class Sub\n  end\nend\n\
+               type si = String | Integer\n\
+               class Box\n  def initialize: () -> void\n\
+               \x20 def t1: (String | Integer? x) -> void\n\
+               \x20 def t2: ((Integer?)? x) -> void\n\
+               \x20 def t3: (Array[\"a::b\"] x) -> void\n\
+               \x20 def t4: (Array[singleton(::MyClass::Sub)] x) -> void\n\
+               \x20 def t5: (Array[:\"a::b\"] x) -> void\n\
+               \x20 def t6: ((String | Integer)? | Float x) -> void\n\
+               \x20 def t7: (Array[\"::x\"] x) -> void\n\
+               \x20 def t8: (Array[{ a: ::Integer }] x) -> void\n\
+               \x20 def t9: (Array[si?] x) -> void\nend\n";
+    let src = b"class Box\n  def initialize; end\n  def t1(x) = nil\n  def t2(x) = nil\n\
+                \x20 def t3(x) = nil\n  def t4(x) = nil\n  def t5(x) = nil\n  def t6(x) = nil\n\
+                \x20 def t7(x) = nil\n  def t8(x) = nil\n  def t9(x) = nil\nend\n\
+                b = Box.new\nb.t1(:s)\nb.t2(:s)\nb.t3(\"x\")\nb.t4(\"x\")\nb.t5(\"x\")\n\
+                b.t6(:s)\nb.t7(\"x\")\nb.t8(\"x\")\nb.t9(\"x\")\n";
+    let msgs = atm_messages_with_sig("describe384", sig, src);
+    let expected = |m: &str, label: &str, got: &str| {
+        format!("argument type mismatch at parameter `x' of `{m}' on Box: expected {label}, got {got}")
+    };
+    assert_eq!(
+        msgs,
+        vec![
+            expected("t1", "Integer | String | nil", ":s"),
+            expected("t2", "Integer?", ":s"),
+            expected("t3", "Array[\"a::b\"]", "\"x\""),
+            expected("t4", "Array[singleton(MyClass::Sub)]", "\"x\""),
+            expected("t5", "Array[:\"a::b\"]", "\"x\""),
+            expected("t6", "Float | Integer | String | nil", ":s"),
+            expected("t7", "Array[\"::x\"]", "\"x\""),
+            expected("t8", "Array[{ a: Integer }]", "\"x\""),
+            expected("t9", "Array[Integer | String | nil]", "\"x\""),
+        ]
+    );
+}

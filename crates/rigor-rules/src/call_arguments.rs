@@ -274,23 +274,8 @@ fn render_describe(t: &RetainedParamType, index: &CoreIndex, depth: usize) -> St
             if depth >= 8 {
                 return "Dynamic[top]".to_string();
             }
-            match index.resolve_type_alias(name) {
-                Some(rhs) => {
-                    // `expand_alias2(name, args)`: substitute the alias's own
-                    // declared params positionally, then render the expansion.
-                    let expanded = match index.type_alias_params(name) {
-                        Some(params) if !params.is_empty() => {
-                            let subst: Vec<(&'static str, RetainedParamType)> = params
-                                .iter()
-                                .copied()
-                                .zip(args.iter().cloned())
-                                .collect();
-                            rhs.substitute_vars(&subst)
-                        }
-                        _ => rhs.clone(),
-                    };
-                    render_describe(&expanded, index, depth + 1)
-                }
+            match expand_alias(name, args, index) {
+                Some(expanded) => render_describe(&expanded, index, depth + 1),
                 // An unexpandable alias degrades to `untyped` (reference
                 // `translate_alias` returns `Dynamic[Top]` when the expander
                 // misses).
@@ -304,15 +289,14 @@ fn render_describe(t: &RetainedParamType, index: &CoreIndex, depth: usize) -> St
         RetainedParamType::Interface(..) | RetainedParamType::Variable(_) => {
             "Dynamic[top]".to_string()
         }
-        RetainedParamType::Union(members) => union_describe(
-            members
-                .iter()
-                .map(|m| render_describe(m, index, depth))
-                .collect(),
-        ),
-        // `translate_optional` = `union(inner, nil)`.
-        RetainedParamType::Optional(inner) => {
-            union_describe(vec![render_describe(inner, index, depth), "nil".to_string()])
+        // `translate_optional` = `union(inner, nil)`; `Combinator.union`
+        // flattens nested unions, so a member optional / union contributes its
+        // own members (`String | Integer?` ⇒ `Integer | String | nil`,
+        // `(Integer?)?` ⇒ `Integer?`).
+        RetainedParamType::Union(_) | RetainedParamType::Optional(_) => {
+            let mut members = Vec::new();
+            describe_union_members(t, index, depth, &mut members);
+            union_describe(members)
         }
         RetainedParamType::Tuple(members) => format!(
             "[{}]",
@@ -332,10 +316,97 @@ fn render_describe(t: &RetainedParamType, index: &CoreIndex, depth: usize) -> St
             _ if s.starts_with('^') => "Proc".to_string(),
             // Literals / singletons / records describe close to their written
             // form once the `::` roots are gone (`singleton(::String)` ⇒
-            // `singleton(String)`).
-            _ => s.replace("::", ""),
+            // `singleton(String)`); internal separators and quoted literal
+            // text survive (`singleton(::A::B)` ⇒ `singleton(A::B)`,
+            // `"a::b"` stays `"a::b"`).
+            _ => strip_root_colons(s),
         },
     }
+}
+
+/// `expand_alias2(name, args)`: the alias's right-hand side with its own
+/// declared params substituted positionally by `args`; `None` when the
+/// alias does not resolve.
+fn expand_alias(
+    name: &str,
+    args: &[RetainedParamType],
+    index: &CoreIndex,
+) -> Option<RetainedParamType> {
+    let rhs = index.resolve_type_alias(name)?;
+    Some(match index.type_alias_params(name) {
+        Some(params) if !params.is_empty() => {
+            let subst: Vec<(&'static str, RetainedParamType)> =
+                params.iter().copied().zip(args.iter().cloned()).collect();
+            rhs.substitute_vars(&subst)
+        }
+        _ => rhs.clone(),
+    })
+}
+
+/// Collect the described members of a (possibly nested) union, flattening
+/// member unions, optionals and union-valued aliases the way
+/// `Combinator.union` does; any other member contributes its own
+/// `render_describe` string.
+fn describe_union_members(
+    t: &RetainedParamType,
+    index: &CoreIndex,
+    depth: usize,
+    out: &mut Vec<String>,
+) {
+    match t {
+        RetainedParamType::Union(members) => {
+            for m in members {
+                describe_union_members(m, index, depth, out);
+            }
+        }
+        RetainedParamType::Optional(inner) => {
+            describe_union_members(inner, index, depth, out);
+            out.push("nil".to_string());
+        }
+        RetainedParamType::Alias(name, args) if depth < 8 => {
+            match expand_alias(name, args, index) {
+                Some(expanded) => describe_union_members(&expanded, index, depth + 1, out),
+                None => out.push("Dynamic[top]".to_string()),
+            }
+        }
+        _ => out.push(render_describe(t, index, depth)),
+    }
+}
+
+/// Drop every ROOT-position `::` (one not preceded by a name character) from
+/// a written type form, leaving namespace separators (`A::B`) and anything
+/// inside a quoted string / symbol literal untouched.
+fn strip_root_colons(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars().peekable();
+    let mut quote: Option<char> = None;
+    let mut prev: Option<char> = None;
+    while let Some(c) = chars.next() {
+        if let Some(q) = quote {
+            out.push(c);
+            if c == '\\' {
+                if let Some(next) = chars.next() {
+                    out.push(next);
+                }
+            } else if c == q {
+                quote = None;
+            }
+            prev = Some(c);
+            continue;
+        }
+        if c == '"' || c == '\'' {
+            quote = Some(c);
+        } else if c == ':'
+            && chars.peek() == Some(&':')
+            && !prev.is_some_and(|p| p.is_alphanumeric() || p == '_')
+        {
+            chars.next();
+            continue;
+        }
+        out.push(c);
+        prev = Some(c);
+    }
+    out
 }
 
 /// Render a union of already-described member strings the way
