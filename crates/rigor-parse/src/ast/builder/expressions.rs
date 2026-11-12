@@ -202,6 +202,8 @@ impl<'src> Builder<'src> {
 
         if let Some(re) = node.as_regular_expression_node() {
             return self.push(Node::RegexpLit {
+                source: String::from_utf8_lossy(re.unescaped()).into_owned(),
+                extended: re.is_extended(),
                 span: span_of(&re.location()),
             });
         }
