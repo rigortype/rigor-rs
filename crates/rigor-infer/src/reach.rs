@@ -1773,7 +1773,7 @@ pub(crate) fn has_non_local_target(targets: &rigor_parse::MultiTargets) -> bool 
 }
 
 /// The class/module body an ivar or cvar read belongs to, resolved once per
-/// read span by [`ReachIndex::class_ivar_scope`](crate::reach_index::ReachIndex::class_ivar_scope).
+/// class region by [`ReachIndex::class_ivar_scope`](crate::reach_index::ReachIndex::class_ivar_scope).
 pub(crate) struct IvarScope {
     /// The innermost enclosing `ClassDef`/`ModuleDef` span, or the whole file.
     pub(crate) region: rigor_parse::Span,
