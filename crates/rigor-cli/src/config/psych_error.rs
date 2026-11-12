@@ -16,8 +16,6 @@
 use std::ffi::CStr;
 use std::mem::MaybeUninit;
 
-use unsafe_libyaml as sys;
-
 /// `Psych::SyntaxError`'s `line`, `column`, `problem`, `context`.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct SyntaxError {
@@ -36,7 +34,7 @@ pub(super) struct SyntaxError {
 pub(super) fn first_document_error(text: &str) -> Option<SyntaxError> {
     // Boxed: `yaml_parser_set_input_string` stores a pointer to the parser in
     // the parser itself (`read_handler_data`), so it must not move.
-    let mut parser = Box::new(MaybeUninit::<sys::yaml_parser_t>::uninit());
+    let mut parser = Box::new(MaybeUninit::<unsafe_libyaml::yaml_parser_t>::uninit());
     // SAFETY: mirrors serde_yaml's `libyaml::parser::Parser::new`/`next`: the
     // parser is initialized before use and deleted exactly once, `text`
     // outlives it, each event is deleted after it is read, and the error
@@ -44,19 +42,19 @@ pub(super) fn first_document_error(text: &str) -> Option<SyntaxError> {
     // delete.
     unsafe {
         let parser = parser.as_mut_ptr();
-        if sys::yaml_parser_initialize(parser).fail {
+        if unsafe_libyaml::yaml_parser_initialize(parser).fail {
             return None;
         }
-        sys::yaml_parser_set_encoding(parser, sys::YAML_UTF8_ENCODING);
-        sys::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
+        unsafe_libyaml::yaml_parser_set_encoding(parser, unsafe_libyaml::YAML_UTF8_ENCODING);
+        unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
         let mut out = None;
         loop {
-            let mut event = MaybeUninit::<sys::yaml_event_t>::uninit();
-            if sys::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
+            let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
+            if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
                 // The error fields are public only through `Deref`, so read
                 // them via a shared borrow (no `&mut` to the parser is live).
                 let p = &*parser;
-                if p.error != sys::YAML_MEMORY_ERROR {
+                if p.error != unsafe_libyaml::YAML_MEMORY_ERROR {
                     out = Some(SyntaxError {
                         line: p.context_mark.line as usize + 1,
                         column: p.context_mark.column as usize + 1,
@@ -67,12 +65,14 @@ pub(super) fn first_document_error(text: &str) -> Option<SyntaxError> {
                 break;
             }
             let kind = (*event.as_ptr()).type_;
-            sys::yaml_event_delete(event.as_mut_ptr());
-            if kind == sys::YAML_DOCUMENT_END_EVENT || kind == sys::YAML_STREAM_END_EVENT {
+            unsafe_libyaml::yaml_event_delete(event.as_mut_ptr());
+            if kind == unsafe_libyaml::YAML_DOCUMENT_END_EVENT
+                || kind == unsafe_libyaml::YAML_STREAM_END_EVENT
+            {
                 break;
             }
         }
-        sys::yaml_parser_delete(parser);
+        unsafe_libyaml::yaml_parser_delete(parser);
         out
     }
 }
