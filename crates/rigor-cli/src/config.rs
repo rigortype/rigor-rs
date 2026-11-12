@@ -38,6 +38,8 @@ use std::path::Path;
 use rigor_rules::SuppressSet;
 use serde::Deserialize;
 
+mod psych_error;
+
 /// The parsed `.rigor.yml`. Unknown keys are ignored (no `deny_unknown_fields`),
 /// and every field defaults so a partial or empty file is valid.
 ///
@@ -1900,14 +1902,14 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
             });
         }
     };
-    let value = parse_yaml(&text).map_err(|e| {
+    // `File.open(path, 'r:bom|utf-8')` drops a leading UTF-8 BOM before
+    // libyaml sees the text; serde_yaml forces UTF-8 on libyaml, which then
+    // reads U+FEFF as content (a column, and `\u{feff}...` a scalar).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let value = parse_yaml(text).map_err(|e| {
         // Re-render as upstream's `#{absolute}:#{e.line}:#{e.column}: not
-        // valid YAML: #{e.problem} #{e.context}` (exit 64). serde_yaml's
-        // Display is `{problem} at line {pl} column {pc}, {context} at line
-        // {cl} column {cc}` (context optional); Psych's `e.line`/`e.column`
-        // name the CONTEXT position — the LAST `at line` — and the detail is
-        // `problem` + ` ` + `context` with no position text at all.
-        let (line, column, detail) = psych_render(&e.to_string());
+        // valid YAML: #{[e.problem, e.context].compact.join(" ")}` (exit 64).
+        let (line, column, detail) = psych_render(text, &e.to_string());
         LoadFailure {
             message: format!("{}:{line}:{column}: not valid YAML: {detail}", absolute.display()),
             code: 64,
@@ -3080,6 +3082,36 @@ fn validate_config_values(merged: &serde_yaml::Mapping) -> Result<(), LoadFailur
     Ok(())
 }
 
+/// The `(line, column, detail)` of the `Psych::SyntaxError` the reference
+/// raises for `text`, which serde_yaml rejected with `serde_display`.
+///
+/// The libyaml error itself ([`psych_error::first_document_error`]) is the
+/// source: Psych's position is libyaml's `context_mark + 1` and its detail
+/// `[problem, context].compact.join(" ")` ([`psych_detail`]). Only when
+/// libyaml parses the first document cleanly (serde_yaml's own errors, e.g.
+/// its recursion limit) does this fall back to [`psych_render_display`].
+fn psych_render(text: &str, serde_display: &str) -> (usize, usize, String) {
+    match psych_error::first_document_error(text) {
+        Some(e) => (e.line, e.column, psych_detail(&e.problem, e.context.as_deref())),
+        None => psych_render_display(serde_display),
+    }
+}
+
+/// `[e.problem, e.context].compact.join(" ")`, with libyaml 0.2.5's own
+/// spelling: its scanner says `hexdecimal` (sic) for a bad `\x`/`\u`/`\U`
+/// escape, which unsafe-libyaml corrects to `hexadecimal`. That is the only
+/// message the two libyamls word differently.
+fn psych_detail(problem: &str, context: Option<&str>) -> String {
+    let problem = match problem {
+        "did not find expected hexadecimal number" => "did not find expected hexdecimal number",
+        p => p,
+    };
+    match context {
+        Some(context) => format!("{problem} {context}"),
+        None => problem.to_string(),
+    }
+}
+
 /// Split a serde_yaml error Display into Psych's `(line, column,
 /// "problem context")` pieces: the header position is the LAST embedded
 /// ` at line L column C` (the context anchor — where the construct started,
@@ -3087,7 +3119,12 @@ fn validate_config_values(merged: &serde_yaml::Mapping) -> Result<(), LoadFailur
 /// `problem` + ` ` + `context` — the position fragments removed and serde's
 /// `", "` separator between them replaced by a space. A message with no
 /// position text keeps `(0, 0)` and itself as the detail.
-fn psych_render(detail: &str) -> (usize, usize, String) {
+///
+/// Only reached for an error serde_yaml raises above libyaml (no libyaml
+/// error, so no Psych counterpart): the Display hides zero marks and a
+/// context mark equal to the problem mark, so for libyaml's own errors the
+/// position this recovers can be wrong (#349).
+fn psych_render_display(detail: &str) -> (usize, usize, String) {
     // Each ` at line <n> column <m>` marker as (start, end, line, column).
     let mut marks: Vec<(usize, usize, usize, usize)> = Vec::new();
     let mut search = 0usize;
@@ -4412,6 +4449,88 @@ mod severity_config_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    /// Issue #349 — `psych_render` reads libyaml's own error, as Psych's
+    /// `make_exception` does: the position is `context_mark + 1` even where
+    /// serde_yaml's Display hides that mark (zero, or equal to the problem
+    /// mark, or no context at all), the detail is `problem context` joined by
+    /// a space, and libyaml 0.2.5's `hexdecimal` spelling is kept. Every row
+    /// is the oracle's output (pin f7595e289, Psych 5.3.1 / libyaml 0.2.5).
+    #[test]
+    fn psych_render_reads_libyaml_marks() {
+        for (yaml, line, column, detail) in [
+            // Both marks zero: serde shows no position and a `, ` join.
+            ("...\n", 1, 1, "did not find expected node content while parsing a block node"),
+            ("!x!y a\n", 1, 1, "found undefined tag handle while parsing a node"),
+            // Context mark zero, problem mark not: serde shows only `2:1`.
+            ("[a\n", 1, 1, "did not find expected ',' or ']' while parsing a flow sequence"),
+            // Positioned context on a later line.
+            (
+                "x: 1\ny: 2\nz: [a, b\n",
+                3,
+                4,
+                "did not find expected ',' or ']' while parsing a flow sequence",
+            ),
+            // Parser error without a context: Psych's zeroed context mark.
+            ("%YAML 1.1\n%YAML 1.1\n--- a\n", 1, 1, "found duplicate %YAML directive"),
+            // Reader error: no marks, serde appends `at position N`.
+            ("a: \"\u{1}\"\n", 1, 1, "control characters are not allowed"),
+            // libyaml 0.2.5's misspelling, for `\x` and `\u` alike.
+            (
+                "a: \"\\xZZ\"\n",
+                1,
+                4,
+                "did not find expected hexdecimal number while parsing a quoted scalar",
+            ),
+            (
+                "a: \"\\uZZZZ\"\n",
+                1,
+                4,
+                "did not find expected hexdecimal number while parsing a quoted scalar",
+            ),
+            // Tab-indented mapping entries.
+            (
+                "a:\n\tb: 1\n",
+                2,
+                1,
+                "found character that cannot start any token while scanning for the next token",
+            ),
+            (
+                "a:\n  b: 1\n\tc: 2\n",
+                2,
+                6,
+                "found a tab character that violates indentation while scanning a plain scalar",
+            ),
+            // Scanner error whose context mark equals the problem mark.
+            ("a: b: c\n", 1, 5, "mapping values are not allowed in this context"),
+        ] {
+            let e = parse_yaml(yaml).expect_err(yaml);
+            assert_eq!(
+                psych_render(yaml, &e.to_string()),
+                (line, column, detail.to_string()),
+                "{yaml:?}"
+            );
+        }
+        // A document libyaml parses: the first document only, as Psych.
+        assert_eq!(psych_error::first_document_error("a: 1\n"), None);
+        assert_eq!(psych_error::first_document_error("a: 1\n--- [\n"), None);
+    }
+
+    /// The serde-Display fallback still joins problem and context with a
+    /// space, for each of serde_yaml's position shapes.
+    #[test]
+    fn psych_render_display_joins_with_a_space() {
+        assert_eq!(
+            psych_render_display("p at line 2 column 3, ctx at line 1 column 4"),
+            (1, 4, "p ctx".to_string())
+        );
+        assert_eq!(psych_render_display("p at line 2 column 3, ctx"), (2, 3, "p ctx".to_string()));
+        assert_eq!(psych_render_display("p at line 2 column 3"), (2, 3, "p".to_string()));
+        assert_eq!(
+            psych_render_display("recursion limit exceeded"),
+            (0, 0, "recursion limit exceeded".to_string())
+        );
+    }
+
     /// Psych's `safe_load_file` folds a repeated mapping key LAST-WINS at
     /// every level — serde_yaml's `Value` rejects it (`duplicate entry with
     /// key`), so the load goes through the pairwise [`DupOk`] collector.
@@ -4608,6 +4727,29 @@ mod severity_config_tests {
         std::fs::write(dir.join("bom.yml"), b"\xef\xbb\xbfpaths: [src]\n").unwrap();
         let cfg = parsed(&dir.join("bom.yml"));
         assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
+        // ... and is not a column: `r:bom|utf-8` strips it before libyaml
+        // (oracle: `<BOM>[a` → `1:1`, `<BOM>...` → the `...` parse error).
+        for (bytes, want) in [
+            (
+                &b"\xef\xbb\xbf[a\n"[..],
+                ":1:1: not valid YAML: did not find expected ',' or ']' \
+                 while parsing a flow sequence",
+            ),
+            (
+                &b"\xef\xbb\xbf...\n"[..],
+                ":1:1: not valid YAML: did not find expected node content \
+                 while parsing a block node",
+            ),
+        ] {
+            std::fs::write(dir.join("bom.yml"), bytes).unwrap();
+            match Config::read(&dir.join("bom.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 64);
+                    assert!(f.message.ends_with(want), "{bytes:?} → {:?}", f.message);
+                }
+                _ => panic!("{bytes:?} must be a fatal parse error"),
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 
