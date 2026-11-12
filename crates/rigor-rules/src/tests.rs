@@ -3073,6 +3073,34 @@ module A\n  class T\n    def self.one(_x) = nil\n  end\n  T.one(1).zork\nend\nT.
     );
 }
 
+#[test]
+fn project_sig_singleton_nilable_return_declines() {
+    // `-> String?` is not `String`: the reference (and master) stay silent
+    // on `T.nn("a").zork` and on a local holding it — the instance arm's
+    // `method_return_nilable` decline. Same for `instance?`, an alias, an
+    // inherited nilable, and the qualified `A::T` spelling (the `Singleton`
+    // arm). The bare `String` / `instance` twins still witness.
+    let rbs = "class T\n  def self.nn: (String) -> String?\n  def self.bare: (String) -> String\n\
+  def self.find: () -> instance?\n  alias self.nn2 self.nn\nend\nclass S < T\nend\n\
+module A\n  class T\n    def self.an: () -> String?\n  end\nend\n";
+    let src = b"class T\n  def self.nn(k) = ENV[k]\n  def self.bare(k) = nil\n  def self.find = nil\nend\n\
+class S < T\nend\nmodule A\n  class T\n    def self.an = nil\n  end\nend\n\
+T.nn(\"a\").zork\nv = T.nn(\"a\")\nv.present?\nT.find.zork\nT.nn2(\"a\").zork\nS.nn(\"a\").zork\n\
+A::T.an.zork\nT.bare(\"a\").zork\n";
+    assert_eq!(run_with_sig("nilable", rbs, src), vec![(20, Some("String".into()))]);
+}
+
+#[test]
+fn project_sig_singleton_receiver_anchoring() {
+    // `::T` re-anchors at the top level (Integer, not `A::T`'s String);
+    // `self::T` and `k::T` have no lexical answer ⇒ decline.
+    let rbs = "class T\n  def self.one: (Integer) -> Integer\nend\n\
+module A\n  class T\n    def self.one: (Integer) -> String\n  end\nend\n";
+    let src = b"class T\n  def self.one(x) = nil\nend\nmodule A\n  class T\n    def self.one(x) = nil\n  end\n\
+  ::T.one(1).abs\n  ::T.one(1).zork\n  self::T.one(1).zork\nend\ndef f(k) = k::T.one(1).zork\n";
+    assert_eq!(run_with_sig("anchoring", rbs, src), vec![(9, Some("Integer".into()))]);
+}
+
 // -----------------------------------------------------------------------
 // flow.duplicate-hash-key (v0.3.0)
 // -----------------------------------------------------------------------

@@ -333,22 +333,10 @@ impl<'i> Typer<'i> {
                 if self.index.is_qualified_project_sig_class(class_name)
                     && self.index.project_sig_chain_ok(class_name)
                 {
-                    if let Some(shapes) =
-                        self.index.receiver_singleton_tuple_return(class_name, method)
+                    if let Some(ty) =
+                        self.project_sig_singleton_answer(class_name, method, interner)
                     {
-                        return self.intern_rbs_tuple(&shapes, interner);
-                    }
-                    if let Some(ret) =
-                        self.index.receiver_singleton_method_return(class_name, method)
-                    {
-                        if let Some(class_id) = self
-                            .index
-                            .class_id(ret)
-                            .or_else(|| self.source.class_id(ret))
-                        {
-                            return interner
-                                .intern(Type::Nominal { class: class_id, args: vec![] });
-                        }
+                        return ty;
                     }
                 }
                 // A TUPLE return (`Process.wait2 : [Integer, Process::Status]`)
@@ -1010,10 +998,12 @@ impl<'i> Typer<'i> {
     /// the `Singleton` arm below never sees it; this resolves the receiver
     /// NAME lexically instead (longest enclosing prefix first, as Ruby's
     /// lookup does) and types only the call's return, never the class
-    /// object. Gated like the instance arm: the qualified name must be a
-    /// project-sig class whose chain the reference can build
-    /// (`project_sig_chain_ok`). A non-bare return (`String?`, a union, a
-    /// generic) is `None` in the flat slot ⇒ decline. A root refinement of
+    /// object. A `::T` receiver resolves at the top level; `expr::T` and
+    /// `self::T` decline (no lexical answer). Gated like the instance arm:
+    /// the qualified name must be a project-sig class whose chain the
+    /// reference can build (`project_sig_chain_ok`). The return comes from
+    /// [`Self::project_sig_singleton_answer`] (a nilable return ⇒ `Dynamic`;
+    /// a union is `None` in the flat slot ⇒ decline). A root refinement of
     /// the name in scope declines too (`refined_class_object_method`).
     fn project_sig_singleton_return(
         &self,
@@ -1023,9 +1013,16 @@ impl<'i> Typer<'i> {
         method: &str,
         interner: &mut Interner,
     ) -> Option<TypeId> {
+        let Node::ConstantRead { dynamic_base, self_anchored, rooted, .. } = ast.get(receiver) else {
+            return None;
+        };
+        if *dynamic_base || *self_anchored {
+            return None;
+        }
         let site = ast.get(receiver).span();
         let prefix = self.enclosing_prefix_in(ast, site);
-        let qualified = self.source.resolve_declared_constant_at(&prefix, name)?;
+        let raw = if *rooted { format!("::{name}") } else { name.to_string() };
+        let qualified = self.source.resolve_declared_constant_at(&prefix, &raw)?;
         if !self.index.is_qualified_project_sig_class(&qualified)
             || !self.index.project_sig_chain_ok(&qualified)
             || self.index.is_synthesized_stub(&qualified)
@@ -1035,10 +1032,30 @@ impl<'i> Typer<'i> {
         if self.refined_class_object_method(ast, site, &qualified, method) {
             return None;
         }
-        if let Some(shapes) = self.index.receiver_singleton_tuple_return(&qualified, method) {
+        self.project_sig_singleton_answer(&qualified, method, interner)
+    }
+
+    /// The project-`sig/` answer for `qualified.method`, shared by the
+    /// `Singleton` arm (issue #168) and [`Self::project_sig_singleton_return`]
+    /// once each has gated the receiver: a tuple return, else the flat
+    /// bare class. A NILABLE return (`String?`, `instance?`) answers
+    /// `Dynamic` — the instance arm's `method_return_nilable` decline; the
+    /// flat slot alone would answer the non-nil class (rigor-rs#450). `None`
+    /// when the signature names no return the index can mint.
+    fn project_sig_singleton_answer(
+        &self,
+        qualified: &str,
+        method: &str,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        if let Some(shapes) = self.index.receiver_singleton_tuple_return(qualified, method) {
             return Some(self.intern_rbs_tuple(&shapes, interner));
         }
-        let ret = self.index.receiver_singleton_method_return(&qualified, method)?;
+        let (ret, nilable) =
+            self.index.receiver_singleton_method_return_nilable(qualified, method)?;
+        if nilable {
+            return Some(interner.untyped());
+        }
         let class_id = self.index.class_id(ret).or_else(|| self.source.class_id(ret))?;
         Some(interner.intern(Type::Nominal { class: class_id, args: vec![] }))
     }
