@@ -594,6 +594,26 @@ fn p2_regexp_last_match_declines() {
     );
 }
 
+/// rigor-rs#449: an early-exit guard that proves a `=~` match leaves
+/// `Regexp.last_match(N)` non-nil for an unconditional group N, as the
+/// reference's narrowed `$N` does (`RegexpFolding.fold_last_match_group`).
+/// An optional group stays `String?` on a successful match, so it still
+/// fires; so does a later `=~` that rebinds `$~`.
+#[test]
+fn issue_449_last_match_after_early_exit_guard() {
+    let guarded = b"def a(line)\n  return unless line =~ /(\\w+)/\n  k = Regexp.last_match(1)\n  k.upcase\nend\n";
+    assert_eq!(last_match_use_arm(guarded, "k", "upcase"), None);
+    let not_match = b"def a(line)\n  return if line !~ /(\\w+)/\n  k = Regexp.last_match(1)\n  k.upcase\nend\n";
+    assert_eq!(last_match_use_arm(not_match, "k", "upcase"), None);
+    let optional = b"def a(line)\n  return unless line =~ /(\\w+)?/\n  k = Regexp.last_match(1)\n  k.upcase\nend\n";
+    assert_eq!(last_match_use_arm(optional, "k", "upcase"), Some("String"));
+    let rebound = b"def a(line)\n  return unless line =~ /(\\w+)/\n  line =~ /x(\\d+)/\n  k = Regexp.last_match(1)\n  k.upcase\nend\n";
+    assert_eq!(last_match_use_arm(rebound, "k", "upcase"), Some("String"));
+    // The no-match edge falls through `return if line =~ re`.
+    let no_match = b"def a(line)\n  return if line =~ /(\\w+)/\n  k = Regexp.last_match(1)\n  k.upcase\nend\n";
+    assert_eq!(last_match_use_arm(no_match, "k", "upcase"), Some("String"));
+}
+
 /// A same-named block parameter must NOT inherit an outer nilable fact — the
 /// fresh-per-block `nenv` makes the shadowing FP class structurally impossible.
 #[test]

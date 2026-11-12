@@ -39,17 +39,24 @@ fn group_key(n: i64) -> String {
     format!("\u{1f}${n}")
 }
 
-/// `MatchRebinding::ALWAYS_MATCHING` ∪ `REGEXP_ARGUMENT` (`match_rebinding.rb`),
+/// `MatchRebinding::Calls::ALWAYS_MATCHING` (`match_rebinding/calls.rb`),
 /// plus the calls that run code by name or run a block parameter. A call
 /// with one of these names may rebind the frame's `$~`, so the walker forgets
-/// the match after it. The reference forgets on a subset of these; the rest
-/// only cost coverage.
+/// the match after it. The reference forgets on a subset of the extra names;
+/// the rest only cost coverage.
 const MAY_MATCH_CALLS: &[&str] = &[
-    "=~", "!~", "match", "sub", "sub!", "gsub", "gsub!", "scan", "[]", "slice", "slice!",
-    "index", "rindex", "partition", "rpartition", "split", "grep", "grep_v", "start_with?",
-    "byteindex", "byterindex", "any?", "all?", "none?", "one?", "===", "[]=", "call",
-    "yield", "send", "public_send", "__send__", "eval", "instance_eval", "instance_exec",
-    "class_eval", "module_eval", "class_exec", "module_exec", "binding", "method",
+    "=~", "!~", "match", "sub", "sub!", "gsub", "gsub!", "scan", "~", "===", "call", "yield",
+    "send", "public_send", "__send__", "eval", "instance_eval", "instance_exec", "class_eval",
+    "module_eval", "class_exec", "module_exec", "binding", "method",
+];
+
+/// `Calls::LOOKUPS` (and `[]=`, read by its index): these rebind `$~` only
+/// with a Regexp argument, so they keep the match when every argument is a
+/// non-Regexp literal (`Calls.forgets_by_name?`). `split` with no separator
+/// splits on `$;`, which may hold a Regexp, so it forgets.
+const LOOKUP_CALLS: &[&str] = &[
+    "[]", "slice", "slice!", "index", "rindex", "byteindex", "byterindex", "partition",
+    "rpartition", "split", "start_with?", "any?", "all?", "none?", "one?", "[]=",
 ];
 
 /// Drop the recorded match: `Scope#forget_match_globals`.
@@ -224,10 +231,14 @@ impl<'i> Typer<'i> {
     }
 
     /// `id` cannot run a regex match in this frame: it is built only from
-    /// local reads and writes, literals, constant reads and block-less calls
-    /// whose name is not in [`MAY_MATCH_CALLS`]. Anything else answers
-    /// `false` (forget), the pre-#449 behaviour.
+    /// local reads and writes, literals, constant reads, own-frame bodies
+    /// (`def`, `class`, `module`), `if`s and `&&`/`||` over such parts, and
+    /// block-less calls that `Calls.forgets_by_name?` clears: a name outside
+    /// [`MAY_MATCH_CALLS`], and a [`LOOKUP_CALLS`] name only on non-Regexp
+    /// literal arguments. Anything else answers `false` (forget), the
+    /// pre-#449 behaviour.
     fn match_free(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        let all = |ids: &[NodeId]| ids.iter().all(|&i| self.match_free(ast, i));
         match ast.get(id) {
             Node::LocalVariableRead { .. }
             | Node::VariableRead { .. }
@@ -243,13 +254,23 @@ impl<'i> Typer<'i> {
             | Node::TrueLit { .. }
             | Node::FalseLit { .. }
             | Node::RegexpLit { .. } => true,
+            // `MatchRebinding::OWN_FRAME_NODES`: the body runs in a frame of
+            // its own.
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => true,
             Node::LocalVariableWrite { value, .. } => self.match_free(ast, *value),
+            // An exit leaves the fall-through unchanged.
+            Node::Return { values, .. } => all(values),
+            Node::Other { jump: Some(_), .. } => true,
             Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
-                parts.iter().all(|&p| self.match_free(ast, p))
+                all(parts)
             }
-            Node::ArrayLit { elements, .. } => elements.iter().all(|&e| self.match_free(ast, e)),
-            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
-                body.iter().all(|&s| self.match_free(ast, s))
+            Node::ArrayLit { elements, .. } => all(elements),
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => all(body),
+            Node::If { predicate, then_body, else_body, .. } => {
+                self.match_free(ast, *predicate) && all(then_body) && all(else_body)
+            }
+            Node::Logical { left, right, .. } => {
+                self.match_free(ast, *left) && self.match_free(ast, *right)
             }
             Node::Call {
                 receiver,
@@ -259,14 +280,41 @@ impl<'i> Typer<'i> {
                 block_span: None,
                 ..
             } => {
+                let name = method.as_str();
+                let args_ok = if LOOKUP_CALLS.contains(&name) {
+                    let checked = if name == "[]=" {
+                        &args[..args.len().saturating_sub(1)]
+                    } else {
+                        &args[..]
+                    };
+                    !(name == "split" && args.is_empty())
+                        && checked.iter().all(|&a| non_regexp_literal(ast.get(a)))
+                        && all(args)
+                } else {
+                    all(args)
+                };
                 block_body.is_empty()
-                    && !MAY_MATCH_CALLS.contains(&method.as_str())
+                    && !MAY_MATCH_CALLS.contains(&name)
+                    && args_ok
                     && receiver.is_none_or(|r| self.match_free(ast, r))
-                    && args.iter().all(|&a| self.match_free(ast, a))
             }
             _ => false,
         }
     }
+}
+
+/// `Operands.keep_literal?`, narrowed: a literal that is not a Regexp.
+fn non_regexp_literal(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::StringLit { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::NilLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. }
+    )
 }
 
 /// A parenthesised single expression `(P)` is `P`.
@@ -413,4 +461,30 @@ fn skip_char_class(src: &[char], start: usize) -> usize {
         pos += if src[pos] == '\\' { 2 } else { 1 };
     }
     pos
+}
+
+#[cfg(test)]
+mod tests {
+    use super::unconditional_capture_groups as groups;
+
+    fn set(v: &[i64]) -> std::collections::BTreeSet<i64> {
+        v.iter().copied().collect()
+    }
+
+    /// The reference's `unconditional_capture_groups` on its documented
+    /// shapes: optional quantifiers, alternation, non-capturing and
+    /// lookaround groups, character classes and named-group numbering.
+    #[test]
+    fn unconditional_capture_groups_match_the_reference_walker() {
+        assert_eq!(groups(r"(\w+)"), set(&[1]));
+        assert_eq!(groups(r"(\w+)?"), set(&[]));
+        assert_eq!(groups(r"(a)*(b)+(c){0,2}(d){1,2}"), set(&[2, 4]));
+        assert_eq!(groups(r"(a)|(b)"), set(&[]));
+        assert_eq!(groups(r"((a)|(b))"), set(&[1]));
+        assert_eq!(groups(r"((\w)+)?(z)"), set(&[3]));
+        assert_eq!(groups(r"(?:a)(b)(?=c)(?<=d)(?!e)(?<!f)"), set(&[1]));
+        assert_eq!(groups(r"[(](\w+)\("), set(&[1]));
+        assert_eq!(groups(r"(?<n>a)(b)"), set(&[1]));
+        assert_eq!(groups(r"(?'n'a)(?<m>b)?"), set(&[1]));
+    }
 }
