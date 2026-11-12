@@ -152,9 +152,12 @@ impl<'i> Typer<'i> {
                 .then_some(groups)
             }
             Node::Logical { left, right, is_and, .. } => {
+                // `P or exit` falls through on P's truthy edge.
+                let falls_through_truthy = !*is_and;
                 let (match_is_truthy, groups) = self.regex_match_edge(ast, *left, tenv, interner)?;
-                (match_is_truthy == !*is_and && self.stmt_exits(ast, *right, &mut Vec::new()))
-                    .then_some(groups)
+                (match_is_truthy == falls_through_truthy
+                    && self.stmt_exits(ast, *right, &mut Vec::new()))
+                .then_some(groups)
             }
             _ => None,
         }
