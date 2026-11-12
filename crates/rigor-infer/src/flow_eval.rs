@@ -880,7 +880,8 @@ impl<'i> Typer<'i> {
             !dead.covers(*s) || (is_content_mutator(m) && dead.inside_iterated(*s))
         });
         closure_muts.retain(|(_, w, _)| !dead.covers(*w));
-        let indexed = collect_indexed_flow(ast);
+        let mut indexed = collect_indexed_flow(ast);
+        indexed.retry_drops = self.retry_edge_index_drops(ast, &rebinds, &mutations, &indexed);
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
         // (its own bindings + `=> e` reach only through replay — rigor-rs#368);
@@ -1333,9 +1334,15 @@ impl<'i> Typer<'i> {
             // a site inside one takes every contained effect conservatively
             // — the flat env's own decline.
             Node::BeginRescue {
-                main_body, clauses, ..
+                main_body, clauses, span, ..
             } => {
                 let (main_body, clauses) = (main_body.clone(), clauses.clone());
+                // rigor-rs#393 — every site inside a retrying `begin` reads
+                // the retry edge's widened entry (`eval_retried_begin`
+                // re-evaluates the body and the clauses under it, and the
+                // index keeps that last visit): a record rooted at a local
+                // the edge rebinds is gone there too.
+                drop_retry_edge_records(&flow.indexed, *span, true, env);
                 if main_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
@@ -2471,8 +2478,30 @@ impl<'i> Typer<'i> {
     /// receiver mutations nested in its value (`x = xs.each { |e| w = e }`,
     /// `y = (a << 1)`); any other statement widens every rebind inside it and
     /// applies the contained `local.<mutator>` calls.
+    ///
+    /// rigor-rs#393 — a retrying `begin` inside the statement then drops
+    /// every indexed narrowing rooted at a local its retry edge rebinds
+    /// ([`Self::retry_edge_index_drops`]): the reference re-evaluates the
+    /// `begin` under the widened entry, so no record from before it, nor
+    /// one its clauses wrote, survives past it.
     #[allow(clippy::too_many_arguments)]
     fn bind_check_statement(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &mut TypeEnv,
+        rebinds: &[(rigor_parse::Span, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
+        interner: &mut Interner,
+    ) {
+        self.bind_check_statement_effects(ast, id, env, rebinds, mutations, indexed, dead, interner);
+        drop_retry_edge_records(indexed, ast.get(id).span(), false, env);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bind_check_statement_effects(
         &self,
         ast: &LoweredAst,
         id: NodeId,
@@ -2926,6 +2955,65 @@ impl<'i> Typer<'i> {
                 drop_indexed_narrowings(env, name);
             }
         }
+    }
+
+    /// rigor-rs#393 — the [`IndexedFlow::retry_drops`] table: for each
+    /// top-level `begin` with a clause holding a `retry` that re-enters it,
+    /// every local the protected body or a retrying clause rebinds or
+    /// mutates. The reference carries those writes back across the retry
+    /// edge (`eval_retried_begin` → `widen_entry_for_retry`: the body's
+    /// `raise_scopes` and each `retry`'s scope) and rebinds the entry's
+    /// binding when the written one is not accepted, which drops every
+    /// indexed narrowing rooted at it (`h[:a] ||= "t"; retry` leaves
+    /// `h[:a]` reading `Hash#[]` past the `begin`). Whether the rebind
+    /// happens hangs on the widened carrier's acceptance (`h[:b] ||= 1`
+    /// keeps the record on the oracle), which the flat env does not model:
+    /// any write declines. A `begin` inside a `def`/`class`/`module` body
+    /// rebinds that scope's locals, not the top-level ones, so it records
+    /// nothing; neither does a write inside such a body.
+    pub(crate) fn retry_edge_index_drops(
+        &self,
+        ast: &LoweredAst,
+        rebinds: &[(rigor_parse::Span, String)],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        indexed: &IndexedFlow,
+    ) -> Vec<(rigor_parse::Span, String)> {
+        let in_scope_body =
+            |s: rigor_parse::Span| indexed.scope_spans.iter().any(|&b| within_span(s, b));
+        let mut out: Vec<(rigor_parse::Span, String)> = Vec::new();
+        for (_, n) in ast.iter() {
+            let Node::BeginRescue { span, main_body, clauses, .. } = n else {
+                continue;
+            };
+            if clauses.is_empty() || in_scope_body(*span) {
+                continue;
+            }
+            let mut regions: Vec<rigor_parse::Span> = clauses
+                .iter()
+                .filter(|c| self.clause_retries(ast, c.span))
+                .map(|c| c.span)
+                .collect();
+            if regions.is_empty() {
+                continue;
+            }
+            if let (Some(&f), Some(&l)) = (main_body.first(), main_body.last()) {
+                regions.push((ast.get(f).span().0, ast.get(l).span().1));
+            }
+            let writes = rebinds
+                .iter()
+                .map(|(w, name)| (*w, name))
+                .chain(mutations.iter().map(|(w, name, ..)| (*w, name)))
+                .chain(indexed.slot_writes.iter().map(|w| (w.span, &w.name)));
+            for (w, name) in writes {
+                if regions.iter().any(|&r| within_span(w, r))
+                    && !in_scope_body(w)
+                    && !out.iter().any(|(b, n)| b == span && n == name)
+                {
+                    out.push((*span, name.clone()));
+                }
+            }
+        }
+        out
     }
 
     /// `IndexedNarrowing.invalidate_after_call` for ONE mutation entry —
@@ -3710,6 +3798,24 @@ impl<'i> Typer<'i> {
                 }
             }
             _ => {}
+        }
+    }
+}
+
+/// rigor-rs#393 — drop every indexed narrowing rooted at a local a retrying
+/// `begin`'s edge rebinds ([`IndexedFlow::retry_drops`]): the `begin` at
+/// exactly `span` when `exact` (a site inside it), else every one inside
+/// `span` (the env past a statement holding it).
+fn drop_retry_edge_records(
+    indexed: &IndexedFlow,
+    span: rigor_parse::Span,
+    exact: bool,
+    env: &mut TypeEnv,
+) {
+    for (begin, name) in &indexed.retry_drops {
+        let hit = if exact { *begin == span } else { within_span(*begin, span) };
+        if hit {
+            drop_indexed_narrowings(env, name);
         }
     }
 }
