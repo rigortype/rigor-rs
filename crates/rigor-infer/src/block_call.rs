@@ -23,7 +23,8 @@ const EXACTLY_ONCE_BLOCK_CALLS: &[&str] = &["tap", "then", "yield_self"];
 /// return normally — they raise, throw, or end the process
 /// (`BlockCallTiming::NON_RETURNING_CALLS`). `loop` is deliberately absent:
 /// its declared `bot` notwithstanding, a `StopIteration` ends it normally.
-const NON_RETURNING_KERNEL_CALLS: &[&str] = &["raise", "fail", "throw", "exit", "exit!", "abort"];
+pub(crate) const NON_RETURNING_KERNEL_CALLS: &[&str] =
+    &["raise", "fail", "throw", "exit", "exit!", "abort"];
 
 /// One union member's auto-splat arm — the `arm_of` half of the reference's
 /// `BlockAutoSplat` (rigor-rs#140).
@@ -927,9 +928,10 @@ impl<'i> Typer<'i> {
     /// [`Self::expr_value_bot`] needs to know (probed: `tap { [1, 2].push(raise
     /// "x") }` keeps the receiver, i.e. the call's value is non-bot).
     ///
-    /// `dead.rs` reuses it for `branch_terminates?`'s Bot half — the same
-    /// Kernel-spelled non-returning call terminates an arm
-    /// (`rescue …; Kernel.raise` drops from `live_rescues`, rigor-rs#386).
+    /// The `project_defines_anywhere` veto is block-call timing's alone
+    /// (`block_call_timing.rb`). `dead.rs`'s `branch_terminates?` port asks
+    /// its own question ([`Typer::kernel_call_terminates`]), which reads the
+    /// call's dispatch, not that coarse gate (rigor-rs#398).
     pub(crate) fn call_declares_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
         let Node::Call { receiver, method, .. } = ast.get(id) else {
             return false;
@@ -1214,7 +1216,11 @@ impl<'i> Typer<'i> {
     /// `exactly_once_block_never_completes?` declines and the union stays
     /// (probed: `tap { self.raise "x" }` keeps `x : Array` and the reference
     /// FIRES `x.upcase`). Declining the spelling here reproduces that.
-    fn kernel_spelled_receiver(&self, ast: &LoweredAst, receiver: Option<NodeId>) -> bool {
+    pub(crate) fn kernel_spelled_receiver(
+        &self,
+        ast: &LoweredAst,
+        receiver: Option<NodeId>,
+    ) -> bool {
         match receiver {
             None => true,
             Some(r) => match ast.get(r) {

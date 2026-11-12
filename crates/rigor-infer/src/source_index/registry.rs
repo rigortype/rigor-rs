@@ -65,6 +65,16 @@ impl SourceIndex {
     /// half of `source_declared_method?`'s `Object` read). `file` is the
     /// analyzed file's [`rigor_parse::FileKey`]; `None` consults the union
     /// over every file.
+    /// [`Self::is_toplevel_def`]'s project-wide table alone — the
+    /// reference's `def_nodes["<toplevel>"]` (`top_level_def_for`) plus the
+    /// `Object`-owner macros — WITHOUT the per-file `Object`-owner overlay.
+    /// A `class Object; def exit!` reopen lives only in the overlay, and it
+    /// does not take an implicit-self `exit!` off Kernel's RBS `bot`
+    /// (rigor-rs#398, probed), so the termination port asks this.
+    pub fn is_project_toplevel_def(&self, name: &str) -> bool {
+        self.toplevel_defs.contains(name)
+    }
+
     pub fn is_toplevel_def(&self, file: Option<&FileKey>, name: &str) -> bool {
         if self.toplevel_defs.contains(name) {
             return true;

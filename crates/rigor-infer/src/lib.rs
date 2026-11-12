@@ -131,6 +131,9 @@ mod meta_new_lift_tests;
 #[cfg(test)]
 mod rbs_tuple_return_tests;
 
+#[cfg(test)]
+mod kernel_termination_tests;
+
 // ---------------------------------------------------------------------------
 // `is_a?` / `case-when` class narrowing (census mechanism 1) — the oracle
 // probe matrix a1–a6 + the load-bearing declines
