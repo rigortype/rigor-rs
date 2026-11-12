@@ -102,7 +102,7 @@ impl<'i> Typer<'i> {
     ///
     /// An early-exit guard whose fall-through is the match edge of a
     /// recognised predicate records that match. Any other statement keeps the
-    /// state only when it cannot run a match ([`Self::match_free`]).
+    /// state only when it cannot run a match ([`match_free`]).
     pub(crate) fn match_globals_after_stmt(
         &self,
         ast: &LoweredAst,
@@ -112,7 +112,7 @@ impl<'i> Typer<'i> {
     ) {
         if let Some(groups) = self.guard_match_edge(ast, id, tenv, interner) {
             record(tenv, &groups, interner);
-        } else if !self.match_free(ast, id) {
+        } else if !match_free(ast, id) {
             forget(tenv);
         }
     }
@@ -229,77 +229,77 @@ impl<'i> Typer<'i> {
             _ => false,
         }
     }
+}
 
-    /// `id` cannot run a regex match in this frame: it is built only from
-    /// local reads and writes, literals, constant reads, own-frame bodies
-    /// (`def`, `class`, `module`), `if`s and `&&`/`||` over such parts, and
-    /// block-less calls that `Calls.forgets_by_name?` clears: a name outside
-    /// [`MAY_MATCH_CALLS`], and a [`LOOKUP_CALLS`] name only on non-Regexp
-    /// literal arguments. Anything else answers `false` (forget), the
-    /// pre-#449 behaviour.
-    fn match_free(&self, ast: &LoweredAst, id: NodeId) -> bool {
-        let all = |ids: &[NodeId]| ids.iter().all(|&i| self.match_free(ast, i));
-        match ast.get(id) {
-            Node::LocalVariableRead { .. }
-            | Node::VariableRead { .. }
-            | Node::ConstantRead { .. }
-            | Node::SelfExpr { .. }
-            | Node::StringLit { .. }
-            | Node::IntegerLit { .. }
-            | Node::FloatLit { .. }
-            | Node::RationalLit { .. }
-            | Node::ImaginaryLit { .. }
-            | Node::SymbolLit { .. }
-            | Node::NilLit { .. }
-            | Node::TrueLit { .. }
-            | Node::FalseLit { .. }
-            | Node::RegexpLit { .. } => true,
-            // `MatchRebinding::OWN_FRAME_NODES`: the body runs in a frame of
-            // its own.
-            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => true,
-            Node::LocalVariableWrite { value, .. } => self.match_free(ast, *value),
-            // An exit leaves the fall-through unchanged.
-            Node::Return { values, .. } => all(values),
-            Node::Other { jump: Some(_), .. } => true,
-            Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
-                all(parts)
-            }
-            Node::ArrayLit { elements, .. } => all(elements),
-            Node::Statements { body, kind: StatementsKind::Sequence, .. } => all(body),
-            Node::If { predicate, then_body, else_body, .. } => {
-                self.match_free(ast, *predicate) && all(then_body) && all(else_body)
-            }
-            Node::Logical { left, right, .. } => {
-                self.match_free(ast, *left) && self.match_free(ast, *right)
-            }
-            Node::Call {
-                receiver,
-                method,
-                args,
-                block_body,
-                block_span: None,
-                ..
-            } => {
-                let name = method.as_str();
-                let args_ok = if LOOKUP_CALLS.contains(&name) {
-                    let checked = if name == "[]=" {
-                        &args[..args.len().saturating_sub(1)]
-                    } else {
-                        &args[..]
-                    };
-                    !(name == "split" && args.is_empty())
-                        && checked.iter().all(|&a| non_regexp_literal(ast.get(a)))
-                        && all(args)
-                } else {
-                    all(args)
-                };
-                block_body.is_empty()
-                    && !MAY_MATCH_CALLS.contains(&name)
-                    && args_ok
-                    && receiver.is_none_or(|r| self.match_free(ast, r))
-            }
-            _ => false,
+/// `id` cannot run a regex match in this frame: it is built only from
+/// local reads and writes, literals, constant reads, own-frame bodies
+/// (`def`, `class`, `module`), `if`s and `&&`/`||` over such parts, and
+/// block-less calls that `Calls.forgets_by_name?` clears: a name outside
+/// [`MAY_MATCH_CALLS`], and a [`LOOKUP_CALLS`] name only on non-Regexp
+/// literal arguments. Anything else answers `false` (forget), the
+/// pre-#449 behaviour.
+fn match_free(ast: &LoweredAst, id: NodeId) -> bool {
+    let all = |ids: &[NodeId]| ids.iter().all(|&i| match_free(ast, i));
+    match ast.get(id) {
+        Node::LocalVariableRead { .. }
+        | Node::VariableRead { .. }
+        | Node::ConstantRead { .. }
+        | Node::SelfExpr { .. }
+        | Node::StringLit { .. }
+        | Node::IntegerLit { .. }
+        | Node::FloatLit { .. }
+        | Node::RationalLit { .. }
+        | Node::ImaginaryLit { .. }
+        | Node::SymbolLit { .. }
+        | Node::NilLit { .. }
+        | Node::TrueLit { .. }
+        | Node::FalseLit { .. }
+        | Node::RegexpLit { .. } => true,
+        // `MatchRebinding::OWN_FRAME_NODES`: the body runs in a frame of
+        // its own.
+        Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => true,
+        Node::LocalVariableWrite { value, .. } => match_free(ast, *value),
+        // An exit leaves the fall-through unchanged.
+        Node::Return { values, .. } => all(values),
+        Node::Other { jump: Some(_), .. } => true,
+        Node::InterpolatedString { parts, .. } | Node::InterpolatedSymbol { parts, .. } => {
+            all(parts)
         }
+        Node::ArrayLit { elements, .. } => all(elements),
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => all(body),
+        Node::If { predicate, then_body, else_body, .. } => {
+            match_free(ast, *predicate) && all(then_body) && all(else_body)
+        }
+        Node::Logical { left, right, .. } => {
+            match_free(ast, *left) && match_free(ast, *right)
+        }
+        Node::Call {
+            receiver,
+            method,
+            args,
+            block_body,
+            block_span: None,
+            ..
+        } => {
+            let name = method.as_str();
+            let args_ok = if LOOKUP_CALLS.contains(&name) {
+                let checked = if name == "[]=" {
+                    &args[..args.len().saturating_sub(1)]
+                } else {
+                    &args[..]
+                };
+                !(name == "split" && args.is_empty())
+                    && checked.iter().all(|&a| non_regexp_literal(ast.get(a)))
+                    && all(args)
+            } else {
+                all(args)
+            };
+            block_body.is_empty()
+                && !MAY_MATCH_CALLS.contains(&name)
+                && args_ok
+                && receiver.is_none_or(|r| match_free(ast, r))
+        }
+        _ => false,
     }
 }
 
