@@ -2996,6 +2996,111 @@ fn bundled_stdlib_new_instance_stays_lenient_with_sig_loaded() {
     assert!(run_with_widget_sig("pathname", b"Pathname.new(\"a\").spni\n").is_empty());
 }
 
+/// rigor-rs#450: `run_with_widget_sig` with a caller-supplied `sig/t.rbs`.
+/// Returns `(1-based line, receiver_type)` of each undefined-method diagnostic.
+fn run_with_sig(label: &str, rbs: &str, src: &[u8]) -> Vec<(u32, Option<String>)> {
+    let dir = std::env::temp_dir()
+        .join(format!("rigor-rules-sig450-{}-{label}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("temp sig dir");
+    std::fs::write(dir.join("t.rbs"), rbs).expect("write sig");
+    let index = CoreIndex::for_project(&[], std::slice::from_ref(&dir));
+    let ast = lower(&parse(src));
+    let refs = [&ast];
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut interner = Interner::new();
+    let diags = analyze_with_source(&ast, &mut interner, &index, &source)
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| {
+            let line = src[..d.start_offset].iter().filter(|&&b| b == b'\n').count() + 1;
+            (line as u32, d.receiver_type)
+        })
+        .collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    diags
+}
+
+const SIG_450_CLASS: &str = "class T\n  def self.one: (Integer) -> String\nend\n";
+
+#[test]
+fn project_sig_singleton_return_wins_over_body_fold() {
+    // The sig's `String` answers ahead of the body's folded `nil`, as an
+    // instance call's sig already does: `.upcase` is silent, `.zork`
+    // witnesses on `String`. An undeclared `def self.two = nil` keeps its
+    // body fold (`for nil`).
+    let src = b"class T\n  def self.one(_x) = nil\n  def self.two = nil\nend\n\
+T.one(1).upcase\nT.one(1).zork\nT.two.upcase\n";
+    assert_eq!(
+        run_with_sig("class", SIG_450_CLASS, src),
+        vec![(6, Some("String".into())), (7, Some("nil".into()))]
+    );
+}
+
+#[test]
+fn project_sig_singleton_return_singleton_class_and_module_twins() {
+    let cos = b"class T\n  class << self\n    def one(_x) = nil\n  end\nend\n\
+T.one(1).upcase\nT.one(1).zork\n";
+    assert_eq!(run_with_sig("cos", SIG_450_CLASS, cos), vec![(7, Some("String".into()))]);
+    let module_sig = "module T\n  def self.one: (Integer) -> String\nend\n";
+    let module_src = b"module T\n  def self.one(_x) = nil\nend\nT.one(1).upcase\nT.one(1).zork\n";
+    assert_eq!(
+        run_with_sig("module", module_sig, module_src),
+        vec![(5, Some("String".into()))]
+    );
+}
+
+#[test]
+fn project_sig_singleton_unbuildable_chain_keeps_the_body_fold() {
+    // A signature the reference cannot build (missing superclass) answers
+    // nothing there, so the body's `nil` still types the call (oracle:
+    // `for nil`) — the instance arm's `project_sig_chain_ok` fall-through.
+    let rbs = "class U < Missing\n  def self.u: () -> String\nend\n";
+    let src = b"class U\n  def self.u = nil\nend\nU.u.upcase\n";
+    assert_eq!(run_with_sig("unbuildable", rbs, src), vec![(4, Some("nil".into()))]);
+}
+
+#[test]
+fn project_sig_singleton_return_resolves_the_receiver_lexically() {
+    // Inside `module A`, `T` is `A::T` (sig: String), not the toplevel `T`
+    // whose unsigned body folds `nil`.
+    let rbs = "module A\n  class T\n    def self.one: (Integer) -> String\n  end\nend\n";
+    let src = b"class T\n  def self.one(_x) = nil\nend\n\
+module A\n  class T\n    def self.one(_x) = nil\n  end\n  T.one(1).zork\nend\nT.one(1).zork\n";
+    assert_eq!(
+        run_with_sig("lexical", rbs, src),
+        vec![(8, Some("String".into())), (10, Some("nil".into()))]
+    );
+}
+
+#[test]
+fn project_sig_singleton_nilable_return_declines() {
+    // `-> String?` is not `String`: the reference (and master) stay silent
+    // on `T.nn("a").zork` and on a local holding it — the instance arm's
+    // `method_return_nilable` decline. Same for `instance?`, an alias, an
+    // inherited nilable, and the qualified `A::T` spelling (the `Singleton`
+    // arm). The bare `String` / `instance` twins still witness.
+    let rbs = "class T\n  def self.nn: (String) -> String?\n  def self.bare: (String) -> String\n\
+  def self.find: () -> instance?\n  alias self.nn2 self.nn\nend\nclass S < T\nend\n\
+module A\n  class T\n    def self.an: () -> String?\n  end\nend\n";
+    let src = b"class T\n  def self.nn(k) = ENV[k]\n  def self.bare(k) = nil\n  def self.find = nil\nend\n\
+class S < T\nend\nmodule A\n  class T\n    def self.an = nil\n  end\nend\n\
+T.nn(\"a\").zork\nv = T.nn(\"a\")\nv.present?\nT.find.zork\nT.nn2(\"a\").zork\nS.nn(\"a\").zork\n\
+A::T.an.zork\nT.bare(\"a\").zork\n";
+    assert_eq!(run_with_sig("nilable", rbs, src), vec![(20, Some("String".into()))]);
+}
+
+#[test]
+fn project_sig_singleton_receiver_anchoring() {
+    // `::T` re-anchors at the top level (Integer, not `A::T`'s String);
+    // `self::T` and `k::T` have no lexical answer ⇒ decline.
+    let rbs = "class T\n  def self.one: (Integer) -> Integer\nend\n\
+module A\n  class T\n    def self.one: (Integer) -> String\n  end\nend\n";
+    let src = b"class T\n  def self.one(x) = nil\nend\nmodule A\n  class T\n    def self.one(x) = nil\n  end\n\
+  ::T.one(1).abs\n  ::T.one(1).zork\n  self::T.one(1).zork\nend\ndef f(k) = k::T.one(1).zork\n";
+    assert_eq!(run_with_sig("anchoring", rbs, src), vec![(9, Some("Integer".into()))]);
+}
+
 // -----------------------------------------------------------------------
 // flow.duplicate-hash-key (v0.3.0)
 // -----------------------------------------------------------------------

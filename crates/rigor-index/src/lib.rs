@@ -467,6 +467,17 @@ impl CoreIndex {
         self.data.receiver_singleton_method_return(class, method)
     }
 
+    /// rigor-rs#450: [`Self::receiver_singleton_method_return`] with the nil
+    /// bit — `(return class, nilable)`. See
+    /// [`rbs::CoreData::receiver_singleton_method_return_nilable`].
+    pub fn receiver_singleton_method_return_nilable(
+        &self,
+        class: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        self.data.receiver_singleton_method_return_nilable(class, method)
+    }
+
     /// Issue #168: the singleton-tuple twin of
     /// [`Self::receiver_method_tuple_return`]. See
     /// [`rbs::CoreData::receiver_singleton_tuple_return`].

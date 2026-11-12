@@ -185,6 +185,7 @@ fn blank_unbuildable(entry: &mut ClassEntry, instance: bool, singleton: bool) {
         entry.overloading_singleton_overloads.clear();
         entry.singleton_block_free_returns.clear();
         entry.void_singleton_methods.clear();
+        entry.nilable_singleton_methods.clear();
         entry.singleton_aliases.clear();
     }
 }
@@ -660,6 +661,14 @@ struct ClassEntry {
     void_methods: HashSet<&'static str>,
     /// The singleton twin of `void_methods` (`def self.x: () -> void`).
     void_singleton_methods: HashSet<&'static str>,
+    /// rigor-rs#450: singleton methods whose flat return class came from an
+    /// `Optional` (`def self.x: () -> String?` ⇒ `String`, nilable) — the nil
+    /// bit the instance side keeps in its slot's flag, which the singleton
+    /// slot spends on `ret_instance`. Conservative by construction: any
+    /// declaration of the name that reads nilable (an overloading reopen
+    /// included) marks it, and merges union, so a stale bit only declines.
+    /// Read ONLY by [`CoreData::receiver_singleton_method_return_nilable`].
+    nilable_singleton_methods: HashSet<&'static str>,
     /// Instance methods this declaration marks PRIVATE — either per-`def`
     /// (`private def respond_to_missing?: ...`) or by falling under a bare
     /// `private` section modifier. Rides the same first-write-wins reopen
@@ -2402,6 +2411,17 @@ impl CoreData {
         method: &str,
         depth: usize,
     ) -> Option<&'static str> {
+        self.singleton_method_return_nilable_inner(class_name, method, depth).map(|(r, _)| r)
+    }
+
+    /// [`Self::singleton_method_return_inner`] with the definer's nil bit
+    /// (`nilable_singleton_methods`) — `(return, nilable)`.
+    fn singleton_method_return_nilable_inner(
+        &self,
+        class_name: &str,
+        method: &str,
+        depth: usize,
+    ) -> Option<(&'static str, bool)> {
         // Alias-chain bound (`alias self.pwd self.getwd` → one hop; a
         // pathological alias cycle terminates here).
         if depth >= 16 {
@@ -2418,12 +2438,13 @@ impl CoreData {
                 return None; // superclass cycle guard.
             }
             if let Some(&(ret, _, is_instance)) = entry.singleton_methods.get(method) {
-                return if is_instance { Some(self_key) } else { ret };
+                let nilable = entry.nilable_singleton_methods.contains(method);
+                return if is_instance { Some(self_key) } else { ret }.map(|r| (r, nilable));
             }
             // A singleton ALIAS (`alias self.pwd self.getwd`) resolves through
             // its target on the QUERIED class (instance-binding preserved).
             if let Some(&target) = entry.singleton_aliases.get(method) {
-                return self.singleton_method_return_inner(class_name, target, depth + 1);
+                return self.singleton_method_return_nilable_inner(class_name, target, depth + 1);
             }
             cur = entry.superclass;
         }
@@ -3205,6 +3226,17 @@ impl CoreData {
         method: &str,
         depth: usize,
     ) -> Option<&'static str> {
+        self.qualified_singleton_method_return_nilable(qname, method, depth).map(|(r, _)| r)
+    }
+
+    /// [`Self::qualified_singleton_method_return`] with the definer's nil bit
+    /// (`nilable_singleton_methods`) — `(return, nilable)`.
+    fn qualified_singleton_method_return_nilable(
+        &self,
+        qname: &str,
+        method: &str,
+        depth: usize,
+    ) -> Option<(&'static str, bool)> {
         if depth >= 16 {
             return None;
         }
@@ -3213,14 +3245,16 @@ impl CoreData {
         for &anc in &chain {
             let entry = self.qualified.get(anc)?;
             if let Some(&(ret, _, is_instance)) = entry.singleton_methods.get(method) {
-                return if is_instance {
+                let nilable = entry.nilable_singleton_methods.contains(method);
+                let ret = if is_instance {
                     Some(self_key)
                 } else {
                     self.resolve_member_type_ref(anc, ret?)
                 };
+                return ret.map(|r| (r, nilable));
             }
             if let Some(&target) = entry.singleton_aliases.get(method) {
-                return self.qualified_singleton_method_return(qname, target, depth + 1);
+                return self.qualified_singleton_method_return_nilable(qname, target, depth + 1);
             }
         }
         None
@@ -3501,6 +3535,25 @@ impl CoreData {
             self.qualified_singleton_method_return(class_name, method, 0)
         } else {
             self.singleton_method_return(class_name, method)
+        }
+    }
+
+    /// rigor-rs#450: [`Self::receiver_singleton_method_return`] with the nil
+    /// bit — `(return class, nilable)`, the singleton twin of
+    /// [`Self::receiver_method_return`]. `String?` ⇒ `(String, true)`.
+    pub fn receiver_singleton_method_return_nilable(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        // The routing of `receiver_singleton_method_return` →
+        // `singleton_method_return` (ADR-0042 Slice 5), flattened.
+        if self.prefers_qualified_return(class_name)
+            || (!self.classes.contains_key(class_name) && self.qualified.contains_key(class_name))
+        {
+            self.qualified_singleton_method_return_nilable(class_name, method, 0)
+        } else {
+            self.singleton_method_return_nilable_inner(class_name, method, 0)
         }
     }
 
@@ -4184,6 +4237,7 @@ impl CoreData {
                     // The stub declares no `-> void` returns.
                     void_methods: HashSet::new(),
                     void_singleton_methods: HashSet::new(),
+                    nilable_singleton_methods: HashSet::new(),
                     // The stub declares everything public.
                     private_methods: HashSet::new(),
                     // The stub declares no attribute members.
@@ -5596,6 +5650,10 @@ impl Builder {
                             | MethodDefinitionKind::SingletonInstance
                     ) {
                         let overloading = md.overloading();
+                        // `String?` and `instance?` alike.
+                        if nilable {
+                            entry.nilable_singleton_methods.insert(mname);
+                        }
                         if overloading {
                             entry.overloading_singletons.push((mname, (ret, arity, ret_instance), ret_void));
                         } else {
@@ -5882,6 +5940,7 @@ impl Builder {
                 slot.void_singleton_methods.insert(k);
             }
         }
+        slot.nilable_singleton_methods.extend(entry.nilable_singleton_methods);
         for (k, v) in entry.singleton_method_overloads {
             slot.singleton_method_overloads.entry(k).or_insert(v);
         }
@@ -6063,6 +6122,7 @@ impl Builder {
                 slot.void_singleton_methods.insert(k);
             }
         }
+        slot.nilable_singleton_methods.extend(entry.nilable_singleton_methods);
         for (k, v) in entry.singleton_method_overloads {
             slot.singleton_method_overloads.entry(k).or_insert(v);
         }
