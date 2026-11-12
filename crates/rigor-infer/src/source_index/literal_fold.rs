@@ -234,10 +234,14 @@ impl SourceIndex {
         // -> String` answers `String`, not the folded `nil`. The same
         // precedence the instance path already gives a project-sig receiver
         // (tier 4b's `receiver_method_return` ahead of `method_return`).
-        // `class_has_singleton_method` answers "present" on an incomplete
-        // surface too, so an unresolvable chain declines the fold (silent).
+        // A signature the reference cannot BUILD (a missing superclass,
+        // include or self-type: `project_sig_chain_ok`) answers nothing, so
+        // the body still types the call — probed: `class U < Missing` with
+        // `def self.u: () -> String` over `def self.u = nil` fires `U.u.upcase`
+        // `for nil` on the oracle, as the instance arm's fall-through does.
         if key.2 == DefKind::Singleton
             && core.is_qualified_project_sig_class(&key.0)
+            && core.project_sig_chain_ok(&key.0)
             && core.class_has_singleton_method(&key.0, &key.1)
         {
             return None;

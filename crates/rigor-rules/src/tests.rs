@@ -3051,6 +3051,16 @@ T.one(1).upcase\nT.one(1).zork\n";
 }
 
 #[test]
+fn project_sig_singleton_unbuildable_chain_keeps_the_body_fold() {
+    // A signature the reference cannot build (missing superclass) answers
+    // nothing there, so the body's `nil` still types the call (oracle:
+    // `for nil`) — the instance arm's `project_sig_chain_ok` fall-through.
+    let rbs = "class U < Missing\n  def self.u: () -> String\nend\n";
+    let src = b"class U\n  def self.u = nil\nend\nU.u.upcase\n";
+    assert_eq!(run_with_sig("unbuildable", rbs, src), vec![(4, Some("nil".into()))]);
+}
+
+#[test]
 fn project_sig_singleton_return_resolves_the_receiver_lexically() {
     // Inside `module A`, `T` is `A::T` (sig: String), not the toplevel `T`
     // whose unsigned body folds `nil`.
