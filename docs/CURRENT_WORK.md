@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver, unbuildable fallback, singleton nil bit. Brief rows byte-identical; 0 FP/658; follow-ups #584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
 - **2026-11-12 #398 Kernel termination** (PR #575): dead-code termination uses `kernel_call_terminates`, not block timing's project-defines veto; explicit `Kernel.*` always terminates. 13+3 FP rows closed, 0 FP/658; follow-ups #581–#583. [note](notes/20261112-issue-398-kernel-termination.md)
 - **2026-11-12 #349 Psych YAML errors** (PR #576): libyaml `context_mark`/problem/context render Psych positions/details incl. `hexdecimal`; BOM parity. 0 FP; follow-ups #579/#580. [note](notes/20261112-issue-349-yaml-fidelity.md)
 - **2026-11-12 #384 ATM describe labels** (PR #573): nested union/optional/alias members flatten before `union_describe`; `Other` strips only root `::`. 12 rows byte-identical, 0 FP; follow-ups #577/#578. [note](notes/20261112-issue-384-render-other-drift.md)
