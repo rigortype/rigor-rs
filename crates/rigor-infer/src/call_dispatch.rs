@@ -151,13 +151,16 @@ impl<'i> Typer<'i> {
         // (Dynamic, silent) — a project constant still types Dynamic as before.
         if let Node::ConstantRead { name, .. } = ast.get(receiver) {
             if !name.is_empty() {
-                if let Some(scalar) = self.source.const_singleton_literal(name, method) {
-                    return interner.intern(Type::Constant(scalar));
-                }
+                // rigor-rs#450: a project-sig declaration answers ahead of
+                // the body fold, resolved lexically — `T.one` inside `module
+                // A` reads `A::T`'s signature, not a toplevel `T`'s fold.
                 if let Some(ty) =
                     self.project_sig_singleton_return(ast, receiver, name, method, interner)
                 {
                     return ty;
+                }
+                if let Some(scalar) = self.source.const_singleton_literal(name, method) {
+                    return interner.intern(Type::Constant(scalar));
                 }
             }
         }
