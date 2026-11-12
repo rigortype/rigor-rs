@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 """Write the D defs x K ivar-guard-pairs stress class of rigor-rs#438.
 
-One class holds D defs. Each def holds K pairs of an ivar truthiness guard
-(`if @x then a = a + k end`) and an ivar-guarded call (`Float(@y).w if @y`),
-so the file has about 3*D*K ivar reads inside one class region with D defs.
+One class holds an `initialize` that writes `@x`/`@y`, then D defs. Each def
+holds K pairs of an ivar truthiness guard (`if @x then a = a + k end`) and an
+ivar-guarded call (`Float(@y).w if @y`), so the file has about 3*D*K ivar
+reads inside one class region with D+1 defs. The writes matter: without them
+the ivar reach is trivial and the shape stops being pathological. Every
+`Float(@y).w` is a diagnostic, so a before/after diff compares real output.
 `ReachIndex::class_ivar_scope` once kept a copy of the region's def list per
 read span; this shape makes that cost visible in max RSS.
 
@@ -17,14 +20,18 @@ import sys
 
 
 def generate(defs: int, pairs: int) -> str:
-    lines = ["class IvarScopeStress"]
+    lines = [
+        "class IvarScopeStress",
+        "  def initialize",
+        "    @x = nil",
+        '    @y = "1.5"',
+        "  end",
+    ]
     for d in range(defs):
         lines.append(f"  def m{d}")
         lines.append("    a = 0")
         for k in range(pairs):
-            lines.append("    if @x then")
-            lines.append(f"      a = a + {k}")
-            lines.append("    end")
+            lines.append(f"    if @x then a = a + {k} end")
             lines.append("    Float(@y).w if @y")
         lines.append("    a")
         lines.append("  end")
@@ -34,7 +41,7 @@ def generate(defs: int, pairs: int) -> str:
 
 def main(argv: list[str]) -> int:
     if len(argv) not in (3, 4):
-        print(__doc__.strip().splitlines()[-3], file=sys.stderr)
+        print(next(l for l in __doc__.splitlines() if l.startswith("Usage:")), file=sys.stderr)
         return 2
     src = generate(int(argv[1]), int(argv[2]))
     if len(argv) == 4:
