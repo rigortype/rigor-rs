@@ -1024,20 +1024,8 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> Option<TypeId> {
         let site = ast.get(receiver).span();
-        let owned_scopes;
-        let scopes: &[(rigor_parse::Span, Vec<String>)] = if self.lexical_scopes.is_empty() {
-            owned_scopes = crate::lexical_scopes(ast);
-            &owned_scopes
-        } else {
-            self.lexical_scopes
-        };
-        let prefix: &[String] = scopes
-            .iter()
-            .filter(|(sp, _)| sp.0 <= site.0 && site.1 <= sp.1)
-            .min_by_key(|(sp, _)| sp.1 - sp.0)
-            .map(|(_, p)| p.as_slice())
-            .unwrap_or(&[]);
-        let qualified = self.source.resolve_declared_constant_at(prefix, name)?;
+        let prefix = self.enclosing_prefix_in(ast, site);
+        let qualified = self.source.resolve_declared_constant_at(&prefix, name)?;
         if !self.index.is_qualified_project_sig_class(&qualified)
             || !self.index.project_sig_chain_ok(&qualified)
             || self.index.is_synthesized_stub(&qualified)
