@@ -62,6 +62,11 @@ ruby-rbs-sys = "0.3"
 # (serde 1.0.228, serde_yaml 0.9.34, glob 0.3.3); no network fetch needed.
 serde = { version = "1", features = ["derive"] }
 serde_yaml = "0.9"
+# The libyaml serde_yaml drives (0.2.11, already in Cargo.lock as its
+# dependency): a rejected `.rigor.yml` is re-parsed through it to read the
+# error's `context_mark`/`problem`/`context` the way Psych's `make_exception`
+# does, which serde_yaml's `Error` does not expose (`config/psych_error.rs`).
+unsafe-libyaml = "0.2"
 glob = "0.3"
 # SARIF output is built as a serde_json::Value tree (already in Cargo.lock).
 serde_json = { version = "1", features = ["preserve_order"] }
