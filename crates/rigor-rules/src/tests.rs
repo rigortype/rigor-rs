@@ -632,6 +632,107 @@ fn index_or_write_narrowing_keeps_its_controls() {
     assert_eq!(diags[0].message, "undefined method `upcase' for nil");
 }
 
+/// rigor-rs#405: a class guard on the receiver local rebinds it
+/// (`Scope#with_local` → `drop_indexed_narrowings_for`) on both edges and
+/// whatever the narrowed type, and the join keeps only shared records — so
+/// the `h[:a] ||= "s"` record no longer answers `h[:a]` inside the guard's
+/// arms, its `&&` right operand, or after the construct. Every row is
+/// reference-silent at the pin (the port fired `for "s" | 1`).
+#[test]
+fn class_guard_drops_the_indexed_records_rooted_at_its_local() {
+    const PRE: &str = "h = {a: 1}\nh[:a] ||= \"s\"\n";
+    for body in [
+        "if h.is_a?(Hash)\n  h[:a].frobnicate\nend\n",
+        "if h.kind_of?(Hash)\n  h[:a].frobnicate\nend\n",
+        "if h.instance_of?(Hash)\n  h[:a].frobnicate\nend\n",
+        "if Hash === h\n  h[:a].frobnicate\nend\n",
+        "if h.is_a?(::Hash)\n  h[:a].frobnicate\nend\n",
+        // A relative name nothing declares still rebinds
+        // (`resolve_class_name_lexically` falls back to the bare name).
+        "if h.is_a?(Foo)\n  1\nelse\n  h[:a].frobnicate\nend\n",
+        // The falsey edge drops too.
+        "if h.is_a?(String)\n  1\nelse\n  h[:a].frobnicate\nend\n",
+        "unless h.is_a?(Hash)\n  1\nelse\n  h[:a].frobnicate\nend\n",
+        "if h.is_a?(String) || h.is_a?(Hash)\n  h[:a].frobnicate\nend\n",
+        "if rand > 0.5 || h.is_a?(Hash)\n  h[:a].frobnicate\nend\n",
+        "if rand > 0.5\n  1\nelsif h.is_a?(Hash)\n  h[:a].frobnicate\nend\n",
+        // A modifier's arm sits BEFORE its predicate.
+        "h[:a].frobnicate if h.is_a?(Hash)\n",
+        "h.is_a?(Hash) ? h[:a].frobnicate : 1\n",
+        "x = h.is_a?(Hash) && h[:a].frobnicate\n",
+        "while h.is_a?(Hash)\n  h[:a].frobnicate\n  break\nend\n",
+        "until h.is_a?(String)\n  h[:a].frobnicate\n  break\nend\n",
+        // After the join, and a later `||=` computing from the dropped slot.
+        "if h.is_a?(Hash)\n  1\nend\nh[:a] ||= \"t\"\nh[:a].frobnicate\n",
+        "if h.is_a?(Hash)\n  h[:a] ||= \"t\"\n  h[:a].frobnicate\nend\n",
+        // `case_when_scopes` rebinds the subject for every `when`, even a
+        // non-class test.
+        "case h\nwhen Hash\n  h[:a].frobnicate\nend\n",
+        "case h\nwhen 1\n  h[:a].frobnicate\nend\n",
+        "case h\nwhen String\n  1\nelse\n  h[:a].frobnicate\nend\n",
+        "case h\nwhen String\n  1\nend\nh[:a].frobnicate\n",
+        "case h\nin Hash\n  h[:a].frobnicate\nend\n",
+        "case\nwhen h.is_a?(Hash)\n  h[:a].frobnicate\nend\n",
+    ] {
+        let src = format!("{PRE}{body}");
+        let diags = run(src.as_bytes());
+        assert!(diags.is_empty(), "expected silence for {src:?}, got {diags:?}");
+    }
+}
+
+/// rigor-rs#405's controls: what the guard does NOT rebind keeps its record
+/// and keeps firing `for "s" | 1` — a truthiness or `nil?` test the type
+/// decides, a predicate that is no class guard, a guard in value or
+/// argument position, a rooted unknown class (`rooted_class_predicate_name`
+/// declines), a pattern that is no bare class (`in {a: Integer}`), a site
+/// before the guard, a guard inside a block the site is not in, and a
+/// record on another local. A record only a post-guard write produces (`for
+/// "t"`) and one written after a rebind (`for "u"`) survive too.
+#[test]
+fn class_guard_record_drop_keeps_its_controls() {
+    const PRE: &str = "h = {a: 1}\nh[:a] ||= \"s\"\n";
+    let stale = "undefined method `frobnicate' for \"s\" | 1";
+    for body in [
+        "if h\n  h[:a].frobnicate\nend\n",
+        "unless h.nil?\n  h[:a].frobnicate\nend\n",
+        "if h.empty?\n  h[:a].frobnicate\nend\n",
+        "if h.key?(:a)\n  h[:a].frobnicate\nend\n",
+        "x = h.is_a?(Hash)\nh[:a].frobnicate\n",
+        "p(h.is_a?(Hash))\nh[:a].frobnicate\n",
+        "if h.is_a?(::NoSuchZz)\n  1\nelse\n  h[:a].frobnicate\nend\n",
+        "case h\nin {a: Integer}\n  h[:a].frobnicate\nend\n",
+        "h[:a].frobnicate\nif h.is_a?(Hash)\n  1\nend\n",
+        "[1].each do\n  if h.is_a?(Hash)\n    1\n  end\nend\nh[:a].frobnicate\n",
+    ] {
+        let src = format!("{PRE}{body}");
+        let diags = run(src.as_bytes());
+        assert_eq!(diags.len(), 1, "expected one diagnostic for {src:?}, got {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].message, stale, "for {src:?}");
+    }
+
+    let src = "g = {a: 1}\ng[:a] ||= \"s\"\nh = {b: 2}\nif h.is_a?(Hash)\n  g[:a].frobnicate\nend\n";
+    let diags = run(src.as_bytes());
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(diags[0].message, stale);
+
+    for (src, msg) in [
+        (
+            "h = {}\nif h.is_a?(Hash)\n  h[:a] ||= \"t\"\n  h[:a].frobnicate\nend\n",
+            "undefined method `frobnicate' for \"t\"",
+        ),
+        (
+            "h = {a: 1}\nh[:a] ||= \"s\"\nif h.is_a?(Hash)\n  1\nend\nh = {}\nh[:a] ||= \"u\"\nh[:a].frobnicate\n",
+            "undefined method `frobnicate' for \"u\"",
+        ),
+    ] {
+        let diags = run(src.as_bytes());
+        assert_eq!(diags.len(), 1, "expected one diagnostic for {src:?}, got {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].message, msg);
+    }
+}
+
 /// The widening's controls: the read WITHOUT the write keeps firing on the
 /// pinned literal (the stale shape is real there), and the carrier itself
 /// still witnesses a method Hash lacks — `for Hash`, the widened nominal.
