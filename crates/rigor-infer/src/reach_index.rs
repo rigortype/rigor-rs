@@ -132,7 +132,7 @@ pub(crate) struct ReachIndex {
     call_selves: RefCell<HashMap<Span, CallSelf>>,
     /// [`LoweredAst::in_blocked_carrier`] per span.
     blocked: RefCell<HashMap<Span, bool>>,
-    /// [`ReachIndex::class_ivar_scope`] per read span.
+    /// [`ReachIndex::class_ivar_scope`] per class region.
     ivar_scopes: RefCell<HashMap<Span, Rc<IvarScope>>>,
     /// [`unrecorded_closure`] per read span.
     unrecorded: RefCell<HashMap<Span, Option<(NodeId, Span)>>>,
@@ -390,16 +390,17 @@ impl ReachIndex {
     /// own class, row i9). With no enclosing class the region is the whole file,
     /// which is where a top-level `def`'s own `@x = …` still binds (row i6)
     /// while a top-level class-body write does not reach it (row t2).
-    /// Memoized per read span.
+    /// Memoized per region: `barriers` and `defs` depend only on it, so every
+    /// read in one class body shares one entry (rigor-rs#438).
     pub(crate) fn class_ivar_scope(&self, ast: &LoweredAst, use_span: Span) -> Rc<IvarScope> {
-        if let Some(hit) = self.ivar_scopes.borrow().get(&use_span) {
-            return hit.clone();
-        }
         let mut region = ast.get(ast.root()).span();
         for &span in &self.class_spans {
             if contains(span, use_span) && span.1 - span.0 < region.1 - region.0 {
                 region = span;
             }
+        }
+        if let Some(hit) = self.ivar_scopes.borrow().get(&region) {
+            return hit.clone();
         }
         let barriers: Vec<Span> = self
             .class_spans
@@ -414,7 +415,7 @@ impl ReachIndex {
             .cloned()
             .collect();
         let out = Rc::new(IvarScope { region, barriers, defs });
-        self.ivar_scopes.borrow_mut().insert(use_span, out.clone());
+        self.ivar_scopes.borrow_mut().insert(region, out.clone());
         out
     }
 
