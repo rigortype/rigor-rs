@@ -599,6 +599,59 @@ fn joined_index_write_keeps_indexed_narrowing() {
     );
 }
 
+/// rigor-rs#393: a `begin` whose rescue clause retries is re-evaluated by
+/// the reference under the retry edge's widened entry
+/// (`eval_retried_begin`). A local the protected body or a retrying clause
+/// writes is rebound there, which drops every indexed narrowing rooted at
+/// it, so `h[:a]` reads `Hash#[]` inside the `begin` and past it. The port
+/// kept the pre-arm `"s" | 1` record and fired `frobnicate` where the
+/// oracle is silent.
+///
+/// Every row below is fully silent on BOTH engines.
+#[test]
+fn retry_edge_index_write_drops_indexed_narrowing() {
+    for src in [
+        // The issue rows: the write in the `retry` predicate, and beside it.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  retry if (h[:a] ||= \"t\")\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\n  retry if ENV[\"K\"]\nend\nh[:a].frobnicate\n"[..],
+        // A body that does not always raise, and a bare `retry`.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  Integer(ENV[\"K\"])\nrescue\n  retry if (h[:a] ||= \"t\")\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\n  retry\nend\nh[:a].frobnicate\n"[..],
+        // A write to another key, or in the protected body, crosses the edge too.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  retry if (h[:b] ||= \"t\")\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  h[:a] ||= \"t\"\n  raise \"e\"\nrescue\n  retry\nend\nh[:a].frobnicate\n"[..],
+        // Reads inside the `begin` see the widened entry as well.
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  h[:a].frobnicate\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\n  retry\nend\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\n  h[:a].frobnicate\n  retry\nend\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\n  retry\nensure\n  h[:a].frobnicate\nend\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence — the retry edge rebinds `h` — for {src:?}, got {diags:?}"
+        );
+    }
+}
+
+/// #393 controls — the record survives a `begin` whose arm cannot carry a
+/// write back: a `retry` with no write, an arm that writes and raises, and
+/// a read inside the body ahead of a non-retrying arm's write.
+#[test]
+fn retry_edge_without_write_keeps_indexed_narrowing() {
+    for src in [
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  retry\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\n  raise\nend\nh[:a].frobnicate\n"[..],
+        &b"h = {a: 1}\nh[:a] ||= \"s\"\nbegin\n  h[:a].frobnicate\n  raise \"e\"\nrescue\n  h[:a] ||= \"t\"\nend\n"[..],
+    ] {
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic for {src:?}, got {diags:?}");
+        assert!(
+            diags[0].message.contains("for \"s\" | 1"),
+            "expected `frobnicate` reported `for \"s\" | 1` for {src:?}, got {diags:?}"
+        );
+    }
+}
+
 /// rigor-rs#382: `call.argument-type-mismatch`'s class-level rejection is the
 /// reference's `class_subtype_result`, which resolves BOTH names via
 /// `const_get` on the host process (acceptance.rb `resolve_class`). An arg
