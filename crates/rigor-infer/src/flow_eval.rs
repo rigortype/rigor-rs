@@ -849,6 +849,7 @@ impl<'i> Typer<'i> {
                     dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
                     loops: Vec::new(),
                     ifs: Vec::new(),
+                    record_guards: Vec::new(),
                 }
             }
         };
@@ -898,6 +899,7 @@ impl<'i> Typer<'i> {
             }
             self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, &indexed, &dead, interner);
         }
+        let record_guards = self.collect_record_guards(ast, &indexed);
         CheckFlow {
             env,
             boundaries,
@@ -908,6 +910,7 @@ impl<'i> Typer<'i> {
             dead,
             loops: self.collect_loop_edges(ast),
             ifs: self.collect_if_edges(ast),
+            record_guards,
         }
     }
 
@@ -1202,6 +1205,9 @@ impl<'i> Typer<'i> {
         let mut base = base;
         self.loop_edge_overlay(ast, flow, site, &mut base, interner);
         self.if_edge_overlay(ast, flow, site, &mut base, interner);
+        // rigor-rs#405 — a class guard's rebind drops the records rooted at
+        // its local, on both edges and past the join.
+        self.record_guard_overlay(&flow.record_guards, site, &mut base, interner);
         if let Some(subjects) = flow.dead.subjects_at(site) {
             let mut env = base.into_owned();
             for (name, op) in subjects {
@@ -3775,6 +3781,9 @@ pub struct CheckFlow {
     /// Every `if`/`unless` whose predicate reads a local — the per-edge
     /// narrowing an inside-arm or post-`if` site reads (rigor-rs#451).
     ifs: Vec<IfEdges>,
+    /// rigor-rs#405 — every class guard whose local holds an indexed
+    /// record, for [`Typer::record_guard_overlay`].
+    record_guards: Vec<crate::record_guards::RecordGuard>,
 }
 
 /// One `while`/`until` loop for [`Typer::loop_edge_overlay`].

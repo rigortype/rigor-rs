@@ -60,6 +60,7 @@ mod guard_suppression;
 mod loop_edges;
 mod nilable;
 mod reach;
+mod record_guards;
 mod reach_index;
 mod reach_memo;
 mod typer;
