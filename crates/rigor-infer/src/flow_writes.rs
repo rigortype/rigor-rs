@@ -2093,6 +2093,12 @@ pub(crate) struct IndexedFlow {
     /// reference's `SCOPE_BODY_NODES`, whose writes are another scope's
     /// ([`widen_clause_entry`], upstream #1837).
     pub scope_spans: Vec<rigor_parse::Span>,
+    /// rigor-rs#393 — `(begin span, local)` for every local a retrying
+    /// `begin` rebinds or mutates on its retry edge (the protected body or a
+    /// retrying clause). The check flow alone fills it
+    /// (`Typer::retry_edge_index_drops`); every other consumer leaves it
+    /// empty.
+    pub retry_drops: Vec<(rigor_parse::Span, String)>,
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s

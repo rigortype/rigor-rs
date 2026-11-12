@@ -108,6 +108,8 @@ impl<'i> Typer<'i> {
     ) {
         for &s in stmts {
             self.nil_flow_stmt(ast, s, tenv, nenv, penv, writes, rebinds, interner, out);
+            // rigor-rs#449: the `$~` / `$N` state `Regexp.last_match` reads.
+            self.match_globals_after_stmt(ast, s, tenv, interner);
         }
     }
 
@@ -526,6 +528,11 @@ impl<'i> Typer<'i> {
                         btenv.remove(name);
                         bpenv.remove(name.as_str());
                     }
+                    // A block body starts without the enclosing match
+                    // (rigor-rs#449): when the block runs, and what it
+                    // rebinds first, is the reference's frame analysis
+                    // (`FreshFrameBlocks`, `YieldingMatch`), not ported.
+                    crate::match_globals::forget(&mut btenv);
                     self.nil_flow_scope(
                         ast, &block_body, &mut btenv, &mut bnenv, &mut bpenv, writes, rebinds,
                         interner, out,
@@ -848,7 +855,18 @@ impl<'i> Typer<'i> {
                         // binds `$~` to `MatchData` on block entry, so the
                         // zero-arg form is non-nil there. Decline.
                         [] if self.in_yielding_match_block(ast, value_id, tenv, interner) => None,
+                        // rigor-rs#449 (`RegexpFolding.fold_last_match`): an
+                        // early-exit guard proved the match, so `$~` is a
+                        // `MatchData` and the read is non-nil.
+                        [] if crate::match_globals::proven(tenv) => None,
                         [] => Some("MatchData"),
+                        // `fold_last_match_group`: `(N)` for a pinned
+                        // positive Integer is `String` when group N is
+                        // unconditional in the proven match. An optional
+                        // group, a name or any other index stays `String?`.
+                        [only] if self.last_match_group_proven(ast, *only, tenv, interner) => {
+                            None
+                        }
                         // A splat lowers to `Statements` (receiver-call args) or
                         // `Other` (`...` forwarding) — arity unknown, decline.
                         [only] if !matches!(

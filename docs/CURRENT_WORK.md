@@ -62,6 +62,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` exit guards record `$~` + mandatory `$N`; `Regexp.last_match` no longer a nil source. 0 FP/658; follow-ups #597/#598. [note](notes/20261112-issue-449-match-globals.md)
+- **2026-11-12 #438 `class_ivar_scope` memo key** (PR #588): reads in one class body share the `IvarScope`; required shapes ~pre-#432 RSS, output byte-identical. [note](notes/20261112-issue-438-ivar-scope-memo.md)
+- **2026-11-12 #393 retry-edge indexed narrowings** (PR #590): retry-rebound/mutated locals drop rooted `h[k]` records inside and after `begin`. ~22 FP rows closed, 0 FP/658; follow-ups #592/#593. [note](notes/20261112-issue-393-retry-index-drop.md)
 - **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver, unbuildable fallback, singleton nil bit. Brief rows byte-identical; 0 FP/658; follow-ups #584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
 - **2026-11-12 #398 Kernel termination** (PR #575): dead-code termination uses `kernel_call_terminates`, not block timing's project-defines veto; explicit `Kernel.*` always terminates. 13+3 FP rows closed, 0 FP/658; follow-ups #581–#583. [note](notes/20261112-issue-398-kernel-termination.md)
 - **2026-11-12 #349 Psych YAML errors** (PR #576): libyaml `context_mark`/problem/context render Psych positions/details incl. `hexdecimal`; BOM parity. 0 FP; follow-ups #579/#580. [note](notes/20261112-issue-349-yaml-fidelity.md)

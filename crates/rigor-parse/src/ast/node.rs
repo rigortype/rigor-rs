@@ -259,10 +259,19 @@ pub enum Node {
     FloatLit { value: f64, span: Span },
     /// A regexp literal (`/re/`). Interpolated regexps lower through the
     /// generic recovery path (their children stay reachable) — this variant is
-    /// the PLAIN literal only. It carries no value: every consumer needs only
-    /// "is a regexp literal" (sig-gen erases it to the `Regexp` nominal,
-    /// rigor-rs#493 item 7).
-    RegexpLit { span: Span },
+    /// the PLAIN literal only. Most consumers need only "is a regexp literal"
+    /// (sig-gen erases it to the `Regexp` nominal, rigor-rs#493 item 7).
+    RegexpLit {
+        /// The pattern source — Prism's `unescaped`, the input the
+        /// reference's `RegexMatchPattern` counts capture groups on
+        /// (`narrowing.rb` `regex_operand_pattern`, rigor-rs#449).
+        source: String,
+        /// The `//x` flag: free whitespace and `#` comments make the
+        /// group count unreliable, so the reference declines the match
+        /// edge for it.
+        extended: bool,
+        span: Span,
+    },
     /// A rational literal (`3r`) — nominal `Rational` (rigor-rs#493 item 7).
     RationalLit { span: Span },
     /// An imaginary literal (`3i`) — nominal `Complex` (rigor-rs#493 item 7).

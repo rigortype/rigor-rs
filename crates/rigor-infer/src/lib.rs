@@ -58,6 +58,7 @@ mod flow_eval;
 mod flow_writes;
 mod guard_suppression;
 mod loop_edges;
+mod match_globals;
 mod nilable;
 mod reach;
 mod record_guards;
