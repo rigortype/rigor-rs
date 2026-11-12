@@ -36,6 +36,7 @@ use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, Span, StatementsKind};
 
 use rigor_types::Scalar;
 
+use crate::block_call::NON_RETURNING_KERNEL_CALLS;
 use crate::source_index::DefKind;
 use crate::Typer;
 
@@ -1390,19 +1391,69 @@ impl<'i> Typer<'i> {
                     // `branch_terminates?`'s OTHER half — a `Bot`-typed call
                     // terminates too (`statement_evaluator.rb:4997`): the
                     // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
-                    // `::Kernel.abort`) and an implicit-self call a same-file
-                    // toplevel `def` answers with a provably-bot body
-                    // (`begin 1 rescue q = 1; die end`, rigor-rs#386). The
-                    // `self_type_answers?` veto gates the toplevel-def half:
-                    // `die` inside `class C; def die` dispatches to C's own
-                    // method, not the private `Object` one.
-                    || self.call_declares_bot(ast, id)
+                    // `::Kernel.abort`, [`Self::kernel_call_terminates`]) and
+                    // an implicit-self call a same-file toplevel `def`
+                    // answers with a provably-bot body (`begin 1 rescue q =
+                    // 1; die end`, rigor-rs#386). The `self_type_answers?`
+                    // veto gates the toplevel-def half: `die` inside `class
+                    // C; def die` dispatches to C's own method, not the
+                    // private `Object` one.
+                    || self.kernel_call_terminates(ast, id)
                     || (receiver.is_none()
                         && !self.self_answers(ast, *span, method)
                         && self.def_exits(ast, method, seen))
             }
             _ => false,
         }
+    }
+
+    /// `branch_terminates?`'s Bot half for a Kernel non-returning call
+    /// (`raise`, `fail`, `throw`, `exit`, `exit!`, `abort`): does the
+    /// reference's dispatch type the call `bot`? Its answer is Kernel's RBS
+    /// `bot` return unless a project TOPLEVEL `def` of the name binds at the
+    /// site, so block-call timing's coarse `project_defines_anywhere` veto
+    /// ([`Self::call_declares_bot`]) does not apply here (rigor-rs#398,
+    /// probed with `type-of` and `check`):
+    ///
+    /// - `Kernel.` / `::Kernel.` always reaches Kernel's own singleton:
+    ///   `Kernel.raise` is `bot` beside `class C; def raise`, a toplevel
+    ///   `def raise`, or a reopened `module Kernel; def self.raise`.
+    /// - an implicit-self call is `bot` beside a `def` on an unrelated class,
+    ///   on a reopened `Object`/`Kernel`, or on the caller's own class
+    ///   (`class C; def exit!; end; def m; exit!` — Kernel's RBS declaration
+    ///   outranks the own body). Only a project toplevel `def` (same file or
+    ///   cross-file, block-nested call sites included) takes the call off
+    ///   Kernel, and then only where the site's `self` does not answer the
+    ///   name itself ([`Self::self_answers`]). That bound call is the
+    ///   caller's [`Self::def_exits`] question, not this one.
+    pub(crate) fn kernel_call_terminates(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        let Node::Call {
+            receiver,
+            method,
+            span,
+            ..
+        } = ast.get(id)
+        else {
+            return false;
+        };
+        if !NON_RETURNING_KERNEL_CALLS.contains(&method.as_str())
+            || !self.kernel_spelled_receiver(ast, *receiver)
+        {
+            return false;
+        }
+        receiver.is_some() || !self.toplevel_def_binds(ast, *span, method)
+    }
+
+    /// Whether an implicit-self `method` call at `site` binds a project
+    /// TOPLEVEL `def` on the reference: the project's `<toplevel>` table
+    /// holds the name and the site's own `self` does not answer it first.
+    /// An `Object` reopen (`class Object; def exit!`, `Object.class_eval do
+    /// def exit!`) is not one — `exit!` stays `bot` beside either — so the
+    /// file-scope [`crate::reach_index::ReachIndex::toplevel_def`] scan,
+    /// which counts a block-nested `def`, is not consulted. An empty index
+    /// answers `false`: the arm terminates, the decline side.
+    fn toplevel_def_binds(&self, ast: &LoweredAst, site: Span, method: &str) -> bool {
+        self.source.is_project_toplevel_def(method) && !self.self_answers(ast, site, method)
     }
 
     /// Whether an implicit-self `method` call types `bot` on the oracle
@@ -1505,7 +1556,7 @@ impl<'i> Typer<'i> {
             } => {
                 receiver.is_some_and(|r| self.stmt_bot(ast, r, seen))
                     || args.iter().any(|&a| self.stmt_bot(ast, a, seen))
-                    || self.call_declares_bot(ast, id)
+                    || self.kernel_call_terminates(ast, id)
                     || (receiver.is_none()
                         && !self.self_answers(ast, *span, method)
                         && self.def_exits(ast, method, seen))
