@@ -1902,10 +1902,14 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
             });
         }
     };
-    let value = parse_yaml(&text).map_err(|e| {
+    // `File.open(path, 'r:bom|utf-8')` drops a leading UTF-8 BOM before
+    // libyaml sees the text; serde_yaml forces UTF-8 on libyaml, which then
+    // reads U+FEFF as content (a column, and `\u{feff}...` a scalar).
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    let value = parse_yaml(text).map_err(|e| {
         // Re-render as upstream's `#{absolute}:#{e.line}:#{e.column}: not
         // valid YAML: #{[e.problem, e.context].compact.join(" ")}` (exit 64).
-        let (line, column, detail) = psych_render(&text, &e.to_string());
+        let (line, column, detail) = psych_render(text, &e.to_string());
         LoadFailure {
             message: format!("{}:{line}:{column}: not valid YAML: {detail}", absolute.display()),
             code: 64,
@@ -4723,6 +4727,29 @@ mod severity_config_tests {
         std::fs::write(dir.join("bom.yml"), b"\xef\xbb\xbfpaths: [src]\n").unwrap();
         let cfg = parsed(&dir.join("bom.yml"));
         assert_eq!(cfg.paths, vec![dir.join("src").display().to_string()]);
+        // ... and is not a column: `r:bom|utf-8` strips it before libyaml
+        // (oracle: `<BOM>[a` → `1:1`, `<BOM>...` → the `...` parse error).
+        for (bytes, want) in [
+            (
+                &b"\xef\xbb\xbf[a\n"[..],
+                ":1:1: not valid YAML: did not find expected ',' or ']' \
+                 while parsing a flow sequence",
+            ),
+            (
+                &b"\xef\xbb\xbf...\n"[..],
+                ":1:1: not valid YAML: did not find expected node content \
+                 while parsing a block node",
+            ),
+        ] {
+            std::fs::write(dir.join("bom.yml"), bytes).unwrap();
+            match Config::read(&dir.join("bom.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 64);
+                    assert!(f.message.ends_with(want), "{bytes:?} → {:?}", f.message);
+                }
+                _ => panic!("{bytes:?} must be a fatal parse error"),
+            }
+        }
         std::fs::remove_dir_all(&dir).ok();
     }
 

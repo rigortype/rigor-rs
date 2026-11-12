@@ -86,5 +86,9 @@ unsafe fn c_string(ptr: *const i8) -> Option<String> {
         return None;
     }
     // SAFETY: the caller's contract.
-    Some(unsafe { CStr::from_ptr(ptr.cast()) }.to_string_lossy().into_owned())
+    Some(
+        unsafe { CStr::from_ptr(ptr.cast()) }
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
