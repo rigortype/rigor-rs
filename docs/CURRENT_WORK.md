@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-12 #349 Psych YAML errors** (PR #576): libyaml `context_mark`/problem/context render Psych positions/details incl. `hexdecimal`; BOM parity. 0 FP; follow-ups #579/#580. [note](notes/20261112-issue-349-yaml-fidelity.md)
 - **2026-11-12 #384 ATM describe labels** (PR #573): nested union/optional/alias members flatten before `union_describe`; `Other` strips only root `::`. 12 rows byte-identical, 0 FP; follow-ups #577/#578. [note](notes/20261112-issue-384-render-other-drift.md)
 - **2026-08-10 post-`if` write join** (issue #443 → PR #572) — `v = nil if p` joins `entry ∪ arm-write` (incl. `op=` + destructure binds) instead of a blanket `Dynamic`; `w = v ? 1 : "s"` unions correctly. Union-witness declines remain. [note](notes/20260810-if-write-join.md)
 - **2026-08-10 `if`-edge narrowing: join per-edge narrowed types for predicate subjects** (issue #451 → PR #571) — `Empty` join semantics (`T ∪ Bot`), terminating-arm liveness (`return`/`throw`/`exit`/`abort`/`fail`), `expr_truthiness` on unmodeled predicates, `&.` on nil carriers, `bind_statement`/`if_edge_overlay` widened-on-`Other` only. 4 review rounds; 0 FP. [note](notes/20260810-if-edge-narrowing.md)
