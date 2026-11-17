@@ -3,38 +3,59 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 53,
+      "line": 118,
       "column": 3,
       "severity": "error",
       "message": "undefined method `tk_greetingx' for 1"
     },
     {
       "rule": "call.undefined-method",
-      "line": 54,
+      "line": 119,
       "column": 8,
       "severity": "error",
       "message": "undefined method `tk_innerx' for \"text\""
     },
     {
       "rule": "call.undefined-method",
-      "line": 58,
+      "line": 123,
       "column": 3,
       "severity": "error",
       "message": "undefined method `tk_extended' for 1"
     },
     {
       "rule": "call.unresolved-toplevel",
-      "line": 52,
+      "line": 117,
       "column": 1,
       "severity": "warning",
       "message": "unresolved toplevel call to `tk_greetingx`. If a project file defines `tk_greetingx` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
     },
     {
       "rule": "call.unresolved-toplevel",
-      "line": 57,
+      "line": 122,
       "column": 1,
       "severity": "warning",
       "message": "unresolved toplevel call to `tk_extended`. If a project file defines `tk_extended` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 124,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tk_public_sent`. If a project file defines `tk_public_sent` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 125,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tk_var_each`. If a project file defines `tk_var_each` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 126,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `tk_in_lambda`. If a project file defines `tk_in_lambda` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
     }
   ]
 }
