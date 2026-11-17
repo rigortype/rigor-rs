@@ -28,9 +28,10 @@ submodule rather than tracked against a drifting local checkout.
 > widened (#2995/#3004/#3007 — `self.include`, send spellings except
 > `public_send`, control-flow/def/value-position/iterator-block includes all
 > count) — **ported** in `ancestry_facts.rs` — and the alias-mutation floor
-> (#2677, ~840 lines of upstream alias-link machinery) — **NOT ported**; fixture
-> 168 carries the 2-FP repro and the branch stays open until it lands. The sweep
-> was not run (no corpora on the bump host). See the
+> (#2677) — **copy-link slice ported** in `flow_writes`/`flow_eval`
+> (element/ivar/argument/foreign links + the gradual `widen_store` answer open
+> at rigor-rs#600). Fixture gate: **0 unregistered, 959/1063 matched.** The
+> sweep was not run (no corpora on the bump host). See the
 > [note](docs/notes/20261115-repin-v048.md).
 
 > **`v0.4.6 → v0.4.7` (2026-11-05): 909 commits, step eight (last).** Re-vendored

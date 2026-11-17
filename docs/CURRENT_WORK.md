@@ -11,10 +11,11 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **IN FLIGHT: re-pin `v0.4.7 → v0.4.8`** (branch `claude/repin-v048`). Raw
-bump done; the mixin-call rework ported (#2995/#3004/#3007/#2998/#3010);
-**blocked on the alias-mutation floor (#2677)** — fixture 168 carries the
-2-FP repro. Sweep not run (no corpora on the bump host). See
+▶ **IN FLIGHT: re-pin `v0.4.7 → v0.4.8`** (branch `claude/repin-v048`,
+draft PR #599). Raw bump done; mixin-call rework ported
+(#2995/#3004/#3007/#2998/#3010); the #2677 alias floor's copy-link slice
+ported (rest at #600) — fixture gate **0 FP, 959/1063**. Remaining before
+ready: sweep on the corpora host + review. See
 [note](notes/20261115-repin-v048.md).
 ▶ NEXT after it: the ADR-127 floor's coverage cost; follow-ups #489–#494.
 Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
