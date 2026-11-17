@@ -8,9 +8,10 @@
 #    reference DOES follow the alias — #2677's alias-mutation floor stales a
 #    copied literal when the object mutates through another name — so `g[0]`
 #    reads the floored element union and `g[0][1].succ`, `g[0][0].zork` and
-#    `g[0].size == 2` are all silent there. The port lacks the floor: rows 20
-#    and 21 are the pinned #2677 repro (2 unregistered FPs until it lands;
-#    see docs/notes/20261115-repin-v048.md). `g[0][1]` still types as `1` on
+#    `g[0].size == 2` are all silent there. The port's copy-link slice of
+#    that floor landed with the v0.4.8 repin (element/ivar/argument and
+#    foreign-locals links remain unported; see
+#    docs/notes/20261115-repin-v048.md). `g[0][1]` still types as `1` on
 #    the port because it does not project a declined Tuple read through the
 #    RBS tier.
 # 2. `<<` / `concat` with one argument on literal-bearing operands. The
@@ -22,8 +23,8 @@ f = [[1]]
 g = f
 f[0] << 2
 g[0][1].succ
-g[0][0].zork               # v0.4.8: silent on the reference (#2677 floor); port FP
-if g[0].size == 2 then puts 1 end   # v0.4.8: silent on the reference; port FP
+g[0][0].zork               # silent on both: v0.4.8 #2677 alias floor
+if g[0].size == 2 then puts 1 end   # silent on both: the copy's carrier is stale
 
 h = [1]
 h[1].succ

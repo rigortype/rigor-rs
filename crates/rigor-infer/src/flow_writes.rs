@@ -365,7 +365,59 @@ pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
             *table.rebinds.entry(name).or_insert(0) += 1;
         }
     }
+    // Upstream #2677 — a copy `bound = source` may share one object, so a
+    // content mutation through either name stales the other's literal
+    // carrier. Every mutation mark propagates across the copy link whose
+    // site may have run first ([`alias_floor_reaches`]): the
+    // bare-receiver marks above, and element mutators like `f[0] << 2`
+    // the [`collect_indexed_flow`] slot-mutation table names (`raw_flow_
+    // writes` only marks bare-local receivers).
+    let links = toplevel_alias_links(ast);
+    if !links.is_empty() {
+        let mut marks: Vec<(rigor_parse::Span, String)> = Vec::new();
+        for (name, spans) in &table.mutation_spans {
+            for s in spans {
+                marks.push((*s, name.clone()));
+            }
+        }
+        for m in &collect_indexed_flow(ast).slot_mutations {
+            marks.push((m.span, m.name.clone()));
+        }
+        for (lspan, bound, source) in &links {
+            for (wspan, name) in &marks {
+                let other = if name == bound {
+                    source
+                } else if name == source {
+                    bound
+                } else {
+                    continue;
+                };
+                if alias_floor_reaches(ast, *lspan, *wspan) {
+                    table
+                        .mutation_spans
+                        .entry(other.clone())
+                        .or_default()
+                        .push(*wspan);
+                }
+            }
+        }
+    }
     table
+}
+
+/// Whether a copy-link site at `lspan` may have run before a mutation at
+/// `wspan` — earlier in the body, or anywhere inside an iterated body the
+/// mutation also sits in (the copy may have run on an earlier pass).
+/// [`floor_alias_linked`] applies the same rule in the check env.
+pub(crate) fn alias_floor_reaches(
+    ast: &LoweredAst,
+    lspan: rigor_parse::Span,
+    wspan: rigor_parse::Span,
+) -> bool {
+    lspan.0 < wspan.0
+        || ast.iterated_body_spans().iter().any(|ib| {
+            ib.0 <= lspan.0 && lspan.1 <= ib.1 && ib.0 <= wspan.0 && wspan.1 <= ib.1
+        })
 }
 
 pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
@@ -2076,6 +2128,34 @@ pub(crate) struct SlotMutation {
     pub method: String,
 }
 
+/// Upstream v0.4.8 (`alias_mutation_floor.rb`, #2677) — the copy links
+/// `bound = source` at the TOP level: a `LocalVariableWrite` whose value
+/// is a bare `LocalVariableRead`. Both names then may hold one object, so
+/// a mutation through either reaches the other local's binding. The full
+/// upstream scan also links container elements, ivars, arguments and
+/// foreign locals; the port's slice covers the copy link only (see
+/// `docs/notes/20261115-repin-v048.md` §3). `(write span, bound, source)`.
+pub(crate) fn toplevel_alias_links(
+    ast: &LoweredAst,
+) -> Vec<(rigor_parse::Span, String, String)> {
+    let (scopes, _) = toplevel_scope_filters(ast);
+    ast.iter()
+        .filter_map(|(_, n)| match n {
+            Node::LocalVariableWrite {
+                name, value, span, ..
+            } => {
+                if let Node::LocalVariableRead { name: source, .. } = ast.get(*value) {
+                    if !scopes.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) {
+                        return Some((*span, name.clone(), source.clone()));
+                    }
+                }
+                None
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 /// The indexed-narrowing facts one file contributes (rigor-rs#325).
 #[derive(Default)]
 pub(crate) struct IndexedFlow {
@@ -2099,6 +2179,10 @@ pub(crate) struct IndexedFlow {
     /// (`Typer::retry_edge_index_drops`); every other consumer leaves it
     /// empty.
     pub retry_drops: Vec<(rigor_parse::Span, String)>,
+    /// Upstream #2677 copy links `bound = source` (see
+    /// [`toplevel_alias_links`]). Filled by the check flow after the dead
+    /// filter; empty for every other consumer.
+    pub alias_links: Vec<(rigor_parse::Span, String, String)>,
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
@@ -2192,5 +2276,6 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
             _ => {}
         }
     }
+    flow.alias_links = toplevel_alias_links(ast);
     flow
 }
