@@ -1810,6 +1810,30 @@ impl<'i> Typer<'i> {
                 self.apply_slot_mutation(ast, &flow.indexed, id, m, env, interner);
             }
         }
+        // Upstream #2677 — mutations the named tables filter out (a
+        // block-local `b << "s"` whose `b` was bound to `a`'s object, a
+        // `def`-internal mutator) still reach the shared object: floor
+        // every copy-linked local they cover. Toplevel mutations appear
+        // here too, so a floor can run twice — `widen_mutated_binding`
+        // declines an already-widened carrier, keeping it idempotent.
+        for am in &flow.indexed.alias_mutations {
+            if am.span.0 >= span.0
+                && am.span.1 <= span.1
+                && flow.dead.write_reaches(am.span, site)
+                && !ast.in_block_break_locals_only_carrier(am.span)
+            {
+                self.floor_alias_linked(
+                    ast,
+                    &flow.indexed,
+                    &am.name,
+                    &am.method,
+                    am.span,
+                    am.part_only,
+                    env,
+                    interner,
+                );
+            }
+        }
     }
 
     /// Replay `owner`'s own [`closure_mutations`](crate::closure_mutations)
@@ -2131,27 +2155,48 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
-        for (lspan, bound, source) in &indexed.alias_links {
-            let other = if bound == name {
-                source.as_str()
-            } else if source == name {
-                bound.as_str()
-            } else {
-                continue;
-            };
-            if other == name {
-                continue;
+        // A compound index write (`h[k] ||= v` / `&&=` / `op=`) is not an
+        // upstream floor trigger — only `CallNode` shape mutators and the
+        // plain `=` store are.
+        if indexed.non_floorable.contains(&wspan) {
+            return;
+        }
+        // The reach closes over chained copies (upstream
+        // `AliasMutationFloor.reach`): `a = b; b = c; c << x` floors `a`
+        // and `b`. Each link's own site decides whether it may have run
+        // before this mutation.
+        let mut queue: Vec<String> = vec![name.to_string()];
+        let mut seen: std::collections::HashSet<String> =
+            [name.to_string()].into_iter().collect();
+        let mut i = 0;
+        while i < queue.len() {
+            let cur = queue[i].clone();
+            i += 1;
+            for (lspan, bound, source) in &indexed.alias_links {
+                let other = if *bound == cur {
+                    source.as_str()
+                } else if *source == cur {
+                    bound.as_str()
+                } else {
+                    continue;
+                };
+                if seen.contains(other)
+                    || !crate::flow_writes::alias_floor_reaches(ast, *lspan, wspan)
+                {
+                    continue;
+                }
+                seen.insert(other.to_string());
+                queue.push(other.to_string());
             }
-            if !crate::flow_writes::alias_floor_reaches(ast, *lspan, wspan) {
-                continue;
-            }
+        }
+        for other in queue.iter().skip(1) {
             if let Some(&pre) = env.get(other) {
                 if part_only && !self.mutable_parts(pre, interner) {
                     continue;
                 }
                 if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
                     if widened != pre {
-                        env.insert(other.to_string(), widened);
+                        env.insert(other.clone(), widened);
                     }
                 }
             }
@@ -2933,6 +2978,24 @@ impl<'i> Typer<'i> {
                 self.apply_slot_mutation(ast, indexed, root, m, env, interner);
             }
         }
+        // Upstream #2677 — the unfiltered `alias_mutations` covers the
+        // block- and def-internal mutators the named tables drop; a
+        // toplevel mutation may floor twice, harmlessly
+        // (`widen_mutated_binding` declines an already-widened carrier).
+        for am in &indexed.alias_mutations {
+            if am.span.0 >= span.0 && am.span.1 <= span.1 {
+                self.floor_alias_linked(
+                    ast,
+                    indexed,
+                    &am.name,
+                    &am.method,
+                    am.span,
+                    am.part_only,
+                    env,
+                    interner,
+                );
+            }
+        }
     }
 
     /// The `h[k] -> stored` pairs every in-span `operand` `||=` writes —
@@ -3050,6 +3113,24 @@ impl<'i> Typer<'i> {
                         );
                     }
                 }
+            }
+        }
+        // Upstream #2677 — the unfiltered `alias_mutations` covers the
+        // block- and def-internal mutators the named tables drop; a
+        // toplevel mutation may floor twice, harmlessly
+        // (`widen_mutated_binding` declines an already-widened carrier).
+        for am in &indexed.alias_mutations {
+            if am.span.0 >= span.0 && am.span.1 <= span.1 {
+                self.floor_alias_linked(
+                    ast,
+                    indexed,
+                    &am.name,
+                    &am.method,
+                    am.span,
+                    am.part_only,
+                    env,
+                    interner,
+                );
             }
         }
     }

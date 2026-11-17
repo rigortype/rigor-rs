@@ -367,12 +367,19 @@ pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
     }
     // Upstream #2677 — a copy `bound = source` may share one object, so a
     // content mutation through either name stales the other's literal
-    // carrier. Every mutation mark propagates across the copy link whose
-    // site may have run first ([`alias_floor_reaches`]): the
-    // bare-receiver marks above, and element mutators like `f[0] << 2`
-    // the [`collect_indexed_flow`] slot-mutation table names (`raw_flow_
-    // writes` only marks bare-local receivers).
-    let links = toplevel_alias_links(ast);
+    // carrier, and the reach closes over chained copies (`a = b; b = c`
+    // stale `a` on `c << x`). Every mutation mark propagates across the
+    // copy links whose site may have run first ([`alias_floor_reaches`]),
+    // to a fixpoint: the bare-receiver marks above, the element mutators
+    // like `f[0] << 2` the named slot-mutation table names (`raw_flow_
+    // writes` only marks bare-local receivers), and the unfiltered
+    // `alias_mutations` (a block- or def-local's mutator can reach a
+    // shared object upstream's `aliased_at` covers). A compound index
+    // write's `[]=` mark (`non_floorable`) never propagates — upstream
+    // triggers the floor on `CallNode` mutators and the plain store
+    // only.
+    let indexed = collect_indexed_flow(ast);
+    let links = &indexed.alias_links;
     if !links.is_empty() {
         let mut marks: Vec<(rigor_parse::Span, String)> = Vec::new();
         for (name, spans) in &table.mutation_spans {
@@ -380,24 +387,41 @@ pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
                 marks.push((*s, name.clone()));
             }
         }
-        for m in &collect_indexed_flow(ast).slot_mutations {
+        for m in &indexed.slot_mutations {
             marks.push((m.span, m.name.clone()));
         }
-        for (lspan, bound, source) in &links {
-            for (wspan, name) in &marks {
-                let other = if name == bound {
-                    source
-                } else if name == source {
-                    bound
-                } else {
-                    continue;
-                };
-                if alias_floor_reaches(ast, *lspan, *wspan) {
-                    table
-                        .mutation_spans
-                        .entry(other.clone())
-                        .or_default()
-                        .push(*wspan);
+        for m in &indexed.alias_mutations {
+            marks.push((m.span, m.name.clone()));
+        }
+        let mut changed = true;
+        while changed {
+            changed = false;
+            let snapshot: Vec<(rigor_parse::Span, String)> = table
+                .mutation_spans
+                .iter()
+                .flat_map(|(n, ss)| ss.iter().map(move |s| (*s, n.clone())))
+                .chain(marks.iter().cloned())
+                .collect();
+            for (lspan, bound, source) in links {
+                for (wspan, name) in &snapshot {
+                    if indexed.non_floorable.contains(wspan) {
+                        continue;
+                    }
+                    let other = if name == bound {
+                        source
+                    } else if name == source {
+                        bound
+                    } else {
+                        continue;
+                    };
+                    if !alias_floor_reaches(ast, *lspan, *wspan) {
+                        continue;
+                    }
+                    let entry = table.mutation_spans.entry(other.clone()).or_default();
+                    if !entry.contains(wspan) {
+                        entry.push(*wspan);
+                        changed = true;
+                    }
                 }
             }
         }
@@ -2128,32 +2152,137 @@ pub(crate) struct SlotMutation {
     pub method: String,
 }
 
+/// Calls whose result is their receiver — upstream #2677
+/// `AliasMutationFloor::SELF_RETURNERS` (`CalleeWriteCensus`'s reading).
+const ALIAS_SELF_RETURNERS: &[&str] = &["tap", "itself", "freeze", "to_a", "to_h", "to_s"];
+
+/// The locals `node`'s value may evaluate to — upstream
+/// `AliasMutationFloor.each_may_be`: the local itself, one branch of a
+/// selection that may answer it (`if`/`ternary`, `||`, `&&`), or a call
+/// that answers its receiver. A `dup`/`a.size`/container read hands
+/// nothing on whole, so it contributes no name.
+fn may_be_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+    match ast.get(id) {
+        Node::LocalVariableRead { name, .. } => out.push(name.clone()),
+        Node::Call {
+            receiver: Some(r),
+            method,
+            ..
+        } if ALIAS_SELF_RETURNERS.contains(&method.as_str()) => {
+            may_be_locals(ast, *r, out);
+        }
+        Node::If {
+            then_body, else_body, ..
+        } => {
+            // A branch's value is its last statement.
+            for arm in then_body.iter().chain(else_body) {
+                may_be_locals(ast, *arm, out);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            may_be_locals(ast, *left, out);
+            may_be_locals(ast, *right, out);
+        }
+        _ => {}
+    }
+}
+
+/// Copy links `bound, c = …` inside a multi-assign: each `Local` (or
+/// `Nested`) target pairs positionally with its `ArrayLit` element —
+/// `b, c = a, 1` links `b` to `a`. A non-array RHS (`b, c = a`) binds
+/// elements, which the slice does not model; a splat slot binds a fresh
+/// remainder array, which links nothing.
+fn multi_target_alias_links(
+    ast: &LoweredAst,
+    targets: &rigor_parse::MultiTargets,
+    elements: &[NodeId],
+    span: rigor_parse::Span,
+    out: &mut Vec<(rigor_parse::Span, String, String)>,
+) {
+    for (target, element) in targets.lefts.iter().zip(elements.iter()) {
+        match target {
+            rigor_parse::MultiTarget::Local { name, .. } => {
+                let mut sources = Vec::new();
+                may_be_locals(ast, *element, &mut sources);
+                out.extend(sources.into_iter().map(|s| (span, name.clone(), s)));
+            }
+            rigor_parse::MultiTarget::Nested(nested) => {
+                if let Node::ArrayLit {
+                    elements: nested_elems,
+                    ..
+                } = ast.get(*element)
+                {
+                    multi_target_alias_links(ast, nested, nested_elems, span, out);
+                }
+            }
+            rigor_parse::MultiTarget::Index { .. } | rigor_parse::MultiTarget::Ignored { .. } => {}
+        }
+    }
+}
+
 /// Upstream v0.4.8 (`alias_mutation_floor.rb`, #2677) — the copy links
-/// `bound = source` at the TOP level: a `LocalVariableWrite` whose value
-/// is a bare `LocalVariableRead`. Both names then may hold one object, so
-/// a mutation through either reaches the other local's binding. The full
-/// upstream scan also links container elements, ivars, arguments and
-/// foreign locals; the port's slice covers the copy link only (see
+/// `bound = source` whose names then may hold ONE object, so a mutation
+/// through either reaches the other local's binding. Covers the
+/// `LocalVariableWrite` value forms upstream's `SiteCollector` links:
+/// a bare read, a self-returning call (`tap`/`itself`/`freeze`/`to_a`/
+/// `to_h`/`to_s`), a selection branch (`if`/`ternary`, `||`, `&&`), a
+/// `||=`/`&&=` write, and a positional multi-assign target — in every
+/// local scope, not only the top level (a `def` body's own copy+mutation
+/// floors the same way upstream; a name-keyed link may over-link across
+/// scopes, the silence-safe direction). The full upstream scan also
+/// links container elements, ivars, arguments and foreign locals; the
+/// port's slice covers the copy link only (see
 /// `docs/notes/20261115-repin-v048.md` §3). `(write span, bound, source)`.
 pub(crate) fn toplevel_alias_links(
     ast: &LoweredAst,
 ) -> Vec<(rigor_parse::Span, String, String)> {
-    let (scopes, _) = toplevel_scope_filters(ast);
-    ast.iter()
-        .filter_map(|(_, n)| match n {
+    let mut out = Vec::new();
+    for (_, n) in ast.iter() {
+        match n {
             Node::LocalVariableWrite {
                 name, value, span, ..
             } => {
-                if let Node::LocalVariableRead { name: source, .. } = ast.get(*value) {
-                    if !scopes.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) {
-                        return Some((*span, name.clone(), source.clone()));
-                    }
-                }
-                None
+                let mut sources = Vec::new();
+                may_be_locals(ast, *value, &mut sources);
+                out.extend(sources.into_iter().map(|s| (*span, name.clone(), s)));
             }
-            _ => None,
-        })
-        .collect()
+            Node::LocalVariableOpWrite {
+                name,
+                value,
+                op: rigor_parse::OpWriteKind::Or | rigor_parse::OpWriteKind::And,
+                span,
+            } => {
+                let mut sources = Vec::new();
+                may_be_locals(ast, *value, &mut sources);
+                out.extend(sources.into_iter().map(|s| (*span, name.clone(), s)));
+            }
+            Node::MultiWrite {
+                targets, value, span, ..
+            } => {
+                if let Node::ArrayLit { elements, .. } = ast.get(*value) {
+                    multi_target_alias_links(ast, targets, elements, *span, &mut out);
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// A mutator call the alias floor (`floor_alias_linked`) may trigger on —
+/// `(span, receiver local, method, part_only)` — collected WITHOUT the
+/// scope and shadow filters the named tables apply: a mutation inside a
+/// block or `def` body may still reach a shared object upstream's
+/// `aliased_at` says a deferred-closure call sees (`[1].each { b = a;
+/// b << "s" }` floors `a`, oracle-measured). `part_only` marks the
+/// element-path mutations (`f[0] << x`), floored on a copy only under
+/// `mutable_parts`.
+#[derive(Clone, Debug)]
+pub(crate) struct AliasMutation {
+    pub span: rigor_parse::Span,
+    pub name: String,
+    pub method: String,
+    pub part_only: bool,
 }
 
 /// The indexed-narrowing facts one file contributes (rigor-rs#325).
@@ -2183,6 +2312,18 @@ pub(crate) struct IndexedFlow {
     /// [`toplevel_alias_links`]). Filled by the check flow after the dead
     /// filter; empty for every other consumer.
     pub alias_links: Vec<(rigor_parse::Span, String, String)>,
+    /// Mutator calls the alias floor may trigger on (see
+    /// [`AliasMutation`]), in every scope — the named `flow.mutations` /
+    /// `slot_mutations` tables' filters do not apply to a mutation whose
+    /// receiver is a block- or def-local bound to a shared object.
+    pub alias_mutations: Vec<AliasMutation>,
+    /// Spans whose `[]=` mark must NOT floor aliased copies: the compound
+    /// index writes (`h[k] ||= v` / `&&=` / `op=` — every [`Node::IndexWrite`]
+    /// is one; a plain `h[k] = v` stays a `[]=` [`Node::Call`]). Upstream's
+    /// floor triggers only on `CallNode` shape mutators and the plain
+    /// index store — `g[:b] += 9` leaves `f`'s slot `1` on the oracle
+    /// (review finding, oracle-verified).
+    pub non_floorable: std::collections::HashSet<rigor_parse::Span>,
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
@@ -2216,6 +2357,9 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 operand,
                 span,
             } => {
+                // Every `IndexWrite` is a compound (`||=`/`&&=`/`op=`) —
+                // upstream's alias floor does not trigger on it.
+                flow.non_floorable.insert(*span);
                 if !*operand {
                     continue;
                 }
@@ -2258,6 +2402,16 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                     continue;
                 }
                 if let Some((name, key)) = element_slot(ast, *r) {
+                    // An element-path mutation (`f[0] << x`) — the alias
+                    // floor sees it even when the receiver local is
+                    // block-shadowed (a block's `b` may share `a`'s
+                    // object); the named slot table keeps the filter.
+                    flow.alias_mutations.push(AliasMutation {
+                        span: *span,
+                        name: name.clone(),
+                        method: method.clone(),
+                        part_only: true,
+                    });
                     if shadowed(id, &name) {
                         continue;
                     }
@@ -2267,6 +2421,16 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                         name,
                         key,
                         method: method.clone(),
+                    });
+                } else if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    // A bare-receiver mutator (`f << x`, `f[k] = v`) —
+                    // the alias floor sees it even under a shadow scope
+                    // or inside a `def`/`class` body.
+                    flow.alias_mutations.push(AliasMutation {
+                        span: *span,
+                        name: name.clone(),
+                        method: method.clone(),
+                        part_only: false,
                     });
                 }
             }
