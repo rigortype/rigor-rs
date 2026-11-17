@@ -3802,4 +3802,6 @@ fn json_string(s: &str) -> String {
 // Tests for the additive CI output formats (github / sarif).
 // ---------------------------------------------------------------------------
 #[cfg(test)]
+mod analysis_stack_audit;
+#[cfg(test)]
 mod tests;
