@@ -15,13 +15,20 @@
 //! text — comments and literals blanked, so a `thread::spawn(` in a doc
 //! comment or string is not a hit — and fails on:
 //!
-//! - a call to the unbounded parse entry points (`rigor_parse::parse(`,
-//!   `ruby_prism::parse(`, and `crate::`/`self::`/`super::parse(` inside
-//!   rigor-parse), or a `use` importing the bare `parse` leaf;
+//! - the unbounded parse entry points (`rigor_parse::parse`,
+//!   `ruby_prism::parse`, and `crate::`/`self::`/`super::parse` inside
+//!   rigor-parse) — called or taken as a value — or a `use` importing
+//!   the bare `parse` leaf;
 //! - `ThreadPoolBuilder::new()`, `thread::Builder::new()`, `thread::spawn`
-//!   or `thread::scope`, unless the same builder chain names
-//!   `spawn_pool_thread` or `ANALYSIS_STACK_BYTES`, or the site is in the
-//!   `threads` helper module itself.
+//!   or `thread::scope` — called or taken as a value — unless the same
+//!   builder chain names `spawn_pool_thread` or `ANALYSIS_STACK_BYTES`,
+//!   or the site is in the `threads` helper module itself.
+//!
+//! Call patterns are token sequences: whitespace around `::` and before
+//! `(` (legal Rust, and `cargo fmt --check` is not a gate here) does not
+//! bypass them, `spawn`/`scope` flag with or without `::<…>` turbofish or
+//! an immediate call, and a `use` that aliases (`… as x`) or globs
+//! (`…::*`) a flagged root flags too.
 //!
 //! `#[cfg(test)]` items are skipped, as are the files `#[cfg(test)] mod x;`
 //! declarations resolve to. Everything else is production code: a hit must
@@ -50,19 +57,19 @@ const THREADS_MODULE: &str = "rigor-cli/src/threads.rs";
 const ALLOW_LIST: &[(&str, &str, usize, &str)] = &[
     (
         "rigor-parse/src/lib.rs",
-        "ruby_prism::parse(",
+        "ruby_prism::parse",
         1,
         "the unbounded entry point's own definition",
     ),
     (
         "rigor-parse/src/depth.rs",
-        "ruby_prism::parse(",
+        "ruby_prism::parse",
         1,
         "parse_bounded's own parse — the depth bound runs on its result",
     ),
     (
         "rigor-parse/src/depth.rs",
-        "thread::scope(",
+        "thread::scope",
         1,
         "the refused-tree release: its thread's stack is sized from the source length, not \
          ANALYSIS_STACK_BYTES",
@@ -75,23 +82,38 @@ const ALLOW_LIST: &[(&str, &str, usize, &str)] = &[
     ),
     (
         "rigor-cli/src/sidecar.rs",
-        "thread::spawn(",
+        "thread::spawn",
         1,
         "the sidecar handshake reader: bounded pipe IO, no analysis",
     ),
 ];
 
-/// Unbounded-parse call-site literals. `crate::`/`self::`/`super::` qualify
-/// only inside rigor-parse, where they can reach the crate-root `parse`.
-const PARSE_CALLS: &[&str] = &["rigor_parse::parse(", "ruby_prism::parse("];
-const PARSE_CALLS_INTERNAL: &[&str] = &["crate::parse(", "self::parse(", "super::parse("];
+/// Unbounded-parse call patterns (token sequences — whitespace around
+/// `::` or before `(` cannot bypass them). No trailing `(`: a function
+/// value (`let f = rigor_parse::parse`) is the same hazard. `crate::`/
+/// `self::`/`super::` qualify only inside rigor-parse, where they can
+/// reach the crate-root `parse`.
+const PARSE_CALLS: &[&[&str]] = &[
+    &["rigor_parse", "::", "parse"],
+    &["ruby_prism", "::", "parse"],
+];
+const PARSE_CALLS_INTERNAL: &[&[&str]] = &[
+    &["crate", "::", "parse"],
+    &["self", "::", "parse"],
+    &["super", "::", "parse"],
+];
 
-/// Thread-creation literals. `ThreadPoolBuilder::new(` and
-/// `thread::Builder::new(` pass when their builder chain sets the analysis
-/// stack; the plain spawns never do, so they always need an allow-list
-/// entry outside `THREADS_MODULE`.
-const THREAD_BUILDERS: &[&str] = &["ThreadPoolBuilder::new(", "thread::Builder::new("];
-const THREAD_SPAWNS: &[&str] = &["thread::spawn(", "thread::scope("];
+/// Thread-creation patterns. `ThreadPoolBuilder::new` and
+/// `thread::Builder::new` pass when their builder chain sets the analysis
+/// stack. `thread::spawn`/`thread::scope` match WITHOUT the `(` — a
+/// turbofish (`spawn::<F,T>`) or a bare function value
+/// (`let f = thread::spawn`) is the same hazard — so they always need an
+/// allow-list entry outside `THREADS_MODULE`.
+const THREAD_BUILDERS: &[&[&str]] = &[
+    &["ThreadPoolBuilder", "::", "new", "("],
+    &["thread", "::", "Builder", "::", "new", "("],
+];
+const THREAD_SPAWNS: &[&[&str]] = &[&["thread", "::", "spawn"], &["thread", "::", "scope"]];
 
 /// Builder-chain tokens that prove the analysis stack is set.
 const STACK_PROOF: &[&str] = &["spawn_pool_thread", "ANALYSIS_STACK_BYTES"];
@@ -131,25 +153,34 @@ fn production_code_uses_bounded_parse_and_analysis_threads() {
         }
         let text = blank(&fs::read_to_string(path).unwrap_or_else(|e| panic!("{path:?}: {e}")));
         let spans = cfg_test_spans(&text);
-        let active = |at: usize| !spans.iter().any(|&(s, e)| at >= s && at < e);
+        let in_test = |at: usize| spans.iter().any(|&(s, e)| at >= s && at < e);
+        let uses = use_item_spans(&text);
+        let uses_active: Vec<(usize, usize)> =
+            uses.iter().copied().filter(|&(s, _)| !in_test(s)).collect();
+        let active = |at: usize| {
+            !in_test(at) && !uses.iter().any(|&(s, e)| at >= s && at < e)
+        };
         let internal = rel.starts_with("rigor-parse/");
         let mut hits: Vec<(usize, String)> = Vec::new();
-        let parse_calls: &[&str] = if internal { PARSE_CALLS_INTERNAL } else { &[] };
-        for &lit in PARSE_CALLS.iter().chain(parse_calls.iter()) {
-            hits.extend(find_calls(&text, lit, &active).into_iter().map(|at| (at, lit.to_string())));
+        let parse_calls: &[&[&str]] = if internal { PARSE_CALLS_INTERNAL } else { &[] };
+        for &pat in PARSE_CALLS.iter().chain(parse_calls.iter()) {
+            let tag = pattern_tag(pat);
+            hits.extend(find_seq(&text, pat, &active).into_iter().map(|(at, _)| (at, tag.clone())));
         }
-        for &lit in THREAD_SPAWNS {
-            hits.extend(find_calls(&text, lit, &active).into_iter().map(|at| (at, lit.to_string())));
+        for &pat in THREAD_SPAWNS {
+            let tag = pattern_tag(pat);
+            hits.extend(find_seq(&text, pat, &active).into_iter().map(|(at, _)| (at, tag.clone())));
         }
-        for &lit in THREAD_BUILDERS {
+        for &pat in THREAD_BUILDERS {
+            let tag = pattern_tag(pat);
             hits.extend(
-                find_calls(&text, lit, &active)
+                find_seq(&text, pat, &active)
                     .into_iter()
-                    .filter(|&at| !chain_has_stack_proof(&text, at))
-                    .map(|at| (at, lit.to_string())),
+                    .filter(|&(_, end)| !chain_has_stack_proof(&text, end))
+                    .map(|(at, _)| (at, tag.clone())),
             );
         }
-        hits.extend(flagged_uses(&text, &active, internal));
+        hits.extend(flagged_uses(&text, &uses_active, internal));
         for (at, tag) in hits {
             findings.push(format!("{rel}:{}: `{tag}` — {}", line_of(&text, at), advice(&tag)));
         }
@@ -232,36 +263,62 @@ fn line_of(text: &str, at: usize) -> usize {
     text[..at].matches('\n').count() + 1
 }
 
-/// Call sites of `lit` outside skipped spans. `lit` ends in `(`, so a
-/// longer name (`parse_bounded`, `spawn_pool_thread`) never matches; the
-/// byte before the match must be `::` (a path qualifier) or anything but
-/// an identifier byte or `.` (`a.b::thread::spawn` still flags).
-fn find_calls(text: &str, lit: &str, active: &dyn Fn(usize) -> bool) -> Vec<usize> {
+/// The tag a call pattern reports under (its tokens joined —
+/// `thread::spawn`, `rigor_parse::parse(`).
+fn pattern_tag(pat: &[&str]) -> String {
+    pat.concat()
+}
+
+/// `tokens` as a token sequence on blanked text — whitespace allowed
+/// between tokens (`std :: thread :: spawn (f)` cannot bypass a pattern,
+/// and `cargo fmt --check` is not a gate here). Identifier tokens must
+/// match whole identifiers (`spawn` does not match `spawn_pool_thread`,
+/// `thread` does not match `threads`). Returns `(match start, index just
+/// after the last token)` for hits outside skipped spans.
+///
+/// The head's left boundary: a path qualifier (`::`) or any non-identifier,
+/// non-`.` byte — `mythread::spawn`, `pool_thread::spawn` and
+/// `x.thread::…` field syntax are out, `std::thread::spawn`,
+/// `::std::thread::spawn` and `pool::thread::spawn` are in.
+fn find_seq(text: &str, tokens: &[&str], active: &dyn Fn(usize) -> bool) -> Vec<(usize, usize)> {
+    let b = text.as_bytes();
+    let ident_tok = |t: &&str| t.bytes().all(is_ident_byte);
     let mut out = Vec::new();
-    for (at, _) in text.match_indices(lit) {
-        let ok = match at.checked_sub(1).map(|i| text.as_bytes()[i]) {
-            None => true,
-            Some(b':') => true,
-            Some(c) => !is_ident_byte(c) && c != b'.',
-        };
-        if ok && active(at) {
-            out.push(at);
+    'next: for (at, _) in text.match_indices(tokens[0]) {
+        match at.checked_sub(1).map(|i| b[i]) {
+            None => {}
+            Some(b':') => {}
+            Some(c) if !is_ident_byte(c) && c != b'.' => {}
+            _ => continue 'next,
+        }
+        let mut end = at;
+        for tok in tokens {
+            end = skip_ws(b, end);
+            if !b[end..].starts_with(tok.as_bytes()) {
+                continue 'next;
+            }
+            end += tok.len();
+            if ident_tok(tok) && b.get(end).is_some_and(|&c| is_ident_byte(c)) {
+                continue 'next;
+            }
+        }
+        if active(at) {
+            out.push((at, end));
         }
     }
     out
 }
 
-/// Whether the builder chain from a `…Builder::new(` hit sets the analysis
-/// stack: consume `.name(…)` links after `new(…)` and look for
-/// `spawn_pool_thread` or `ANALYSIS_STACK_BYTES` as bare tokens in the
-/// chain text. `at` is the match start (`ThreadPoolBuilder`/`thread`).
-fn chain_has_stack_proof(text: &str, at: usize) -> bool {
+/// Whether the builder chain ending a `…Builder::new(` hit sets the
+/// analysis stack: `end` is just after `new(`; match it, then consume
+/// `.name(…)` links and look for `spawn_pool_thread` or
+/// `ANALYSIS_STACK_BYTES` as bare tokens in the chain text.
+fn chain_has_stack_proof(text: &str, end: usize) -> bool {
     let b = text.as_bytes();
-    // `new(`'s close is the chain's anchor.
-    let open = at + text[at..].find('(').unwrap();
-    let mut end = close_of(b, open) + 1;
+    let open = end - 1; // the `(` the pattern ended on
+    let mut last = close_of(b, open) + 1;
     loop {
-        let mut i = skip_ws(b, end);
+        let mut i = skip_ws(b, last);
         if i >= b.len() || b[i] != b'.' {
             break;
         }
@@ -271,9 +328,9 @@ fn chain_has_stack_proof(text: &str, at: usize) -> bool {
         if i >= b.len() || b[i] != b'(' {
             break; // a field access ends the call chain
         }
-        end = close_of(b, i) + 1;
+        last = close_of(b, i) + 1;
     }
-    let chain = &text[at..end];
+    let chain = &text[open..last];
     STACK_PROOF.iter().any(|p| {
         chain.match_indices(p).any(|(i, _)| {
             let before = i == 0 || !is_ident_byte(chain.as_bytes()[i - 1]);
@@ -283,49 +340,110 @@ fn chain_has_stack_proof(text: &str, at: usize) -> bool {
     })
 }
 
-/// `use` items (outside skipped spans) importing a flagged leaf: `parse`
-/// under `rigor_parse` — plus `crate`/`self`/`super` inside rigor-parse,
-/// where they reach the crate root — or `spawn`/`scope`/`Builder` under a
-/// `thread` path segment.
-fn flagged_uses(
-    text: &str,
-    active: &dyn Fn(usize) -> bool,
-    internal: bool,
-) -> Vec<(usize, String)> {
+/// Every `use` item's byte extent outside `#[cfg(test)]` spans — so call
+/// patterns do not also report the sites a `use:*` tag covers. `uses` and
+/// the `#[cfg(test)]` spans are computed once per file by the caller.
+fn use_item_spans(text: &str) -> Vec<(usize, usize)> {
     let b = text.as_bytes();
     let mut out = Vec::new();
     for (at, _) in text.match_indices("use") {
         let before = at == 0 || !is_ident_byte(b[at - 1]);
         let after = b.get(at + 3).is_none_or(|&c| !is_ident_byte(c));
-        if !before || !after || !active(at) {
-            continue;
-        }
-        let Some(semi) = text[at..].find(';').map(|n| at + n) else { continue };
-        let item = &text[at + 3..semi];
-        let roots: &[&str] =
-            if internal { &["rigor_parse", "crate", "self", "super"] } else { &["rigor_parse"] };
-        let mut toks = idents(item);
-        if roots.contains(&toks.next().unwrap_or("")) && toks.any(|t| t == "parse") {
-            out.push((at, "use:parse".to_string()));
-        }
-        if idents(item).any(|t| t == "thread") {
-            for &leaf in USE_LEAVES_THREAD {
-                if idents(item).any(|t| t == leaf) {
-                    out.push((at, format!("use:{leaf}")));
-                }
+        if before && after {
+            if let Some(semi) = text[at..].find(';').map(|n| at + n) {
+                out.push((at, semi + 1));
             }
         }
     }
     out
 }
 
-/// The identifiers of `s`, in order (on blanked text: no comments or
-/// literals can produce phantom ones).
-fn idents(s: &str) -> impl Iterator<Item = &str> + '_ {
+/// `use` items (outside `#[cfg(test)]` spans — the caller's `active` mask
+/// already excludes them AND the use-item extents it also hands in)
+/// reaching a flagged symbol:
+///
+/// - a `parse` leaf under `rigor_parse` — plus `crate`/`self`/`super`
+///   inside rigor-parse, where they reach the crate root — `use
+///   rigor_parse::parse`, `use rigor_parse::{lower, parse}`;
+/// - a `spawn`/`scope`/`Builder` leaf under a `thread` segment (`use
+///   std::thread::spawn`, `use std::thread::{spawn}`), plus the same
+///   under any deeper path (`crossbeam::thread::scope`);
+/// - an ALIAS or GLOB that renames a flagged root out of the call
+///   patterns' reach: `use rigor_parse as rp` (`rp::parse`),
+///   `use rigor_parse::{self as rp}`, `use std::thread as t`
+///   (`t::spawn`), `use std::thread::{self as t}`,
+///   `use rayon::ThreadPoolBuilder as TPB`, `use rigor_parse::*`
+///   (`parse(src)`), `use std::thread::*` (`spawn(job)`).
+fn flagged_uses(
+    text: &str,
+    uses: &[(usize, usize)],
+    internal: bool,
+) -> Vec<(usize, String)> {
+    let mut out = Vec::new();
+    for &(at, end) in uses {
+        let item = &text[at + 3..end - 1];
+        let toks: Vec<(usize, &str)> = ident_spans(item).collect();
+        let roots: &[&str] =
+            if internal { &["rigor_parse", "crate", "self", "super"] } else { &["rigor_parse"] };
+        let first = toks.first().map_or("", |t| t.1);
+        let pair = |x: &str, y: &str| {
+            toks.windows(2).any(|w| w[0].1 == x && w[1].1 == y)
+        };
+        if roots.contains(&first) {
+            if toks.iter().any(|t| t.1 == "parse") {
+                out.push((at, "use:parse".to_string()));
+            }
+            // `use rigor_parse as rp`, `use rigor_parse::{self as rp}`,
+            // `use rigor_parse::*` — the calls then escape the patterns.
+            if toks.get(1).is_some_and(|t| t.1 == "as")
+                || pair("self", "as")
+                || after_ident_is_glob(item, toks[0])
+            {
+                out.push((at, "use:alias-or-glob".to_string()));
+            }
+        }
+        if toks.iter().any(|t| t.1 == "thread") {
+            for &leaf in USE_LEAVES_THREAD {
+                if toks.iter().any(|t| t.1 == leaf) {
+                    out.push((at, format!("use:{leaf}")));
+                }
+            }
+            // `use std::thread as t`, `use std::thread::{self as t}`,
+            // `use std::thread::*` — `t::spawn`/`spawn` escape the patterns.
+            if pair("thread", "as")
+                || pair("self", "as")
+                || toks.iter().any(|t| t.1 == "thread" && after_ident_is_glob(item, *t))
+            {
+                out.push((at, "use:alias-or-glob".to_string()));
+            }
+        }
+        // `use rayon::ThreadPoolBuilder as TPB` — `TPB::new()` escapes.
+        if pair("ThreadPoolBuilder", "as") {
+            out.push((at, "use:alias-or-glob".to_string()));
+        }
+    }
+    out
+}
+
+/// The identifiers of `s` with their byte offsets, in order (on blanked
+/// text: no comments or literals can produce phantom ones).
+fn ident_spans(s: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
     let b = s.as_bytes();
     (0..b.len())
         .filter(move |&i| is_ident_byte(b[i]) && (i == 0 || !is_ident_byte(b[i - 1])))
-        .map(move |i| ident_at(s, i))
+        .map(move |i| (i, ident_at(s, i)))
+}
+
+/// Whether `tok` (an identifier span in `s`) is followed by `::*` — a glob
+/// leaf: `rigor_parse::*`, `std::thread::*`.
+fn after_ident_is_glob(s: &str, tok: (usize, &str)) -> bool {
+    let b = s.as_bytes();
+    let mut i = skip_ws(b, tok.0 + tok.1.len());
+    if !b[i..].starts_with(b"::") {
+        return false;
+    }
+    i = skip_ws(b, i + 2);
+    b.get(i) == Some(&b'*')
 }
 
 /// The `#[cfg(test)]` items' byte extents: the `#` through the item's `;`
