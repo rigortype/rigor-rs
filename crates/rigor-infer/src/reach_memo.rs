@@ -180,6 +180,16 @@ impl<T> ExprEntry<T> {
     }
 }
 
+/// What [`expr_entry_hit`] returns: the stored answer plus the dependency
+/// record handed to the enclosing computation.
+type ExprHit<T> = (T, Rc<[u32]>, Rc<[TruthyKey]>);
+
+/// `type_of` memo payload: the carrier plus whether it embeds no interner ids.
+type TypeOfOut = (Type, bool);
+
+/// Per-node table keyed by `(node id, seen.len())`.
+type ExprTable<T> = FastMap<(u32, usize), Vec<ExprEntry<T>>>;
+
 /// The newest usable `ExprEntry` in `entries` for `stack` — the matching
 /// half of `local_reach`'s hit loop (the `root` test does not apply: the key
 /// names the node). MRU first; an entry whose fold landed on a value is
@@ -189,7 +199,7 @@ fn expr_entry_hit<T: Clone>(
     stack: &[u32],
     running: &std::collections::HashSet<TruthyKey>,
     landed: &std::collections::HashMap<TruthyKey, Option<bool>>,
-) -> Option<(T, Rc<[u32]>, Rc<[TruthyKey]>)> {
+) -> Option<ExprHit<T>> {
     let mut found = None;
     let mut i = 0;
     while i < entries.len() {
@@ -231,14 +241,14 @@ pub(crate) struct ReachMemo {
     /// record per entry. A deep right-nested chain (`2 ** 2 ** …`,
     /// rigor-rs#424) is what re-walked its whole remaining suffix per level
     /// without this.
-    expr_scalars: FastMap<(u32, usize), Vec<ExprEntry<Option<Scalar>>>>,
+    expr_scalars: ExprTable<Option<Scalar>>,
     /// `expr_reach` answers under the same keying.
-    expr_reaches: FastMap<(u32, usize), Vec<ExprEntry<Reach>>>,
-    /// `type_of` answers for env-free `Node::Call` subtrees — `(Type,
-    /// interner-free)`: only a `Type` that embeds no interner ids is stored
-    /// (see [`Typer::type_of_memo`]), so a hit re-interns it under whatever
+    expr_reaches: ExprTable<Reach>,
+    /// `type_of` answers for env-free `Node::Call` subtrees — [`TypeOfOut`]:
+    /// only a `Type` that embeds no interner ids is stored (see
+    /// [`Typer::type_of_memo`]), so a hit re-interns it under whatever
     /// interner asks (rigor-rs#424).
-    type_ofs: FastMap<(u32, usize), Vec<ExprEntry<(Type, bool)>>>,
+    type_ofs: ExprTable<TypeOfOut>,
     /// Every `seen` key tested on this AST, interned, so dependencies are
     /// lists of small ids. Reset with the AST only while no computation is
     /// in progress — the frames hold ids too.
@@ -575,7 +585,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         seen: &mut Vec<String>,
-        map: impl Fn(&mut ReachMemo) -> &mut FastMap<(u32, usize), Vec<ExprEntry<T>>>,
+        map: impl Fn(&mut ReachMemo) -> &mut ExprTable<T>,
         compute: impl FnOnce(&Self, &LoweredAst, NodeId, &mut Vec<String>) -> T,
         store_if: impl Fn(&T) -> bool,
     ) -> T
