@@ -63,6 +63,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #642 CLOSED** (PR #644): one `LineIndex` on `LoweredAst` (`CarrierSpans` box); MCP/LSP/annotate/stage 3 share it — LSP publish 2.89s→0.36s, MCP 4.26s→0.54s (20k diags); byte-identical; 0 FP; Opus Approved. [note](notes/20261119-issue-642-shared-line-index.md)
 - **2026-11-19 #435 CLOSED** (PR #634): loop-cap widen — structural `loop_cap_widening` + post-join `apply_loop_cap_widen` (ADR-56 slice B); m1/m2/o8 match, r3 silent; 0 FP, 0 gaps closed/opened; Opus Approved. → #638–#640. [note](notes/20261119-issue-435-loop-cap-widen.md)
 - **2026-11-19 #453 CLOSED** (PR #645): one-pass Logical `subject_edges` — 34 terms 14.05s→0.10s, 68 0.08s; byte-identical vs master (7k files); 0 FP/8,251; Opus Approved. → #646/#647. [note](notes/20261119-issue-453-logical-one-pass.md)
 - **2026-11-19 #636 CLOSED** (PR #641): findings store resolved `(line, column)` (`line_starts` at production), not a per-diag source clone + `line_col` walk — 60k-diag 169s/~49 GB → 1.8s/141 MB; byte-identical; 0 FP; Opus Approved. → #642/#643. [note](notes/20261119-issue-636-findings-line-index.md)
@@ -70,7 +71,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-11-19 #346 CLOSED** (PR #630): config `~`/`~/` via MRI `Dir.home` NSS (`HOME` → `getpwnam(getlogin())` → `getpwuid`); `~name` literal (`ConfigPath`); `--config` `~`. Probes identical; Opus+Grok Approved. → #631–#633. [note](notes/20261119-issue-346-tilde-dir-home.md)
 - **2026-11-19 #614 CLOSED** (PR #624): `LocalOwnership` ports `constructor?`/`class_call?` + `singleton` — `.new` allocates on a constant path, `x.class`, or SINGLETON self. 2 OVER + 3 UNDER; Approved. → #629. [note](notes/20261119-issue-614-local-ownership-allocation.md)
 
-- **2026-11-19 #603 CLOSED** (PR #623): alias floor ports `selection_branches` (case/in, begin/rescue, rescue-modifier — last per arm), `ReceiverAlias.candidates` receivers, `message_loc` reach, block-declined `send`; carrier marks in `CarrierSpans`, mixed-candidate spans `non_floorable`. 4 FP rows + ~130 probes match, 2-round Approved; sweep unmeasurable locally (0 FP/0 diff). → #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
+- **2026-11-19 #603 CLOSED** (PR #623): alias floor `selection_branches` + `ReceiverAlias.candidates` + carrier marks; 4 FP + ~130 probes; 2-round Approved. → #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
 
 - **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; probes byte-identical, 0 OVER, unit tests cover the fixture blind spot. → #621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
 
