@@ -328,7 +328,7 @@ impl<'src> Builder<'src> {
                 return only;
             }
             let main_body = body.clone();
-            return self.push(Node::BeginRescue {
+            let id = self.push(Node::BeginRescue {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
@@ -336,6 +336,13 @@ impl<'src> Builder<'src> {
                 clauses: Vec::new(),
                 span: span_of(&parens.location()),
             });
+            // A multi-statement parens IS a `ParenthesesNode` upstream —
+            // `ReceiverAlias.candidates` unwraps it to its last statement,
+            // where a real `begin`/`rescue` on the same carrier shape names
+            // no local (rigor-rs#603). Mark the carrier so that walk can
+            // tell the two apart.
+            self.paren_carriers.push(id.0);
+            return id;
         }
 
         if let Some(ivw) = node.as_instance_variable_write_node() {

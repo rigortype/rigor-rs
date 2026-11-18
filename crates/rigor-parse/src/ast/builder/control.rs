@@ -139,7 +139,7 @@ impl<'src> Builder<'src> {
                 .map(|s| self.lower_body(&s.body()))
                 .unwrap_or_default();
             let main_body = body.clone();
-            return self.push(Node::BeginRescue {
+            let id = self.push(Node::BeginRescue {
                 body,
                 main_body,
                 ensure_body: Vec::new(),
@@ -147,6 +147,11 @@ impl<'src> Builder<'src> {
                 clauses: Vec::new(),
                 span: span_of(&else_node.location()),
             });
+            // `ReceiverAlias.candidates` unwraps an `ElseNode` to its
+            // statements' last — the same carrier shape a real `begin`
+            // shares, where it answers nothing (rigor-rs#603).
+            self.else_carriers.push(id.0);
+            return id;
         }
 
         if let Some(case_node) = node.as_case_node() {

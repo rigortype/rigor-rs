@@ -2236,3 +2236,82 @@ fn core_singleton_name_is_string() {
     assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
 }
 
+
+#[test]
+fn link_writes_read_case_begin_rescue_and_rescue_modifier_arms() {
+    // rigor-rs#603: `each_may_be` treats every `selection_branches`
+    // construct the same — `case`/`case in`, `begin`/`rescue` clauses,
+    // and the rescue modifier — not only `if`/`||`/`&&`.
+    for (src, want) in [
+        (b"f = [1]\ng = case c\nwhen true then f\nelse [3]\nend\n" as &[u8], true),
+        (b"f = [1]\ng = case x\nin Integer then f\nelse nil\nend\n", true),
+        (b"f = [1]\ng = begin\nf\nrescue\nnil\nend\n", true),
+        (b"f = [1]\ng = (f rescue nil)\n", true),
+        // `ensure` is not a selection branch — its statements do not
+        // contribute; the main body's `f` still does.
+        (b"f = [1]\ng = begin\nf\nensure\nnil\nend\n", true),
+        // A `while` body is not a selection — no link.
+        (b"f = [1]\ng = while c\nf\nend\n", false),
+    ] {
+        let ast = lower_src(src);
+        let links = &flow_writes::collect_indexed_flow(&ast).alias_links;
+        let has = links.iter().any(|(_, to, from)| to == "g" && from == "f");
+        assert_eq!(has, want, "{}", String::from_utf8_lossy(src));
+    }
+}
+
+#[test]
+fn a_write_value_names_itself_not_its_source() {
+    // `may_be_locals` answers the write's NAME upstream — `g = (h = f)`
+    // links `g` to `h`, and `h` to `f` by its own bind.
+    let ast = lower_src(b"f = [1]\ng = (h = f)\n");
+    let links = &flow_writes::collect_indexed_flow(&ast).alias_links;
+    let pairs: Vec<(&String, &String)> = links
+        .iter()
+        .map(|(_, to, from)| (to, from))
+        .collect();
+    let g: String = "g".into();
+    let h: String = "h".into();
+    let f: String = "f".into();
+    assert!(pairs.contains(&(&g, &h)));
+    assert!(pairs.contains(&(&h, &f)));
+    assert!(!pairs.contains(&(&g, &f)));
+}
+
+#[test]
+fn a_mutation_inside_its_receiver_reaches_an_earlier_link() {
+    // rigor-rs#603: upstream keys the reach on `write.end <=
+    // call.message_loc.start` — a copy inside the mutator's RECEIVER ran
+    // before `<<` fired; one inside a later argument did not.
+    let st = |src: &[u8]| flow_writes::stale_local_names(&lower_src(src));
+    let t = st(b"f = [1]\ng = f\n(g2 = f) << 2\n");
+    assert!(t.stale("g2"));
+    assert!(t.stale("f"));
+    // `f << (h = g)` — the `h`-copy runs after `<<`, so `h` keeps its pin
+    // while `g` (linked earlier) floors.
+    let t = st(b"f = [1]\ng = f\nf << (h = g)\n");
+    assert!(t.stale("f"));
+    assert!(t.stale("g"));
+    assert!(!t.stale("h"));
+}
+
+#[test]
+fn a_selection_receiver_names_each_arms_local() {
+    // `mutated_reads` walks `ReceiverAlias.candidates`: `if` arm lasts,
+    // logical operands, local writes/op-writes, and the last statement of
+    // a multi-statement parens — `begin`/`else`/`in` carriers name
+    // nothing.
+    let st = |src: &[u8]| flow_writes::stale_local_names(&lower_src(src));
+    assert!(st(b"g = [1]\nh = [2]\n(c ? g : h) << 2\n").stale("g"));
+    assert!(st(b"g = [1]\nh = [2]\n(c ? g : h) << 2\n").stale("h"));
+    assert!(st(b"(g ||= f) << 2\n").stale("g"));
+    assert!(st(b"g = [1]\n(x(); g) << 2\n").stale("g"));
+    // A real `begin` as the receiver names no local.
+    assert!(!st(b"g = [1]\n(begin g; end) << 2\n").stale("g"));
+    // `g.send(:<<, 2) { }` carries a block — the literal-target send
+    // declines, so no receiver mutation at all.
+    assert!(!st(b"f = [1]\ng = f\ng.send(:<<, 2) { }\n").stale("f"));
+    // `[]=` through a selection marks each arm's local too.
+    assert!(st(b"g = [1]\nh = [2]\n(c ? g : h)[0] = 9\n").stale("h"));
+}
+

@@ -253,12 +253,15 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
                 span,
                 ..
             } if MUTATOR_METHODS.contains(&method.as_str()) => {
-                match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => {
-                        vec![(id, *span, name.clone(), true)]
-                    }
-                    _ => Vec::new(),
-                }
+                // `mutated_reads`: the receiver may be a selection or a
+                // write, not only a bare read — `(c ? g : h) << 2` marks
+                // both `g` and `h` (rigor-rs#603).
+                let mut names = Vec::new();
+                receiver_alias_locals(ast, *r, &mut names);
+                names
+                    .into_iter()
+                    .map(|name| (id, *span, name, true))
+                    .collect()
             }
             Node::Call {
                 receiver: Some(r),
@@ -266,12 +269,12 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
                 ..
             } if literal_send_target(ast, n).is_some_and(|m| MUTATOR_METHODS.contains(&m.as_str())) =>
             {
-                match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => {
-                        vec![(id, *span, name.clone(), true)]
-                    }
-                    _ => Vec::new(),
-                }
+                let mut names = Vec::new();
+                receiver_alias_locals(ast, *r, &mut names);
+                names
+                    .into_iter()
+                    .map(|name| (id, *span, name, true))
+                    .collect()
             }
             // `h[k] ||= v` / `h[k] &&= v` / `h[k] op= v` — a compound index
             // write stores through `[]=` on its receiver, so a bare-local
@@ -280,12 +283,16 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
             // reference routes all three into `widen_for_mutator` /
             // `widen_receiver_aliases` with method `[]=` (`index_write_
             // widening.rb`, upstream #560).
-            Node::IndexWrite { receiver: Some(r), span, .. } => match ast.get(*r) {
-                Node::LocalVariableRead { name, .. } => {
-                    vec![(id, *span, name.clone(), true)]
-                }
-                _ => Vec::new(),
-            },
+            Node::IndexWrite { receiver: Some(r), span, .. } => {
+                // `(c ? g : h)[k] ||= v` stores through `[]=` on whichever
+                // arm the selection answered — `mutated_reads` marks both.
+                let mut names = Vec::new();
+                receiver_alias_locals(ast, *r, &mut names);
+                names
+                    .into_iter()
+                    .map(|name| (id, *span, name, true))
+                    .collect()
+            }
             Node::Loop { index, index_writes, .. } => {
                 let mut entries: Vec<(NodeId, rigor_parse::Span, String, bool)> =
                     for_index_rebinds(index)
@@ -434,7 +441,7 @@ pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
                     } else {
                         continue;
                     };
-                    if !alias_floor_reaches(ast, *lspan, *wspan) {
+                    if !alias_floor_reaches(ast, &indexed, *lspan, *wspan) {
                         continue;
                     }
                     let entry = table.mutation_spans.entry(other.clone()).or_default();
@@ -450,15 +457,28 @@ pub fn stale_local_names(ast: &LoweredAst) -> StaleLocals {
 }
 
 /// Whether a copy-link site at `lspan` may have run before a mutation at
-/// `wspan` — earlier in the body, or anywhere inside an iterated body the
-/// mutation also sits in (the copy may have run on an earlier pass).
-/// [`floor_alias_linked`] applies the same rule in the check env.
+/// `wspan`. Upstream compares the link's key — the write's HANDED-BY
+/// offset (its own end, or its enclosing loop's start) — against the
+/// call's `message_loc`: a copy inside the mutator's RECEIVER ran before
+/// the message fired (`(g = f) << 2` floors `f` on the oracle), while one
+/// inside a later argument did not. [`IndexedFlow::mutation_offsets`]
+/// holds each mutator call's message start; a mark whose span has no
+/// entry keeps the whole-span start. The iterated-body half is unchanged:
+/// a copy inside an iterated body the mutation also sits in may have run
+/// on an earlier pass. [`floor_alias_linked`] applies the same rule in
+/// the check env.
 pub(crate) fn alias_floor_reaches(
     ast: &LoweredAst,
+    indexed: &IndexedFlow,
     lspan: rigor_parse::Span,
     wspan: rigor_parse::Span,
 ) -> bool {
-    lspan.0 < wspan.0
+    let woffset = indexed
+        .mutation_offsets
+        .get(&wspan)
+        .copied()
+        .unwrap_or(wspan.0);
+    lspan.1 <= woffset
         || ast.iterated_body_spans().iter().any(|ib| {
             ib.0 <= lspan.0 && lspan.1 <= ib.1 && ib.0 <= wspan.0 && wspan.1 <= ib.1
         })
@@ -733,7 +753,12 @@ pub(crate) fn toplevel_mutations(
                 if !is_shape_mutator(&effective) {
                     continue;
                 }
-                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                // `mutated_reads`: the receiver may select or write, not
+                // only read — `(c ? g : h) << 2` marks `g` and `h`,
+                // `(g = f) << 2` marks `g` (rigor-rs#603).
+                let mut names = Vec::new();
+                receiver_alias_locals(ast, *r, &mut names);
+                if !names.is_empty() {
                     let drop_key = if effective == "[]=" {
                         // `f[k] = v` keys on `args[0]`; `f.send(:[]=, k, v)`
                         // on `args[1]`.
@@ -746,7 +771,9 @@ pub(crate) fn toplevel_mutations(
                     } else {
                         None
                     };
-                    out.push((id, *span, name.clone(), effective, drop_key));
+                    for name in names {
+                        out.push((id, *span, name, effective.clone(), drop_key.clone()));
+                    }
                 }
             }
             // An `h[k]` index target is a `[]=` call whose call node Prism
@@ -2203,12 +2230,20 @@ fn literal_send_target(ast: &LoweredAst, node: &Node) -> Option<String> {
         method,
         args,
         block_body,
+        block_span,
         ..
     } = node
     else {
         return None;
     };
-    if !SEND_SELECTORS.contains(&method.as_str()) || !block_body.is_empty() {
+    // Upstream's `call_node.block.nil?` — ANY block (a literal `{ }`, even
+    // an empty-bodied one, or a `&expr` pass) declines the literal-target
+    // reading. `block_body` alone misses `send(:push, 2) { }` — an empty
+    // block still has `block_span` (rigor-rs#603).
+    if !SEND_SELECTORS.contains(&method.as_str())
+        || block_span.is_some()
+        || !block_body.is_empty()
+    {
         return None;
     }
     match args.first().map(|a| ast.get(*a)) {
@@ -2219,34 +2254,209 @@ fn literal_send_target(ast: &LoweredAst, node: &Node) -> Option<String> {
     }
 }
 
+/// `AliasMutationFloor`'s `SELECTION_DEPTH`: a selection nested deeper
+/// reads as no local upstream.
+const SELECTION_DEPTH: u32 = 6;
+
 /// The locals `node`'s value may evaluate to — upstream
-/// `AliasMutationFloor.each_may_be`: the local itself, one branch of a
-/// selection that may answer it (`if`/`ternary`, `||`, `&&`), an
-/// assignment's value (nested `g = h = f`), or a call that answers its
+/// `AliasMutationFloor.each_may_be`: the local itself, a write of it
+/// (upstream's `ReceiverAlias.candidates` answers a local write by the
+/// variable it leaves — `g = (h = f)` links `g`-`h` while `h`-`f` rides the
+/// inner write's own bind), one branch of a selection that may answer it
+/// (`if`/`unless`/ternary, `||`/`&&`, `case`/`when`, `case`/`in`, a
+/// `begin` body's own/rescue/`else` statements, a `rescue` modifier's two
+/// operands), a statement sequence's tail, or a call that answers its
 /// receiver. A `dup`/`a.size`/container read hands nothing on whole, so
 /// it contributes no name.
-fn may_be_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+///
+/// Where upstream takes each branch's LAST statement the port reads the
+/// whole arm — a superset that only ever links MORE, the
+/// silence-safe direction the `if` arm already took.
+pub(crate) fn may_be_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+    may_be_locals_at(ast, id, 0, out);
+}
+
+fn may_be_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<String>) {
+    if depth > SELECTION_DEPTH {
+        return;
+    }
     match ast.get(id) {
         Node::LocalVariableRead { name, .. } => out.push(name.clone()),
-        Node::LocalVariableWrite { value, .. } => may_be_locals(ast, *value, out),
+        Node::LocalVariableWrite { name, .. }
+        | Node::LocalVariableOpWrite { name, .. } => out.push(name.clone()),
         Node::Call {
             receiver: Some(r),
             method,
             ..
         } if ALIAS_SELF_RETURNERS.contains(&method.as_str()) => {
-            may_be_locals(ast, *r, out);
+            may_be_locals_at(ast, *r, depth + 1, out);
         }
         Node::If {
             then_body, else_body, ..
         } => {
-            // A branch's value is its last statement.
+            // Upstream `selection_branches` yields the `then` statements
+            // plus the `subsequent` (else/elsif chain).
             for arm in then_body.iter().chain(else_body) {
-                may_be_locals(ast, *arm, out);
+                may_be_locals_at(ast, *arm, depth + 1, out);
             }
         }
         Node::Logical { left, right, .. } => {
-            may_be_locals(ast, *left, out);
-            may_be_locals(ast, *right, out);
+            may_be_locals_at(ast, *left, depth + 1, out);
+            may_be_locals_at(ast, *right, depth + 1, out);
+        }
+        // `case`/`when` and `case`/`in` — upstream `selection_branches`'
+        // `CaseNode`/`CaseMatchNode` row: each condition's statements plus
+        // the `else` clause.
+        Node::Case {
+            branches, else_body, ..
+        } => {
+            for arm in branches {
+                match ast.get(*arm) {
+                    Node::When { body, .. } => {
+                        for s in body {
+                            may_be_locals_at(ast, *s, depth + 1, out);
+                        }
+                    }
+                    // An `in` clause's reused `BeginRescue` carrier:
+                    // `body[0]` is the pattern (never a value), the rest
+                    // its statements.
+                    Node::BeginRescue { body, .. } => {
+                        for s in &body[1.min(body.len())..] {
+                            may_be_locals_at(ast, *s, depth + 1, out);
+                        }
+                    }
+                    _ => may_be_locals_at(ast, *arm, depth + 1, out),
+                }
+            }
+            for s in else_body {
+                may_be_locals_at(ast, *s, depth + 1, out);
+            }
+        }
+        // A real `begin` — upstream `begin_branches`: the protected body,
+        // each rescue clause's statements, and the `else` — never the
+        // `ensure` (it contributes no value) and never a clause's
+        // exception designators. The reused carriers (a multi-statement
+        // parens, an `else`, an `in` clause) share the shape with
+        // `main_body == body`, no clauses and no ensure — reading
+        // `main_body` alone unwraps them to their last statements, which
+        // is what upstream's `ParenthesesNode`/`ElseNode` rows answer.
+        Node::BeginRescue {
+            body,
+            main_body,
+            ensure_body,
+            clauses,
+            ..
+        } => {
+            for s in main_body {
+                may_be_locals_at(ast, *s, depth + 1, out);
+            }
+            for c in clauses {
+                for s in &c.body {
+                    may_be_locals_at(ast, *s, depth + 1, out);
+                }
+            }
+            // The `else` statements ride `body` between the clause parts
+            // (exceptions + bodies) and the `ensure` tail.
+            let clause_len: usize = clauses
+                .iter()
+                .map(|c| c.exceptions.len() + c.body.len())
+                .sum();
+            let else_start = main_body.len() + clause_len;
+            let else_end = body.len() - ensure_body.len();
+            for s in &body[else_start.min(else_end)..else_end] {
+                may_be_locals_at(ast, *s, depth + 1, out);
+            }
+        }
+        // A real statement sequence's value is its last statement — the
+        // port reads them all (the superset convention, see the doc).
+        Node::Statements {
+            body,
+            kind: StatementsKind::Sequence,
+            ..
+        } => {
+            for s in body {
+                may_be_locals_at(ast, *s, depth + 1, out);
+            }
+        }
+        // A `rescue` MODIFIER — upstream `selection_branches` yields both
+        // `[expression, rescue_expression]`; the `Recovered` carrier's
+        // children are those two operands' contents. Any OTHER `Recovered`
+        // carrier (`super`, a splat, `defined?`) names nothing — upstream
+        // `ReceiverAlias.candidates` answers [] for it.
+        Node::Statements {
+            body,
+            kind: StatementsKind::Recovered,
+            ..
+        } if ast.is_rescue_modifier(id) => {
+            for s in body {
+                may_be_locals_at(ast, *s, depth + 1, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// `ReceiverAlias.candidates`, local names only — the locals a mutator
+/// call's receiver EXPRESSION may evaluate to (`ReceiverAlias.mutated_reads`
+/// for the local half): a read or write of the local itself (`(g = f) << 2`,
+/// `(g ||= f) << 2`), one arm of an `if`/`unless`/ternary or `||`/`&&`
+/// selection (`(c ? g : h) << 2`), or the last statement of a parenthesized
+/// sequence. Every other form names no local the copy-link floor can carry:
+/// upstream routes it to the whole-aliased-set answer (`targets(nil, …)`),
+/// which the slice does not model — a cvar/gvar/ivar receiver included.
+/// Depth-capped like upstream's `WALK_DEPTH_CAP`.
+pub(crate) fn receiver_alias_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+    receiver_alias_locals_at(ast, id, 0, out);
+}
+
+fn receiver_alias_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<String>) {
+    if depth > SELECTION_DEPTH {
+        return;
+    }
+    let mut push = |name: &String| {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    };
+    match ast.get(id) {
+        // `variable_write?` — a local write answers the variable it leaves.
+        Node::LocalVariableRead { name, .. }
+        | Node::LocalVariableWrite { name, .. }
+        | Node::LocalVariableOpWrite { name, .. } => push(name),
+        Node::Statements {
+            body,
+            kind: StatementsKind::Sequence,
+            ..
+        } => {
+            if let Some(last) = body.last() {
+                receiver_alias_locals_at(ast, *last, depth + 1, out);
+            }
+        }
+        // A multi-statement parens unwraps to its last statement; the
+        // carrier shape is shared with `begin`/`else`/`in`, which name
+        // nothing — `is_paren_carrier` tells them apart.
+        Node::BeginRescue { body, .. }
+            if ast.is_paren_carrier(id) || ast.is_else_carrier(id) =>
+        {
+            if let Some(last) = body.last() {
+                receiver_alias_locals_at(ast, *last, depth + 1, out);
+            }
+        }
+        Node::If {
+            then_body, else_body, ..
+        } => {
+            // Upstream takes each arm's LAST statement (`statements`,
+            // `subsequent`).
+            if let Some(last) = then_body.last() {
+                receiver_alias_locals_at(ast, *last, depth + 1, out);
+            }
+            if let Some(last) = else_body.last() {
+                receiver_alias_locals_at(ast, *last, depth + 1, out);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            receiver_alias_locals_at(ast, *left, depth + 1, out);
+            receiver_alias_locals_at(ast, *right, depth + 1, out);
         }
         _ => {}
     }
@@ -2405,6 +2615,13 @@ pub(crate) struct IndexedFlow {
     /// index store — `g[:b] += 9` leaves `f`'s slot `1` on the oracle
     /// (review finding, oracle-verified).
     pub non_floorable: std::collections::HashSet<rigor_parse::Span>,
+    /// `(mutator call span -> message_loc start)` — upstream `offset_of`'
+    /// `call_node.message_loc`, the offset a mutation's reach test
+    /// compares link keys against (`alias_floor_reaches`, rigor-rs#603):
+    /// a copy inside the RECEIVER (`(g = f) << 2`) ran before `<<` fired.
+    /// Only `Node::Call` mutations get an entry; every other mark reads
+    /// its own span start.
+    pub mutation_offsets: std::collections::HashMap<rigor_parse::Span, usize>,
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
@@ -2491,7 +2708,32 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 let effective = literal_send_target(ast, n)
                     .filter(|m| is_shape_mutator(m))
                     .unwrap_or_else(|| method.clone());
-                if let Some((name, key)) = element_slot(ast, *r) {
+                // Upstream `offset_of` keys the reach on the message
+                // token, not the whole call — a write inside the receiver
+                // precedes it.
+                if let Node::Call { message_span, .. } = n {
+                    flow.mutation_offsets.insert(*span, message_span.0);
+                }
+                // Upstream `receiver_targets`: `ReceiverAlias.candidates`
+                // of the receiver FIRST — every local the receiver may
+                // evaluate to triggers on its own name — and only a
+                // candidate-free receiver falls to the element path.
+                let mut names = Vec::new();
+                receiver_alias_locals(ast, *r, &mut names);
+                if !names.is_empty() {
+                    // A bare or selecting receiver (`f << x`, `f[k] = v`,
+                    // `f.send(:<<)`, `(c ? g : h) << 2`, `(g = f) << 2`) —
+                    // the alias floor sees it even under a shadow scope or
+                    // inside a `def`/`class` body.
+                    for name in names {
+                        flow.alias_mutations.push(AliasMutation {
+                            span: *span,
+                            name,
+                            method: effective.clone(),
+                            part_only: false,
+                        });
+                    }
+                } else if let Some((name, key)) = element_slot(ast, *r) {
                     // An element-path mutation (`f[0] << x`) — the alias
                     // floor sees it even when the receiver local is
                     // block-shadowed (a block's `b` may share `a`'s
@@ -2511,16 +2753,6 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                         name,
                         key,
                         method: effective.clone(),
-                    });
-                } else if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                    // A bare-receiver mutator (`f << x`, `f[k] = v`,
-                    // `f.send(:<<)`) — the alias floor sees it even under
-                    // a shadow scope or inside a `def`/`class` body.
-                    flow.alias_mutations.push(AliasMutation {
-                        span: *span,
-                        name: name.clone(),
-                        method: effective,
-                        part_only: false,
                     });
                 }
             }
