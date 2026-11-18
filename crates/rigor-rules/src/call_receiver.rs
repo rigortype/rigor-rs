@@ -93,8 +93,24 @@ fn unenumerable_receiver_class(class_name: &str) -> bool {
 /// i.e. `v.class.typo` where `v` is mixin-typed — needs no port: rigor-rs is already
 /// silent there on both engines (row c6), because `.class` on a Dynamic receiver
 /// yields no witnessable carrier.
-fn unenumerable_instance_receiver(index: &CoreIndex, class_name: &str) -> bool {
-    unenumerable_receiver_class(class_name) || index.is_qualified_module(class_name)
+///
+/// Upstream v0.4.8 (#2991/#3006, `last_resort_surface_answers?`'s
+/// `unknown_mixin_includer?` arm): a class on the receiver's instance chain whose
+/// include side names a module the walk cannot name — `include(*MODS)`,
+/// `include m`, `include M, h`, a computed `send` that may be a mixin, a hook's
+/// `base.include M` — is open: the unnamed module may define any name, so the
+/// rule declines exactly as it does on a module-typed receiver. Order-only
+/// taints (`include M; prepend M`, `extend(*EMODS)`, a receiverless `send` in a
+/// `def`, the `Module.new` argument #2975 keeps) still fire, as the oracle
+/// measures.
+fn unenumerable_instance_receiver(
+    index: &CoreIndex,
+    source: &rigor_infer::SourceIndex,
+    class_name: &str,
+) -> bool {
+    unenumerable_receiver_class(class_name)
+        || index.is_qualified_module(class_name)
+        || source.unnamed_mixin_on_chain(class_name)
 }
 
 /// Upstream v0.4.5 (#2086 / issue #1722, `subclass_instance_may_answer?`'s
@@ -388,7 +404,7 @@ pub(crate) fn check_call(
             // same reason the reference puts `unenumerable_receiver?` at the top of
             // the diagnostic: the question is about the receiver, not about which
             // surface happens to model it.
-            if unenumerable_instance_receiver(index, name)
+            if unenumerable_instance_receiver(index, typer.source(), name)
                 || typer.source().ruby_library_reopen(index, name)
             {
                 return None;
@@ -449,7 +465,7 @@ pub(crate) fn check_call(
     // answers only with a `CORE_CLASSES` name today, none of which is a module or a
     // metaclass, so this is defence in depth: it keeps the two instance paths
     // answering the same question the same way should that array ever widen.
-    if unenumerable_instance_receiver(index, class_name) {
+    if unenumerable_instance_receiver(index, typer.source(), class_name) {
         return None;
     }
     if !index.knows_class(class_name) {
@@ -580,7 +596,7 @@ fn check_union_call(
             }) {
             None => return None,
             Some((class_name, registry_arm)) => {
-                if unenumerable_instance_receiver(index, &class_name)
+                if unenumerable_instance_receiver(index, typer.source(), &class_name)
                     || typer.source().ruby_library_reopen(index, &class_name)
                 {
                     return None;
@@ -756,7 +772,7 @@ pub(crate) fn check_narrowed_call(
     // typed `Array` keeps the `Array` bound (subclass ordering), so `class_name`
     // there is `"Array"` and the witness still fires on both engines — row x11,
     // the control an "any module in the guard" test would have silenced.
-    if unenumerable_instance_receiver(index, class_name) {
+    if unenumerable_instance_receiver(index, typer.source(), class_name) {
         return None;
     }
     // Accepted surfaces: the existing top-level one, the project's own `sig/`

@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{AncestryFacts, MixinSide, MIXIN_WILDCARD};
+use rigor_parse::{AncestryFacts, MixinSide, MIXIN_UNNAMED, MIXIN_WILDCARD};
 
 use super::{DefKind, SourceIndex};
 
@@ -66,6 +66,10 @@ pub(crate) struct AncestryIndex {
     /// Upstream v0.4.5 (#2086): per owner candidate, its receiver-form
     /// instance mixins ([`AncestryFacts::receiver_mixins`]).
     receiver_listed: HashMap<String, Vec<String>>,
+    /// Upstream v0.4.8 (#2991): owners defining an `extend`-triggered hook
+    /// ([`AncestryFacts::extend_hook_owners`]) — `extend_reshapes_instance?`'s
+    /// `defines_any?` half.
+    extend_hook_owners: HashSet<String>,
 }
 
 impl AncestryIndex {
@@ -91,6 +95,7 @@ impl AncestryIndex {
         self.possible.extend(facts.possible_methods.iter().cloned());
         self.contested.extend(facts.contested_visibilities.iter().cloned());
         self.dirty.extend(facts.dirty_owners.iter().cloned());
+        self.extend_hook_owners.extend(facts.extend_hook_owners.iter().cloned());
         self.def_owners.extend(facts.def_owners.iter().cloned());
         self.required_features.extend(facts.required_features.iter().cloned());
         self.required_segments.extend(facts.required_segments.iter().cloned());
@@ -346,16 +351,93 @@ impl SourceIndex {
         Some(Chain { entries, retro, marks })
     }
 
+    /// `ResolutionChain::Builder#mark` — the mark a node carries on its
+    /// instance side: the names `include`/`prepend` wrote (the `["*", "?"]`
+    /// markers among them), plus [`SourceIndex::extend_hook_taint`]. Neither
+    /// marker counts toward the `multi_file` edge count (the reference's
+    /// `!multi_file` reads `includes_of` — names — against `*`).
     fn mark_of(&self, node: &str) -> Option<Mark> {
-        let listed = self.ancestry.include_listed.get(node).cloned().unwrap_or_default();
+        let mut listed = self.ancestry.include_listed.get(node).cloned().unwrap_or_default();
+        let mut taint = self.extend_hook_taint(node);
         let edges = self.override_classes.get(node).map_or(0, |e| e.includes.len())
-            + listed.iter().filter(|n| *n != MIXIN_WILDCARD).count();
+            + listed
+                .iter()
+                .filter(|n| *n != MIXIN_WILDCARD && *n != MIXIN_UNNAMED)
+                .count();
         let multi_file =
             edges >= 2 && self.ancestry.decl_files.get(node).copied().unwrap_or(0) >= 2;
-        if listed.is_empty() && !multi_file {
+        if listed.is_empty() && taint.is_empty() && !multi_file {
             return None;
         }
+        listed.append(&mut taint);
         Some(Mark { node: node.to_string(), listed, multi_file })
+    }
+
+    /// Upstream v0.4.8 (#2991/#3006, `DiscoveryIndex#extend_hook_taint` +
+    /// `extend_reshapes_instance?`): a module `name` extends whose hook may
+    /// mix modules into the extender's instance side — its mark also lists
+    /// `["*", "?"]` when such a module's own include side names a module the
+    /// walk cannot name, `["*"]` when it only taints order, nothing when no
+    /// extended module reshapes.
+    fn extend_hook_taint(&self, name: &str) -> Vec<String> {
+        let mut found = false;
+        for raw in self.singleton_raws(name) {
+            let Some(resolved) = self.resolve_override_ancestor(name, &raw) else {
+                continue;
+            };
+            if !self.extend_reshapes_instance(&resolved) {
+                continue;
+            }
+            if self
+                .ancestry
+                .include_listed
+                .get(&resolved)
+                .is_some_and(|l| l.iter().any(|n| n == MIXIN_UNNAMED))
+            {
+                return vec![MIXIN_WILDCARD.to_string(), MIXIN_UNNAMED.to_string()];
+            }
+            found = true;
+        }
+        if found { vec![MIXIN_WILDCARD.to_string()] } else { Vec::new() }
+    }
+
+    /// `extend_reshapes_instance?` — a `*` on the module's own include side
+    /// plus a hook `extend` runs on the extended module (`extended` /
+    /// `extend_object` on its singleton, `included` / `append_features` /
+    /// `prepended` / `prepend_features` / `inherited` on its instances — the
+    /// census's [`AncestryFacts::extend_hook_owners`]).
+    fn extend_reshapes_instance(&self, resolved: &str) -> bool {
+        self.ancestry.wildcard_include(resolved)
+            && self.ancestry.extend_hook_owners.contains(resolved)
+    }
+
+    /// Upstream v0.4.8 (#2991/#3006, `ResolutionChain#unnamed_mixin?` +
+    /// `DiscoveryIndex.unnamed_mixin_on_chain?`): whether a class on
+    /// `class_name`'s instance-side chain lists a mixin no name spells — a
+    /// computed or unrecorded `include` (`include(*MODS)`, `include m`,
+    /// `include M, h`, a computed `send` that may be a mixin, a hook's
+    /// `base.include M`) opens the class: the unnamed module may define any
+    /// name, so a `def`-side reader declines. The marks are the ones the
+    /// chain build reaches — a chain the port cannot settle keeps the marks
+    /// it gathered, as the reference's own build does.
+    pub fn unnamed_mixin_on_chain(&self, class_name: &str) -> bool {
+        self.chain_marks(class_name)
+            .iter()
+            .any(|m| m.listed.iter().any(|n| n == MIXIN_UNNAMED))
+    }
+
+    /// `ResolutionChain::Builder#marks` over `class`'s chain — collected even
+    /// for a chain the build cannot settle (`unnamed_mixin?` reads them).
+    fn chain_marks(&self, class: &str) -> Vec<Mark> {
+        if !self.override_classes.contains_key(class) {
+            // A class with no project declaration still carries the marks its
+            // receiver-form edges wrote (`X.include(*M)` on a sig-only class).
+            return self.mark_of(class).into_iter().collect();
+        }
+        let mut b =
+            Builder { idx: self, nodes: Vec::new(), stack: Vec::new(), failed: false, forks: 0 };
+        let _ = b.lin(class);
+        b.nodes.iter().filter_map(|n| self.mark_of(n)).collect()
     }
 
     /// `Relevance.discharged?` — a mark does not move the first definer of
