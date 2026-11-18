@@ -2363,3 +2363,30 @@ fn loop_converged_body_keeps_constant_pins() {
     assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
 }
 
+/// A capped loop's widen lands on the POST-JOIN env, not the entry env:
+/// `w`'s own body write (`w = 1` under a `w = nil` seed) survives the cap
+/// pass the reference's way — `Integer | NilClass`, never a minted `nil` —
+/// so `if w` keeps no `Constant`/`NilClass` pin to fire on (rigor-rs#435
+/// review: the entry-env overlay turned this into an always-falsey FP).
+#[test]
+fn loop_cap_widen_preserves_body_writes_to_non_suspect_names() {
+    let src = b"def f(c)\n  w = nil\n  i = 0\n  while c\n    w = 1\n    i += 1\n  end\n  if w\n    puts i\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_))
+            && index.class_name_of(&i, ty) != Some("NilClass"),
+        "w must keep its body write (widened), got {:?}",
+        i.get(ty)
+    );
+}
+

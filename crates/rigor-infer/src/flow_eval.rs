@@ -416,15 +416,17 @@ impl<'i> Typer<'i> {
                         .map(str::to_string)
                         .collect();
                     // ADR-56 slice B: when the rebind fixpoint needs the cap
-                    // pass, the reference widens EVERY tracked name — the
-                    // overlay is computed on the entry env, before the join.
+                    // pass, the reference widens EVERY tracked name. The
+                    // criterion reads the entry env; the widen is applied
+                    // over the post-join bindings so a body write to a
+                    // non-suspect name survives (`w = nil` seeded, `w = 1`
+                    // in the body — the pin the join produced sheds to
+                    // `Integer | NilClass`, never `nil`).
                     let capped =
                         self.loop_cap_widening(ast, env, &body, interner);
                     self.join_arm_writes(ast, env, &[(&body, &carried), (&[], &[])], interner, returns);
-                    if let Some(binds) = capped {
-                        for (name, ty) in binds {
-                            env.insert(name, ty);
-                        }
+                    if let Some((tracked, suspect)) = capped {
+                        self.apply_loop_cap_widen(env, &tracked, &suspect, interner);
                     }
                 }
                 // A `return` recorded inside the body typed its value at
@@ -821,15 +823,7 @@ impl<'i> Typer<'i> {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) => ty,
             Type::Constant(s) => {
-                let class = match s {
-                    Scalar::Int(_) | Scalar::BigInt(_) => "Integer",
-                    Scalar::Float(_) => "Float",
-                    Scalar::Str(_) => "String",
-                    Scalar::Sym(_) => "Symbol",
-                    Scalar::Bool(true) => "TrueClass",
-                    Scalar::Bool(false) => "FalseClass",
-                    Scalar::Nil => unreachable!(),
-                };
+                let class = crate::folding::scalar_class(&s);
                 self.nominal_or_untyped(class, interner)
             }
             Type::IntegerRange { .. } => self.nominal_or_untyped("Integer", interner),
@@ -883,15 +877,16 @@ impl<'i> Typer<'i> {
     /// keeps the caller's own post-loop binding (`None`), so convergent
     /// loops keep their constants.
     ///
-    /// Returns `(name, binding)` overlays for [`TypeEnv`] on a cap, `None`
-    /// when the body provably converges or is untracked.
+    /// Returns `(tracked, suspect)` on a cap — the caller applies the
+    /// widen over its POST-JOIN env via [`Self::apply_loop_cap_widen`] —
+    /// `None` when the body provably converges or is untracked.
     fn loop_cap_widening(
         &self,
         ast: &LoweredAst,
         env: &TypeEnv,
         body: &[NodeId],
         interner: &mut Interner,
-    ) -> Option<Vec<(String, TypeId)>> {
+    ) -> Option<(Vec<String>, std::collections::HashSet<String>)> {
         use std::collections::HashSet;
         use rigor_parse::OpWriteKind;
 
@@ -1121,24 +1116,37 @@ impl<'i> Typer<'i> {
         if suspect.is_empty() {
             return None;
         }
-        // The cap pass widened every tracked name; a name still moving
-        // floors to `Dynamic[top]`. Overlay joins the caller's own post-loop
-        // binding so the result only ever loses pins the reference lost.
+        Some((names, suspect))
+    }
+
+    /// Applies a capped fixpoint's last-pass widen to the caller's POST-JOIN
+    /// env: a still-moving (suspect) tracked name floors to `Dynamic[top]`;
+    /// every other tracked name sheds `Constant -> Nominal` the reference's
+    /// way ([`Self::widen_value_pinned`]). The widen reads the binding the
+    /// join produced — a body write to a non-suspect name (`w = 1` under a
+    /// `w = nil` seed) must survive, and a name the join does not bind is
+    /// left alone, never minted `nil`.
+    fn apply_loop_cap_widen(
+        &self,
+        env: &mut TypeEnv,
+        tracked: &[String],
+        suspect: &std::collections::HashSet<String>,
+        interner: &mut Interner,
+    ) {
         let untyped = interner.untyped();
-        let mut out = Vec::with_capacity(names.len());
-        for n in &names {
-            let current = env.get(n).copied().unwrap_or(nil);
+        for n in tracked {
+            let Some(&post) = env.get(n) else { continue };
             let widened = if suspect.contains(n) {
                 untyped
             } else {
-                self.widen_value_pinned(current, interner)
+                self.widen_value_pinned(post, interner)
             };
-            out.push((n.clone(), rigor_types::Algebra::join(interner, current, widened)));
+            env.insert(n.clone(), widened);
         }
-        Some(out)
     }
 
 
+    /// [`Self::build_toplevel_env`] for the `check` rules: the same straight-line
     /// binder, except that every statement it does not bind WIDENS (to
     /// `Dynamic`) each top-level local rebound inside it, in statement order.
     ///
@@ -4105,7 +4113,7 @@ impl<'i> Typer<'i> {
             }
             // A `while`/`until`/`for` loop: the same flat widen as `other`,
             // then the ADR-56 slice-B rebind fixpoint — see
-            // [`Self::loop_rebind_fixpoint`]. A `begin … end while`, a `for`,
+            // [`Self::loop_cap_widening`]. A `begin … end while`, a `for`,
             // or a body holding `break`/`next`/`redo`/`retry` keeps the plain
             // widen (the replay arm declines the same shapes).
             Node::Loop { body, kind, .. } => {
@@ -4120,9 +4128,11 @@ impl<'i> Typer<'i> {
                     rigor_parse::LoopKind::While { begin_modifier: true }
                         | rigor_parse::LoopKind::Until { begin_modifier: true }
                 );
-                // The cap walk reads the ENTRY env — running it after
+                // The cap CRITERION reads the entry env — running it after
                 // `widen_flow_writes` would read every tracked name
-                // pre-widened and always answer "converged".
+                // pre-widened and always answer "converged" — but the widen
+                // itself lands on the post-join bindings: a body write to a
+                // non-suspect name must survive the cap pass.
                 let capped = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
                     self.loop_cap_widening(ast, env, &body, interner)
                 } else {
@@ -4134,10 +4144,8 @@ impl<'i> Typer<'i> {
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
-                if let Some(binds) = capped {
-                    for (name, ty) in binds {
-                        env.insert(name, ty);
-                    }
+                if let Some((tracked, suspect)) = capped {
+                    self.apply_loop_cap_widen(env, &tracked, &suspect, interner);
                 }
                 self.widen_loop_exits_within(ast, span, env, interner);
             }
