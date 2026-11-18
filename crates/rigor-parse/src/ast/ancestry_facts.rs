@@ -57,6 +57,15 @@ use super::{constant_path_string, constant_string, strict_constant_path_string};
 /// hold (the reference's `MixinAccumulator::WILDCARD`).
 pub const WILDCARD: &str = "*";
 
+/// Upstream v0.4.8 (#2991, `MixinAccumulator::UNNAMED`): the name an owner side
+/// also lists when such a call mixes in a module the walk cannot name
+/// (`include(*MODS)`, `include m`, `include M, h`, a computed `send` that may be
+/// a mixin, a hook's `base.include M`) — listed beside [`WILDCARD`] as the
+/// reference's `UNNAMED_LIST` (`["*", "?"]`). An order-only taint (`include M;
+/// prepend M`, a `Module.new` argument, an edge whose names are all recorded)
+/// lists the wildcard alone and opens nothing.
+pub const UNNAMED: &str = "?";
+
 /// Which side of an owner's ancestry a mixin edge reshapes: `include` /
 /// `prepend` the instance side, `extend` (and `include` inside
 /// `class << self`) the singleton side.
@@ -87,6 +96,14 @@ pub struct AncestryFacts {
     /// not) — the reference's `known_user_class?` reads a `def` of either
     /// kind as making a name a project class.
     pub def_owners: Vec<String>,
+    /// Upstream v0.4.8 (#2991, `DiscoveryIndex#extend_reshapes_instance?`):
+    /// owners defining a hook `extend` runs on the extended module —
+    /// `extended` / `extend_object` on its singleton (`SINGLETON_EXTEND_HOOKS`)
+    /// or `included` / `append_features` / `prepended` / `prepend_features` /
+    /// `inherited` on its instances (`INSTANCE_EXTEND_HOOKS`) — read against
+    /// `discovered_def_nodes` / `discovered_singleton_def_nodes`, the def NODE
+    /// tables, not a fold's.
+    pub extend_hook_owners: Vec<String>,
     /// Upstream v0.4.2 (#1706 / issue #1697) — the module names of every
     /// receiverless `include` written as a DIRECT program statement: `main.include`,
     /// which mixes into `Object` (the reference's `ObjectMixins::TOPLEVEL_INCLUDE_KEY`
@@ -534,6 +551,433 @@ fn span_key(n: &PrismNode<'_>) -> (usize, usize) {
     (l.start_offset(), l.end_offset())
 }
 
+/// A fresh handle to `n`: the `Node` enum is a plain `{parser, pointer,
+/// marker}` triple — POD, no `Drop` and no `Copy`/`Clone` impl — so a bitwise
+/// copy is a second handle to the same parse-owned node, exactly what
+/// `Node::as_node()` returns for the typed nodes.
+fn node_copy<'pr>(n: &PrismNode<'pr>) -> PrismNode<'pr> {
+    // SAFETY: `Node` is an enum of raw pointers and `PhantomData` only; it
+    // owns nothing (the parse result owns the arena), so duplicating it
+    // bitwise cannot double-free or alias mutably.
+    unsafe { std::ptr::read(n) }
+}
+
+/// `opaque_mixin_argument?` — an argument that names no module: not a
+/// constant path, and not the `Module.new` argument that keeps its #2975
+/// reading (`include Module.new { def helper; end; end }` is positioned).
+fn opaque_mixin_argument(a: &PrismNode<'_>) -> bool {
+    constant_path_string(a).is_empty() && !module_new_call(a)
+}
+
+/// `module_new_call?` — `Module.new` / `Module.new { … }` (any `new` receiver
+/// spelling resolves to the `Module` constant).
+fn module_new_call(n: &PrismNode<'_>) -> bool {
+    let Some(c) = n.as_call_node() else { return false };
+    constant_string(c.name().as_slice()) == "new"
+        && c.receiver().is_some_and(|r| constant_path_string(&r) == "Module")
+}
+
+/// `literal_send_name` — the method name a `send` argument spells: a name
+/// literal's, or `Some("")` — no mixin's — for an interpolation with a literal
+/// part no mixin name contains. `None` when it may spell any name.
+fn literal_send_name(n: &PrismNode<'_>) -> Option<String> {
+    if let Some(s) = n.as_symbol_node() {
+        return Some(String::from_utf8_lossy(s.unescaped()).into_owned());
+    }
+    if let Some(s) = n.as_string_node() {
+        return Some(String::from_utf8_lossy(s.unescaped()).into_owned());
+    }
+    let parts = if let Some(s) = n.as_interpolated_string_node() {
+        s.parts().iter().collect::<Vec<_>>()
+    } else if let Some(s) = n.as_interpolated_symbol_node() {
+        s.parts().iter().collect::<Vec<_>>()
+    } else {
+        return None;
+    };
+    let excluded = parts.iter().any(|p| {
+        p.as_string_node().is_some_and(|s| {
+            let lit = String::from_utf8_lossy(s.unescaped()).into_owned();
+            MIXIN_KINDS.iter().all(|k| !k.contains(lit.as_str()))
+        })
+    });
+    if excluded {
+        Some(String::new())
+    } else {
+        None
+    }
+}
+
+/// `LOCAL_SCOPE_BOUNDARIES` — a nested `def` or declaration opens a scope of
+/// its own: its writes never bind the outer local.
+fn local_scope_boundary(n: &PrismNode<'_>) -> bool {
+    n.as_def_node().is_some()
+        || n.as_class_node().is_some()
+        || n.as_module_node().is_some()
+        || n.as_singleton_class_node().is_some()
+}
+
+/// The bare name a parameter / local-variable write / block-local node binds,
+/// when it has one — `local_binding?`'s `node.respond_to?(:name)`.
+fn binding_name(n: &PrismNode<'_>) -> Option<String> {
+    // *ParameterNode (an anonymous `*`, `**` or `&` has none).
+    if let Some(x) = n.as_required_parameter_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_optional_parameter_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_rest_parameter_node() {
+        return x.name().map(|nm| constant_string(nm.as_slice()));
+    }
+    if let Some(x) = n.as_required_keyword_parameter_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_optional_keyword_parameter_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_keyword_rest_parameter_node() {
+        return x.name().map(|nm| constant_string(nm.as_slice()));
+    }
+    if let Some(x) = n.as_block_parameter_node() {
+        return x.name().map(|nm| constant_string(nm.as_slice()));
+    }
+    // LocalVariable* (the read is a `local_binding?` early return, not here).
+    if let Some(x) = n.as_local_variable_write_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_local_variable_target_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_local_variable_operator_write_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_local_variable_and_write_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    if let Some(x) = n.as_local_variable_or_write_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    // `Prism::BlockLocalVariableNode` — the `|k; shadow|` list's names.
+    if let Some(x) = n.as_block_local_variable_node() {
+        return Some(constant_string(x.name().as_slice()));
+    }
+    None
+}
+
+/// `local_binding?(node, local)` — a write, pattern target, parameter or
+/// block-local named `local`.
+fn local_binding(n: &PrismNode<'_>, local: &str) -> bool {
+    if n.as_local_variable_read_node().is_some() {
+        return false;
+    }
+    binding_name(n).is_some_and(|name| name == local)
+}
+
+/// `local_send_name_literal(node, local)` — `Some(name)` when `node` binds
+/// `local` to a name literal, `Err(())` for a binding the walk cannot read,
+/// `None` when `node` is no binding of `local`.
+fn local_send_name_literal(n: &PrismNode<'_>, local: &str) -> Option<Result<String, ()>> {
+    if let Some(w) = n.as_local_variable_write_node() {
+        if constant_string(w.name().as_slice()) == local {
+            return Some(match literal_send_name(&w.value()) {
+                Some(name) => Ok(name),
+                None => Err(()),
+            });
+        }
+        return None;
+    }
+    if local_binding(n, local) {
+        return Some(Err(()));
+    }
+    None
+}
+
+/// `iterated_element_names(node, local, scope_nodes)` — the literal names the
+/// literal elements of the receiver of an `each` / `each_with_index` / `map`
+/// iterator spell, when `node` is such a call whose first block parameter is
+/// `local`: `Some(names)`, `Some(err)` when the receiver or an element names
+/// nothing readable (`:unknown`), `None` when `node` is not that iterator
+/// (#3024).
+fn iterated_element_names<'pr>(
+    n: &PrismNode<'pr>,
+    local: &str,
+    scope_nodes: &[PrismNode<'pr>],
+) -> Option<Result<Vec<String>, ()>> {
+    let elements = iterated_element_source(n, local, scope_nodes)?;
+    let Some(elements) = elements else {
+        return Some(Err(()));
+    };
+    let mut names = Vec::with_capacity(elements.len());
+    for e in &elements {
+        match literal_send_name(e) {
+            Some(name) => names.push(name),
+            None => return Some(Err(())),
+        }
+    }
+    Some(Ok(names))
+}
+
+/// `ARRAY_ITERATORS` — the iterators whose first block parameter #3024 reads
+/// as the elements: `each`, `each_with_index`, `map`.
+const ARRAY_ITERATORS: [&str; 3] = ["each", "each_with_index", "map"];
+
+/// `iterated_element_source(node, local, scope_nodes)` — `Some(Some(elements))`
+/// for the literal-element receiver, `Some(None)` (`:unknown`) for an
+/// iterator whose receiver names nothing readable, `None` when `node` is not
+/// the `[…].each { |local| … }` shape at all.
+fn iterated_element_source<'pr>(
+    n: &PrismNode<'pr>,
+    local: &str,
+    scope_nodes: &[PrismNode<'pr>],
+) -> Option<Option<Vec<PrismNode<'pr>>>> {
+    let call = n.as_call_node()?;
+    let name = constant_string(call.name().as_slice());
+    if !ARRAY_ITERATORS.contains(&name.as_str()) {
+        return None;
+    }
+    let block = call.block().and_then(|b| b.as_block_node())?;
+    if !iterated_first_parameter(&block, local) {
+        return None;
+    }
+    Some(iterated_receiver_elements(&call, scope_nodes))
+}
+
+/// `iterated_first_parameter?(block, local)` — the block's first required
+/// parameter is `local` and no other parameter binds it.
+fn iterated_first_parameter(block: &ruby_prism::BlockNode<'_>, local: &str) -> bool {
+    let Some(params) = block
+        .parameters()
+        .and_then(|p| p.as_block_parameters_node())
+        .and_then(|p| p.parameters())
+    else {
+        return false;
+    };
+    let Some(first) = params
+        .requireds()
+        .iter()
+        .next()
+        .and_then(|r| r.as_required_parameter_node())
+    else {
+        return false;
+    };
+    if constant_string(first.name().as_slice()) != local {
+        return false;
+    }
+    // `Source::NodeWalker.each(parameters)` — every descendant of the
+    // ParametersNode — must bind no other `local`.
+    !descendants(&params.as_node())
+        .iter()
+        .any(|p| span_key(p) != span_key(&first.as_node()) && local_binding(p, local))
+}
+
+/// `iterated_receiver_elements` — the literal elements of the receiver: an
+/// `[…]` literal's, or the elements a plain `KINDS = […]` constant write in
+/// scope gives a `ConstantReadNode` receiver. `None` (`:unknown`) otherwise.
+fn iterated_receiver_elements<'pr>(
+    call: &ruby_prism::CallNode<'pr>,
+    scope_nodes: &[PrismNode<'pr>],
+) -> Option<Vec<PrismNode<'pr>>> {
+    let recv = call.receiver()?;
+    if let Some(arr) = recv.as_array_node() {
+        return Some(arr.elements().iter().collect());
+    }
+    let c = recv.as_constant_read_node()?;
+    constant_array_elements(&constant_string(c.name().as_slice()), scope_nodes)
+}
+
+/// `constant_array_elements(name, nodes)` — the `[…]` elements of the single
+/// plain `NAME = […]` write in scope.
+fn constant_array_elements<'pr>(name: &str, nodes: &[PrismNode<'pr>]) -> Option<Vec<PrismNode<'pr>>> {
+    let mut writes: Vec<PrismNode<'pr>> = Vec::new();
+    for n in nodes {
+        constant_write_nodes(n, name, &mut writes);
+    }
+    if writes.len() != 1 {
+        return None;
+    }
+    let value = writes[0].as_constant_write_node()?.value();
+    Some(value.as_array_node()?.elements().iter().collect())
+}
+
+/// `constant_write_nodes(nodes, name)` — every constant binding of `name`
+/// (write / pattern target / op-assignment) below `nodes`, skipping nested
+/// scopes (`LOCAL_SCOPE_BOUNDARIES`).
+fn constant_write_nodes<'pr>(n: &PrismNode<'pr>, name: &str, out: &mut Vec<PrismNode<'pr>>) {
+    if local_scope_boundary(n) {
+        return;
+    }
+    if constant_binding(n, name) {
+        out.push(node_copy(n));
+    }
+    for c in compact_children(n) {
+        constant_write_nodes(&c, name, out);
+    }
+}
+
+/// `constant_binding?(node, name)` — a `Prism::Constant*` node named `name`,
+/// minus `ConstantPath*` and `ConstantReadNode`: write, target and
+/// op-assignment forms.
+fn constant_binding(n: &PrismNode<'_>, name: &str) -> bool {
+    if let Some(x) = n.as_constant_write_node() {
+        return constant_string(x.name().as_slice()) == name;
+    }
+    if let Some(x) = n.as_constant_target_node() {
+        return constant_string(x.name().as_slice()) == name;
+    }
+    if let Some(x) = n.as_constant_operator_write_node() {
+        return constant_string(x.name().as_slice()) == name;
+    }
+    if let Some(x) = n.as_constant_and_write_node() {
+        return constant_string(x.name().as_slice()) == name;
+    }
+    if let Some(x) = n.as_constant_or_write_node() {
+        return constant_string(x.name().as_slice()) == name;
+    }
+    false
+}
+
+/// Every descendant of `n` in visit order (`Source::NodeWalker.each`).
+fn descendants<'pr>(n: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+    let mut out = Vec::new();
+    for c in compact_children(n) {
+        out.push(node_copy(&c));
+        out.extend(descendants(&c));
+    }
+    out
+}
+
+/// `iterated_element_children` — the receiver, the arguments and the block's
+/// body: everything but the block's parameters (the first is `local` bound to
+/// the elements; the rest bind other names).
+fn iterated_element_children<'pr>(call: &ruby_prism::CallNode<'pr>) -> Vec<PrismNode<'pr>> {
+    let mut out = Vec::new();
+    if let Some(r) = call.receiver() {
+        out.push(r);
+    }
+    if let Some(a) = call.arguments() {
+        out.push(a.as_node());
+    }
+    if let Some(b) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
+        out.push(b);
+    }
+    out
+}
+
+/// `local_send_names` — the names `local`'s writes in `scope` bind it to, or
+/// `None` when the argument is not a plain local read, a binding in scope is
+/// not a readable literal write, or no write names it at all — any of which
+/// leaves the call's name computed. Iterated `local` elements resolve through
+/// literal element names (#3024).
+fn local_send_names<'pr>(arg: &PrismNode<'pr>, scope: &PrismNode<'pr>) -> Option<Vec<String>> {
+    let local = constant_string(arg.as_local_variable_read_node()?.name().as_slice());
+    // `root` — a `def` contributes its parameter bindings too; its
+    // `compact_child_nodes` are the parameters, the body's statements and the
+    // locals written among them.
+    let root: Vec<PrismNode<'pr>> = if scope.as_def_node().is_some() {
+        compact_children(scope)
+    } else {
+        vec![node_copy(scope)]
+    };
+    let mut names = Vec::new();
+    if !collect_local_send_names(&root, &local, &mut names, &root) {
+        return None;
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+/// `collect_local_send_names` — gathers the literal names `local` is bound to
+/// across `nodes`; `false` on a binding or element the walk cannot read.
+fn collect_local_send_names<'pr>(
+    nodes: &[PrismNode<'pr>],
+    local: &str,
+    names: &mut Vec<String>,
+    scope_nodes: &[PrismNode<'pr>],
+) -> bool {
+    nodes.iter().all(|n| {
+        if local_scope_boundary(n) {
+            return true;
+        }
+        match iterated_element_names(n, local, scope_nodes) {
+            Some(Ok(iter_names)) => {
+                names.extend(iter_names);
+                if let Some(call) = n.as_call_node() {
+                    return collect_local_send_names(
+                        &iterated_element_children(&call),
+                        local,
+                        names,
+                        scope_nodes,
+                    );
+                }
+                return true;
+            }
+            Some(Err(())) => return false,
+            None => {}
+        }
+        match local_send_name_literal(n, local) {
+            Some(Ok(name)) => names.push(name),
+            Some(Err(())) => return false,
+            None => {}
+        }
+        collect_local_send_names(&compact_children(n), local, names, scope_nodes)
+    })
+}
+
+/// `MainSelfCalls.collect(body, instance_defs: false)` — the `{call => scope
+/// node}` map of one class body: every call the body's own `self` answers —
+/// a call reached through `main_self_control_flow`, any method call's
+/// `{…}` block, and `def self.` bodies (their locals are the scope). Other
+/// `def`s open a scope the map does not enter; a lambda, `class`/`module`,
+/// `return`, `defined?` or `rescue` body is not descended into.
+fn collect_class_body_calls<'pr>(
+    body: &PrismNode<'pr>,
+) -> std::collections::HashMap<(usize, usize), PrismNode<'pr>> {
+    let mut out = std::collections::HashMap::new();
+    class_body_visit(body, body, &mut out);
+    out
+}
+
+fn class_body_visit<'pr>(
+    n: &PrismNode<'pr>,
+    scope: &PrismNode<'pr>,
+    out: &mut std::collections::HashMap<(usize, usize), PrismNode<'pr>>,
+) {
+    if let Some(call) = n.as_call_node() {
+        out.insert(span_key(n), node_copy(scope));
+        if let Some(r) = call.receiver() {
+            class_body_visit(&r, scope, out);
+        }
+        if let Some(a) = call.arguments() {
+            class_body_visit(&a.as_node(), scope, out);
+        }
+        // `any_block?` — every method-call block keeps the body's `self` (a
+        // `->` lambda is a LambdaNode, not a BlockNode).
+        if let Some(b) = call.block().and_then(|b| b.as_block_node()).and_then(|b| b.body()) {
+            class_body_visit(&b, scope, out);
+        }
+        return;
+    }
+    if let Some(def) = n.as_def_node() {
+        // `instance_defs: false` — only `def self.` keeps the class's `self`;
+        // its locals are the scope.
+        if def.receiver().is_some_and(|r| r.as_self_node().is_some()) {
+            if let Some(b) = def.body() {
+                class_body_visit(&b, n, out);
+            }
+        }
+        return;
+    }
+    if !main_self_control_flow(n) {
+        return;
+    }
+    for c in compact_children(n) {
+        class_body_visit(&c, scope, out);
+    }
+}
+
 /// One owner frame: the candidate names (`None` = an owner the walk cannot
 /// name, which records nothing), whether `self` is the singleton, and the
 /// running visibility default's uncertainty.
@@ -546,11 +990,11 @@ struct Frame {
     /// `owner` stays `None` (its `def`s bind on the singleton). The
     /// reference's extends walk opens that block as the receiver's own body,
     /// exactly as `class_eval`, so `X.instance_eval { extend M }` files `M`
-    /// on `X`'s singleton side. Read only by [`Census::singleton_owner`].
+    /// on `X`'s singleton side. Read only by [`Census::self_owner`].
     eval_owner: Option<Vec<String>>,
 }
 
-struct Census {
+struct Census<'pr> {
     out: AncestryFacts,
     /// The lexical class/module prefix (constant resolution only).
     prefix: Vec<String>,
@@ -572,9 +1016,17 @@ struct Census {
     /// `MainSelfCalls.collect`): the call spans whose `self` is `main`, so a
     /// lexical-self `include` among them is `main.include` (`Object.include`).
     main_self: HashSet<(usize, usize)>,
+    /// Upstream v0.4.8 (#3006, `MixinAccumulator#class_bodies`): the class /
+    /// module / `class << self` bodies whose calls [`Census::class_body_scope`]
+    /// answers for.
+    class_bodies: Vec<PrismNode<'pr>>,
+    /// `MixinAccumulator#class_body_calls` — `{call span => scope node}` for
+    /// each registered body, extended one body per question.
+    class_body_calls: std::collections::HashMap<(usize, usize), PrismNode<'pr>>,
+    class_bodies_read: usize,
 }
 
-impl Census {
+impl<'pr> Census<'pr> {
     fn frame(&self) -> &Frame {
         self.frames.last().expect("root frame")
     }
@@ -583,10 +1035,13 @@ impl Census {
         self.frame().owner.clone()
     }
 
-    /// The owner a singleton-side mixin in this frame files under (the
-    /// [`AncestryFacts::singleton_mixins`] census only): [`Census::owner`],
-    /// else the `instance_eval` receiver ([`Frame::eval_owner`]).
-    fn singleton_owner(&self) -> Option<Vec<String>> {
+    /// The class this frame's `self` names: the declaration/eval owner,
+    /// else the `instance_eval` receiver ([`Frame::eval_owner`]) —
+    /// `X.instance_eval { include(*MODS) }` opens `X`'s instance side. The
+    /// reference's `current_class` carries that receiver through the same
+    /// walks; the port splits it into [`Frame::owner`] + [`Frame::eval_owner`]
+    /// and re-joins them here.
+    fn self_owner(&self) -> Option<Vec<String>> {
         let f = self.frame();
         f.owner.clone().or_else(|| f.eval_owner.clone())
     }
@@ -612,6 +1067,17 @@ impl Census {
 
     fn wildcard(&mut self, owners: Vec<String>, side: MixinSide) {
         self.unpositioned(owners, side, vec![WILDCARD.to_string()]);
+    }
+
+    /// `MixinAccumulator#taint(owner, side, unnamed: true)` — the side's order
+    /// AND its module set are unknown: the [`UNNAMED`] marker rides beside the
+    /// [`WILDCARD`] exactly as the reference's `UNNAMED_LIST` lists both.
+    fn unnamed(&mut self, owners: Vec<String>, side: MixinSide) {
+        self.unpositioned(
+            owners,
+            side,
+            vec![WILDCARD.to_string(), UNNAMED.to_string()],
+        );
     }
 
     /// The candidate qualified names a constant `raw` denotes from the current
@@ -652,7 +1118,7 @@ impl Census {
         false
     }
 
-    fn declaration(&mut self, n: &PrismNode<'_>, name: String, body: Option<PrismNode<'_>>) {
+    fn declaration(&mut self, n: &PrismNode<'_>, name: String, body: Option<PrismNode<'pr>>) {
         let direct = self.is_direct(n);
         if name.is_empty() {
             // An unnameable declaration owns nothing the port can hold.
@@ -663,6 +1129,11 @@ impl Census {
             }
             self.frames.pop();
             return;
+        }
+        // `MixinAccumulator#class_body(node.body)` — the body's locals are the
+        // scope a computed `send` in it resolves through.
+        if let Some(b) = &body {
+            self.class_bodies.push(node_copy(b));
         }
         let qualified = self.qualify(&name);
         // A declaration that is not itself direct (`class C … end if X`) marks
@@ -694,7 +1165,7 @@ impl Census {
 
     /// `[kind, arguments, via_send]` of a mixin call (the reference's
     /// `mixin_call_view`).
-    fn mixin_view<'pr>(
+    fn mixin_view(
         &self,
         call: &ruby_prism::CallNode<'pr>,
     ) -> Option<(&'static str, Vec<PrismNode<'pr>>, bool)> {
@@ -720,8 +1191,9 @@ impl Census {
         Some((k, args, true))
     }
 
-    fn record_mixin(&mut self, n: &PrismNode<'_>, call: &ruby_prism::CallNode<'_>) {
+    fn record_mixin(&mut self, n: &PrismNode<'pr>, call: &ruby_prism::CallNode<'pr>) {
         let Some((kind, args, via_send)) = self.mixin_view(call) else {
+            self.taint_computed_send(n, call);
             return;
         };
         let names: Vec<Option<String>> =
@@ -762,13 +1234,15 @@ impl Census {
                 _ => MixinSide::Include,
             };
             if side == MixinSide::Extend {
-                if let Some(owner) = self.singleton_owner() {
+                if let Some(owner) = self.self_owner() {
                     // `self` as an argument names the owner itself.
                     // Upstream v0.4.8 `singleton_mixin_recorded?` +
                     // `record_extend_targets` (#2995): a lexical-self call in
                     // ANY spelling records its constant targets; an argument
-                    // the walk cannot name leaves them UNNAMED (the port's
-                    // WILDCARD).
+                    // the walk cannot name leaves them UNNAMED — the port's
+                    // WILDCARD, plus `?` whenever the argument list is not
+                    // fully named (`record_extend_targets`'s
+                    // `note(complete: false)` → `taint(unnamed: true)`).
                     let all_named = !args.is_empty()
                         && args.iter().all(|a| {
                             strict_constant_path_string(a).is_some() || a.as_self_node().is_some()
@@ -785,19 +1259,31 @@ impl Census {
                         .collect();
                     if !all_named {
                         listed.push(WILDCARD.to_string());
+                        if !args.is_empty() {
+                            listed.push(UNNAMED.to_string());
+                        }
                     }
                     self.out.singleton_mixins.push((owner, listed));
                 }
             }
-            let Some(owner) = self.owner() else { return };
+            let Some(owner) = self.self_owner() else { return };
             // Upstream v0.4.8 `instance_mixin_recorded?` (#2995): a
             // lexical-self call — a bare `include M`, `self.include M`, or a
             // `send` / `public_send` / `__send__` spelling — records its
             // constant targets wherever it is written; a call naming none
             // taints the side, a partially named one records what it can and
-            // taints the rest (UNNAMED, the port's WILDCARD).
+            // taints the rest (UNNAMED, the port's `?`).
             if names.is_empty() {
-                self.wildcard(owner, side);
+                // `taint_unrecorded_mixin`: a lexical `self` is never a hook
+                // parameter or `singleton_class`, so `unnamed` is `opaque` on
+                // either side — an argument that names no module
+                // (`opaque_mixin_argument?`: not a constant, and not the
+                // `Module.new` argument that keeps its #2975 reading).
+                if args.iter().any(|a| opaque_mixin_argument(a)) {
+                    self.unnamed(owner, side);
+                } else {
+                    self.wildcard(owner, side);
+                }
                 return;
             }
             if self.is_direct(n) && !singleton {
@@ -820,7 +1306,9 @@ impl Census {
                 self.unpositioned(owner.clone(), side, names);
             }
             if !complete {
-                self.wildcard(owner, side);
+                // `note(complete: false)` → `taint(unnamed: true)`: the
+                // recorded names' neighbour is a module no name spells.
+                self.unnamed(owner, side);
             }
             return;
         }
@@ -829,8 +1317,15 @@ impl Census {
             let sc_name = constant_string(sc.name().as_slice());
             let plain = sc.receiver().is_none_or(|r| r.as_self_node().is_some());
             if sc_name == "singleton_class" && sc.arguments().is_none() && plain {
-                if let Some(owner) = self.owner() {
-                    self.wildcard(owner, MixinSide::Extend);
+                if let Some(owner) = self.self_owner() {
+                    // `unnamed_singleton_include?` / `taint_unrecorded_mixin`:
+                    // an argument that names no module leaves the singleton
+                    // SET unknown (`singleton_class.include(*MODS)`).
+                    if args.iter().any(|a| opaque_mixin_argument(a)) {
+                        self.unnamed(owner, MixinSide::Extend);
+                    } else {
+                        self.wildcard(owner, MixinSide::Extend);
+                    }
                 }
                 return;
             }
@@ -838,12 +1333,20 @@ impl Census {
         if let Some(raw) = strict_constant_path_string(&recv) {
             let side = if kind == "extend" { MixinSide::Extend } else { MixinSide::Include };
             let owners = self.candidates(&raw);
+            // The side's UNNAMED taint: an argument the walk cannot name
+            // (`include M, h` — `note(complete: false)`, or `include(*M)` /
+            // `include m` — `taint_unrecorded_mixin`'s `opaque`).
+            let set_unknown =
+                args.iter().any(|a| opaque_mixin_argument(a)) || (!complete && !names.is_empty());
             if kind == "extend" {
                 // `receiver_extend_recorded?`: constant arguments name edges;
                 // a `self` or other argument, or a `send`, taints.
                 let mut listed = names.clone();
                 if via_send || !complete || args.iter().any(|a| a.as_self_node().is_some()) {
                     listed.push(WILDCARD.to_string());
+                    if set_unknown {
+                        listed.push(UNNAMED.to_string());
+                    }
                 }
                 self.out.singleton_mixins.push((owners.clone(), listed));
             }
@@ -851,18 +1354,183 @@ impl Census {
                 let mut listed = names.clone();
                 if !complete {
                     listed.push(WILDCARD.to_string());
+                    if set_unknown {
+                        listed.push(UNNAMED.to_string());
+                    }
                 }
                 self.out.receiver_mixins.push((owners.clone(), listed));
             }
-            self.wildcard(owners, side);
+            if set_unknown {
+                self.unnamed(owners, side);
+            } else {
+                self.wildcard(owners, side);
+            }
             return;
         }
         if self.hook_receiver(&recv) {
-            if let Some(owner) = self.owner() {
-                self.wildcard(owner.clone(), MixinSide::Include);
-                self.wildcard(owner, MixinSide::Extend);
+            if let Some(owner) = self.self_owner() {
+                // `taint_unrecorded_mixin` — `unnamed` on the instance side
+                // reads `kind ∈ {include, prepend}` AND a receiver that is not
+                // a `singleton_class` call AND (`hook_parameter_receiver?` —
+                // the BARE local, not the chain — or an opaque argument);
+                // the extend side's is `opaque && !hook_parameter_receiver?`.
+                // A chained receiver (`base.singleton_class`, `base.class`)
+                // still taints both sides — `hook_receiver?` — but keeps the
+                // side it is not opaque to order-only.
+                let sc_eval = recv
+                    .as_call_node()
+                    .is_some_and(|c| constant_string(c.name().as_slice()) == "singleton_class");
+                let hook_param = self.hook_parameter_receiver(&recv);
+                let opaque = args.iter().any(|a| opaque_mixin_argument(a));
+                if kind != "extend" && !sc_eval && (hook_param || opaque) {
+                    self.unnamed(owner.clone(), MixinSide::Include);
+                } else {
+                    self.wildcard(owner.clone(), MixinSide::Include);
+                }
+                if opaque && !hook_param {
+                    self.unnamed(owner, MixinSide::Extend);
+                } else {
+                    self.wildcard(owner, MixinSide::Extend);
+                }
             }
         }
+    }
+
+    /// `hook_parameter_receiver?` — the receiver IS a hook parameter (`base`
+    /// in `def self.included(base)`), as distinct from `hook_receiver?` which
+    /// also follows a no-argument call chain off one (`base.singleton_class`,
+    /// `base.class`).
+    fn hook_parameter_receiver(&self, recv: &PrismNode<'_>) -> bool {
+        recv.as_local_variable_read_node()
+            .is_some_and(|lv| self.hook_params.contains(&constant_string(lv.name().as_slice())))
+    }
+
+    /// Upstream v0.4.8 (#3006, `taint_computed_mixin_send` +
+    /// `taint_computed_hook_send`): a receiverless or `self.` `send` /
+    /// `public_send` / `__send__` written in a class body (or a hook's
+    /// `base.send`) whose name is computed and which passes at least one
+    /// further argument may be a mixin call the walk cannot record — it lists
+    /// the [`UNNAMED`] marker on the side(s) the name may reach. A name bound
+    /// only to non-mixin literals in the call's class-body scope taints
+    /// nothing ([`local_send_names`]).
+    fn taint_computed_send(&mut self, n: &PrismNode<'pr>, call: &ruby_prism::CallNode<'pr>) {
+        // `computed_send_name`: a `send`-family call on the lexical `self` or
+        // a hook parameter, with a non-literal first argument and at least one
+        // further argument.
+        let call_name = constant_string(call.name().as_slice());
+        if !SEND_NAMES.contains(&call_name.as_str()) {
+            return;
+        }
+        let recv = call.receiver();
+        let lexical_self = recv.is_none() || recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
+        // `computed_send_name` accepts the hook PARAMETER — the bare local —
+        // not `hook_receiver?`'s call chain: `base.singleton_class.send(m, M)`
+        // names nothing mixin.
+        let hook = recv.as_ref().is_some_and(|r| self.hook_parameter_receiver(r));
+        if !lexical_self && !hook {
+            return;
+        }
+        let args: Vec<PrismNode> =
+            call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+        if args.len() < 2 || literal_send_name(&args[0]).is_some() {
+            return;
+        }
+        // `current_class` — the owner the walk names for the call's `self`:
+        // [`Census::self_owner`], the declaration/eval owner or the
+        // `instance_eval` receiver — none for `class << obj` or an ownerless
+        // frame.
+        let in_singleton = self.frame().singleton;
+        let owner = self.self_owner();
+        let Some(owner) = owner else { return };
+        let scope = self.class_body_scope(n);
+        if scope.is_none() && !hook {
+            return;
+        }
+        let names = scope.and_then(|s| local_send_names(&args[0], &s));
+        if hook {
+            // `taint_computed_hook_send`: no taint when the name resolves and
+            // none of its literals is a mixin kind; the include side marks
+            // UNNAMED only when the name may be `include` or `prepend`.
+            if names.as_ref().is_some_and(|ns| !ns.iter().any(|l| MIXIN_KINDS.contains(&l.as_str()))) {
+                return;
+            }
+            let instance =
+                names.as_ref().is_none_or(|ns| ns.iter().any(|l| l == "include" || l == "prepend"));
+            self.wildcard(owner.clone(), MixinSide::Extend);
+            if instance {
+                self.unnamed(owner, MixinSide::Include);
+            } else {
+                self.wildcard(owner, MixinSide::Include);
+            }
+            return;
+        }
+        // `names` nil — the argument may spell any name — taints every side
+        // the name may reach; a resolved name list taints only the kinds it
+        // spells. The include walk reads `{include, prepend}` on `:include`;
+        // the extend walk reads `{extend}` on `:extend`, and inside
+        // `class << self` — where a computed `include` / `prepend` is the
+        // singleton mixin — `{include, prepend}` on `:extend` alone.
+        let may = |kinds: &[&str]| -> bool {
+            names.as_ref().is_none_or(|ns| ns.iter().any(|l| kinds.contains(&l.as_str())))
+        };
+        if in_singleton {
+            if may(&["include", "prepend"]) {
+                self.unnamed(owner, MixinSide::Extend);
+            }
+        } else {
+            if may(&["include", "prepend"]) {
+                self.unnamed(owner.clone(), MixinSide::Include);
+            }
+            if may(&["extend"]) {
+                self.unnamed(owner, MixinSide::Extend);
+            }
+        }
+    }
+
+    /// `MixinAccumulator#class_body_scope` — the node whose locals a call
+    /// written in a registered class body reads (the body itself, or the
+    /// `def self.` it sits in), or `None` when the call is not one whose
+    /// `self` is that body's class as far as [`collect_class_body_calls`] can
+    /// tell. Collected lazily, a body at a time, exactly as the accumulator
+    /// extends its map on the first question.
+    fn class_body_scope(&mut self, n: &PrismNode<'pr>) -> Option<PrismNode<'pr>> {
+        while self.class_bodies_read < self.class_bodies.len() {
+            let body = node_copy(&self.class_bodies[self.class_bodies_read]);
+            for (key, scope) in collect_class_body_calls(&body) {
+                self.class_body_calls.insert(key, scope);
+            }
+            self.class_bodies_read += 1;
+        }
+        self.class_body_calls.get(&span_key(n)).map(node_copy)
+    }
+
+    /// `taint_opaque_eval`'s `block_mixes_into_self?` — a receiverless or
+    /// `self.` `include` / `prepend` (or its `send` spelling) anywhere in
+    /// `node`, which may mix into the class the block's `self` is.
+    fn block_mixes_into_self(&self, n: &PrismNode<'_>) -> bool {
+        struct Finder<'a, 'pr> {
+            census: &'a Census<'pr>,
+            found: bool,
+        }
+        impl<'pr> Visit<'pr> for Finder<'_, 'pr> {
+            fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
+                let lexical_self =
+                    node.receiver().is_none_or(|r| r.as_self_node().is_some());
+                if lexical_self
+                    && self
+                        .census
+                        .mixin_view(node)
+                        .is_some_and(|(k, _, _)| k == "include" || k == "prepend")
+                {
+                    self.found = true;
+                    return;
+                }
+                ruby_prism::visit_call_node(self, node);
+            }
+        }
+        let mut f = Finder { census: self, found: false };
+        f.visit(n);
+        f.found
     }
 
     /// Upstream v0.4.6 (#2269, `singleton_class_rewrite_tainted?` +
@@ -884,7 +1552,7 @@ impl Census {
         let object = sc.receiver();
         let lexical_self = object.as_ref().is_none_or(|o| o.as_self_node().is_some());
         let owner = if lexical_self {
-            self.singleton_owner()
+            self.self_owner()
         } else {
             object.as_ref().and_then(strict_constant_path_string).map(|raw| self.candidates(&raw))
         };
@@ -951,11 +1619,11 @@ impl Census {
     }
 
     fn block_mixes_in(&self, n: &PrismNode<'_>) -> bool {
-        struct Finder<'a> {
-            census: &'a Census,
+        struct Finder<'a, 'pr> {
+            census: &'a Census<'pr>,
             found: bool,
         }
-        impl<'pr> Visit<'pr> for Finder<'_> {
+        impl<'pr> Visit<'pr> for Finder<'_, 'pr> {
             fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
                 if self.census.mixin_view(node).is_some() {
                     self.found = true;
@@ -970,7 +1638,7 @@ impl Census {
     }
 }
 
-impl<'pr> Visit<'pr> for Census {
+impl<'pr> Visit<'pr> for Census<'pr> {
     fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
         for s in node.statements().body().iter() {
             self.direct.insert(span_key(&s));
@@ -1005,7 +1673,20 @@ impl<'pr> Visit<'pr> for Census {
             strict_constant_path_string(&expr).map(|raw| self.candidates(&raw))
         };
         // `class << self` inside `X.instance_eval { … }` opens `X`'s singleton.
-        let eval_owner = if is_self { self.singleton_owner() } else { None };
+        let eval_owner = if is_self { self.self_owner() } else { None };
+        // `MixinAccumulator#class_body` — registered only where the
+        // reference's walks register one: declaration bodies (in
+        // [`declaration`]) and a FIRST-LEVEL `class << self`'s — `opens_self =
+        // self && !in_singleton`. `class << Const`
+        // (`walk_extends_constant_singleton`) and a nested `class << self`
+        // inside a singleton body register nothing: a computed `send` in
+        // either stays a taint.
+        let registrable = is_self && !self.frame().singleton;
+        if registrable {
+            if let Some(b) = node.body() {
+                self.class_bodies.push(node_copy(&b));
+            }
+        }
         self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner });
         if let Some(b) = node.body() {
             self.visit(&b);
@@ -1017,7 +1698,11 @@ impl<'pr> Visit<'pr> for Census {
         let name = constant_string(node.name().as_slice());
         let recv_self = node.receiver().is_some_and(|r| r.as_self_node().is_some());
         let singleton_def = recv_self || (node.receiver().is_none() && self.frame().singleton);
-        let mut hook = false;
+        // `hook_def_params` — the parameters of ANY `def` named in `HOOK_DEFS`
+        // (an instance `def included(base)` binds `base` the same as
+        // `def self.included(base)`; the extends walk needs it for the
+        // `included` / `inherited` hooks `extend` runs), at any `def` depth.
+        let hook = HOOK_DEFS.contains(&name.as_str());
         if self.in_def == 0 {
             if let Some(owner) = self.owner() {
                 for o in &owner {
@@ -1029,7 +1714,12 @@ impl<'pr> Visit<'pr> for Census {
                     if ALL_HOOKS.contains(&name.as_str()) {
                         self.out.dirty_owners.extend(owner.iter().cloned());
                     }
-                    hook = HOOK_DEFS.contains(&name.as_str());
+                    // `extend_reshapes_instance?` — `extended` / `extend_object`
+                    // on the extended module's singleton is a hook `extend`
+                    // runs.
+                    if ["extended", "extend_object"].contains(&name.as_str()) {
+                        self.out.extend_hook_owners.extend(owner.iter().cloned());
+                    }
                 } else if node.receiver().is_none() {
                     let key = span_key(&node.as_node());
                     let recorded = self.direct.contains(&key) || self.recorded_arg_defs.contains(&key);
@@ -1043,6 +1733,25 @@ impl<'pr> Visit<'pr> for Census {
                     }
                     if name == "method_missing" {
                         self.out.dirty_owners.extend(owner.iter().cloned());
+                    }
+                    // `INSTANCE_EXTEND_HOOKS` — the instance-side hooks an
+                    // `extend` runs on the extended module.
+                    if ["included", "append_features", "prepended", "prepend_features", "inherited"]
+                        .contains(&name.as_str())
+                    {
+                        self.out.extend_hook_owners.extend(owner.iter().cloned());
+                    }
+                }
+                // A constant receiver's `def X.hook` files under X's
+                // candidates, as `discovered_singleton_def_nodes[X]` does.
+                if let Some(r) = node.receiver() {
+                    if r.as_self_node().is_none() {
+                        if let Some(raw) = strict_constant_path_string(&r) {
+                            if ["extended", "extend_object"].contains(&name.as_str()) {
+                                let owners = self.candidates(&raw);
+                                self.out.extend_hook_owners.extend(owners);
+                            }
+                        }
                     }
                 }
             }
@@ -1168,7 +1877,21 @@ impl<'pr> Visit<'pr> for Census {
                     && (self.hook_receiver(r) || self.block_mixes_in(&b.as_node()))
                 {
                     if let Some(owner) = self.owner() {
-                        self.wildcard(owner.clone(), MixinSide::Include);
+                        // `taint_opaque_eval` (#2991): the include side's SET
+                        // is unknown only where the block may mix into the
+                        // class itself — a hook's `base`, or a receiverless /
+                        // `self.` include|prepend in the block of a receiver
+                        // other than a `singleton_class` — the extend side
+                        // keeps the wildcard.
+                        let hook = self.hook_receiver(r);
+                        let sc_eval = r
+                            .as_call_node()
+                            .is_some_and(|c| constant_string(c.name().as_slice()) == "singleton_class");
+                        if hook || (!sc_eval && self.block_mixes_into_self(&b.as_node())) {
+                            self.unnamed(owner.clone(), MixinSide::Include);
+                        } else {
+                            self.wildcard(owner.clone(), MixinSide::Include);
+                        }
                         self.wildcard(owner, MixinSide::Extend);
                     }
                 }
@@ -1215,8 +1938,8 @@ impl<'pr> Visit<'pr> for Census {
             // A bare / `self` receiver keeps the enclosing self, an
             // `instance_eval` frame's included.
             let eval_owner = match (&recv, &recv_const) {
-                (None, _) => self.singleton_owner(),
-                (Some(r), _) if r.as_self_node().is_some() => self.singleton_owner(),
+                (None, _) => self.self_owner(),
+                (Some(r), _) if r.as_self_node().is_some() => self.self_owner(),
                 _ => owner.clone(),
             };
             let owner = if instance_side { None } else { owner };
@@ -1247,6 +1970,9 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
         hook_params: Vec::new(),
         direct_includes: std::collections::HashMap::new(),
         main_self: HashSet::new(),
+        class_bodies: Vec::new(),
+        class_body_calls: std::collections::HashMap::new(),
+        class_bodies_read: 0,
     };
     c.visit(root);
     c.out.singleton_locals = super::singleton_locals::collect(root);
