@@ -18,10 +18,10 @@
 //!    frame-owned local is `mutate.local`, and so is a receiver that is itself
 //!    an allocation (`{}.compare_by_identity`, `raw.dup.force_encoding(e)`) by
 //!    the local rule's own witness ([`allocation`]). **Anything else answers
-//!    None**, and the caller records nothing rather than a proven bare
-//!    `mutate`: Ruby's ownership is a dataflow question, and a proven parent
-//!    label on a fresh-but-unproven receiver would put findings on correct
-//!    code.
+//!    None**, and the caller records an `unknown-ownership` taint rather
+//!    than a proven bare `mutate`: Ruby's ownership is a dataflow question,
+//!    and a proven parent label on a fresh-but-unproven receiver would put
+//!    findings on correct code.
 //!
 //! [`owned_locals`] is deliberately **flow-insensitive and whole-body**: a local
 //! that escapes anywhere disqualifies, even if the escape happens after the
@@ -129,7 +129,7 @@ impl MutationClassifier {
             }
             return self.owned_locals.contains(&name).then_some(Ownership::Local);
         }
-        // Upstream's `else` arm (`mutation_classifier.rb:91`): a receiver that
+        // Upstream's `else` arm (`mutation_classifier.rb:88`): a receiver that
         // is itself an allocation earns `mutate.local` — each evaluation is a
         // new object no caller holds yet (`{}.compare_by_identity`,
         // `raw.dup.force_encoding(e)`).
@@ -144,7 +144,7 @@ impl MutationClassifier {
 /// The set of frame-owned local names in `body`, given the method's parameter
 /// names (a parameter is never frame-owned — the caller holds the same object,
 /// so mutating it is `mutate.instance`) and whether `self` is a class there
-/// ([`constructor`] reads it, `local_ownership.rb:33`).
+/// ([`constructor`] reads it, `local_ownership.rb:36`).
 pub(super) fn owned_locals(
     body: Option<&Node<'_>>,
     parameters: &BTreeSet<String>,
@@ -281,7 +281,7 @@ fn stored_value<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
 }
 
 /// Whether `node` is an expression that allocates a fresh object this frame is
-/// the sole holder of (`local_ownership.rb:51`). `singleton` is whether the
+/// the sole holder of (`local_ownership.rb:52`). `singleton` is whether the
 /// enclosing unit's `self` is a class, as [`constructor`] reads it.
 fn allocation(node: &Node<'_>, singleton: bool) -> bool {
     if node.as_array_node().is_some()
@@ -300,7 +300,7 @@ fn allocation(node: &Node<'_>, singleton: bool) -> bool {
 
 /// A `new` whose receiver the author wrote as a class object: a constant path,
 /// a `class` call (`self.class`, `other.class`), or `self` — explicit or
-/// implicit — in a singleton-method body (`local_ownership.rb:67`). Any other
+/// implicit — in a singleton-method body (`local_ownership.rb:71`). Any other
 /// receiver may be an object whose `new` only shares the name: an ActiveRecord
 /// association's `new` builds a record into the association's own target,
 /// where the caller can reach it. `self` in an instance method is such a
@@ -325,7 +325,7 @@ fn constructor(call: &CallNode<'_>, singleton: bool) -> bool {
 }
 
 /// `x.class` — `Kernel#class` answers the receiver's class, unless the
-/// receiver overrides it (`local_ownership.rb:80`).
+/// receiver overrides it (`local_ownership.rb:84`).
 fn class_call(call: &CallNode<'_>) -> bool {
     call.name().as_slice() == b"class" && call.arguments().is_none() && call.block().is_none()
 }
@@ -381,14 +381,14 @@ mod tests {
         assert_eq!(owned("h = {}\nh[:k] = 1\nnil", &[]), ["h"]);
         assert_eq!(owned("o = Thing.new\no.x = 1\nnil", &[]), ["o"]);
         assert_eq!(owned("d = other.dup\nd.clear\nnil", &[]), ["d"]);
-        // `x.class` receivers are class objects (`local_ownership.rb:80`).
+        // `x.class` receivers are class objects (`local_ownership.rb:84`).
         assert_eq!(owned("o = self.class.new\no.x = 1\nnil", &[]), ["o"]);
         assert_eq!(owned("o = other.class.new\no.x = 1\nnil", &[]), ["o"]);
     }
 
     #[test]
     fn new_allocates_only_on_a_class_object_receiver() {
-        // `constructor?` (`local_ownership.rb:67`) — issue #614.
+        // `constructor?` (`local_ownership.rb:71`) — issue #614.
         // A non-class receiver's `new` only shares the name.
         assert!(owned("o = assoc.items.new\no.x = 1\nnil", &[]).is_empty());
         // Bare `new` on an instance body is `self.new`, and `self` is not a
