@@ -505,8 +505,10 @@ chasing a non-bug.)
    `rigor-rbs-contract`; #376). The tie is mechanical —
    `cargo test -p rigor-cli bundled_name_tables` re-derives both tables from
    the submodule exactly the way `PluginCommand#discover` /
-   `SkillCommand#discover_skills` do and fails on any drift, so the ordinary
-   workspace test gate catches it.
+   `SkillCommand#discover_skills` do and fails on any drift. The test skips
+   where the submodule is unpopulated (CI's `build + test` job checks out
+   without submodules) — a bump is only ever performed where the oracle
+   exists, so the bump-time gate is `harness/gate.sh`'s `cargo test -p` run.
 7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
    --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
    (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap
