@@ -55,7 +55,7 @@ pub fn shadowed_rescue_diagnostics(
     source_index: &SourceIndex,
     source: &str,
 ) -> Vec<Diagnostic> {
-    let line_starts = line_starts_of(source);
+    let lines = ast.line_index();
     let severity = catalog(FLOW_SHADOWED_RESCUE_CLAUSE)
         .map(|e| e.default_severity)
         .unwrap_or(Severity::Warning);
@@ -92,7 +92,7 @@ pub fn shadowed_rescue_diagnostics(
                 index,
                 source_index,
                 source,
-                &line_starts,
+                lines,
                 severity,
             ) {
                 out.push(diag);
@@ -215,7 +215,7 @@ fn check_shadowed(
     index: &CoreIndex,
     source_index: &SourceIndex,
     source: &str,
-    line_starts: &[usize],
+    lines: &rigor_parse::LineIndex,
     severity: Severity,
 ) -> Option<Diagnostic> {
     // The certified earlier clauses (opaque ones contribute nothing).
@@ -251,7 +251,7 @@ fn check_shadowed(
         .iter()
         .map(|c| {
             let src = clause_source(c.clause, ast, source);
-            let line = line_at(line_starts, c.clause.span.0);
+            let line = lines.line(c.clause.span.0);
             format!("`{src}' (line {line})")
         })
         .collect();
@@ -368,22 +368,6 @@ fn raw_slice(source: &str, span: Span) -> &str {
     source.get(span.0..span.1).unwrap_or("")
 }
 
-/// Precompute the byte offset of every line start (index 0 = line 1).
-fn line_starts_of(source: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (i, b) in source.bytes().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-/// The 1-based source line of a byte offset (binary search over line starts).
-fn line_at(line_starts: &[usize], offset: usize) -> usize {
-    line_starts.partition_point(|&ls| ls <= offset)
-}
-
 /// The enclosing class/module names for a node at `inner`, outermost first —
 /// every `ClassDef`/`ModuleDef` whose span strictly contains `inner`, ordered by
 /// containment (widest first). Names are the as-written constant paths, matching
@@ -423,12 +407,11 @@ mod tests {
         let source = SourceIndex::build(&ast, &index);
         let diags = shadowed_rescue_diagnostics(&ast, &index, &source, src);
         // Compute a 1-based column from the byte offset, like the CLI does.
-        let starts = line_starts_of(src);
+        let lines = ast.line_index();
         diags
             .into_iter()
             .map(|d| {
-                let line = line_at(&starts, d.start_offset);
-                let col = d.start_offset - starts[line - 1] + 1;
+                let (line, col) = lines.line_col(d.start_offset);
                 (line, col, d.message)
             })
             .collect()

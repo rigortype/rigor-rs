@@ -48,7 +48,7 @@ use lsp_types::{
 
 use rigor_index::CoreIndex;
 use rigor_infer::{Harvest, SourceIndex, Typer};
-use rigor_parse::{comment_lines, lower, lower_with_key, parse_bounded, FileKey, LoweredAst, Node};
+use rigor_parse::{comment_lines, lower, lower_with_key, parse_bounded, FileKey, LineIndex, LoweredAst, Node};
 use rigor_rules::{analyze_with_source_and_folder, filter_suppressed, Severity, SuppressSet};
 use rigor_types::{Interner, Type, TypeId};
 
@@ -2978,12 +2978,12 @@ fn compute_diagnostics(
         if result.errors().next().is_some() {
             return Ok(None);
         }
-        let comments = comment_lines(&result, &bytes);
         // Issue #102: the buffer is the content of a file at a known path, so its
         // lowering takes that path's key — the same key tier 1 gave the on-disk
         // lowering this one REPLACES, and the same key `hover`/`completion` give
         // their own re-lowering of the buffer.
         let ast = lower_with_key(&result, document_file_key(buf.canonical.as_deref()));
+        let comments = comment_lines(&result, &bytes, ast.line_index());
         let (source, overlay_build) =
             overlay_source_index(project, buf.canonical.as_deref(), &ast);
         let mut interner = Interner::new();
@@ -3017,14 +3017,15 @@ fn compute_diagnostics(
         // nothing and cost staleness (probe §4 — this is the one gate that keeps
         // the fallback posture literally unchanged).
         let project_index = overlay_build.is_some().then(|| Arc::clone(&source));
-        Ok(Some((diags, comments, overlay_build, project_index)))
+        Ok(Some((diags, comments, overlay_build, project_index, ast.share_line_index())))
     }));
 
-    let (mut diags, comments, overlay_build, project_index) = match analysed {
-        Ok(Ok(Some(quad))) => quad,
+    let (mut diags, comments, overlay_build, project_index, lines) = match analysed {
+        Ok(Ok(Some(quint))) => quint,
         Ok(Err(msg)) => {
             let skipped = crate::depth_refusal_diag(msg);
-            return (vec![to_lsp_diagnostic(text, &skipped)], None, None);
+            let lines = LineIndex::new(text.as_bytes());
+            return (vec![to_lsp_diagnostic(text, &lines, &skipped)], None, None);
         }
         Ok(Ok(None)) | Err(_) => return (Vec::new(), None, None),
     };
@@ -3035,7 +3036,7 @@ fn compute_diagnostics(
     // 1-based line, filter, then drop config-`disable:`d rules.
     let with_lines: Vec<(usize, rigor_rules::Diagnostic)> = diags
         .into_iter()
-        .map(|d| (offset_to_position(text, d.start_offset).line as usize + 1, d))
+        .map(|d| (lines.line(d.start_offset), d))
         .collect();
 
     // COMPOSITION ORDER, verified against `main.rs`'s stage 3 (do not reorder):
@@ -3049,7 +3050,7 @@ fn compute_diagnostics(
         .into_iter()
         .filter(|(_, d)| !project.disable.suppresses(d.rule_id))
         .filter_map(|(_, mut d)| {
-            project.stamp.apply(&mut d).then(|| to_lsp_diagnostic(text, &d))
+            project.stamp.apply(&mut d).then(|| to_lsp_diagnostic(text, &lines, &d))
         })
         .collect();
     (out, overlay_build, project_index)
@@ -3059,9 +3060,9 @@ fn compute_diagnostics(
 /// `code` = the rule id, severity per ADR-0029 (`error`→Error, `warning`→Warning,
 /// `info`→Information). The range is the diagnostic's byte span, resolved to
 /// 0-based UTF-16 LSP positions.
-fn to_lsp_diagnostic(text: &str, d: &rigor_rules::Diagnostic) -> Diagnostic {
-    let start = offset_to_position(text, d.start_offset);
-    let end = offset_to_position(text, d.end_offset.max(d.start_offset));
+fn to_lsp_diagnostic(text: &str, lines: &LineIndex, d: &rigor_rules::Diagnostic) -> Diagnostic {
+    let start = offset_to_position_at(text, lines, d.start_offset);
+    let end = offset_to_position_at(text, lines, d.end_offset.max(d.start_offset));
     let severity = match d.severity {
         Severity::Error => DiagnosticSeverity::ERROR,
         Severity::Warning => DiagnosticSeverity::WARNING,
@@ -3177,14 +3178,15 @@ fn hover(
     }));
 
     let (value, start, end) = result.ok().flatten()?;
+    let lines = LineIndex::new(text.as_bytes());
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: MarkupKind::Markdown,
             value,
         }),
         range: Some(Range {
-            start: offset_to_position(text, start),
-            end: offset_to_position(text, end),
+            start: offset_to_position_at(text, &lines, start),
+            end: offset_to_position_at(text, &lines, end),
         }),
     })
 }
@@ -3482,7 +3484,8 @@ fn document_symbols(
         // Past the depth bound (rigor-rs#412): no symbols.
         let Ok(parsed) = parse_bounded(text.as_bytes()) else { return Vec::new() };
         let ast = lower(&parsed);
-        crate::outline::build(&ast).iter().map(|s| to_document_symbol(s, text)).collect::<Vec<_>>()
+        let lines = ast.line_index();
+        crate::outline::build(&ast).iter().map(|s| to_document_symbol(s, text, lines)).collect::<Vec<_>>()
     }))
     .ok()?;
     if syms.is_empty() {
@@ -3493,12 +3496,12 @@ fn document_symbols(
 
 /// Adapt a shared [`crate::outline::SymNode`] into an LSP `DocumentSymbol`
 /// (byte-offset spans → 0-based UTF-16 ranges; kind → `SymbolKind`).
-fn to_document_symbol(s: &crate::outline::SymNode, text: &str) -> DocumentSymbol {
+fn to_document_symbol(s: &crate::outline::SymNode, text: &str, lines: &LineIndex) -> DocumentSymbol {
     use crate::outline::SymKind;
-    let kids: Vec<DocumentSymbol> = s.children.iter().map(|c| to_document_symbol(c, text)).collect();
+    let kids: Vec<DocumentSymbol> = s.children.iter().map(|c| to_document_symbol(c, text, lines)).collect();
     let to_range = |(a, b): (usize, usize)| Range {
-        start: offset_to_position(text, a),
-        end: offset_to_position(text, b),
+        start: offset_to_position_at(text, lines, a),
+        end: offset_to_position_at(text, lines, b),
     };
     let kind = match s.kind {
         SymKind::Class => SymbolKind::CLASS,
@@ -3525,18 +3528,15 @@ fn to_document_symbol(s: &crate::outline::SymNode, text: &str) -> DocumentSymbol
 /// Byte offset → LSP `Position` (0-based line, 0-based UTF-16 character). The
 /// column is counted in UTF-16 code units per the LSP default position encoding.
 fn offset_to_position(text: &str, offset: usize) -> Position {
+    offset_to_position_at(text, &LineIndex::new(text.as_bytes()), offset)
+}
+
+/// Byte offset → LSP `Position` over a shared [`LineIndex`] (rigor-rs#642):
+/// 0-based line from the table, UTF-16 `character` counted only on that line.
+fn offset_to_position_at(text: &str, lines: &LineIndex, offset: usize) -> Position {
     let offset = offset.min(text.len());
-    let mut line = 0u32;
-    let mut line_start = 0usize;
-    for (i, b) in text.as_bytes().iter().enumerate() {
-        if i >= offset {
-            break;
-        }
-        if *b == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
+    let line_start = lines.line_start(offset);
+    let line = (lines.line(offset) as u32).saturating_sub(1);
     let character: u32 = text[line_start..offset]
         .chars()
         .map(|c| c.len_utf16() as u32)
