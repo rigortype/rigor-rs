@@ -2684,6 +2684,9 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
     }
 }
 
+/// One findings row — see [`Findings`].
+type Finding = (usize, String, (usize, usize), Diagnostic);
+
 /// A run's findings: `(input-order, path, (line, column), diagnostic)`
 /// tuples. The position is resolved ONCE where the row is produced (stage 3
 /// and the parse-error drain build a [`line_starts`] table per file; run- and
@@ -2691,7 +2694,7 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
 /// file's source so the renderers could re-walk it per row — O(diagnostics ×
 /// file bytes) in both memory and time, rigor-rs#636's 160 s / ~49 GB
 /// footprint on a 60k-diagnostic file.
-type Findings = Vec<(usize, String, (usize, usize), Diagnostic)>;
+type Findings = Vec<Finding>;
 
 /// The baseline subcommand switch tables — `parse_generate_options` /
 /// `parse_dump_options` / `parse_drift_options` / `parse_prune_options` in
@@ -3428,8 +3431,7 @@ fn apply_baseline(
     // Keep only the surfaced indices IN THE FILTER'S ORDER — the reference
     // regroups output by (file, rule) bin under a non-empty baseline
     // (`Baseline#filter` returns the regrouped diagnostics themselves).
-    let mut slots: Vec<Option<(usize, String, (usize, usize), Diagnostic)>> =
-        findings.into_iter().map(Some).collect();
+    let mut slots: Vec<Option<Finding>> = findings.into_iter().map(Some).collect();
     surfaced_idx
         .into_iter()
         .map(|i| slots[i].take().expect("baseline filter returns each index at most once"))
