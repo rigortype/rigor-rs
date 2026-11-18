@@ -1555,6 +1555,34 @@ mod tests {
     }
 
     #[test]
+    fn a_rooted_header_resets_the_unit_prefix() {
+        // `declaration_prefix` (`constant_path.rb:94`): a `class ::Path`
+        // header names `Path` wherever it is written, so the enclosing
+        // prefix is DROPPED. MEASURED against the oracle at pin v0.4.8 —
+        // issue #615's probe table.
+        assert_eq!(keys("module Outer\n class ::Rooted\n  def m\n  end\n end\nend"), ["Rooted#m"]);
+        assert_eq!(
+            keys("module Outer\n class ::Deep::Rooted2\n  def m\n  end\n  def self.s\n  end\n end\nend"),
+            ["Deep::Rooted2#m", "Deep::Rooted2.s"]
+        );
+        assert_eq!(
+            keys("module M\n class N\n  class ::A::B\n   def i\n   end\n   def self.s\n   end\n  end\n end\nend"),
+            ["A::B#i", "A::B.s"]
+        );
+        // Rooted at the top level renders the same as unrooted.
+        assert_eq!(keys("class ::Top\n def m\n end\nend"), ["Top#m"]);
+    }
+
+    #[test]
+    fn a_non_rooted_header_still_appends_to_the_unit_prefix() {
+        // The controls for the reset: a dynamic base (`self::Dyn`) renders
+        // its trailing name and appends, and a plain `P` under `M::N` stays
+        // `M::N::P`.
+        assert_eq!(keys("module Outer\n class self::Dyn\n  def m\n  end\n end\nend"), ["Outer::Dyn#m"]);
+        assert_eq!(keys("module M\n class N\n  class P\n   def i\n   end\n  end\n end\nend"), ["M::N::P#i"]);
+    }
+
+    #[test]
     fn a_class_body_alias_is_silent() {
         // Class bodies are not effect units in v1, so an `alias` in one is
         // neither a unit nor a label.
