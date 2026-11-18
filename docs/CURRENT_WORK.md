@@ -63,6 +63,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #603 CLOSED** (PR #623): alias floor ports `selection_branches` (case/in, begin/rescue, rescue-modifier — last statement per arm), `ReceiverAlias.candidates` receivers, `message_loc` reach, block-declined `send`; three carrier marks in `CarrierSpans`, mixed-candidate spans `non_floorable`. 4 FP rows + ~130 probes match, 2-round Approved; sweep unmeasurable locally (substitutes 0 FP/0 diff). Follow-ups #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
+
 - **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; probes byte-identical, 0 OVER, unit tests cover the fixture blind spot. → #621 (sig-scoped `Const.new.m` FP), #622 (ConstantPath consolidation). [note](notes/20261119-issue-615-rooted-class-header.md)
 
 - **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in every mixin list — computed class-body `include`/`send` opens the class (`taint_unrecorded_mixin`, `taint_computed_send`/`local_send_names`/`opens_self`, `extend_hook_taint`, `unnamed_mixin_on_chain`); scalar-path decline only, unions still fire. ~60 probe rows match; 2-round review closed 5 findings (hook-param vs chain, `?`-as-name leak, `eval_owner`, instance hook defs); sweep unmeasurable locally (no corpora). Follow-ups #617–#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
