@@ -1878,7 +1878,7 @@ fn prism_accepts_target(version: &str) -> bool {
 /// `baseline: rel.yml` keeps its cwd-relative spelling.
 const PATH_KEYS: [&str; 3] = ["paths", "signature_paths", "pre_eval"];
 
-/// Read + parse `absolute` (already `File.expand_path`'d) as a YAML document,
+/// Read + parse `absolute` (already `File.absolute_path`'d) as a YAML document,
 /// or the [`LoadFailure`] the reference dies with: a read error is an uncaught
 /// `Errno` upstream (exit 1); a `Psych::SyntaxError` is re-rendered upstream
 /// as `<abs>:<line>:<col>: not valid YAML: <detail>` (exit 64); a document

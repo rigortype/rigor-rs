@@ -388,7 +388,8 @@ fn has_glob_meta(s: &str) -> bool {
 
 /// Whether the reference reads the same signature directory the port reads
 /// for `entry` (as written in the config whose directory is `base`): no `~`
-/// (`File.expand_path` expands it), no glob metacharacter anywhere in the
+/// (`ConfigPath.absolute` substitutes `~/` only — the gate stays
+/// conservative and declines both), no glob metacharacter anywhere in the
 /// absolute path `Dir.glob` receives, and a `..` only where the lexical fold
 /// the reference makes names the directory the OS reaches.
 pub(crate) fn signature_entry_ok(entry: &str, base: Option<&Path>) -> bool {
@@ -449,7 +450,8 @@ pub(crate) fn spelled_case_is_on_disk(path: &Path) -> bool {
 
 /// Whether the `--config` path names, for the reference, the file the port
 /// reads, in the directory the port resolves against. The reference reads
-/// `File.expand_path(path)`: `~` expanded and `..` folded LEXICALLY, where
+/// `File.absolute_path(path)`: a leading `~` stays literal (the gate
+/// declines it anyway — conservative) and `..` folded LEXICALLY, where
 /// the OS follows a symlink before `..` (oracle: `--config <D>/lnk/../x.yml`
 /// read a different file there), and the case of each segment matters (see
 /// [`spelled_case_is_on_disk`]).
