@@ -2187,7 +2187,7 @@ impl<'i> Typer<'i> {
                     continue;
                 };
                 if seen.contains(other)
-                    || !crate::flow_writes::alias_floor_reaches(ast, *lspan, wspan)
+                    || !crate::flow_writes::alias_floor_reaches(ast, indexed, *lspan, wspan)
                 {
                     continue;
                 }

@@ -60,6 +60,22 @@ pub(crate) struct Builder<'src> {
     /// `(id, (start, end))` — the `(`…`)` span each unwrapped id replaced
     /// (the reference's `ParenthesesNode` anchors diagnostics on the `(`).
     pub(crate) paren_spans: std::collections::HashMap<u32, (usize, usize)>,
+    /// Arena ids of the `BeginRescue` carriers a MULTI-STATEMENT
+    /// parenthesized group lowered to — see
+    /// [`LoweredAst::is_paren_carrier`].
+    ///
+    /// [`LoweredAst::is_paren_carrier`]: crate::ast::LoweredAst::is_paren_carrier
+    pub(crate) paren_carriers: Vec<u32>,
+    /// Arena ids of the `Statements{Recovered}` carriers a `rescue`
+    /// MODIFIER lowered to — see [`LoweredAst::is_rescue_modifier`].
+    ///
+    /// [`LoweredAst::is_rescue_modifier`]: crate::ast::LoweredAst::is_rescue_modifier
+    pub(crate) rescue_modifier_carriers: Vec<u32>,
+    /// Arena ids of the `BeginRescue` carriers an `else` clause lowered to
+    /// — see [`LoweredAst::is_else_carrier`].
+    ///
+    /// [`LoweredAst::is_else_carrier`]: crate::ast::LoweredAst::is_else_carrier
+    pub(crate) else_carriers: Vec<u32>,
     /// `(arena id, bound names)` for recovered children the recovery walk
     /// reached by CROSSING a `BlockNode`/`LambdaNode` — the closure's `locals`
     /// still shadow the enclosing scope inside the recovered subtree
@@ -349,7 +365,16 @@ impl<'src> Builder<'src> {
             return self.push(Node::Other { span, jump: None });
         }
         let body: Vec<NodeId> = self.lower_recovered(recovered);
-        self.push(Node::Statements { body, span, kind: StatementsKind::Recovered })
+        let is_rescue_modifier = node.as_rescue_modifier_node().is_some();
+        let id = self.push(Node::Statements { body, span, kind: StatementsKind::Recovered });
+        if is_rescue_modifier {
+            // `x = a rescue b` — upstream `selection_branches` yields the
+            // may-be locals of BOTH operands; mark the carrier so the
+            // alias floor's `may_be_locals` reads its children as the two
+            // operand expressions (rigor-rs#603).
+            self.rescue_modifier_carriers.push(id.0);
+        }
+        id
     }
 
     /// The debug half of [`Self::lower_node`]'s disjointness contract: `node`

@@ -112,10 +112,24 @@ pub struct LoweredAst {
 
 /// The span side tables for positions whose post-scope the reference never
 /// lands — `StatementsKind::Inert` carriers and `Recovered::blocked`
-/// extents. Bundled and boxed so the four lists cost `LoweredAst` one
-/// pointer.
+/// extents — plus the two carrier-identity sets the alias floor's receiver
+/// and value walks discriminate on. Bundled and boxed so the lists cost
+/// `LoweredAst` one pointer.
 #[derive(Clone, Default)]
 struct CarrierSpans {
+    /// Arena ids of the `BeginRescue` carriers a MULTI-STATEMENT
+    /// parenthesized group lowered to, sorted for a binary-search read via
+    /// [`LoweredAst::is_paren_carrier`]. A single-statement `(e)` unwraps
+    /// to its inner node instead ([`LoweredAst::paren_unwrapped`]).
+    paren_carrier_ids: Vec<u32>,
+    /// Arena ids of the `Statements{Recovered}` carriers a `rescue`
+    /// MODIFIER lowered to, sorted for a binary-search read via
+    /// [`LoweredAst::is_rescue_modifier`].
+    rescue_modifier_ids: Vec<u32>,
+    /// Arena ids of the `BeginRescue` carriers an `else` clause lowered
+    /// to, sorted for a binary-search read via
+    /// [`LoweredAst::is_else_carrier`].
+    else_carrier_ids: Vec<u32>,
     /// The spans of every [`StatementsKind::Inert`] carrier, for
     /// [`LoweredAst::in_inert_carrier`].
     inert: Vec<Span>,
@@ -443,6 +457,42 @@ impl LoweredAst {
             .map(|i| (self.paren_spans[i].1, self.paren_spans[i].2))
     }
 
+    /// Whether `id` is the `BeginRescue` carrier a MULTI-STATEMENT
+    /// parenthesized group lowered to. `ReceiverAlias.candidates` reads a
+    /// `ParenthesesNode`'s last statement; a real `begin`/`rescue` on the
+    /// same carrier shape (or an `in`/`else` reused carrier) names NO
+    /// local, so that walk must not unwrap the same way (rigor-rs#603).
+    pub fn is_paren_carrier(&self, id: NodeId) -> bool {
+        self.carrier_spans
+            .paren_carrier_ids
+            .binary_search(&id.0)
+            .is_ok()
+    }
+
+    /// Whether `id` is the `Statements{Recovered}` carrier a `rescue`
+    /// MODIFIER lowered to. Upstream `selection_branches` yields the may-be
+    /// locals of `[expression, rescue_expression]` — the carrier's
+    /// recovered children are exactly those two operands' contents. Other
+    /// `Recovered` carriers (`super`, splats, `defined?`) name nothing
+    /// (rigor-rs#603).
+    pub fn is_rescue_modifier(&self, id: NodeId) -> bool {
+        self.carrier_spans
+            .rescue_modifier_ids
+            .binary_search(&id.0)
+            .is_ok()
+    }
+
+    /// Whether `id` is the `BeginRescue` carrier an `else` clause lowered
+    /// to. `ReceiverAlias.candidates` unwraps an `ElseNode` to its
+    /// statements' last statement; a real `begin`/`rescue` on the same
+    /// carrier shape names NO local (rigor-rs#603).
+    pub fn is_else_carrier(&self, id: NodeId) -> bool {
+        self.carrier_spans
+            .else_carrier_ids
+            .binary_search(&id.0)
+            .is_ok()
+    }
+
     /// Upstream v0.4.1 — this file's [`AncestryFacts`]: the mixin edges,
     /// definers and visibility slots the direct-statement harvest cannot
     /// vouch for.
@@ -529,6 +579,9 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         line_starts,
         paren_unwrapped: Vec::new(),
         paren_spans: std::collections::HashMap::new(),
+        paren_carriers: Vec::new(),
+        rescue_modifier_carriers: Vec::new(),
+        else_carriers: Vec::new(),
         closure_bindings: Vec::new(),
         recovery_joined: 0,
         recovery_blocked: 0,
@@ -574,7 +627,16 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
             _ => None,
         })
         .collect();
+    let mut paren_carrier_ids = builder.paren_carriers;
+    paren_carrier_ids.sort_unstable();
+    let mut rescue_modifier_ids = builder.rescue_modifier_carriers;
+    rescue_modifier_ids.sort_unstable();
+    let mut else_carrier_ids = builder.else_carriers;
+    else_carrier_ids.sort_unstable();
     let carrier_spans = Box::new(CarrierSpans {
+        paren_carrier_ids,
+        rescue_modifier_ids,
+        else_carrier_ids,
         inert: inert_spans,
         scanned_inert: builder.scanned_inert_spans,
         blocked: builder.blocked_spans,
