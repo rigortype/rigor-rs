@@ -6,7 +6,7 @@
 //! (e.g. `bool` for `true | false`) but MUST NOT change type identity
 //! (normalization.md §"Interaction with display").
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::algebra::is_bool_pair;
 use crate::interner::Interner;
@@ -168,22 +168,22 @@ fn render_postorder(
         Enter(TypeId),
         Exit(TypeId),
     }
-    // TypeIds are dense over `0..i.len()`, so flat tables index by `id.0`.
+    // Tables sized by the REACHABLE set, not the whole arena — a call on a
+    // shallow type must not pay O(interner.len()).
     let mut edges: Vec<TypeId> = Vec::new();
 
     // Pass 1: in-degree of every reachable node (every edge counts once per
     // parent, since each node is expanded once).
-    let mut refs: Vec<u32> = vec![0; i.len()];
-    let mut seen: Vec<bool> = vec![false; i.len()];
+    let mut refs: HashMap<TypeId, u32> = HashMap::new();
+    let mut seen: HashSet<TypeId> = HashSet::new();
     let mut todo = vec![root];
-    seen[root.0 as usize] = true;
+    seen.insert(root);
     while let Some(id) = todo.pop() {
         edges.clear();
         children(i.get(id), &mut edges);
         for &c in &edges {
-            refs[c.0 as usize] += 1;
-            if !seen[c.0 as usize] {
-                seen[c.0 as usize] = true;
+            *refs.entry(c).or_insert(0) += 1;
+            if seen.insert(c) {
                 todo.push(c);
             }
         }
@@ -192,15 +192,14 @@ fn render_postorder(
     // Pass 2: post-order combine, freeing a child's string after its last
     // parent's Exit.
     let mut memo: HashMap<TypeId, String> = HashMap::new();
-    seen.fill(false);
+    seen.clear();
     let mut stack = vec![Task::Enter(root)];
     while let Some(task) = stack.pop() {
         match task {
             Task::Enter(id) => {
-                if seen[id.0 as usize] {
+                if !seen.insert(id) {
                     continue;
                 }
-                seen[id.0 as usize] = true;
                 stack.push(Task::Exit(id));
                 edges.clear();
                 children(i.get(id), &mut edges);
@@ -219,10 +218,11 @@ fn render_postorder(
                 edges.clear();
                 children(i.get(id), &mut edges);
                 for &c in &edges {
-                    let r = &mut refs[c.0 as usize];
-                    *r -= 1;
-                    if *r == 0 {
-                        memo.remove(&c);
+                    if let Some(r) = refs.get_mut(&c) {
+                        *r -= 1;
+                        if *r == 0 {
+                            memo.remove(&c);
+                        }
                     }
                 }
             }
