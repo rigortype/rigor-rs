@@ -257,7 +257,7 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
                 // write, not only a bare read — `(c ? g : h) << 2` marks
                 // both `g` and `h` (rigor-rs#603).
                 let mut names = Vec::new();
-                receiver_alias_locals(ast, *r, &mut names);
+                let _ = receiver_alias_locals(ast, *r, &mut names);
                 names
                     .into_iter()
                     .map(|name| (id, *span, name, true))
@@ -270,7 +270,7 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
             } if literal_send_target(ast, n).is_some_and(|m| MUTATOR_METHODS.contains(&m.as_str())) =>
             {
                 let mut names = Vec::new();
-                receiver_alias_locals(ast, *r, &mut names);
+                let _ = receiver_alias_locals(ast, *r, &mut names);
                 names
                     .into_iter()
                     .map(|name| (id, *span, name, true))
@@ -287,7 +287,7 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
                 // `(c ? g : h)[k] ||= v` stores through `[]=` on whichever
                 // arm the selection answered — `mutated_reads` marks both.
                 let mut names = Vec::new();
-                receiver_alias_locals(ast, *r, &mut names);
+                let _ = receiver_alias_locals(ast, *r, &mut names);
                 names
                     .into_iter()
                     .map(|name| (id, *span, name, true))
@@ -757,7 +757,7 @@ pub(crate) fn toplevel_mutations(
                 // only read — `(c ? g : h) << 2` marks `g` and `h`,
                 // `(g = f) << 2` marks `g` (rigor-rs#603).
                 let mut names = Vec::new();
-                receiver_alias_locals(ast, *r, &mut names);
+                let _ = receiver_alias_locals(ast, *r, &mut names);
                 if !names.is_empty() {
                     let drop_key = if effective == "[]=" {
                         // `f[k] = v` keys on `args[0]`; `f.send(:[]=, k, v)`
@@ -2313,23 +2313,23 @@ fn may_be_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<Stri
             for arm in branches {
                 match ast.get(*arm) {
                     Node::When { body, .. } => {
-                        for s in body {
-                            may_be_locals_at(ast, *s, depth + 1, out);
+                        if let Some(last) = body.last() {
+                            may_be_locals_at(ast, *last, depth + 1, out);
                         }
                     }
                     // An `in` clause's reused `BeginRescue` carrier:
                     // `body[0]` is the pattern (never a value), the rest
                     // its statements.
                     Node::BeginRescue { body, .. } => {
-                        for s in &body[1.min(body.len())..] {
-                            may_be_locals_at(ast, *s, depth + 1, out);
+                        if let Some(last) = body[1.min(body.len())..].last() {
+                            may_be_locals_at(ast, *last, depth + 1, out);
                         }
                     }
                     _ => may_be_locals_at(ast, *arm, depth + 1, out),
                 }
             }
-            for s in else_body {
-                may_be_locals_at(ast, *s, depth + 1, out);
+            if let Some(last) = else_body.last() {
+                may_be_locals_at(ast, *last, depth + 1, out);
             }
         }
         // A real `begin` — upstream `begin_branches`: the protected body,
@@ -2347,12 +2347,16 @@ fn may_be_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<Stri
             clauses,
             ..
         } => {
-            for s in main_body {
-                may_be_locals_at(ast, *s, depth + 1, out);
+            // Upstream answers each section's LAST statement — a non-last
+            // write like `when 1 then s = f; +"x"` names nothing there,
+            // and reading it floors `f` where the oracle keeps its pin
+            // (`for "ab"`, not `for String`; review F1).
+            if let Some(last) = main_body.last() {
+                may_be_locals_at(ast, *last, depth + 1, out);
             }
             for c in clauses {
-                for s in &c.body {
-                    may_be_locals_at(ast, *s, depth + 1, out);
+                if let Some(last) = c.body.last() {
+                    may_be_locals_at(ast, *last, depth + 1, out);
                 }
             }
             // The `else` statements ride `body` between the clause parts
@@ -2363,19 +2367,19 @@ fn may_be_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<Stri
                 .sum();
             let else_start = main_body.len() + clause_len;
             let else_end = body.len() - ensure_body.len();
-            for s in &body[else_start.min(else_end)..else_end] {
-                may_be_locals_at(ast, *s, depth + 1, out);
+            if let Some(last) = body[else_start.min(else_end)..else_end].last() {
+                may_be_locals_at(ast, *last, depth + 1, out);
             }
         }
-        // A real statement sequence's value is its last statement — the
-        // port reads them all (the superset convention, see the doc).
+        // A statement sequence's value is its last statement — upstream
+        // `StatementsNode` answers `[node.body.last]`.
         Node::Statements {
             body,
             kind: StatementsKind::Sequence,
             ..
         } => {
-            for s in body {
-                may_be_locals_at(ast, *s, depth + 1, out);
+            if let Some(last) = body.last() {
+                may_be_locals_at(ast, *last, depth + 1, out);
             }
         }
         // A `rescue` MODIFIER — upstream `selection_branches` yields both
@@ -2396,20 +2400,32 @@ fn may_be_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<Stri
     }
 }
 
-/// `ReceiverAlias.candidates`, local names only — the locals a mutator
-/// call's receiver EXPRESSION may evaluate to (`ReceiverAlias.mutated_reads`
-/// for the local half): a read or write of the local itself (`(g = f) << 2`,
+/// `ReceiverAlias.candidates`' LOCAL names — the locals a mutator call's
+/// receiver EXPRESSION may evaluate to (`ReceiverAlias.mutated_reads` for
+/// the local half): a read or write of the local itself (`(g = f) << 2`,
 /// `(g ||= f) << 2`), one arm of an `if`/`unless`/ternary or `||`/`&&`
 /// selection (`(c ? g : h) << 2`), or the last statement of a parenthesized
-/// sequence. Every other form names no local the copy-link floor can carry:
-/// upstream routes it to the whole-aliased-set answer (`targets(nil, …)`),
-/// which the slice does not model — a cvar/gvar/ivar receiver included.
+/// sequence. Every other form names no local the copy-link floor can carry.
+/// Returns whether a NON-LOCAL candidate was also seen (an ivar read or
+/// write anywhere in the walk, a cvar/gvar at the direct receiver): then
+/// upstream `receiver_targets` answers `targets(nil)` — the aliased set the
+/// port does not model — so the caller marks the locals it found but flags
+/// the span `non_floorable` (the mark never propagates over copy links).
 /// Depth-capped like upstream's `WALK_DEPTH_CAP`.
-pub(crate) fn receiver_alias_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
-    receiver_alias_locals_at(ast, id, 0, out);
+pub(crate) fn receiver_alias_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) -> bool {
+    let mut non_local = false;
+    receiver_alias_locals_at(ast, id, 0, out, true, &mut non_local);
+    non_local
 }
 
-fn receiver_alias_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut Vec<String>) {
+fn receiver_alias_locals_at(
+    ast: &LoweredAst,
+    id: NodeId,
+    depth: u32,
+    out: &mut Vec<String>,
+    direct: bool,
+    non_local: &mut bool,
+) {
     if depth > SELECTION_DEPTH {
         return;
     }
@@ -2423,23 +2439,47 @@ fn receiver_alias_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut 
         Node::LocalVariableRead { name, .. }
         | Node::LocalVariableWrite { name, .. }
         | Node::LocalVariableOpWrite { name, .. } => push(name),
+        // An ivar read or write is a candidate that is not a local —
+        // `mutated_reads` includes it wherever the walk reaches it
+        // (`variable_write?` covers ivar writes too). A cvar/gvar counts
+        // only AS the direct receiver (`NON_ALIASED_READS` /
+        // `non_aliased_write?` read the unwrapped head, never a branch
+        // that selects it).
+        Node::InstanceVariableWrite { .. } => *non_local = true,
+        Node::VariableRead { name, .. } | Node::VariableWrite { name, .. } => {
+            // `name` carries the sigil: `@x` is the ivar read; `@@x`/`$x`
+            // count only in the direct position.
+            if (name.starts_with('@') && !name.starts_with("@@")) || direct {
+                *non_local = true;
+            }
+        }
         Node::Statements {
             body,
             kind: StatementsKind::Sequence,
             ..
         } => {
             if let Some(last) = body.last() {
-                receiver_alias_locals_at(ast, *last, depth + 1, out);
+                receiver_alias_locals_at(ast, *last, depth + 1, out, false, non_local);
             }
         }
-        // A multi-statement parens unwraps to its last statement; the
-        // carrier shape is shared with `begin`/`else`/`in`, which name
-        // nothing — `is_paren_carrier` tells them apart.
+        // A multi-statement parens or an `else` clause unwraps to its
+        // last statement; the carrier shape is shared with `begin`/`in`,
+        // which name nothing — `is_paren_carrier` / `is_else_carrier`
+        // tell them apart. The parens peel keeps the `direct` position
+        // (upstream's `mutated_reads` unwraps it for `NON_ALIASED_READS`);
+        // a selection arm does not.
         Node::BeginRescue { body, .. }
             if ast.is_paren_carrier(id) || ast.is_else_carrier(id) =>
         {
             if let Some(last) = body.last() {
-                receiver_alias_locals_at(ast, *last, depth + 1, out);
+                receiver_alias_locals_at(
+                    ast,
+                    *last,
+                    depth + 1,
+                    out,
+                    direct && ast.is_paren_carrier(id),
+                    non_local,
+                );
             }
         }
         Node::If {
@@ -2448,15 +2488,15 @@ fn receiver_alias_locals_at(ast: &LoweredAst, id: NodeId, depth: u32, out: &mut 
             // Upstream takes each arm's LAST statement (`statements`,
             // `subsequent`).
             if let Some(last) = then_body.last() {
-                receiver_alias_locals_at(ast, *last, depth + 1, out);
+                receiver_alias_locals_at(ast, *last, depth + 1, out, false, non_local);
             }
             if let Some(last) = else_body.last() {
-                receiver_alias_locals_at(ast, *last, depth + 1, out);
+                receiver_alias_locals_at(ast, *last, depth + 1, out, false, non_local);
             }
         }
         Node::Logical { left, right, .. } => {
-            receiver_alias_locals_at(ast, *left, depth + 1, out);
-            receiver_alias_locals_at(ast, *right, depth + 1, out);
+            receiver_alias_locals_at(ast, *left, depth + 1, out, false, non_local);
+            receiver_alias_locals_at(ast, *right, depth + 1, out, false, non_local);
         }
         _ => {}
     }
@@ -2717,9 +2757,17 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 // Upstream `receiver_targets`: `ReceiverAlias.candidates`
                 // of the receiver FIRST — every local the receiver may
                 // evaluate to triggers on its own name — and only a
-                // candidate-free receiver falls to the element path.
+                // candidate-free receiver falls to the element path. A
+                // MIXED candidate set (`(c ? f : @a) << 2`) fails
+                // `reads.all?(LocalVariableReadNode)` upstream, where the
+                // answer is `targets(nil)` — the unmodelled aliased set —
+                // so the local marks stand but never propagate over copy
+                // links (`non_floorable`, review finding: `(c ? f : @a)
+                // << 2` must not stale `g` where `g = f`).
                 let mut names = Vec::new();
-                receiver_alias_locals(ast, *r, &mut names);
+                if receiver_alias_locals(ast, *r, &mut names) {
+                    flow.non_floorable.insert(*span);
+                }
                 if !names.is_empty() {
                     // A bare or selecting receiver (`f << x`, `f[k] = v`,
                     // `f.send(:<<)`, `(c ? g : h) << 2`, `(g = f) << 2`) —
