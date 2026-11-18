@@ -38,12 +38,12 @@ pub(crate) enum Edge {
 
 /// `a` then `b` on the same edge (`&&`'s truthy edge): an unreachable or
 /// unmodelled first step decides alone.
-pub(crate) fn seq(a: Edge, b: impl FnOnce() -> Edge) -> Edge {
+pub(crate) fn seq(a: Edge, b: Edge) -> Edge {
     // Conjunction of two sequential guards: `Empty` absorbs — the second
     // guard's path cannot hold the carrier (`h.frozen? || h.is_a?(Hash)`
     // enters its arm only through `frozen?`, which keeps `Array`,
     // rigor-rs#451) — `Keep` is the identity, `Other` is anything undecided.
-    match (a, b()) {
+    match (a, b) {
         (Edge::Empty, _) | (_, Edge::Empty) => Edge::Empty,
         (Edge::Keep, x) | (x, Edge::Keep) => x,
         _ => Edge::Other,
@@ -300,20 +300,38 @@ impl<'i> Typer<'i> {
         respond_only: bool,
         interner: &Interner,
     ) -> Edge {
+        let (t, f) = self.subject_edges(ast, pred, subject, ty, respond_only, interner);
+        if edge { t } else { f }
+    }
+
+    /// Both edges of [`Typer::subject_edge`] from one walk. A `Logical`
+    /// node's non-sequential edge used to re-evaluate the left operand, so
+    /// nested `&&`/`||` was exponential (rigor-rs#453). The reference's
+    /// `analyse_and` / `analyse_or` already return both edges from one
+    /// left-hand analysis.
+    fn subject_edges(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+        subject: &Subject,
+        ty: TypeId,
+        respond_only: bool,
+        interner: &Interner,
+    ) -> (Edge, Edge) {
         if !self.reads_subject(ast, pred, subject) {
             // An operand that never mentions the subject leaves it alone on
             // both edges — unless it folds, which makes one edge dead
             // (`… && false`): decline that rather than model it.
-            return if self.expr_truthiness(ast, pred, &mut Vec::new()).is_some() {
+            let e = if self.expr_truthiness(ast, pred, &mut Vec::new()).is_some() {
                 Edge::Other
             } else {
                 Edge::Keep
             };
+            return (e, e);
         }
-        let eff = |n: NodeId, e: bool| {
-            self.subject_edge(ast, n, subject, ty, e, respond_only, interner)
-        };
+        let both = |n: NodeId| self.subject_edges(ast, n, subject, ty, respond_only, interner);
         let atom = |e: Edge| if respond_only { Edge::Keep } else { e };
+        let atom2 = |t: Edge, f: Edge| (atom(t), atom(f));
         // Any other expression that merely READS the subject: a local may be
         // narrowed by shapes this allow-list does not decide (`h.empty?`), so
         // it declines; a constant is narrowed ONLY by the guard shapes above
@@ -326,10 +344,26 @@ impl<'i> Typer<'i> {
         // UNLESS the whole predicate folds: `if 5.negative?` deads its arm
         // on the oracle (`folding` covers `zero?`/`positive?`/`negative?`),
         // and a `Keep` there would revive a dead arm (rigor-rs#451 review).
-        let unknown = match self.expr_truthiness(ast, pred, &mut Vec::new()) {
-            Some(holds) if holds == edge => Edge::Keep,
-            Some(_) => Edge::Empty,
-            None => Edge::Keep,
+        let unknown_at = |edge: bool| {
+            let unknown = match self.expr_truthiness(ast, pred, &mut Vec::new()) {
+                Some(holds) if holds == edge => Edge::Keep,
+                Some(_) => Edge::Empty,
+                None => Edge::Keep,
+            };
+            let nil_safe_nav = match ast.get(pred) {
+                Node::Call { safe_nav: true, .. } => {
+                    matches!(self.nilness(interner, ty), Some(true))
+                }
+                _ => false,
+            };
+            if nil_safe_nav {
+                match edge {
+                    true => Edge::Empty,
+                    false => Edge::Keep,
+                }
+            } else {
+                unknown
+            }
         };
         // …except on a provably-nil safe-nav receiver: `nil&.m` is `nil`,
         // so an unmodeled `&.` call's truthy edge is dead (`if
@@ -340,23 +374,23 @@ impl<'i> Typer<'i> {
             }
             _ => false,
         };
-        let unknown = if nil_safe_nav {
-            match edge {
-                true => Edge::Empty,
-                false => Edge::Keep,
-            }
-        } else {
-            unknown
-        };
+        let unknown = (unknown_at(true), unknown_at(false));
         match ast.get(pred) {
             Node::Statements { body, kind: StatementsKind::Sequence, .. } if body.len() == 1 => {
-                eff(body[0], edge)
+                both(body[0])
             }
-            _ if subject.is_read(ast, pred) => atom(match self.truthiness(interner, ty) {
-                Some(t) if t == edge => Edge::Keep,
-                Some(_) => Edge::Empty,
-                None => Edge::Other,
-            }),
+            _ if subject.is_read(ast, pred) => atom2(
+                match self.truthiness(interner, ty) {
+                    Some(true) => Edge::Keep,
+                    Some(false) => Edge::Empty,
+                    None => Edge::Other,
+                },
+                match self.truthiness(interner, ty) {
+                    Some(true) => Edge::Empty,
+                    Some(false) => Edge::Keep,
+                    None => Edge::Other,
+                },
+            ),
             Node::Logical { left, right, is_and, .. } => {
                 let (l, r) = (*left, *right);
                 // A constant's narrowing is a scope-table entry: a join with
@@ -367,11 +401,12 @@ impl<'i> Typer<'i> {
                     Subject::Const(..) if a == Edge::Keep || b == Edge::Keep => Edge::Keep,
                     _ => join(a, b),
                 };
-                match (*is_and, edge) {
-                    (true, true) => seq(eff(l, true), || eff(r, true)),
-                    (true, false) => j(eff(l, false), seq(eff(l, true), || eff(r, false))),
-                    (false, true) => j(eff(l, true), seq(eff(l, false), || eff(r, true))),
-                    (false, false) => seq(eff(l, false), || eff(r, false)),
+                let (lt, lf) = both(l);
+                let (rt, rf) = both(r);
+                if *is_and {
+                    (seq(lt, rt), j(lf, seq(lt, rf)))
+                } else {
+                    (j(lt, seq(lf, rt)), seq(lf, rf))
                 }
             }
             // `h&.m` narrows exactly like `h.m` for the ATOMS that already
@@ -386,23 +421,32 @@ impl<'i> Typer<'i> {
                 let (r, span) = (*r, *span);
                 let recv_is_subject = subject.is_read(ast, r);
                 match (method.as_str(), args.as_slice()) {
-                    ("!", []) => eff(r, !edge),
-                    ("nil?", []) if recv_is_subject => atom(match self.nilness(interner, ty) {
-                        Some(is_nil) if is_nil == edge => Edge::Keep,
-                        Some(_) => Edge::Empty,
-                        None => Edge::Other,
-                    }),
+                    ("!", []) => {
+                        let (t, f) = both(r);
+                        (f, t)
+                    }
+                    ("nil?", []) if recv_is_subject => atom2(
+                        match self.nilness(interner, ty) {
+                            Some(true) => Edge::Keep,
+                            Some(false) => Edge::Empty,
+                            None => Edge::Other,
+                        },
+                        match self.nilness(interner, ty) {
+                            Some(true) => Edge::Empty,
+                            Some(false) => Edge::Keep,
+                            None => Edge::Other,
+                        },
+                    ),
                     // `h.empty?`: the truthy edge keeps the carrier (`if
                     // h.empty?; h.inside; end` fires `for Array`), the
                     // falsey edge narrows to the non-empty shape — the port
                     // declines that to a widen (`non-empty-array[top]`'s
                     // firing is a coverage loss, never an FP —
                     // rigor-rs#451).
-                    ("empty?", []) if recv_is_subject => atom(match edge {
-                        true if nil_safe_nav => Edge::Empty,
-                        true => Edge::Keep,
-                        false => Edge::Other,
-                    }),
+                    ("empty?", []) if recv_is_subject => atom2(
+                        if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                        Edge::Other,
+                    ),
                     // `v == nil` / `v != nil`: only the nil comparison
                     // collapses (`narrow_nil` / `narrow_non_nil` — `v ==
                     // nil` truthy on `[1, 2]` is unreachable, `!= nil`
@@ -414,11 +458,12 @@ impl<'i> Typer<'i> {
                             Some(Scalar::Nil)
                         );
                         if nil_arg {
-                            atom(match self.nilness(interner, ty) {
-                                Some(is_nil) if (is_nil == (method == "==")) == edge => Edge::Keep,
-                                Some(_) => Edge::Empty,
-                                None => Edge::Other,
-                            })
+                            let eq = method == "==";
+                            match self.nilness(interner, ty) {
+                                Some(is_nil) if is_nil == eq => atom2(Edge::Keep, Edge::Empty),
+                                Some(_) => atom2(Edge::Empty, Edge::Keep),
+                                None => atom2(Edge::Other, Edge::Other),
+                            }
                         } else {
                             unknown
                         }
@@ -433,10 +478,12 @@ impl<'i> Typer<'i> {
                         if subject.is_read(ast, *arg)
                             && matches!(ast.get(r), Node::NilLit { .. }) =>
                     {
-                        atom(match self.nilness(interner, ty) {
-                            Some(is_nil) if (is_nil == (method == "==")) == edge => Edge::Keep,
-                            _ => Edge::Other,
-                        })
+                        let eq = method == "==";
+                        match self.nilness(interner, ty) {
+                            Some(is_nil) if is_nil == eq => atom2(Edge::Keep, Edge::Other),
+                            Some(_) => atom2(Edge::Other, Edge::Keep),
+                            None => atom2(Edge::Other, Edge::Other),
+                        }
                     }
                     ("is_a?" | "kind_of?" | "instance_of?", [c]) if recv_is_subject => {
                         // A guard whose class operand is not a constant
@@ -448,34 +495,40 @@ impl<'i> Typer<'i> {
                         if self.guard_constant(ast, *c, span).is_none()
                             && matches!(subject, Subject::Const(..))
                         {
-                            Edge::Keep
+                            (Edge::Keep, Edge::Keep)
                         } else {
-                            atom(self.class_edge(
-                                ast,
-                                *c,
-                                span,
-                                method == "instance_of?",
-                                ty,
-                                edge,
-                                interner,
-                            ))
+                            atom2(
+                                self.class_edge(
+                                    ast,
+                                    *c,
+                                    span,
+                                    method == "instance_of?",
+                                    ty,
+                                    true,
+                                    interner,
+                                ),
+                                self.class_edge(
+                                    ast,
+                                    *c,
+                                    span,
+                                    method == "instance_of?",
+                                    ty,
+                                    false,
+                                    interner,
+                                ),
+                            )
                         }
                     }
                     ("===", [arg]) if subject.is_read(ast, *arg) && !self.reads_subject(ast, r, subject) => {
                         if self.guard_constant(ast, r, span).is_none()
                             && matches!(subject, Subject::Const(..))
                         {
-                            Edge::Keep
+                            (Edge::Keep, Edge::Keep)
                         } else {
-                            atom(self.class_edge(
-                                ast,
-                                r,
-                                span,
-                                false,
-                                ty,
-                                edge,
-                                interner,
-                            ))
+                            atom2(
+                                self.class_edge(ast, r, span, false, ty, true, interner),
+                                self.class_edge(ast, r, span, false, ty, false, interner),
+                            )
                         }
                     }
                     ("respond_to?", [m]) if recv_is_subject => {
@@ -486,7 +539,10 @@ impl<'i> Typer<'i> {
                             _ => None,
                         };
                         match name {
-                            Some(m) => self.respond_edge(ty, &m, edge, interner),
+                            Some(m) => (
+                                self.respond_edge(ty, &m, true, interner),
+                                self.respond_edge(ty, &m, false, interner),
+                            ),
                             // A dynamic `respond_to?` name cannot narrow a
                             // CONSTANT or a literal-pinned local (`if
                             // File.respond_to?(m); File.frob; end` and
@@ -497,9 +553,9 @@ impl<'i> Typer<'i> {
                                 if matches!(subject, Subject::Const(..))
                                     || matches!(interner.get(ty), Type::Constant(_)) =>
                             {
-                                Edge::Keep
+                                (Edge::Keep, Edge::Keep)
                             }
-                            None => Edge::Other,
+                            None => (Edge::Other, Edge::Other),
                         }
                     }
                     _ => unknown,

@@ -2389,4 +2389,27 @@ fn loop_cap_widen_preserves_body_writes_to_non_suspect_names() {
         i.get(ty)
     );
 }
+#[test]
+fn nested_alternating_logical_guard_is_linear() {
+    // rigor-rs#453: `subject_edge` re-evaluated a Logical's left operand on
+    // the non-sequential edge, so 34 nested `&&`/`||` terms took ~14 s in
+    // release. Both edges in one pass is linear in the predicate.
+    let mut expr = String::from("ENV.key?(\"k0\")");
+    for i in 1..40 {
+        let op = if i % 2 == 1 { "&&" } else { "||" };
+        expr = format!("({expr} {op} x{i})");
+    }
+    let src = format!("if {expr}\n  1\nend\n");
+    let ast = lower_src(src.as_bytes());
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let start = std::time::Instant::now();
+    let _dead = typer.guard_suppressed_calls(&ast, &mut i);
+    let dt = start.elapsed();
+    assert!(
+        dt.as_millis() < 500,
+        "40 nested Logical terms took {dt:?} (must stay linear)"
+    );
+}
 
