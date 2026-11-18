@@ -497,18 +497,20 @@ chasing a non-bug.)
    (grep `method_dispatcher.rb`, empirically probe `Array.new(n)`-slice
    possible-nil around the boundary) and, once ported, the other
    `constant_folding.rb` / `shape_dispatch.rb` limits. The bundled-name tables
-   `BUNDLED_PLUGIN_NAMES` / `BUNDLED_SKILL_NAMES` in
-   `crates/rigor-cli/src/main.rs` are a second such surface: they transcribe
-   the reference's `plugins/` + `examples/` + `skills/` trees for the
-   `Unknown plugin:`/`Unknown skill:` error surface, and a bump that adds or
-   removes a bundled directory desyncs them silently (v0.4.8 added
-   `rigor-rbs-contract`; #376). The tie is mechanical —
-   `cargo test -p rigor-cli bundled_name_tables` re-derives both tables from
-   the submodule exactly the way `PluginCommand#discover` /
-   `SkillCommand#discover_skills` do and fails on any drift. The test skips
-   where the submodule is unpopulated (CI's `build + test` job checks out
-   without submodules) — a bump is only ever performed where the oracle
-   exists, so the bump-time gate is `harness/gate.sh`'s `cargo test -p` run.
+   are another such surface: `BUNDLED_PLUGIN_NAMES` / `BUNDLED_SKILL_NAMES`
+   in `crates/rigor-cli/src/main.rs` (the `Unknown plugin:`/`Unknown skill:`
+   error surface) and `BUNDLED_PLUGIN_GEMS` in `config.rs` all transcribe
+   directories of the reference's `plugins/` + `examples/` + `skills/` trees,
+   and a bump that adds or removes a bundled directory desyncs them silently
+   (v0.4.8 added `rigor-rbs-contract`; #376). Re-derive them here with
+   `cargo test -p rigor-cli bundled_` —
+   `bundled_name_tables_match_the_pinned_reference` and
+   `bundled_plugin_gems_match_the_pin` rebuild each table from the populated
+   submodule the way the upstream `discover` methods do and fail on any
+   drift. Both tests skip where the submodule is unpopulated (CI's
+   `build + test` job checks out without submodules, and `gate.sh` tests only
+   crates the branch touched), which is why THIS step, not a gate, is the
+   tie.
 7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
    --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
    (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap

@@ -1236,10 +1236,13 @@ fn a_file_past_the_depth_bound_carries_the_refusal_message() {
 /// `SkillCommand#discover_skills`: `Dir.children(root).sort`, directories
 /// only, and for skills only a directory holding a `SKILL.md`).
 ///
-/// Skips when the submodule is not populated: CI's `build + test` job checks
-/// out without submodules, and a pin bump is only ever performed where the
-/// oracle exists anyway (`run_snapshot.rb` needs it too), so the tie fires on
-/// every path a bump can take — `harness/gate.sh` included.
+/// Skips when the submodule is not populated (CI's `build + test` job checks
+/// out without submodules, and `gate.sh` tests only crates the branch
+/// touched). The bump-time gate is UPSTREAM.md step 6, which runs this test
+/// in the populated checkout a bump is always performed in.
+///
+/// Sibling of `config_audit::bundled_plugin_gems_match_the_pin`, which ties
+/// `BUNDLED_PLUGIN_GEMS` to the same tree by the same mechanism.
 #[test]
 fn bundled_name_tables_match_the_pinned_reference() {
     let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
