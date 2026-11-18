@@ -243,8 +243,28 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
                 );
                 entries
             }
-            Node::Call { receiver: Some(r), method, span, .. }
-                if MUTATOR_METHODS.contains(&method.as_str()) =>
+            // A literal-target `send` (`f.send(:<<, 2)`, symbol or string)
+            // is the mutator call it makes — upstream #2335 normalises it
+            // before `widen_after_call`, so it marks the receiver exactly
+            // as `f << 2` does.
+            Node::Call {
+                receiver: Some(r),
+                method,
+                span,
+                ..
+            } if MUTATOR_METHODS.contains(&method.as_str()) => {
+                match ast.get(*r) {
+                    Node::LocalVariableRead { name, .. } => {
+                        vec![(id, *span, name.clone(), true)]
+                    }
+                    _ => Vec::new(),
+                }
+            }
+            Node::Call {
+                receiver: Some(r),
+                span,
+                ..
+            } if literal_send_target(ast, n).is_some_and(|m| MUTATOR_METHODS.contains(&m.as_str())) =>
             {
                 match ast.get(*r) {
                     Node::LocalVariableRead { name, .. } => {
@@ -702,20 +722,31 @@ pub(crate) fn toplevel_mutations(
                 span,
                 ..
             } => {
-                // `IndexedNarrowing.mutator?` reads the whole SHAPE_MUTATORS
-                // table — the HashLookupMutation names (`default=` …)
-                // included: they never change a binding here, but they DO
-                // drop indexed narrowings rooted at the receiver.
-                if !is_shape_mutator(method) {
+                // A literal-target `send` (`f.send(:<<, 2)`) is the mutator
+                // call it makes — upstream #2335 `literal_send_target`
+                // normalises it before `widen_after_call`. `IndexedNarrowing.
+                // mutator?` then reads the whole SHAPE_MUTATORS table — the
+                // HashLookupMutation names (`default=` …) included: they
+                // never change a binding here, but they DO drop indexed
+                // narrowings rooted at the receiver.
+                let effective = literal_send_target(ast, n).unwrap_or_else(|| method.clone());
+                if !is_shape_mutator(&effective) {
                     continue;
                 }
                 if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                    let drop_key = if method == "[]=" {
-                        args.first().and_then(|&a| stable_index_key(ast.get(a)))
+                    let drop_key = if effective == "[]=" {
+                        // `f[k] = v` keys on `args[0]`; `f.send(:[]=, k, v)`
+                        // on `args[1]`.
+                        let key_arg = if method == "[]=" {
+                            args.first()
+                        } else {
+                            args.get(1)
+                        };
+                        key_arg.and_then(|&a| stable_index_key(ast.get(a)))
                     } else {
                         None
                     };
-                    out.push((id, *span, name.clone(), method.clone(), drop_key));
+                    out.push((id, *span, name.clone(), effective, drop_key));
                 }
             }
             // An `h[k]` index target is a `[]=` call whose call node Prism
@@ -2156,14 +2187,48 @@ pub(crate) struct SlotMutation {
 /// `AliasMutationFloor::SELF_RETURNERS` (`CalleeWriteCensus`'s reading).
 const ALIAS_SELF_RETURNERS: &[&str] = &["tap", "itself", "freeze", "to_a", "to_h", "to_s"];
 
+/// Calls `send` / `public_send` / `__send__` spell —
+/// `AliasMutationFloor.literal_send_target` / `CalleeWriteCensus.
+/// literal_send?` (#2335 / #2677).
+const SEND_SELECTORS: &[&str] = &["send", "public_send", "__send__"];
+
+/// The method a literal-target `send` makes — upstream
+/// `AliasMutationFloor.literal_send_target`: a `send` / `public_send` /
+/// `__send__` with no block whose first argument is a Symbol or String
+/// literal IS the named call (`a.send(:push, x)` is `a.push(x)`); anything
+/// else (a computed selector, a block, a splat the lowering leaves in
+/// `args`) names no method.
+fn literal_send_target(ast: &LoweredAst, node: &Node) -> Option<String> {
+    let Node::Call {
+        method,
+        args,
+        block_body,
+        ..
+    } = node
+    else {
+        return None;
+    };
+    if !SEND_SELECTORS.contains(&method.as_str()) || !block_body.is_empty() {
+        return None;
+    }
+    match args.first().map(|a| ast.get(*a)) {
+        Some(Node::SymbolLit { value, .. }) | Some(Node::StringLit { value, .. }) => {
+            Some(value.clone())
+        }
+        _ => None,
+    }
+}
+
 /// The locals `node`'s value may evaluate to — upstream
 /// `AliasMutationFloor.each_may_be`: the local itself, one branch of a
-/// selection that may answer it (`if`/`ternary`, `||`, `&&`), or a call
-/// that answers its receiver. A `dup`/`a.size`/container read hands
-/// nothing on whole, so it contributes no name.
+/// selection that may answer it (`if`/`ternary`, `||`, `&&`), an
+/// assignment's value (nested `g = h = f`), or a call that answers its
+/// receiver. A `dup`/`a.size`/container read hands nothing on whole, so
+/// it contributes no name.
 fn may_be_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
     match ast.get(id) {
         Node::LocalVariableRead { name, .. } => out.push(name.clone()),
+        Node::LocalVariableWrite { value, .. } => may_be_locals(ast, *value, out),
         Node::Call {
             receiver: Some(r),
             method,
@@ -2261,6 +2326,22 @@ pub(crate) fn toplevel_alias_links(
             } => {
                 if let Node::ArrayLit { elements, .. } = ast.get(*value) {
                     multi_target_alias_links(ast, targets, elements, *span, &mut out);
+                } else {
+                    // `g, h = f` — upstream `value_bound` binds EVERY
+                    // target to each name the RHS may be (the precise
+                    // element shapes are out of the slice); `g << x`
+                    // floors `f` on the oracle.
+                    let mut sources = Vec::new();
+                    may_be_locals(ast, *value, &mut sources);
+                    if !sources.is_empty() {
+                        let mut bound = Vec::new();
+                        targets.collect_bound_names(&mut bound);
+                        for (name, _) in bound {
+                            out.extend(
+                                sources.iter().cloned().map(|s| (*span, name.clone(), s)),
+                            );
+                        }
+                    }
                 }
             }
             _ => {}
@@ -2397,10 +2478,19 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 method,
                 span,
                 ..
-            } if method == "[]=" || is_shape_mutator(method) => {
+            } if method == "[]="
+                || is_shape_mutator(method)
+                || literal_send_target(ast, n).is_some_and(|m| is_shape_mutator(&m)) =>
+            {
                 if write_dropped(*span) {
                     continue;
                 }
+                // A literal-target `send` (`f[0].send(:<<, 2)`) mutates
+                // under the call it makes, as `literal_send_target`
+                // normalises it upstream.
+                let effective = literal_send_target(ast, n)
+                    .filter(|m| is_shape_mutator(m))
+                    .unwrap_or_else(|| method.clone());
                 if let Some((name, key)) = element_slot(ast, *r) {
                     // An element-path mutation (`f[0] << x`) — the alias
                     // floor sees it even when the receiver local is
@@ -2409,7 +2499,7 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                     flow.alias_mutations.push(AliasMutation {
                         span: *span,
                         name: name.clone(),
-                        method: method.clone(),
+                        method: effective.clone(),
                         part_only: true,
                     });
                     if shadowed(id, &name) {
@@ -2420,16 +2510,16 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                         span: *span,
                         name,
                         key,
-                        method: method.clone(),
+                        method: effective.clone(),
                     });
                 } else if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                    // A bare-receiver mutator (`f << x`, `f[k] = v`) —
-                    // the alias floor sees it even under a shadow scope
-                    // or inside a `def`/`class` body.
+                    // A bare-receiver mutator (`f << x`, `f[k] = v`,
+                    // `f.send(:<<)`) — the alias floor sees it even under
+                    // a shadow scope or inside a `def`/`class` body.
                     flow.alias_mutations.push(AliasMutation {
                         span: *span,
                         name: name.clone(),
-                        method: method.clone(),
+                        method: effective,
                         part_only: false,
                     });
                 }

@@ -745,13 +745,13 @@ impl Census {
         {
             // Upstream `instance_mixin_recorded?` writes the constant
             // targets BEFORE the partial-name `note(complete: false)` —
-            // `include Mk, h` records `Mk` (so `1.mk` declines) while the
-            // unnamed half taints only the edge's order (`2.unknown_thing`
-            // still fires — oracle-measured).
+            // `include Mk, h` records `Mk` (so `1.mk` declines). The
+            // unnamed half taints only the edge's ORDER — it lives on
+            // `unpositioned`, never in the include set, so it suppresses
+            // nothing: `2.unknown_thing` still fires, and `helper`'s own
+            // `unresolved-toplevel` is not excused by the include
+            // (oracle-measured). No WILDCARD is pushed.
             self.out.toplevel_includes.extend(names.iter().cloned());
-            if !complete {
-                self.out.toplevel_includes.push(WILDCARD.to_string());
-            }
             return;
         }
         if lexical_self {

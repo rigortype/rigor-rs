@@ -882,9 +882,15 @@ impl<'i> Typer<'i> {
         });
         closure_muts.retain(|(_, w, _)| !dead.covers(*w));
         let mut indexed = collect_indexed_flow(ast);
-        // Upstream #2677: a copy link inside a folded-dead arm never ran,
-        // so it must not alias either.
-        indexed.alias_links.retain(|(s, _, _)| !dead.covers(*s));
+        // Upstream #2677's `SiteCollector` walks the whole program — a
+        // copy link inside a folded-dead arm still counts (`if false;
+        // g = f; end; g << 2` floors `f` on the oracle), so no
+        // dead-position filter applies to the links. A mutation inside
+        // one still never ran, so it takes the `mutations` retain.
+        indexed.alias_mutations.retain(|am| {
+            !dead.covers(am.span)
+                || (is_content_mutator(&am.method) && dead.inside_iterated(am.span))
+        });
         indexed.retry_drops = self.retry_edge_index_drops(ast, &rebinds, &mutations, &indexed);
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
@@ -3371,7 +3377,12 @@ impl<'i> Typer<'i> {
         mutations.retain(|(s, _, m, _)| {
             !dead.covers(*s) || (is_content_mutator(m) && dead.inside_iterated(*s))
         });
-        indexed.alias_links.retain(|(s, _, _)| !dead.covers(*s));
+        indexed.alias_mutations.retain(|am| {
+            !dead.covers(am.span)
+                || (is_content_mutator(&am.method) && dead.inside_iterated(am.span))
+        });
+        // The copy links keep their dead-arm rows — upstream's
+        // `SiteCollector` walks the whole program.
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,
