@@ -15,8 +15,24 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.7`** (2026-11-03) |
-| Commit | `f7595e28` |
+| **Pinned ref** | **`v0.4.8`** (2026-11-15) |
+| Commit | `bbea1bac4` |
+
+> **`v0.4.7 → v0.4.8` (2026-11-15): 1,504 commits, the largest delta yet — WIP.**
+> `core_overlay/bigdecimal.rbs` is new (#2969), `resolv.rbs` gained `singleton(T)`
+> overloads, and the ActiveSupport plugin sig grew `NumericWithFormat#to_fs`
+> (#2918); vendored gem sigs, capability roles and the effects catalogue are
+> byte-identical. The oracle now needs **ruby >= 4.0** (gemspec floor) plus host
+> gems `rbs 4.2.0`, `prism 1.9.0`, `language_server-protocol`, `bigdecimal 4.1.3`.
+> The raw bump left 4 fixture FPs in 2 fixtures: the `main.include` reading
+> widened (#2995/#3004/#3007 — `self.include`, send spellings except
+> `public_send`, control-flow/def/value-position/iterator-block includes all
+> count) — **ported** in `ancestry_facts.rs` — and the alias-mutation floor
+> (#2677) — **copy-link slice ported** in `flow_writes`/`flow_eval`
+> (element/ivar/argument/foreign links + the gradual `widen_store` answer open
+> at rigor-rs#600). Fixture gate: **0 unregistered, 959/1063 matched.** The
+> sweep was not run (no corpora on the bump host). See the
+> [note](docs/notes/20261115-repin-v048.md).
 
 > **`v0.4.6 → v0.4.7` (2026-11-05): 909 commits, step eight (last).** Re-vendored
 > `vendored_gem_sigs/{bundler,rubygems}` and the ActiveSupport plugin sig. The raw bump

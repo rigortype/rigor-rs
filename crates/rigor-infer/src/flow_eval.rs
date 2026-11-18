@@ -882,6 +882,15 @@ impl<'i> Typer<'i> {
         });
         closure_muts.retain(|(_, w, _)| !dead.covers(*w));
         let mut indexed = collect_indexed_flow(ast);
+        // Upstream #2677's `SiteCollector` walks the whole program — a
+        // copy link inside a folded-dead arm still counts (`if false;
+        // g = f; end; g << 2` floors `f` on the oracle), so no
+        // dead-position filter applies to the links. A mutation inside
+        // one still never ran, so it takes the `mutations` retain.
+        indexed.alias_mutations.retain(|am| {
+            !dead.covers(am.span)
+                || (is_content_mutator(&am.method) && dead.inside_iterated(am.span))
+        });
         indexed.retry_drops = self.retry_edge_index_drops(ast, &rebinds, &mutations, &indexed);
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
@@ -1804,7 +1813,31 @@ impl<'i> Typer<'i> {
                 // (rigor-rs#407).
                 && !ast.in_block_break_locals_only_carrier(m.span)
             {
-                self.apply_slot_mutation(ast, id, m, env, interner);
+                self.apply_slot_mutation(ast, &flow.indexed, id, m, env, interner);
+            }
+        }
+        // Upstream #2677 — mutations the named tables filter out (a
+        // block-local `b << "s"` whose `b` was bound to `a`'s object, a
+        // `def`-internal mutator) still reach the shared object: floor
+        // every copy-linked local they cover. Toplevel mutations appear
+        // here too, so a floor can run twice — `widen_mutated_binding`
+        // declines an already-widened carrier, keeping it idempotent.
+        for am in &flow.indexed.alias_mutations {
+            if am.span.0 >= span.0
+                && am.span.1 <= span.1
+                && flow.dead.write_reaches(am.span, site)
+                && !ast.in_block_break_locals_only_carrier(am.span)
+            {
+                self.floor_alias_linked(
+                    ast,
+                    &flow.indexed,
+                    &am.name,
+                    &am.method,
+                    am.span,
+                    am.part_only,
+                    env,
+                    interner,
+                );
             }
         }
     }
@@ -2095,8 +2128,120 @@ impl<'i> Typer<'i> {
                 }
             }
         }
+        self.floor_alias_linked(ast, indexed, name, method, wspan, false, env, interner);
         if let Some((key, ty)) = stored {
             env.insert(key, ty);
+        }
+    }
+
+    /// Upstream #2677 (`AliasMutationFloor.floor_after_call`) — a mutation
+    /// through `name` may reach the object another local's copy `x = name`
+    /// (or `name = x`) bound, so the copy's literal carrier goes stale the
+    /// same way. The floor lands once the copy site may have run: earlier
+    /// in the body, or anywhere inside an iterated body the mutation also
+    /// sits in (the copy may have run on an earlier pass). A binding the
+    /// widening declines keeps its type, exactly as upstream floors only
+    /// literal shapes. `part_only` marks a mutation that reached `name`'s
+    /// ELEMENT — `f[0] << 2`, never `name`'s own object — so the copy is
+    /// floored only when its binding can hold a mutable element
+    /// (`mutable_parts`, upstream's `kind == PART` gate): `z = w` where
+    /// `w = [1]` keeps `Tuple[1]` under `w[0] << 2` — `1` is immutable —
+    /// while `g = f` where `f = [[1]]` floors. The port's slice sees copy
+    /// links only — element, ivar, argument and foreign-locals links are
+    /// not modelled.
+    #[allow(clippy::too_many_arguments)]
+    fn floor_alias_linked(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        name: &str,
+        method: &str,
+        wspan: rigor_parse::Span,
+        part_only: bool,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        // A compound index write (`h[k] ||= v` / `&&=` / `op=`) is not an
+        // upstream floor trigger — only `CallNode` shape mutators and the
+        // plain `=` store are.
+        if indexed.non_floorable.contains(&wspan) {
+            return;
+        }
+        // The reach closes over chained copies (upstream
+        // `AliasMutationFloor.reach`): `a = b; b = c; c << x` floors `a`
+        // and `b`. Each link's own site decides whether it may have run
+        // before this mutation.
+        let mut queue: Vec<String> = vec![name.to_string()];
+        let mut seen: std::collections::HashSet<String> =
+            [name.to_string()].into_iter().collect();
+        let mut i = 0;
+        while i < queue.len() {
+            let cur = queue[i].clone();
+            i += 1;
+            for (lspan, bound, source) in &indexed.alias_links {
+                let other = if *bound == cur {
+                    source.as_str()
+                } else if *source == cur {
+                    bound.as_str()
+                } else {
+                    continue;
+                };
+                if seen.contains(other)
+                    || !crate::flow_writes::alias_floor_reaches(ast, *lspan, wspan)
+                {
+                    continue;
+                }
+                seen.insert(other.to_string());
+                queue.push(other.to_string());
+            }
+        }
+        for other in queue.iter().skip(1) {
+            if let Some(&pre) = env.get(other) {
+                if part_only && !self.mutable_parts(pre, interner) {
+                    continue;
+                }
+                if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
+                    if widened != pre {
+                        env.insert(other.clone(), widened);
+                    }
+                }
+            }
+            crate::flow_writes::drop_indexed_narrowings(env, other);
+        }
+    }
+
+    /// Upstream `AliasMutationFloor.mutable_parts?` — whether `ty`'s
+    /// binding can hold a mutable element: any collection member that is a
+    /// container (Tuple, HashShape, literal or nominal `String`/`Array`/
+    /// `Hash`/`Set`) or an untyped member. A `Tuple[1]` whose elements are
+    /// all immutable scalars answers false.
+    fn mutable_parts(&self, ty: TypeId, interner: &mut Interner) -> bool {
+        self.coll_value_members(interner, ty)
+            .iter()
+            .any(|&m| self.mutable_member(m, interner))
+    }
+
+    fn mutable_member(&self, m: TypeId, interner: &mut Interner) -> bool {
+        match interner.get(m) {
+            Type::Tuple(_) | Type::HashShape(_) | Type::DataInstance { .. } => true,
+            // A String literal is mutable; every other literal scalar
+            // (Integer, Symbol, nil, true/false) is not.
+            Type::Constant(rigor_types::Scalar::Str(_)) => true,
+            Type::Constant(_) | Type::IntegerRange { .. } | Type::Bottom | Type::Void => {
+                false
+            }
+            Type::Nominal { class, .. } => matches!(
+                self.index.class_name_for_id(*class),
+                Some("Array" | "Hash" | "Set" | "String")
+            ),
+            Type::Union(members) => {
+                let members = members.clone();
+                members
+                    .iter()
+                    .any(|&m| self.mutable_member(m, interner))
+            }
+            // An untyped or Dynamic member may hold anything — floor it.
+            _ => true,
         }
     }
 
@@ -2109,6 +2254,7 @@ impl<'i> Typer<'i> {
     fn apply_slot_mutation(
         &self,
         ast: &LoweredAst,
+        indexed: &IndexedFlow,
         root: NodeId,
         m: &crate::flow_writes::SlotMutation,
         env: &mut TypeEnv,
@@ -2119,7 +2265,17 @@ impl<'i> Typer<'i> {
         // propagates: `break h[:a] << 2` keeps `h[:a]`'s `"s" | 1`
         // (rigor-rs#363).
         let lookup = indexed_narrowing_key(&m.name, &m.key);
-        let Some(&recorded) = env.get(&lookup) else {
+        let recorded = env.get(&lookup).copied();
+        // Upstream #2677: a mutator on `name`'s element mutates the shared
+        // object a copy `x = name` also holds — the copy's whole carrier
+        // goes stale, not just the touched slot — but only when the copy
+        // can hold a mutable element (`part_only`: `w = [1]` under
+        // `w[0] << 2` does not stale `z = w`, whose `1`s are immutable).
+        // Floored even when `name` itself has no slot record:
+        // `f = [[1]]; g = f; f[0] << 2` stales `g` although `f[0]`
+        // recorded nothing.
+        self.floor_alias_linked(ast, indexed, &m.name, &m.method, m.span, true, env, interner);
+        let Some(recorded) = recorded else {
             return;
         };
         // Element mutators live in ordinary expression positions (argument
@@ -2825,7 +2981,25 @@ impl<'i> Typer<'i> {
                 && m.span.1 <= span.1
                 && !ast.in_block_break_locals_only_carrier(m.span)
             {
-                self.apply_slot_mutation(ast, root, m, env, interner);
+                self.apply_slot_mutation(ast, indexed, root, m, env, interner);
+            }
+        }
+        // Upstream #2677 — the unfiltered `alias_mutations` covers the
+        // block- and def-internal mutators the named tables drop; a
+        // toplevel mutation may floor twice, harmlessly
+        // (`widen_mutated_binding` declines an already-widened carrier).
+        for am in &indexed.alias_mutations {
+            if am.span.0 >= span.0 && am.span.1 <= span.1 {
+                self.floor_alias_linked(
+                    ast,
+                    indexed,
+                    &am.name,
+                    &am.method,
+                    am.span,
+                    am.part_only,
+                    env,
+                    interner,
+                );
             }
         }
     }
@@ -2937,6 +3111,7 @@ impl<'i> Typer<'i> {
                     ) {
                         self.apply_slot_mutation(
                             ast,
+                            indexed,
                             root,
                             &indexed.slot_mutations[i],
                             env,
@@ -2944,6 +3119,24 @@ impl<'i> Typer<'i> {
                         );
                     }
                 }
+            }
+        }
+        // Upstream #2677 — the unfiltered `alias_mutations` covers the
+        // block- and def-internal mutators the named tables drop; a
+        // toplevel mutation may floor twice, harmlessly
+        // (`widen_mutated_binding` declines an already-widened carrier).
+        for am in &indexed.alias_mutations {
+            if am.span.0 >= span.0 && am.span.1 <= span.1 {
+                self.floor_alias_linked(
+                    ast,
+                    indexed,
+                    &am.name,
+                    &am.method,
+                    am.span,
+                    am.part_only,
+                    env,
+                    interner,
+                );
             }
         }
     }
@@ -3173,7 +3366,7 @@ impl<'i> Typer<'i> {
         let mut rebinds = collect_flow_writes(ast);
         rebinds.extend(indexed_flow_writes(ast, self.source));
         let mut mutations = toplevel_mutations(ast);
-        let indexed = collect_indexed_flow(ast);
+        let mut indexed = collect_indexed_flow(ast);
         // rigor-rs#368 — a write/mutation inside a folded-dead arm never
         // lands; it must not widen this env either. Same iterated-body
         // writeback exception as the `check_flow` retain above
@@ -3184,6 +3377,12 @@ impl<'i> Typer<'i> {
         mutations.retain(|(s, _, m, _)| {
             !dead.covers(*s) || (is_content_mutator(m) && dead.inside_iterated(*s))
         });
+        indexed.alias_mutations.retain(|am| {
+            !dead.covers(am.span)
+                || (is_content_mutator(&am.method) && dead.inside_iterated(am.span))
+        });
+        // The copy links keep their dead-arm rows — upstream's
+        // `SiteCollector` walks the whole program.
         let body = match ast.get(ast.root()) {
             Node::Program { body, .. } => body.clone(),
             _ => return out,

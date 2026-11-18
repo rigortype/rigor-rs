@@ -10,6 +10,27 @@
     },
     {
       "rule": "call.unresolved-toplevel",
+      "line": 59,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `rigor_default_size`. If a project file defines `rigor_default_size` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 64,
+      "column": 3,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `rigor_default_size`. If a project file defines `rigor_default_size` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 66,
+      "column": 1,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `rigor_default_size`. If a project file defines `rigor_default_size` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
       "line": 73,
       "column": 1,
       "severity": "warning",

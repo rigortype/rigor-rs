@@ -24,6 +24,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 30,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `not_named' for singleton(Integer)"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 33,
       "column": 8,
       "severity": "error",

@@ -4785,8 +4785,17 @@ fn toplevel_include_reaches_other_files() {
     );
     assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
     assert!(!got.iter().any(|(_, m)| m == "mine_x"), "{got:?}");
-    // MUST STILL FIRE: no top-level include anywhere (the include is in a block).
+    // Upstream v0.4.8 (#3007): an `include` inside a SELF-KEEPING iterator's
+    // block on a literal receiver counts as `main.include` too, so both bare
+    // calls decline project-wide here.
     let got = project_rule_methods(&[b"[1].each { include SomeGem::Helpers }\n", other], 1);
+    assert!(!got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
+    assert!(!got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "mine_x".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "frob_int".into())), "{got:?}");
+    assert!(got.contains(&(CALL_UNDEFINED_METHOD, "mine_x".into())), "{got:?}");
+    // MUST STILL FIRE: an `include` inside an iterator block on a
+    // NON-LITERAL receiver is not a `main.include`.
+    let got = project_rule_methods(&[b"xs = [1]\nxs.each { include SomeGem::Helpers }\n", other], 1);
     assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "frob_b".into())), "{got:?}");
     assert!(got.contains(&(CALL_UNRESOLVED_TOPLEVEL, "mine_x".into())), "{got:?}");
 }

@@ -11,16 +11,22 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494.**
+▶ **IN FLIGHT: re-pin `v0.4.7 → v0.4.8`** (branch `claude/repin-v048`,
+draft PR #599). Raw bump done; mixin-call rework ported
+(#2995/#3004/#3007/#2998/#3010); the #2677 alias floor's copy-link slice
+ported (rest at #600) — fixture gate **0 FP, 959/1063**. Remaining before
+ready: sweep on the corpora host + review. See
+[note](notes/20261115-repin-v048.md).
+▶ NEXT after it: the ADR-127 floor's coverage cost; follow-ups #489–#494.
 Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
-- **Pin is `v0.4.7`** (rbs 4.2.0 vendored). Both
-  standing exception tables EMPTY; new entries are real findings
-  (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
+- **Pin is `v0.4.7` on master** (`v0.4.8` on the repin branch; rbs 4.2.0
+  vendored). Both standing exception tables EMPTY; new entries are real
+  findings (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
 
 State (verified 2026-11-05, at `v0.4.7`): harness **170 fixtures / 0
 unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 623

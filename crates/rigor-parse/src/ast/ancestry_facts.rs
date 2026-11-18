@@ -116,12 +116,14 @@ pub struct AncestryFacts {
     /// Upstream v0.4.6 (#2094 / #2269) — every SINGLETON-side mixin of an
     /// owner, wherever written: `(owner candidates, names)`, where a
     /// spelling the reference cannot record is [`WILDCARD`] (its
-    /// `taint(owner, :extend)`). Named: `X.extend(M)` and
-    /// `X.singleton_class.include(M)` with constant arguments, a class-body
-    /// `extend M`. Wildcard: a `send` spelling, a non-constant or `self`
-    /// argument, any `send` / `*_eval` / computed-name naming call on
-    /// `X.singleton_class` (or a literal-named one that is not a direct
-    /// statement), and `singleton_class.include` inside `class << self`.
+    /// `taint(owner, :extend)`). Named: `X.extend(M)`, a
+    /// `X.singleton_class.include(M)` / `X.singleton_class.send(:prepend, M)`
+    /// with constant arguments, a class-body `extend M` and its `self.` /
+    /// send spellings (v0.4.8 #2995). Wildcard: a non-constant argument, a
+    /// `send` spelling on a constant receiver, any `send` / `*_eval` /
+    /// computed-name naming call on `X.singleton_class` (or a literal-named
+    /// one that is not a direct statement), and `singleton_class.include`
+    /// inside `class << self`.
     /// Read only by the set-shaped `call.undefined-method` singleton decline,
     /// so the order readers keep their own taints.
     pub singleton_mixins: Vec<(Vec<String>, Vec<String>)>,
@@ -348,6 +350,172 @@ const MIXIN_KINDS: [&str; 3] = ["include", "prepend", "extend"];
 const SEND_NAMES: [&str; 3] = ["send", "public_send", "__send__"];
 const EVAL_CALLS: [&str; 6] =
     ["class_eval", "module_eval", "class_exec", "module_exec", "instance_eval", "instance_exec"];
+
+/// Upstream v0.4.8 (#3007, `MainSelfCalls::SELF_KEEPING_ITERATORS`): the core
+/// iterators whose block runs with the caller's `self`, entered on a literal
+/// receiver.
+const SELF_KEEPING_ITERATORS: [&str; 10] = [
+    "each",
+    "each_with_index",
+    "each_with_object",
+    "map",
+    "times",
+    "upto",
+    "downto",
+    "tap",
+    "then",
+    "loop",
+];
+/// The iterators entered without a receiver: `Kernel#loop`, and `tap` /
+/// `then` on `main` itself.
+const RECEIVERLESS_ITERATORS: [&str; 3] = ["tap", "then", "loop"];
+
+/// `MainSelfCalls::visit` — the node kinds its descent reaches through: a
+/// call nested only in these keeps `main` as its `self`. Any other node
+/// (`class`, a lambda, a `return`, …) ends the descent.
+fn main_self_control_flow(n: &PrismNode<'_>) -> bool {
+    n.as_statements_node().is_some()
+        || n.as_begin_node().is_some()
+        || n.as_rescue_node().is_some()
+        || n.as_else_node().is_some()
+        || n.as_ensure_node().is_some()
+        || n.as_if_node().is_some()
+        || n.as_unless_node().is_some()
+        || n.as_case_node().is_some()
+        || n.as_case_match_node().is_some()
+        || n.as_when_node().is_some()
+        || n.as_in_node().is_some()
+        || n.as_while_node().is_some()
+        || n.as_until_node().is_some()
+        || n.as_for_node().is_some()
+        || n.as_parentheses_node().is_some()
+        || n.as_and_node().is_some()
+        || n.as_or_node().is_some()
+        || n.as_rescue_modifier_node().is_some()
+        || n.as_local_variable_write_node().is_some()
+        || n.as_instance_variable_write_node().is_some()
+        || n.as_global_variable_write_node().is_some()
+        || n.as_constant_write_node().is_some()
+        || n.as_multi_write_node().is_some()
+        || n.as_arguments_node().is_some()
+        || n.as_array_node().is_some()
+}
+
+/// `MainSelfCalls::self_keeping_block?` — the call's block runs with `main`:
+/// a self-keeping iterator spelled on a literal receiver
+/// (`[1].each { … }`, `3.times { … }`), or a receiverless `tap` / `then` /
+/// `loop`.
+fn main_self_keeping_block(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(blk) = call.block() else { return false };
+    if blk.as_block_node().is_none() {
+        return false;
+    }
+    let name = constant_string(call.name().as_slice());
+    if !SELF_KEEPING_ITERATORS.contains(&name.as_str()) {
+        return false;
+    }
+    match call.receiver() {
+        None => RECEIVERLESS_ITERATORS.contains(&name.as_str()),
+        Some(r) => main_self_literal(&r),
+    }
+}
+
+/// `MainSelfCalls::literal` — a `(1..2)` parenthesised range counts as its
+/// inner literal when the parentheses hold a single statement.
+fn main_self_literal(n: &PrismNode<'_>) -> bool {
+    let literal = |m: &PrismNode<'_>| {
+        m.as_array_node().is_some()
+            || m.as_range_node().is_some()
+            || m.as_integer_node().is_some()
+    };
+    if literal(n) {
+        return true;
+    }
+    let Some(p) = n.as_parentheses_node() else { return false };
+    let Some(stmts) = p.body().and_then(|b| b.as_statements_node()) else { return false };
+    let body: Vec<PrismNode<'_>> = stmts.body().iter().collect();
+    body.len() == 1 && literal(&body[0])
+}
+
+/// `node.compact_child_nodes` — every direct child, in visit order.
+fn compact_children<'pr>(n: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+    struct Children<'pr> {
+        depth: usize,
+        out: Vec<PrismNode<'pr>>,
+    }
+    impl<'pr> Visit<'pr> for Children<'pr> {
+        fn visit_branch_node_enter(&mut self, node: PrismNode<'pr>) {
+            if self.depth == 1 {
+                self.out.push(node);
+            }
+            self.depth += 1;
+        }
+        fn visit_branch_node_leave(&mut self) {
+            self.depth -= 1;
+        }
+        fn visit_leaf_node_enter(&mut self, node: PrismNode<'pr>) {
+            if self.depth == 1 {
+                self.out.push(node);
+            }
+            self.depth += 1;
+        }
+        fn visit_leaf_node_leave(&mut self) {
+            self.depth -= 1;
+        }
+    }
+    let mut c = Children { depth: 0, out: Vec::new() };
+    c.visit(n);
+    c.out
+}
+
+/// `MainSelfCalls.collect(body)` (upstream v0.4.8 #3007) — the span keys of
+/// every call whose `self` is `main` as far as the mixin walk can tell: a
+/// top-level statement's call, or one reached through control flow or a
+/// value position, or through the body of a top-level `def` / `def self.`,
+/// or the block of a self-keeping iterator on a literal receiver. A
+/// `def obj.f` or `class` body, a non-entered block and everything under
+/// them stay out.
+fn collect_main_self_calls(body: &PrismNode<'_>) -> HashSet<(usize, usize)> {
+    let mut out = HashSet::new();
+    main_self_visit(body, &mut out);
+    out
+}
+
+fn main_self_visit(n: &PrismNode<'_>, out: &mut HashSet<(usize, usize)>) {
+    if let Some(call) = n.as_call_node() {
+        out.insert(span_key(n));
+        if let Some(r) = call.receiver() {
+            main_self_visit(&r, out);
+        }
+        if let Some(a) = call.arguments() {
+            main_self_visit(&a.as_node(), out);
+        }
+        if main_self_keeping_block(&call) {
+            if let Some(b) = call
+                .block()
+                .and_then(|b| b.as_block_node())
+                .and_then(|b| b.body())
+            {
+                main_self_visit(&b, out);
+            }
+        }
+        return;
+    }
+    if let Some(def) = n.as_def_node() {
+        if def.receiver().is_none_or(|r| r.as_self_node().is_some()) {
+            if let Some(b) = def.body() {
+                main_self_visit(&b, out);
+            }
+        }
+        return;
+    }
+    if !main_self_control_flow(n) {
+        return;
+    }
+    for c in compact_children(n) {
+        main_self_visit(&c, out);
+    }
+}
 const HOOK_DEFS: [&str; 4] = ["included", "extended", "prepended", "inherited"];
 /// `Relevance::HOOKS` — every singleton hook Ruby calls while a module enters
 /// another's ancestry.
@@ -400,6 +568,10 @@ struct Census {
     /// Per owner (first candidate), the direct include / prepend targets — a
     /// target written both ways is one body the tables cannot represent.
     direct_includes: std::collections::HashMap<String, (Vec<String>, Vec<String>)>,
+    /// Upstream v0.4.8 (#3007, `MixinAccumulator#program_statement?` —
+    /// `MainSelfCalls.collect`): the call spans whose `self` is `main`, so a
+    /// lexical-self `include` among them is `main.include` (`Object.include`).
+    main_self: HashSet<(usize, usize)>,
 }
 
 impl Census {
@@ -557,17 +729,32 @@ impl Census {
         let complete = !names.is_empty() && names.iter().all(Option::is_some);
         let names: Vec<String> = names.into_iter().flatten().collect();
         let recv = call.receiver();
-        if recv.is_none() && !via_send && kind == "include" && self.frames.len() == 1 && self.is_direct(n)
+        let call_name = constant_string(call.name().as_slice());
+        let self_recv = recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
+        let lexical_self = recv.is_none() || self_recv;
+        // Upstream v0.4.8 `toplevel_include_owner` (#2995 / #3004 / #3007): a
+        // lexical-self `include` — every spelling but `public_send`, which
+        // cannot reach `main`'s private `include` — that `MainSelfCalls`
+        // reaches is `main.include`, filed under the toplevel owner as
+        // `Object.include`.
+        if lexical_self
+            && kind == "include"
+            && call_name != "public_send"
+            && self.frames.len() == 1
+            && self.main_self.contains(&span_key(n))
         {
-            if complete {
-                self.out.toplevel_includes.extend(names.iter().cloned());
-            } else if !args.is_empty() {
-                self.out.toplevel_includes.push(WILDCARD.to_string());
-            }
+            // Upstream `instance_mixin_recorded?` writes the constant
+            // targets BEFORE the partial-name `note(complete: false)` —
+            // `include Mk, h` records `Mk` (so `1.mk` declines). The
+            // unnamed half taints only the edge's ORDER — it lives on
+            // `unpositioned`, never in the include set, so it suppresses
+            // nothing: `2.unknown_thing` still fires, and `helper`'s own
+            // `unresolved-toplevel` is not excused by the include
+            // (oracle-measured). No WILDCARD is pushed.
+            self.out.toplevel_includes.extend(names.iter().cloned());
             return;
         }
-        let self_recv = recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
-        if recv.is_none() || self_recv {
+        if lexical_self {
             let singleton = self.frame().singleton;
             let side = match (singleton, kind) {
                 (true, "extend") => return,
@@ -577,6 +764,11 @@ impl Census {
             if side == MixinSide::Extend {
                 if let Some(owner) = self.singleton_owner() {
                     // `self` as an argument names the owner itself.
+                    // Upstream v0.4.8 `singleton_mixin_recorded?` +
+                    // `record_extend_targets` (#2995): a lexical-self call in
+                    // ANY spelling records its constant targets; an argument
+                    // the walk cannot name leaves them UNNAMED (the port's
+                    // WILDCARD).
                     let all_named = !args.is_empty()
                         && args.iter().all(|a| {
                             strict_constant_path_string(a).is_some() || a.as_self_node().is_some()
@@ -591,37 +783,43 @@ impl Census {
                             }
                         })
                         .collect();
-                    // `singleton_mixin_recorded?` reads a `self.` receiver
-                    // through `receiver_extend_recorded?`, whose
-                    // `prepend_call_receiver` names no class for `self`: a taint.
-                    if via_send || !all_named || self_recv {
+                    if !all_named {
                         listed.push(WILDCARD.to_string());
                     }
                     self.out.singleton_mixins.push((owner, listed));
                 }
             }
             let Some(owner) = self.owner() else { return };
-            if recv.is_none() && !via_send && complete {
-                if self.is_direct(n) && !singleton {
-                    if kind != "extend" {
-                        let key = owner[0].clone();
-                        let entry = self.direct_includes.entry(key.clone()).or_default();
-                        let (mine, other) = if kind == "prepend" {
-                            (&mut entry.1, &entry.0)
-                        } else {
-                            (&mut entry.0, &entry.1)
-                        };
-                        let clash = names.iter().any(|t| other.contains(t));
-                        mine.extend(names.iter().cloned());
-                        if clash {
-                            self.wildcard(owner.clone(), MixinSide::Include);
-                        }
-                        self.out.direct_mixins.push((key.clone(), kind == "prepend", names.clone()));
+            // Upstream v0.4.8 `instance_mixin_recorded?` (#2995): a
+            // lexical-self call — a bare `include M`, `self.include M`, or a
+            // `send` / `public_send` / `__send__` spelling — records its
+            // constant targets wherever it is written; a call naming none
+            // taints the side, a partially named one records what it can and
+            // taints the rest (UNNAMED, the port's WILDCARD).
+            if names.is_empty() {
+                self.wildcard(owner, side);
+                return;
+            }
+            if self.is_direct(n) && !singleton {
+                if kind != "extend" {
+                    let key = owner[0].clone();
+                    let entry = self.direct_includes.entry(key.clone()).or_default();
+                    let (mine, other) = if kind == "prepend" {
+                        (&mut entry.1, &entry.0)
+                    } else {
+                        (&mut entry.0, &entry.1)
+                    };
+                    let clash = names.iter().any(|t| other.contains(t));
+                    mine.extend(names.iter().cloned());
+                    if clash {
+                        self.wildcard(owner.clone(), MixinSide::Include);
                     }
-                    return;
+                    self.out.direct_mixins.push((key.clone(), kind == "prepend", names.clone()));
                 }
-                self.unpositioned(owner, side, names);
             } else {
+                self.unpositioned(owner.clone(), side, names);
+            }
+            if !complete {
                 self.wildcard(owner, side);
             }
             return;
@@ -697,14 +895,27 @@ impl Census {
             return;
         }
         let up_level = self.frame().singleton && lexical_self;
-        let consts: Vec<Option<String>> = args.iter().map(strict_constant_path_string).collect();
-        if !up_level
-            && (name == "include" || name == "prepend")
-            && !consts.is_empty()
-            && consts.iter().all(Option::is_some)
-        {
-            self.out.singleton_mixins.push((owner, consts.into_iter().flatten().collect()));
-            return;
+        // Upstream v0.4.8 `singleton_class_include_recorded?` (#2998): a
+        // constant-argument `include` (spelled `include` only — a `send`
+        // spelling stays a taint) or `prepend` — `prepend` records through
+        // `send(:prepend, P)` too — puts the module on the receiver's
+        // singleton.
+        let recordable = match self.mixin_view(call) {
+            Some(("prepend", view_args, _)) => Some(view_args),
+            Some(("include", view_args, false)) if name == "include" => Some(view_args),
+            _ => None,
+        };
+        if !up_level {
+            if let Some(view_args) = recordable {
+                let consts: Vec<Option<String>> =
+                    view_args.iter().map(strict_constant_path_string).collect();
+                if !consts.is_empty() && consts.iter().all(Option::is_some) {
+                    self.out
+                        .singleton_mixins
+                        .push((owner, consts.into_iter().flatten().collect()));
+                    return;
+                }
+            }
         }
         self.out.singleton_mixins.push((owner, vec![WILDCARD.to_string()]));
     }
@@ -764,6 +975,7 @@ impl<'pr> Visit<'pr> for Census {
         for s in node.statements().body().iter() {
             self.direct.insert(span_key(&s));
         }
+        self.main_self = collect_main_self_calls(&node.statements().as_node());
         ruby_prism::visit_program_node(self, node);
     }
 
@@ -784,7 +996,14 @@ impl<'pr> Visit<'pr> for Census {
         let expr = node.expression();
         self.visit(&expr);
         let is_self = expr.as_self_node().is_some();
-        let owner = if is_self { self.owner() } else { None };
+        // Upstream v0.4.8 (#3010): `class << Const` is followed as the
+        // constant's own singleton; `class << obj` names something this
+        // walk cannot resolve to a class.
+        let owner = if is_self {
+            self.owner()
+        } else {
+            strict_constant_path_string(&expr).map(|raw| self.candidates(&raw))
+        };
         // `class << self` inside `X.instance_eval { … }` opens `X`'s singleton.
         let eval_owner = if is_self { self.singleton_owner() } else { None };
         self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner });
@@ -1027,6 +1246,7 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
         in_def: 0,
         hook_params: Vec::new(),
         direct_includes: std::collections::HashMap::new(),
+        main_self: HashSet::new(),
     };
     c.visit(root);
     c.out.singleton_locals = super::singleton_locals::collect(root);
