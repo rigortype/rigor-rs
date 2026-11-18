@@ -31,6 +31,15 @@ use std::collections::{HashMap, HashSet};
 use rigor_index::CoreIndex;
 use rigor_parse::{AncestryFacts, MixinSide, MIXIN_UNNAMED, MIXIN_WILDCARD};
 
+/// `?` ([`MIXIN_UNNAMED`]) rides beside `*` ([`MIXIN_WILDCARD`]) in every list
+/// the census writes — `UNNAMED_LIST` is `["*", "?"]` — so a name-reader that
+/// treated `?` as a resolvable name would answer wrongly wherever the
+/// reference's `includes_of` / `discovered_extends` hold no such name. Every
+/// marker check reads both.
+fn mixin_marker(n: &str) -> bool {
+    n == MIXIN_WILDCARD || n == MIXIN_UNNAMED
+}
+
 use super::{DefKind, SourceIndex};
 
 /// `ResolutionChain::LIMIT` — the project entries a chain may hold.
@@ -715,7 +724,7 @@ impl SourceIndex {
         method: &str,
         explicit: bool,
     ) -> bool {
-        if raw == MIXIN_WILDCARD {
+        if mixin_marker(raw) {
             return !explicit;
         }
         // The question is a union over the module's ancestry, not "which
@@ -726,7 +735,7 @@ impl SourceIndex {
         let mut queue: Vec<(String, String)> = vec![(owner.to_string(), raw.to_string())];
         let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
-            if raw == MIXIN_WILDCARD {
+            if mixin_marker(&raw) {
                 if !explicit {
                     return true;
                 }
@@ -906,11 +915,11 @@ impl SourceIndex {
         let mut queue: Vec<(String, String)> = self
             .instance_mixin_edges(a)
             .into_iter()
-            .filter(|(_, raw)| raw != MIXIN_WILDCARD)
+            .filter(|(_, raw)| !mixin_marker(raw))
             .collect();
         let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
-            if raw == MIXIN_WILDCARD {
+            if mixin_marker(&raw) {
                 if open && !hook_only {
                     return true;
                 }
@@ -986,7 +995,7 @@ impl SourceIndex {
         let listed = self.ancestry.extend_listed.get(q).into_iter().flatten();
         let harvested = self.override_classes.get(q).into_iter().flat_map(|e| e.extends.iter());
         for raw in listed.chain(harvested) {
-            if raw != MIXIN_WILDCARD && !out.contains(raw) {
+            if !mixin_marker(raw) && !out.contains(raw) {
                 out.push(raw.clone());
             }
         }
@@ -999,12 +1008,12 @@ impl SourceIndex {
         let mut queue: Vec<(String, String)> = self
             .singleton_raws(q)
             .into_iter()
-            .filter(|r| r != MIXIN_WILDCARD)
+            .filter(|r| !mixin_marker(r))
             .map(|r| (q.to_string(), r))
             .collect();
         let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
-            if raw == MIXIN_WILDCARD {
+            if mixin_marker(&raw) {
                 continue;
             }
             if let Some(m) = self.resolve_override_ancestor(&from, &raw) {
@@ -1038,7 +1047,7 @@ impl SourceIndex {
             || self
                 .singleton_raws(owner)
                 .iter()
-                .filter(|r| *r != MIXIN_WILDCARD)
+                .filter(|r| !mixin_marker(r))
                 .any(|raw| self.entry_hook_capable(core, owner, raw))
     }
 
@@ -1069,10 +1078,10 @@ impl SourceIndex {
             .any(|n| {
                 let open = !OBJECT_ROOTS.contains(&n.as_str());
                 let raws = self.singleton_raws(n);
-                if self.singleton_truncated(n) || (open && raws.iter().any(|r| r == MIXIN_WILDCARD)) {
+                if self.singleton_truncated(n) || (open && raws.iter().any(|r| mixin_marker(r))) {
                     return true;
                 }
-                raws.iter().filter(|r| *r != MIXIN_WILDCARD).any(|raw| {
+                raws.iter().filter(|r| !mixin_marker(r)).any(|raw| {
                     // v0.4.6 review: level 0 of the reference's singleton
                     // chain holds the extended module's own include/prepend
                     // closure too (`module Ext; include Inner`), read as the

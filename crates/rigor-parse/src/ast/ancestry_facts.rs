@@ -1366,20 +1366,40 @@ impl<'pr> Census<'pr> {
         }
         if self.hook_receiver(&recv) {
             if let Some(owner) = self.owner() {
-                // `taint_unrecorded_mixin` with `hook` true: the instance side
-                // is UNNAMED for an `include` / `prepend` (the hook's `base`
-                // may be mixed into the class itself); the extend side's
-                // `unnamed` is `opaque && !hook` — always the wildcard (#2994:
-                // `base.extend(*X)` extends the includer, not the module the
-                // hook is written in).
-                if kind != "extend" {
+                // `taint_unrecorded_mixin` — `unnamed` on the instance side
+                // reads `kind ∈ {include, prepend}` AND a receiver that is not
+                // a `singleton_class` call AND (`hook_parameter_receiver?` —
+                // the BARE local, not the chain — or an opaque argument);
+                // the extend side's is `opaque && !hook_parameter_receiver?`.
+                // A chained receiver (`base.singleton_class`, `base.class`)
+                // still taints both sides — `hook_receiver?` — but keeps the
+                // side it is not opaque to order-only.
+                let sc_eval = recv
+                    .as_call_node()
+                    .is_some_and(|c| constant_string(c.name().as_slice()) == "singleton_class");
+                let hook_param = self.hook_parameter_receiver(&recv);
+                let opaque = args.iter().any(|a| opaque_mixin_argument(a));
+                if kind != "extend" && !sc_eval && (hook_param || opaque) {
                     self.unnamed(owner.clone(), MixinSide::Include);
                 } else {
                     self.wildcard(owner.clone(), MixinSide::Include);
                 }
-                self.wildcard(owner, MixinSide::Extend);
+                if opaque && !hook_param {
+                    self.unnamed(owner, MixinSide::Extend);
+                } else {
+                    self.wildcard(owner, MixinSide::Extend);
+                }
             }
         }
+    }
+
+    /// `hook_parameter_receiver?` — the receiver IS a hook parameter (`base`
+    /// in `def self.included(base)`), as distinct from `hook_receiver?` which
+    /// also follows a no-argument call chain off one (`base.singleton_class`,
+    /// `base.class`).
+    fn hook_parameter_receiver(&self, recv: &PrismNode<'_>) -> bool {
+        recv.as_local_variable_read_node()
+            .is_some_and(|lv| self.hook_params.contains(&constant_string(lv.name().as_slice())))
     }
 
     /// Upstream v0.4.8 (#3006, `taint_computed_mixin_send` +
@@ -1400,7 +1420,10 @@ impl<'pr> Census<'pr> {
         }
         let recv = call.receiver();
         let lexical_self = recv.is_none() || recv.as_ref().is_some_and(|r| r.as_self_node().is_some());
-        let hook = recv.as_ref().is_some_and(|r| self.hook_receiver(r));
+        // `computed_send_name` accepts the hook PARAMETER — the bare local —
+        // not `hook_receiver?`'s call chain: `base.singleton_class.send(m, M)`
+        // names nothing mixin.
+        let hook = recv.as_ref().is_some_and(|r| self.hook_parameter_receiver(r));
         if !lexical_self && !hook {
             return;
         }
