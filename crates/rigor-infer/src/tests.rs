@@ -2315,6 +2315,80 @@ fn a_selection_receiver_names_each_arms_local() {
     assert!(st(b"g = [1]\nh = [2]\n(c ? g : h)[0] = 9\n").stale("h"));
 }
 
+
+/// rigor-rs#435 (ADR-56 slice B): a loop body that does not converge inside
+/// the reference's 3-pass `BodyFixpoint` widens EVERY tracked name on the cap
+/// pass — `Constant -> Nominal` — so a dead-arm write (`if false; t = nil;
+/// end`) must not leave `t` value-pinned where the reference already lost the
+/// pin. The snapshot of `if t` after the loop must NOT be a `Type::Constant`.
+#[test]
+fn loop_cap_widens_tracked_names_when_body_never_converges() {
+    let src = b"def f(c)\n  t = 1\n  y = nil\n  while c\n    if false\n      t = nil\n    end\n    y = [y]\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "t must shed its pin once a tracked name fails to converge, got {:?}",
+        i.get(ty)
+    );
+}
+
+/// The convergent control for `loop_cap_widening`: a body whose tracked
+/// names settle inside two passes (`y = 2` joins `nil | 2` once, then holds)
+/// keeps the constant pins — `if t` still folds to `Constant[1]` and
+/// `flow.always-truthy-condition` fires on both engines.
+#[test]
+fn loop_converged_body_keeps_constant_pins() {
+    let src = b"def f(c)\n  t = 1\n  y = nil\n  while c\n    if false\n      t = nil\n    end\n    y = 2\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+}
+
+/// A capped loop's widen lands on the POST-JOIN env, not the entry env:
+/// `w`'s own body write (`w = 1` under a `w = nil` seed) survives the cap
+/// pass the reference's way — `Integer | NilClass`, never a minted `nil` —
+/// so `if w` keeps no `Constant`/`NilClass` pin to fire on (rigor-rs#435
+/// review: the entry-env overlay turned this into an always-falsey FP).
+#[test]
+fn loop_cap_widen_preserves_body_writes_to_non_suspect_names() {
+    let src = b"def f(c)\n  w = nil\n  i = 0\n  while c\n    w = 1\n    i += 1\n  end\n  if w\n    puts i\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_))
+            && index.class_name_of(&i, ty) != Some("NilClass"),
+        "w must keep its body write (widened), got {:?}",
+        i.get(ty)
+    );
+}
 #[test]
 fn nested_alternating_logical_guard_is_linear() {
     // rigor-rs#453: `subject_edge` re-evaluated a Logical's left operand on
