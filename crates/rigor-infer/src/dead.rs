@@ -473,7 +473,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         seen: &mut Vec<String>,
     ) -> std::rc::Rc<DeadPositions> {
-        let key = ast as *const LoweredAst as usize;
+        let key = ast.uid() as usize;
         if let Some((cached_key, cached)) = &*self.dead_cache.borrow() {
             if *cached_key == key {
                 return cached.clone();
@@ -642,7 +642,7 @@ impl<'i> Typer<'i> {
         pred: NodeId,
         seen: &mut Vec<String>,
     ) -> Option<bool> {
-        let key = (ast as *const LoweredAst as usize, pred.0);
+        let key = (ast.uid() as usize, pred.0);
         if let Some(hit) = self.truthy_memo.borrow().get(&key) {
             return *hit;
         }

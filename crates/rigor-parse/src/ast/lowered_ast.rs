@@ -16,6 +16,12 @@ use super::{collect_ancestry_facts, AncestryFacts, collect_const_mutations, Buil
 static NEXT_ANONYMOUS_FILE_KEY: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
+/// Per-instance identity of a [`LoweredAst`]. Fresh on every `lower_with_key`,
+/// so two AST instances never share a memo key even when a freed arena's
+/// address is reused (rigor-rs#424).
+static NEXT_AST_UID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 /// Stable identity of the FILE an AST was lowered from (issue #102).
 ///
 /// Some analysis facts are per-FILE — the reference's in-source CONSTANT VALUE
@@ -75,6 +81,12 @@ pub struct LoweredAst {
     /// for the AST's lifetime and preserved by `Clone` (a clone is the same
     /// file).
     file_key: FileKey,
+    /// Per-INSTANCE identity: a fresh counter on every `lower_with_key`,
+    /// preserved by `Clone` (a clone holds the same nodes, so memos keyed on
+    /// it stay valid). The arena pointer cannot serve — a freed AST's
+    /// address re-enters service for a later one, and `(ptr, len)` then
+    /// aliases two different trees (rigor-rs#424).
+    uid: u64,
     /// Upstream #540 (`fc3b8b42`) — every site in this file that MUTATES a
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
@@ -249,6 +261,13 @@ impl LoweredAst {
     /// that drops the AST but still needs positions.
     pub fn share_line_index(&self) -> Arc<LineIndex> {
         Arc::clone(&self.carrier_spans.line_index)
+    }
+
+    /// The per-instance identity — see the field's docs. For memo tables
+    /// keyed on the AST itself (reach, dead-set, type-of); never equal
+    /// across two `lower` calls even at the same arena address.
+    pub fn uid(&self) -> u64 {
+        self.uid
     }
 
     /// Upstream #540's mutation census for this file, in walk order. See
@@ -682,6 +701,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         nodes: builder.nodes,
         root,
         file_key,
+        uid: NEXT_AST_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         const_mutations,
         element_mutations,
         local_read_starts,

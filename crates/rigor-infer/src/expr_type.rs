@@ -131,6 +131,33 @@ impl<'i> Typer<'i> {
     /// load-bearing behaviour that keeps downstream rules zero-false-positive
     /// (ADR-0023 tier-5).
     pub fn type_of(&self, ast: &LoweredAst, id: NodeId, env: &TypeEnv, interner: &mut Interner) -> TypeId {
+        // rigor-rs#424 — a `Call` whose subtree reads no env types the same
+        // under every env, so its answer memoizes per (ast, dead set):
+        // without it each call site of a deep chain (`2 ** 2 ** …`,
+        // `1 + 1 + …`, `x.a.a…`) re-types its remaining suffix, quadratic
+        // per site and cubic over the arg-reach fanout.
+        if matches!(ast.get(id), Node::Call { .. })
+            && !self
+                .reach_index(ast)
+                .env_sensitive_within(ast.get(id).span())
+        {
+            let ty = self.type_of_memo(ast, id, |s| {
+                let tid = s.type_of_uncached(ast, id, env, interner);
+                let ty = interner.get(tid);
+                (ty.clone(), type_is_interner_free(ty, interner))
+            });
+            return interner.intern(ty);
+        }
+        self.type_of_uncached(ast, id, env, interner)
+    }
+
+    fn type_of_uncached(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
         match ast.get(id) {
             Node::StringLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Str(value.clone())))
@@ -1970,4 +1997,31 @@ fn set_union(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
 /// of the ones that survive (`[1, 1, 2] - [2] == [1, 1]`).
 fn set_difference(a: &[Scalar], b: &[Scalar]) -> Vec<Scalar> {
     a.iter().filter(|s| !b.contains(s)).cloned().collect()
+}
+
+/// Whether `ty` embeds no [`TypeId`] whose meaning changes across interners —
+/// the condition under which [`Typer::type_of_memo`] may store it and a hit
+/// re-intern it under the caller's interner (rigor-rs#424). Flat carriers are
+/// free; `Dynamic` over a PRE-INTERNED atomic (`Dynamic[top]` — the untyped
+/// answer most chain nodes produce) is free because every interner pins the
+/// same atomics at construction; any other embedded id would index into
+/// whichever interner happened to write the entry.
+fn type_is_interner_free(ty: &Type, interner: &Interner) -> bool {
+    match ty {
+        Type::Top
+        | Type::Bottom
+        | Type::Constant(_)
+        | Type::IntegerRange { .. }
+        | Type::Singleton(_)
+        | Type::Void
+        | Type::SelfType
+        | Type::Instance
+        | Type::ClassType => true,
+        Type::Nominal { args, .. } => args.is_empty(),
+        Type::Dynamic(id) => matches!(
+            interner.get(*id),
+            Type::Top | Type::Bottom | Type::Constant(Scalar::Nil | Scalar::Bool(_))
+        ),
+        _ => false,
+    }
 }

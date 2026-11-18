@@ -764,7 +764,7 @@ impl<'i> Typer<'i> {
     /// The marks of `ast`, built on first use and memoized per `ast`
     /// identity (the `reach_index` keying).
     pub fn def_local_marks(&self, ast: &LoweredAst) -> Rc<DefLocalMarks> {
-        let key = (ast as *const LoweredAst as usize, ast.len());
+        let key = (ast.uid() as usize, ast.len());
         if let Some((cached_key, marks)) = &*self.def_marks.borrow() {
             if *cached_key == key {
                 return marks.clone();
