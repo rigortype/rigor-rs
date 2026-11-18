@@ -15,10 +15,13 @@
 //! 2. **Who owns the receiver?** [`MutationClassifier::label_for`]. `self` and
 //!    its ivars are `mutate.self` (`mutate.static` in singleton context), a
 //!    class variable is `mutate.static`, a parameter is `mutate.instance`, a
-//!    frame-owned local is `mutate.local`. **Anything else answers None**, and
-//!    the caller records nothing rather than a proven bare `mutate`: Ruby's
-//!    ownership is a dataflow question, and a proven parent label on a
-//!    fresh-but-unproven receiver would put findings on correct code.
+//!    frame-owned local is `mutate.local`, and so is a receiver that is itself
+//!    an allocation (`{}.compare_by_identity`, `raw.dup.force_encoding(e)`) by
+//!    the local rule's own witness ([`allocation`]). **Anything else answers
+//!    None**, and the caller records an `unknown-ownership` taint rather
+//!    than a proven bare `mutate`: Ruby's ownership is a dataflow question,
+//!    and a proven parent label on a fresh-but-unproven receiver would put
+//!    findings on correct code.
 //!
 //! [`owned_locals`] is deliberately **flow-insensitive and whole-body**: a local
 //! that escapes anywhere disqualifies, even if the escape happens after the
@@ -29,9 +32,11 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use rigor_parse::ruby_prism::{CallNode, Node, Visit};
 
-/// Assignment right-hand sides that witness a fresh allocation
-/// (`local_ownership.rb:29`).
-const ALLOCATING_SELECTORS: &[&[u8]] = &[b"new", b"dup", b"clone"];
+/// Assignment right-hand sides that witness a fresh allocation on ANY
+/// receiver (`local_ownership.rb:29`, `COPYING_SELECTORS`). `.new` is NOT
+/// here — only a class object's `new` is `Class#new`, which is
+/// [`constructor`]'s question.
+const COPYING_SELECTORS: &[&[u8]] = &[b"dup", b"clone"];
 
 /// The `mutate.*` label an ownership answer earns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -117,12 +122,18 @@ impl MutationClassifier {
         if receiver.as_class_variable_read_node().is_some() {
             return Some(Ownership::Static);
         }
-        let local = receiver.as_local_variable_read_node()?;
-        let name = name_of(local.name().as_slice());
-        if self.parameters.contains(&name) {
-            return Some(Ownership::Instance);
+        if let Some(local) = receiver.as_local_variable_read_node() {
+            let name = name_of(local.name().as_slice());
+            if self.parameters.contains(&name) {
+                return Some(Ownership::Instance);
+            }
+            return self.owned_locals.contains(&name).then_some(Ownership::Local);
         }
-        self.owned_locals.contains(&name).then_some(Ownership::Local)
+        // Upstream's `else` arm (`mutation_classifier.rb:88`): a receiver that
+        // is itself an allocation earns `mutate.local` — each evaluation is a
+        // new object no caller holds yet (`{}.compare_by_identity`,
+        // `raw.dup.force_encoding(e)`).
+        allocation(receiver, self.singleton).then_some(Ownership::Local)
     }
 
     fn self_or_static(&self) -> Ownership {
@@ -132,15 +143,17 @@ impl MutationClassifier {
 
 /// The set of frame-owned local names in `body`, given the method's parameter
 /// names (a parameter is never frame-owned — the caller holds the same object,
-/// so mutating it is `mutate.instance`).
+/// so mutating it is `mutate.instance`) and whether `self` is a class there
+/// ([`constructor`] reads it, `local_ownership.rb:36`).
 pub(super) fn owned_locals(
     body: Option<&Node<'_>>,
     parameters: &BTreeSet<String>,
+    singleton: bool,
 ) -> BTreeSet<String> {
     let Some(body) = body else { return BTreeSet::new() };
-    let mut scan = OwnershipScan::default();
+    let mut scan = OwnershipScan { singleton, ..Default::default() };
     scan.visit(body);
-    let OwnershipScan { assignments, mut escaped } = scan;
+    let OwnershipScan { assignments, mut escaped, .. } = scan;
     escaped.extend(trailing_read(body));
     assignments
         .into_iter()
@@ -158,6 +171,9 @@ pub(super) fn owned_locals(
 struct OwnershipScan {
     assignments: BTreeMap<String, Vec<bool>>,
     escaped: BTreeSet<String>,
+    /// Whether the enclosing unit's `self` is a class — [`constructor`]'s
+    /// `singleton` (`scanner.rb:254`).
+    singleton: bool,
 }
 
 impl OwnershipScan {
@@ -170,7 +186,10 @@ impl OwnershipScan {
         if let Some(write) = node.as_local_variable_write_node() {
             let value = write.value();
             let name = name_of(write.name().as_slice());
-            self.assignments.entry(name).or_default().push(allocation(&value));
+            self.assignments
+                .entry(name)
+                .or_default()
+                .push(allocation(&value, self.singleton));
             // `y = x` hands the same object to a second name; neither can be
             // proven frame-private cheaply.
             self.note_read(Some(&value));
@@ -262,8 +281,9 @@ fn stored_value<'pr>(node: &Node<'pr>) -> Option<Node<'pr>> {
 }
 
 /// Whether `node` is an expression that allocates a fresh object this frame is
-/// the sole holder of.
-fn allocation(node: &Node<'_>) -> bool {
+/// the sole holder of (`local_ownership.rb:52`). `singleton` is whether the
+/// enclosing unit's `self` is a class, as [`constructor`] reads it.
+fn allocation(node: &Node<'_>, singleton: bool) -> bool {
     if node.as_array_node().is_some()
         || node.as_hash_node().is_some()
         || node.as_string_node().is_some()
@@ -273,7 +293,41 @@ fn allocation(node: &Node<'_>) -> bool {
         return true;
     }
     let Some(call) = node.as_call_node() else { return false };
-    ALLOCATING_SELECTORS.contains(&call.name().as_slice()) || unary_plus_string(&call)
+    COPYING_SELECTORS.contains(&call.name().as_slice())
+        || constructor(&call, singleton)
+        || unary_plus_string(&call)
+}
+
+/// A `new` whose receiver the author wrote as a class object: a constant path,
+/// a `class` call (`self.class`, `other.class`), or `self` — explicit or
+/// implicit — in a singleton-method body (`local_ownership.rb:71`). Any other
+/// receiver may be an object whose `new` only shares the name: an ActiveRecord
+/// association's `new` builds a record into the association's own target,
+/// where the caller can reach it. `self` in an instance method is such a
+/// receiver too — an association extension's `new` is the association's.
+fn constructor(call: &CallNode<'_>, singleton: bool) -> bool {
+    if call.name().as_slice() != b"new" {
+        return false;
+    }
+    let Some(receiver) = call.receiver() else { return singleton };
+    if receiver.as_self_node().is_some() {
+        return singleton;
+    }
+    if receiver.as_constant_read_node().is_some()
+        || receiver.as_constant_path_node().is_some()
+    {
+        return true;
+    }
+    match receiver.as_call_node() {
+        Some(receiver_call) => class_call(&receiver_call),
+        None => false,
+    }
+}
+
+/// `x.class` — `Kernel#class` answers the receiver's class, unless the
+/// receiver overrides it (`local_ownership.rb:84`).
+fn class_call(call: &CallNode<'_>) -> bool {
+    call.name().as_slice() == b"class" && call.arguments().is_none() && call.block().is_none()
 }
 
 /// `+""` — the frozen-string-literal era's spelling of "a fresh mutable String".
@@ -300,14 +354,21 @@ pub(super) fn name_of(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    /// Instance-method context (`singleton: false`) — most cases.
     fn owned(source: &str, parameters: &[&str]) -> Vec<String> {
+        owned_as(source, parameters, false)
+    }
+
+    fn owned_as(source: &str, parameters: &[&str], singleton: bool) -> Vec<String> {
         let result = rigor_parse::parse(source.as_bytes());
         let params: BTreeSet<String> = parameters.iter().map(|p| (*p).to_string()).collect();
         // The real caller hands a method BODY, which is a `StatementsNode`; a
         // parse result's root is the enclosing `ProgramNode`, and `trailing_read`
         // reads the statements' tail.
         let program = result.node().as_program_node().expect("a program").statements();
-        owned_locals(Some(&program.as_node()), &params).into_iter().collect()
+        owned_locals(Some(&program.as_node()), &params, singleton)
+            .into_iter()
+            .collect()
     }
 
     #[test]
@@ -320,6 +381,27 @@ mod tests {
         assert_eq!(owned("h = {}\nh[:k] = 1\nnil", &[]), ["h"]);
         assert_eq!(owned("o = Thing.new\no.x = 1\nnil", &[]), ["o"]);
         assert_eq!(owned("d = other.dup\nd.clear\nnil", &[]), ["d"]);
+        // `x.class` receivers are class objects (`local_ownership.rb:84`).
+        assert_eq!(owned("o = self.class.new\no.x = 1\nnil", &[]), ["o"]);
+        assert_eq!(owned("o = other.class.new\no.x = 1\nnil", &[]), ["o"]);
+    }
+
+    #[test]
+    fn new_allocates_only_on_a_class_object_receiver() {
+        // `constructor?` (`local_ownership.rb:71`) — issue #614.
+        // A non-class receiver's `new` only shares the name.
+        assert!(owned("o = assoc.items.new\no.x = 1\nnil", &[]).is_empty());
+        // Bare `new` on an instance body is `self.new`, and `self` is not a
+        // class there; on a singleton body it is `Class#new`.
+        assert!(owned("o = new\no.x = 1\nnil", &[]).is_empty());
+        assert!(owned("o = self.new\no.x = 1\nnil", &[]).is_empty());
+        assert_eq!(owned_as("o = new\no.x = 1\nnil", &[], true), ["o"]);
+        assert_eq!(owned_as("o = self.new\no.x = 1\nnil", &[], true), ["o"]);
+        // A constant receiver is always a class object.
+        assert_eq!(owned("o = Thing.new\no.x = 1\nnil", &[]), ["o"]);
+        assert_eq!(owned("o = Outer::Thing.new\no.x = 1\nnil", &[]), ["o"]);
+        // `x.class` with arguments or a block is not `Kernel#class`.
+        assert!(owned("o = other.class(:x).new\no.x = 1\nnil", &[]).is_empty());
     }
 
     #[test]

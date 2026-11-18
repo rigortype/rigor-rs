@@ -63,6 +63,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #614 CLOSED** (PR #624): `LocalOwnership` ports `constructor?`/`class_call?` + the `singleton` bit — `.new` allocates only on a constant path, `x.class`, or self in a SINGLETON body; `MutationClassifier` gained the allocation-receiver `else` arm. 2 OVERs + 3 UNDERs closed; probes + 82-unit advisory re-probe 0 OVER; Approved + fix-confirmation; sweep unmeasurable (no corpora). → #629 (`[]=` drops `unknown-ownership`). [note](notes/20261119-issue-614-local-ownership-allocation.md)
+
 - **2026-11-19 #603 CLOSED** (PR #623): alias floor ports `selection_branches` (case/in, begin/rescue, rescue-modifier — last statement per arm), `ReceiverAlias.candidates` receivers, `message_loc` reach, block-declined `send`; three carrier marks in `CarrierSpans`, mixed-candidate spans `non_floorable`. 4 FP rows + ~130 probes match, 2-round Approved; sweep unmeasurable locally (substitutes 0 FP/0 diff). Follow-ups #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
 
 - **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; probes byte-identical, 0 OVER, unit tests cover the fixture blind spot. → #621 (sig-scoped `Const.new.m` FP), #622 (ConstantPath consolidation). [note](notes/20261119-issue-615-rooted-class-header.md)
