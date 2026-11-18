@@ -615,22 +615,16 @@ impl Config {
     ///
     /// Two gates, in the reference's order: `File.exist?(path)` on the RAW
     /// spelling (a leading `~` is never expanded, `..` resolves through the
-    /// OS — symlinks honoured), then `File.expand_path(path)` for the file
-    /// actually read (`~`/`~user` expanded, `..` folded LEXICALLY — so
-    /// `lnk/../x.yml` reads the lexical parent even when `lnk` points
-    /// elsewhere, and a `~`-led path that only exists literally reads the
-    /// `$HOME` file).
+    /// OS — symlinks honoured), then `File.absolute_path(path)` for the file
+    /// actually read (a leading `~`/`~user` stays LITERAL since
+    /// `91c86cac8` — `..` folded LEXICALLY, so `lnk/../x.yml` reads the
+    /// lexical parent even when `lnk` points elsewhere).
     #[must_use]
     pub fn read(path: &Path) -> ConfigRead {
         if !path.exists() {
             return ConfigRead::Absent(format!("no such file or directory — {}", path.display()));
         }
-        let absolute = match expand_tilde_head(&path.to_string_lossy())
-            .map(|s| crate::conformance_gate::expand_path(Path::new(&s)))
-        {
-            Ok(p) => p,
-            Err(f) => return ConfigRead::Fatal(f),
-        };
+        let absolute = crate::conformance_gate::expand_path(path);
         let mut includes_seen = false;
         let mut key_texts: Vec<KeyText> = Vec::new();
         let merged = match load_with_includes(
@@ -1884,7 +1878,7 @@ fn prism_accepts_target(version: &str) -> bool {
 /// `baseline: rel.yml` keeps its cwd-relative spelling.
 const PATH_KEYS: [&str; 3] = ["paths", "signature_paths", "pre_eval"];
 
-/// Read + parse `absolute` (already `File.expand_path`'d) as a YAML document,
+/// Read + parse `absolute` (already `File.absolute_path`'d) as a YAML document,
 /// or the [`LoadFailure`] the reference dies with: a read error is an uncaught
 /// `Errno` upstream (exit 1); a `Psych::SyntaxError` is re-rendered upstream
 /// as `<abs>:<line>:<col>: not valid YAML: <detail>` (exit 64); a document
@@ -3631,7 +3625,7 @@ fn load_with_includes(
 }
 
 /// `Configuration::merge_includes`: each `includes:` entry is
-/// `File.expand_path(inc.to_s, base_dir)` — `base_dir` is the INCLUDING file's
+/// `ConfigPath.absolute(inc.to_s, base_dir)` — `base_dir` is the INCLUDING file's
 /// directory — then loaded recursively; a missing one is the load-time
 /// `include not found: <inc> (referenced from <base_dir>)` error (exit 64).
 /// Included files merge left-to-right (a later include wins over an earlier),
@@ -3646,7 +3640,7 @@ fn merge_includes(
 ) -> Result<serde_yaml::Mapping, LoadFailure> {
     let mut accumulated = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
     for inc in includes {
-        let inc_path = expand_config_entry(&ruby_to_s(inc), base_dir)?;
+        let inc_path = expand_config_entry(&ruby_to_s(inc), base_dir);
         if !inc_path.exists() {
             return Err(LoadFailure {
                 message: format!(
@@ -3728,7 +3722,7 @@ fn merge_dependencies_hash(
 }
 
 /// `Configuration::resolve_paths_in`: each PATH_KEYS entry plus the nested
-/// `plugins_io.allowed_paths:` is `Array(v).map { File.expand_path(p.to_s,
+/// `plugins_io.allowed_paths:` is `Array(v).map { ConfigPath.absolute(p.to_s,
 /// base_dir) }` — a present-but-null key stays null (the reference's "not
 /// configured"). `cache.path:` is intentionally left as-is upstream.
 fn resolve_paths_in(
@@ -3743,7 +3737,7 @@ fn resolve_paths_in(
         let mut resolved = Vec::new();
         for entry in ruby_array_raw(v) {
             resolved.push(serde_yaml::Value::String(
-                expand_config_entry(&ruby_to_s(&entry), base_dir)?
+                expand_config_entry(&ruby_to_s(&entry), base_dir)
                     .to_string_lossy()
                     .into_owned(),
             ));
@@ -3755,7 +3749,7 @@ fn resolve_paths_in(
     }
     // `SCALAR_PATH_KEYS` (v0.4.7): `core_root:` when it is a String.
     if let Some(serde_yaml::Value::String(cr)) = out.get("core_root") {
-        let abs = expand_config_entry(cr, base_dir)?.to_string_lossy().into_owned();
+        let abs = expand_config_entry(cr, base_dir).to_string_lossy().into_owned();
         out.insert(
             serde_yaml::Value::String("core_root".to_string()),
             serde_yaml::Value::String(abs),
@@ -3770,7 +3764,7 @@ fn resolve_paths_in(
                 let mut resolved = Vec::new();
                 for entry in ruby_array_raw(ap) {
                     resolved.push(serde_yaml::Value::String(
-                        expand_config_entry(&ruby_to_s(&entry), base_dir)?
+                        expand_config_entry(&ruby_to_s(&entry), base_dir)
                             .to_string_lossy()
                             .into_owned(),
                     ));
@@ -3785,86 +3779,136 @@ fn resolve_paths_in(
     Ok(())
 }
 
-/// Ruby `File.expand_path(entry, base_dir)`: `~`/`~user` expand at the head,
-/// then `.`/`..` fold LEXICALLY against `base` (no symlink resolution — the
-/// `lnk/../sig` case lands on the lexical parent, upstream-verified). `base`
-/// is already absolute (the expanded config's directory).
-fn expand_config_entry(entry: &str, base: &Path) -> Result<std::path::PathBuf, LoadFailure> {
-    let expanded = expand_tilde_head(entry)?;
-    let path = Path::new(&expanded);
+/// `Rigor::ConfigPath.absolute(entry, base_dir)` (reference v0.4.8
+/// `config_path.rb`): a `~`/`~/` head substitutes `Dir.home`, every other
+/// spelling — a `~name` head INCLUDED — is `File.absolute_path`'s literal
+/// read (`~drafts/x` names a directory `~drafts`; it is NOT user `drafts`'
+/// home, upstream #1510 / `d1779f95f` — `File.expand_path`'s
+/// `user name doesn't exist` `ArgumentError` is unreachable here).
+/// `Dir.home`'s own `ArgumentError` (no HOME and no passwd answer) rescues
+/// to the literal spelling, so this never fails. `.`/`..` then fold
+/// LEXICALLY against `base` (no symlink resolution — the `lnk/../sig` case
+/// lands on the lexical parent, upstream-verified). `base` is already
+/// absolute (the expanded config's directory).
+fn expand_config_entry(entry: &str, base: &Path) -> std::path::PathBuf {
+    let text = substitute_home(entry);
+    let path = Path::new(&text);
     let joined = if path.is_absolute() {
         path.to_path_buf()
     } else {
         base.join(path)
     };
-    Ok(crate::conformance_gate::expand_path(&joined))
+    crate::conformance_gate::expand_path(&joined)
 }
 
-/// `File.expand_path`'s `~` handling at the head of `raw` only: `~` / `~/…`
-/// names the current user's home (`ENV["HOME"]`, falling back to the
-/// password database like `Dir.home`); `~user/…` names that user's home —
-/// an unknown user is upstream's `ArgumentError` (uncaught → exit 1). A `~`
-/// with no resolvable home stays literal — the path then names nothing on
-/// disk, the safe direction.
-fn expand_tilde_head(raw: &str) -> Result<String, LoadFailure> {
-    let Some(rest) = raw.strip_prefix('~') else {
-        return Ok(raw.to_string());
-    };
-    let (user, tail) = match rest.split_once('/') {
-        Some((u, t)) => (u.to_string(), format!("/{t}")),
-        None => (rest.to_string(), String::new()),
-    };
-    let home = if user.is_empty() {
-        home_dir()
-    } else {
-        passwd_home(&user)
-    };
-    match home {
-        Some(h) => Ok(format!("{}{tail}", h.trim_end_matches('/'))),
-        None if user.is_empty() => Ok(raw.to_string()),
-        None => Err(LoadFailure {
-            message: format!("user {user} doesn't exist"),
-            code: 1,
-        }),
+/// `ConfigPath.absolute`'s `text.sub(HOME_PREFIX, Dir.home)`: only the two
+/// spellings the `\A~(?=/|\z)` anchor admits — a bare `~` and `~/…` —
+/// substitute; the `~` is replaced and the `/` (or end) that anchored the
+/// match stays, exactly `sub`'s regex semantics. `~name` and `~`-free
+/// spellings return verbatim. A `Dir.home` `None` is the rescued
+/// `ArgumentError`: the spelling comes back literal.
+fn substitute_home(text: &str) -> String {
+    if text != "~" && !text.starts_with("~/") {
+        return text.to_string();
+    }
+    match dir_home() {
+        Some(home) => format!("{home}{}", &text[1..]),
+        None => text.to_string(),
     }
 }
 
-/// `Dir.home` — `ENV["HOME"]`, else the current uid's passwd entry.
-fn home_dir() -> Option<String> {
-    std::env::var("HOME")
-        .ok()
-        .filter(|h| !h.is_empty())
-        .or_else(current_user_home)
+/// `Dir.home` — MRI's `rb_default_home_dir`: `ENV["HOME"]` verbatim, empty
+/// and relative values INCLUDED (a `File.expand_path`-style
+/// "non-absolute home" check is not `Dir.home`'s — `ConfigPath`
+/// substitutes whatever it returns). HOME-less it asks
+/// `getpwnam(getlogin())` FIRST — POSIX allows several login names, each
+/// with its own passwd home, on one uid — then `getpwuid(getuid())` for a
+/// process with no login(1) ancestor. `None` where MRI raises
+/// `ArgumentError` ("couldn't find home for uid"); the `ConfigPath` caller
+/// rescues it into the literal spelling. The NSS chain — not an
+/// `/etc/passwd` scan — is what makes a macOS OpenDirectory-only account
+/// resolve here exactly as the reference's does (#346).
+fn dir_home() -> Option<String> {
+    if let Some(home) = std::env::var_os("HOME") {
+        return Some(home.to_string_lossy().into_owned());
+    }
+    login_home().or_else(current_uid_home)
 }
 
-/// `/etc/passwd` lookup by login name (`getpwnam` equivalent enough for a
-/// `~user` expansion — the reference's own resolution is the OS's).
-fn passwd_home(user: &str) -> Option<String> {
-    passwd_entry(|fields| fields.first() == Some(&user))
+/// `rb_getpwdirnam_for_login(rb_getlogin())`: the login(1)-recorded name's
+/// passwd home — `getlogin()` NULL (no login ancestor) or a `getpwnam` miss
+/// both decline to the `getpwuid` fallback, as MRI's chain does.
+#[cfg(unix)]
+fn login_home() -> Option<String> {
+    let login = unsafe { libc::getlogin() };
+    if login.is_null() {
+        return None;
+    }
+    passwd_home_of(unsafe { std::ffi::CStr::from_ptr(login) })
 }
 
-/// The current user's home from `/etc/passwd`, keyed by `id -u` (no libc dep
-/// here); `None` when it cannot be told (the `~` then stays literal).
-fn current_user_home() -> Option<String> {
-    let uid = std::process::Command::new("id")
-        .arg("-u")
-        .output()
-        .ok()
-        .filter(|o| o.status.success())
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())?;
-    passwd_entry(|fields| fields.get(2) == Some(&uid.as_str()))
+/// `rb_getpwdiruid()`: `getpwuid(getuid())`'s home — MRI's fallback for a
+/// process the login database does not name.
+#[cfg(unix)]
+fn current_uid_home() -> Option<String> {
+    passwd_entry_with(|pwd, buf, cap, out| unsafe {
+        libc::getpwuid_r(libc::getuid(), pwd, buf, cap, out)
+    })
 }
 
-/// Scan `/etc/passwd` for the first record `pred` accepts, returning its
-/// home-directory field.
-fn passwd_entry(pred: impl Fn(&[&str]) -> bool) -> Option<String> {
-    let text = std::fs::read_to_string("/etc/passwd").ok()?;
-    for line in text.lines() {
-        let fields: Vec<&str> = line.split(':').collect();
-        if fields.len() >= 6 && pred(&fields) {
-            return Some(fields[5].to_string());
+/// `getpwnam_r(name)`: `name`'s passwd home — the reentrant form, so a
+/// config load racing another thread's NSS use cannot tear a `getpwnam`
+/// static buffer.
+#[cfg(unix)]
+fn passwd_home_of(name: &std::ffi::CStr) -> Option<String> {
+    passwd_entry_with(|pwd, buf, cap, out| unsafe {
+        libc::getpwnam_r(name.as_ptr(), pwd, buf, cap, out)
+    })
+}
+
+/// One `getpw*_r` lookup: a `sysconf(_SC_GETPW_R_SIZE_MAX)`-sized buffer
+/// (1 KiB where sysconf cannot say), grown on `ERANGE`; the `pw_dir` of the
+/// first entry `f` fills, `None` on a miss or a lookup error.
+#[cfg(unix)]
+fn passwd_entry_with(
+    f: impl Fn(*mut libc::passwd, *mut libc::c_char, usize, *mut *mut libc::passwd) -> libc::c_int,
+) -> Option<String> {
+    let mut cap = unsafe { libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX) };
+    if cap <= 0 {
+        cap = 1024;
+    }
+    let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
+    for _ in 0..4 {
+        let mut buf = vec![0u8; cap as usize];
+        let mut out: *mut libc::passwd = std::ptr::null_mut();
+        let rc = f(
+            &mut pwd,
+            buf.as_mut_ptr().cast::<libc::c_char>(),
+            buf.len(),
+            &mut out,
+        );
+        if !out.is_null() {
+            let dir = unsafe { std::ffi::CStr::from_ptr(pwd.pw_dir) };
+            return Some(dir.to_string_lossy().into_owned());
         }
+        if rc != libc::ERANGE {
+            return None;
+        }
+        cap = cap.saturating_mul(4);
     }
+    None
+}
+
+/// Non-unix `Dir.home` has no passwd chain; the env-only answer above plus
+/// `None` here keeps `~` literal, the pre-change fallback on those targets.
+#[cfg(not(unix))]
+fn login_home() -> Option<String> {
+    None
+}
+
+/// See [`login_home`].
+#[cfg(not(unix))]
+fn current_uid_home() -> Option<String> {
     None
 }
 
@@ -4694,16 +4738,18 @@ mod severity_config_tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// `~` expands at the head of a path entry (`File.expand_path`), `~user`
-    /// names that user's home, and an unknown `~user` is the uncaught
-    /// `ArgumentError` upstream — a fatal load (exit 1), not a silent miss.
+    /// `~`/`~/` expand at the head of a path entry (`ConfigPath.absolute`'s
+    /// `Dir.home` substitution); every `~name` — even a user that EXISTS —
+    /// stays a literal directory name (`File.absolute_path`, upstream
+    /// `d1779f95f`), never an error, so the `user name doesn't exist`
+    /// `ArgumentError` is unreachable through config paths.
     #[test]
     fn tilde_expands_at_the_head() {
         let dir = cfg_dir("tilde");
-        let home = home_dir().expect("HOME must resolve for this test");
+        let home = dir_home().expect("HOME must resolve for this test");
         std::fs::write(
             dir.join(".rigor.yml"),
-            "paths: [~/proj, ~/../proj2, literal/~x]\n",
+            "paths: [~/proj, ~/../proj2, literal/~x, ~nonexistent_user_158/x]\n",
         )
         .unwrap();
         let cfg = parsed(&dir.join(".rigor.yml"));
@@ -4716,16 +4762,24 @@ mod severity_config_tests {
         assert_eq!(cfg.paths[1], format!("{home_parent}/proj2"));
         // `~` NOT at the head stays literal and resolves like any relative path.
         assert_eq!(cfg.paths[2], dir.join("literal/~x").display().to_string());
-
-        std::fs::write(dir.join("bad.yml"), "paths: [~nonexistent_user_158/x]\n").unwrap();
-        match Config::read(&dir.join("bad.yml")) {
-            ConfigRead::Fatal(f) => {
-                assert_eq!(f.code, 1);
-                assert!(f.message.contains("doesn't exist"), "{}", f.message);
-            }
-            _ => panic!("~nouser must die like the reference"),
-        }
+        // A `~name` head is literal too — joined under the config's directory,
+        // never probed in the passwd database, never an error.
+        assert_eq!(
+            cfg.paths[3],
+            dir.join("~nonexistent_user_158/x").display().to_string()
+        );
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `getpwuid(getuid())` — the `Dir.home` fallback MRI reaches past
+    /// `getlogin()` — resolves the current uid to a non-empty home path.
+    /// This is the lookup the `/etc/passwd` scan missed for
+    /// OpenDirectory-only accounts (#346).
+    #[cfg(unix)]
+    #[test]
+    fn current_uid_home_resolves() {
+        let home = current_uid_home().expect("getpwuid_r must answer for the current uid");
+        assert!(!home.is_empty());
     }
 
     /// `includes:` merge order (included first, current overrides), each file
