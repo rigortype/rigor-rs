@@ -929,7 +929,6 @@ fn certain_singleton_defs(
     ast: &LoweredAst,
     body: &[NodeId],
     in_sc: bool,
-    owner: &str,
     written: &[String],
     out: &mut HashSet<NodeId>,
 ) {
@@ -937,7 +936,7 @@ fn certain_singleton_defs(
         match ast.get(child) {
             Node::Definition { is_singleton_class: true, singleton_operand, body: inner, .. } => {
                 if !in_sc && singleton_operand.is_some_and(|op| matches!(ast.get(op), Node::SelfExpr { .. })) {
-                    certain_singleton_defs(ast, inner, true, owner, written, out);
+                    certain_singleton_defs(ast, inner, true, written, out);
                 }
             }
             Node::Definition { name: Some(_), .. } if in_sc => {
@@ -972,7 +971,7 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
     let class_span = class_node.span();
     let mut certain: HashSet<NodeId> = HashSet::new();
     if let Node::ClassDef { body, .. } | Node::ModuleDef { body, .. } = class_node {
-        certain_singleton_defs(ast, body, false, owner, written, &mut certain);
+        certain_singleton_defs(ast, body, false, written, &mut certain);
     }
     let self_or_none =
         |r: &Option<NodeId>| r.is_none_or(|r| matches!(ast.get(r), Node::SelfExpr { .. }));
@@ -1024,11 +1023,6 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
             self_eval_blocks.push((*b, is_instance));
         }
     }
-    let self_eval_within = |span: Span, instance: bool| {
-        self_eval_blocks
-            .iter()
-            .any(|(b, i)| *i == instance && within(span, *b))
-    };
     let mut events: Vec<SingletonEvent> = Vec::new();
     // Bare `module_function` toggles of this body, and the receiverless
     // instance `def`s of this body (each a copy candidate).
@@ -1053,6 +1047,20 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
             None => false,
             Some((_, _, true)) => true,
             Some(_) => continue,
+        };
+        // The innermost self-eval block holding `n` — eval blocks nest
+        // between `Definition` scopes, so which context governs a def or a
+        // call depends on the INNERMOST of the two: a `class <<` inside a
+        // self-eval is `in_singleton_class` territory (it outranks the
+        // eval's `call_singleton`), while an eval nested INSIDE a
+        // `class <<` rebinds the defs its body reaches.
+        let inner_self_eval = self_eval_blocks
+            .iter()
+            .filter(|(b, _)| within(span, *b))
+            .min_by_key(|(b, _)| b.1 - b.0);
+        let sclass_innermost = match scope {
+            Some((_, ss, true)) => inner_self_eval.is_none_or(|(eb, _)| within(*ss, *eb)),
+            _ => false,
         };
         // A certain site wins the slot back; any other write of the name
         // contests it.
@@ -1093,23 +1101,35 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
             // another class's singleton stays
             // [`foreign_singleton_events`]' domain.
             Node::Definition { receiver_def_name: Some(m), def_receiver_path, .. } => {
-                if in_singleton_self_eval(span) {
-                    // `class <<` interior under `instance_eval` — nothing names it.
-                } else if self_eval_within(span, true) {
-                    events.push((span.0, Err(Some(vec![m.clone()]))));
-                } else if self_eval_within(span, false) {
-                    if def_receiver_path
+                if sclass_innermost {
+                    // `class <<` governs — inside it ANY receiver files
+                    // the owner's slot (`in_singleton_class` is
+                    // unconditional — `def W.x`, `def obj.x`).
+                    events.push(write(m));
+                } else if let Some((_, instance)) = inner_self_eval {
+                    if *instance {
+                        // `instance_*` eval — `defs_singleton` binds every
+                        // def, except under a `class <<` interior where
+                        // it binds the singleton's own singleton
+                        // (`:unnameable`, skipped).
+                        if !in_singleton_self_eval(span) {
+                            events.push((span.0, Err(Some(vec![m.clone()]))));
+                        }
+                    } else if def_receiver_path
                         .as_ref()
                         .is_some_and(|p| receiver_path_is_owner(p, owner))
                     {
                         events.push((span.0, Err(Some(vec![m.clone()]))));
                     }
-                } else if in_sc {
-                    events.push(write(m));
                 } else if def_receiver_path
                     .as_ref()
                     .is_some_and(|p| receiver_path_targets_written(p, written))
                 {
+                    // A direct-body `def <recv>.x` must name the class by
+                    // the WRITTEN-name chain
+                    // (`def_receiver_targets_lexical_self?`). A def that
+                    // names another class's singleton stays
+                    // [`foreign_singleton_events`]' domain.
                     events.push(write(m));
                 }
             }
@@ -1118,17 +1138,16 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
                 // self-eval (unless it is the `:unnameable` shape) and under
                 // `class <<`; under `class_eval` it is an ordinary instance
                 // def of the eval's owner — no singleton write at all.
-                if self_eval_within(span, true) {
+                if sclass_innermost {
+                    events.push(write(m));
+                } else if let Some((_, true)) = inner_self_eval {
                     if !in_singleton_self_eval(span) {
                         events.push((span.0, Err(Some(vec![m.clone()]))));
                     }
-                } else if self_eval_within(span, false) {
-                    // `class_eval` interior — instance-side.
-                } else if in_sc {
-                    events.push(write(m));
-                } else {
+                } else if inner_self_eval.is_none() {
                     instance_defs.push((span.0, m.clone()));
                 }
+                // `class_eval` interior — instance-side, no event.
             }
             Node::Alias { new_name, .. } if in_sc => {
                 events.push((span.0, Err(literal_name(ast, *new_name).map(|m| vec![m]))));
@@ -1151,11 +1170,17 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
                     matches!(ast.get(r), Node::Call { method, receiver: rr, .. }
                         if method == "singleton_class" && self_or_none(rr))
                 });
-                let names = if on_singleton_class && !in_sc {
+                // `singleton_call_target` — `singleton_class.X` and a bare
+                // `define_singleton_method` need `!in_singleton_class`
+                // (inside `class <<` they are instance-of-singleton-side),
+                // while inside `class <<` every bare/`self.` naming call
+                // supersedes. `sclass_innermost` applies the same nesting
+                // rule as the def arms.
+                let names = if on_singleton_class && !sclass_innermost {
                     singleton_naming(ast, method, args)
-                } else if self_or_none(receiver) && method == "define_singleton_method" && !in_sc {
+                } else if self_or_none(receiver) && method == "define_singleton_method" && !sclass_innermost {
                     Some(all_literal_names(ast, &args[..args.len().min(1)]))
-                } else if self_or_none(receiver) && in_sc {
+                } else if self_or_none(receiver) && sclass_innermost {
                     singleton_naming(ast, method, args)
                 } else {
                     None
@@ -1222,25 +1247,118 @@ fn foreign_singleton_events(ast: &LoweredAst) -> Vec<(String, SingletonEvent)> {
     // (receiver path, block span, `instance_*`?)
     let mut eval_blocks: Vec<(String, Span, bool)> = Vec::new();
     let mut out: Vec<(String, SingletonEvent)> = Vec::new();
+    // `class <<` spans, used before `sclasses` below to keep
+    // `Const.singleton_class.X` quiet inside them: the reference's first
+    // `singleton_call_target` arm is gated on `!in_singleton_class`.
+    let sclass_all: Vec<Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { is_singleton_class: true, .. } => Some(n.span()),
+            _ => None,
+        })
+        .collect();
     for (_, n) in ast.iter() {
-        match n {
-            Node::Call { receiver, method, args, block_span, span, .. } => {
-                if let (Some(path), Some(b)) = (const_path(*receiver), block_span) {
-                    if INSTANCE_EVALS.contains(&method.as_str()) {
-                        eval_blocks.push((path, *b, true));
-                    } else if CLASS_EVALS.contains(&method.as_str()) {
-                        eval_blocks.push((path, *b, false));
-                    }
+        let Node::Call { receiver, method, args, block_span, span, .. } = n else {
+            continue;
+        };
+        if let (Some(path), Some(b)) = (const_path(*receiver), block_span) {
+            if INSTANCE_EVALS.contains(&method.as_str()) {
+                eval_blocks.push((path, *b, true));
+            } else if CLASS_EVALS.contains(&method.as_str()) {
+                eval_blocks.push((path, *b, false));
+            }
+        }
+        let sc_path = receiver.and_then(|r| match ast.get(r) {
+            Node::Call { method, receiver: rr, .. } if method == "singleton_class" => const_path(*rr),
+            _ => None,
+        });
+        if let Some(path) = sc_path {
+            if !sclass_all.iter().any(|s| within(*span, *s)) {
+                if let Some(names) = singleton_naming(ast, method, args) {
+                    out.push((path, (span.0, Err(names))));
                 }
-                let sc_path = receiver.and_then(|r| match ast.get(r) {
-                    Node::Call { method, receiver: rr, .. } if method == "singleton_class" => const_path(*rr),
+            }
+        }
+    }
+    // `class <<` interiors OUTSIDE a class body's own scan — at top level,
+    // inside a `class << Const`, inside a `def`, inside an eval block —
+    // still read `in_singleton_class` writers on the reference
+    // (`walk_singleton_body`): a bare/`self.` naming call (`alias_method`,
+    // `define_method`, `attr_*`, the eval/`send` family — never
+    // `define_singleton_method`, which the naming list does not reach) and
+    // the `alias` keyword supersede the `class <<` TARGET's slots. `self`
+    // names the innermost enclosing eval receiver (`class << self` inside
+    // `V.instance_eval` opens V's singleton); `class << self` inside a
+    // class body is already covered by `singleton_events`' in_sc arm, and
+    // `class << self` inside another `class <<` names the singleton's own
+    // singleton — `:unnameable`, skipped.
+    let sclasses: Vec<(NodeId, Span, Option<String>)> = ast
+        .iter()
+        .filter_map(|(id, n)| match n {
+            Node::Definition { is_singleton_class: true, singleton_operand, .. } => {
+                let owner = match singleton_operand.map(|op| ast.get(op)) {
+                    Some(Node::ConstantRead { name, .. }) if !name.is_empty() => {
+                        Some(name.strip_prefix("::").unwrap_or(name).to_string())
+                    }
+                    Some(Node::SelfExpr { .. }) => eval_blocks
+                        .iter()
+                        .filter(|(_, b, _)| within(n.span(), *b))
+                        .min_by_key(|(_, b, _)| b.1 - b.0)
+                        .map(|(p, _, _)| p.clone()),
                     _ => None,
-                });
-                if let Some(path) = sc_path {
+                };
+                Some((id, n.span(), owner))
+            }
+            _ => None,
+        })
+        .collect();
+    let defs: Vec<Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { is_singleton_class: false, .. } => Some(n.span()),
+            _ => None,
+        })
+        .collect();
+    for (_, n) in ast.iter() {
+        let span = n.span();
+        if matches!(n, Node::Definition { .. }) {
+            continue;
+        }
+        // Exclude nodes inside a `def` body — def interiors are never
+        // reached by the reference's singleton walk.
+        if defs.iter().any(|d| within(span, *d) && *d != span) {
+            continue;
+        }
+        // Its innermost `class <<` — a deeper one owns the interior.
+        let Some((_, sc_span, owner)) = sclasses
+            .iter()
+            .filter(|(_, s, _)| within(span, *s) && *s != span)
+            .min_by_key(|(_, s, _)| s.1 - s.0)
+        else {
+            continue;
+        };
+        // An eval block nested inside that `class <<` governs its own
+        // interior; a `class <<` inside an eval is still `class <<`
+        // territory (`in_singleton_class` outranks `call_singleton`).
+        if eval_blocks
+            .iter()
+            .any(|(_, b, _)| within(span, *b) && within(*b, *sc_span))
+        {
+            continue;
+        }
+        let Some(owner) = owner.clone() else {
+            continue;
+        };
+        match n {
+            Node::Call { receiver, method, args, .. } => {
+                if self_or_none(receiver) {
                     if let Some(names) = singleton_naming(ast, method, args) {
-                        out.push((path, (span.0, Err(names))));
+                        out.push((owner, (span.0, Err(names))));
                     }
                 }
+            }
+            Node::Alias { new_name, .. } => {
+                out.push((owner, (span.0, Err(literal_name(ast, *new_name).map(|m| vec![m])))));
             }
             _ => {}
         }
@@ -1248,13 +1366,6 @@ fn foreign_singleton_events(ast: &LoweredAst) -> Vec<(String, SingletonEvent)> {
     if eval_blocks.is_empty() {
         return out;
     }
-    let sclasses: Vec<Span> = ast
-        .iter()
-        .filter_map(|(_, n)| match n {
-            Node::Definition { is_singleton_class: true, .. } => Some(n.span()),
-            _ => None,
-        })
-        .collect();
     // The eval block a node belongs to is its INNERMOST one — the reference's
     // walk threads a single def-owner prefix, so a call inside
     // `V.instance_eval { W.class_eval { … } }` contests `W`, not `V`.
@@ -1312,19 +1423,29 @@ fn foreign_singleton_events(ast: &LoweredAst) -> Vec<(String, SingletonEvent)> {
         // receiver def naming the eval's owner (`def V.x` — its last
         // segment), or a def inside a `class <<` nested in the block. A
         // bare `def x` or `def W.x` there is an ordinary instance def.
-        let binds = if *instance {
-            true
-        } else if sclasses.iter().any(|s| within(*s, *b) && within(span, *s)) {
-            true
-        } else if singleton_name.is_some() {
-            true
-        } else {
-            def_receiver_path
-                .as_ref()
-                .is_some_and(|p| receiver_path_is_owner(p, path))
+        // Inside a nested `class <<` the def files on the SCLASS's owner —
+        // `self` names the eval's receiver, `class << W` names `W`.
+        let inner_sclass = sclasses
+            .iter()
+            .filter(|(_, s, _)| within(*s, *b) && within(span, *s))
+            .min_by_key(|(_, s, _)| s.1 - s.0);
+        let target = match inner_sclass {
+            Some((_, _, owner)) => owner.clone(),
+            None => {
+                if *instance
+                    || singleton_name.is_some()
+                    || def_receiver_path
+                        .as_ref()
+                        .is_some_and(|p| receiver_path_is_owner(p, path))
+                {
+                    Some(path.clone())
+                } else {
+                    None
+                }
+            }
         };
-        if binds {
-            out.push((path.clone(), (span.0, Err(Some(vec![m.clone()])))));
+        if let Some(target) = target {
+            out.push((target, (span.0, Err(Some(vec![m.clone()])))));
         }
     }
     out

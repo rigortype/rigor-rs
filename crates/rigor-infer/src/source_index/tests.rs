@@ -1917,3 +1917,52 @@ fn class_eval_bare_and_self_receivers() {
     assert!(!idx2.is_toplevel_def(None, "tl_eval_def"));
     assert!(!idx2.is_toplevel_def(None, "tl_self_eval_def"));
 }
+
+#[test]
+fn sclass_body_naming_calls_supersede_everywhere() {
+    // Inside `class <<` the reference is `in_singleton_class` — a bare
+    // naming call and `alias` supersede the target's slot wherever the
+    // `class <<` sits: top level, nested in another class, inside an eval
+    // block (`class << self` there names the eval's receiver). #490 review.
+    let core = CoreIndex::new();
+    for src in [
+        b"module V\n  def self.x = \"s\"\nend\nclass << V\n  alias_method :x, :y\nend\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nclass << V\n  alias x y\nend\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nmodule W\n  class << V\n    attr_accessor :x\n  end\nend\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nV.instance_eval { class << self; alias_method :x, :y; end }\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nV.class_eval { class << self; alias x y; end }\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nV.class_eval { class << self; attr_reader :x; end }\n" as &[u8],
+    ] {
+        let (_a, idx) = build_one(src, &core);
+        assert_eq!(
+            idx.const_singleton_literal("V", "x"),
+            None,
+            "{}",
+            String::from_utf8_lossy(src)
+        );
+    }
+    // `class <<` inside a self-eval inside a class body still files on the
+    // class — the eval does not outrank `in_singleton_class`.
+    let (_b, idx2) = build_one(
+        b"class V\n  def self.x = \"s\"\n  class_eval do\n    class << self\n      def x = 1\n    end\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(idx2.const_singleton_literal("V", "x"), None);
+}
+
+#[test]
+fn sclass_target_def_files_on_the_sclass_owner() {
+    // A def inside `class << W` inside `V.class_eval` files W's slot, not
+    // the eval owner's; `class << obj` names nothing.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module V\n  def self.x = \"s\"\nend\nmodule W\n  def self.x = \"s\"\nend\nV.class_eval { class << W; def x = 1; end }\n",
+        &core,
+    );
+    assert_eq!(idx.const_singleton_literal("W", "x"), None);
+    // V's slot is NOT contested — the def filed on W.
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Str("s".to_string()))
+    );
+}

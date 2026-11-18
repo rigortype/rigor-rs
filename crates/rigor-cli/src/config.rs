@@ -2104,10 +2104,26 @@ fn severity_override_key_texts(text: &str) -> Vec<KeyText> {
 /// [`plain_key_to_s`] then reads the key as plain, its usual best-effort
 /// stance.
 fn severity_override_tagged_spellings(text: &str) -> HashMap<String, String> {
+    // `severity_overrides:` written plainly, quoted (`"severity_overrides":`)
+    // or as a flow document's first key (`{severity_overrides: {…}}`).
     let is_key_line = |trimmed: &str| {
-        trimmed
+        let t = trimmed
+            .strip_prefix('{')
+            .map(str::trim_start)
+            .unwrap_or(trimmed);
+        let name = t
             .strip_prefix("severity_overrides")
-            .is_some_and(|rest| rest.trim_start().starts_with(':'))
+            .or_else(|| {
+                t.strip_prefix('"')
+                    .and_then(|r| r.strip_prefix("severity_overrides"))
+                    .and_then(|r| r.strip_prefix('"'))
+            })
+            .or_else(|| {
+                t.strip_prefix('\'')
+                    .and_then(|r| r.strip_prefix("severity_overrides"))
+                    .and_then(|r| r.strip_prefix('\''))
+            });
+        name.is_some_and(|rest| rest.trim_start().starts_with(':'))
     };
     // The smallest indent any `severity_overrides:` candidate carries — a
     // nested use can only sit deeper, so it is never a candidate.
@@ -2187,19 +2203,49 @@ fn severity_override_tagged_spellings(text: &str) -> HashMap<String, String> {
         let line = &line[..scan_end];
         let bytes = line.as_bytes();
         let mut i = 0;
-        while let Some(off) = line[i..].find("!!") {
+        while let Some(off) = line[i..].find('!') {
             let at = i + off;
-            i = at + 2;
-            let name_end = bytes[i..]
-                .iter()
-                .position(|b| !b.is_ascii_alphanumeric() && *b != b'_')
-                .map(|p| i + p)
-                .unwrap_or(line.len());
-            if name_end == i {
+            i = at + 1;
+            // A tag starts a token — `it!s` or `a!=b` inside a key is not
+            // one.
+            if at > 0 && !matches!(bytes[at - 1], b' ' | b'\t' | b'{' | b'[' | b',' | b':') {
                 continue;
             }
-            let tag = line[i..name_end].to_string();
-            i = name_end;
+            // `!!name`, `!name` and `!<tag:…>` all reach Psych's `deserialize`
+            // tag arms the same way — a `!float` local tag resolves like
+            // `!!float`, and a verbatim tag resolves on its last segment.
+            let tag = if bytes.get(i) == Some(&b'!') {
+                i += 1;
+                let end = bytes[i..]
+                    .iter()
+                    .position(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                    .map(|p| i + p)
+                    .unwrap_or(line.len());
+                let t = line[i..end].to_string();
+                i = end;
+                t
+            } else if bytes.get(i) == Some(&b'<') {
+                let Some(gt) = line[i..].find('>').map(|p| i + p) else {
+                    break;
+                };
+                let inner = &line[i + 1..gt];
+                i = gt + 1;
+                inner.rsplit(':').next().unwrap_or(inner).to_string()
+            } else if bytes.get(i).is_some_and(|b| b.is_ascii_alphabetic() || *b == b'_') {
+                let end = bytes[i..]
+                    .iter()
+                    .position(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                    .map(|p| i + p)
+                    .unwrap_or(line.len());
+                let t = line[i..end].to_string();
+                i = end;
+                t
+            } else {
+                continue;
+            };
+            if tag.is_empty() {
+                continue;
+            }
             while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
                 i += 1;
             }
@@ -2354,38 +2400,42 @@ fn loaded_scalar_to_s(key: &serde_yaml::Value) -> Option<String> {
 }
 
 /// `k.to_s` for a `severity_overrides:` key that WAS tagged (`!!float 1e3`):
-/// Psych resolves the scalar under the tag, so the name is the tagged
-/// value's `to_s`, not the plain-scanner's (which keeps `1e3` a String). An
-/// unhandled tag declines the key's text rather than guess (issue #490).
+/// Psych's `ToRuby#deserialize` is narrow — `str` reads the value, `float`
+/// does `Float(tokenize(v))` — and EVERY OTHER tag (`int`, `bool`, `null`,
+/// unknown, verbatim) falls through to `tokenize`: the scalar resolves as
+/// its PLAIN text (`!!int 0o17` → `"0o17"`, `!!bool 0x10` → `"16"`,
+/// `!!null x` → `"x"`, `!!float 0x10` → `"16.0"`). Issue #490.
 fn psych_key_to_s(t: &str, tag: Option<&str>) -> Option<String> {
-    let Some(tag) = tag else {
-        return psych_plain_to_s(t);
-    };
-    Some(match tag {
-        // `!!str` keeps the scalar a String; `!!null` is `nil`.
-        "str" => t.to_string(),
-        "null" => String::new(),
-        // `!!bool`/`!!int` parse under Psych's scalar scanner or stay the
-        // written String (`!!int 0o17` loads as `"0o17"`).
-        "bool" => match t.to_ascii_lowercase().as_str() {
-            "true" | "yes" | "on" => "true".to_string(),
-            "false" | "no" | "off" => "false".to_string(),
-            _ => t.to_string(),
-        },
-        "int" => match psych_int(t) {
-            Some(v) => v.to_string(),
-            None => t.to_string(),
-        },
-        // `!!float` has no `\.` requirement — `Float("1e3")` parses.
-        "float" => {
-            let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
-            match cleaned.parse::<f64>() {
-                Ok(f) => rigor_types::ruby_float_to_s(f),
-                Err(_) => t.to_string(),
-            }
-        }
-        _ => return None,
-    })
+    match tag {
+        Some("str") => Some(t.to_string()),
+        Some("float") => Some(psych_float_to_s(t)),
+        Some(_) | None => psych_plain_to_s(t),
+    }
+}
+
+/// `Float(tokenize(v))` — the reference's `deserialize` `float` arm:
+/// `tokenize` resolves `0x10`/`017`/`.inf` first, then the result goes
+/// through `Float(...)`, whose `to_s` spells `16.0`, `15.0`, `Infinity`.
+fn psych_float_to_s(t: &str) -> String {
+    let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
+    if cleaned.eq_ignore_ascii_case(".inf") {
+        return "Infinity".to_string();
+    }
+    if cleaned.eq_ignore_ascii_case("-.inf") {
+        return "-Infinity".to_string();
+    }
+    if cleaned.eq_ignore_ascii_case(".nan") {
+        return "NaN".to_string();
+    }
+    if let Some(i) = psych_int(&cleaned) {
+        return rigor_types::ruby_float_to_s(i as f64);
+    }
+    match cleaned.parse::<f64>() {
+        Ok(f) => rigor_types::ruby_float_to_s(f),
+        // `Float("garbage")` raises on the reference — the load fails before
+        // any audit; name by text.
+        Err(_) => t.to_string(),
+    }
 }
 
 /// `Psych::ScalarScanner#tokenize(text).to_s` for a PLAIN scalar (Ruby
