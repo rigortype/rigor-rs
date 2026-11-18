@@ -707,6 +707,171 @@ fn recursive_method_declines_fold() {
     assert_eq!(idx.const_singleton_literal("M", "loopy"), None);
 }
 
+// --- issue #490: the eval-block singleton-slot writers -------------------
+
+#[test]
+fn eval_block_define_singleton_method_supersedes() {
+    // `V.instance_eval { define_singleton_method(:x) {} }` contests `V.x` —
+    // the reference's `supersede` (`singleton_call_target`'s receiverless
+    // arm reads `define_singleton_method` even outside `class <<`).
+    let core = CoreIndex::new();
+    for eval in ["instance_eval", "class_eval"] {
+        let (_a, idx) = build_one(
+            format!("module V\n  def self.x = \"s\"\nend\nV.{eval} {{ define_singleton_method(:x) {{ 1 }} }}\n")
+                .as_bytes(),
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("V", "x"), None, "{eval}");
+    }
+}
+
+#[test]
+fn eval_block_singleton_class_call_supersedes() {
+    // `V.{instance,class}_eval { singleton_class.alias_method :x, :y }`
+    // names the slot through the bare `singleton_class` receiver, whose self
+    // inside the block is `V`.
+    let core = CoreIndex::new();
+    for eval in ["instance_eval", "class_eval"] {
+        let (_a, idx) = build_one(
+            format!("module V\n  def self.x = \"s\"\nend\nV.{eval} {{ singleton_class.alias_method :x, :y }}\n")
+                .as_bytes(),
+            &core,
+        );
+        assert_eq!(idx.const_singleton_literal("V", "x"), None, "{eval}");
+    }
+}
+
+#[test]
+fn foreign_eval_block_leaves_the_slot() {
+    // `W.instance_eval` inside `module V` contests `W.x`, not `V.x`: the
+    // eval's block rebinds self to the receiver.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module V\n  def self.x = \"s\"\n  W.instance_eval { define_singleton_method(:x) { 1 } }\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Str("s".to_string()))
+    );
+}
+
+#[test]
+fn sclass_self_def_writes_the_owner_slot() {
+    // `class << self; def self.x` files on the OWNER's singleton on the
+    // reference (`def_singleton?` reads only the SelfNode receiver), so an
+    // agreeing `class <<` def keeps the fold and a disagreeing one declines.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module V\n  def self.x = \"s\"\n  class << self\n    def self.x = \"s\"\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Str("s".to_string()))
+    );
+    let (_a, idx) = build_one(
+        b"module V\n  def self.x = \"s\"\n  class << self\n    def self.x = 1\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(idx.const_singleton_literal("V", "x"), None);
+}
+
+#[test]
+fn own_receiver_def_files_on_the_singleton() {
+    // `def V.x` inside `module V` is `def_receiver_targets_lexical_self?`'s
+    // match: the reference writes `V.x` from it like `def self.x`.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(b"module V\n  def V.x = 1\nend\n", &core);
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Int(1))
+    );
+    // `def V.x` inside `class << self` writes the same slot.
+    let (_a, idx) = build_one(
+        b"module V\n  class << self\n    def V.x = 1\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Int(1))
+    );
+}
+
+#[test]
+fn compound_declaration_keeps_def_receiver_lexical() {
+    // #490 review finding 1 — `def_receiver_targets_lexical_self?` compares
+    // the receiver against the innermost declaration's WRITTEN name:
+    // `def V.x` inside `module A::V` names nothing (the written name is
+    // `"A::V"`, not `"V"`), so the def is an instance def of A::V and `V.x`
+    // stays uncontested.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module V\n  def self.x = \"s\"\nend\nmodule A::V\n  def V.x = 1\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Str("s".to_string()))
+    );
+    // And A::V's singleton holds no `x` either — the reference files the
+    // def instance-side.
+    assert_eq!(idx.const_singleton_literal("A::V", "x"), None);
+    // The same receiver inside a `class <<` body DOES write the slot —
+    // `in_singleton_class` makes `def_singleton?` unconditional.
+    let (_a, idx) = build_one(
+        b"module A::V\n  class << self\n    def V.x = 1\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.const_singleton_literal("A::V", "x"),
+        Some(Scalar::Int(1))
+    );
+}
+
+#[test]
+fn sclass_receiver_def_files_any_receiver() {
+    // #490 review — inside `class <<`, the reference's `in_singleton_class`
+    // short-circuits `def_singleton?`: `def W.x` and even `def obj.x` file
+    // on the body's owner, so an earlier `def self.x` is contested.
+    let core = CoreIndex::new();
+    for src in [
+        b"module V\n  def self.x = \"s\"\n  class << self\n    def W.x = 1\n  end\nend\n".as_slice(),
+        b"module V\n  def self.x = \"s\"\n  class << self\n    def obj.x = 1\n  end\nend\n".as_slice(),
+    ] {
+        let (_a, idx) = build_one(src, &core);
+        assert_eq!(idx.const_singleton_literal("V", "x"), None, "{src:?}");
+    }
+    // The slot it writes folds like any other singleton site.
+    let (_a, idx) = build_one(
+        b"module V\n  class << self\n    def W.x = 1\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Int(1))
+    );
+}
+
+#[test]
+fn foreign_context_defs_leave_the_slot() {
+    // `def V.x` writes `V`'s singleton only where the reference files it —
+    // not at top level, not inside a `def`, not inside a different class.
+    let core = CoreIndex::new();
+    for src in [
+        b"module V\n  def self.x = \"s\"\nend\ndef V.x = 1\n".as_slice(),
+        b"module V\n  def self.x = \"s\"\nend\ndef m\n  def V.x = 1\nend\n".as_slice(),
+        b"module V\n  def self.x = \"s\"\nend\nmodule W\n  def V.x = 1\nend\n".as_slice(),
+    ] {
+        let (_a, idx) = build_one(src, &core);
+        assert_eq!(
+            idx.const_singleton_literal("V", "x"),
+            Some(Scalar::Str("s".to_string())),
+            "{src:?}"
+        );
+    }
+}
+
 #[test]
 fn raise_guarded_tail_folds() {
     // A raise-guarded earlier statement leaves the tail literal foldable.
@@ -1751,4 +1916,53 @@ fn class_eval_bare_and_self_receivers() {
     );
     assert!(!idx2.is_toplevel_def(None, "tl_eval_def"));
     assert!(!idx2.is_toplevel_def(None, "tl_self_eval_def"));
+}
+
+#[test]
+fn sclass_body_naming_calls_supersede_everywhere() {
+    // Inside `class <<` the reference is `in_singleton_class` — a bare
+    // naming call and `alias` supersede the target's slot wherever the
+    // `class <<` sits: top level, nested in another class, inside an eval
+    // block (`class << self` there names the eval's receiver). #490 review.
+    let core = CoreIndex::new();
+    for src in [
+        b"module V\n  def self.x = \"s\"\nend\nclass << V\n  alias_method :x, :y\nend\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nclass << V\n  alias x y\nend\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nmodule W\n  class << V\n    attr_accessor :x\n  end\nend\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nV.instance_eval { class << self; alias_method :x, :y; end }\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nV.class_eval { class << self; alias x y; end }\n" as &[u8],
+        b"module V\n  def self.x = \"s\"\nend\nV.class_eval { class << self; attr_reader :x; end }\n" as &[u8],
+    ] {
+        let (_a, idx) = build_one(src, &core);
+        assert_eq!(
+            idx.const_singleton_literal("V", "x"),
+            None,
+            "{}",
+            String::from_utf8_lossy(src)
+        );
+    }
+    // `class <<` inside a self-eval inside a class body still files on the
+    // class — the eval does not outrank `in_singleton_class`.
+    let (_b, idx2) = build_one(
+        b"class V\n  def self.x = \"s\"\n  class_eval do\n    class << self\n      def x = 1\n    end\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(idx2.const_singleton_literal("V", "x"), None);
+}
+
+#[test]
+fn sclass_target_def_files_on_the_sclass_owner() {
+    // A def inside `class << W` inside `V.class_eval` files W's slot, not
+    // the eval owner's; `class << obj` names nothing.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module V\n  def self.x = \"s\"\nend\nmodule W\n  def self.x = \"s\"\nend\nV.class_eval { class << W; def x = 1; end }\n",
+        &core,
+    );
+    assert_eq!(idx.const_singleton_literal("W", "x"), None);
+    // V's slot is NOT contested — the def filed on W.
+    assert_eq!(
+        idx.const_singleton_literal("V", "x"),
+        Some(Scalar::Str("s".to_string()))
+    );
 }
