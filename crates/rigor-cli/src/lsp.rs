@@ -3527,6 +3527,7 @@ fn to_document_symbol(s: &crate::outline::SymNode, text: &str, lines: &LineIndex
 
 /// Byte offset → LSP `Position` (0-based line, 0-based UTF-16 character). The
 /// column is counted in UTF-16 code units per the LSP default position encoding.
+#[cfg(test)]
 fn offset_to_position(text: &str, offset: usize) -> Position {
     offset_to_position_at(text, &LineIndex::new(text.as_bytes()), offset)
 }

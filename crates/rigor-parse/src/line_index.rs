@@ -20,6 +20,12 @@ pub struct LineIndex {
     len: usize,
 }
 
+impl Default for LineIndex {
+    fn default() -> Self {
+        Self { starts: vec![0], len: 0 }
+    }
+}
+
 impl LineIndex {
     /// Index one source's line starts (one scan of `source`).
     #[must_use]
