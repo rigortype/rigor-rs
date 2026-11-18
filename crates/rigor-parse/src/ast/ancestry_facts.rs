@@ -990,7 +990,7 @@ struct Frame {
     /// `owner` stays `None` (its `def`s bind on the singleton). The
     /// reference's extends walk opens that block as the receiver's own body,
     /// exactly as `class_eval`, so `X.instance_eval { extend M }` files `M`
-    /// on `X`'s singleton side. Read only by [`Census::singleton_owner`].
+    /// on `X`'s singleton side. Read only by [`Census::self_owner`].
     eval_owner: Option<Vec<String>>,
 }
 
@@ -1035,10 +1035,13 @@ impl<'pr> Census<'pr> {
         self.frame().owner.clone()
     }
 
-    /// The owner a singleton-side mixin in this frame files under (the
-    /// [`AncestryFacts::singleton_mixins`] census only): [`Census::owner`],
-    /// else the `instance_eval` receiver ([`Frame::eval_owner`]).
-    fn singleton_owner(&self) -> Option<Vec<String>> {
+    /// The class this frame's `self` names: the declaration/eval owner,
+    /// else the `instance_eval` receiver ([`Frame::eval_owner`]) —
+    /// `X.instance_eval { include(*MODS) }` opens `X`'s instance side. The
+    /// reference's `current_class` carries that receiver through the same
+    /// walks; the port splits it into [`Frame::owner`] + [`Frame::eval_owner`]
+    /// and re-joins them here.
+    fn self_owner(&self) -> Option<Vec<String>> {
         let f = self.frame();
         f.owner.clone().or_else(|| f.eval_owner.clone())
     }
@@ -1231,7 +1234,7 @@ impl<'pr> Census<'pr> {
                 _ => MixinSide::Include,
             };
             if side == MixinSide::Extend {
-                if let Some(owner) = self.singleton_owner() {
+                if let Some(owner) = self.self_owner() {
                     // `self` as an argument names the owner itself.
                     // Upstream v0.4.8 `singleton_mixin_recorded?` +
                     // `record_extend_targets` (#2995): a lexical-self call in
@@ -1263,7 +1266,7 @@ impl<'pr> Census<'pr> {
                     self.out.singleton_mixins.push((owner, listed));
                 }
             }
-            let Some(owner) = self.owner() else { return };
+            let Some(owner) = self.self_owner() else { return };
             // Upstream v0.4.8 `instance_mixin_recorded?` (#2995): a
             // lexical-self call — a bare `include M`, `self.include M`, or a
             // `send` / `public_send` / `__send__` spelling — records its
@@ -1314,7 +1317,7 @@ impl<'pr> Census<'pr> {
             let sc_name = constant_string(sc.name().as_slice());
             let plain = sc.receiver().is_none_or(|r| r.as_self_node().is_some());
             if sc_name == "singleton_class" && sc.arguments().is_none() && plain {
-                if let Some(owner) = self.owner() {
+                if let Some(owner) = self.self_owner() {
                     // `unnamed_singleton_include?` / `taint_unrecorded_mixin`:
                     // an argument that names no module leaves the singleton
                     // SET unknown (`singleton_class.include(*MODS)`).
@@ -1365,7 +1368,7 @@ impl<'pr> Census<'pr> {
             return;
         }
         if self.hook_receiver(&recv) {
-            if let Some(owner) = self.owner() {
+            if let Some(owner) = self.self_owner() {
                 // `taint_unrecorded_mixin` — `unnamed` on the instance side
                 // reads `kind ∈ {include, prepend}` AND a receiver that is not
                 // a `singleton_class` call AND (`hook_parameter_receiver?` —
@@ -1433,16 +1436,11 @@ impl<'pr> Census<'pr> {
             return;
         }
         // `current_class` — the owner the walk names for the call's `self`:
-        // the frame owner, or the singleton body's own — `eval_owner` for
-        // `class << self` (the enclosing class, or the `instance_eval`
-        // receiver's), the `class << Const` candidates, none for `class <<
-        // obj` or an ownerless frame.
+        // [`Census::self_owner`], the declaration/eval owner or the
+        // `instance_eval` receiver — none for `class << obj` or an ownerless
+        // frame.
         let in_singleton = self.frame().singleton;
-        let owner = if in_singleton {
-            self.frame().eval_owner.clone().or_else(|| self.owner())
-        } else {
-            self.owner()
-        };
+        let owner = self.self_owner();
         let Some(owner) = owner else { return };
         let scope = self.class_body_scope(n);
         if scope.is_none() && !hook {
@@ -1554,7 +1552,7 @@ impl<'pr> Census<'pr> {
         let object = sc.receiver();
         let lexical_self = object.as_ref().is_none_or(|o| o.as_self_node().is_some());
         let owner = if lexical_self {
-            self.singleton_owner()
+            self.self_owner()
         } else {
             object.as_ref().and_then(strict_constant_path_string).map(|raw| self.candidates(&raw))
         };
@@ -1675,16 +1673,15 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             strict_constant_path_string(&expr).map(|raw| self.candidates(&raw))
         };
         // `class << self` inside `X.instance_eval { … }` opens `X`'s singleton.
-        let eval_owner = if is_self { self.singleton_owner() } else { None };
-        // `MixinAccumulator#class_body(node.body)` — registered wherever the
-        // body names a class (the `decl_name` reading): `class << self` where
-        // the enclosing self is named, or `class << Const` — not `class << obj`
-        // or a top-level `class << self`.
-        let registrable = if is_self {
-            self.singleton_owner().is_some()
-        } else {
-            owner.is_some()
-        };
+        let eval_owner = if is_self { self.self_owner() } else { None };
+        // `MixinAccumulator#class_body` — registered only where the
+        // reference's walks register one: declaration bodies (in
+        // [`declaration`]) and a FIRST-LEVEL `class << self`'s — `opens_self =
+        // self && !in_singleton`. `class << Const`
+        // (`walk_extends_constant_singleton`) and a nested `class << self`
+        // inside a singleton body register nothing: a computed `send` in
+        // either stays a taint.
+        let registrable = is_self && !self.frame().singleton;
         if registrable {
             if let Some(b) = node.body() {
                 self.class_bodies.push(node_copy(&b));
@@ -1701,7 +1698,11 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         let name = constant_string(node.name().as_slice());
         let recv_self = node.receiver().is_some_and(|r| r.as_self_node().is_some());
         let singleton_def = recv_self || (node.receiver().is_none() && self.frame().singleton);
-        let mut hook = false;
+        // `hook_def_params` — the parameters of ANY `def` named in `HOOK_DEFS`
+        // (an instance `def included(base)` binds `base` the same as
+        // `def self.included(base)`; the extends walk needs it for the
+        // `included` / `inherited` hooks `extend` runs), at any `def` depth.
+        let hook = HOOK_DEFS.contains(&name.as_str());
         if self.in_def == 0 {
             if let Some(owner) = self.owner() {
                 for o in &owner {
@@ -1713,7 +1714,6 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                     if ALL_HOOKS.contains(&name.as_str()) {
                         self.out.dirty_owners.extend(owner.iter().cloned());
                     }
-                    hook = HOOK_DEFS.contains(&name.as_str());
                     // `extend_reshapes_instance?` — `extended` / `extend_object`
                     // on the extended module's singleton is a hook `extend`
                     // runs.
@@ -1938,8 +1938,8 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             // A bare / `self` receiver keeps the enclosing self, an
             // `instance_eval` frame's included.
             let eval_owner = match (&recv, &recv_const) {
-                (None, _) => self.singleton_owner(),
-                (Some(r), _) if r.as_self_node().is_some() => self.singleton_owner(),
+                (None, _) => self.self_owner(),
+                (Some(r), _) if r.as_self_node().is_some() => self.self_owner(),
                 _ => owner.clone(),
             };
             let owner = if instance_side { None } else { owner };
