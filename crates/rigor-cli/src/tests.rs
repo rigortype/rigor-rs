@@ -120,8 +120,26 @@ fn line_col_start_of_line_and_eof() {
     assert_eq!(line_col("", 7), (1, 1));
 }
 
+#[test]
+fn line_col_at_matches_line_col_at_every_offset() {
+    // The indexed resolver must agree with the byte walk on EVERY offset —
+    // multi-byte scalars, a `\n` as the offset itself (stays on the newline's
+    // own line), a trailing `\n`, and a past-EOF clamp.
+    let src = "a = \"\u{e4}x\"\n\u{1f48c} = 2\nfoo.bar\n";
+    let starts = line_starts(src);
+    for off in 0..=src.len() + 3 {
+        assert_eq!(line_col_at(src, &starts, off), line_col(src, off), "offset {off}");
+    }
+    assert_eq!(line_col_at("", &line_starts(""), 5), line_col("", 5));
+    let cr = "a\rb\nc\n";
+    let starts = line_starts(cr);
+    for off in 0..=cr.len() {
+        assert_eq!(line_col_at(cr, &starts, off), line_col(cr, off), "cr offset {off}");
+    }
+}
+
 /// Capture github output for a slice of findings without spawning a process.
-fn github_all(findings: &[(usize, String, String, Diagnostic)]) -> String {
+fn github_all(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> String {
     diagnostic_formats::render_github(&to_rendered(findings))
 }
 
@@ -131,17 +149,17 @@ fn github_empty_when_no_diagnostics() {
 }
 
 /// The REAL SARIF renderer's output, re-parsed.
-fn sarif_value(findings: &[(usize, String, String, Diagnostic)]) -> serde_json::Value {
+fn sarif_value(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> serde_json::Value {
     serde_json::from_str(&diagnostic_formats::render_sarif(&to_rendered(findings))).unwrap()
 }
 
-fn finding(rule: &'static str, sev: Severity, msg: &str) -> (usize, String, String, Diagnostic) {
-    (0, "f.rb".to_string(), String::new(), diag(rule, sev, msg))
+fn finding(rule: &'static str, sev: Severity, msg: &str) -> (usize, String, (usize, usize), Diagnostic) {
+    (0, "f.rb".to_string(), (1, 1), diag(rule, sev, msg))
 }
 
 /// A finding with NO rule — what `parse_diagnostics` produces.
-fn finding_ruleless(msg: &str) -> (usize, String, String, Diagnostic) {
-    (0, "f.rb".to_string(), String::new(), diag(rigor_rules::NO_RULE, Severity::Error, msg))
+fn finding_ruleless(msg: &str) -> (usize, String, (usize, usize), Diagnostic) {
+    (0, "f.rb".to_string(), (1, 1), diag(rigor_rules::NO_RULE, Severity::Error, msg))
 }
 
 #[test]
@@ -443,7 +461,7 @@ fn prepend_path_errors_severity_and_placement() {
         PathError { path: "x.txt".into(), not_found: false },
     ];
     // any_files = true ⇒ warnings, "(skipped)" suffix.
-    let mut findings = vec![(0usize, "a.rb".to_string(), "x = 1\n".to_string(),
+    let mut findings = vec![(0usize, "a.rb".to_string(), (1, 1),
         diag("call.undefined-method", Severity::Error, "boom"))];
     prepend_path_errors(&mut findings, &errs, true);
     assert_eq!(findings.len(), 3);
