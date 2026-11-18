@@ -64,6 +64,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer set + `class <<`-composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. 3 review rounds, ~135 probe rows identical; follow-ups #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
 - **2026-11-18 upstream re-pin `v0.4.7 → v0.4.8`** (PR #599, human-merged) — mixin-call recording rework + #2677 alias-floor copy-link slice ported; three review rounds closed 13 blocking findings (partial include, transitive links, send mutations, dead-arm links, `*` over-decline); **0 FP fixture + ~8.7K-file sweep, 959/1063**; residuals #600, #603–#605. [note](notes/20261115-repin-v048.md)
 - **2026-11-12 #405 class-guard record drop** (PR #591): class guards drop rooted `h[k]` records via a decline-side `record_guards` overlay. 18 master FPs closed, 0 FP/658; follow-ups #595/#596. [note](notes/20261112-issue-405-class-guard-records.md)
 - **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` exit guards record `$~` + mandatory `$N`; `Regexp.last_match` no longer a nil source. 0 FP/658; follow-ups #597/#598. [note](notes/20261112-issue-449-match-globals.md)
