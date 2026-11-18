@@ -197,12 +197,15 @@ pub struct Config {
     parity_text_ok: bool,
     /// Issue #476: the raw text of every `severity_overrides:` key written in
     /// the loaded file and its `includes:` (each file's first document, in
-    /// read order). A non-String key's `to_s` depends on how Psych resolved
-    /// the PLAIN scalar, which the typed value no longer shows (`0o17` and
-    /// `15` both load here as 15; Psych keeps the first a String). Read only
-    /// by [`Config::severity_override_key_names`]. Never (de)serialized.
+    /// read order), with the `!!` tag each carried when it had one. A
+    /// non-String key's `to_s` depends on how Psych resolved the scalar —
+    /// plain or tagged — which the typed value no longer shows (`0o17` and
+    /// `15` both load here as 15; Psych keeps the first a String, and
+    /// `!!float 1e3` loads as `1000.0` where its plain text stays a String).
+    /// Read only by [`Config::severity_override_key_names`]. Never
+    /// (de)serialized.
     #[serde(skip)]
-    severity_override_key_texts: Vec<String>,
+    severity_override_key_texts: Vec<KeyText>,
 }
 
 /// ADR-0036: the `rigor_rs:` namespace for rigor-rs-specific config keys — those
@@ -629,7 +632,7 @@ impl Config {
             Err(f) => return ConfigRead::Fatal(f),
         };
         let mut includes_seen = false;
-        let mut key_texts: Vec<String> = Vec::new();
+        let mut key_texts: Vec<KeyText> = Vec::new();
         let merged = match load_with_includes(
             &absolute,
             &std::collections::BTreeSet::new(),
@@ -926,8 +929,13 @@ impl Config {
         for k in map.keys() {
             let name = match k {
                 Value::String(s) => (psych_plain_to_s(s).as_deref() == Some(s.as_str())).then(|| s.clone()),
+                // A key no written spelling settles — a `<<`-merged entry,
+                // a `!!`-tagged scalar — still names itself on the reference,
+                // whose audit iterates the LOADED hash; the loaded value's
+                // own `to_s` is the fallback spelling (issue #490).
                 Value::Null | Value::Bool(_) | Value::Number(_) => {
                     plain_key_to_s(k, &self.severity_override_key_texts)
+                        .or_else(|| loaded_scalar_to_s(k))
                 }
                 _ => None,
             };
@@ -1959,13 +1967,30 @@ fn utf8_error_detail(bytes: &[u8], start: usize) -> &'static str {
 /// applied Psych-style inside [`DupOkVisitor::visit_map`] — NEVER through
 /// `Value::apply_merge`, which errors on non-mapping merge values where
 /// Psych keeps `<<` as a literal key.
-/// Issue #476 — the raw text of each key of the top-level
-/// `severity_overrides:` mapping in `text`'s first document, in order.
+/// One `severity_overrides:` key's written spelling, with the `!!` tag it
+/// carried — serde_yaml resolves a standard tag before a visitor can see it,
+/// so [`severity_override_tagged_spellings`] re-reads it from the source
+/// text (issue #490).
+#[derive(Debug)]
+struct KeyText {
+    /// The key's scalar text as `deserialize_string` yields it.
+    spelling: String,
+    /// The resolved `!!` tag name (`"float"`), or `None` for a plain scalar.
+    tag: Option<String>,
+}
+
+/// Issue #476 — the raw text of each key of the LAST top-level
+/// `severity_overrides:` mapping in `text`'s first document, in order
+/// (Psych's duplicate-key rule keeps only the last occurrence's value —
+/// earlier mappings' spellings must not name the keys that survived, #490).
 /// `String`'s deserialize asks serde_yaml for `deserialize_string`, which
-/// hands over a scalar's text unresolved (`1`, `~`, `0o17`). Anything this
-/// cannot read (a complex key, a non-mapping value) yields what was read so
-/// far; [`plain_key_to_s`] declines a key it finds no text for.
-fn severity_override_key_texts(text: &str) -> Vec<String> {
+/// hands over a scalar's text unresolved (`1`, `~`, `0o17`). A `<<` merge
+/// key's inline sources are walked for their keys too: Psych files the
+/// merged entries' keys in the loaded hash, so their spellings name them.
+/// Anything this cannot read (a complex key, a non-mapping value) yields
+/// what was read so far; [`plain_key_to_s`] declines a key it finds no text
+/// for.
+fn severity_override_key_texts(text: &str) -> Vec<KeyText> {
     use serde::de::{DeserializeSeed, Deserializer, IgnoredAny, MapAccess, Visitor};
     struct Top<'a>(&'a mut Vec<String>);
     struct Keys<'a>(&'a mut Vec<String>);
@@ -1977,6 +2002,7 @@ fn severity_override_key_texts(text: &str) -> Vec<String> {
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
             while let Some(key) = map.next_key::<String>()? {
                 if key == "severity_overrides" {
+                    self.0.clear();
                     map.next_value_seed(Keys(&mut *self.0))?;
                 } else {
                     map.next_value::<IgnoredAny>()?;
@@ -1998,25 +2024,152 @@ fn severity_override_key_texts(text: &str) -> Vec<String> {
         }
         fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<(), A::Error> {
             while let Some(key) = map.next_key::<String>()? {
-                self.0.push(key);
-                map.next_value::<IgnoredAny>()?;
+                if key == "<<" {
+                    map.next_value_seed(Keys(&mut *self.0))?;
+                } else {
+                    self.0.push(key);
+                    map.next_value::<IgnoredAny>()?;
+                }
             }
             Ok(())
         }
     }
-    let mut out = Vec::new();
+    let mut spellings = Vec::new();
     if let Some(doc) = serde_yaml::Deserializer::from_str(text).next() {
-        let _ = doc.deserialize_map(Top(&mut out));
+        let _ = doc.deserialize_map(Top(&mut spellings));
+    }
+    let tags = severity_override_tagged_spellings(text);
+    spellings
+        .into_iter()
+        .map(|spelling| KeyText {
+            tag: tags.get(&spelling).cloned(),
+            spelling,
+        })
+        .collect()
+}
+
+/// `spelling → tag` for every `!!`-tagged scalar key in the LAST top-level
+/// `severity_overrides:` block of `text`. The block is found line-wise — the
+/// `severity_overrides:` line with the smallest indent (a nested use indents
+/// deeper) and, among those, the last (Psych's duplicate-key rule) — and its
+/// body is the lines indented under it plus the rest of its own line, so a
+/// flow mapping on the key line is read too. A scalar the scan cannot shape
+/// (a `!!`-spelling it can't match to a collected text, a `!foo` local tag)
+/// simply contributes nothing tagged; [`plain_key_to_s`] then reads the key
+/// as plain, its usual best-effort stance.
+fn severity_override_tagged_spellings(text: &str) -> HashMap<String, String> {
+    let mut block: Option<(usize, Vec<String>)> = None;
+    let mut current: Option<(usize, Vec<String>)> = None;
+    for line in text.lines() {
+        let indent = line.len() - line.trim_start().len();
+        let trimmed = line.trim_start();
+        let is_key_line = trimmed
+            .strip_prefix("severity_overrides")
+            .is_some_and(|rest| rest.trim_start().starts_with(':'));
+        if is_key_line {
+            match &current {
+                Some((i, _)) if indent > *i => {
+                    // A `severity_overrides:` nested under the current block
+                    // — still inside it, so its body stays open.
+                    current.as_mut().unwrap().1.push(line.to_string());
+                    continue;
+                }
+                _ => {
+                    current = Some((indent, vec![line.to_string()]));
+                    continue;
+                }
+            }
+        }
+        if let Some((i, lines)) = &mut current {
+            if trimmed.is_empty() || trimmed.starts_with('#') || indent > *i {
+                lines.push(line.to_string());
+                continue;
+            }
+            block = current.take();
+        }
+    }
+    if let Some(c) = current {
+        block = Some(c);
+    }
+    let Some((_, lines)) = block else {
+        return HashMap::new();
+    };
+    let mut out = HashMap::new();
+    for line in &lines {
+        let bytes = line.as_bytes();
+        let mut i = 0;
+        while let Some(off) = line[i..].find("!!") {
+            let at = i + off;
+            i = at + 2;
+            let name_end = bytes[i..]
+                .iter()
+                .position(|b| !b.is_ascii_alphanumeric() && *b != b'_')
+                .map(|p| i + p)
+                .unwrap_or(line.len());
+            if name_end == i {
+                continue;
+            }
+            let tag = line[i..name_end].to_string();
+            i = name_end;
+            while bytes.get(i).is_some_and(u8::is_ascii_whitespace) {
+                i += 1;
+            }
+            let spelling = match bytes.get(i) {
+                Some(b'\'') => {
+                    let mut s = String::new();
+                    let mut j = i + 1;
+                    while j < line.len() {
+                        if bytes[j] == b'\'' {
+                            if bytes.get(j + 1) == Some(&b'\'') {
+                                s.push('\'');
+                                j += 2;
+                            } else {
+                                break;
+                            }
+                        } else {
+                            s.push(bytes[j] as char);
+                            j += 1;
+                        }
+                    }
+                    i = j + 1;
+                    s
+                }
+                Some(b'"') => {
+                    let mut s = String::new();
+                    let mut j = i + 1;
+                    while j < line.len() && bytes[j] != b'"' {
+                        s.push(bytes[j] as char);
+                        j += usize::from(bytes[j] == b'\\') + 1;
+                    }
+                    i = j + 1;
+                    s
+                }
+                _ => {
+                    let end = bytes[i..]
+                        .iter()
+                        .position(|b| matches!(b, b' ' | b'\t' | b':' | b',' | b'}' | b']' | b'#'))
+                        .map(|p| i + p)
+                        .unwrap_or(line.len());
+                    let s = line[i..end].to_string();
+                    i = end;
+                    s
+                }
+            };
+            if !spelling.is_empty() {
+                out.insert(spelling, tag);
+            }
+        }
     }
     out
 }
+
 
 /// The `to_s` of a non-String `severity_overrides:` key: every written key
 /// text that serde_yaml resolves to `key` must give one Psych `to_s`, or the
 /// key is unsettled (`None`). Only texts made of the characters a YAML
 /// null, bool, int or float can be spelled with are resolved, so a quoted
 /// key's text is never re-read as YAML syntax.
-fn plain_key_to_s(key: &serde_yaml::Value, texts: &[String]) -> Option<String> {
+fn plain_key_to_s(key: &serde_yaml::Value, texts: &[KeyText]) -> Option<String> {
     use serde_yaml::Value;
     let same = |a: &Value, b: &Value| match (a, b) {
         (Value::Number(x), Value::Number(y)) if x.is_f64() && y.is_f64() => {
@@ -2026,7 +2179,8 @@ fn plain_key_to_s(key: &serde_yaml::Value, texts: &[String]) -> Option<String> {
         _ => Some(a == b),
     };
     let mut found: Option<String> = None;
-    for t in texts {
+    for kt in texts {
+        let t = &kt.spelling;
         if !t.bytes().all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-' | b'_' | b'~')) {
             continue;
         }
@@ -2041,13 +2195,66 @@ fn plain_key_to_s(key: &serde_yaml::Value, texts: &[String]) -> Option<String> {
         if !same(&resolved, key)? {
             continue;
         }
-        let s = psych_plain_to_s(t)?;
+        let s = psych_key_to_s(t, kt.tag.as_deref())?;
         match &found {
             Some(f) if *f != s => return None,
             _ => found = Some(s),
         }
     }
     found
+}
+
+/// `key.to_s` for a `severity_overrides:` key that no written spelling
+/// settles — a `<<`-merged entry's key has no spelling of its own, but the
+/// reference's audit still iterates the LOADED hash and names it (issue
+/// #490): `15` -> `"15"`, `1000.0` -> `"1000.0"`, `true` -> `"true"`,
+/// `nil` -> `""`.
+fn loaded_scalar_to_s(key: &serde_yaml::Value) -> Option<String> {
+    use serde_yaml::Value;
+    Some(match key {
+        Value::Null => String::new(),
+        Value::Bool(b) => b.to_string(),
+        Value::Number(n) => n
+            .as_f64()
+            .map(rigor_types::ruby_float_to_s)
+            .unwrap_or_else(|| n.to_string()),
+        _ => return None,
+    })
+}
+
+/// `k.to_s` for a `severity_overrides:` key that WAS tagged (`!!float 1e3`):
+/// Psych resolves the scalar under the tag, so the name is the tagged
+/// value's `to_s`, not the plain-scanner's (which keeps `1e3` a String). An
+/// unhandled tag declines the key's text rather than guess (issue #490).
+fn psych_key_to_s(t: &str, tag: Option<&str>) -> Option<String> {
+    let Some(tag) = tag else {
+        return psych_plain_to_s(t);
+    };
+    Some(match tag {
+        // `!!str` keeps the scalar a String; `!!null` is `nil`.
+        "str" => t.to_string(),
+        "null" => String::new(),
+        // `!!bool`/`!!int` parse under Psych's scalar scanner or stay the
+        // written String (`!!int 0o17` loads as `"0o17"`).
+        "bool" => match t.to_ascii_lowercase().as_str() {
+            "true" | "yes" | "on" => "true".to_string(),
+            "false" | "no" | "off" => "false".to_string(),
+            _ => t.to_string(),
+        },
+        "int" => match psych_int(t) {
+            Some(v) => v.to_string(),
+            None => t.to_string(),
+        },
+        // `!!float` has no `\.` requirement — `Float("1e3")` parses.
+        "float" => {
+            let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
+            match cleaned.parse::<f64>() {
+                Ok(f) => rigor_types::ruby_float_to_s(f),
+                Err(_) => t.to_string(),
+            }
+        }
+        _ => return None,
+    })
 }
 
 /// `Psych::ScalarScanner#tokenize(text).to_s` for a PLAIN scalar (Ruby
@@ -2146,24 +2353,43 @@ fn psych_plain_to_s(t: &str) -> Option<String> {
         return cleaned.parse::<f64>().ok().map(rigor_types::ruby_float_to_s);
     }
     if int.is_match(t) {
-        // `Integer(string.delete(',_'))`: `0b` / `0x` / a leading-`0` octal.
-        let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
-        let (neg, mag) = match cleaned.strip_prefix('-') {
-            Some(m) => (true, m),
-            None => (false, cleaned.strip_prefix('+').unwrap_or(&cleaned)),
-        };
-        let value = if let Some(h) = mag.strip_prefix("0x") {
-            i128::from_str_radix(h, 16).ok()?
-        } else if let Some(b) = mag.strip_prefix("0b") {
-            i128::from_str_radix(b, 2).ok()?
-        } else if mag.len() > 1 && mag.starts_with('0') {
-            i128::from_str_radix(&mag[1..], 8).ok()?
-        } else {
-            mag.parse::<i128>().ok()?
-        };
-        return Some(if neg { -value } else { value }.to_string());
+        return psych_int(t).map(|v| v.to_string());
     }
     Some(t.to_string())
+}
+
+/// `Psych`'s `!!int` resolution of `t` — `Integer(string.delete(',_'))` with
+/// `0b` / `0x` / a leading-`0` octal — or `None` when the text is not an
+/// integer spelling Psych's scalar scanner accepts (it then stays a String:
+/// `!!int 0o17` loads as `"0o17"`, issue #490).
+fn psych_int(t: &str) -> Option<i128> {
+    use regex::Regex;
+    use std::sync::OnceLock;
+    static INT: OnceLock<Regex> = OnceLock::new();
+    let int = INT.get_or_init(|| {
+        Regex::new(
+            r"^(?:[-+]?0b[_,]*[0-1][0-1_,]*|[-+]?0[_,]*[0-7][0-7_,]*|[-+]?(?:0|[1-9](?:[0-9]|,[0-9]|_[0-9])*)|[-+]?0x[_,]*[0-9a-fA-F][0-9a-fA-F_,]*)$",
+        )
+        .unwrap()
+    });
+    if !int.is_match(t) {
+        return None;
+    }
+    let cleaned: String = t.chars().filter(|&c| c != ',' && c != '_').collect();
+    let (neg, mag) = match cleaned.strip_prefix('-') {
+        Some(m) => (true, m),
+        None => (false, cleaned.strip_prefix('+').unwrap_or(&cleaned)),
+    };
+    let value = if let Some(h) = mag.strip_prefix("0x") {
+        i128::from_str_radix(h, 16).ok()?
+    } else if let Some(b) = mag.strip_prefix("0b") {
+        i128::from_str_radix(b, 2).ok()?
+    } else if mag.len() > 1 && mag.starts_with('0') {
+        i128::from_str_radix(&mag[1..], 8).ok()?
+    } else {
+        mag.parse::<i128>().ok()?
+    };
+    Some(if neg { -value } else { value })
 }
 
 fn parse_yaml(text: &str) -> Result<serde_yaml::Value, serde_yaml::Error> {
@@ -3194,7 +3420,7 @@ fn load_with_includes(
     absolute: &Path,
     visited: &std::collections::BTreeSet<std::path::PathBuf>,
     includes_seen: &mut bool,
-    key_texts: &mut Vec<String>,
+    key_texts: &mut Vec<KeyText>,
 ) -> Result<serde_yaml::Mapping, LoadFailure> {
     if visited.contains(absolute) {
         return Err(LoadFailure {
@@ -3235,7 +3461,7 @@ fn merge_includes(
     base_dir: &Path,
     visited: &std::collections::BTreeSet<std::path::PathBuf>,
     includes_seen: &mut bool,
-    key_texts: &mut Vec<String>,
+    key_texts: &mut Vec<KeyText>,
 ) -> Result<serde_yaml::Mapping, LoadFailure> {
     let mut accumulated = serde_yaml::Value::Mapping(serde_yaml::Mapping::new());
     for inc in includes {

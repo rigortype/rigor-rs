@@ -679,6 +679,55 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
+    // Issue #490, oracle-probed: a `!!`-tagged key names the value Psych
+    // resolves it to, not the plain text — `!!float 1e3` loads as 1000.0 and
+    // warns `"1000.0"`, while the same spelling plain still warns `"1e3"`.
+    #[test]
+    fn tagged_override_keys_warn_by_tagged_to_s() {
+        let dir = std::env::temp_dir().join(format!("rigor_audit_tagged_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".rigor.yml");
+        std::fs::write(
+            &path,
+            "severity_overrides:\n  !!float 1e3: warning\n  !!float 2e+3: warning\n  !!float 15: warning\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        let hint = " is not a recognized rule id; the override has no effect \
+                    (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)";
+        let want: Vec<String> = [r#""1000.0""#, r#""2000.0""#, r#""15.0""#]
+            .iter()
+            .map(|k| format!("severity_overrides: {k}{hint}"))
+            .collect();
+        assert_eq!(messages(&cfg, &dir), want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // Issue #490, oracle-probed: a second top-level `severity_overrides:`
+    // replaces the first entirely — Psych's duplicate-key rule keeps only
+    // the last occurrence's value — and a `<<` merge inside it loads `15`,
+    // which the audit names by the loaded key's own `to_s`.
+    #[test]
+    fn duplicate_severity_overrides_names_only_the_last_mappings_keys() {
+        let dir = std::env::temp_dir().join(format!("rigor_audit_dupsev_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(".rigor.yml");
+        std::fs::write(
+            &path,
+            "severity_overrides:\n  0o17: warning\nseverity_overrides:\n  <<: {15: warning}\n",
+        )
+        .unwrap();
+        let cfg = Config::load(Some(&path)).unwrap();
+        let hint = " is not a recognized rule id; the override has no effect \
+                    (if this is a plugin's rule, write it as `plugin.<id>.<rule>`)";
+        let want: Vec<String> = [r#""15""#]
+            .iter()
+            .map(|k| format!("severity_overrides: {k}{hint}"))
+            .collect();
+        assert_eq!(messages(&cfg, &dir), want);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     // A third-party gem without `id:` makes the configured ids unknowable, so
     // the plugin-token check stays off.
     #[test]
