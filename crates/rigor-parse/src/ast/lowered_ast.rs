@@ -1,7 +1,10 @@
 //! The owned AST (`LoweredAst`), its file identity (`FileKey`), and the `lower`
 //! / `lower_with_key` entry points (ADR-0012).
 
+use std::sync::Arc;
+
 use crate::ruby_prism::ParseResult;
+use crate::LineIndex;
 
 use super::{collect_ancestry_facts, AncestryFacts, collect_const_mutations, Builder, ConstMutation, Node, NodeId, Span, StatementsKind};
 
@@ -85,7 +88,9 @@ pub struct LoweredAst {
     local_read_starts: Vec<usize>,
     /// The never-evaluated/discarded extent tables — bundled behind one
     /// allocation so they do not inflate `LoweredAst` (its size feeds
-    /// `enum Lowered`'s variant budget in rigor-cli). See [`CarrierSpans`].
+    /// `enum Lowered`'s variant budget in rigor-cli). The file's [`LineIndex`]
+    /// rides here too (rigor-rs#642) so it does not add a pointer on the AST.
+    /// See [`CarrierSpans`].
     carrier_spans: Box<CarrierSpans>,
     /// Nodes a single-statement `(e)` parens was UNWRAPPED to. The reference
     /// reads the receiver's SYNTAX node — `(nil)` is a `ParenthesesNode`, not
@@ -206,6 +211,9 @@ struct CarrierSpans {
     /// [`DeadPositions::mutation_reaches`]:
     ///     rigor_infer::dead::DeadPositions::mutation_reaches
     next_args: Vec<(Span, Span)>,
+    /// Line-start table for this file's source (rigor-rs#642). Lives behind
+    /// the `CarrierSpans` box so it does not inflate `LoweredAst`.
+    line_index: Arc<LineIndex>,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -228,6 +236,19 @@ impl LoweredAst {
     /// from the same pathless `lower()` call (or a clone of it).
     pub fn file_key(&self) -> &FileKey {
         &self.file_key
+    }
+
+    /// The line-start table built during lowering (rigor-rs#642). Every offset
+    /// query against this file — findings, comments, MCP, LSP, annotate,
+    /// shadowed-rescue — reads this table instead of walking the source prefix.
+    pub fn line_index(&self) -> &LineIndex {
+        &self.carrier_spans.line_index
+    }
+
+    /// Cheap clone of the shared table (one atomic increment) for a consumer
+    /// that drops the AST but still needs positions.
+    pub fn share_line_index(&self) -> Arc<LineIndex> {
+        Arc::clone(&self.carrier_spans.line_index)
     }
 
     /// Upstream #540's mutation census for this file, in walk order. See
@@ -647,6 +668,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         block_break_locals_only: builder.block_break_locals_only_spans,
         iterated_bodies: builder.iterated_body_spans,
         next_args: builder.next_arg_spans,
+        line_index: Arc::new(LineIndex::from_starts(builder.line_starts, source.len())),
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();

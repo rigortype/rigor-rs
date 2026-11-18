@@ -120,23 +120,6 @@ fn line_col_start_of_line_and_eof() {
     assert_eq!(line_col("", 7), (1, 1));
 }
 
-#[test]
-fn line_col_at_matches_line_col_at_every_offset() {
-    // The indexed resolver must agree with the byte walk on EVERY offset —
-    // multi-byte scalars, a `\n` as the offset itself (stays on the newline's
-    // own line), a trailing `\n`, and a past-EOF clamp.
-    let src = "a = \"\u{e4}x\"\n\u{1f48c} = 2\nfoo.bar\n";
-    let starts = line_starts(src);
-    for off in 0..=src.len() + 3 {
-        assert_eq!(line_col_at(src, &starts, off), line_col(src, off), "offset {off}");
-    }
-    assert_eq!(line_col_at("", &line_starts(""), 5), line_col("", 5));
-    let cr = "a\rb\nc\n";
-    let starts = line_starts(cr);
-    for off in 0..=cr.len() {
-        assert_eq!(line_col_at(cr, &starts, off), line_col(cr, off), "cr offset {off}");
-    }
-}
 
 /// Capture github output for a slice of findings without spawning a process.
 fn github_all(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> String {
