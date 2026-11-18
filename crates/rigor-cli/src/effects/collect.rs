@@ -541,7 +541,6 @@ impl Scanner {
                 &class.constant_path(),
                 class.body().as_ref(),
                 prefix,
-                ctx,
             );
         }
         if let Some(module) = node.as_module_node() {
@@ -550,7 +549,6 @@ impl Scanner {
                 &module.constant_path(),
                 module.body().as_ref(),
                 prefix,
-                ctx,
             );
         }
         if let Some(singleton_class) = node.as_singleton_class_node() {
@@ -599,20 +597,18 @@ impl Scanner {
         path: &Node<'_>,
         body: Option<&Node<'_>>,
         prefix: &[String],
-        ctx: BodyCtx,
     ) {
-        let Some(name) = qualified_name(path) else {
+        let Some(nested) = declaration_prefix(prefix, path) else {
             // A constant path the syntax cannot name — upstream descends into
-            // the declaration's OWN children keeping the OUTER context
-            // (`scanner.rb:156`), so `class (expr)` at top level declares
-            // nothing and one inside `class << self` keeps the singleton side.
+            // the declaration's OWN children under a fresh `CLASS_BODY`
+            // (`scanner.rb:156`). Only a syntax-error header reaches this
+            // arm: Prism yields a non-constant `constant_path` on a parse
+            // error alone, and both engines then emit no units for the file.
             for child in children(node) {
-                self.walk(&child, prefix, ctx);
+                self.walk(&child, prefix, BodyCtx::CLASS_BODY);
             }
             return;
         };
-        let mut nested = prefix.to_vec();
-        nested.push(name);
         if let Some(body) = body {
             self.walk(body, &nested, BodyCtx::CLASS_BODY);
         }
@@ -1370,6 +1366,32 @@ fn render_constant_path(path: &ruby_prism::ConstantPathNode<'_>) -> String {
         None => String::new(),
     };
     format!("{prefix}{name}")
+}
+
+/// `Source::ConstantPath.rooted?` (`constant_path.rb:72`) — true when the
+/// path is written with a leading `::` (`::Foo`, `::Foo::Bar`). Prism spells
+/// the root as a `ConstantPathNode` with a nil `parent`, so the answer lives
+/// at the LEFTMOST segment and the walk has to reach it. A bare
+/// `ConstantReadNode` and a dynamic base (`expr::Bar`) are both false.
+fn rooted(node: &Node<'_>) -> bool {
+    let Some(path) = node.as_constant_path_node() else { return false };
+    match path.parent() {
+        Some(parent) => rooted(&parent),
+        None => true,
+    }
+}
+
+/// `Source::ConstantPath.declaration_prefix` (`constant_path.rb:94`) — the
+/// qualified prefix a `class` / `module` header contributes to the body it
+/// opens, given the prefix of the body the header is WRITTEN in. A ROOTED
+/// header RESETS the prefix: `class ::Rooted` names `Rooted` wherever it is
+/// written, so the enclosing prefix is DROPPED rather than kept. None when
+/// the header names no constant.
+fn declaration_prefix(outer: &[String], path: &Node<'_>) -> Option<Vec<String>> {
+    let name = qualified_name(path)?;
+    let mut nested = if rooted(path) { Vec::new() } else { outer.to_vec() };
+    nested.push(name);
+    Some(nested)
 }
 
 /// Every direct child node, in `compact_child_nodes` order — the `Scanner`'s
