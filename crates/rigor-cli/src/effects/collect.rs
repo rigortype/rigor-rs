@@ -650,7 +650,7 @@ impl Scanner {
             method_name,
             names.clone(),
             block_parameter_name(parameters),
-            owned_locals(body, &names),
+            owned_locals(body, &names, ctx.singleton()),
         );
         if let Some(body) = body {
             scan.visit(body);
@@ -1795,6 +1795,53 @@ mod tests {
         assert_eq!(one("  list[0] ||= 1"), ["mutate.instance"]);
         assert_eq!(one("  @x.count += 1"), ["mutate.self"]);
         assert_eq!(one("  b = []\n  b[0] &&= 1\n  nil"), ["mutate.local"]);
+    }
+
+    #[test]
+    fn new_allocates_only_on_a_class_object_receiver() {
+        // #614 — `constructor?` reads the receiver AND `context.singleton?`
+        // (`local_ownership.rb:71`). A non-class receiver's `new` only shares
+        // the name, and bare `new` on an instance body is `self.new`, where
+        // `self` is no class either: `o` stays unowned and the write taints
+        // `unknown-ownership` instead of proving `mutate.local`.
+        let found = summaries("class C\n def m\n  o = assoc.items.new\n  o.x = 1\n  nil\n end\nend");
+        assert!(found["C#m"].is_empty());
+        let found = summaries("class C\n def m\n  o = new\n  o.x = 1\n  nil\n end\nend");
+        assert!(found["C#m"].is_empty());
+        // …and both sites carry the `unknown-ownership` taint the comment
+        // claims, not just an empty label set.
+        for source in [
+            "class C\n def m\n  o = assoc.items.new\n  o.x = 1\n  nil\n end\nend",
+            "class C\n def m\n  o = new\n  o.x = 1\n  nil\n end\nend",
+        ] {
+            let (_, causes) = bits(source).remove("C#m").expect("the unit must exist");
+            assert!(causes.contains(&cause(UNKNOWN_OWNERSHIP, None)), "{source}: {causes:?}");
+        }
+        // …but on a singleton body bare `new` IS `Class#new`.
+        let found = summaries("class C\n def self.s\n  o = new\n  o.x = 1\n  nil\n end\nend");
+        assert_eq!(found["C.s"], ["mutate.local"]);
+        // …and a constant path or a `x.class` receiver always names one.
+        assert_eq!(one("  o = Thing.new\n  o.x = 1\n  nil"), ["mutate.local"]);
+        assert_eq!(one("  o = other.class.new\n  o.x = 1\n  nil"), ["mutate.local"]);
+    }
+
+    #[test]
+    fn a_receiver_that_is_itself_an_allocation_is_mutate_local() {
+        // Upstream's `else` arm (`mutation_classifier.rb:88`): each evaluation
+        // is a new object no caller holds yet.
+        assert_eq!(one("  {}.x = 1"), ["mutate.local"]);
+        assert_eq!(one("  Thing.new.x = 1"), ["mutate.local"]);
+        assert_eq!(one("  other.dup.x = 1"), ["mutate.local"]);
+        // …and bare `new` allocates only where `self` is a class.
+        let found = summaries("class C\n def self.s\n  new.x = 1\n end\nend");
+        assert_eq!(found["C.s"], ["mutate.local"]);
+        // Negative controls: a non-class `new` receiver, a bare `new` on an
+        // instance body, and a plain constant receiver all taint
+        // `unknown-ownership` instead of proving `mutate.local`.
+        for body in ["  assoc.items.new.x = 1", "  new.x = 1", "  Thing.x = 1"] {
+            let (_, causes) = taint(body);
+            assert!(causes.contains(&cause(UNKNOWN_OWNERSHIP, None)), "{body}: {causes:?}");
+        }
     }
 
     #[test]
