@@ -6,6 +6,8 @@
 //! (e.g. `bool` for `true | false`) but MUST NOT change type identity
 //! (normalization.md §"Interaction with display").
 
+use std::collections::HashMap;
+
 use crate::algebra::is_bool_pair;
 use crate::interner::Interner;
 use crate::ty::{ClassId, Scalar, ShapeKey, ShapeMember, Type, TypeId};
@@ -31,18 +33,30 @@ pub fn describe_named(
     id: TypeId,
     resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> String {
+    render_postorder(i, id, named_children, |i, n, at| {
+        named_node(i, n, resolve, at)
+    })
+}
+
+/// One node's `describe_named` string, given its children's rendered strings
+/// (`at(child)` — see [`render_postorder`]).
+fn named_node<'m>(
+    i: &Interner,
+    id: TypeId,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+    at: &'m dyn Fn(TypeId) -> &'m str,
+) -> String {
     match i.get(id) {
         Type::Top => "top".to_string(),
         Type::Bottom => "bot".to_string(),
-        Type::Dynamic(facet) => format!("Dynamic[{}]", describe_named(i, *facet, resolve)),
+        Type::Dynamic(facet) => format!("Dynamic[{}]", at(*facet)),
 
         Type::Nominal { class, args } => {
             let name = named_class(*class, resolve);
             if args.is_empty() {
                 name
             } else {
-                let inner: Vec<String> =
-                    args.iter().map(|&a| describe_named(i, a, resolve)).collect();
+                let inner: Vec<&str> = args.iter().map(|&a| at(a)).collect();
                 format!("{name}[{}]", inner.join(", "))
             }
         }
@@ -54,8 +68,7 @@ pub fn describe_named(
             if elems.is_empty() {
                 "[]".to_string()
             } else {
-                let inner: Vec<String> =
-                    elems.iter().map(|&e| describe_named(i, e, resolve)).collect();
+                let inner: Vec<&str> = elems.iter().map(|&e| at(e)).collect();
                 format!("[{}]", inner.join(", "))
             }
         }
@@ -69,7 +82,7 @@ pub fn describe_named(
                     .map(|m| {
                         let opt = if m.optional { "?" } else { "" };
                         let key = named_key_prefix(&m.key);
-                        format!("{opt}{key} {}", describe_named(i, m.value, resolve))
+                        format!("{opt}{key} {}", at(m.value))
                     })
                     .collect();
                 format!("{{ {} }}", inner.join(", "))
@@ -78,29 +91,25 @@ pub fn describe_named(
 
         Type::IntegerRange { min, max } => named_integer_range(*min, *max),
 
-        Type::Union(members) => named_union(i, members, resolve),
+        Type::Union(members) => named_union(i, members, at),
 
-        Type::Difference { base, removed } => format!(
-            "{} - {}",
-            describe_named(i, *base, resolve),
-            describe_named(i, *removed, resolve)
-        ),
+        Type::Difference { base, removed } => format!("{} - {}", at(*base), at(*removed)),
         Type::Intersection(members) => members
             .iter()
-            .map(|&m| describe_named(i, m, resolve))
+            .map(|&m| at(m))
             .collect::<Vec<_>>()
             .join(" & "),
-        Type::Complement(inner) => format!("~{}", describe_named(i, *inner, resolve)),
+        Type::Complement(inner) => format!("~{}", at(*inner)),
 
         // Refinement / App / DataInstance carry names/tables the reference
         // resolves through machinery rigor-rs has not ported; render the closest
         // faithful approximation rather than leaking an internal id.
-        Type::Refined { base, .. } => describe_named(i, *base, resolve),
+        Type::Refined { base, .. } => at(*base).to_string(),
         Type::App { .. } => "App".to_string(),
         Type::DataInstance { class, members } => {
             let inner: Vec<String> = members
                 .iter()
-                .map(|(name, ty)| format!("{name}: {}", describe_named(i, *ty, resolve)))
+                .map(|(name, ty)| format!("{name}: {}", at(*ty)))
                 .collect();
             format!("{}({})", named_class(*class, resolve), inner.join(", "))
         }
@@ -110,6 +119,116 @@ pub fn describe_named(
         Type::Instance => "instance".to_string(),
         Type::ClassType => "class".to_string(),
     }
+}
+
+/// The subterm ids a node's `describe_named` string depends on — the edges of
+/// the type DAG [`render_postorder`] walks for [`describe_named`].
+fn named_children(ty: &Type, out: &mut Vec<TypeId>) {
+    match ty {
+        Type::Dynamic(f) | Type::Complement(f) => out.push(*f),
+        Type::Nominal { args, .. } => out.extend_from_slice(args),
+        Type::Tuple(elems) | Type::Union(elems) | Type::Intersection(elems) => {
+            out.extend_from_slice(elems)
+        }
+        Type::HashShape(ms) => out.extend(ms.iter().map(|m| m.value)),
+        Type::DataInstance { members, .. } => out.extend(members.iter().map(|(_, t)| *t)),
+        Type::Difference { base, removed } => {
+            out.push(*base);
+            out.push(*removed);
+        }
+        Type::Refined { base, .. } => out.push(*base),
+        _ => {}
+    }
+}
+
+/// Post-order evaluation of a type renderer over the interned carrier DAG,
+/// using an explicit work stack rather than call-stack recursion
+/// (rigor-rs#427: a carrier can nest ~10⁶ levels deep on generated input,
+/// where recursion overflows even the 256 MiB analysis stack).
+///
+/// `children` lists the subterm ids a node's string depends on; `combine`
+/// renders one node from its children's already-rendered strings, looked up
+/// through `at`. The result is byte-identical to naive recursion: a renderer
+/// is a pure function of the carrier, so a memoized child equals the
+/// re-descended value.
+///
+/// Memory stays O(live strings), like the recursion it replaces — NOT
+/// O(all rendered strings), which would be quadratic on a chain. Pass 1
+/// counts each reachable node's in-degree; pass 2 frees a child's string
+/// when its last parent is combined. A DAG-shared child still renders once:
+/// the `seen` set suppresses its repeat `Enter`s while its string outlives
+/// every consumer.
+fn render_postorder(
+    i: &Interner,
+    root: TypeId,
+    mut children: impl FnMut(&Type, &mut Vec<TypeId>),
+    combine: impl for<'m> Fn(&Interner, TypeId, &'m dyn Fn(TypeId) -> &'m str) -> String,
+) -> String {
+    enum Task {
+        Enter(TypeId),
+        Exit(TypeId),
+    }
+    // TypeIds are dense over `0..i.len()`, so flat tables index by `id.0`.
+    let mut edges: Vec<TypeId> = Vec::new();
+
+    // Pass 1: in-degree of every reachable node (every edge counts once per
+    // parent, since each node is expanded once).
+    let mut refs: Vec<u32> = vec![0; i.len()];
+    let mut seen: Vec<bool> = vec![false; i.len()];
+    let mut todo = vec![root];
+    seen[root.0 as usize] = true;
+    while let Some(id) = todo.pop() {
+        edges.clear();
+        children(i.get(id), &mut edges);
+        for &c in &edges {
+            refs[c.0 as usize] += 1;
+            if !seen[c.0 as usize] {
+                seen[c.0 as usize] = true;
+                todo.push(c);
+            }
+        }
+    }
+
+    // Pass 2: post-order combine, freeing a child's string after its last
+    // parent's Exit.
+    let mut memo: HashMap<TypeId, String> = HashMap::new();
+    seen.fill(false);
+    let mut stack = vec![Task::Enter(root)];
+    while let Some(task) = stack.pop() {
+        match task {
+            Task::Enter(id) => {
+                if seen[id.0 as usize] {
+                    continue;
+                }
+                seen[id.0 as usize] = true;
+                stack.push(Task::Exit(id));
+                edges.clear();
+                children(i.get(id), &mut edges);
+                for &c in &edges {
+                    stack.push(Task::Enter(c));
+                }
+            }
+            Task::Exit(id) => {
+                // Every child id was Entered before this Exit, so its string
+                // is in `memo` already.
+                let at = |c: TypeId| -> &str {
+                    memo.get(&c).expect("post-order renders children first")
+                };
+                let s = combine(i, id, &at);
+                memo.insert(id, s);
+                edges.clear();
+                children(i.get(id), &mut edges);
+                for &c in &edges {
+                    let r = &mut refs[c.0 as usize];
+                    *r -= 1;
+                    if *r == 0 {
+                        memo.remove(&c);
+                    }
+                }
+            }
+        }
+    }
+    memo.remove(&root).expect("root renders last")
 }
 
 /// A class id's name, or the `Class<id>` fallback when `resolve` cannot name it.
@@ -137,6 +256,19 @@ pub fn erase_to_rbs_named(
     id: TypeId,
     resolve: &dyn Fn(ClassId) -> Option<String>,
 ) -> String {
+    render_postorder(i, id, erase_children, |i, n, at| {
+        erase_node(i, n, resolve, at)
+    })
+}
+
+/// One node's `erase_to_rbs_named` string, given its children's erased strings
+/// (`at(child)` — see [`render_postorder`]).
+fn erase_node<'m>(
+    i: &Interner,
+    id: TypeId,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+    at: &'m dyn Fn(TypeId) -> &'m str,
+) -> String {
     match i.get(id) {
         Type::Top => "top".to_string(),
         Type::Bottom => "bot".to_string(),
@@ -148,8 +280,7 @@ pub fn erase_to_rbs_named(
             if args.is_empty() {
                 name
             } else {
-                let inner: Vec<String> =
-                    args.iter().map(|&a| erase_to_rbs_named(i, a, resolve)).collect();
+                let inner: Vec<&str> = args.iter().map(|&a| at(a)).collect();
                 format!("{name}[{}]", inner.join(", "))
             }
         }
@@ -161,28 +292,27 @@ pub fn erase_to_rbs_named(
             if elems.is_empty() {
                 "[]".to_string()
             } else {
-                let inner: Vec<String> =
-                    elems.iter().map(|&e| erase_to_rbs_named(i, e, resolve)).collect();
+                let inner: Vec<&str> = elems.iter().map(|&e| at(e)).collect();
                 format!("[{}]", inner.join(", "))
             }
         }
 
-        Type::HashShape(members) => erase_hash_shape(i, members, resolve),
+        Type::HashShape(members) => erase_hash_shape(i, members, resolve, at),
 
         // A refined integer range generalizes to the nominal `Integer` (the RBS
         // has no `int<lo, hi>` spelling).
         Type::IntegerRange { .. } => "Integer".to_string(),
 
-        Type::Union(members) => erase_union(i, members, resolve),
+        Type::Union(members) => erase_union(members, at),
 
         // A difference erases through its base; an intersection through its first
         // member (reference `Difference` / `Intersection#erase_to_rbs`).
-        Type::Difference { base, .. } => erase_to_rbs_named(i, *base, resolve),
+        Type::Difference { base, .. } => at(*base).to_string(),
         Type::Intersection(members) => members
             .first()
-            .map(|&m| erase_to_rbs_named(i, m, resolve))
+            .map(|&m| at(m).to_string())
             .unwrap_or_else(|| "untyped".to_string()),
-        Type::Refined { base, .. } => erase_to_rbs_named(i, *base, resolve),
+        Type::Refined { base, .. } => at(*base).to_string(),
 
         // Carriers with no faithful RBS spelling in this port erase conservatively
         // to `untyped` — always sound (it widens, never narrows).
@@ -199,6 +329,21 @@ pub fn erase_to_rbs_named(
         Type::SelfType => "self".to_string(),
         Type::Instance => "instance".to_string(),
         Type::ClassType => "class".to_string(),
+    }
+}
+
+/// The subterm ids a node's `erase_to_rbs_named` string depends on — fewer
+/// than [`named_children`]: a `Dynamic` facet, a `Complement`/`App` payload,
+/// `DataInstance` members and a `removed` difference side all erase without
+/// being rendered, and an `Intersection` renders only its first member.
+fn erase_children(ty: &Type, out: &mut Vec<TypeId>) {
+    match ty {
+        Type::Nominal { args, .. } => out.extend_from_slice(args),
+        Type::Tuple(elems) | Type::Union(elems) => out.extend_from_slice(elems),
+        Type::HashShape(ms) => out.extend(ms.iter().map(|m| m.value)),
+        Type::Intersection(ms) => out.extend(ms.first()),
+        Type::Difference { base, .. } | Type::Refined { base, .. } => out.push(*base),
+        _ => {}
     }
 }
 
@@ -223,13 +368,8 @@ fn scalar_erase(s: &Scalar) -> String {
 /// short-circuiting to `untyped` if any member is `untyped`, else the members
 /// deduped (first-occurrence order, Ruby `Array#uniq`) and joined with ` | `.
 /// No `bool` / `T?` collapse — those are display-only.
-fn erase_union(
-    i: &Interner,
-    members: &[TypeId],
-    resolve: &dyn Fn(ClassId) -> Option<String>,
-) -> String {
-    let erased: Vec<String> =
-        members.iter().map(|&m| erase_to_rbs_named(i, m, resolve)).collect();
+fn erase_union<'m>(members: &[TypeId], at: &'m dyn Fn(TypeId) -> &'m str) -> String {
+    let erased: Vec<String> = members.iter().map(|&m| at(m).to_string()).collect();
     if erased.iter().any(|e| e == "untyped") {
         return "untyped".to_string();
     }
@@ -242,23 +382,24 @@ fn erase_union(
 /// *closed*: an empty shape erases to `{}`; a shape with any non-symbol key
 /// generalizes to `Hash[K, V]` (RBS record keys must be symbols); an all-symbol
 /// shape keeps the record spelling `{ key: T, ?opt: T }`.
-fn erase_hash_shape(
+fn erase_hash_shape<'m>(
     i: &Interner,
     members: &[ShapeMember],
     resolve: &dyn Fn(ClassId) -> Option<String>,
+    at: &'m dyn Fn(TypeId) -> &'m str,
 ) -> String {
     if members.is_empty() {
         return "{}".to_string();
     }
     if !members.iter().all(|m| matches!(m.key, ShapeKey::Sym(_))) {
-        return hash_erasure(i, members, resolve);
+        return hash_erasure(i, members, resolve, at);
     }
     let rendered: Vec<String> = members
         .iter()
         .map(|m| {
             let ShapeKey::Sym(name) = &m.key else { unreachable!() };
             let key = if m.optional { format!("?{name}") } else { name.clone() };
-            format!("{key}: {}", erase_to_rbs_named(i, m.value, resolve))
+            format!("{key}: {}", at(m.value))
         })
         .collect();
     format!("{{ {} }}", rendered.join(", "))
@@ -274,10 +415,11 @@ fn erase_hash_shape(
 /// sorted by that display string before being erased — NOT by rigor-rs's own
 /// tag/ClassId canonical order. We reproduce that here so the erased bound is
 /// byte-identical to the oracle's (load-bearing for sig-gen output).
-fn hash_erasure(
+fn hash_erasure<'m>(
     i: &Interner,
     members: &[ShapeMember],
     resolve: &dyn Fn(ClassId) -> Option<String>,
+    at: &'m dyn Fn(TypeId) -> &'m str,
 ) -> String {
     // Key bound: every key class's `describe(:short)` equals its erasure (a
     // nominal renders its name; the `true`/`false`/`nil` literals render
@@ -293,8 +435,7 @@ fn hash_erasure(
     // `untyped` member collapses the whole union (reference `Union#erase_to_rbs`).
     let mut vals: Vec<TypeId> = members.iter().map(|m| m.value).collect();
     vals.sort_by_key(|&v| describe_named(i, v, resolve));
-    let val_erased: Vec<String> =
-        vals.iter().map(|&v| erase_to_rbs_named(i, v, resolve)).collect();
+    let val_erased: Vec<String> = vals.iter().map(|&v| at(v).to_string()).collect();
     let value_type = if val_erased.iter().any(|e| e == "untyped") {
         "untyped".to_string()
     } else {
@@ -645,11 +786,7 @@ fn named_integer_range(min: Option<i64>, max: Option<i64>) -> String {
 /// A union as the reference `Union#describe` renders it: an optional union
 /// (`T | nil`, one logical non-nil member) collapses to `T?`; a `true | false`
 /// pair collapses to `bool`; otherwise the members join with ` | `.
-fn named_union(
-    i: &Interner,
-    members: &[TypeId],
-    resolve: &dyn Fn(ClassId) -> Option<String>,
-) -> String {
+fn named_union<'m>(i: &Interner, members: &[TypeId], at: &'m dyn Fn(TypeId) -> &'m str) -> String {
     let is_nil = |id: TypeId| matches!(i.get(id), Type::Constant(Scalar::Nil));
     let is_bool_lit = |id: TypeId| matches!(i.get(id), Type::Constant(Scalar::Bool(_)));
     let has_true =
@@ -667,7 +804,7 @@ fn named_union(
             "bool".to_string()
         } else {
             let m = *members.iter().find(|&&m| !is_nil(m)).unwrap();
-            describe_named(i, m, resolve)
+            at(m).to_string()
         };
         return format!("{inner}?");
     }
@@ -678,7 +815,7 @@ fn named_union(
         let mut rest: Vec<String> = members
             .iter()
             .filter(|&&m| !is_bool_lit(m))
-            .map(|&m| describe_named(i, m, resolve))
+            .map(|&m| at(m).to_string())
             .collect();
         rest.sort();
         return std::iter::once("bool".to_string()).chain(rest).collect::<Vec<_>>().join(" | ");
@@ -689,21 +826,26 @@ fn named_union(
     // The interner's canonical member order is structural, not rendered, so
     // reproduce the reference's order by sorting the rendered strings
     // (`"s" | 1`, not `1 | "s"`).
-    let mut rendered: Vec<String> =
-        members.iter().map(|&m| describe_named(i, m, resolve)).collect();
+    let mut rendered: Vec<&str> = members.iter().map(|&m| at(m)).collect();
     rendered.sort();
     rendered.join(" | ")
 }
 
 /// Render `id` as a human-readable string.
 pub fn describe(i: &Interner, id: TypeId) -> String {
+    render_postorder(i, id, describe_children, |i, n, at| describe_node(i, n, at))
+}
+
+/// One node's `describe` string, given its children's rendered strings
+/// (`at(child)` — see [`render_postorder`]).
+fn describe_node<'m>(i: &Interner, id: TypeId, at: &'m dyn Fn(TypeId) -> &'m str) -> String {
     match i.get(id) {
         Type::Top => "top".to_string(),
         Type::Bottom => "bot".to_string(),
 
         // untyped == Dynamic[top] displays as `Dynamic[top]`. The internal
         // form still records provenance; this is display only.
-        Type::Dynamic(facet) => format!("Dynamic[{}]", describe(i, *facet)),
+        Type::Dynamic(facet) => format!("Dynamic[{}]", at(*facet)),
 
         Type::Nominal { class, args } => {
             // Skeleton: render the nominal as `Class<id>` since the class name
@@ -712,7 +854,7 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
             if args.is_empty() {
                 format!("Class<{}>", class.0)
             } else {
-                let inner: Vec<String> = args.iter().map(|&a| describe(i, a)).collect();
+                let inner: Vec<&str> = args.iter().map(|&a| at(a)).collect();
                 format!("Class<{}>[{}]", class.0, inner.join(", "))
             }
         }
@@ -727,7 +869,7 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
         Type::Constant(s) => format!("Constant[{}]", scalar(s)),
 
         Type::Tuple(elems) => {
-            let inner: Vec<String> = elems.iter().map(|&e| describe(i, e)).collect();
+            let inner: Vec<&str> = elems.iter().map(|&e| at(e)).collect();
             format!("Tuple[{}]", inner.join(", "))
         }
 
@@ -736,7 +878,7 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
                 .iter()
                 .map(|m| {
                     let opt = if m.optional { "?" } else { "" };
-                    format!("{}{} => {}", shape_key(&m.key), opt, describe(i, m.value))
+                    format!("{}{} => {}", shape_key(&m.key), opt, at(m.value))
                 })
                 .collect();
             format!("{{{}}}", inner.join(", "))
@@ -750,22 +892,22 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
         }
 
         Type::Refined { base, refinement } => {
-            format!("{}[refine #{}]", describe(i, *base), refinement.0)
+            format!("{}[refine #{}]", at(*base), refinement.0)
         }
 
         Type::Difference { base, removed } => {
-            format!("{} - {}", describe(i, *base), describe(i, *removed))
+            format!("{} - {}", at(*base), at(*removed))
         }
 
         Type::Intersection(members) => {
-            let inner: Vec<String> = members.iter().map(|&m| describe(i, m)).collect();
+            let inner: Vec<&str> = members.iter().map(|&m| at(m)).collect();
             inner.join(" & ")
         }
 
-        Type::Complement(inner) => format!("~{}", describe(i, *inner)),
+        Type::Complement(inner) => format!("~{}", at(*inner)),
 
         Type::App { uri, args } => {
-            let inner: Vec<String> = args.iter().map(|&a| describe(i, a)).collect();
+            let inner: Vec<&str> = args.iter().map(|&a| at(a)).collect();
             if inner.is_empty() {
                 format!("App[{}]", uri.0)
             } else {
@@ -776,7 +918,7 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
         Type::DataInstance { class, members } => {
             let inner: Vec<String> = members
                 .iter()
-                .map(|(name, ty)| format!("{}: {}", name, describe(i, *ty)))
+                .map(|(name, ty)| format!("{}: {}", name, at(*ty)))
                 .collect();
             format!("Data<{}>({})", class.0, inner.join(", "))
         }
@@ -796,11 +938,20 @@ pub fn describe(i: &Interner, id: TypeId) -> String {
             // `describe(:short)` string at construction — `Union#describe`
             // joins them as-is. The interner's canonical order is structural,
             // so sort the rendered strings to reproduce it.
-            let mut parts: Vec<String> =
-                members.iter().map(|&m| describe(i, m)).collect();
+            let mut parts: Vec<&str> = members.iter().map(|&m| at(m)).collect();
             parts.sort();
             parts.join(" | ")
         }
+    }
+}
+
+/// The subterm ids a node's `describe` string depends on — the same edges as
+/// [`named_children`] plus `App` args (the internal render spells `App[uri,
+/// args]` where the user-facing one prints `App`).
+fn describe_children(ty: &Type, out: &mut Vec<TypeId>) {
+    match ty {
+        Type::App { args, .. } => out.extend_from_slice(args),
+        _ => named_children(ty, out),
     }
 }
 
@@ -1305,5 +1456,137 @@ mod tests {
         let u = Algebra::join(&mut i, s, nil);
         // nil floats to the end: `Class<10> | nil`.
         assert_eq!(describe(&i, u), "Class<10> | nil");
+    }
+}
+
+#[cfg(test)]
+mod depth_tests {
+    //! rigor-rs#427: the renderers walk the interned carrier DAG with an
+    //! explicit work stack, so a carrier nested far past any call-stack
+    //! budget still renders — and renders byte-identically to the pre-change
+    //! recursive functions (these pins double as that equivalence check on
+    //! nested shapes).
+    use super::*;
+    use crate::algebra::Algebra;
+
+    fn resolver(class: ClassId) -> Option<String> {
+        match class.0 {
+            1 => Some("Integer".to_string()),
+            2 => Some("String".to_string()),
+            3 => Some("Array".to_string()),
+            _ => None,
+        }
+    }
+
+    /// `D` levels of `Tuple([…])` wrapped around `inner`.
+    fn nest(i: &mut Interner, inner: TypeId, d: usize) -> TypeId {
+        let mut t = inner;
+        for _ in 0..d {
+            t = i.intern(Type::Tuple(vec![t]));
+        }
+        t
+    }
+
+    #[test]
+    fn nested_types_render_identically() {
+        // Byte-pinned mixed nesting: every recursion edge the renderer takes
+        // (Tuple / Nominal args / HashShape / Union / Difference / Complement
+        // / Refined / DataInstance / Dynamic) appears at least once.
+        let mut i = Interner::new();
+        let int = i.int(1);
+        let tup = nest(&mut i, int, 2); // [[1]]
+        let arr = i.intern(Type::Nominal {
+            class: ClassId(3),
+            args: vec![tup],
+        });
+        assert_eq!(describe_named(&i, arr, &resolver), "Array[[[1]]]");
+        assert_eq!(erase_to_rbs_named(&i, arr, &resolver), "Array[[[1]]]");
+        assert_eq!(describe(&i, arr), "Class<3>[Tuple[Tuple[Constant[1]]]]");
+
+        let shape = i.intern(Type::HashShape(vec![
+            ShapeMember { key: ShapeKey::Sym("a".to_string()), value: arr, optional: false },
+            ShapeMember { key: ShapeKey::Sym("b?".to_string()), value: int, optional: true },
+        ]));
+        assert_eq!(
+            describe_named(&i, shape, &resolver),
+            "{ a: Array[[[1]]], ?b?: 1 }"
+        );
+
+        let nil = i.nil();
+        let opt_arr = Algebra::join(&mut i, arr, nil);
+        assert_eq!(describe_named(&i, opt_arr, &resolver), "Array[[[1]]]?");
+
+        let dyn_arr = i.intern(Type::Dynamic(arr));
+        assert_eq!(describe_named(&i, dyn_arr, &resolver), "Dynamic[Array[[[1]]]]");
+        assert_eq!(erase_to_rbs_named(&i, dyn_arr, &resolver), "untyped");
+
+        let complement = i.intern(Type::Complement(arr));
+        assert_eq!(describe_named(&i, complement, &resolver), "~Array[[[1]]]");
+        assert_eq!(describe(&i, complement), "~Class<3>[Tuple[Tuple[Constant[1]]]]");
+
+        let diff = i.intern(Type::Difference {
+            base: arr,
+            removed: int,
+        });
+        assert_eq!(describe_named(&i, diff, &resolver), "Array[[[1]]] - 1");
+        // A difference erases through its base.
+        assert_eq!(erase_to_rbs_named(&i, diff, &resolver), "Array[[[1]]]");
+
+        let refined = i.intern(Type::Refined {
+            base: arr,
+            refinement: crate::ty::RefinementId(4),
+        });
+        assert_eq!(describe_named(&i, refined, &resolver), "Array[[[1]]]");
+        assert_eq!(describe(&i, refined), "Class<3>[Tuple[Tuple[Constant[1]]]][refine #4]");
+
+        let data = i.intern(Type::DataInstance {
+            class: ClassId(1),
+            members: vec![("x".to_string(), int), ("ys".to_string(), arr)],
+        });
+        assert_eq!(describe_named(&i, data, &resolver), "Integer(x: 1, ys: Array[[[1]]])");
+        // A data instance erases to its class name.
+        assert_eq!(erase_to_rbs_named(&i, data, &resolver), "Integer");
+    }
+
+    #[test]
+    fn deep_tuple_chain_renders_without_stack_growth() {
+        // Far deeper than any test-thread call stack could hold recursively
+        // (~440 B/frame ⇒ ~20k frames per 8 MiB). The work stack keeps peak
+        // call-stack usage O(1).
+        // 50k levels still needs ~10–20 MB of call-stack frames recursively
+        // — over every thread stack in play — while keeping the debug-build
+        // test in the seconds range.
+        const DEPTH: usize = 50_000;
+        let mut i = Interner::new();
+        let one = i.int(1);
+        let t = nest(&mut i, one, DEPTH);
+
+        let want_named = format!("{}1{}", "[".repeat(DEPTH), "]".repeat(DEPTH));
+        assert_eq!(describe_named(&i, t, &resolver), want_named);
+        assert_eq!(erase_to_rbs_named(&i, t, &resolver), want_named);
+        let want_internal = format!(
+            "{}Constant[1]{}",
+            "Tuple[".repeat(DEPTH),
+            "]".repeat(DEPTH)
+        );
+        assert_eq!(describe(&i, t), want_internal);
+    }
+
+    #[test]
+    fn deep_dag_shared_subterms_render_once() {
+        // `x = [x, x]` repeated builds a DAG: each node shares the previous
+        // subterm twice. The render memoizes by TypeId, so node count — not
+        // expansion size — bounds the walk (the STRING is still exponential,
+        // as both engines' outputs are; keep the count tiny).
+        const WIDTH: usize = 14;
+        let mut i = Interner::new();
+        let mut t = i.int(1);
+        for _ in 0..WIDTH {
+            t = i.intern(Type::Tuple(vec![t, t]));
+        }
+        let got = describe_named(&i, t, &resolver);
+        // Depth 14 ⇒ 2¹⁴ leaves of `1` — assert on structure, not the megabytes.
+        assert_eq!(got.matches('1').count(), 1 << WIDTH);
+        assert!(got.starts_with('[') && got.ends_with(']'));
     }
 }
