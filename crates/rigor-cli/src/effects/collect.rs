@@ -165,9 +165,23 @@ const TOP_LEVEL_KEY: &str = "<toplevel>";
 const DECLARATION_MACROS: &[&str] =
     &["include", "prepend", "attr_reader", "attr_writer", "attr_accessor", "define_method"];
 
-/// `$~` and friends are frame-local, not global state: a read of one is not
-/// `global.read` (`unit_scan.rb:40`).
-const FRAME_LOCAL_GLOBALS: &[&str] = &["$~", "$_", "$&", "$`", "$'", "$+", "$!"];
+/// `$~` and `$_` are frame-local, not global state: a read of one is not
+/// `global.read`, and a write binds only the running body's special-variable
+/// slot, so it earns no label — except in a `define_method` body, which runs
+/// on the slot of the body that defined it (`shared_slot`; `unit_scan.rb:40-48`).
+const FRAME_LOCAL_GLOBALS: &[&str] = &["$~", "$_"];
+
+/// `$!` and `$@` are the rescued exception and its backtrace: a read reaches
+/// the dynamically enclosing rescue clause rather than program state, so it is
+/// not `global.read`; a write stays `global.write` (`unit_scan.rb:50-57`).
+const RESCUED_EXCEPTION_GLOBALS: &[&str] = &["$!", "$@"];
+
+// The globals whose read is not `global.read` are the union of the two sets
+// above — upstream's `UNCOLOURED_READS` (`unit_scan.rb:59`), tested at the
+// read arm below rather than spelled as a third constant. The rest of the
+// match family (`$&`, `` $` ``, `$'`, `$+`, `$1`…) needs no entry: Prism
+// spells them BackReference / NumberedReference read nodes, which never reach
+// that arm.
 
 const REFLECTIVE_SEND: &[&str] = &["send", "public_send", "__send__"];
 
@@ -318,10 +332,10 @@ pub(super) fn selector_of(key: &str) -> &str {
 }
 
 /// A synthesised `attr_writer` / `attr_accessor` setter's summary — the same
-/// value at every accessor in the project (`scanner.rb:55`).
-fn writer_summary() -> Summary {
+/// value at every accessor on the same side (`scanner.rb:60-61`).
+fn writer_summary(singleton: bool) -> Summary {
     let mut summary = Summary::default();
-    summary.add(ATTR_WRITER, ["mutate.self"]);
+    summary.add(ATTR_WRITER, [if singleton { "mutate.static" } else { "mutate.self" }]);
     summary
 }
 
@@ -332,8 +346,186 @@ fn writer_summary() -> Summary {
 /// `<toplevel>#m` for a `def` outside any class body.
 pub(super) fn scan(root: &Node<'_>) -> BTreeMap<String, Summary> {
     let mut scanner = Scanner::default();
-    scanner.walk(root, &[], false);
+    scanner.walk(root, &[], BodyCtx::TOP_LEVEL);
     scanner.summaries
+}
+
+/// `DefinitionContext` (`definition_context.rb`) — which side of its class a
+/// definition written at some point lands on, and what `self` its body runs
+/// under, or that the syntax does not say. The scanner's `walk` passes one
+/// down the class-body positions; the unit walk holds one that `class <<`
+/// bodies and the rebinding call blocks move (`for_child`).
+///
+/// `self_kind` is `:instance`, `:class` (the class the enclosing namespace
+/// opened), `:singleton_class` (that class's singleton class) or `:unknown`,
+/// and `definee` is `definee_singleton` — true, false, or None when unknown.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SelfKind {
+    Instance,
+    Class,
+    SingletonClass,
+    Unknown,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct BodyCtx {
+    kind: SelfKind,
+    definee: Option<bool>,
+}
+
+/// `CLASS_EVAL_CALLS` / `INSTANCE_EVAL_CALLS` (`definition_context.rb:35-36`)
+/// — the call families whose literal block rebinds `self`.
+const CLASS_EVAL_CALLS: &[&str] =
+    &["class_eval", "class_exec", "module_eval", "module_exec"];
+const INSTANCE_EVAL_CALLS: &[&str] = &["instance_eval", "instance_exec"];
+
+impl BodyCtx {
+    /// `TOP_LEVEL` — `self` is `main`, an instance of `Object`.
+    const TOP_LEVEL: Self = Self { kind: SelfKind::Instance, definee: Some(false) };
+    /// `CLASS_BODY` — `self` is the class object, `def` lands `C#m`.
+    const CLASS_BODY: Self = Self { kind: SelfKind::Class, definee: Some(false) };
+    /// `SINGLETON_CLASS_BODY` — `self` and the definee are both the
+    /// singleton class.
+    const SINGLETON_CLASS_BODY: Self =
+        Self { kind: SelfKind::SingletonClass, definee: Some(true) };
+    /// `UNKNOWN` — where the syntax says neither what `self` is nor where a
+    /// `def` lands.
+    const UNKNOWN: Self = Self { kind: SelfKind::Unknown, definee: None };
+
+    /// `singleton?` — whether `self` here is a class object
+    /// (`definition_context.rb:82`).
+    fn singleton(self) -> bool {
+        matches!(self.kind, SelfKind::Class | SelfKind::SingletonClass)
+    }
+
+    /// `self_kind == :class` — all `def self.x` asks (`def_body`).
+    fn self_is_class(self) -> bool {
+        self.kind == SelfKind::Class
+    }
+
+    /// `def_body` — the context the body of `def` node `receiver` runs under,
+    /// or None where no key names the method (`definition_context.rb:96`).
+    /// The unit's key separator is the answer's `singleton()`.
+    fn def_body(self, receiver: Option<&Node<'_>>) -> Option<Self> {
+        match receiver {
+            None => self.definee.map(|definee| Self {
+                kind: if definee { SelfKind::Class } else { SelfKind::Instance },
+                definee: self.definee,
+            }),
+            Some(r) if r.as_self_node().is_some() => self.self_is_class().then_some(self),
+            Some(r)
+                if r.as_constant_read_node().is_some()
+                    || r.as_constant_path_node().is_some() =>
+            {
+                (self.kind != SelfKind::Unknown)
+                    .then_some(Self { kind: SelfKind::Class, definee: self.definee })
+            }
+            Some(_) => None,
+        }
+    }
+
+    /// `module_call_body` — the context the block of a literal-name
+    /// `define_method`, or an `attr_*` macro, defines into; None where no key
+    /// names the method (`definition_context.rb:112`).
+    fn module_call(self) -> Option<Self> {
+        match self.kind {
+            SelfKind::Class => {
+                Some(Self { kind: SelfKind::Instance, definee: self.definee })
+            }
+            SelfKind::SingletonClass => {
+                Some(Self { kind: SelfKind::Class, definee: self.definee })
+            }
+            SelfKind::Instance | SelfKind::Unknown => None,
+        }
+    }
+
+    /// `singleton_class_body` — `class << self` opens the singleton class
+    /// only where `self` IS the class; `class << obj`, or `class << self`
+    /// anywhere else, is a position no key names (`definition_context.rb:139`).
+    fn singleton_class(self, expression: &Node<'_>) -> Self {
+        if self.self_is_class() && expression.as_self_node().is_some() {
+            Self::SINGLETON_CLASS_BODY
+        } else {
+            Self::UNKNOWN
+        }
+    }
+
+    /// `for_child`'s `block(call)` — the context a call's literal block runs
+    /// under (`definition_context.rb:130`). Only the `_eval` families, a
+    /// `singleton_class`-call receiver and the anonymous builders rebind;
+    /// every other block keeps this context.
+    fn block_ctx(self, call: &CallNode<'_>) -> Self {
+        let name = name_of(call.name().as_slice());
+        let receiver = call.receiver();
+        if CLASS_EVAL_CALLS.contains(&name.as_str()) {
+            // `class_eval` makes its receiver both `self` and the definee.
+            if self_receiver(receiver.as_ref()) && self.singleton() {
+                return Self {
+                    kind: self.kind,
+                    definee: Some(self.kind == SelfKind::SingletonClass),
+                };
+            }
+            if self.singleton_class_receiver(receiver.as_ref()) {
+                return Self::SINGLETON_CLASS_BODY;
+            }
+            return Self::UNKNOWN;
+        }
+        if INSTANCE_EVAL_CALLS.contains(&name.as_str()) {
+            // `instance_eval` makes its receiver `self` and the receiver's
+            // singleton class the definee.
+            if self_receiver(receiver.as_ref()) && self.kind == SelfKind::Class {
+                return Self { kind: SelfKind::Class, definee: Some(true) };
+            }
+            if (self_receiver(receiver.as_ref()) && self.kind == SelfKind::SingletonClass)
+                || self.singleton_class_receiver(receiver.as_ref())
+            {
+                return Self { kind: SelfKind::SingletonClass, definee: None };
+            }
+            return Self::UNKNOWN;
+        }
+        if anonymous_builder(call) {
+            return Self::UNKNOWN;
+        }
+        self
+    }
+
+    /// `singleton_class` called on the class (`definition_context.rb:159`).
+    fn singleton_class_receiver(self, receiver: Option<&Node<'_>>) -> bool {
+        let Some(call) = receiver.and_then(|r| r.as_call_node()) else { return false };
+        self.kind == SelfKind::Class
+            && call.name().as_slice() == b"singleton_class"
+            && self_receiver(call.receiver().as_ref())
+            && call.arguments().is_none()
+            && call.block().is_none()
+    }
+}
+
+/// `self_receiver?` (`definition_context.rb:155`).
+fn self_receiver(receiver: Option<&Node<'_>>) -> bool {
+    receiver.is_none() || receiver.is_some_and(|r| r.as_self_node().is_some())
+}
+
+/// `anonymous_builder?` (`definition_context.rb:166`) — `Class.new`,
+/// `Module.new`, `Struct.new` and `Data.define` spelled on the core constant.
+fn anonymous_builder(call: &CallNode<'_>) -> bool {
+    let Some(receiver) = call.receiver() else { return false };
+    let name = if let Some(read) = receiver.as_constant_read_node() {
+        read.name().as_slice()
+    } else if let Some(path) = receiver.as_constant_path_node() {
+        match (path.parent(), path.name()) {
+            (None, Some(name)) => name.as_slice(),
+            _ => return false,
+        }
+    } else {
+        return false;
+    };
+    matches!(
+        (name, call.name().as_slice()),
+        (b"Class", b"new")
+            | (b"Module", b"new")
+            | (b"Struct", b"new")
+            | (b"Data", b"define")
+    )
 }
 
 #[derive(Default)]
@@ -342,9 +534,15 @@ struct Scanner {
 }
 
 impl Scanner {
-    fn walk(&mut self, node: &Node<'_>, prefix: &[String], singleton: bool) {
+    fn walk(&mut self, node: &Node<'_>, prefix: &[String], ctx: BodyCtx) {
         if let Some(class) = node.as_class_node() {
-            return self.walk_namespace(node, &class.constant_path(), class.body().as_ref(), prefix);
+            return self.walk_namespace(
+                node,
+                &class.constant_path(),
+                class.body().as_ref(),
+                prefix,
+                ctx,
+            );
         }
         if let Some(module) = node.as_module_node() {
             return self.walk_namespace(
@@ -352,27 +550,43 @@ impl Scanner {
                 &module.constant_path(),
                 module.body().as_ref(),
                 prefix,
+                ctx,
             );
         }
         if let Some(singleton_class) = node.as_singleton_class_node() {
-            // `class << self` flips the axis that separates `mutate.self` from
-            // `mutate.static`. An EMPTY one falls through to the ordinary
+            // `class << self` re-keys every definition inside onto the
+            // singleton class; `class << obj` opens a position no key names.
+            // The EXPRESSION keeps this context — only the body rebinds
+            // (`for_child`). An EMPTY one falls through to the ordinary
             // descent, exactly as upstream's `… if node.body` does.
             if let Some(body) = singleton_class.body() {
-                self.walk(&body, prefix, true);
+                self.walk(&singleton_class.expression(), prefix, ctx);
+                self.walk(&body, prefix, ctx.singleton_class(&singleton_class.expression()));
                 return;
             }
         }
         if let Some(def) = node.as_def_node() {
-            return self.enter_def(&def, prefix, singleton);
+            return self.enter_def(&def, prefix, ctx);
         }
         if let Some(call) = node.as_call_node() {
             if declaration(&call) {
-                return self.record_declaration(&call, prefix);
+                return self.record_declaration(&call, prefix, ctx);
             }
         }
         for child in children(node) {
-            self.walk(&child, prefix, singleton);
+            // `for_child` — only a call's literal BLOCK may rebind `self`;
+            // every other child keeps this context. The block is the call's
+            // only `BlockNode` child.
+            let child_ctx = match node.as_call_node() {
+                Some(call)
+                    if child.as_block_node().is_some()
+                        && call.block().is_some_and(|b| b.as_block_node().is_some()) =>
+                {
+                    ctx.block_ctx(&call)
+                }
+                _ => ctx,
+            };
+            self.walk(&child, prefix, child_ctx);
         }
     }
 
@@ -385,46 +599,58 @@ impl Scanner {
         path: &Node<'_>,
         body: Option<&Node<'_>>,
         prefix: &[String],
+        ctx: BodyCtx,
     ) {
         let Some(name) = qualified_name(path) else {
             // A constant path the syntax cannot name — upstream descends into
-            // the declaration's OWN children without entering a namespace.
+            // the declaration's OWN children keeping the OUTER context
+            // (`scanner.rb:156`), so `class (expr)` at top level declares
+            // nothing and one inside `class << self` keeps the singleton side.
             for child in children(node) {
-                self.walk(&child, prefix, false);
+                self.walk(&child, prefix, ctx);
             }
             return;
         };
         let mut nested = prefix.to_vec();
         nested.push(name);
         if let Some(body) = body {
-            self.walk(body, &nested, false);
+            self.walk(body, &nested, BodyCtx::CLASS_BODY);
         }
     }
 
-    fn enter_def(&mut self, node: &DefNode<'_>, prefix: &[String], singleton: bool) {
+    /// `ctx` is the `DefinitionContext` at the class-body position the `def`
+    /// sits at — `def_body` splits it into the unit's own context and its
+    /// key separator, and files nothing where no key names the method.
+    fn enter_def(&mut self, node: &DefNode<'_>, prefix: &[String], ctx: BodyCtx) {
+        let Some(unit_ctx) = ctx.def_body(node.receiver().as_ref()) else { return };
         self.add_unit(
             &class_name_for(prefix),
             &name_of(node.name().as_slice()),
-            singleton || node.receiver().is_some(),
+            unit_ctx,
             node.body().as_ref(),
             node.parameters().as_ref(),
+            false,
         );
     }
 
     /// Scans one unit and files its summary, then recurses into the units its
-    /// body declared.
+    /// body declared. `ctx` is the unit's own `DefinitionContext` — the key
+    /// separator is its `singleton` and the body walks with it.
     fn add_unit(
         &mut self,
         class_name: &str,
         method_name: &str,
-        singleton: bool,
+        ctx: BodyCtx,
         body: Option<&Node<'_>>,
         parameters: Option<&ParametersNode<'_>>,
+        shared_slot: bool,
     ) {
-        let key = format!("{class_name}{}{method_name}", if singleton { "." } else { "#" });
+        let key =
+            format!("{class_name}{}{method_name}", if ctx.singleton() { "." } else { "#" });
         let names = parameter_names(parameters);
         let mut scan = UnitScan::new(
-            singleton,
+            ctx,
+            shared_slot,
             method_name,
             names.clone(),
             block_parameter_name(parameters),
@@ -439,14 +665,19 @@ impl Scanner {
             self.add_unit(
                 class_name,
                 &unit.name,
-                singleton || unit.singleton,
+                unit.ctx,
                 unit.body.as_ref(),
                 unit.parameters.as_ref(),
+                unit.shared_slot,
             );
         }
     }
 
-    fn record_declaration(&mut self, node: &CallNode<'_>, prefix: &[String]) {
+    fn record_declaration(&mut self, node: &CallNode<'_>, prefix: &[String], ctx: BodyCtx) {
+        // `define_method` and the `attr_*` macros are calls on `self`, so they
+        // declare nothing where `module_call_body` is nil — the top level and
+        // every unplaceable position (`scanner.rb:289`, `:301`).
+        let Some(unit_ctx) = ctx.module_call() else { return };
         let class_name = class_name_for(prefix);
         match name_of(node.name().as_slice()).as_str() {
             // `include` / `prepend` record ancestry, which the transitive lane
@@ -457,28 +688,42 @@ impl Scanner {
                     self.add_unit(
                         &class_name,
                         &unit.name,
-                        unit.singleton,
+                        unit_ctx,
                         unit.body.as_ref(),
                         unit.parameters.as_ref(),
+                        unit.shared_slot,
                     );
                 }
             }
-            macro_name => self.synthesize_accessors(&class_name, macro_name, node),
+            macro_name => {
+                self.synthesize_accessors(&class_name, macro_name, node, unit_ctx.singleton())
+            }
         }
     }
 
     /// `attr_reader` / `attr_writer` / `attr_accessor` — synthesised: a reader
-    /// is ∅, a writer is `mutate.self`. Without them a caller's edge into an
-    /// accessor would read as unresolved.
-    fn synthesize_accessors(&mut self, class_name: &str, macro_name: &str, node: &CallNode<'_>) {
+    /// is ∅, a writer is `mutate.self` (`mutate.static` on the singleton side,
+    /// `scanner.rb:60-61`). Without them a caller's edge into an accessor
+    /// would read as unresolved.
+    fn synthesize_accessors(
+        &mut self,
+        class_name: &str,
+        macro_name: &str,
+        node: &CallNode<'_>,
+        keyed_singleton: bool,
+    ) {
+        let separator = if keyed_singleton { "." } else { "#" };
         for name in symbol_arguments(node) {
             if macro_name != "attr_writer" {
-                self.merge_unit(&format!("{class_name}#{name}"), Summary::default());
+                self.merge_unit(&format!("{class_name}{separator}{name}"), Summary::default());
             }
             if macro_name == "attr_reader" {
                 continue;
             }
-            self.merge_unit(&format!("{class_name}#{name}="), writer_summary());
+            self.merge_unit(
+                &format!("{class_name}{separator}{name}="),
+                writer_summary(keyed_singleton),
+            );
         }
     }
 
@@ -491,9 +736,16 @@ impl Scanner {
 /// a literal name whose block becomes that method's body.
 struct NestedUnit<'pr> {
     name: String,
-    singleton: bool,
+    /// The body's own `DefinitionContext` — `def_body`'s or
+    /// `module_call_body`'s answer at the def site. Its `singleton()` is the
+    /// key separator AND the body's `self` answer.
+    ctx: BodyCtx,
     body: Option<Node<'pr>>,
     parameters: Option<ParametersNode<'pr>>,
+    /// Whether the body runs on the special-variable slot of the body that
+    /// defined it rather than on one of its own — true for a `define_method`
+    /// block, false for a nested `def` (`unit_scan.rb:338`, `:348`).
+    shared_slot: bool,
 }
 
 /// `define_method(:literal) { … }` — the block becomes `literal`'s body, so the
@@ -510,12 +762,51 @@ fn define_method_unit<'pr>(node: &CallNode<'pr>) -> Option<NestedUnit<'pr>> {
     // A block's parameters are a `BlockParametersNode`, not a `ParametersNode`;
     // upstream's `parameter_names` takes only the latter, so a `define_method`
     // unit has no parameter names on either side.
-    Some(NestedUnit { name, singleton: false, body: block.body(), parameters: None })
+    // `ctx` is a placeholder — the two callers that file a unit overwrite it
+    // with `module_call_body`'s answer (the scanner's `record_declaration`,
+    // the unit walk's `visit_call_node`).
+    Some(NestedUnit {
+        name,
+        ctx: BodyCtx::UNKNOWN,
+        body: block.body(),
+        parameters: None,
+        shared_slot: true,
+    })
+}
+
+/// The name a global-variable WRITE binds, for every node kind upstream's
+/// write arm lists (`unit_scan.rb:374-376`): the plain, operator, `||=` and
+/// `&&=` forms, and the `GlobalVariableTargetNode` of a multiple assignment,
+/// a `for` loop or a `rescue =>` clause. None for any other node.
+fn gvar_write_name(node: &Node<'_>) -> Option<String> {
+    let name = if let Some(write) = node.as_global_variable_write_node() {
+        write.name()
+    } else if let Some(write) = node.as_global_variable_operator_write_node() {
+        write.name()
+    } else if let Some(write) = node.as_global_variable_or_write_node() {
+        write.name()
+    } else if let Some(write) = node.as_global_variable_and_write_node() {
+        write.name()
+    } else {
+        node.as_global_variable_target_node()?.name()
+    };
+    Some(name_of(name.as_slice()))
 }
 
 /// One method body, scanned into its direct summary.
 struct UnitScan<'pr> {
+    /// `context.singleton?` — this unit's `self` is a class object
+    /// (`definition_context.rb:82`). Upstream's IVAR_WRITE label reads the
+    /// unit-level bit, NOT the moving context — so it stays a fixed field
+    /// even now that `ctx` moves.
     singleton: bool,
+    /// `context` — the `DefinitionContext` the walk stands at (`@context`,
+    /// `unit_scan.rb:184`). Starts as the body's own and moves only inside a
+    /// `class <<` body or a rebinding call's block (`for_child`).
+    ctx: BodyCtx,
+    /// `unit_scan.rb:197` — see [`NestedUnit::shared_slot`]. A write to a
+    /// {`FRAME_LOCAL_GLOBALS`} name stays `global.write` when set.
+    shared_slot: bool,
     /// The unit's OWN selector, which is the one thing a `super` in its body
     /// names (`unit_scan.rb:249` reads `@method_name` for exactly this). It is
     /// the taint detail, and upstream renders it as `unresolved-super(name)`.
@@ -532,14 +823,18 @@ struct UnitScan<'pr> {
 
 impl<'pr> UnitScan<'pr> {
     fn new(
-        singleton: bool,
+        ctx: BodyCtx,
+        shared_slot: bool,
         method_name: &str,
         parameters: BTreeSet<String>,
         block_parameter: Option<String>,
         owned: BTreeSet<String>,
     ) -> Self {
+        let singleton = ctx.singleton();
         Self {
             singleton,
+            ctx,
+            shared_slot,
             method_name: method_name.to_string(),
             block_parameter,
             mutation: MutationClassifier::new(singleton, parameters, owned),
@@ -599,17 +894,21 @@ impl<'pr> UnitScan<'pr> {
         }
         if let Some(read) = node.as_global_variable_read_node() {
             let name = name_of(read.name().as_slice());
-            if !FRAME_LOCAL_GLOBALS.contains(&name.as_str()) {
+            // `UNCOLOURED_READS.include?` (`unit_scan.rb:373`).
+            if !FRAME_LOCAL_GLOBALS.contains(&name.as_str())
+                && !RESCUED_EXCEPTION_GLOBALS.contains(&name.as_str())
+            {
                 self.summary.add(GVAR_READ, ["global.read"]);
             }
             return;
         }
-        if node.as_global_variable_write_node().is_some()
-            || node.as_global_variable_operator_write_node().is_some()
-            || node.as_global_variable_or_write_node().is_some()
-            || node.as_global_variable_and_write_node().is_some()
-        {
-            return self.summary.add(GVAR_WRITE, ["global.write"]);
+        if let Some(name) = gvar_write_name(node) {
+            // `!@shared_slot && FRAME_LOCAL_GLOBALS.include?` verbatim
+            // (`unit_scan.rb:378`).
+            if self.shared_slot || !FRAME_LOCAL_GLOBALS.contains(&name.as_str()) {
+                self.summary.add(GVAR_WRITE, ["global.write"]);
+            }
+            return;
         }
         if node.as_class_variable_read_node().is_some() {
             return self.summary.add(CVAR_READ, ["global.read"]);
@@ -839,14 +1138,29 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
 
     /// A nested `def` is recorded and NOT descended into: its body belongs to
     /// its own summary, and the enclosing method gets nothing — a nested def is
-    /// deliberately not `mutate.static` (`unit_scan.rb:176`).
+    /// deliberately not `mutate.static` (`unit_scan.rb:176`). One the
+    /// `DefinitionContext` cannot place belongs to NO summary (`def_keyed_singleton`).
     fn visit_def_node(&mut self, node: &DefNode<'pr>) {
+        let Some(ctx) = self.ctx.def_body(node.receiver().as_ref()) else { return };
         self.nested.push(NestedUnit {
             name: name_of(node.name().as_slice()),
-            singleton: node.receiver().is_some(),
+            ctx,
             body: node.body(),
             parameters: node.parameters(),
+            shared_slot: false,
         });
+    }
+
+    /// `class <<` inside a method body — `for_child`'s `singleton_class_body`
+    /// (`definition_context.rb:139`). Only the BODY rebinds; the expression
+    /// keeps this context.
+    fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+        self.visit(&node.expression());
+        let Some(body) = node.body() else { return };
+        let rebound = self.ctx.singleton_class(&node.expression());
+        let outer = std::mem::replace(&mut self.ctx, rebound);
+        self.visit(&body);
+        self.ctx = outer;
     }
 
     fn visit_call_node(&mut self, node: &CallNode<'pr>) {
@@ -854,7 +1168,14 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
         // is the new method's body, and the enclosing method gains only the
         // `mutate.static` of having defined it.
         if let Some(unit) = define_method_unit(node) {
-            self.nested.push(unit);
+            // …but only where `self` is a class object: `module_call_body` is
+            // nil on an instance body, and the reference files NO unit for
+            // `def m; define_method(:x) { … }` (`unit_scan.rb:348`,
+            // `definition_context.rb:114`). The `mutate.static` lands either
+            // way.
+            if let Some(ctx) = self.ctx.module_call() {
+                self.nested.push(NestedUnit { ctx, ..unit });
+            }
             self.summary.add(DEFINE_METHOD, ["mutate.static"]);
             return;
         }
@@ -864,8 +1185,27 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
         // Upstream runs this on every call, claimed or not (`unit_scan.rb:232`).
         self.visit_block_argument(node);
         // Containment: a block literal's origins always join the enclosing
-        // method, so the walk descends into every child including the block.
-        ruby_prism::visit_call_node(self, node);
+        // method, so the walk descends into every child including the block —
+        // but only the literal block of an `*_eval` / anonymous-builder call
+        // may rebind the definition context (`for_child`; the receiver and
+        // the arguments keep this one). A `BlockArgumentNode` (`&blk`) never
+        // does (`definition_context.rb:59`).
+        if let Some(receiver) = node.receiver() {
+            self.visit(&receiver);
+        }
+        if let Some(arguments) = node.arguments() {
+            self.visit_arguments_node(&arguments);
+        }
+        if let Some(block) = node.block() {
+            if block.as_block_node().is_some() {
+                let rebound = self.ctx.block_ctx(node);
+                let outer = std::mem::replace(&mut self.ctx, rebound);
+                self.visit(&block);
+                self.ctx = outer;
+            } else {
+                self.visit(&block);
+            }
+        }
     }
 }
 
@@ -1146,11 +1486,26 @@ mod tests {
     }
 
     #[test]
-    fn define_method_inside_a_method_is_a_unit_and_mutate_static_on_the_encloser() {
+    fn define_method_inside_an_instance_method_is_no_unit_but_mutate_static_on_the_encloser() {
+        // MEASURED against the oracle: `define_method` is a call on `self`,
+        // and an instance method's `self` is no class —
+        // `DefinitionContext#module_call_body` is nil there, so the block
+        // belongs to no summary (`unit_scan.rb:348`). The `mutate.static` of
+        // performing the definition still lands on the enclosing unit.
         let found = summaries("class C\n def build\n  define_method(:lit) { @x = 1 }\n end\nend");
-        assert_eq!(found.keys().collect::<Vec<_>>(), ["C#build", "C#lit"]);
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["C#build"]);
         assert_eq!(found["C#build"], ["mutate.static"]);
+    }
+
+    #[test]
+    fn define_method_inside_a_singleton_method_stays_a_unit() {
+        // The same call inside `def self.build` runs with `self` as the class
+        // object, so `module_call_body` answers and the unit keys `C#lit`
+        // (`definition_context.rb:112`).
+        let found = summaries("class C\n def self.build\n  define_method(:lit) { @x = 1 }\n end\nend");
+        assert_eq!(found.keys().collect::<Vec<_>>(), ["C#lit", "C.build"]);
         assert_eq!(found["C#lit"], ["mutate.self"]);
+        assert_eq!(found["C.build"], ["mutate.static"]);
     }
 
     #[test]
@@ -1227,10 +1582,46 @@ mod tests {
 
     #[test]
     fn the_frame_local_globals_are_not_global_state() {
-        for special in ["$~", "$_", "$&", "$`", "$'", "$+", "$!"] {
+        // Reads: the frame-local pair and the rescued-exception pair are
+        // `UNCOLOURED_READS`; the match family stays silent because Prism
+        // spells it BackReference / NumberedReference nodes, not gvar reads
+        // (`unit_scan.rb:46`). `$?` / `$LAST_MATCH_INFO` keep the label.
+        for special in ["$~", "$_", "$!", "$@", "$&", "$`", "$'", "$+", "$1"] {
             assert!(one(&format!("  {special}")).is_empty(), "{special} read as global state");
         }
         assert_eq!(one("  $stdout"), ["global.read"]);
+        assert_eq!(one("  $?"), ["global.read"]);
+        assert_eq!(one("  $LAST_MATCH_INFO"), ["global.read"]);
+
+        // Writes: only `$~` and `$_` are frame-local. `$@ =` / `$! =` keep
+        // `global.write` — the write changes the exception the rescuing
+        // frame observes (`unit_scan.rb:54`).
+        assert!(one("  $_ = nil").is_empty());
+        assert!(one("  $~ = nil").is_empty());
+        assert!(one("  $_ ||= 1").is_empty());
+        assert!(one("  $~ += 1").is_empty());
+        assert_eq!(one("  $@ = bt"), ["global.write"]);
+        assert_eq!(one("  $! = e"), ["global.write"]);
+        assert_eq!(one("  $x = nil"), ["global.write"]);
+
+        // A gvar TARGET is a write too — a `for` variable or a multiple
+        // assignment (`unit_scan.rb:376`) — and the same pair suppresses.
+        assert_eq!(one("  for $g in list\n  end"), ["global.write"]);
+        assert_eq!(one("  $h, x = list"), ["global.write"]);
+        assert!(one("  for $_ in list\n  end").is_empty());
+        assert!(one("  $_, x = list").is_empty());
+    }
+
+    #[test]
+    fn a_define_method_body_shares_the_special_variable_slot() {
+        // Upstream's `shared_slot` (`unit_scan.rb:378`): a `define_method`
+        // block runs on the special-variable slot of the body that defined
+        // it — shared with every sibling defined there — so `$_`/`$~`
+        // writes stay `global.write`, while a nested `def`'s go quiet.
+        let found = summaries("class C\n define_method(:lit) { $_ = nil; $x = nil }\nend");
+        assert_eq!(found["C#lit"], ["global.write"]);
+        let nested = summaries("class C\n define_method(:lit) { def inner\n  $_ = nil\n end }\nend");
+        assert!(nested["C#inner"].is_empty());
     }
 
     #[test]
@@ -1544,11 +1935,17 @@ mod tests {
         // The singleton side reads the same, and the detail carries no sigil.
         let singleton = bits("class C\n def self.s\n  super\n end\nend");
         assert_eq!(singleton["C.s"], (false, vec![cause(UNRESOLVED_SUPER, Some("s"))]));
-        // A `define_method` block is the DEFINED method's body, so the `super`
-        // lands there rather than on the class body's enclosing unit.
-        let defined = bits("class C\n def m\n  define_method(:d) { super }\n end\nend");
+        // A `define_method` block is the DEFINED method's body — but only
+        // where `self` is a class object: inside an INSTANCE method the
+        // oracle's `module_call_body` is nil and no unit exists, so `m` keeps
+        // its `mutate.static` and nothing carries the `super`. Inside
+        // `def self.m` the unit exists and owns the taint.
+        let unplaceable = bits("class C\n def m\n  define_method(:d) { super }\n end\nend");
+        assert_eq!(unplaceable["C#m"], (true, vec![]));
+        assert!(!unplaceable.contains_key("C#d"));
+        let defined = bits("class C\n def self.m\n  define_method(:d) { super }\n end\nend");
         assert_eq!(defined["C#d"], (false, vec![cause(UNRESOLVED_SUPER, Some("d"))]));
-        assert_eq!(defined["C#m"], (true, vec![]));
+        assert_eq!(defined["C.m"], (true, vec![]));
     }
 
     #[test]
