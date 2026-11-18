@@ -12,8 +12,7 @@ note or ADR *first*. No status essays — hard byte budget.
 ## Now / Next
 
 ▶ NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494, plus the
-repin's filed residuals #600, #603–#605 (#604 is pin-induced and the
-highest-value next slice — computed class-body `include` opens the class).
+repin's filed residuals #600, #603, #605.
 Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
@@ -64,6 +63,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in every mixin list — computed class-body `include`/`send` opens the class (`taint_unrecorded_mixin`, `taint_computed_send`/`local_send_names`/`opens_self`, `extend_hook_taint`, `unnamed_mixin_on_chain`); scalar-path decline only, unions still fire. ~60 probe rows match; 2-round review closed 5 findings (hook-param vs chain, `?`-as-name leak, `eval_owner`, instance hook defs); sweep unmeasurable locally (no corpora). Follow-ups #617–#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
 - **2026-11-18 #448 frame-local specials + DefinitionContext placement** (PR #613): `UNCOLOURED_READS = {$~,$_,$!,$@}`, `{$~,$_}` writes gated on `!shared_slot` (+`GlobalVariableTargetNode`); `BodyCtx` ports `definition_context.rb` so `define_method`/`attr_*`/`def self.x` placement matches (killed master OVERs: units filed in method bodies, `class << obj`, non-self evals, anonymous builders; `def self.m{define_method}` re-keyed `C.x`→`C#x`). `effects --full` byte-identical; effects_diff 0 OVER; 6-gem reviewer differential MATCH=2414/0 OVER. Follow-ups #614–#616. [note](notes/20261118-issue-448-frame-local-specials.md)
 - **2026-11-18 #376 bundled-name tables tied to the pin** (PR #609): v0.4.8's `rigor-rbs-contract` had already desynced `BUNDLED_SKILL_NAMES` (oracle lists 18 skills, port listed 17); entry added + `bundled_name_tables_match_the_pinned_reference` re-derives both tables from the submodule (skips unpopulated; step-6 bump run is the tie — gate.sh sees no crates on a gitlink-only bump). 0 FP/8,251; follow-ups #610/#611. [note](notes/20261118-issue-376-bundled-name-tie.md)
 - **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer set + `class <<`-composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. 3 review rounds, ~135 probe rows identical; follow-ups #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
