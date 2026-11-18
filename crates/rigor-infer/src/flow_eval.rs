@@ -823,7 +823,7 @@ impl<'i> Typer<'i> {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) => ty,
             Type::Constant(s) => {
-                let class = crate::folding::scalar_class(&s);
+                let class = crate::folding::scalar_class(s);
                 self.nominal_or_untyped(class, interner)
             }
             Type::IntegerRange { .. } => self.nominal_or_untyped("Integer", interner),
