@@ -11,22 +11,18 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **IN FLIGHT: re-pin `v0.4.7 → v0.4.8`** (branch `claude/repin-v048`,
-draft PR #599). Raw bump done; mixin-call rework ported
-(#2995/#3004/#3007/#2998/#3010); the #2677 alias floor's copy-link slice
-ported (rest at #600) — fixture gate **0 FP, 959/1063**. Remaining before
-ready: sweep on the corpora host + review. See
-[note](notes/20261115-repin-v048.md).
-▶ NEXT after it: the ADR-127 floor's coverage cost; follow-ups #489–#494.
+▶ NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494, plus the
+repin's filed residuals #600, #603–#605 (#604 is pin-induced and the
+highest-value next slice — computed class-body `include` opens the class).
 Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
-- **Pin is `v0.4.7` on master** (`v0.4.8` on the repin branch; rbs 4.2.0
-  vendored). Both standing exception tables EMPTY; new entries are real
-  findings (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
+- **Pin is `v0.4.8` on master** (rbs 4.2.0 vendored). Both standing
+  exception tables EMPTY; new entries are real findings (`UPSTREAM.md`
+  hazards + overlay/`sig/shims` trap).
 
 State (verified 2026-11-05, at `v0.4.7`): harness **170 fixtures / 0
 unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 623
@@ -68,6 +64,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-18 upstream re-pin `v0.4.7 → v0.4.8`** (PR #599, human-merged) — mixin-call recording rework + #2677 alias-floor copy-link slice ported; three review rounds closed 13 blocking findings (partial include, transitive links, send mutations, dead-arm links, `*` over-decline); **0 FP fixture + ~8.7K-file sweep, 959/1063**; residuals #600, #603–#605. [note](notes/20261115-repin-v048.md)
 - **2026-11-12 #405 class-guard record drop** (PR #591): class guards drop rooted `h[k]` records via a decline-side `record_guards` overlay. 18 master FPs closed, 0 FP/658; follow-ups #595/#596. [note](notes/20261112-issue-405-class-guard-records.md)
 - **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` exit guards record `$~` + mandatory `$N`; `Regexp.last_match` no longer a nil source. 0 FP/658; follow-ups #597/#598. [note](notes/20261112-issue-449-match-globals.md)
 - **2026-11-12 #438 `class_ivar_scope` memo key** (PR #588): reads in one class body share the `IvarScope`; required shapes ~pre-#432 RSS, output byte-identical. [note](notes/20261112-issue-438-ivar-scope-memo.md)
