@@ -1226,3 +1226,58 @@ fn a_file_past_the_depth_bound_carries_the_refusal_message() {
         format!("rigor check: skipped a.rb: {}", d.message)
     );
 }
+
+/// The `BUNDLED_*_NAMES` tables are hand transcriptions of the pinned
+/// reference's `plugins/`, `examples/` and `skills/` trees (issue #376). A pin
+/// bump that adds or removes a bundled directory silently desyncs the
+/// `Unknown plugin:`/`Unknown skill:` error surface — this test is the
+/// mechanical tie: it re-derives the expected tables from the submodule the
+/// same way upstream does (`PluginCommand#discover` /
+/// `SkillCommand#discover_skills`: `Dir.children(root).sort`, directories
+/// only, and for skills only a directory holding a `SKILL.md`).
+#[test]
+fn bundled_name_tables_match_the_pinned_reference() {
+    let reference = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../reference/rigor");
+
+    let dir_names = |root: &std::path::Path, skill_md_only: bool| -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(root)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "cannot read {}: {e} — is the reference submodule populated? \
+                     run `git submodule update --init reference/rigor`",
+                    root.display()
+                )
+            })
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if !path.is_dir() {
+                    return None;
+                }
+                if skill_md_only && !path.join("SKILL.md").is_file() {
+                    return None;
+                }
+                path.file_name()?.to_str().map(str::to_owned)
+            })
+            .collect();
+        names.sort();
+        names
+    };
+
+    let expected_plugins = dir_names(&reference.join("plugins"), false)
+        .into_iter()
+        .chain(dir_names(&reference.join("examples"), false))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        BUNDLED_PLUGIN_NAMES, expected_plugins,
+        "BUNDLED_PLUGIN_NAMES desynced from the pinned reference — update the \
+         table in crates/rigor-cli/src/main.rs (UPSTREAM.md step 6)"
+    );
+
+    let expected_skills = dir_names(&reference.join("skills"), true);
+    assert_eq!(
+        BUNDLED_SKILL_NAMES, expected_skills,
+        "BUNDLED_SKILL_NAMES desynced from the pinned reference — update the \
+         table in crates/rigor-cli/src/main.rs (UPSTREAM.md step 6)"
+    );
+}

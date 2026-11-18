@@ -584,6 +584,8 @@ fn plugin_name_known(name: &str) -> bool {
 
 /// `discover(PLUGINS_ROOT) + discover(EXAMPLES_ROOT)` at the pinned ref —
 /// production plugins first, then the tutorial examples.
+/// `bundled_name_tables_match_the_pinned_reference` keeps this in sync with
+/// the submodule across pin bumps (issue #376).
 const BUNDLED_PLUGIN_NAMES: &[&str] = &[
     "rigor-ac-library-rb",
     "rigor-actioncable",
@@ -702,6 +704,8 @@ fn cmd_skill_named(name: &str) -> ExitCode {
 /// the names `name_error` prints, in directory order. The SKILL.md bodies are
 /// not shipped in the standalone build; this list exists only so the unknown-
 /// skill error surface matches the reference byte-for-byte.
+/// `bundled_name_tables_match_the_pinned_reference` keeps this in sync with
+/// the submodule across pin bumps (issue #376).
 const BUNDLED_SKILL_NAMES: &[&str] = &[
     "rigor-ask",
     "rigor-baseline-reduce",
@@ -716,6 +720,7 @@ const BUNDLED_SKILL_NAMES: &[&str] = &[
     "rigor-plugin-tune",
     "rigor-project-init",
     "rigor-protection-uplift",
+    "rigor-rbs-contract",
     "rigor-rbs-setup",
     "rigor-type-oracle",
     "rigor-unused-adjudicate",

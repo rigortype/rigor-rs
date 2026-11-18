@@ -496,7 +496,17 @@ chasing a non-bug.)
    ([ADR-0039](docs/adr/0039-shape-typing-tier.md)) — `ARRAY_NEW_TUPLE_LIMIT`
    (grep `method_dispatcher.rb`, empirically probe `Array.new(n)`-slice
    possible-nil around the boundary) and, once ported, the other
-   `constant_folding.rb` / `shape_dispatch.rb` limits.
+   `constant_folding.rb` / `shape_dispatch.rb` limits. The bundled-name tables
+   `BUNDLED_PLUGIN_NAMES` / `BUNDLED_SKILL_NAMES` in
+   `crates/rigor-cli/src/main.rs` are a second such surface: they transcribe
+   the reference's `plugins/` + `examples/` + `skills/` trees for the
+   `Unknown plugin:`/`Unknown skill:` error surface, and a bump that adds or
+   removes a bundled directory desyncs them silently (v0.4.8 added
+   `rigor-rbs-contract`; #376). The tie is mechanical —
+   `cargo test -p rigor-cli bundled_name_tables` re-derives both tables from
+   the submodule exactly the way `PluginCommand#discover` /
+   `SkillCommand#discover_skills` do and fails on any drift, so the ordinary
+   workspace test gate catches it.
 7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
    --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
    (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap
