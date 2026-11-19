@@ -1126,7 +1126,7 @@ impl<'i> Typer<'i> {
             if !(span.1 <= site.0 && site.0 < end) {
                 continue;
             }
-            let raw = if *rooted { format!("::{name}") } else { name.clone() };
+            let raw = if *rooted { format!("::{name}") } else { name.to_string() };
             let Some(module) = self.source.resolve_declared_constant_at(prefix, &raw) else {
                 continue;
             };

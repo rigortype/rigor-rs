@@ -11,8 +11,8 @@ use crate::ruby_prism::Node as PrismNode;
 
 use super::{
     constant_list_names, constant_path_string, constant_string, integer_decimal, integer_value,
-    lower_multi_targets, span_of, strict_constant_path_string, Builder, Node, NodeId,
-    StatementsKind, UNMATCHED,
+    lower_multi_targets, span_of, strict_constant_path_string, Builder, ConstName, ConstPathChain,
+    Node, NodeId, StatementsKind, UNMATCHED,
 };
 
 impl<'src> Builder<'src> {
@@ -404,7 +404,7 @@ impl<'src> Builder<'src> {
         }
         if let Some(cr) = node.as_constant_read_node() {
             return self.push(Node::ConstantRead {
-                name: constant_string(cr.name().as_slice()),
+                name: constant_string(cr.name().as_slice()).into(),
                 span: span_of(&cr.location()),
                 dynamic_base: false,
                 self_anchored: false,
@@ -528,26 +528,16 @@ impl<'src> Builder<'src> {
     /// computes all of them. Push order matches the recursive form exactly:
     /// the non-path base lowers first, then the levels inner to outer.
     fn lower_constant_path(&mut self, cp: crate::ruby_prism::ConstantPathNode<'_>) -> NodeId {
-        // Collect the path levels outermost→innermost; `base` is the
-        // innermost non-path parent (`None` for the `::A` rooted spelling).
-        let mut chain = vec![cp];
-        let base = loop {
-            match chain.last().unwrap().parent() {
-                Some(parent) => match parent.as_constant_path_node() {
-                    Some(next) => chain.push(next),
-                    None => break Some(parent),
-                },
-                None => break None,
-            }
-        };
+        // One shared chain walk (rigor-rs#657): `nodes` is outermost→innermost,
+        // `base` the innermost non-path parent (`None` for the `::A` rooted
+        // spelling).
+        let chain = ConstPathChain::collect(&cp.as_node()).expect("a path node collects");
 
         // `rooted` / `self_anchored` answer on the chain's leftmost segment,
         // which every level shares: `rooted` iff the innermost path node has
         // no parent (`::A`), `self_anchored` iff the base is `self`.
-        let rooted = base.is_none();
-        let self_anchored = base
-            .as_ref()
-            .is_some_and(|b| b.as_self_node().is_some());
+        let rooted = chain.rooted();
+        let self_anchored = chain.self_anchored();
 
         // The base lowers exactly as the recursive form's deepest
         // `lower_node` did: a bare `A` pushes its own `ConstantRead`, a
@@ -557,14 +547,17 @@ impl<'src> Builder<'src> {
         // name).
         let mut name = String::new();
         let mut strict_ok = true;
-        if let Some(base) = &base {
+        if let Some(base) = &chain.base {
             self.lower_node(base);
             name = constant_path_string(base);
             strict_ok = strict_constant_path_string(base).is_some();
         }
 
-        let mut id = UNMATCHED;
-        for cp in chain.iter().rev() {
+        // Every level's lenient name is a byte-PREFIX of the outermost level's,
+        // so build the full name once and hand each node a shared `ConstName`
+        // prefix (rigor-rs#657: per-level `String`s made this O(depth²) bytes).
+        let mut levels = Vec::with_capacity(chain.nodes.len());
+        for cp in chain.nodes.iter().rev() {
             let last = cp
                 .name()
                 .map(|n| constant_string(n.as_slice()))
@@ -576,10 +569,15 @@ impl<'src> Builder<'src> {
             }
             name.push_str(&last);
             strict_ok &= cp.name().is_some();
+            levels.push((name.len(), strict_ok));
+        }
+        let full: std::sync::Arc<str> = std::sync::Arc::from(name);
+        let mut id = UNMATCHED;
+        for (cp, &(len, level_strict)) in chain.nodes.iter().rev().zip(&levels) {
             id = self.push(Node::ConstantRead {
-                name: name.clone(),
+                name: ConstName::prefix_of(&full, len),
                 span: span_of(&cp.location()),
-                dynamic_base: !strict_ok,
+                dynamic_base: !level_strict,
                 self_anchored,
                 rooted,
             });

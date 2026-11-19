@@ -713,7 +713,7 @@ fn refined_using_regions(
             Some((s, p)) => (s.1, p.as_slice()),
             None => (file_end, &[]),
         };
-        let raw = if *rooted { format!("::{name}") } else { name.clone() };
+        let raw = if *rooted { format!("::{name}") } else { name.to_string() };
         if let Some(module) = source.resolve_declared_constant_at(prefix, &raw) {
             out.push((span.1, end, module));
         }
@@ -750,7 +750,7 @@ fn opaque_using_regions(
         };
         let declared = match ast.get(args[0]) {
             Node::ConstantRead { name, dynamic_base: false, self_anchored: false, rooted, .. } => {
-                let raw = if *rooted { format!("::{name}") } else { name.clone() };
+                let raw = if *rooted { format!("::{name}") } else { name.to_string() };
                 source.declares_constant_at(prefix, &raw)
             }
             _ => false,

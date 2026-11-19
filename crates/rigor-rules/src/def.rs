@@ -176,7 +176,7 @@ fn collect_rescue_bindings(
                         if !name.is_empty()
                             && (index.knows_class(name) || source.knows_class(name)) =>
                     {
-                        Some(name.clone())
+                        Some(name.to_string())
                     }
                     _ => None,
                 },

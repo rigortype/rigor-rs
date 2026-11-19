@@ -169,7 +169,7 @@ fn resolve_constant(
     // has the leading `::` stripped (`constant_path_string`), so detect it from
     // the RAW source slice instead.
     if raw_slice(source, *span).starts_with("::") {
-        return known_name(name, index, source_index).then(|| name.clone());
+        return known_name(name, index, source_index).then(|| name.to_string());
     }
 
     // Candidates: innermost-qualified first, outward, then the bare name.
@@ -179,7 +179,7 @@ fn resolve_constant(
             return Some(candidate);
         }
     }
-    known_name(name, index, source_index).then(|| name.clone())
+    known_name(name, index, source_index).then(|| name.to_string())
 }
 
 /// Presence check used to pick the lexical candidate — deliberately broader than

@@ -1239,7 +1239,7 @@ fn foreign_singleton_events(ast: &LoweredAst) -> Vec<(String, SingletonEvent)> {
     use rigor_parse::Span;
     let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
     let const_path = |r: Option<NodeId>| match r.map(|r| ast.get(r)) {
-        Some(Node::ConstantRead { name, .. }) if !name.is_empty() => Some(name.clone()),
+        Some(Node::ConstantRead { name, .. }) if !name.is_empty() => Some(name.to_string()),
         _ => None,
     };
     let self_or_none =

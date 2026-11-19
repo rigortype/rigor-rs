@@ -1542,7 +1542,7 @@ fn untyped_expr_root(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<Untyped
     }
     match ast.get(id) {
         Node::LocalVariableRead { name, .. } => Some(UntypedRoot::Local(name.clone())),
-        Node::ConstantRead { name, .. } => Some(UntypedRoot::Const(name.clone())),
+        Node::ConstantRead { name, .. } => Some(UntypedRoot::Const(name.to_string())),
         Node::VariableRead { name, .. } => {
             if let Some(rest) = name.strip_prefix("@@") {
                 (!rest.is_empty()).then(|| UntypedRoot::Cvar(name.clone()))

@@ -2,8 +2,8 @@
 //! `StatementsKind` / `JumpKind` / `RescueClause` payloads.
 
 use super::{
-    BlockParamKind, HashKey, IndexWrites, MethodBody, MultiTargets, NodeId, ParamShape, Span,
-    Visibility,
+    BlockParamKind, ConstName, HashKey, IndexWrites, MethodBody, MultiTargets, NodeId, ParamShape,
+    Span, Visibility,
 };
 
 /// One `rescue` clause of a `begin`/`def` rescue chain, in chain order — the
@@ -817,7 +817,9 @@ pub enum Node {
     /// `self` parent is not a constant), which is what its existing consumers
     /// already assumed.
     ConstantRead {
-        name: String,
+        /// [`ConstName`] — one `Arc` per chain, a prefix length per node
+        /// (rigor-rs#657); derefs to `&str`, so reads are unchanged.
+        name: ConstName,
         span: Span,
         dynamic_base: bool,
         self_anchored: bool,

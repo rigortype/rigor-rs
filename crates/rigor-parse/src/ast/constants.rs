@@ -47,36 +47,121 @@ pub struct ConstMutation {
     pub method: Option<String>,
 }
 
+/// One walk of a `ConstantPathNode` chain — the single traversal the lenient
+/// render, the strict render, the `rooted`/`self_anchored` flags and the
+/// lowering all share (rigor-rs#657: the recursive helpers each re-walked the
+/// chain, and the recursive `format!` render made a deep class/module header
+/// write O(depth²) bytes).
+pub(crate) struct ConstPathChain<'pr> {
+    /// The chain's `ConstantPathNode`s OUTERMOST first (`nodes[0]` is the node
+    /// `collect` was given — `A::B::C`'s node, whose `name()` is `"C"`).
+    pub nodes: Vec<ruby_prism::ConstantPathNode<'pr>>,
+    /// The innermost non-path parent: `None` for the rooted `::A` spelling,
+    /// else the chain's leftmost segment — a `ConstantReadNode` (`A::B`), a
+    /// `SelfNode` (`self::A`) or a dynamic expression (`expr::A`).
+    pub base: Option<PrismNode<'pr>>,
+}
+
+impl<'pr> ConstPathChain<'pr> {
+    /// Walk `node`'s parent links to the chain's base. `None` when `node` is
+    /// not a `ConstantPathNode` at all (the bare `ConstantReadNode` name case
+    /// has no chain — callers handle it before collecting).
+    pub(crate) fn collect(node: &PrismNode<'pr>) -> Option<Self> {
+        let cp = node.as_constant_path_node()?;
+        let mut nodes = vec![cp];
+        let base = loop {
+            match nodes.last().unwrap().parent() {
+                Some(parent) => match parent.as_constant_path_node() {
+                    Some(next) => nodes.push(next),
+                    None => break Some(parent),
+                },
+                None => break None,
+            }
+        };
+        Some(Self { nodes, base })
+    }
+
+    /// `Source::ConstantPath.rooted?` — `true` when the innermost path node
+    /// has no parent (the `::Foo` spelling re-anchors at the top level).
+    pub(crate) fn rooted(&self) -> bool {
+        self.base.is_none()
+    }
+
+    /// `self_anchored_tail` — `true` when the chain's leftmost segment is
+    /// `self` (`self::X`, `self::X::Y`).
+    pub(crate) fn self_anchored(&self) -> bool {
+        self.base.as_ref().is_some_and(|b| b.as_self_node().is_some())
+    }
+
+    /// The chain's segment names OUTERMOST last — i.e. innermost→outermost,
+    /// the order the lenient join appends them (`nodes` is outermost-first,
+    /// so this is `nodes` reversed). Each entry is `(segment-name, named)`:
+    /// `named` is `false` for a segment `name()` cannot answer (the strict
+    /// render declines the whole path on one).
+    fn segments(&self) -> impl Iterator<Item = (String, bool)> + '_ {
+        self.nodes.iter().rev().map(|cp| {
+            (
+                cp.name()
+                    .map(|n| constant_string(n.as_slice()))
+                    .unwrap_or_default(),
+                cp.name().is_some(),
+            )
+        })
+    }
+
+    /// The lenient render — what `constant_path_string` produced recursively:
+    /// the base's own lenient head (a `ConstantReadNode`'s name, `""` for any
+    /// other base) joined with every segment name in innermost→outermost
+    /// order, `::` inserted only before a non-empty tail.
+    pub(crate) fn lenient(&self) -> String {
+        let mut name = self
+            .base
+            .as_ref()
+            .map(|b| constant_path_string(b))
+            .unwrap_or_default();
+        for (last, _) in self.segments() {
+            if !name.is_empty() {
+                name.push_str("::");
+            }
+            name.push_str(&last);
+        }
+        name
+    }
+
+    /// The strict render — `qualified_name_or_nil`: `None` when the base is
+    /// anything but a constant read (`self`, a dynamic expression) or any
+    /// segment is un-namable. A rooted chain renders its un-rooted join.
+    pub(crate) fn strict(&self) -> Option<String> {
+        let mut name = match &self.base {
+            None => String::new(),
+            Some(b) => strict_constant_path_string(b)?,
+        };
+        for (last, named) in self.segments() {
+            if !named {
+                return None;
+            }
+            if !name.is_empty() {
+                name.push_str("::");
+            }
+            name.push_str(&last);
+        }
+        Some(name)
+    }
+}
+
 /// The dotted constant-path name of a `class`/`module` declaration's path node:
 /// `Point` -> `"Point"`, `Foo::Bar` -> `"Foo::Bar"`. A `ConstantReadNode` is the
-/// bare-name case; a `ConstantPathNode` is the `A::B` case (recurse on parent).
-/// Any other node (an unusual dynamic-constant form) yields an empty string,
-/// which the SourceIndex treats as un-namable (no instance typing for it).
+/// bare-name case; a `ConstantPathNode` is the `A::B` case (walked iteratively
+/// by [`ConstPathChain`]). Any other node (an unusual dynamic-constant form)
+/// yields an empty string, which the SourceIndex treats as un-namable (no
+/// instance typing for it).
 pub(crate) fn constant_path_string(node: &PrismNode<'_>) -> String {
     if let Some(cr) = node.as_constant_read_node() {
         return constant_string(cr.name().as_slice());
     }
-    if let Some(cp) = node.as_constant_path_node() {
-        // `name()` is the last component (`Bar` in `Foo::Bar`); the parent is the
-        // scope. `::Foo` has no parent (top-level) — render just the name.
-        let last = cp
-            .name()
-            .map(|n| constant_string(n.as_slice()))
-            .unwrap_or_default();
-        match cp.parent() {
-            Some(parent) => {
-                let head = constant_path_string(&parent);
-                if head.is_empty() {
-                    last
-                } else {
-                    format!("{head}::{last}")
-                }
-            }
-            None => last,
-        }
-    } else {
-        String::new()
-    }
+    ConstPathChain::collect(node)
+        .map(|chain| chain.lenient())
+        .unwrap_or_default()
 }
 
 /// Whether a constant-path node's leftmost ancestor is `self` (`self::X`,
@@ -85,19 +170,7 @@ pub(crate) fn constant_path_string(node: &PrismNode<'_>) -> String {
 /// `Prism::SelfNode` — every other base (`::`, a constant, a dynamic
 /// expression) answers `false`.
 pub(crate) fn self_anchored_constant_path(node: &PrismNode<'_>) -> bool {
-    let Some(mut cp) = node.as_constant_path_node() else {
-        return false;
-    };
-    while let Some(parent) = cp.parent() {
-        if parent.as_self_node().is_some() {
-            return true;
-        }
-        match parent.as_constant_path_node() {
-            Some(next) => cp = next,
-            None => return false,
-        }
-    }
-    false
+    ConstPathChain::collect(node).is_some_and(|c| c.self_anchored())
 }
 
 /// Whether a constant-path node is written with a leading `::` (`::Foo`,
@@ -107,18 +180,7 @@ pub(crate) fn self_anchored_constant_path(node: &PrismNode<'_>) -> bool {
 /// on no parent (rooted) or on a non-path base — a `ConstantReadNode` (bare
 /// `Foo`), a `SelfNode` (`self::Foo`) or a dynamic expression — which is not.
 pub(crate) fn rooted_constant_path(node: &PrismNode<'_>) -> bool {
-    let Some(mut cp) = node.as_constant_path_node() else {
-        return false;
-    };
-    loop {
-        match cp.parent() {
-            None => return true,
-            Some(parent) => match parent.as_constant_path_node() {
-                Some(next) => cp = next,
-                None => return false,
-            },
-        }
-    }
+    ConstPathChain::collect(node).is_some_and(|c| c.rooted())
 }
 
 /// The STRICT twin of [`constant_path_string`] — the reference's
@@ -131,12 +193,7 @@ pub(crate) fn strict_constant_path_string(node: &PrismNode<'_>) -> Option<String
     if let Some(cr) = node.as_constant_read_node() {
         return Some(constant_string(cr.name().as_slice()));
     }
-    let cp = node.as_constant_path_node()?;
-    let last = constant_string(cp.name()?.as_slice());
-    match cp.parent() {
-        None => Some(last),
-        Some(parent) => Some(format!("{}::{last}", strict_constant_path_string(&parent)?)),
-    }
+    ConstPathChain::collect(node)?.strict()
 }
 
 /// Upstream #540 (`fc3b8b42`) — the whole-file mutation census behind the
