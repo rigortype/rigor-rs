@@ -42,6 +42,7 @@
 //! post-guard scope already and is kept.
 
 use std::borrow::Cow;
+use std::rc::Rc;
 
 use rigor_parse::{LoweredAst, Node, NodeId, Span};
 use rigor_types::Interner;
@@ -302,7 +303,7 @@ impl<'i> Typer<'i> {
             for key in &g.keys {
                 if env.contains_key(key.as_str()) {
                     let u = interner.untyped();
-                    env.to_mut().insert(key.clone(), u);
+                    env.to_mut().insert(Rc::from(key.as_str()), u);
                 }
             }
         }

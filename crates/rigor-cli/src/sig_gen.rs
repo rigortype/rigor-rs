@@ -79,6 +79,7 @@
 //!   (an under-emit — a pre-existing inference gap, not a naming defect).
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -2395,7 +2396,7 @@ fn method_candidate(
     if let Some(names) = sig.params.as_ref() {
         let untyped = interner.untyped();
         for name in names {
-            entry.insert(name.clone(), untyped);
+            entry.insert(Rc::from(name.as_str()), untyped);
         }
     }
     // The def's own decisions: a Dynamic local narrowed by a type test and

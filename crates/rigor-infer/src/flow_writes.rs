@@ -5,6 +5,7 @@
 //! consume them.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rigor_parse::{Compound, IndexTargetKey, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, ShapeKey};
@@ -2012,8 +2013,24 @@ pub(crate) fn qualify_self(prefix: Option<&str>, name: &str) -> String {
 
 /// Widen (to `Dynamic`) every tracked local whose write span is contained in
 /// `span` — the conservative invalidation a control-flow construct applies.
-pub(crate) fn widen_flow_writes(
+/// The `writes` entries that can lie inside `span`: the tables
+/// [`Typer::class_narrowing_pass`] / [`Typer::collection_shape_snapshots`]
+/// thread are start-sorted, so this is a binary search, not a linear scan —
+/// a flat generated file used to pay a whole-table scan once per
+/// `if`/`case`/call (rigor-rs#424). Callers keep their own
+/// `wspan.0 >= span.0 && wspan.1 <= span.1` filter — the slice is only a
+/// superset bound (an entry starting inside may end past `span`).
+pub(crate) fn writes_within(
     writes: &[(rigor_parse::Span, String)],
+    span: rigor_parse::Span,
+) -> &[(rigor_parse::Span, String)] {
+    let lo = writes.partition_point(|(w, _)| w.0 < span.0);
+    let hi = writes.partition_point(|(w, _)| w.0 <= span.1);
+    &writes[lo..hi.max(lo)]
+}
+
+pub(crate) fn widen_flow_writes<'w>(
+    writes: impl Iterator<Item = &'w (rigor_parse::Span, String)>,
     span: rigor_parse::Span,
     env: &mut TypeEnv,
     interner: &mut Interner,
@@ -2021,7 +2038,7 @@ pub(crate) fn widen_flow_writes(
     let u = interner.untyped();
     for (wspan, name) in writes {
         if span.0 <= wspan.0 && wspan.1 <= span.1 {
-            env.insert(name.clone(), u);
+            env.insert(Rc::from(name.as_str()), u);
         }
     }
 }
@@ -2055,7 +2072,7 @@ pub(crate) fn widen_clause_entry(
         {
             continue;
         }
-        if let Some(ty) = env.get_mut(name) {
+        if let Some(ty) = env.get_mut(name.as_str()) {
             *ty = u;
         }
     }

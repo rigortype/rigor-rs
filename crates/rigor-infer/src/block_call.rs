@@ -5,6 +5,7 @@
 //! block-parameter splat tables.
 
 use std::collections::HashSet;
+use std::rc::Rc;
 
 use rigor_parse::{BlockParamKind, JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, Type, TypeId};
@@ -527,12 +528,12 @@ impl<'i> Typer<'i> {
         let mut benv = env.clone();
         let mut bound_first = false;
         for (name, kind) in block_params {
-            benv.remove(name);
+            benv.remove(name.as_str());
             if !bound_first
                 && !name.is_empty()
                 && matches!(kind, BlockParamKind::SelfArg | BlockParamKind::SelfOpt)
             {
-                benv.insert(name.clone(), element);
+                benv.insert(Rc::from(name.as_str()), element);
                 bound_first = true;
             }
         }
@@ -546,7 +547,7 @@ impl<'i> Typer<'i> {
             };
             if span.1 <= tail_offset {
                 let vty = self.type_of(ast, *value, &benv, interner);
-                benv.insert(name.clone(), vty);
+                benv.insert(Rc::from(name.as_str()), vty);
             }
         }
         benv
@@ -1665,7 +1666,7 @@ impl<'i> Typer<'i> {
             None
         };
         for (name, kind) in block_params {
-            benv.remove(name);
+            benv.remove(name.as_str());
             let bound = match kind {
                 BlockParamKind::SelfArg | BlockParamKind::SelfOpt => {
                     Some(match &splat {
@@ -1703,7 +1704,7 @@ impl<'i> Typer<'i> {
                 BlockParamKind::Block => Some(self.nominal_or_untyped("Proc", interner)),
             };
             if let Some(ty) = bound {
-                benv.insert(name.clone(), ty);
+                benv.insert(Rc::from(name.as_str()), ty);
             }
         }
         for &id in block_body {
@@ -1712,7 +1713,7 @@ impl<'i> Typer<'i> {
             };
             if span.1 <= offset {
                 let vty = self.type_of(ast, *value, &benv, interner);
-                benv.insert(name.clone(), vty);
+                benv.insert(Rc::from(name.as_str()), vty);
             }
         }
         benv

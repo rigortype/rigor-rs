@@ -5,6 +5,7 @@
 //! `flow.always-truthy-condition` reads.
 
 use std::borrow::Cow;
+use std::rc::Rc;
 use std::collections::HashMap;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
@@ -225,7 +226,7 @@ impl<'i> Typer<'i> {
                     {
                         Some(LoopContinuation::Fixpoint(bindings)) => {
                             for (n, ty) in bindings {
-                                env.insert(n, ty);
+                                env.insert(Rc::from(n.as_str()), ty);
                             }
                         }
                         Some(LoopContinuation::Structural(tracked, suspect)) => {
@@ -539,7 +540,7 @@ impl<'i> Typer<'i> {
                 }
                 let (name, value) = (name.clone(), *value);
                 let ty = self.type_of(ast, value, env, interner);
-                env.insert(name, ty);
+                env.insert(Rc::from(name.as_str()), ty);
             }
             // `a op= v` rebinds `a` to the fold of its entry binding and `v`:
             // `a = 1; a += 2` ⇒ `3`, `a = nil; a ||= 5` ⇒ `5`. Anything the
@@ -554,12 +555,12 @@ impl<'i> Typer<'i> {
                 }
                 let (name, value, op) = (name.clone(), *value, op.clone());
                 let v_ty = self.type_of(ast, value, env, interner);
-                let new_ty = match env.get(&name).copied() {
+                let new_ty = match env.get(name.as_str()).copied() {
                     Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
                     None => interner.untyped(),
                 };
                 drop_indexed_narrowings(env, &name);
-                env.insert(name, new_ty);
+                env.insert(Rc::from(name.as_str()), new_ty);
             }
             Node::Call { block_body, block_params, block_locals, block_span, .. } if !block_body.is_empty() => {
                 // A block may run and rebind a captured local — its
@@ -593,7 +594,7 @@ impl<'i> Typer<'i> {
                 self.replay_statements(ast, &mut block_env, block_body, interner, returns);
                 let untyped = interner.untyped();
                 for (name, ty) in block_env.iter() {
-                    if shadowed.contains(name) {
+                    if shadowed.iter().any(|b| b.as_str() == &**name) {
                         continue;
                     }
                     if env.get(name) != Some(ty) {
@@ -840,7 +841,7 @@ impl<'i> Typer<'i> {
                 continue;
             }
             let ty = env
-                .get(name)
+                .get(name.as_str())
                 .copied()
                 .unwrap_or_else(|| interner.untyped());
             // An untyped carrier is the guard map's domain — `subject_edge`
@@ -887,7 +888,7 @@ impl<'i> Typer<'i> {
             let mut e = entry.clone();
             Self::widen_names(&mut e, entry_stale, interner);
             for (name, ty) in binds.get(i).into_iter().flatten() {
-                e.insert(name.clone(), *ty);
+                e.insert(Rc::from(name.as_str()), *ty);
             }
             self.replay_statements(ast, &mut e, arm, interner, returns);
             arm_envs.push(e);
@@ -906,15 +907,15 @@ impl<'i> Typer<'i> {
         // path is `entry` itself — appended by callers below).
         for ae in &arm_envs {
             for (name, _) in ae.iter() {
-                if !bound.contains(name) {
-                    bound.push(name.clone());
+                if !bound.iter().any(|b| b.as_str() == &**name) {
+                    bound.push(name.to_string());
                 }
             }
         }
         for name in bound {
             // Only names an arm actually CHANGED need the join; a name no arm
             // rebinds keeps its entry binding.
-            if arm_envs.iter().all(|ae| ae.get(&name) == entry.get(&name)) {
+            if arm_envs.iter().all(|ae| ae.get(name.as_str()) == entry.get(name.as_str())) {
                 continue;
             }
             // An ivar unbound at entry reads its class seed there, not
@@ -922,7 +923,7 @@ impl<'i> Typer<'i> {
             let absent = if crate::def_local_marks::is_ivar(&name) { interner.untyped() } else { nil };
             let mut members: Vec<TypeId> = Vec::new();
             for ae in &arm_envs {
-                let ty = ae.get(&name).or_else(|| entry.get(&name)).copied().unwrap_or(absent);
+                let ty = ae.get(name.as_str()).or_else(|| entry.get(name.as_str())).copied().unwrap_or(absent);
                 if !members.contains(&ty) {
                     members.push(ty);
                 }
@@ -930,7 +931,7 @@ impl<'i> Typer<'i> {
             let joined = members.iter().skip(1).fold(members[0], |acc, &m| {
                 rigor_types::Algebra::join(interner, acc, m)
             });
-            env.insert(name, joined);
+            env.insert(Rc::from(name.as_str()), joined);
         }
         Self::widen_names(env, &suspect, interner);
     }
@@ -1020,7 +1021,7 @@ impl<'i> Typer<'i> {
         let mut names: Vec<String> = Vec::new();
         for name in marks.written_within(body_span) {
             if crate::def_local_marks::is_ivar(&name) {
-                if env.contains_key(&name) {
+                if env.contains_key(name.as_str()) {
                     names.push(name);
                 }
             } else {
@@ -1068,7 +1069,7 @@ impl<'i> Typer<'i> {
         // `Dynamic` would converge a pass earlier and keep pins the
         // reference's cap widen sheds (design-review of #437).
         if names.iter().any(|n| {
-            env.get(n)
+            env.get(n.as_str())
                 .map(|&t| Self::type_has_decline(interner, t))
                 .unwrap_or(false)
         }) {
@@ -1080,12 +1081,12 @@ impl<'i> Typer<'i> {
         // `except(*body_first)`).
         let overlay: Vec<String> = names
             .iter()
-            .filter(|n| env.contains_key(*n))
+            .filter(|n| env.contains_key(n.as_str()))
             .cloned()
             .collect();
         let mut assumption: HashMap<String, TypeId> = names
             .iter()
-            .map(|n| (n.clone(), env.get(n).copied().unwrap_or(nil)))
+            .map(|n| (n.clone(), env.get(n.as_str()).copied().unwrap_or(nil)))
             .collect();
         const CAP: usize = 3;
         self.loop_pass.set(true);
@@ -1093,7 +1094,7 @@ impl<'i> Typer<'i> {
             let last = iteration + 1 == CAP;
             let mut pass_env = env.clone();
             for n in &overlay {
-                pass_env.insert(n.clone(), assumption[n]);
+                pass_env.insert(Rc::from(n.as_str()), assumption[n]);
             }
             let mut returns = Vec::new();
             self.replay_statements(ast, &mut pass_env, body, interner, &mut returns);
@@ -1103,14 +1104,14 @@ impl<'i> Typer<'i> {
             if names.iter().any(|n| {
                 Self::type_has_decline(
                     interner,
-                    pass_env.get(n).copied().unwrap_or(assumption[n]),
+                    pass_env.get(n.as_str()).copied().unwrap_or(assumption[n]),
                 )
             }) {
                 structural!();
             }
             let mut stable = true;
             for n in &names {
-                let exit_ty = pass_env.get(n).copied().unwrap_or(assumption[n]);
+                let exit_ty = pass_env.get(n.as_str()).copied().unwrap_or(assumption[n]);
                 if last {
                     let base = self.widen_value_pinned(assumption[n], interner);
                     let exit_w = self.widen_value_pinned(exit_ty, interner);
@@ -1200,7 +1201,7 @@ impl<'i> Typer<'i> {
         let mut names: Vec<String> = Vec::new();
         for name in marks.written_within(body_span) {
             if crate::def_local_marks::is_ivar(&name) {
-                if env.contains_key(&name) {
+                if env.contains_key(name.as_str()) {
                     names.push(name);
                 }
             } else {
@@ -1437,13 +1438,13 @@ impl<'i> Typer<'i> {
     ) {
         let untyped = interner.untyped();
         for n in tracked {
-            let Some(&post) = env.get(n) else { continue };
+            let Some(&post) = env.get(n.as_str()) else { continue };
             let widened = if suspect.contains(n) {
                 untyped
             } else {
                 self.widen_value_pinned(post, interner)
             };
-            env.insert(n.clone(), widened);
+            env.insert(Rc::from(n.as_str()), widened);
         }
     }
 
@@ -1488,8 +1489,9 @@ impl<'i> Typer<'i> {
                 return CheckFlow {
                     env,
                     boundaries: Vec::new(),
-                    rebinds: Vec::new(),
-                    mutations: Vec::new(),
+                    boundary_stmts: Vec::new(),
+                    boundary_stride: 1,
+                    effects: FlowEffects::new(Vec::new(), Vec::new()),
                     closure_mutations: Vec::new(),
                     indexed: IndexedFlow::default(),
                     dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
@@ -1548,19 +1550,32 @@ impl<'i> Typer<'i> {
         let record = !(rebinds.is_empty() && mutations.is_empty() && closure_muts.is_empty())
             || dead.has_folded()
             || dead.has_rescue();
+        // A boundary env per statement is a full clone of a growing map —
+        // O(statements × env size) time and memory on a flat file
+        // (rigor-rs#424). Checkpoints at `stride` spacing bound the table
+        // to ~sqrt(N) envs; `check_env_at` replays the ≤ stride-1
+        // statements between a checkpoint and the queried one through the
+        // same `bind_check_statement`, so the env it sees is identical.
+        let stride = (body.len() as f64).sqrt().ceil().max(1.0) as usize;
         let mut boundaries = Vec::new();
-        for stmt in body {
+        let mut boundary_stmts = Vec::with_capacity(body.len());
+        let effects = FlowEffects::new(rebinds, mutations);
+        for (i, &stmt) in body.iter().enumerate() {
             if record {
-                boundaries.push((stmt, env.clone()));
+                boundary_stmts.push((stmt, ast.get(stmt).span()));
+                if i % stride == 0 {
+                    boundaries.push((i, env.clone()));
+                }
             }
-            self.bind_check_statement(ast, stmt, &mut env, &rebinds, &mutations, &indexed, &dead, interner);
+            self.bind_check_statement(ast, stmt, &mut env, &effects, &indexed, &dead, interner);
         }
         let record_guards = self.collect_record_guards(ast, &indexed);
         CheckFlow {
             env,
             boundaries,
-            rebinds,
-            mutations,
+            boundary_stmts,
+            boundary_stride: stride,
+            effects,
             closure_mutations: closure_muts,
             indexed,
             dead,
@@ -1737,7 +1752,7 @@ impl<'i> Typer<'i> {
                         );
                         if e != crate::loop_edges::Edge::Keep {
                             let u = interner.untyped();
-                            env.to_mut().insert(name.clone(), u);
+                            env.to_mut().insert(Rc::from(name.as_str()), u);
                             drop_indexed_narrowings(env.to_mut(), name);
                         }
                     }
@@ -1747,7 +1762,7 @@ impl<'i> Typer<'i> {
                         use crate::loop_edges::Edge;
                         if t == Edge::Other || f == Edge::Other {
                             let u = interner.untyped();
-                            env.to_mut().insert(name.clone(), u);
+                            env.to_mut().insert(Rc::from(name.as_str()), u);
                             drop_indexed_narrowings(env.to_mut(), name);
                         }
                     }
@@ -1798,7 +1813,7 @@ impl<'i> Typer<'i> {
                 if !self.loop_edge_keeps(ast, l.id, name, ty, side, interner) {
                     let u = interner.untyped();
                     let env = env.to_mut();
-                    env.insert(name.clone(), u);
+                    env.insert(Rc::from(name.as_str()), u);
                     drop_indexed_narrowings(env, name);
                 }
             }
@@ -1827,18 +1842,28 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> Cow<'f, TypeEnv> {
         let base: Cow<'f, TypeEnv> = 'env: {
-            let Some(&(stmt, ref pre)) = flow.boundaries.iter().find(|(id, _)| {
-                let s = ast.get(*id).span();
-                s.0 <= site.0 && site.1 <= s.1
-            }) else {
+            // The containing statement: `boundary_stmts` is in program
+            // (span) order and top-level statements never overlap, so the
+            // last one starting at or before the site is the only
+            // candidate — a binary search, not the per-statement `find`
+            // this used to run (rigor-rs#424).
+            let k = flow
+                .boundary_stmts
+                .partition_point(|(_, s)| s.0 <= site.0);
+            let Some(&(stmt, stmt_span)) = k
+                .checked_sub(1)
+                .and_then(|i| flow.boundary_stmts.get(i))
+            else {
                 break 'env Cow::Borrowed(&flow.env);
             };
-            let stmt_span = ast.get(stmt).span();
+            if !(stmt_span.0 <= site.0 && site.1 <= stmt_span.1) {
+                break 'env Cow::Borrowed(&flow.env);
+            }
             // rigor-rs#368 — a site inside a `rescue` clause also needs the
             // replay even when no write postdates its statement: the clause's
             // own bindings (`rescue => e`) reach only through it.
-            let later = flow.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
-                || flow.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0)
+            let later = flow.effects.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
+                || flow.effects.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0)
                 || flow
                     .closure_mutations
                     .iter()
@@ -1847,7 +1872,22 @@ impl<'i> Typer<'i> {
             if !later {
                 break 'env Cow::Borrowed(&flow.env);
             }
-            let mut env = pre.clone();
+            // The env before `stmt`: the checkpoint at or before its index
+            // plus the same `bind_check_statement` replay the flat env ran
+            // over the ≤ `boundary_stride` statements in between — the env
+            // is byte-identical to the per-statement snapshot this
+            // replaced (rigor-rs#424).
+            let ci = flow
+                .boundaries
+                .partition_point(|&(i, _)| i < k)
+                .saturating_sub(1);
+            let (cp_idx, ref cp_env) = flow.boundaries[ci];
+            let mut env = cp_env.clone();
+            for &(s, _) in &flow.boundary_stmts[cp_idx..k - 1] {
+                self.bind_check_statement(
+                    ast, s, &mut env, &flow.effects, &flow.indexed, &flow.dead, interner,
+                );
+            }
             self.entry_descend(ast, stmt, site, true, false, &mut env, flow, interner);
             Cow::Owned(env)
         };
@@ -1868,11 +1908,11 @@ impl<'i> Typer<'i> {
             let mut env = base.into_owned();
             for (name, op) in subjects {
                 let cur = env
-                    .get(name)
+                    .get(name.as_str())
                     .copied()
                     .unwrap_or_else(|| interner.untyped());
                 let narrowed = self.dead_subject_type(ast, cur, op, interner);
-                env.insert(name.clone(), narrowed);
+                env.insert(Rc::from(name.as_str()), narrowed);
             }
             return Cow::Owned(env);
         }
@@ -1953,7 +1993,7 @@ impl<'i> Typer<'i> {
                     for (name, ty) in
                         self.predicate_edge_binds(ast, predicate, env, edge, interner)
                     {
-                        env.insert(name, ty);
+                        env.insert(Rc::from(name.as_str()), ty);
                     }
                 }
                 // rigor-rs#368 — a folded-dead arm never runs: the site reads
@@ -1980,9 +2020,7 @@ impl<'i> Typer<'i> {
                         self.bind_check_statement(
                             ast,
                             s,
-                            env,
-                            &flow.rebinds,
-                            &flow.mutations,
+                            env, &flow.effects,
                             &flow.indexed,
                             &flow.dead,
                             interner,
@@ -2033,7 +2071,7 @@ impl<'i> Typer<'i> {
                         if let (Some(&f), Some(&l)) = (main_body.first(), main_body.last()) {
                             let region = (ast.get(f).span().0, ast.get(l).span().1);
                             widen_clause_entry(
-                                &flow.rebinds, region, &flow.indexed.scope_spans, env, interner,
+                                &flow.effects.rebinds, region, &flow.indexed.scope_spans, env, interner,
                             );
                         }
                         for rs in clauses
@@ -2041,18 +2079,18 @@ impl<'i> Typer<'i> {
                             .filter(|rc| self.clause_retries(ast, rc.span))
                             .map(|rc| rc.span)
                         {
-                            widen_flow_writes(&flow.rebinds, rs, env, interner);
+                            widen_flow_writes(flow.effects.rebinds.iter(), rs, env, interner);
                         }
                         // `rescue => e` binds the exception inside the arm —
                         // `bind_rescue_reference` on the oracle
                         // (`statement_evaluator.rb:5100`).
                         if let Some(name) = c.bound_name.clone() {
                             let ty = self.rescue_reference_type(ast, c, interner);
-                            env.insert(name, ty);
+                            env.insert(Rc::from(name.as_str()), ty);
                         }
                         for &pre_s in c.body.iter().take_while(|&x| *x != s) {
                             self.bind_check_statement(
-                                ast, pre_s, env, &flow.rebinds, &flow.mutations, &flow.indexed, &flow.dead, interner,
+                                ast, pre_s, env, &flow.effects, &flow.indexed, &flow.dead, interner,
                             );
                         }
                         self.entry_descend(ast, s, site, false, preserve_env, env, flow, interner);
@@ -2210,9 +2248,7 @@ impl<'i> Typer<'i> {
                 self.bind_check_statement(
                     ast,
                     child,
-                    env,
-                    &flow.rebinds,
-                    &flow.mutations,
+                    env, &flow.effects,
                     &flow.indexed,
                     &flow.dead,
                     interner,
@@ -2418,17 +2454,17 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         let span = ast.get(id).span();
-        for (wspan, name) in &flow.rebinds {
+        for (wspan, name) in &flow.effects.rebinds {
             if wspan.0 >= span.0
                 && wspan.1 <= span.1
                 && flow.dead.write_reaches(*wspan, site)
             {
                 let u = interner.untyped();
-                env.insert(name.clone(), u);
+                env.insert(Rc::from(name.as_str()), u);
                 drop_indexed_narrowings(env, name);
             }
         }
-        for (wspan, name, method, drop_key) in &flow.mutations {
+        for (wspan, name, method, drop_key) in &flow.effects.mutations {
             if wspan.0 >= span.0
                 && wspan.1 <= span.1
                 && flow
@@ -2778,16 +2814,16 @@ impl<'i> Typer<'i> {
             if let Some(&pre) = env.get(name) {
                 if evaluated {
                     if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
-                        env.insert(name.to_string(), widened);
+                        env.insert(Rc::from(name), widened);
                     }
                 } else {
-                    env.insert(name.to_string(), interner.untyped());
+                    env.insert(Rc::from(name), interner.untyped());
                 }
             }
         }
         self.floor_alias_linked(ast, indexed, name, method, wspan, false, env, interner);
         if let Some((key, ty)) = stored {
-            env.insert(key, ty);
+            env.insert(Rc::from(key.as_str()), ty);
         }
     }
 
@@ -2853,13 +2889,13 @@ impl<'i> Typer<'i> {
             }
         }
         for other in queue.iter().skip(1) {
-            if let Some(&pre) = env.get(other) {
+            if let Some(&pre) = env.get(other.as_str()) {
                 if part_only && !self.mutable_parts(pre, interner) {
                     continue;
                 }
                 if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
                     if widened != pre {
-                        env.insert(other.clone(), widened);
+                        env.insert(Rc::from(other.as_str()), widened);
                     }
                 }
             }
@@ -2922,7 +2958,7 @@ impl<'i> Typer<'i> {
         // propagates: `break h[:a] << 2` keeps `h[:a]`'s `"s" | 1`
         // (rigor-rs#363).
         let lookup = indexed_narrowing_key(&m.name, &m.key);
-        let recorded = env.get(&lookup).copied();
+        let recorded = env.get(lookup.as_str()).copied();
         // Upstream #2677: a mutator on `name`'s element mutates the shared
         // object a copy `x = name` also holds — the copy's whole carrier
         // goes stale, not just the touched slot — but only when the copy
@@ -2943,7 +2979,7 @@ impl<'i> Typer<'i> {
             .operand(m.span)
             .unwrap_or_else(|| self.path_operand_evaluated(ast, root, m.span))
         {
-            env.remove(&lookup);
+            env.remove(lookup.as_str());
             return;
         }
         let widened = self
@@ -2951,10 +2987,10 @@ impl<'i> Typer<'i> {
             .or_else(|| self.string_slot_floor(recorded, &m.method, interner));
         match widened {
             Some(ty) => {
-                env.insert(lookup, ty);
+                env.insert(Rc::from(lookup.as_str()), ty);
             }
             None => {
-                env.remove(&lookup);
+                env.remove(lookup.as_str());
             }
         }
     }
@@ -3407,13 +3443,12 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         env: &mut TypeEnv,
-        rebinds: &[(rigor_parse::Span, String)],
-        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        effects: &FlowEffects,
         indexed: &IndexedFlow,
         dead: &crate::dead::DeadPositions,
         interner: &mut Interner,
     ) {
-        self.bind_check_statement_effects(ast, id, env, rebinds, mutations, indexed, dead, interner);
+        self.bind_check_statement_effects(ast, id, env, effects, indexed, dead, interner);
         drop_retry_edge_records(indexed, ast.get(id).span(), false, env);
     }
 
@@ -3423,8 +3458,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         id: NodeId,
         env: &mut TypeEnv,
-        rebinds: &[(rigor_parse::Span, String)],
-        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        effects: &FlowEffects,
         indexed: &IndexedFlow,
         dead: &crate::dead::DeadPositions,
         interner: &mut Interner,
@@ -3432,9 +3466,11 @@ impl<'i> Typer<'i> {
         match ast.get(id) {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
-                widen_flow_writes(rebinds, vspan, env, interner);
-                self.drop_indexed_rebinds(rebinds, vspan, env);
-                self.widen_mutated_locals(ast, mutations.iter(), indexed, *value, vspan, env, interner);
+                widen_flow_writes(effects.rebinds_within(vspan), vspan, env, interner);
+                self.drop_indexed_rebinds(effects.rebinds_within(vspan), vspan, indexed, env);
+                self.widen_mutated_locals(
+                    ast, effects.mutations_within(vspan), indexed, *value, vspan, env, interner,
+                );
                 self.bind_statement(ast, id, env, interner);
                 // An `h[k]` index target stores through `[]=` on the POST-binding
                 // scope — `swap, swap[:a] = swap, 1` stores into the object `swap`
@@ -3445,7 +3481,9 @@ impl<'i> Typer<'i> {
                 // as a straight-line `h[k] = v` gets.
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
                     for (_, tspan, _) in targets.index_writes() {
-                        self.widen_mutated_locals(ast, mutations.iter(), indexed, id, tspan, env, interner);
+                        self.widen_mutated_locals(
+                            ast, effects.mutations_within(tspan), indexed, id, tspan, env, interner,
+                        );
                     }
                 }
             }
@@ -3456,7 +3494,7 @@ impl<'i> Typer<'i> {
             // changes nothing (rigor-rs#153).
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for &s in body {
-                    self.bind_check_statement(ast, s, env, rebinds, mutations, indexed, dead, interner);
+                    self.bind_check_statement(ast, s, env, effects, indexed, dead, interner);
                 }
             }
             // rigor-rs#368 — `live_branch_for_if`: a certainty-folded
@@ -3479,18 +3517,22 @@ impl<'i> Typer<'i> {
                         } else {
                             else_body.clone()
                         };
-                        let live_rebinds: Vec<_> = rebinds
-                            .iter()
+                        // Only the effects INSIDE the `if`'s span are ever
+                        // applied — every consumer below keeps the span
+                        // check — so the tables' span slice replaces the
+                        // whole-table scan (rigor-rs#424).
+                        let live_rebinds: Vec<_> = effects
+                            .rebinds_within(span)
                             .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                             .cloned()
                             .collect();
-                        let live_mutations = mutations
-                            .iter()
-                            .filter(|(w, _, m, _)| {
+                        let live_mutations = effects.mutations_within(span).filter(
+                            |(w, _, m, _)| {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                            });
-                        widen_flow_writes(&live_rebinds, span, env, interner);
-                        self.drop_indexed_rebinds(&live_rebinds, span, env);
+                            },
+                        );
+                        widen_flow_writes(live_rebinds.iter(), span, env, interner);
+                        self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                         self.widen_mutated_locals(
                             ast, live_mutations, indexed, id, span, env, interner,
                         );
@@ -3502,16 +3544,19 @@ impl<'i> Typer<'i> {
                         // rigor-rs#362 — a non-folded `if`'s terminated arm
                         // still evaluates but its scope dies at the join:
                         // its writes must not widen the post-`if` env.
-                        let live_rebinds: Vec<_> = rebinds
-                            .iter()
+                        // Same in-span slice as the folded arm above —
+                        // `widen_*`/`drop_*`/`arm_write_ty` only ever read
+                        // the inside-`span` entries (rigor-rs#424).
+                        let live_rebinds: Vec<_> = effects
+                            .rebinds_within(span)
                             .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                             .cloned()
                             .collect();
-                        let live_mutations = mutations
-                            .iter()
-                            .filter(|(w, _, m, _)| {
+                        let live_mutations = effects.mutations_within(span).filter(
+                            |(w, _, m, _)| {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                            });
+                            },
+                        );
                         // rigor-rs#443 — the post-`if` env JOINS a conditional
                         // write's value with the entry type, not a blanket
                         // `Dynamic`: `v = nil if p` on `v = nil` keeps `nil`
@@ -3589,7 +3634,7 @@ impl<'i> Typer<'i> {
                             } else {
                                 (then_body, else_body)
                             };
-                            let entry_for_write = env.get(name).copied().unwrap_or_else(|| interner.untyped());
+                            let entry_for_write = env.get(name.as_str()).copied().unwrap_or_else(|| interner.untyped());
                             let t_write = arm_write_ty(self, ast, env, truthy_body, name, entry_for_write, interner);
                             let f_write = arm_write_ty(self, ast, env, falsey_body, name, entry_for_write, interner);
                             // A terminating arm contributes the entry type —
@@ -3600,7 +3645,7 @@ impl<'i> Typer<'i> {
                             let t_term = !truthy_body.is_empty() && crate::class_narrowing::branch_terminates(ast, truthy_body);
                             let f_term = !falsey_body.is_empty() && crate::class_narrowing::branch_terminates(ast, falsey_body);
                             let u = interner.untyped();
-                            let entry_ty = env.get(name).copied().unwrap_or(u);
+                            let entry_ty = env.get(name.as_str()).copied().unwrap_or(u);
                             let t_ty = match (t_term, t_write) {
                                 (true, _) => entry_ty,
                                 (false, Some(v)) => v,
@@ -3613,9 +3658,9 @@ impl<'i> Typer<'i> {
                             };
                             let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
                             drop_indexed_narrowings(env, name);
-                            env.insert(name.clone(), j);
+                            env.insert(Rc::from(name.as_str()), j);
                         }
-                        self.drop_indexed_rebinds(&live_rebinds, span, env);
+                        self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                         self.widen_mutated_locals(
                             ast, live_mutations, indexed, id, span, env, interner,
                         );
@@ -3629,18 +3674,16 @@ impl<'i> Typer<'i> {
             // fires `for 1` on the oracle — `x` keeps its pre-begin binding).
             Node::BeginRescue { clauses, .. } if !clauses.is_empty() => {
                 let span = ast.get(id).span();
-                let live_rebinds: Vec<_> = rebinds
-                    .iter()
+                let live_rebinds: Vec<_> = effects
+                    .rebinds_within(span)
                     .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                     .cloned()
                     .collect();
-                let live_mutations = mutations
-                    .iter()
-                    .filter(|(w, _, m, _)| {
-                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                    });
-                widen_flow_writes(&live_rebinds, span, env, interner);
-                self.drop_indexed_rebinds(&live_rebinds, span, env);
+                let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
+                    dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                });
+                widen_flow_writes(live_rebinds.iter(), span, env, interner);
+                self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
             }
             Node::Loop { predicate, body, kind, .. } => {
@@ -3666,23 +3709,21 @@ impl<'i> Typer<'i> {
                 } else {
                     None
                 };
-                let live_rebinds: Vec<_> = rebinds
-                    .iter()
+                let live_rebinds: Vec<_> = effects
+                    .rebinds_within(span)
                     .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                     .cloned()
                     .collect();
-                let live_mutations = mutations
-                    .iter()
-                    .filter(|(w, _, m, _)| {
-                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                    });
-                widen_flow_writes(&live_rebinds, span, env, interner);
-                self.drop_indexed_rebinds(&live_rebinds, span, env);
+                let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
+                    dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                });
+                widen_flow_writes(live_rebinds.iter(), span, env, interner);
+                self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
                 match cont {
                     Some(LoopContinuation::Fixpoint(bindings)) => {
                         for (n, ty) in bindings {
-                            env.insert(n, ty);
+                            env.insert(Rc::from(n.as_str()), ty);
                         }
                     }
                     Some(LoopContinuation::Structural(tracked, suspect)) => {
@@ -3699,18 +3740,16 @@ impl<'i> Typer<'i> {
                 // needs the same drop: a write inside an
                 // evaluated-but-join-dropped position must not widen the
                 // post-statement scope.
-                let live_rebinds: Vec<_> = rebinds
-                    .iter()
+                let live_rebinds: Vec<_> = effects
+                    .rebinds_within(span)
                     .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                     .cloned()
                     .collect();
-                let live_mutations = mutations
-                    .iter()
-                    .filter(|(w, _, m, _)| {
-                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                    });
-                widen_flow_writes(&live_rebinds, span, env, interner);
-                self.drop_indexed_rebinds(&live_rebinds, span, env);
+                let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
+                    dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                });
+                widen_flow_writes(live_rebinds.iter(), span, env, interner);
+                self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
             }
         }
@@ -3861,7 +3900,7 @@ impl<'i> Typer<'i> {
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
-        self.drop_indexed_rebinds(rebinds, span, env);
+        self.drop_indexed_rebinds(rebinds.iter(), span, indexed, env);
         // Merge the three event lists by span start; kind order on a tie is
         // drop < insert < slot-widen (a `h[k] = v` after the `||=` still
         // drops the record the `||=` just wrote).
@@ -3909,7 +3948,7 @@ impl<'i> Typer<'i> {
                     }
                 }
                 Ev::Insert(i) => {
-                    env.insert(stored[i].1.clone(), stored[i].2);
+                    env.insert(Rc::from(stored[i].1.as_str()), stored[i].2);
                 }
                 Ev::SlotMut(i) => {
                     // `join_block_break_bindings` drops the widening
@@ -3951,12 +3990,21 @@ impl<'i> Typer<'i> {
 
     /// `Scope#type_of=`'s rebind invalidation: a local rebound anywhere in
     /// `span` drops every indexed narrowing rooted at it.
-    fn drop_indexed_rebinds(
+    fn drop_indexed_rebinds<'r>(
         &self,
-        rebinds: &[(rigor_parse::Span, String)],
+        rebinds: impl Iterator<Item = &'r (rigor_parse::Span, String)>,
         span: rigor_parse::Span,
+        indexed: &IndexedFlow,
         env: &mut TypeEnv,
     ) {
+        // A `name\u{1f}key` env entry is only ever minted from an
+        // `indexed.slot_writes` record — where there are none the O(env)
+        // `retain` inside `drop_indexed_narrowings` cannot find anything,
+        // and a flat generated file pays it once per statement
+        // (rigor-rs#424).
+        if indexed.slot_writes.is_empty() {
+            return;
+        }
         for (wspan, name) in rebinds {
             if wspan.0 >= span.0 && wspan.1 <= span.1 {
                 drop_indexed_narrowings(env, name);
@@ -4034,7 +4082,7 @@ impl<'i> Typer<'i> {
     ) {
         match drop_key {
             Some(key) => {
-                env.remove(&indexed_narrowing_key(name, key));
+                env.remove(indexed_narrowing_key(name, key).as_str());
             }
             None if method != "[]=" => drop_indexed_narrowings(env, name),
             _ => {}
@@ -4261,7 +4309,7 @@ impl<'i> Typer<'i> {
                 // (`index_write_stored_type` runs on the entry scope).
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, vspan, env, interner);
-                widen_flow_writes(writes, vspan, env, interner);
+                widen_flow_writes(writes.iter(), vspan, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, vspan, rebinds, mutations, stored, env, interner,
                 );
@@ -4281,7 +4329,7 @@ impl<'i> Typer<'i> {
                 }
                 let ty = self.type_of(ast, value, env, interner);
                 drop_indexed_narrowings(env, &name);
-                env.insert(name, ty);
+                env.insert(Rc::from(name.as_str()), ty);
             }
             // `a, b = rhs` — destructure the RHS and rebind every target. This
             // is the arm that closes the multi-write flow-write FP: without it
@@ -4294,14 +4342,14 @@ impl<'i> Typer<'i> {
                 let vspan = ast.get(value).span();
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, vspan, env, interner);
-                widen_flow_writes(writes, vspan, env, interner);
+                widen_flow_writes(writes.iter(), vspan, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, vspan, rebinds, mutations, stored, env, interner,
                 );
                 let rhs = self.type_of(ast, value, env, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     drop_indexed_narrowings(env, &name);
-                    env.insert(name, ty);
+                    env.insert(Rc::from(name.as_str()), ty);
                 }
                 // An `h[k]` index target stores through `[]=` on the
                 // POST-binding scope (`h, h[:a] = h, 1` stores into the rebound
@@ -4309,7 +4357,7 @@ impl<'i> Typer<'i> {
                 // exactly as `h[k] = v` widens them (`eval_multi_write` →
                 // `IndexWriteWidening.widen`, rigor-rs#134).
                 for (_, tspan, _) in targets.index_writes() {
-                    widen_flow_writes(writes, tspan, env, interner);
+                    widen_flow_writes(writes.iter(), tspan, env, interner);
                 }
             }
             Node::LocalVariableOpWrite { name, .. } => {
@@ -4318,7 +4366,7 @@ impl<'i> Typer<'i> {
                 let name = name.clone();
                 let u = interner.untyped();
                 drop_indexed_narrowings(env, &name);
-                env.insert(name, u);
+                env.insert(Rc::from(name.as_str()), u);
             }
             Node::If { predicate, then_body, else_body, is_unless, .. } => {
                 let (predicate, then_body, else_body, is_unless) =
@@ -4361,11 +4409,11 @@ impl<'i> Typer<'i> {
                         Self::predicate_edge_locals(ast, predicate, !truthy, &mut subjects);
                         for (name, op) in subjects {
                             let cur = dead_env
-                                .get(&name)
+                                .get(name.as_str())
                                 .copied()
                                 .unwrap_or_else(|| interner.untyped());
                             let narrowed = self.dead_subject_type(ast, cur, &op, interner);
-                            dead_env.insert(name, narrowed);
+                            dead_env.insert(Rc::from(name.as_str()), narrowed);
                         }
                         self.flow_eval_scope(
                             ast, dead_arm, &mut dead_env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out,
@@ -4392,7 +4440,7 @@ impl<'i> Typer<'i> {
                 }
                 // A predicate may contain a write (`if (x = f)`); widen post-join.
                 let pspan = ast.get(predicate).span();
-                widen_flow_writes(writes, pspan, env, interner);
+                widen_flow_writes(writes.iter(), pspan, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, if_span, rebinds, mutations, stored, env, interner,
                 );
@@ -4489,7 +4537,7 @@ impl<'i> Typer<'i> {
                         // `source_internal_user_finder.rb#fetch_ghost_user`).
                         let mut cenv = env.clone();
                         if self.clause_retries(ast, c.span) {
-                            widen_flow_writes(rebinds, begin_span, &mut cenv, interner);
+                            widen_flow_writes(rebinds.iter(), begin_span, &mut cenv, interner);
                         }
                         // Under a retry edge the clause-entry widening
                         // (`rescue_writes`) holds for EVERY arm, not just
@@ -4508,7 +4556,7 @@ impl<'i> Typer<'i> {
                         // retry; rescue B; if ok` is silent on the oracle).
                         if !self.clause_retries(ast, c.span) {
                             for rs in &retry_spans {
-                                widen_flow_writes(rebinds, *rs, &mut cenv, interner);
+                                widen_flow_writes(rebinds.iter(), *rs, &mut cenv, interner);
                             }
                         }
                         self.flow_eval_scope(
@@ -4569,7 +4617,7 @@ impl<'i> Typer<'i> {
                 let span = ast.get(id).span();
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, span, env, interner);
-                widen_flow_writes(writes, span, env, interner);
+                widen_flow_writes(writes.iter(), span, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
@@ -4604,14 +4652,14 @@ impl<'i> Typer<'i> {
                 };
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, span, env, interner);
-                widen_flow_writes(writes, span, env, interner);
+                widen_flow_writes(writes.iter(), span, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
                 match cont {
                     Some(LoopContinuation::Fixpoint(bindings)) => {
                         for (n, ty) in bindings {
-                            env.insert(n, ty);
+                            env.insert(Rc::from(n.as_str()), ty);
                         }
                     }
                     Some(LoopContinuation::Structural(tracked, suspect)) => {
@@ -4630,7 +4678,7 @@ impl<'i> Typer<'i> {
                 let span = other.span();
                 let stored =
                     self.stored_slot_writes(ast, indexed, id, span, env, interner);
-                widen_flow_writes(writes, span, env, interner);
+                widen_flow_writes(writes.iter(), span, env, interner);
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
@@ -4751,7 +4799,7 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 let ty = self.type_of(ast, value, env, interner);
                 drop_indexed_narrowings(env, &name);
-                env.insert(name, ty);
+                env.insert(Rc::from(name.as_str()), ty);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
@@ -4762,7 +4810,7 @@ impl<'i> Typer<'i> {
                         continue;
                     }
                     drop_indexed_narrowings(env, &name);
-                    env.insert(name, ty);
+                    env.insert(Rc::from(name.as_str()), ty);
                 }
             }
             // A write under `defined?` / `END` / `BEGIN` / `super` / `yield`
@@ -4812,7 +4860,7 @@ impl<'i> Typer<'i> {
                             continue;
                         };
                         let ty = env
-                            .get(name)
+                            .get(name.as_str())
                             .copied()
                             .unwrap_or_else(|| interner.untyped());
                         if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
@@ -4840,7 +4888,7 @@ impl<'i> Typer<'i> {
                             || f == crate::loop_edges::Edge::Other
                         {
                             let u = interner.untyped();
-                            env.insert(name.clone(), u);
+                            env.insert(Rc::from(name.as_str()), u);
                         }
                     }
                 }
@@ -4946,6 +4994,72 @@ impl PathMarks {
     }
 }
 
+/// The flat-env effect tables one statement's replay consults —
+/// [`toplevel_rebinds`] and [`toplevel_mutations`] — with a start-sorted
+/// position index for span slicing (rigor-rs#424). Every consumer of a
+/// statement's effects keeps only the entries INSIDE the statement's own
+/// span, so the per-statement work used to be an O(effects) scan to find a
+/// handful of in-span candidates — quadratic on a flat generated file
+/// (`x_i = 1 if y` × N). `within` slices the sorted index to the span's
+/// start range instead: O(log effects + in-span), original order inside.
+pub(crate) struct FlowEffects {
+    /// [`toplevel_rebinds`]: every top-level local write `(span, name)`.
+    pub(crate) rebinds: Vec<(rigor_parse::Span, String)>,
+    /// [`toplevel_mutations`]: every `local.<mutator>` call
+    /// `(call span, name, method, drop_key)`.
+    pub(crate) mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    /// Positions into `rebinds`, sorted by span start (stable — the
+    /// tables' own order inside an equal start).
+    rebind_starts: Vec<u32>,
+    /// Positions into `mutations`, same rule.
+    mutation_starts: Vec<u32>,
+}
+
+impl FlowEffects {
+    pub(crate) fn new(
+        rebinds: Vec<(rigor_parse::Span, String)>,
+        mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    ) -> Self {
+        let mut rebind_starts: Vec<u32> = (0..rebinds.len() as u32).collect();
+        rebind_starts.sort_by_key(|&i| rebinds[i as usize].0 .0);
+        let mut mutation_starts: Vec<u32> = (0..mutations.len() as u32).collect();
+        mutation_starts.sort_by_key(|&i| mutations[i as usize].0 .0);
+        FlowEffects { rebinds, mutations, rebind_starts, mutation_starts }
+    }
+
+    /// The positions of `table`'s span-keyed entries whose START falls in
+    /// `span`, in `table` order. The `w.1 <= span.1` half of containment is
+    /// still per-candidate (a span never properly crosses a boundary, but
+    /// the callers' predicates are kept verbatim).
+    fn within<'a, T: 'a>(
+        table: &'a [T],
+        starts: &'a [u32],
+        span: rigor_parse::Span,
+        at: impl Fn(&'a T) -> rigor_parse::Span + 'a,
+    ) -> impl Iterator<Item = &'a T> {
+        let lo = starts.partition_point(|&i| at(&table[i as usize]).0 < span.0);
+        let hi = starts.partition_point(|&i| at(&table[i as usize]).0 <= span.1);
+        starts[lo..hi].iter().map(move |&i| &table[i as usize])
+    }
+
+    /// `rebinds` entries starting inside `span` (`w.0 <= span.1` — the end
+    /// check is the caller's).
+    pub(crate) fn rebinds_within(
+        &self,
+        span: rigor_parse::Span,
+    ) -> impl Iterator<Item = &(rigor_parse::Span, String)> {
+        Self::within(&self.rebinds, &self.rebind_starts, span, |r| r.0)
+    }
+
+    /// `mutations` entries starting inside `span`, same rule.
+    pub(crate) fn mutations_within(
+        &self,
+        span: rigor_parse::Span,
+    ) -> impl Iterator<Item = &(rigor_parse::Span, String, String, Option<ShapeKey>)> {
+        Self::within(&self.mutations, &self.mutation_starts, span, |m| m.0)
+    }
+}
+
 /// The flat check env plus the data [`Typer::check_env_at`] needs to
 /// reconstruct the scope a use site was ENTERED from — the port of the
 /// reference's per-node scope index (`OperandWalk`, upstream rigor#1310 /
@@ -4957,14 +5071,23 @@ pub struct CheckFlow {
     /// whole answer, and the fallback for sites inside a barrier scope or
     /// outside every recorded statement.
     pub env: TypeEnv,
-    /// `(top-level statement, env before it)` in program order. Empty unless
-    /// the file has any recorded effect at all.
-    boundaries: Vec<(NodeId, TypeEnv)>,
-    /// [`toplevel_rebinds`]: every top-level local write `(span, name)`.
-    rebinds: Vec<(rigor_parse::Span, String)>,
-    /// [`toplevel_mutations`]: every `local.<mutator>` call
-    /// `(call span, name, method, drop_key)`.
-    mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    /// `(top-level statement index, env before it)` — a CHECKPOINT every
+    /// `boundary_stride` statements, not every one: `check_env_at` replays
+    /// `bind_check_statement` over the (bounded) gap instead of storing an
+    /// env per statement — N full env clones were O(N²) time AND memory on
+    /// a flat generated file (rigor-rs#424). Empty unless the file has any
+    /// recorded effect at all. Index 0 (the empty env) is always stored
+    /// when the table is non-empty.
+    boundaries: Vec<(usize, TypeEnv)>,
+    /// Every top-level `(statement, span)` in program order — the
+    /// `check_env_at` containing-statement lookup (binary search) and the
+    /// replay range between a checkpoint and a queried statement.
+    boundary_stmts: Vec<(NodeId, rigor_parse::Span)>,
+    /// The statements between consecutive `boundaries` entries — the
+    /// replay bound.
+    boundary_stride: usize,
+    /// The flat-env effect tables ([`FlowEffects`]).
+    effects: FlowEffects,
     /// [`closure_mutations`]: every `h.attr op= v` a literal block/lambda
     /// body's own scope evaluates — `(body owner node, write span, receiver
     /// name)` — replayed only for a site inside that body (rigor-rs#366).

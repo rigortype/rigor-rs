@@ -3,12 +3,18 @@
 //! cvar / gvar / chain arms) — the gate of the #521 / #1021 untyped-argument
 //! declines — with the definite-assignment and untyped-root helpers behind it.
 
+use std::rc::Rc;
+
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::Scalar;
 
 use crate::dead::DeadPositions;
 use crate::folding;
 use crate::reach_index::{LocalEvent, LocalWrite, ReachIndex, ScopeNode};
+use crate::reach_memo::{
+    ast_identity, audit_mode, deps_match, id_bit, same_dead, stack_id, KillKey, KillRec,
+    KillScan, KillSeg, TruthyKey, MAX_KILL_CELLS,
+};
 use crate::Typer;
 
 /// The most writes of one local that may reach a read before
@@ -839,8 +845,9 @@ impl<'i> Typer<'i> {
         // closure's own POSITION, not the read's: the definite-assignment cut
         // runs to the closure-bearing statement and no further into its body.
         let kill_span = operand.map(|(b, _)| ast.get(b).span()).unwrap_or(use_span);
-        let kill =
-            self.latest_definite_assignment(ast, flow_body, kill_span, &is_target, &dead, seen);
+        let kill = self.latest_definite_assignment(
+            ast, flow_body, kill_span, root, &is_target, &dead, seen,
+        );
         // The pin runs beside the reach join: `None` until a value
         // contributes, `Some(Some(s))` while every contributor folds to the
         // same scalar, `Some(None)` once one does not (`pin_join`).
@@ -1039,9 +1046,9 @@ impl<'i> Typer<'i> {
             if let Node::Definition { body, .. } = ast.get(id) {
                 let is_target =
                     |n: &Node| matches!(n, Node::InstanceVariableWrite { name, .. } if name == root);
-                if let Some(kill) =
-                    self.latest_definite_assignment(ast, body, use_span, &is_target, &dead, seen)
-                {
+                if let Some(kill) = self.latest_definite_assignment(
+                    ast, body, use_span, root, &is_target, &dead, seen,
+                ) {
                     let mut reach = Reach::NONE;
                     for &(span, value) in &writes {
                         if contains(d, span)
@@ -1310,8 +1317,9 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         body: &[NodeId],
         use_span: rigor_parse::Span,
+        name: &str,
         is_target: &dyn Fn(&Node) -> bool,
-        dead: &DeadPositions,
+        dead: &Rc<DeadPositions>,
         seen: &mut Vec<String>,
     ) -> Option<rigor_parse::Span> {
     let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
@@ -1329,11 +1337,7 @@ impl<'i> Typer<'i> {
         let Some(pos) = body.iter().position(|&s| contains(ast.get(s).span(), use_span)) else {
             break;
         };
-        for &s in &body[..pos] {
-            if self.definitely_assigns(ast, s, is_target, &idx, dead, seen) {
-                kill = Some(ast.get(s).span());
-            }
-        }
+        kill = self.kill_prefix(ast, body, pos, name, is_target, &idx, dead, seen);
         // The statement's own sections first; failing that (the read sits in
         // an expression — `x = items.map { |v| t = 1; Float(t) }`, a hash of
         // `lambda {}`s, an `if` predicate's block), the OUTERMOST section of a
@@ -1355,6 +1359,237 @@ impl<'i> Typer<'i> {
         }
     }
     kill
+    }
+
+    /// [`Typer::latest_definite_assignment`]'s prefix half: the span of the
+    /// last statement in `body[..pos]` that [`Typer::definitely_assigns`].
+    /// The naive scan is O(pos) per read, so N reads in one flat statement
+    /// list cost O(N²) — a generated `x_i = 1 if y` × N file ran ~4× slower
+    /// per doubling past 2k (rigor-rs#424). The [`ReachMemo::kill_scans`]
+    /// row folds each statement's answer once per `(ast, dead)` window
+    /// instead, leaving O(1) per read.
+    ///
+    /// A row is reused only under what the answers cannot differ under —
+    /// the [`MemoEntry`] rules: the same `dead` OBJECT (a `dead_partial`
+    /// publish or the scan's end clears the whole map), the same
+    /// `seen.len()` (the key carries the fold fuel), a stack answering each
+    /// segment's recorded `seen` tests the way the building stack did
+    /// ([`deps_match`]), and every fold the evaluations saw re-entered
+    /// still answering `None`. Anything else falls back to the scan, which
+    /// is also what an overflowed or reset row costs.
+    #[allow(clippy::too_many_arguments)]
+    fn kill_prefix(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        pos: usize,
+        name: &str,
+        is_target: &dyn Fn(&Node) -> bool,
+        idx: &ReachIndex,
+        dead: &Rc<DeadPositions>,
+        seen: &mut Vec<String>,
+    ) -> Option<rigor_parse::Span> {
+        if pos == 0 {
+            return None;
+        }
+        let dead_opt = Some(dead.clone());
+        // The row lives in the reach memo's `(ast, dead)` window; reuse is
+        // possible only while `dead` IS the window's set — an answer folded
+        // against a superseded partial or the settled set while a
+        // re-entrant caller still sees the partial would be stale.
+        if !same_dead(&self.current_dead(ast), &dead_opt) {
+            return self.kill_prefix_uncached(ast, body, pos, is_target, idx, dead, seen);
+        }
+        let ast_id = ast_identity(ast);
+        let key: KillKey = (body.as_ptr() as usize, body.len(), name.into(), seen.len());
+        // Phase 1: the longest still-valid prefix the row covers. A segment
+        // whose recorded tests the current stack answers differently, or
+        // whose in-flight folds have since landed on a value, truncates the
+        // row — statements in it (and everything after) were folded against
+        // a context that no longer holds.
+        let (start, mut kill, hit) = {
+            let mut memo = self.reach_memo.borrow_mut();
+            memo.reset_unless_valid(ast_id, &dead_opt);
+            let stack = memo.stack_ids(seen);
+            let mut dropped_cells = 0usize;
+            let out = match memo.kill_scans.get_mut(&key) {
+                None => (0usize, None, None),
+                Some(row) => {
+                    let running = self.truthy_in_flight.borrow();
+                    let landed = self.truthy_memo.borrow();
+                    let mut prev_end = 0usize;
+                    let mut cut = row.kills.len();
+                    for seg in &row.segs {
+                        if !deps_match(seg.tested_bits, &seg.tested, &seg.present, &stack)
+                            || !seg
+                                .folding
+                                .iter()
+                                .all(|p| running.contains(p) || landed.get(p) == Some(&None))
+                        {
+                            cut = prev_end;
+                            break;
+                        }
+                        prev_end = seg.end;
+                    }
+                    if cut < row.kills.len() {
+                        dropped_cells = row.kills.len() - cut;
+                        row.kills.truncate(cut);
+                        row.segs.retain(|s| s.end <= cut);
+                    }
+                    if pos <= row.kills.len() {
+                        // The hit's dependencies, to hand the enclosing
+                        // computation's record: every test and re-entered
+                        // fold the covered segments were folded under.
+                        let mut tested: Vec<u32> = Vec::new();
+                        let mut folding: Vec<TruthyKey> = Vec::new();
+                        let mut prev = 0usize;
+                        for seg in &row.segs {
+                            if prev >= pos {
+                                break;
+                            }
+                            for &t in seg.tested.iter() {
+                                if !tested.contains(&t) {
+                                    tested.push(t);
+                                }
+                            }
+                            for p in seg.folding.iter() {
+                                if !folding.contains(p) {
+                                    folding.push(*p);
+                                }
+                            }
+                            prev = seg.end;
+                        }
+                        (0, None, Some((row.kills[pos - 1], tested, folding)))
+                    } else {
+                        (row.kills.len(), row.kills.last().copied().flatten(), None)
+                    }
+                }
+            };
+            memo.kill_cells -= dropped_cells;
+            out
+        };
+        if let Some((out, tested, folding)) = hit {
+            self.reach_frames
+                .borrow_mut()
+                .record(stack_id(seen), &tested, &folding);
+            if audit_mode() {
+                let again = self.kill_prefix_uncached(ast, body, pos, is_target, idx, dead, seen);
+                assert_eq!(
+                    again, out,
+                    "rigor-rs#424 kill-prefix audit: prefix of {pos} statements for {name} \
+                     memo {out:?} != recomputed {again:?} in {:?}",
+                    ast.file_key(),
+                );
+            }
+            return out;
+        }
+        // Phase 2: evaluate `body[start..pos]` once, recording every `seen`
+        // test and re-entered fold the evaluations make on the `kill_rec`
+        // stack's top (a nested extension pushes its own and merges it into
+        // this one on pop).
+        {
+            let memo = self.reach_memo.borrow();
+            memo.kill_rec.borrow_mut().push(KillRec::default());
+        }
+        let mut new_kills = Vec::with_capacity(pos - start);
+        for &s in &body[start..pos] {
+            if self.definitely_assigns(ast, s, is_target, idx, dead, seen) {
+                kill = Some(ast.get(s).span());
+            }
+            new_kills.push(kill);
+        }
+        let rec = {
+            let memo = self.reach_memo.borrow();
+            let mut recs = memo.kill_rec.borrow_mut();
+            let rec = recs.pop().unwrap_or_default();
+            if let Some(outer) = recs.last_mut() {
+                for &t in &rec.tested {
+                    if !outer.tested.contains(&t) {
+                        outer.tested.push(t);
+                    }
+                }
+                for &f in &rec.folding {
+                    if !outer.folding.contains(&f) {
+                        outer.folding.push(f);
+                    }
+                }
+            }
+            rec
+        };
+        // Phase 3: store if the window still holds — and only where the
+        // row's cells still line up with what was just evaluated (a nested
+        // query may have extended the row further under the same context or
+        // cut it back on a landed fold).
+        {
+            let mut memo = self.reach_memo.borrow_mut();
+            if memo.valid_for(ast_id, &dead_opt) && !memo.kill_overflowed {
+                let mut tested = rec.tested;
+                tested.sort_unstable();
+                tested.dedup();
+                let tested_bits = tested.iter().fold(0, |bits, &id| bits | id_bit(id));
+                let stack = memo.stack_ids(seen);
+                let mut present: Vec<u32> = stack
+                    .iter()
+                    .filter(|id| tested.binary_search(id).is_ok())
+                    .copied()
+                    .collect();
+                present.sort_unstable();
+                let seg = KillSeg {
+                    end: pos,
+                    folding: rec.folding.into(),
+                    tested: tested.into(),
+                    tested_bits,
+                    present: present.into(),
+                };
+                match memo.kill_scans.get_mut(&key) {
+                    Some(row) if row.kills.len() >= pos => {}
+                    Some(row) if row.kills.len() >= start => {
+                        let have = row.kills.len();
+                        row.kills.extend_from_slice(&new_kills[have - start..]);
+                        row.segs.push(seg);
+                        memo.kill_cells += pos - have;
+                    }
+                    // A nested query cut the row back under us: our cells
+                    // no longer line up with its prefix — leave it alone.
+                    Some(_) => {}
+                    None => {
+                        memo.kill_cells += new_kills.len();
+                        memo.kill_scans.insert(
+                            key,
+                            KillScan { kills: new_kills, segs: vec![seg] },
+                        );
+                    }
+                }
+                if memo.kill_cells > MAX_KILL_CELLS {
+                    memo.kill_scans.clear();
+                    memo.kill_cells = 0;
+                    memo.kill_overflowed = true;
+                }
+            }
+        }
+        kill
+    }
+
+    /// [`Typer::kill_prefix`]'s uncached half — the `body[..pos]` scan
+    /// `latest_definite_assignment` ran before the rows existed.
+    #[allow(clippy::too_many_arguments)]
+    fn kill_prefix_uncached(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        pos: usize,
+        is_target: &dyn Fn(&Node) -> bool,
+        idx: &ReachIndex,
+        dead: &Rc<DeadPositions>,
+        seen: &mut Vec<String>,
+    ) -> Option<rigor_parse::Span> {
+        let mut kill = None;
+        for &s in &body[..pos] {
+            if self.definitely_assigns(ast, s, is_target, idx, dead, seen) {
+                kill = Some(ast.get(s).span());
+            }
+        }
+        kill
     }
 }
 
@@ -1404,7 +1639,7 @@ impl<'i> Typer<'i> {
     /// assigns nothing (rigor-rs#368), and a folded `if`/`unless` asks only
     /// its live arm; the terminating-arm test is the reference's
     /// `branch_unconditionally_exits?` port ([`Typer::stmt_exits`]).
-    fn definitely_assigns(
+    pub(crate) fn definitely_assigns(
         &self,
         ast: &LoweredAst,
         id: NodeId,
@@ -1582,58 +1817,6 @@ fn untyped_expr_root(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<Untyped
 /// level fires `for 1.0` — and a closure-bound name never reads the precise
 /// value the entry scope might suggest.
 ///
-/// `Some((bearing, boundary))` — the innermost unrecorded closure's node and
-/// the span of the OUTERMOST ancestor whose edge toward it is typed-only —
-/// when the read sits inside such a closure; `None` when the read is inside
-/// no closure at all, or when the closure sits on an evaluate-through edge
-/// all the way up (a statement, a `def`/branch/loop/`begin`/`case` section,
-/// a local/ivar/gvar/`op=` RHS, a `&&`/`||` operand, an evaluated call's own
-/// literal block, a `->` body). Every closure inside `boundary` is unentered
-/// — nested operand positions (`f(g { … })`, `h = [xs.map { … }]`) mark
-/// every ancestor they pass through.
-pub(crate) fn unrecorded_closure(
-    ast: &LoweredAst,
-    use_span: rigor_parse::Span,
-) -> Option<(NodeId, rigor_parse::Span)> {
-    let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
-    let mut inner: Option<(rigor_parse::Span, NodeId)> = None;
-    for (id, n) in ast.iter() {
-        // The CLOSURE's extent is the literal block node (`{ |q| … }`,
-        // parameters included) for a call, the whole `->` node for a lambda —
-        // the reference floors params and `;`-locals the same way it does
-        // body-introduced locals.
-        let extent = match n {
-            Node::Lambda { span, .. } => *span,
-            Node::Call { block_span: Some(b), .. } => *b,
-            _ => continue,
-        };
-        if contains(extent, use_span)
-            && inner.is_none_or(|(c, _)| extent.1 - extent.0 < c.1 - c.0)
-        {
-            inner = Some((extent, id));
-        }
-    }
-    let (_, bearing) = inner?;
-    let bearing_span = ast.get(bearing).span();
-    // The closure is scope-recorded iff EVERY ancestor edge preserves
-    // evaluation; a single typed-only ancestor leaves the whole subtree
-    // unentered (`x = [y = 1, lambda { … }]` threads the write through the
-    // operand walker but still records no scope inside the `lambda`). Keep
-    // the OUTERMOST such ancestor: it is the boundary inside which every
-    // closure is unentered.
-    let mut boundary: Option<rigor_parse::Span> = None;
-    for (id, n) in ast.iter() {
-        let span = n.span();
-        if id == bearing || !contains(span, bearing_span) || edge_evaluates(ast, id, bearing_span)
-        {
-            continue;
-        }
-        if boundary.is_none_or(|b| span.1 - span.0 > b.1 - b.0) {
-            boundary = Some(span);
-        }
-    }
-    boundary.map(|b| (bearing, b))
-}
 
 /// Meet one more contributor into a running pin ([`Typer::local_reach`] /
 /// [`Typer::expr_scalar`]): `Some(Some(s))` while every contributor folds to
@@ -1712,7 +1895,7 @@ pub(crate) fn unevaluated_case_clause_spans(ast: &LoweredAst) -> Vec<rigor_parse
 /// when `parent` itself is ([`unrecorded_closure`]): the edge classes the
 /// reference's statement evaluator threads scopes through — anything else
 /// types, defers or discards its operand.
-fn edge_evaluates(ast: &LoweredAst, parent: NodeId, child_span: rigor_parse::Span) -> bool {
+pub(crate) fn edge_evaluates(ast: &LoweredAst, parent: NodeId, child_span: rigor_parse::Span) -> bool {
     let contains = |s: rigor_parse::Span, i: rigor_parse::Span| s.0 <= i.0 && i.1 <= s.1;
     match ast.get(parent) {
         // An evaluated call enters its LITERAL block

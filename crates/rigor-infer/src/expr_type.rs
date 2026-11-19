@@ -253,7 +253,7 @@ impl<'i> Typer<'i> {
             Node::TrueLit { .. } => interner.intern(Type::Constant(Scalar::Bool(true))),
             Node::FalseLit { .. } => interner.intern(Type::Constant(Scalar::Bool(false))),
             Node::LocalVariableRead { name, .. } => env
-                .get(name)
+                .get(name.as_str())
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
             // `@i` / `@@i` / `$g` reads bind through the same env map — only
@@ -261,7 +261,7 @@ impl<'i> Typer<'i> {
             // sigilled keys, so `check`'s envs see `untyped` as before
             // (rigor-rs#548).
             Node::VariableRead { name, .. } => env
-                .get(name)
+                .get(name.as_str())
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
             // `a, b = rhs` AS AN EXPRESSION is its right-hand side (Ruby: `(a, b

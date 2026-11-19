@@ -95,7 +95,16 @@ pub(crate) use flow_writes::*;
 /// A flat name -> type binding environment, populated by `LocalVariableWrite`
 /// as the statement sequence is walked in order. Intentionally not
 /// flow-sensitive in this slice.
-pub type TypeEnv = HashMap<String, TypeId>;
+/// Key type for [`TypeEnv`] entries. `Rc<str>` makes the per-edge env clones
+/// in `class_flow_if`/`evaluate_if` and the boundary checkpoints refcount
+/// bumps instead of a `String` allocation per entry — those clones ran once
+/// per `if`/`case` over an env that grows with the file's locals, which is
+/// the residual quadratic of rigor-rs#424's sequential-`if` row.
+pub type LocalKey = std::rc::Rc<str>;
+
+/// local name -> inferred type. The key borrows as `str`, so every existing
+/// `env.get(name.as_str())`/`env.remove(name)`-style call keeps working.
+pub type TypeEnv = HashMap<LocalKey, TypeId>;
 
 /// Type an owned-AST node against the current `env`. Free-function wrapper kept
 /// source-compatible for callers (e.g. rigor-rules) that predate [`Typer`]; it

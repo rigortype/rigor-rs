@@ -2,6 +2,7 @@
 //! span containment, and lexical class-name qualification.
 
 use rigor_infer::Typer;
+use std::rc::Rc;
 use rigor_parse::{LoweredAst, Node};
 use rigor_types::Interner;
 
@@ -186,7 +187,7 @@ impl ScopedEnv {
             if env.contains_key(name) {
                 shadowed
                     .get_or_insert_with(|| env.as_ref().clone())
-                    .insert(name.to_string(), self.untyped);
+                    .insert(Rc::from(name), self.untyped);
             }
         }
         for (descendants, bound) in &self.closures {
@@ -197,7 +198,7 @@ impl ScopedEnv {
                 if env.contains_key(name.as_str()) {
                     shadowed
                         .get_or_insert_with(|| env.as_ref().clone())
-                        .insert(name.clone(), self.untyped);
+                        .insert(Rc::from(name.as_str()), self.untyped);
                 }
             }
         }

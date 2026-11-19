@@ -23,8 +23,8 @@ use rigor_parse::{LoweredAst, Node, NodeId, Span};
 
 use crate::dead::CallSelf;
 use crate::reach::{
-    has_non_local_target, proc_like_block, statement_sections, unevaluated_case_clause_spans,
-    unrecorded_closure, IvarScope,
+    edge_evaluates, has_non_local_target, proc_like_block, statement_sections,
+    unevaluated_case_clause_spans, IvarScope,
 };
 use crate::Typer;
 
@@ -106,6 +106,14 @@ pub(crate) struct ReachIndex {
     /// `Node::Lambda { span, locals }` and `Node::Call { block_span:
     /// Some(_), block_locals }`, in arena order.
     closures: HashMap<String, Vec<Span>>,
+    /// Every closure extent with its bearing node — `Node::Lambda`'s own
+    /// span and every `Node::Call`'s `block_span` — the candidate set
+    /// [`unrecorded_closure`] picks the innermost container from (a
+    /// whole-arena walk it used to pay per read span, rigor-rs#424).
+    closure_extents: Vec<(Span, NodeId)>,
+    /// [`unrecorded_closure`]'s outermost-unevaluated-ancestor answer per
+    /// bearing closure node — shared by every read the closure holds.
+    closure_boundaries: RefCell<HashMap<NodeId, Option<Span>>>,
     /// Per local name, the nodes the write collector can match for it, in
     /// arena order (see [`LocalEvent`]).
     by_name: HashMap<String, Vec<NodeId>>,
@@ -172,6 +180,7 @@ impl ReachIndex {
         let mut def_ids = Vec::new();
         let mut scopes = Vec::new();
         let mut closures: HashMap<String, Vec<Span>> = HashMap::new();
+        let mut closure_extents: Vec<(Span, NodeId)> = Vec::new();
         let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
         let mut env_sensitive_starts = Vec::new();
         let mut note = |name: &str, id: NodeId| {
@@ -219,6 +228,7 @@ impl ReachIndex {
                 }
                 Node::Lambda { span, locals, .. } => {
                     lambda_spans.push(*span);
+                    closure_extents.push((*span, id));
                     scopes.push(ScopeNode::Lambda { span: *span });
                     for l in locals {
                         closures.entry(l.clone()).or_default().push(*span);
@@ -284,6 +294,7 @@ impl ReachIndex {
                     }
                 }
                 if let Some(b) = block_span {
+                    closure_extents.push((*b, id));
                     for l in block_locals {
                         closures.entry(l.clone()).or_default().push(*b);
                     }
@@ -339,6 +350,8 @@ impl ReachIndex {
             lambda_spans,
             scopes,
             closures,
+            closure_extents,
+            closure_boundaries: RefCell::new(HashMap::new()),
             by_name,
             unrecorded: RefCell::new(HashMap::new()),
             retries: RefCell::new(HashMap::new()),
@@ -455,7 +468,8 @@ impl ReachIndex {
         out
     }
 
-    /// [`unrecorded_closure`] for `use_span`, memoized.
+    /// [`unrecorded_closure`] for `use_span`, memoized — over the indexed
+    /// closure set rather than two whole-arena walks per read (rigor-rs#424).
     pub(crate) fn unrecorded_closure(
         &self,
         ast: &LoweredAst,
@@ -464,7 +478,43 @@ impl ReachIndex {
         if let Some(hit) = self.unrecorded.borrow().get(&use_span) {
             return *hit;
         }
-        let out = unrecorded_closure(ast, use_span);
+        let contains = |s: Span, i: Span| s.0 <= i.0 && i.1 <= s.1;
+        // The innermost closure extent holding the use — [`unrecorded_closure`]'s
+        // first pass, on the closure table alone.
+        let mut inner: Option<(Span, NodeId)> = None;
+        for &(extent, id) in &self.closure_extents {
+            if contains(extent, use_span)
+                && inner.is_none_or(|(c, _)| extent.1 - extent.0 < c.1 - c.0)
+            {
+                inner = Some((extent, id));
+            }
+        }
+        let out = inner.and_then(|(_, bearing)| {
+            // Its outermost unentered ancestor — one arena walk per bearing
+            // closure node, memoized: every read inside the closure asks
+            // the same question.
+            if let Some(hit) = self.closure_boundaries.borrow().get(&bearing) {
+                return hit.map(|b| (bearing, b));
+            }
+            let bearing_span = ast.get(bearing).span();
+            let mut boundary: Option<Span> = None;
+            for (id, n) in ast.iter() {
+                let span = n.span();
+                if id == bearing
+                    || !contains(span, bearing_span)
+                    || edge_evaluates(ast, id, bearing_span)
+                {
+                    continue;
+                }
+                if boundary.is_none_or(|b| span.1 - span.0 > b.1 - b.0) {
+                    boundary = Some(span);
+                }
+            }
+            self.closure_boundaries
+                .borrow_mut()
+                .insert(bearing, boundary);
+            boundary.map(|b| (bearing, b))
+        });
         self.unrecorded.borrow_mut().insert(use_span, out);
         out
     }
