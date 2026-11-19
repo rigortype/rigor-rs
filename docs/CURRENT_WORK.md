@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #638 MERGED** (PR #674): exact-gated loop fixpoint replay; #435 structural fallback on declines. 0 FP/360; Approved. → #681–#684. [note](notes/20261119-issue-638-loop-fixpoint.md)
 - **2026-11-19 #431 CLOSED** (PR #675): command thread reserves its stack before the rayon pool — a capped host can no longer strand it on Rust's 2 MiB default; fallback messages name the actual stack. ADR-0045 amended; → #676–#679. [note](notes/20261119-issue-431-stack-fallback-order.md)
 - **2026-11-19 #424 modifier-if** (PR #669): subsequent-first exit + compact_children; 10k `if true` 2.16s→0.52s; 0 FP. [note](notes/20261119-issue-424-modifier-if.md)
 - **2026-11-19 #670 CLOSED** (PR #671): class-guard `dynamic_base` — 13 master FPs gone, sweep 0 FP/360. → #672/#673. [note](notes/20261119-issue-670-dynamic-base-class-guard.md)
@@ -85,7 +86,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; 0 OVER. → #621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
 
-- **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in mixin lists; computed class-body `include`/`send` opens the class; scalar-path decline only. ~60 probes; 0 OVER. → #617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
+- **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"`; computed class-body `include`/`send` opens the class. ~60 probes; 0 OVER. → #617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
 - **2026-11-18 #448 frame-local specials + DefinitionContext** (PR #613): `UNCOLOURED_READS`; `{$~,$_}` writes on `!shared_slot`; `BodyCtx` ports `definition_context.rb`. effects 0 OVER. → #614/#616. [note](notes/20261118-issue-448-frame-local-specials.md)
 - **2026-11-18 #376 bundled-name tables tied to the pin** (PR #609): `BUNDLED_SKILL_NAMES` desynced (oracle 18, port 17); a test re-derives both tables from the submodule. 0 FP/8,251; → #610/#611. [note](notes/20261118-issue-376-bundled-name-tie.md)
 - **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer + composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. ~135 probes; → #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
@@ -94,12 +95,12 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` exit guards record `$~` + mandatory `$N`; `Regexp.last_match` no longer a nil source. 0 FP/658; follow-ups #597/#598. [note](notes/20261112-issue-449-match-globals.md)
 - **2026-11-12 #438 `class_ivar_scope` memo key** (PR #588): reads in one class body share the `IvarScope`; required shapes ~pre-#432 RSS, output byte-identical. [note](notes/20261112-issue-438-ivar-scope-memo.md)
 - **2026-11-12 #393 retry-edge indexed narrowings** (PR #590): retry-rebound/mutated locals drop rooted `h[k]` records inside and after `begin`. ~22 FP rows closed, 0 FP/658; follow-ups #592/#593. [note](notes/20261112-issue-393-retry-index-drop.md)
-- **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver, unbuildable fallback, singleton nil bit. Brief rows byte-identical; 0 FP/658; follow-ups #584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
-- **2026-11-12 #398 Kernel termination** (PR #575): dead-code termination uses `kernel_call_terminates`, not block timing's project-defines veto; explicit `Kernel.*` always terminates. 13+3 FP rows closed, 0 FP/658; follow-ups #581–#583. [note](notes/20261112-issue-398-kernel-termination.md)
+- **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver + nil bit. Byte-identical; 0 FP/658; → #584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
+- **2026-11-12 #398 Kernel termination** (PR #575): dead-code termination uses `kernel_call_terminates`, not block-timing veto; `Kernel.*` always terminates. 13+3 FP closed, 0 FP/658; → #581–#583. [note](notes/20261112-issue-398-kernel-termination.md)
 - **2026-11-12 #349 Psych YAML errors** (PR #576): libyaml `context_mark`/problem/context render Psych positions/details incl. `hexdecimal`; BOM parity. 0 FP; follow-ups #579/#580. [note](notes/20261112-issue-349-yaml-fidelity.md)
 - **2026-11-12 #384 ATM describe labels** (PR #573): nested union/optional/alias members flatten before `union_describe`; `Other` strips only root `::`. 12 rows byte-identical, 0 FP; follow-ups #577/#578. [note](notes/20261112-issue-384-render-other-drift.md)
 - **2026-08-10 post-`if` write join** (issue #443 → PR #572) — `v = nil if p` joins `entry ∪ arm-write` (incl. `op=` + destructure binds) instead of a blanket `Dynamic`; `w = v ? 1 : "s"` unions correctly. Union-witness declines remain. [note](notes/20260810-if-write-join.md)
-- **2026-08-10 `if`-edge narrowing: join per-edge narrowed types** (issue #451 → PR #571) — `Empty` join (`T ∪ Bot`), terminating-arm liveness, `expr_truthiness` on unmodeled predicates, `&.` on nil carriers, `if_edge_overlay` widened-on-`Other` only. 4 rounds; 0 FP. [note](notes/20260810-if-edge-narrowing.md)
+- **2026-08-10 `if`-edge narrowing: join per-edge narrowed types** (issue #451 → PR #571) — `Empty` join, terminating-arm liveness, `expr_truthiness`, `&.` on nil, `if_edge_overlay` on `Other`. 4 rounds; 0 FP. [note](notes/20260810-if-edge-narrowing.md)
 - **2026-11-06 `run_corpus.rb` REMOVED** (PR #495): a first-80-files sample of `fp_audit.py --sweep`; its one unique input, the reference's own trees, measures identically by path (examples 32 files, 0 FP). [PR](https://github.com/rigortype/rigor-rs/pull/495) / [CORPUS.md](../harness/CORPUS.md)
 - **2026-11-05 walk follow-ups** (#483–#488): port-only rows fixed, `pre_eval:` declines; 0 FP / 623. [note](notes/20261105-walk-followups.md)
 - **2026-11-05 re-pin walk → `v0.4.7` DONE** (#445…#481): 0 FP / 623 gaps. Last tag: callee floor, `core_root:`, CLI. [notes](notes/20261105-repin-v047.md)
