@@ -151,10 +151,16 @@ impl<'i> Typer<'i> {
             }
             // Capture the pre-loop env: `replay_one` + `apply_def_local_marks`
             // join/widen the body's writes, and the ADR-56 continuation must
-            // overlay the *entry* seed afterwards (rigor-rs#638).
-            let loop_entry = match ast.get(stmt) {
-                Node::Loop { body, kind, .. } => Some((body.clone(), *kind, env.clone())),
-                _ => None,
+            // overlay the *entry* seed afterwards (rigor-rs#638). Skip under
+            // `def_scope` — sig-gen's def-local replay must keep declining
+            // loops it cannot fold the same way the reference does.
+            let loop_entry = if self.def_scope.get().is_none() {
+                match ast.get(stmt) {
+                    Node::Loop { body, kind, .. } => Some((body.clone(), *kind, env.clone())),
+                    _ => None,
+                }
+            } else {
+                None
             };
             if guards.is_empty() && !wild {
                 self.replay_one(ast, &marks, env, stmt, interner, returns);
