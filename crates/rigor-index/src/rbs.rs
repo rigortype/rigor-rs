@@ -231,6 +231,11 @@ type ArityEnvelope = Option<Arity>;
 /// side.
 type MethodSlot = (Option<&'static str>, ArityEnvelope, bool);
 
+/// rigor-rs#658 — the shared [`CoreData::ancestors`] answer: the resolved
+/// chain plus its `complete` flag, `Arc`'d so a memo hit hands back a cheap
+/// clone of the pointer's contents.
+type AncestorChain = Arc<(Vec<&'static str>, bool)>;
+
 /// rigor-rs#658 — the per-`method` answers a class's [`CoreData::method_memo`]
 /// entry carries. Every value is `Copy` or an interned `&'static` borrow into
 /// `classes`, so a hit borrows nothing from the map.
@@ -1048,11 +1053,11 @@ pub struct CoreData {
     /// rigor-rs#658 — memoized [`Self::ancestors`] chains, keyed by the
     /// class's interned `classes` key. The chain is a pure function of
     /// `classes` (immutable once loaded), but each answer rebuilt a `Vec`
-    /// + `HashSet` and re-hashed every ancestor name — a `v.push(1)` × N
-    /// chain re-collected `Array`'s chain per `type_call` level, the
-    /// sampled `collect` / hashing hot leaves. `Mutex` keeps `CoreData:
-    /// Sync` for the file-parallel walk.
-    ancestors_memo: Mutex<HashMap<&'static str, Arc<(Vec<&'static str>, bool)>>>,
+    /// and a `HashSet` and re-hashed every ancestor name — a `v.push(1)`
+    /// × N chain re-collected `Array`'s chain per `type_call` level, the
+    /// sampled `collect` / hashing hot leaves. `Mutex` keeps `CoreData`
+    /// `Sync` for the file-parallel walk.
+    ancestors_memo: Mutex<HashMap<&'static str, AncestorChain>>,
     /// rigor-rs#658 — per-(class, method) instance-method resolution
     /// answers, keyed by the class's interned `classes` key then the method
     /// name. The short-key instance lookups all begin
@@ -2322,9 +2327,7 @@ impl CoreData {
     /// per-(class, method) memo. `None` means no ancestor declared `method`
     /// at all — the tuple answer is then `None` either way.
     fn tuple_definer(&self, class_name: &str, method: &str) -> Option<&'static str> {
-        let Some((&key, _)) = self.classes.get_key_value(class_name) else {
-            return None;
-        };
+        let (&key, _) = self.classes.get_key_value(class_name)?;
         if let Some(hit) = self
             .method_memo
             .lock()
@@ -2710,9 +2713,7 @@ impl CoreData {
         class_name: &str,
         method: &str,
     ) -> Option<&'static str> {
-        let Some((&key, _)) = self.classes.get_key_value(class_name) else {
-            return None;
-        };
+        let (&key, _) = self.classes.get_key_value(class_name)?;
         if let Some(hit) = self
             .method_memo
             .lock()
@@ -4297,7 +4298,7 @@ impl CoreData {
         self.ancestors_memo
             .lock()
             .unwrap()
-            .insert(key, Arc::new(out.clone()));
+            .insert(key, AncestorChain::new(out.clone()));
         out
     }
 

@@ -134,7 +134,7 @@ pub struct Typer<'i> {
     /// from each receiver-prefix root, and without the shared table every
     /// answer re-walked the shared path prefix (the chain went cubic).
     /// Bounded: each table is O(root subtree).
-    pub(crate) path_marks: RefCell<Vec<((usize, rigor_parse::NodeId), std::rc::Rc<crate::flow_eval::PathMarks>)>>,
+    pub(crate) path_marks: RefCell<Vec<PathMarksEntry>>,
     /// Memoized [`crate::lexical_scopes`] for a Typer built WITHOUT the
     /// driver's per-file scopes, keyed by the AST's address — one Typer
     /// types every file in `infer_method_returns`, so the memo must not
@@ -143,6 +143,14 @@ pub struct Typer<'i> {
 }
 
 type LexicalScopes = std::rc::Rc<Vec<(rigor_parse::Span, Vec<String>)>>;
+
+/// One [`Typer::path_marks`] LRU entry: `(AST identity, replay root)` ->
+/// the shared `path_*` answers one DFS recorded for that root
+/// (rigor-rs#658).
+type PathMarksEntry = (
+    (usize, rigor_parse::NodeId),
+    std::rc::Rc<crate::flow_eval::PathMarks>,
+);
 
 /// A shared empty lexical-scope slice — the default `lexical_scopes` for a
 /// [`Typer`] built without the C1 per-file scopes.

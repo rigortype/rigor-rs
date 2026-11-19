@@ -245,6 +245,9 @@ impl EnvExprEntry {
 
 /// The env-sensitive counterpart of [`expr_entry_hit`]: the dep-match loop
 /// with [`EnvExprEntry::matches`]'s env test folded in.
+// too_many_arguments: the env context is one logical key — a bundle struct
+/// would obscure what a hit must match.
+#[allow(clippy::too_many_arguments)]
 fn env_expr_entry_hit(
     entries: &mut Vec<EnvExprEntry>,
     stack: &[u32],
