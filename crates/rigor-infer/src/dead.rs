@@ -1194,14 +1194,19 @@ impl<'i> Typer<'i> {
                         | Node::LocalVariableWrite { name, .. } = ast.get(*r)
                         {
                             let op = match ast.get(args[0]) {
-                                Node::ConstantRead { name: class, .. } => DeadOp::Isa {
+                                Node::ConstantRead {
+                                    name: class,
+                                    dynamic_base: false,
+                                    ..
+                                } => DeadOp::Isa {
                                     class: class.to_string(),
                                     exact: method == "instance_of?",
                                     holds: polarity,
                                 },
-                                // A non-constant class operand — the
-                                // reference declines to narrow; the local
-                                // keeps its env value (omit the subject).
+                                // A non-constant class operand — including a
+                                // dynamic-base path (`k::String`, rigor-rs#670)
+                                // — the reference declines to narrow; the
+                                // local keeps its env value (omit the subject).
                                 _ => return,
                             };
                             push(out, name, op);

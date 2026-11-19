@@ -326,7 +326,12 @@ impl<'i> Typer<'i> {
                 let [arg] = args.as_slice() else {
                     return None;
                 };
-                let Node::ConstantRead { name: class, .. } = ast.get(*arg) else {
+                let Node::ConstantRead {
+                    name: class,
+                    dynamic_base: false,
+                    ..
+                } = ast.get(*arg)
+                else {
                     return None;
                 };
                 let own = folding::scalar_class(&recv_scalar);
