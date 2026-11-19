@@ -29,10 +29,13 @@ blanked text and fails on:
 an item keyword follows the attribute — `pub` looks one word deeper,
 past any `(…)` visibility group, since it also heads a visibility-
 qualified field (`struct S { #[cfg(test)] pub x: u8 }`, rigor-rs#653).
-On a field (visibility-qualified or not), variant, parameter or match
-arm only the attribute itself is masked, so the next item is not
-swallowed with it; the extent scan also stops at a `}` the item never
-opened. Files `#[cfg(test)] mod x;` resolves to are
+On a non-item position (field, variant, parameter, match arm) only the
+attribute itself is masked; a keyword-headed one (a `union`/`macro_rules`
+field or param name, a `fn()`-typed field) still goes through `item_end`,
+which never crosses a `)`/`]`/`}` the item did not open — so the next
+item is not swallowed with it. A keyword-headed generic parameter (a
+`const` inside `<…>`, #692) is the known limit. Files `#[cfg(test)] mod x;`
+resolves to are
 skipped whole (Rust 2018 module
 resolution: `foo.rs`→`foo/x.rs`, `lib`/`main`/`mod.rs`→`x.rs`; nested
 `mod a { mod b; }` followed). `use` items mask call patterns so each site
