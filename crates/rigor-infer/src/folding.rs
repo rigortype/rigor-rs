@@ -12,9 +12,12 @@
 //! This module is *only* the Rust core. Its hard contract is **zero false
 //! positives**: [`fold`] returns `Some(result)` only when the result is
 //! deterministic AND byte-exactly what Ruby would compute; on any doubt —
-//! non-determinism, a non-modeled method, a non-ASCII string, overflow, a
-//! divide-by-zero — it returns `None`, and the dispatcher widens to the nominal
-//! type rather than minting a spurious `Constant` (ADR-0023 tier-5).
+//! non-determinism, a non-modeled method, a non-ASCII string, a divide-by-zero
+//! — it returns `None`, and the dispatcher widens to the nominal type rather
+//! than minting a spurious `Constant` (ADR-0023 tier-5). Integer overflow is
+//! not a decline: an out-of-`i64` result promotes to the `Scalar::BigInt`
+//! decimal spelling, matching the reference's arbitrary-precision `Constant`,
+//! up to the reference's `INTEGER_FOLD_BIT_LIMIT` gate.
 //!
 // TODO(spec): the long tail (Float formatting, encoding-sensitive String,
 // Rational/Complex, Date/Time, Regexp, `String#%`, `(1..10).first(3)`) goes to
@@ -33,8 +36,8 @@ use rigor_types::Scalar;
 /// `None` is returned for: a non-modeled receiver class / method, the wrong
 /// argument count, a non-`Constant` argument (the caller passes only the scalars
 /// it could pin), a non-deterministic operation, or any boundary condition
-/// (overflow, divide-by-zero, non-ASCII string) where Rust's result could
-/// diverge from Ruby's.
+/// (divide-by-zero, non-ASCII string, a fold past the reference's integer bit
+/// limit) where Rust's result could diverge from Ruby's.
 pub fn fold(receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar> {
     match (method, args) {
         // `nil?` answers from the pin's identity alone — `nil.nil?` is
@@ -346,14 +349,20 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         "+" => Some(int_scalar(i128::from(a) + i128::from(b))),
         "-" => Some(int_scalar(i128::from(a) - i128::from(b))),
         "*" => Some(int_scalar(i128::from(a) * i128::from(b))),
+
         // Ruby integer division floors toward negative infinity, and 0-divisor
-        // raises. Decline on zero; use floor (Euclidean-flavoured) division.
+        // raises. Decline on zero. `div_euclid` is NOT floor on a negative
+        // divisor (`7 / -2` came out `-3` where Ruby floors to `-4` — the
+        // pre-existing drift the review caught); truncate then adjust by the
+        // sign-of-divisor rule,
+        // the same rule `ruby_mod` applies. `i64::MIN / -1` promotes.
         "/" => {
             if b == 0 {
                 None
             } else {
-                // `i64::MIN / -1` overflows the quotient too — promote.
-                Some(int_scalar(i128::from(a).div_euclid(i128::from(b))))
+                let (a, b) = (i128::from(a), i128::from(b));
+                let (q, r) = (a / b, a % b);
+                Some(int_scalar(if r != 0 && (r < 0) != (b < 0) { q - 1 } else { q }))
             }
         }
         // Ruby `%` result takes the sign of the divisor (rem_euclid is for
@@ -372,12 +381,14 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         // precheck — `floor(log2|a|) * b > INTEGER_FOLD_BIT_LIMIT` — widens
         // to `Nominal[Integer]`; declining lands there through the RBS
         // signature. A result past the same limit after the fact (the
-        // estimate is a lower bound) declines the same way.
+        // estimate is a lower bound) declines the same way. `u32::try_from`
+        // guards the exponent: `b as u32` once truncated `2 ** 4294967296`
+        // into `checked_pow(0)` -> `1` (PR #693 review).
         "**" => {
             if b < 0 {
                 None
-            } else {
-                match a.checked_pow(b as u32) {
+            } else if let Ok(b32) = u32::try_from(b) {
+                match a.checked_pow(b32) {
                     Some(v) => Some(Scalar::Int(v)),
                     None => {
                         // Only reachable for |a| >= 2 (`checked_pow` covers
@@ -390,6 +401,15 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
                             .filter(|d| !decimal_oversized(d))
                             .map(Scalar::BigInt)
                     }
+                }
+            } else {
+                // `b >= 2**32`: only a unit base answers without tripping the
+                // bit limit (`0**b == 0`, `(±1)**b == ±1`).
+                match a {
+                    0 => Some(Scalar::Int(0)),
+                    1 => Some(Scalar::Int(1)),
+                    -1 => Some(Scalar::Int(if b % 2 == 0 { 1 } else { -1 })),
+                    _ => None,
                 }
             }
         }
@@ -459,11 +479,12 @@ fn shift_result(a: i64, shift: i128) -> Option<Scalar> {
     if a == 0 {
         return Some(Scalar::Int(0));
     }
-    if u128::from(ruby_bit_length(a)) + shift as u128 > u128::from(INTEGER_FOLD_BIT_LIMIT) {
+    let bits = u128::from(ruby_bit_length(a));
+    if bits + shift as u128 > u128::from(INTEGER_FOLD_BIT_LIMIT) {
         return None;
     }
-    let shift = u32::try_from(shift).unwrap_or(u32::MAX);
-    if u128::from(ruby_bit_length(a)) + u128::from(shift) <= 127 {
+    let shift = shift as u32; // <= INTEGER_FOLD_BIT_LIMIT, so the cast is exact
+    if bits + u128::from(shift) <= 127 {
         Some(int_scalar(i128::from(a) << shift))
     } else {
         Some(Scalar::BigInt(decimal_shl(a, u64::from(shift))))
@@ -635,15 +656,16 @@ fn cmp_bool(method: &str, o: std::cmp::Ordering) -> bool {
     }
 }
 
-/// `d ± 1` on a canonical BigInt spelling; an in-range result demotes to
-/// `Scalar::Int` (`(-9223372036854775808).succ` -> `-9223372036854775807`).
-fn decimal_step(d: &str, up: bool) -> Scalar {
+/// `d ± 1` spelled in decimal on a canonical BigInt spelling — the caller
+/// canonicalises it with [`big_scalar`] (`(-9223372036854775808).succ` ->
+/// the `Scalar::Int` `-9223372036854775807`).
+fn decimal_step(d: &str, up: bool) -> String {
     let negative = d.starts_with('-');
     let mut mag: Vec<u8> = d.trim_start_matches('-').bytes().collect();
     // `up` grows the magnitude on a positive, shrinks it on a negative.
     if negative == up {
         let mut i = mag.len();
-        loop {
+        while i > 0 {
             i -= 1;
             if mag[i] > b'0' {
                 mag[i] -= 1;
@@ -668,15 +690,27 @@ fn decimal_step(d: &str, up: bool) -> Scalar {
     }
     let mag = String::from_utf8(mag).unwrap_or_default();
     let mag = mag.trim_start_matches('0');
-    let mag = if mag.is_empty() { "0" } else { mag };
-    let signed = if negative && mag != "0" {
+    if negative && !mag.is_empty() && mag != "0" {
         format!("-{mag}")
+    } else if mag.is_empty() {
+        "0".to_string()
     } else {
         mag.to_string()
-    };
-    match signed.parse::<i64>() {
-        Ok(v) => Scalar::Int(v),
-        Err(_) => Scalar::BigInt(signed),
+    }
+}
+
+/// Canonicalise a folded integer result's decimal spelling: `Scalar::Int`
+/// when it fits, `None` when the reference's `oversized_number?` gate would
+/// widen the result to `Nominal[Integer]` (the RBS signature lands there),
+/// `Scalar::BigInt` otherwise. Every integer-producing BigInt arm exits
+/// through here so a result past [`INTEGER_FOLD_BIT_LIMIT`] never mints a
+/// `Constant` the reference does not emit — `x.succ` on a 5001-digit literal
+/// is `Integer` on the oracle, not a one-larger literal (PR #693 review).
+fn big_scalar(spelling: String) -> Option<Scalar> {
+    match spelling.parse::<i64>() {
+        Ok(v) => Some(Scalar::Int(v)),
+        Err(_) if decimal_oversized(&spelling) => None,
+        Err(_) => Some(Scalar::BigInt(spelling)),
     }
 }
 
@@ -688,15 +722,11 @@ fn decimal_step(d: &str, up: bool) -> Scalar {
 fn fold_bigint(d: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     let negative = d.starts_with('-');
     match (method, args) {
-        ("abs", []) => Some(Scalar::BigInt(d.trim_start_matches('-').to_string())),
-        ("-@", []) => Some(Scalar::BigInt(if negative {
-            d[1..].to_string()
-        } else {
-            format!("-{d}")
-        })),
-        ("+@", []) => Some(Scalar::BigInt(d.to_string())),
-        ("succ", []) => Some(decimal_step(d, true)),
-        ("pred", []) => Some(decimal_step(d, false)),
+        ("abs", []) => big_scalar(d.trim_start_matches('-').to_string()),
+        ("-@", []) => big_scalar(if negative { d[1..].to_string() } else { format!("-{d}") }),
+        ("+@", []) => big_scalar(d.to_string()),
+        ("succ", []) => big_scalar(decimal_step(d, true)),
+        ("pred", []) => big_scalar(decimal_step(d, false)),
         ("even?", []) => Some(Scalar::Bool(d.as_bytes().last().is_some_and(|c| c % 2 == 0))),
         ("odd?", []) => Some(Scalar::Bool(d.as_bytes().last().is_some_and(|c| c % 2 == 1))),
         ("zero?", []) => Some(Scalar::Bool(false)), // a BigInt is never 0.
@@ -736,16 +766,13 @@ fn bigint_shift(d: &str, shift: i128) -> Option<Scalar> {
         }
         decimal_shr_chunks(&mut chunks, r);
         let mag = chunks_to_decimal(false, &chunks);
-        return Some(if !negative {
-            match mag.parse::<i64>() {
-                Ok(v) => Scalar::Int(v),
-                Err(_) => Scalar::BigInt(mag),
-            }
+        return if !negative {
+            big_scalar(mag)
         } else if mag == "0" {
-            Scalar::Int(-1)
+            Some(Scalar::Int(-1))
         } else {
-            decimal_step(&format!("-{mag}"), false)
-        });
+            big_scalar(decimal_step(&format!("-{mag}"), false))
+        };
     }
     let s = u64::try_from(shift).unwrap_or(u64::MAX);
     if s > INTEGER_FOLD_BIT_LIMIT {
@@ -753,15 +780,7 @@ fn bigint_shift(d: &str, shift: i128) -> Option<Scalar> {
     }
     let mut chunks = decimal_chunks(d.trim_start_matches('-'));
     decimal_shl_chunks(&mut chunks, s);
-    let spelling = chunks_to_decimal(negative, &chunks);
-    if decimal_oversized(&spelling) {
-        None
-    } else {
-        Some(match spelling.parse::<i64>() {
-            Ok(v) => Scalar::Int(v),
-            Err(_) => Scalar::BigInt(spelling),
-        })
-    }
+    big_scalar(chunks_to_decimal(negative, &chunks))
 }
 
 /// Ruby's `Integer#%`: the result has the sign of the divisor.
@@ -1101,8 +1120,8 @@ fn fold_str_lookup(a: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
 /// `a ** b` as a decimal-spelled [`Scalar::BigInt`] operand — digit-vector
 /// long multiplication, sign carried separately. Used only for results past
 /// `i64` (the caller tries `checked_pow` first). `a` is small (the foldable
-/// receivers are i64 literals) and `b <= 4096`, so the loop is bounded by
-/// ~19*4096 digits worst-case.
+/// receivers are i64 literals) and `bits(|a|) * b <= INTEGER_FOLD_BIT_LIMIT`,
+/// so the loop is bounded by ~19*13606 digits worst-case.
 fn decimal_pow(a: i64, b: u64) -> Option<String> {
     if a == 0 {
         return None; // 0 ** b never overflows; unreachable in practice.
@@ -1195,6 +1214,20 @@ mod tests {
         assert_eq!(fold(&i(i64::MIN), "-", &[i(1)]), Some(big("-9223372036854775809")));
         assert_eq!(fold(&i(4611686018427387904), "*", &[i(4)]), Some(big("18446744073709551616")));
         assert_eq!(fold(&i(i64::MIN), "/", &[i(-1)]), Some(big("9223372036854775808")));
+        // Ruby `/` floors: `7 / -2` is -4, `div_euclid`'s -3 was a drift
+        // (pre-existing; PR #693 review).
+        assert_eq!(fold(&i(7), "/", &[i(-2)]), Some(i(-4)));
+        assert_eq!(fold(&i(-7), "/", &[i(-2)]), Some(i(3)));
+        assert_eq!(fold(&i(-7), "/", &[i(2)]), Some(i(-4)));
+        assert_eq!(fold(&i(7), "/", &[i(2)]), Some(i(3)));
+        // An exponent at/past `u32::MAX` must not truncate into `checked_pow`:
+        // `2 ** 4294967296` is `Integer` on the oracle, never `1`.
+        assert_eq!(fold(&i(2), "**", &[i(4294967296)]), None);
+        assert_eq!(fold(&i(-2), "**", &[i(4294967297)]), None);
+        assert_eq!(fold(&i(0), "**", &[i(4294967296)]), Some(i(0)));
+        assert_eq!(fold(&i(1), "**", &[i(4294967296)]), Some(i(1)));
+        assert_eq!(fold(&i(-1), "**", &[i(4294967297)]), Some(i(-1)));
+        assert_eq!(fold(&i(-1), "**", &[i(4294967296)]), Some(i(1)));
         assert_eq!(fold(&i(i64::MIN), "abs", &[]), Some(big("9223372036854775808")));
         assert_eq!(fold(&i(i64::MAX), "succ", &[]), Some(big("9223372036854775808")));
         assert_eq!(fold(&i(i64::MIN), "pred", &[]), Some(big("-9223372036854775809")));
@@ -1252,24 +1285,30 @@ mod tests {
         assert_eq!(fold(&n, "positive?", &[]), Some(Scalar::Bool(true)));
         assert_eq!(fold(&n, "negative?", &[]), Some(Scalar::Bool(false)));
         assert_eq!(fold(&n, "to_s", &[]), Some(Scalar::Str("99999999999999999999".into())));
-        let neg = big("-9223372036854775808");
+        // `-99999999999999999999` is a canonical negative BigInt spelling
+        // (`-9223372036854775808` is not — it fits `i64`, so a produced
+        // spelling that fits demotes to `Scalar::Int`).
+        let neg = big("-99999999999999999999");
         assert_eq!(fold(&neg, "negative?", &[]), Some(Scalar::Bool(true)));
         assert_eq!(fold(&neg, "<", &[i(0)]), Some(Scalar::Bool(true)));
-        assert_eq!(fold(&neg, "succ", &[]), Some(i(-9223372036854775807)));
-        assert_eq!(fold(&neg, "pred", &[]), Some(big("-9223372036854775809")));
-        assert_eq!(fold(&neg, "abs", &[]), Some(big("9223372036854775808")));
-        assert_eq!(fold(&neg, "-@", &[]), Some(big("9223372036854775808")));
+        assert_eq!(fold(&neg, "succ", &[]), Some(big("-99999999999999999998")));
+        assert_eq!(fold(&neg, "pred", &[]), Some(big("-100000000000000000000")));
+        assert_eq!(fold(&neg, "abs", &[]), Some(n.clone()));
+        assert_eq!(fold(&neg, "-@", &[]), Some(n.clone()));
         assert_eq!(fold(&n, "succ", &[]), Some(big("100000000000000000000")));
         assert_eq!(fold(&big("9223372036854775808"), "pred", &[]), Some(i(i64::MAX)));
+        assert_eq!(fold(&big("-9223372036854775809"), "succ", &[]), Some(i(i64::MIN)));
+        assert_eq!(fold(&big("9223372036854775808"), "-@", &[]), Some(i(i64::MIN)));
         // Bignum `<<`/`>>` fold in place — same semantics as `shift_result`.
         assert_eq!(fold(&n, "<<", &[i(1)]), Some(big("199999999999999999998")));
         assert_eq!(fold(&n, ">>", &[i(1)]), Some(big("49999999999999999999")));
         assert_eq!(fold(&n, ">>", &[i(64)]), Some(i(5)));
         assert_eq!(fold(&n, ">>", &[i(1000)]), Some(i(0)));
-        assert_eq!(fold(&neg, ">>", &[i(1)]), Some(i(-4611686018427387904)));
-        assert_eq!(fold(&neg, ">>", &[i(63)]), Some(i(-1)));
+        assert_eq!(fold(&neg, ">>", &[i(1)]), Some(big("-50000000000000000000")));
+        assert_eq!(fold(&neg, ">>", &[i(63)]), Some(i(-11)));
+        assert_eq!(fold(&neg, ">>", &[i(64)]), Some(i(-6)));
         assert_eq!(fold(&neg, ">>", &[i(1000)]), Some(i(-1)));
-        assert_eq!(fold(&neg, "<<", &[i(1)]), Some(big("-18446744073709551616")));
+        assert_eq!(fold(&neg, "<<", &[i(1)]), Some(big("-199999999999999999998")));
         // A huge count by sign: `big << -huge` saturates, `big << +huge`
         // widens (the reference's `WidenedResult` — the RBS `Integer` here).
         let huge = big("99999999999999999999999999999999999999");
@@ -1283,9 +1322,29 @@ mod tests {
         assert_eq!(fold(&n, "+", &[i(1)]), None);
         assert_eq!(fold(&n, "*", &[i(2)]), None);
         assert_eq!(fold(&n, "==", &[Scalar::Str("x".into())]), None);
+    }
+
+    /// The `oversized_number?` result gate applies on a BigInt receiver too:
+    /// a literal past `INTEGER_FOLD_BIT_LIMIT` is still a `Constant` on both
+    /// engines, but a fold whose RESULT stays past the limit widens to
+    /// `Integer` on the oracle — never a minted `Constant` (PR #693 review).
+    #[test]
+    fn declines_bigint_results_past_the_bit_limit() {
+        let i = Scalar::Int;
+        let huge = Scalar::BigInt("9".repeat(5001));
+        for m in ["succ", "pred", "abs", "-@", "+@"] {
+            assert_eq!(fold(&huge, m, &[]), None, "{m} on an oversized receiver");
+        }
+        assert_eq!(fold(&huge, ">>", &[i(1)]), None);
+        assert_eq!(fold(&huge, "<<", &[i(1)]), None);
+        assert_eq!(fold(&huge, ">>", &[i(20000)]), Some(i(0)));
+        // … while predicates and comparisons on it still fold (non-Integer
+        // results are never gated).
+        assert_eq!(fold(&huge, "even?", &[]), Some(Scalar::Bool(false)));
+        assert_eq!(fold(&huge, ">", &[i(0)]), Some(Scalar::Bool(true)));
         // … and an `i64` receiver compares against a Bignum argument.
-        assert_eq!(fold(&i(5), "<", &[n.clone()]), Some(Scalar::Bool(true)));
-        assert_eq!(fold(&i(5), "==", &[n]), Some(Scalar::Bool(false)));
+        assert_eq!(fold(&i(5), "<", &[huge.clone()]), Some(Scalar::Bool(true)));
+        assert_eq!(fold(&i(5), "==", &[huge]), Some(Scalar::Bool(false)));
     }
 
     #[test]
