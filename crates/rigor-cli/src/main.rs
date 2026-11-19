@@ -132,8 +132,9 @@ fn run_command_with_pool() -> ExitCode {
 /// spawn even one 2 MiB worker they still answer instead of exiting 70
 /// (rigor-rs#678). Every other command keeps the pool-first ordering — the
 /// safe side, since a command that reached rayon before
-/// `configure_global_pool` ran would build a default pool on unbounded
-/// stacks.
+/// `configure_global_pool` ran would build rayon's default pool on std's
+/// default worker stacks (2 MiB, or `RUST_MIN_STACK`) — the #412
+/// regression.
 fn needs_analysis_pool(args: &[String]) -> bool {
     !matches!(
         args.first().map(String::as_str),
