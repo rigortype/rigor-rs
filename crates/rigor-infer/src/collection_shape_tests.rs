@@ -627,3 +627,47 @@ fn coll_union_literal_arms_converge_fires() {
         Some("Array"),
     );
 }
+
+/// rigor-rs#424 review F1: the `changed` set the delta join re-joins must
+/// come from the env keys the walk actually inserted ([`CollCtx::dirty`]),
+/// not a syntax enumeration — a block/lambda-bound local's write or
+/// MUTATION lands on the block env while the write collector drops the
+/// record for being bound-local. Before the dirty-key tracking, the join
+/// kept one edge's carrier and `check_collection_call` fired where the
+/// oracle is silent.
+#[test]
+fn coll_block_bound_mutation_under_condition_silent() {
+    for src in [
+        // `args` bound to the BLOCK env, mutated under `unless` in the
+        // block — out of `writes` AND out of the local-write nodes.
+        b"def f(xs)\n  xs.map do |u|\n    args = [1, 2]\n    args << u unless u.nil?\n    args.frobnicate_zzz\n  end\nend\n" as &[u8],
+        // … `each` + `if` — the reviewer's second row.
+        b"def f(xs)\n  xs.each do |u|\n    args = [1, 2]\n    args << u if u\n    args.frobnicate_zzz\n  end\nend\n",
+        // Block-bound Hash mutated by `[]=` under `if`.
+        b"def f(xs)\n  xs.each do |u|\n    h = {a: 1}\n    if u\n      h[:b] = 2\n    end\n    h.frobnicate_zzz\n  end\nend\n",
+        // The gitlab `schema_checker` shape — `[]=` on a block-bound
+        // literal under `if`, then a use inside the same block.
+        b"def f(es)\n  es.map do |entry|\n    base_entry = {name: entry}\n    base_entry[:details] = entry.to_s if entry\n    base_entry.frobnicate_zzz\n  end\nend\n",
+        // `case`/`when` on a block-bound local.
+        b"def f(xs)\n  xs.each do |u|\n    a = []\n    case u when 1 then a << u end\n    a.frobnicate_zzz\n  end\nend\n",
+        // A `loop`'s own scope is a block env too: the `a.push(2) if xs`
+        // mutation is bound-local to it.
+        b"def f(xs)\n  loop do\n    a = [1]\n    a.push(2) if xs\n    a.frobnicate_zzz\n    break\n  end\nend\n",
+    ] {
+        assert_eq!(snap(src, "frobnicate_zzz"), None, "{src:?}");
+    }
+}
+
+/// The same rows still FIRE when the block-bound mutation is unconditional
+/// — the union member growth is not suppressed, the join just sees the
+/// change. Must-still-fire control for the dirty-key tracking.
+#[test]
+fn coll_block_bound_mutation_unconditional_fires() {
+    assert_eq!(
+        snap(
+            b"def f(xs)\n  xs.each do |u|\n    args = [1, 2]\n    args << u\n    args.frobnicate_zzz\n  end\nend\n",
+            "frobnicate_zzz",
+        ),
+        Some("Array"),
+    );
+}

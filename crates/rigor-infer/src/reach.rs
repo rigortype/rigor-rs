@@ -1416,7 +1416,7 @@ impl<'i> Typer<'i> {
                 None => (0usize, None, None),
                 Some(row) => {
                     let running = self.truthy_in_flight.borrow();
-                    let landed = self.truthy_memo.borrow();
+                    let landed = self.truthy_landed.borrow();
                     let mut prev_end = 0usize;
                     let mut cut = row.kills.len();
                     for seg in &row.segs {
@@ -1798,25 +1798,6 @@ fn untyped_expr_root(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<Untyped
         _ => None,
     }
 }
-
-/// The span of the innermost literal block or `->` body enclosing `use_span`
-/// when no scope-recording evaluation reaches that closure — issue #146's
-/// "operand position".
-///
-/// The reference's scope index (`scope_indexer.rb`) records a type
-/// environment per node the statement evaluator ENTERS. A closure sitting in
-/// a position the evaluator only TYPES — an element of an array/hash/range
-/// literal or interpolation, a call's argument or receiver, a `Constant`'s
-/// right-hand side, a multi-assignment or index-write value, a
-/// `return`/`next`/`break` value, a `rescue` modifier — is never entered:
-/// `propagate` fills the unrecorded body with the PARENT scope, and
-/// `closure_scope` floors every name the closure itself binds (parameters,
-/// `;`-locals and body-introduced locals) to `Dynamic[top]`. An in-body write
-/// therefore never reaches a read in that body — `{ a: lambda { |q| q = 1;
-/// Float(q) } }` is reference-silent where the same `lambda` at statement
-/// level fires `for 1.0` — and a closure-bound name never reads the precise
-/// value the entry scope might suggest.
-///
 
 /// Meet one more contributor into a running pin ([`Typer::local_reach`] /
 /// [`Typer::expr_scalar`]): `Some(Some(s))` while every contributor folds to

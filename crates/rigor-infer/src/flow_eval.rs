@@ -5028,9 +5028,14 @@ impl FlowEffects {
     }
 
     /// The positions of `table`'s span-keyed entries whose START falls in
-    /// `span`, in `table` order. The `w.1 <= span.1` half of containment is
-    /// still per-candidate (a span never properly crosses a boundary, but
-    /// the callers' predicates are kept verbatim).
+    /// `span`, IN `table` ORDER — the table's arena order is post-order
+    /// (children lower before parents), and consumers like
+    /// `apply_mutation_effects`/`arm_write_ty` sequence effects by it, so
+    /// the slice's indices are sorted back into table order rather than
+    /// yielded start-sorted (an outer mutator must not run before the
+    /// `h[k] ||= v` nested inside it). The `w.1 <= span.1` half of
+    /// containment is still per-candidate (a span never properly crosses
+    /// a boundary, but the callers' predicates are kept verbatim).
     fn within<'a, T: 'a>(
         table: &'a [T],
         starts: &'a [u32],
@@ -5039,7 +5044,9 @@ impl FlowEffects {
     ) -> impl Iterator<Item = &'a T> {
         let lo = starts.partition_point(|&i| at(&table[i as usize]).0 < span.0);
         let hi = starts.partition_point(|&i| at(&table[i as usize]).0 <= span.1);
-        starts[lo..hi].iter().map(move |&i| &table[i as usize])
+        let mut order = starts[lo..hi].to_vec();
+        order.sort_unstable();
+        order.into_iter().map(move |i| &table[i as usize])
     }
 
     /// `rebinds` entries starting inside `span` (`w.0 <= span.1` — the end

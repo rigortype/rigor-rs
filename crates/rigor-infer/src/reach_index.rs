@@ -468,8 +468,20 @@ impl ReachIndex {
         out
     }
 
-    /// [`unrecorded_closure`] for `use_span`, memoized — over the indexed
-    /// closure set rather than two whole-arena walks per read (rigor-rs#424).
+    /// The span of the innermost literal block or `->` body enclosing
+    /// `use_span` when no scope-recording evaluation reaches that closure —
+    /// issue #146's "operand position", memoized over the indexed closure
+    /// set rather than two whole-arena walks per read (rigor-rs#424).
+    ///
+    /// The reference's scope index (`scope_indexer.rb`) records a type
+    /// environment per node the statement evaluator ENTERS. A closure
+    /// sitting in a position the evaluator only TYPES — an element of an
+    /// array/hash/range literal or interpolation, a call's argument or
+    /// receiver, a `Constant`'s right-hand side, a multi-assignment or
+    /// index-write value, a `return`/`next`/`break` value, a `rescue`
+    /// modifier — is never entered: `propagate` fills the unrecorded body
+    /// with the PARENT scope, and `closure_scope` floors every name the
+    /// closure itself binds to `Dynamic[top]`.
     pub(crate) fn unrecorded_closure(
         &self,
         ast: &LoweredAst,
