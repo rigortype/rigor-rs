@@ -63,9 +63,10 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-19 #429 CLOSED** (PR #601): `analysis_stack_audit` — workspace test scans `crates/*/src` for unbounded parses + unsized-stack threads (exact-count ALLOW_LIST); Opus Approved after `ruby_prism`/span/`::default` fix. → #652–#654. [note](notes/20261118-issue-429-analysis-stack-audit.md)
-- **2026-11-19 #424 const** (PR #651): `lower_constant_path`; `A::A::…` 20k→0.72s; 0 FP; Approved. → #655–#658. [note](notes/20261119-issue-424-const-path.md)
-- **2026-11-19 #427 display stack** (PR #648): `render_postorder`; wrap90 SIGABRT→exit 1, wrap70 identical; 0 FP; Opus Approved. `.map` still #424. → #650. [note](notes/20261119-issue-427-iterative-type-display.md)
+- **2026-11-19 #658 CLOSED** (PR #659): PathMarks + CoreData + env-fp type_of; 2.5k push 49.5s→1.7s; 0 FP; Approved. [note](notes/20261119-issue-658-mutator-chains.md)
+- **2026-11-19 #429 CLOSED** (PR #601): `analysis_stack_audit` — unbounded parses + unsized-stack threads; Approved. → #652–#654. [note](notes/20261118-issue-429-analysis-stack-audit.md)
+- **2026-11-19 #424 const** (PR #651): `lower_constant_path`; 20k→0.72s; 0 FP; Approved. → #655–#658. [note](notes/20261119-issue-424-const-path.md)
+- **2026-11-19 #427 display stack** (PR #648): `render_postorder`; wrap90 SIGABRT→exit 1; 0 FP; Approved. → #650. [note](notes/20261119-issue-427-iterative-type-display.md)
 - **2026-11-19 #424 `**` row** (PR #649): env-free call memos — 800 `**` 38s→0.5s; literal `x.a`/`1+` 20k under bar; 0 FP/8,251; Opus Approved. Const-path + local-rooted remain. [note](notes/20261119-issue-424-pow-chain.md)
 - **2026-11-19 #642 CLOSED** (PR #644): one `LineIndex` on `LoweredAst` (`CarrierSpans` box); MCP/LSP/annotate/stage 3 share it — LSP publish 2.89s→0.36s, MCP 4.26s→0.54s (20k diags); byte-identical; 0 FP; Opus Approved. [note](notes/20261119-issue-642-shared-line-index.md)
 - **2026-11-19 #435 CLOSED** (PR #634): loop-cap widen — structural `loop_cap_widening` + post-join `apply_loop_cap_widen` (ADR-56 slice B); m1/m2/o8 match, r3 silent; 0 FP, 0 gaps closed/opened; Opus Approved. → #638–#640. [note](notes/20261119-issue-435-loop-cap-widen.md)
