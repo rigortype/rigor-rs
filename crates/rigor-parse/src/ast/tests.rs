@@ -1987,3 +1987,79 @@ fn lowered_ast_uid_is_per_instance() {
     assert_eq!(a.uid(), a.clone().uid());
 }
 
+
+/// rigor-rs#424: a constant-path chain lowers in one iterative pass. Pin the
+/// per-level `ConstantRead` fields — push order (base first, inner to outer),
+/// lenient `name`, `dynamic_base`, `self_anchored`, `rooted` and span — to the
+/// values the per-node helpers produced. Each row renders
+/// `name|span-text|dynamic_base|self_anchored|rooted`.
+#[test]
+fn constant_path_chain_lowers_each_level_with_uniform_flags() {
+    fn reads(src: &str) -> Vec<String> {
+        let ast = lower(&crate::parse(src.as_bytes()));
+        ast.iter()
+            .filter_map(|(_, n)| match n {
+                Node::ConstantRead {
+                    name,
+                    span,
+                    dynamic_base,
+                    self_anchored,
+                    rooted,
+                } => Some(format!(
+                    "{name}|{}|{dynamic_base}|{self_anchored}|{rooted}",
+                    &src[span.0..span.1]
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+    let cases: [(&str, &[&str]); 6] = [
+        // `A` lowers through the bare `ConstantReadNode` arm, `A::B` and
+        // `A::B::C` through the path arm — all pushed before their outer
+        // levels and carrying this chain's flags.
+        (
+            "A::B::C\n",
+            &[
+                "A|A|false|false|false",
+                "A::B|A::B|false|false|false",
+                "A::B::C|A::B::C|false|false|false",
+            ],
+        ),
+        // `::A` has no parent: the whole chain is `rooted`.
+        (
+            "::A::B::C\n",
+            &[
+                "A|::A|false|false|true",
+                "A::B|::A::B|false|false|true",
+                "A::B::C|::A::B::C|false|false|true",
+            ],
+        ),
+        // A `self` base anchors AND counts as dynamic (its strict name is
+        // nil), so both flags hold at every level.
+        (
+            "self::X::Y\n",
+            &[
+                "X|self::X|true|true|false",
+                "X::Y|self::X::Y|true|true|false",
+            ],
+        ),
+        // A dynamic base renders leniently from the last constant segment.
+        (
+            "k::A::B\n",
+            &["A|k::A|true|false|false", "A::B|k::A::B|true|false|false"],
+        ),
+        ("expr::B\n", &["B|expr::B|true|false|false"]),
+        // A path under a call receiver lowers the same way.
+        (
+            "A::B::C.foo\n",
+            &[
+                "A|A|false|false|false",
+                "A::B|A::B|false|false|false",
+                "A::B::C|A::B::C|false|false|false",
+            ],
+        ),
+    ];
+    for (src, want) in cases {
+        assert_eq!(reads(src), want, "constant path lowering drifted for {src:?}");
+    }
+}

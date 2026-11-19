@@ -11,8 +11,8 @@ use crate::ruby_prism::Node as PrismNode;
 
 use super::{
     constant_list_names, constant_path_string, constant_string, integer_decimal, integer_value,
-    lower_multi_targets, rooted_constant_path, self_anchored_constant_path, span_of,
-    strict_constant_path_string, Builder, Node, NodeId, StatementsKind, UNMATCHED,
+    lower_multi_targets, span_of, strict_constant_path_string, Builder, Node, NodeId,
+    StatementsKind, UNMATCHED,
 };
 
 impl<'src> Builder<'src> {
@@ -412,17 +412,7 @@ impl<'src> Builder<'src> {
             });
         }
         if let Some(cp) = node.as_constant_path_node() {
-            // `Foo::Bar` — lower the parent scope (it may itself be a call/const).
-            if let Some(parent) = cp.parent() {
-                self.lower_node(&parent);
-            }
-            return self.push(Node::ConstantRead {
-                name: constant_path_string(node),
-                span: span_of(&cp.location()),
-                dynamic_base: strict_constant_path_string(node).is_none(),
-                self_anchored: self_anchored_constant_path(node),
-                rooted: rooted_constant_path(node),
-            });
+            return self.lower_constant_path(cp);
         }
 
         if let Some(self_node) = node.as_self_node() {
@@ -524,5 +514,76 @@ impl<'src> Builder<'src> {
         }
 
         UNMATCHED
+    }
+
+    /// Lower `cp` and its `ConstantPathNode` ancestors in ONE pass
+    /// (rigor-rs#424). The per-node form ran `lower_node` on the parent and
+    /// then asked `constant_path_string` / `strict_constant_path_string` /
+    /// `self_anchored_constant_path` / `rooted_constant_path` — four O(depth)
+    /// re-walks of the Prism chain per level, two of them string-building, so
+    /// `A::A::…` cost quadratic time in the builder alone. The chain facts are
+    /// uniform (`rooted`, `self_anchored` both read the leftmost segment) or
+    /// prefix-monotone (`dynamic_base`), and each level's lenient `name` is
+    /// the parent's name plus one segment, so a single innermost-out pass
+    /// computes all of them. Push order matches the recursive form exactly:
+    /// the non-path base lowers first, then the levels inner to outer.
+    fn lower_constant_path(&mut self, cp: crate::ruby_prism::ConstantPathNode<'_>) -> NodeId {
+        // Collect the path levels outermost→innermost; `base` is the
+        // innermost non-path parent (`None` for the `::A` rooted spelling).
+        let mut chain = vec![cp];
+        let base = loop {
+            match chain.last().unwrap().parent() {
+                Some(parent) => match parent.as_constant_path_node() {
+                    Some(next) => chain.push(next),
+                    None => break Some(parent),
+                },
+                None => break None,
+            }
+        };
+
+        // `rooted` / `self_anchored` answer on the chain's leftmost segment,
+        // which every level shares: `rooted` iff the innermost path node has
+        // no parent (`::A`), `self_anchored` iff the base is `self`.
+        let rooted = base.is_none();
+        let self_anchored = base
+            .as_ref()
+            .is_some_and(|b| b.as_self_node().is_some());
+
+        // The base lowers exactly as the recursive form's deepest
+        // `lower_node` did: a bare `A` pushes its own `ConstantRead`, a
+        // dynamic `expr::` types the expression. Its lenient name is the
+        // first level's `head`; its strictness seeds `dynamic_base` (a
+        // non-constant base — `self` included — fails every level's strict
+        // name).
+        let mut name = String::new();
+        let mut strict_ok = true;
+        if let Some(base) = &base {
+            self.lower_node(base);
+            name = constant_path_string(base);
+            strict_ok = strict_constant_path_string(base).is_some();
+        }
+
+        let mut id = UNMATCHED;
+        for cp in chain.iter().rev() {
+            let last = cp
+                .name()
+                .map(|n| constant_string(n.as_slice()))
+                .unwrap_or_default();
+            // `constant_path_string`'s lenient join: an un-namable parent
+            // contributes nothing, so `k::A::B` renders `A::B`.
+            if !name.is_empty() {
+                name.push_str("::");
+            }
+            name.push_str(&last);
+            strict_ok &= cp.name().is_some();
+            id = self.push(Node::ConstantRead {
+                name: name.clone(),
+                span: span_of(&cp.location()),
+                dynamic_base: !strict_ok,
+                self_anchored,
+                rooted,
+            });
+        }
+        id
     }
 }
