@@ -2342,13 +2342,33 @@ fn loop_cap_widens_tracked_names_when_body_never_converges() {
     );
 }
 
-/// The convergent control for `loop_cap_widening`: a body whose tracked
+/// The convergent control for `loop_rebind_fixpoint`: a body whose tracked
 /// names settle inside two passes (`y = 2` joins `nil | 2` once, then holds)
 /// keeps the constant pins — `if t` still folds to `Constant[1]` and
 /// `flow.always-truthy-condition` fires on both engines.
 #[test]
 fn loop_converged_body_keeps_constant_pins() {
     let src = b"def f(c)\n  t = 1\n  y = nil\n  while c\n    if false\n      t = nil\n    end\n    y = 2\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+}
+
+/// rigor-rs#638: a value-stabilizing self-op (`x |= 1`) converges inside
+/// two BodyFixpoint passes, so the last-pass widen never runs and a sibling
+/// dead-arm pin stays `Constant[1]`.
+#[test]
+fn loop_stabilizing_op_write_keeps_constant_pins() {
+    let src = b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x |= 1\n  end\n  if t\n    y = 3\n  end\nend\n";
     let ast = lower_src(src);
     let index = CoreIndex::new();
     let typer = Typer::new(&index);

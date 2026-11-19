@@ -415,18 +415,19 @@ impl<'i> Typer<'i> {
                         .filter(|r| written.iter().any(|w| w == r))
                         .map(str::to_string)
                         .collect();
-                    // ADR-56 slice B: when the rebind fixpoint needs the cap
-                    // pass, the reference widens EVERY tracked name. The
-                    // criterion reads the entry env; the widen is applied
-                    // over the post-join bindings so a body write to a
-                    // non-suspect name survives (`w = nil` seeded, `w = 1`
-                    // in the body — the pin the join produced sheds to
-                    // `Integer | NilClass`, never `nil`).
-                    let capped =
-                        self.loop_cap_widening(ast, env, &body, interner);
+                    // ADR-56 slice B: bounded rebind fixpoint in the replay
+                    // env (rigor-rs#638). Overlay the continuation after the
+                    // single-pass join so a body write to a non-suspect name
+                    // survives (`w = nil` seeded, `w = 1` in the body) and a
+                    // stabilizing self-op (`x |= 1`) does not shed a sibling
+                    // dead-arm pin.
+                    let fix =
+                        self.loop_rebind_fixpoint(ast, env, &body, interner);
                     self.join_arm_writes(ast, env, &[(&body, &carried), (&[], &[])], interner, returns);
-                    if let Some((tracked, suspect)) = capped {
-                        self.apply_loop_cap_widen(env, &tracked, &suspect, interner);
+                    if let Some(bindings) = fix {
+                        for (n, ty) in bindings {
+                            env.insert(n, ty);
+                        }
                     }
                 }
                 // A `return` recorded inside the body typed its value at
@@ -614,12 +615,35 @@ impl<'i> Typer<'i> {
             // `a <binop>= v` ⇒ `a = a.<binop>(v)`: only a literal-by-literal
             // fold is exact; every other dispatch declines.
             OpWriteKind::Operator(opname) => {
-                if let (Type::Constant(r), Type::Constant(a)) = (interner.get(entry), interner.get(v_ty)) {
-                    if let Some(sc) = crate::folding::fold(r, opname, &[a.clone()]) {
-                        return interner.intern(Type::Constant(sc));
-                    }
+                // Memberwise over a union of constants so a loop fixpoint can
+                // see `x |= 1` stabilize at `0 | 1` instead of declining the
+                // second pass to `Dynamic` (rigor-rs#638). A non-constant
+                // member still declines the whole write.
+                let v_scalar = match interner.get(v_ty) {
+                    Type::Constant(a) => a.clone(),
+                    _ => return untyped,
+                };
+                let members: Vec<TypeId> = match interner.get(entry) {
+                    Type::Union(ms) => ms.clone(),
+                    _ => vec![entry],
+                };
+                let mut acc: Option<TypeId> = None;
+                for m in members {
+                    let r = match interner.get(m) {
+                        Type::Constant(r) => r.clone(),
+                        _ => return untyped,
+                    };
+                    let Some(sc) = crate::folding::fold(&r, opname, std::slice::from_ref(&v_scalar))
+                    else {
+                        return untyped;
+                    };
+                    let f = interner.intern(Type::Constant(sc));
+                    acc = Some(match acc {
+                        None => f,
+                        Some(a) => rigor_types::Algebra::join(interner, a, f),
+                    });
                 }
-                untyped
+                acc.unwrap_or(untyped)
             }
         }
     }
@@ -849,50 +873,37 @@ impl<'i> Typer<'i> {
 
     /// ADR-56 slice B — the reference's `loop_rebind_fixpoint`
     /// (`StatementEvaluator#loop_rebind_fixpoint`, `BodyFixpoint.converge`,
-    /// CAP = 3): when a `while`/`until` body's rebind fixpoint has not
-    /// converged by the last permitted pass, EVERY tracked name is widened
-    /// `Constant -> Nominal` ([`Self::widen_value_pinned`]), and a still-
-    /// moving one floors to `Dynamic[top]`. The port's env algebra collapses
-    /// any arm disagreement to `Dynamic`, so it cannot replay the reference's
-    /// passes to observe the same divergence — a body whose `y = [y]` or
-    /// `if y` keeps moving in the reference is already a flat `Dynamic`
-    /// here. This is the structural reading of the same criterion:
+    /// CAP = 3). Runs bounded passes in the replay env (seed = the loop's
+    /// entry / post-predicate env) and returns the per-name continuation
+    /// binding. A name the body does not rebind is absent from the result
+    /// set only when nothing is tracked; otherwise every tracked name is
+    /// present.
     ///
-    /// - a write COMPOUNDS — its RHS reads the name it rebinds (`y = [y]`,
-    ///   `i += 1`), so every pass produces a strictly new binding — or is
-    ///   an op-write the reference refolds per pass (`d *= 2`);
-    /// - a write's RHS reads the ASSUMPTION of a name that moved — the
-    ///   read precedes the name's first body write (`s = t` where `t` still
-    ///   moved at some pass); a name moved at ANY pass keeps moving its
-    ///   readers a pass later;
-    /// - a write lands only under a DECISION reading a moved name — the
-    ///   arm's liveness changes between passes (`if s then y = 1 end` goes
-    ///   live when `s`'s union gains a truthy member, o8 in rigor-rs#435).
+    /// Passes overlay the running assumption onto a clone of `env` (body-first
+    /// locals are not overlaid — their `nil` seed is a 0-iteration join
+    /// constituent only) and replay the body via [`Self::replay_statements`],
+    /// which is the port of `single_pass` + `join_with_nil_injection`
+    /// (`join_arm_writes_bound`). Per-name join stability is `TypeId`
+    /// equality after `Algebra::join` with the previous assumption, matching
+    /// `BodyFixpoint`. On the last permitted pass both sides are
+    /// [`Self::widen_value_pinned`] before the join; a name that still moves
+    /// floors to `Dynamic[top]`.
     ///
-    /// A body carrying any such name MAY still move at the reference's
-    /// cap pass, so every tracked name is widened — `Constant -> Nominal`,
-    /// a compounding name to `Dynamic[top]` — and a dead-arm pin like
-    /// `if false; t = nil; end` sheds `Constant[1]` exactly as the
-    /// reference's last-pass widen does. A name nothing moves through
-    /// keeps the caller's own post-loop binding (`None`), so convergent
-    /// loops keep their constants.
+    /// Stabilizing self-ops (`x |= 1`, `i += 0`) converge in pass 1–2 and
+    /// never hit the last-pass widen, so a sibling dead-arm pin (`t = 1`
+    /// with `if false; t = nil`) stays `Constant` — the structural
+    /// criterion in rigor-rs#435 treated every op-write as compounding and
+    /// over-capped those rows (rigor-rs#638). A still-growing shape
+    /// (`y = [y]`) reaches CAP and sheds every tracked pin, as before.
     ///
-    /// Returns `(tracked, suspect)` on a cap — the caller applies the
-    /// widen over its POST-JOIN env via [`Self::apply_loop_cap_widen`] —
-    /// `None` when the body provably converges or is untracked.
-    fn loop_cap_widening(
+    /// Returns `None` when the body writes nothing tracked.
+    fn loop_rebind_fixpoint(
         &self,
         ast: &LoweredAst,
         env: &TypeEnv,
         body: &[NodeId],
         interner: &mut Interner,
-    ) -> Option<(Vec<String>, std::collections::HashSet<String>)> {
-        use std::collections::HashSet;
-        use rigor_parse::OpWriteKind;
-
-        // `loop_body_local_writes` + `loop_body_ivar_writes`: every local the
-        // body writes textually (nested def/class/module scopes excluded),
-        // plus the ivars bound at entry (the `rebindable_ivar?` gate).
+    ) -> Option<HashMap<String, TypeId>> {
         let marks = self.def_local_marks(ast);
         let body_span = crate::def_local_marks::body_span(ast, body)?;
         let mut names: Vec<String> = Vec::new();
@@ -908,243 +919,56 @@ impl<'i> Typer<'i> {
         if names.is_empty() {
             return None;
         }
-        let tracked: HashSet<&str> = names.iter().map(String::as_str).collect();
-        let nested = marks.nested_scopes_within(body_span);
-        let inside_nested =
-            |span: rigor_parse::Span| nested.iter().any(|s| s.0 <= span.0 && span.1 <= s.1);
-        let dead = self.dead_positions(ast, &mut Vec::new());
-
-        // The body's live write sites. `value` is the RHS node — a `None`
-        // site is a write the port cannot read the value of (pattern binds,
-        // `for` indices), which can never prove convergence.
-        struct Site {
-            target: String,
-            span: rigor_parse::Span,
-            value: Option<rigor_parse::Span>,
-            value_node: Option<NodeId>,
-            compound: bool,
-            unmodeled: bool,
-        }
-        let mut sites: Vec<Site> = Vec::new();
-        for (_, n) in ast.iter() {
-            let span = n.span();
-            if !(body_span.0 <= span.0 && span.1 <= body_span.1) || inside_nested(span) {
-                continue;
-            }
-            match n {
-                Node::LocalVariableWrite { name, value, span, .. }
-                | Node::InstanceVariableWrite { name, value, span, .. } => {
-                    if !tracked.contains(name.as_str()) {
-                        continue;
-                    }
-                    let vs = ast.get(*value).span();
-                    // A bare `x = x` or a `x = x || v` / `x = x && v`
-                    // rebinding can only union with the entry binding — the
-                    // join is monotone and converges; every other self-read
-                    // (`y = [y]`, `x = f(x)`) compounds.
-                    let compound = marks.reads_within(vs).contains(&name.as_str())
-                        && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } if n2 == name)
-                        && !matches!(ast.get(*value), Node::Logical { .. });
-                    sites.push(Site {
-                        target: name.clone(),
-                        span: *span,
-                        value: Some(vs),
-                        value_node: Some(*value),
-                        compound,
-                        unmodeled: false,
-                    });
-                }
-                Node::LocalVariableOpWrite { name, value, op, span, .. } => {
-                    if !tracked.contains(name.as_str()) {
-                        continue;
-                    }
-                    let vs = ast.get(*value).span();
-                    // `x <binop>= v` folds `x.binop(v)` afresh per pass —
-                    // compounding. `x ||= v` / `x &&= v` only unions with
-                    // the entry binding (converges) unless `v` itself reads
-                    // `x` (`x ||= [x]`).
-                    let compound = matches!(op, OpWriteKind::Operator(_))
-                        || (marks.reads_within(vs).contains(&name.as_str())
-                            && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } if n2 == name));
-                    sites.push(Site {
-                        target: name.clone(),
-                        span: *span,
-                        value: Some(vs),
-                        value_node: Some(*value),
-                        compound,
-                        unmodeled: false,
-                    });
-                }
-                Node::MultiWrite { targets, value, span, .. } => {
-                    let vs = ast.get(*value).span();
-                    // A masgn RHS evaluates before any target binds, so every
-                    // read inside it sees the assumption — `a, b = b, a`
-                    // swaps the pass-entry bindings.
-                    for (name, _) in targets.bound_names() {
-                        if !tracked.contains(name.as_str()) {
-                            continue;
-                        }
-                        sites.push(Site {
-                            target: name,
-                            span: *span,
-                            value: Some(vs),
-                            value_node: Some(*value),
-                            compound: false,
-                            unmodeled: false,
-                        });
-                    }
-                }
-                Node::UnmodeledWrite { span, names: writes } => {
-                    for name in writes {
-                        if !tracked.contains(name.as_str()) {
-                            continue;
-                        }
-                        sites.push(Site {
-                            target: name.clone(),
-                            span: *span,
-                            value: None,
-                            value_node: None,
-                            compound: false,
-                            unmodeled: true,
-                        });
-                    }
-                }
-                _ => {}
-            }
-        }
-        let live: Vec<&Site> = sites.iter().filter(|s| !dead.covers(s.span)).collect();
-        // A name's first live write position in the body: a read of it left
-        // of that position sees the pass-entry ASSUMPTION; a later read sees
-        // the body's own binding.
-        let first_write = |name: &str| -> usize {
-            live.iter()
-                .filter(|s| s.target == name)
-                .map(|s| s.span.0)
-                .min()
-                .unwrap_or(usize::MAX)
-        };
         let nil = interner.nil();
-        // `moved`: a name whose binding can differ from its seed at ANY pass
-        // — a write whose value types differently than the entry binding,
-        // plus the propagated cases below. `suspect`: a name that can still
-        // move at pass >= 2 — the cap trigger.
-        let mut moved: HashSet<String> = HashSet::new();
-        let mut suspect: HashSet<String> = HashSet::new();
-        loop {
-            let mut grew = false;
-            for site in &live {
-                let n = site.target.as_str();
-                if site.unmodeled {
-                    grew |= suspect.insert(n.to_string());
-                }
-                if site.compound {
-                    grew |= suspect.insert(n.to_string());
-                }
-                if !moved.contains(n) {
-                    // A pass-1 mover: the write's value at the entry env is
-                    // not the seed binding (`y = 2` for `y = nil` seeds it
-                    // `nil | 2`).
-                    let differs = match site.value_node {
-                        Some(v) => {
-                            let vt = self.type_of(ast, v, env, interner);
-                            vt != env.get(n).copied().unwrap_or(nil)
-                        }
-                        None => true,
-                    };
-                    if differs {
-                        moved.insert(n.to_string());
-                        grew = true;
-                    }
-                }
-                // Assumption reads: a value read of a moved name that
-                // precedes the name's first body write sees the pass-entry
-                // binding — it changes again next pass, so the reader moves
-                // at pass >= 2 (`s = t` before `t`'s write). Reads of a
-                // SUSPECT name move regardless of position.
-                if !suspect.contains(n) {
-                    if let Some(vs) = site.value {
-                        let hits = marks
-                            .read_positions_within(vs)
-                            .iter()
-                            .any(|(pos, r)| {
-                                *r != n
-                                    && (suspect.contains(*r)
-                                        || (moved.contains(*r) && *pos < first_write(r)))
-                            });
-                        if hits {
-                            suspect.insert(n.to_string());
-                            grew = true;
-                        }
+        // Pre-existing names only: a body-first local's `nil` seed must not
+        // leak into the body (reference `loop_pass_entry` / `except(*body_first)`).
+        let overlay: Vec<String> = names
+            .iter()
+            .filter(|n| env.contains_key(*n))
+            .cloned()
+            .collect();
+        let mut assumption: HashMap<String, TypeId> = names
+            .iter()
+            .map(|n| (n.clone(), env.get(n).copied().unwrap_or(nil)))
+            .collect();
+        const CAP: usize = 3;
+        for iteration in 0..CAP {
+            let last = iteration + 1 == CAP;
+            let mut pass_env = env.clone();
+            for n in &overlay {
+                pass_env.insert(n.clone(), assumption[n]);
+            }
+            let mut returns = Vec::new();
+            self.replay_statements(ast, &mut pass_env, body, interner, &mut returns);
+            let mut stable = true;
+            for n in &names {
+                let exit_ty = pass_env.get(n).copied().unwrap_or(assumption[n]);
+                if last {
+                    let base = self.widen_value_pinned(assumption[n], interner);
+                    let exit_w = self.widen_value_pinned(exit_ty, interner);
+                    let joined = rigor_types::Algebra::join(interner, base, exit_w);
+                    assumption.insert(
+                        n.clone(),
+                        if joined == base {
+                            joined
+                        } else {
+                            interner.untyped()
+                        },
+                    );
+                } else {
+                    let joined = rigor_types::Algebra::join(interner, assumption[n], exit_ty);
+                    if joined != assumption[n] {
+                        stable = false;
+                        assumption.insert(n.clone(), joined);
                     }
                 }
             }
-            // A decision whose read can still move flips an arm's liveness
-            // between passes — every name written inside its construct (the
-            // smallest node enclosing the predicate span: the `if`, `while`,
-            // `&&`/`||`, `case`/`when`) moves at pass >= 2 (`if s then
-            // y = 1 end`, o8).
-            for d in marks.decision_spans_within(body_span) {
-                if dead.covers(d) {
-                    continue;
-                }
-                let hot = marks.read_positions_within(d).iter().any(|(pos, r)| {
-                    suspect.contains(*r) || (moved.contains(*r) && *pos < first_write(r))
-                });
-                if !hot {
-                    continue;
-                }
-                let gate = ast
-                    .iter()
-                    .map(|(_, n)| n.span())
-                    .filter(|s| s.0 <= d.0 && d.1 <= s.1 && *s != d)
-                    .min_by_key(|s| s.1 - s.0);
-                if let Some(gate) = gate {
-                    for site in &live {
-                        if gate.0 <= site.span.0 && site.span.1 <= gate.1 {
-                            grew |= suspect.insert(site.target.clone());
-                        }
-                    }
-                }
-            }
-            for n in suspect.iter() {
-                moved.insert(n.clone());
-            }
-            if !grew {
+            if stable {
                 break;
             }
         }
-        if suspect.is_empty() {
-            return None;
-        }
-        Some((names, suspect))
+        Some(assumption)
     }
-
-    /// Applies a capped fixpoint's last-pass widen to the caller's POST-JOIN
-    /// env: a still-moving (suspect) tracked name floors to `Dynamic[top]`;
-    /// every other tracked name sheds `Constant -> Nominal` the reference's
-    /// way ([`Self::widen_value_pinned`]). The widen reads the binding the
-    /// join produced — a body write to a non-suspect name (`w = 1` under a
-    /// `w = nil` seed) must survive, and a name the join does not bind is
-    /// left alone, never minted `nil`.
-    fn apply_loop_cap_widen(
-        &self,
-        env: &mut TypeEnv,
-        tracked: &[String],
-        suspect: &std::collections::HashSet<String>,
-        interner: &mut Interner,
-    ) {
-        let untyped = interner.untyped();
-        for n in tracked {
-            let Some(&post) = env.get(n) else { continue };
-            let widened = if suspect.contains(n) {
-                untyped
-            } else {
-                self.widen_value_pinned(post, interner)
-            };
-            env.insert(n.clone(), widened);
-        }
-    }
-
 
     /// [`Self::build_toplevel_env`] for the `check` rules: the same straight-line
     /// binder, except that every statement it does not bind WIDENS (to
@@ -4227,7 +4051,7 @@ impl<'i> Typer<'i> {
             }
             // A `while`/`until`/`for` loop: the same flat widen as `other`,
             // then the ADR-56 slice-B rebind fixpoint — see
-            // [`Self::loop_cap_widening`]. A `begin … end while`, a `for`,
+            // [`Self::loop_rebind_fixpoint`]. A `begin … end while`, a `for`,
             // or a body holding `break`/`next`/`redo`/`retry` keeps the plain
             // widen (the replay arm declines the same shapes).
             Node::Loop { body, kind, .. } => {
@@ -4242,13 +4066,14 @@ impl<'i> Typer<'i> {
                     rigor_parse::LoopKind::While { begin_modifier: true }
                         | rigor_parse::LoopKind::Until { begin_modifier: true }
                 );
-                // The cap CRITERION reads the entry env — running it after
-                // `widen_flow_writes` would read every tracked name
-                // pre-widened and always answer "converged" — but the widen
-                // itself lands on the post-join bindings: a body write to a
-                // non-suspect name must survive the cap pass.
-                let capped = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    self.loop_cap_widening(ast, env, &body, interner)
+                // The fixpoint reads the entry env — running it after
+                // `widen_flow_writes` would overlay already-declined names
+                // and always answer "converged". Overlay the continuation
+                // AFTER the flat widen so a body write to a non-suspect name
+                // survives, and a stabilizing self-op does not shed a
+                // sibling pin (rigor-rs#638).
+                let fix = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
+                    self.loop_rebind_fixpoint(ast, env, &body, interner)
                 } else {
                     None
                 };
@@ -4258,8 +4083,10 @@ impl<'i> Typer<'i> {
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
-                if let Some((tracked, suspect)) = capped {
-                    self.apply_loop_cap_widen(env, &tracked, &suspect, interner);
+                if let Some(bindings) = fix {
+                    for (n, ty) in bindings {
+                        env.insert(n, ty);
+                    }
                 }
                 self.widen_loop_exits_within(ast, span, env, interner);
             }
