@@ -44,9 +44,12 @@ use crate::Typer;
 /// | parser `lexer-F0.rb` / `lexer-F1.rb` | ≥ 437 / ≥ 691 | `advance`'s `p` |
 ///
 /// 256 clears every file but the two lexers, which then check in under a
-/// second. It does NOT bound the walk below it: one local with W
-/// conditional self-rewrites in a loop still costs about W^4 (W = 96 takes
-/// a minute; rigor-rs#441). The cap is not purely a decline: a capped
+/// second. Below the cap the walk still costs about W^4, but only until
+/// the join saturates: `local_reach`'s absorption guard stops the loop
+/// once the answer is `(UNKNOWN, Some(None))` (rigor-rs#441), which every
+/// measured band file reaches early. A join that stays PRECISE never
+/// saturates, so a residual precise-only band is still possible in
+/// principle — none is measured. The cap is not purely a decline: a capped
 /// top-level `if` predicate stops folding, so an arm the reference treats as
 /// dead goes live without its narrowing (rigor-rs#442), and the skipped walk
 /// moves a predicate fold's first visit (rigor-rs#437). It is a `const` and
@@ -908,6 +911,21 @@ impl<'i> Typer<'i> {
             {
                 continue;
             }
+            // Absorption (rigor-rs#441): [`Reach::UNKNOWN`] is `join`'s top
+            // element and `Some(None)` is `pin_join`'s, so once BOTH hold
+            // every remaining write joins into the same `(reach, pin)` —
+            // the loop is then pure cost, about W^4 for W conditional
+            // self-rewrites of one local inside a loop (regexp_parser's
+            // `scanner.rb` sat in that band). The pin conjunct is implied
+            // today — every untyped contributor meets `None` into the pin,
+            // and the pin is unobservable beside an untyped reach
+            // (`expr_scalar` gates it on `reach.precise && !reach.untyped`),
+            // so `(UNKNOWN, Some(Some(_)))` is unreachable — but it keeps
+            // the guard exact by the lattice alone if a later arm starts
+            // pinning an untyped write.
+            if reach == Reach::UNKNOWN && pin == Some(None) {
+                break;
+            }
             reach = reach.join(match *write {
                 LocalWrite::Plain(v) => {
                     pin = pin_join(pin, self.expr_scalar(ast, v, seen));
@@ -937,6 +955,14 @@ impl<'i> Typer<'i> {
                     }
                 }
             });
+            // The absorption guard's implied half: every untyped
+            // contributor met `None` into the pin (the untyped seed, the
+            // `Op`/`Multi` arms, and a `Plain` write whose `expr_reach` is
+            // untyped always has `expr_scalar == None` — `expr_reach`
+            // short-circuits a `Some` scalar to `LITERAL` before it can
+            // reach untyped). If a new arm breaks that, the pin conjunct
+            // is what keeps the guard's tuple exact.
+            debug_assert!(!reach.untyped || pin == Some(None));
         }
         (reach, pin.flatten())
     }
