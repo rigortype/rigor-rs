@@ -44,8 +44,9 @@ pub enum Scalar {
     /// its signed decimal spelling. Ruby Integers are arbitrary precision and
     /// the reference pins the literal VALUE (`Constant[99999999999999999999]`);
     /// the spelling round-trips the value for witness rendering and equality
-    /// without an arbitrary-precision dependency. Arithmetic folds decline it,
-    /// matching the pre-pin `Integer` nominal's safety (rigor-rs#194).
+    /// without an arbitrary-precision dependency. Arithmetic folds that
+    /// cannot produce the exact spelling decline it — predicates, ordering and
+    /// decimal-shifting folds do not (rigor-rs#194, rigor-rs#682).
     BigInt(String),
     Str(String),
     Sym(String),
