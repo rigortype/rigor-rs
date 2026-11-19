@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #437 MERGED** (PR #687): canonical/contextual `expr_truthiness` split + `loop_pass` if-modelling; o6/o9/o10 family fires; snapshot 952→959; 0 FP. x5's `zz` →#688; arm judges →#690; back-edge folds →#691. [note](notes/20261119-issue-437-fold-memo.md)
 - **2026-11-19 #653 CLOSED** (PR #689): `#[cfg(test)]` span — `pub` looks past its visibility group; `item_end` stops at any unopened `)`/`]`/`}`. 0 FP. →#692. [note](notes/20261119-issue-653-pub-field-cfg-span.md)
 - **2026-11-19 #679 CLOSED** (PR #686): last stack fallback is an explicit `stack_size(2 << 20)`; `Option` out of the spawn path. ADR-0045 amended. [note](notes/20261119-issue-679-explicit-2mib-fallback.md)
 - **2026-11-19 #427 walkers** (PR #680): stackless `Interner::cmp` + iterative `literal_seed`/sig-gen predicates; 0 FP. →#685. [note](notes/20261119-issue-427-iterative-walkers.md)
