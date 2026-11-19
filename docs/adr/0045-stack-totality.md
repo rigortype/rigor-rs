@@ -85,13 +85,21 @@ an empty report). See
    - The `coverage --workers=N` pool uses the same handler.
    - The command's own stack never stops a command from starting (it can
      always fall back to the process main thread); a pool with no worker
-     at all does stop it, with the exit-70 line above. A thread that falls
-     back prints one stderr line per degradation level — a stack reports
-     only when it is strictly smaller than every stack reported before it,
-     so a mild early fallback cannot hide the worst case (rigor-rs#677);
-     the normal path prints nothing. Each line names what was actually
-     used: "64 MiB", "2 MiB", or "the process main thread" — never "the
-     platform default".
+     at all does stop it, with the exit-70 line above. A stack that falls
+     back prints one stderr line when it is strictly smaller than every
+     stack reported before it — at most one per new worst, so a mild
+     early fallback cannot hide the worst case (rigor-rs#677); the normal
+     path prints nothing. Each line names what was actually used and its
+     size: "64 MiB", "2 MiB", or "the process main thread (8 MiB)" —
+     never "the platform default" — and quotes the first refusal's OS
+     error, since `spawn` cannot tell stack memory from a pid limit. The
+     process main thread ranks at its real `RLIMIT_STACK` capped just
+     under 256 MiB (Unix) / its 1 MiB PE reserve (Windows), so an inline
+     run always reports as on master: `unlimited` does not mean safe,
+     because `ulimit -v` and `vm.overcommit_memory=2` bound the main
+     stack's growth as surely as they refuse the spawns. A worker reports
+     as it spawns, so a line can precede the exit-70 one when a later
+     worker's spawn then fails the whole build.
 2. **A depth bound of 25,000** (`rigor_parse::MAX_NESTING_DEPTH`):
    - Depth is counted in Prism child edges; the program node is depth 1.
    - `rigor_parse::parse_bounded` measures it right after the parse, before

@@ -24,7 +24,6 @@
 
 use std::io;
 use std::process::ExitCode;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rigor_parse::ANALYSIS_STACK_BYTES;
@@ -60,25 +59,32 @@ pub(crate) enum StackKind {
     ProcessMainThread,
 }
 
-/// Spawn `job` with the first size in `sizes` that `spawn` accepts, and return
-/// the spawn's handle and that size.
+/// Spawn `job` with the first size in `sizes` that `spawn` accepts, and
+/// return the spawn's handle, that size, and the first refusal the larger
+/// sizes gave (`None` when the first size worked). The fallback warning
+/// quotes the refusal: `spawn` cannot tell stack memory apart from a pid
+/// or thread limit — both arrive as `EAGAIN` — so the line reports what
+/// happened, not a guessed cause.
 ///
 /// `std::thread::Builder::spawn` consumes its closure even when it fails, so
 /// the job waits in a shared slot. Every attempt receives a fresh closure that
 /// takes the job out of the slot only once its thread runs. The job therefore
 /// runs at most once: on the thread of the first attempt that succeeds.
 ///
-/// `spawn` is injected so a test can fail chosen sizes.
+/// On total failure the error is the FIRST refusal — the cause of the
+/// whole fallback — not the last attempt's. `spawn` is injected so a test
+/// can fail chosen sizes.
 pub(crate) fn spawn_fallback<J, H, S>(
     sizes: &[usize],
     job: J,
     mut spawn: S,
-) -> io::Result<(H, usize)>
+) -> io::Result<(H, usize, Option<io::Error>)>
 where
     J: FnOnce() + Send + 'static,
     S: FnMut(usize, Job) -> io::Result<H>,
 {
     let slot = Arc::new(Mutex::new(Some(job)));
+    let mut first_err = None;
     let mut last_err = None;
     for &size in sizes {
         let slot = Arc::clone(&slot);
@@ -89,11 +95,19 @@ where
             }
         });
         match spawn(size, attempt) {
-            Ok(handle) => return Ok((handle, size)),
-            Err(e) => last_err = Some(e),
+            Ok(handle) => return Ok((handle, size, first_err)),
+            Err(e) => {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                } else {
+                    last_err = Some(e);
+                }
+            }
         }
     }
-    Err(last_err.unwrap_or_else(|| io::Error::other("no stack size to try")))
+    Err(first_err
+        .or(last_err)
+        .unwrap_or_else(|| io::Error::other("no stack size to try")))
 }
 
 /// A `std::thread::Builder` for one attempt, detached.
@@ -107,29 +121,59 @@ fn std_spawn(name: Option<String>) -> impl FnMut(usize, Job) -> io::Result<()> {
     }
 }
 
-fn describe_stack(kind: StackKind) -> String {
+/// Bytes as whole MiB, rounding up: a stack limit reads as the most it
+/// guarantees, so a sub-MiB-aligned host limit like macOS's 8,176 KiB
+/// `RLIMIT_STACK` still says "8 MiB".
+fn mib(bytes: u64) -> String {
+    format!("{} MiB", bytes.div_ceil(1 << 20))
+}
+
+/// The clause that says what the fallback left behind. The main thread
+/// gets its own phrasing — the command thread IS that thread — and its
+/// real limit, so a reader can compare it against the worker sizes.
+fn describe_stack(kind: StackKind, bytes: u64) -> String {
     match kind {
-        StackKind::Reserved(bytes) => format!("{} MiB", bytes >> 20),
-        StackKind::ProcessMainThread => "the process main thread".to_string(),
+        StackKind::Reserved(_) => {
+            format!("some analysis threads are using {}", mib(bytes))
+        }
+        StackKind::ProcessMainThread => {
+            let limit = if bytes == u64::MAX {
+                "unlimited".to_string()
+            } else {
+                mib(bytes)
+            };
+            format!("some analysis runs on the process main thread ({limit})")
+        }
     }
 }
 
 /// The stderr line a newly-worst fallback prints. Named so tests can pin
 /// the wording.
-pub(crate) fn stack_warning(kind: StackKind) -> String {
+pub(crate) fn stack_warning(
+    kind: StackKind,
+    bytes: u64,
+    refusal: Option<&io::Error>,
+) -> String {
+    // "could not start", never "could not reserve": the refusal is
+    // quoted, because `spawn` cannot tell stack memory apart from a pid
+    // or thread limit — both arrive as `EAGAIN`.
+    let cause = refusal.map_or_else(String::new, |e| format!(" ({e})"));
     format!(
-        "rigor: could not reserve {} MiB thread stacks; some analysis \
-         threads are using {}; deeply nested files may overflow",
+        "rigor: could not start threads with {} MiB stacks{cause}; \
+         {}; deeply nested files may overflow",
         ANALYSIS_STACK_BYTES >> 20,
-        describe_stack(kind)
+        describe_stack(kind, bytes)
     )
 }
 
 /// The smallest stack any analysis thread has reported, in bytes
-/// (`u64::MAX` before the first report).
-static WORST_STACK_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+/// (`u64::MAX` before the first report). The lock is held across the
+/// compare and the print so the lines come out in strictly worsening
+/// order — a `fetch_min` plus a separate `eprintln!` could print a milder
+/// line after a worse one. Taken at most once per fallback spawn.
+static WORST_STACK_BYTES: Mutex<u64> = Mutex::new(u64::MAX);
 
-/// One stderr line per degradation level when a thread got less than
+/// One stderr line per new worst stack when a thread got less than
 /// [`ANALYSIS_STACK_BYTES`]; silent on the normal path.
 ///
 /// The first process-wide line used to be the only one (`Once`), so a
@@ -139,47 +183,78 @@ static WORST_STACK_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
 /// when it is strictly smaller than every stack reported before it, so
 /// each line is true when printed and the worst case always gets a line —
 /// at most one per distinct size, three on the real ladders.
-fn note_stack(kind: StackKind) {
-    let bytes = match kind {
+fn note_stack(kind: StackKind, refusal: Option<&io::Error>) {
+    let raw = match kind {
         StackKind::Reserved(bytes) => bytes as u64,
         StackKind::ProcessMainThread => process_main_stack_bytes(),
     };
-    // A stack at or above the target is not a fallback: an inline command
-    // on an `RLIM_INFINITY` main thread reports nothing.
-    if bytes >= ANALYSIS_STACK_BYTES as u64 {
+    let Some(rank) = rank_bytes(kind, raw) else {
         return;
-    }
-    if report_if_worst(&WORST_STACK_BYTES, bytes) {
-        eprintln!("{}", stack_warning(kind));
+    };
+    let mut worst = WORST_STACK_BYTES
+        .lock()
+        .unwrap_or_else(PoisonError::into_inner);
+    if report_if_worst(&mut worst, rank) {
+        eprintln!("{}", stack_warning(kind, raw, refusal));
     }
 }
 
+/// The bytes `kind`'s stack ranks at for the worst-first report — `Some`
+/// when it is a fallback worth a line (`None` on the full-size path).
+/// `main_thread_bytes` is only consulted for `ProcessMainThread`.
+///
+/// An inline run ranks at its real limit capped just under
+/// [`ANALYSIS_STACK_BYTES`]: it always reports, as it did on master,
+/// because `RLIMIT_STACK` unlimited does not mean safe — `ulimit -v` and
+/// `vm.overcommit_memory=2` refuse the spawns AND bound the main stack's
+/// growth alike (rigor-rs#677 review). A small `ulimit -s` still ranks
+/// correctly against the 2 MiB workers.
+fn rank_bytes(kind: StackKind, main_thread_bytes: u64) -> Option<u64> {
+    let raw = match kind {
+        StackKind::Reserved(bytes) => bytes as u64,
+        StackKind::ProcessMainThread => {
+            main_thread_bytes.min(ANALYSIS_STACK_BYTES as u64 - 1)
+        }
+    };
+    (raw < ANALYSIS_STACK_BYTES as u64).then_some(raw)
+}
+
 /// Record `bytes` in `worst`; `true` when it is strictly smaller than the
-/// previous smallest — the caller then prints its line.
-fn report_if_worst(worst: &AtomicU64, bytes: u64) -> bool {
-    worst.fetch_min(bytes, Ordering::Relaxed) > bytes
+/// previous smallest — the caller, holding the lock, then prints its line.
+fn report_if_worst(worst: &mut u64, bytes: u64) -> bool {
+    if bytes < *worst {
+        *worst = bytes;
+        true
+    } else {
+        false
+    }
 }
 
 /// The stack the process main thread already has, for ranking an inline
 /// command run against the explicit fallbacks.
+// `as u64` is a no-op on the release targets but `rlim_t` is `i64` on
+// FreeBSD and 32-bit `c_ulong` elsewhere, so the cast stays for
+// portability; clippy sees only this host's type.
+#[allow(clippy::unnecessary_cast)]
 #[cfg(unix)]
 fn process_main_stack_bytes() -> u64 {
     // `RLIMIT_STACK` is the main thread's ceiling: 8 MiB by default, but a
     // host can set it under the 2 MiB spawn the Unix ladder skips (the
     // ADR-0045 "possibly less" case — the inline run is then the worst
-    // thread and must still get a line), or lift it to `RLIM_INFINITY`,
-    // where running inline is no fallback at all. An unreadable limit
-    // counts as the default the ladder assumes.
+    // thread and must still get a line), or lift it to `RLIM_INFINITY`.
+    // An unreadable limit counts as the default the ladder assumes.
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     if unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } == 0 {
-        unsafe { limit.assume_init() }.rlim_cur
+        unsafe { limit.assume_init() }.rlim_cur as u64
     } else {
         8 << 20
     }
 }
 
 /// The Windows process main thread's reserve is 1 MiB — below the
-/// explicit 2 MiB the command thread tries before running inline.
+/// explicit 2 MiB the command thread tries before running inline. That is
+/// the PE default: the repo sets no `/STACK` linker flag, so a build that
+/// changed it would belong here.
 #[cfg(not(unix))]
 fn process_main_stack_bytes() -> u64 {
     1 << 20
@@ -225,8 +300,8 @@ where
         },
         spawn,
     ) {
-        Ok((handle, size)) => {
-            note_stack(StackKind::Reserved(size));
+        Ok((handle, size, refusal)) => {
+            note_stack(StackKind::Reserved(size), refusal.as_ref());
             if let Err(payload) = handle.join() {
                 std::panic::resume_unwind(payload);
             }
@@ -235,8 +310,8 @@ where
             // command never produced a code — a could-not-run, so 70.
             code.unwrap_or(ExitCode::from(crate::EXIT_INTERNAL_ERROR))
         }
-        Err(_) => {
-            note_stack(StackKind::ProcessMainThread);
+        Err(e) => {
+            note_stack(StackKind::ProcessMainThread, Some(&e));
             let command = command
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
@@ -268,8 +343,9 @@ pub(crate) fn disable_global_pool() {
 /// first stack size the host can reserve.
 pub(crate) fn spawn_pool_thread(thread: rayon::ThreadBuilder) -> io::Result<()> {
     let name = thread.name().map(str::to_string);
-    let size = spawn_pool_thread_with(thread, &STACK_FALLBACK, std_spawn(name))?;
-    note_stack(StackKind::Reserved(size));
+    let (size, refusal) =
+        spawn_pool_thread_with(thread, &STACK_FALLBACK, std_spawn(name))?;
+    note_stack(StackKind::Reserved(size), refusal.as_ref());
     Ok(())
 }
 
@@ -278,11 +354,12 @@ fn spawn_pool_thread_with<S>(
     thread: rayon::ThreadBuilder,
     sizes: &[usize],
     spawn: S,
-) -> io::Result<usize>
+) -> io::Result<(usize, Option<io::Error>)>
 where
     S: FnMut(usize, Job) -> io::Result<()>,
 {
-    spawn_fallback(sizes, move || thread.run(), spawn).map(|((), size)| size)
+    spawn_fallback(sizes, move || thread.run(), spawn)
+        .map(|((), size, refusal)| (size, refusal))
 }
 
 /// Build the global rayon pool with [`spawn_pool_thread`]. It must run on
@@ -312,10 +389,12 @@ pub(crate) fn configure_global_pool() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
-    /// An injected spawn that refuses every size in `refuse` and otherwise
-    /// spawns a real thread at that size, recording what it was asked for.
+    /// An injected spawn that refuses every size in `refuse` — each with
+    /// its own message, so a test can tell the first refusal from the
+    /// last — and otherwise spawns a real thread at that size, recording
+    /// what it was asked for.
     fn refusing(
         refuse: Vec<usize>,
         asked: Arc<Mutex<Vec<usize>>>,
@@ -323,7 +402,7 @@ mod tests {
         move |size, job| {
             asked.lock().unwrap().push(size);
             if refuse.contains(&size) {
-                return Err(io::Error::other("refused"));
+                return Err(io::Error::other(format!("refused {size}")));
             }
             std::thread::Builder::new().stack_size(size).spawn(job)
         }
@@ -334,7 +413,7 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let asked = Arc::new(Mutex::new(Vec::new()));
         let counted = Arc::clone(&runs);
-        let (handle, size) = spawn_fallback(
+        let (handle, size, refusal) = spawn_fallback(
             &STACK_FALLBACK,
             move || {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -344,6 +423,11 @@ mod tests {
         .unwrap();
         handle.join().unwrap();
         assert_eq!(size, 64 << 20);
+        // The refusal the warning quotes is the first size's.
+        assert_eq!(
+            refusal.map(|e| e.to_string()),
+            Some(format!("refused {ANALYSIS_STACK_BYTES}"))
+        );
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(
             *asked.lock().unwrap(),
@@ -356,7 +440,7 @@ mod tests {
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&runs);
         let refuse = vec![ANALYSIS_STACK_BYTES, 64 << 20];
-        let (handle, size) = spawn_fallback(
+        let (handle, size, _) = spawn_fallback(
             &STACK_FALLBACK,
             move || {
                 counted.fetch_add(1, Ordering::SeqCst);
@@ -380,7 +464,12 @@ mod tests {
             },
             refusing(STACK_FALLBACK.to_vec(), Arc::new(Mutex::new(Vec::new()))),
         );
-        assert!(result.is_err());
+        // The error is the first refusal — the cause of the whole
+        // fallback — not the last attempt's.
+        assert_eq!(
+            result.unwrap_err().to_string(),
+            format!("refused {ANALYSIS_STACK_BYTES}")
+        );
         assert_eq!(runs.load(Ordering::SeqCst), 0);
     }
 
@@ -453,26 +542,41 @@ mod tests {
 
     #[test]
     fn fallback_messages_name_the_actual_stack() {
-        let mib64 = stack_warning(StackKind::Reserved(64 << 20));
+        let mib64 = stack_warning(StackKind::Reserved(64 << 20), 64 << 20, None);
         assert!(
             mib64.contains("some analysis threads are using 64 MiB"),
             "{mib64}"
         );
         assert!(!mib64.contains("platform default"), "{mib64}");
+        assert!(!mib64.contains("could not reserve"), "{mib64}");
 
-        let two_mib = stack_warning(StackKind::Reserved(2 << 20));
+        let two_mib = stack_warning(StackKind::Reserved(2 << 20), 2 << 20, None);
         assert!(
             two_mib.contains("some analysis threads are using 2 MiB"),
             "{two_mib}"
         );
         assert!(!two_mib.contains("platform default"), "{two_mib}");
 
-        let inline = stack_warning(StackKind::ProcessMainThread);
+        let inline = stack_warning(StackKind::ProcessMainThread, 8 << 20, None);
         assert!(
-            inline.contains("some analysis threads are using the process main thread"),
+            inline.contains("some analysis runs on the process main thread (8 MiB)"),
             "{inline}"
         );
         assert!(!inline.contains("platform default"), "{inline}");
+
+        // A sub-MiB-aligned rlimit (macOS is 8,176 KiB) still reads as
+        // whole MiB; `RLIM_INFINITY` reads as itself.
+        let odd = stack_warning(StackKind::ProcessMainThread, (8 << 20) - (64 << 10), None);
+        assert!(odd.contains("(8 MiB)"), "{odd}");
+        let unlimited = stack_warning(StackKind::ProcessMainThread, u64::MAX, None);
+        assert!(unlimited.contains("(unlimited)"), "{unlimited}");
+
+        // The refusal's OS error is quoted, not guessed at: `spawn`
+        // cannot tell stack memory from a pid limit.
+        let refusal = io::Error::from_raw_os_error(11);
+        let caused =
+            stack_warning(StackKind::Reserved(2 << 20), 2 << 20, Some(&refusal));
+        assert!(caused.contains("(os error 11)"), "{caused}");
     }
 
     #[test]
@@ -492,7 +596,7 @@ mod tests {
             .num_threads(2)
             .spawn_handler(move |thread| {
                 let mut spawn = refusing(vec![ANALYSIS_STACK_BYTES], Arc::clone(&asked_in));
-                let size = spawn_pool_thread_with(thread, &STACK_FALLBACK, move |size, job| {
+                let (size, _) = spawn_pool_thread_with(thread, &STACK_FALLBACK, move |size, job| {
                     spawn(size, job).map(drop)
                 })?;
                 sizes_in.lock().unwrap().push(size);
@@ -511,25 +615,59 @@ mod tests {
 
     #[test]
     fn a_strictly_worse_stack_reports_once() {
-        // A fresh atomic: the process-wide WORST_STACK_BYTES is shared, so
-        // the report logic is pinned here instead of through note_stack.
-        let worst = AtomicU64::new(u64::MAX);
+        // The process-wide WORST_STACK_BYTES is shared, so the report
+        // logic is pinned on a fresh local instead of through note_stack.
+        let mut worst = u64::MAX;
         let mib64 = 64 << 20;
         let mib8 = 8 << 20;
         let mib2 = 2 << 20;
         let mib1 = 1 << 20;
         // Each strictly smaller stack reports exactly once; anything equal
         // or milder does not, whichever order they arrive in.
-        assert!(report_if_worst(&worst, mib64));
-        assert!(!report_if_worst(&worst, mib64));
-        assert!(report_if_worst(&worst, mib2));
-        assert!(!report_if_worst(&worst, mib8));
-        assert!(!report_if_worst(&worst, mib64));
-        assert!(report_if_worst(&worst, mib1));
-        assert!(!report_if_worst(&worst, mib1));
-        assert_eq!(worst.load(Ordering::Relaxed), mib1);
+        assert!(report_if_worst(&mut worst, mib64));
+        assert!(!report_if_worst(&mut worst, mib64));
+        assert!(report_if_worst(&mut worst, mib2));
+        assert!(!report_if_worst(&mut worst, mib8));
+        assert!(!report_if_worst(&mut worst, mib64));
+        assert!(report_if_worst(&mut worst, mib1));
+        assert!(!report_if_worst(&mut worst, mib1));
+        assert_eq!(worst, mib1);
     }
 
+    #[test]
+    fn the_inline_rank_is_capped_so_it_always_reports() {
+        // The full-size path is silent.
+        assert_eq!(
+            rank_bytes(StackKind::Reserved(ANALYSIS_STACK_BYTES), 0),
+            None
+        );
+        assert_eq!(
+            rank_bytes(StackKind::Reserved(64 << 20), 0),
+            Some(64 << 20)
+        );
+        // An inline run always ranks below the target — unlimited
+        // `RLIMIT_STACK` does not mean safe, since `ulimit -v` and
+        // `vm.overcommit_memory=2` refuse the spawns AND bound the main
+        // stack's growth alike (rigor-rs#677 review).
+        let just_under = Some(ANALYSIS_STACK_BYTES as u64 - 1);
+        assert_eq!(rank_bytes(StackKind::ProcessMainThread, u64::MAX), just_under);
+        assert_eq!(
+            rank_bytes(StackKind::ProcessMainThread, 512 << 20),
+            just_under
+        );
+        // A small `ulimit -s` still ranks by its real value, so the
+        // inline run orders correctly against the 2 MiB workers.
+        assert_eq!(
+            rank_bytes(StackKind::ProcessMainThread, 8 << 20),
+            Some(8 << 20)
+        );
+        assert_eq!(
+            rank_bytes(StackKind::ProcessMainThread, 1 << 20),
+            Some(1 << 20)
+        );
+    }
+
+    #[allow(clippy::unnecessary_cast)] // see process_main_stack_bytes
     #[cfg(unix)]
     #[test]
     fn the_main_thread_ranks_by_its_real_limit() {
@@ -538,7 +676,7 @@ mod tests {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         let rc = unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) };
         assert_eq!(rc, 0, "getrlimit works on every test host");
-        let expected = unsafe { limit.assume_init() }.rlim_cur;
+        let expected = unsafe { limit.assume_init() }.rlim_cur as u64;
         assert_eq!(process_main_stack_bytes(), expected);
     }
 }
