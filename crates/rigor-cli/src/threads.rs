@@ -17,8 +17,10 @@
 //! all does: it prints one error and the command exits 70 (the reference's
 //! `EXIT_INTERNAL_ERROR`, rigor-rs#678); it does not continue into a later
 //! `GlobalPoolAlreadyInitialized` panic. Commands that only print static
-//! text (`help`, `version`, `upgrade`) never reach the pool build, so
-//! they still answer on a host too starved for even one worker.
+//! text (`help`, `version`, `upgrade`) skip the pool build and poison the
+//! one-shot registry instead ([`disable_global_pool`]), so they still
+//! answer on a host too starved for even one worker — and a skipped path
+//! that reached rayon would panic rather than build a default pool.
 
 use std::io;
 use std::process::ExitCode;
@@ -179,7 +181,9 @@ where
                 std::panic::resume_unwind(payload);
             }
             let code = code.lock().unwrap_or_else(PoisonError::into_inner).take();
-            code.unwrap_or(ExitCode::FAILURE)
+            // Unreachable (the command runs exactly once); if reached, the
+            // command never produced a code — a could-not-run, so 70.
+            code.unwrap_or(ExitCode::from(crate::EXIT_INTERNAL_ERROR))
         }
         Err(_) => {
             note_stack(StackKind::ProcessMainThread);
@@ -187,9 +191,27 @@ where
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            command.map(|c| c()).unwrap_or(ExitCode::FAILURE)
+            // Unreachable (the command is taken exactly once); if reached,
+            // the command never ran — a could-not-run, so 70.
+            command
+                .map(|c| c())
+                .unwrap_or(ExitCode::from(crate::EXIT_INTERNAL_ERROR))
         }
     }
+}
+
+/// Poison the global pool for a command that never runs analysis. A failed
+/// `build_global` still consumes the one-shot registry (see
+/// [`configure_global_pool`]), so it leaves the registry permanently unset:
+/// any rayon use after this point panics instead of silently building a
+/// default pool on std's small worker stacks — the #412 regression a
+/// whitelisted command that grew analysis would otherwise reintroduce
+/// (rigor-rs#678). The spawn handler fails before any worker exists, so no
+/// thread is spawned.
+pub(crate) fn disable_global_pool() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .spawn_handler(|_| Err(io::Error::other("a static-text command")))
+        .build_global();
 }
 
 /// The rayon `spawn_handler` for every analysis pool: each worker gets the

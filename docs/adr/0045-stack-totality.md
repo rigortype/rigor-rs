@@ -9,8 +9,9 @@ resort is an explicit 2 MiB `stack_size`, never `thread::Builder`'s no-size
 default, which honours `RUST_MIN_STACK`.
 Amended 2026-11-19 ([#678](https://github.com/rigortype/rigor-rs/issues/678)): a pool
 with no worker at all exits 70 (the reference's `EXIT_INTERNAL_ERROR`),
-not 1; `help` / `version` / `upgrade` skip the pool build entirely, and
-`coverage --workers` discloses a scoped-pool build failure.
+not 1; `help` / `version` / `upgrade` skip the pool build and instead
+poison the one-shot registry so a skipped path that reached rayon panics;
+and `coverage --workers` discloses a scoped-pool build failure.
 Measured on release builds (aarch64 macOS, toolchain 1.88, the toolchain the
 release binaries use).
 
@@ -60,7 +61,12 @@ an empty report). See
      only prints static text (`help`, `version`, `upgrade`, or the bare
      command list), which never touches rayon and so skips the build; on a
      host too starved for even one worker those commands still answer
-     (rigor-rs#678). `build_global` is
+     (rigor-rs#678). The skip is fail-closed: instead of building, it runs
+     a `build_global` whose spawn handler always fails — the failed build
+     still consumes the one-shot registry, so a skipped path that reached
+     rayon panics rather than silently building a default pool on std's
+     small stacks (`disable_global_pool`; `tests/static_commands_no_pool.rs`
+     runs `help <cmd>` for every catalogue command). `build_global` is
      one-shot: rayon marks the registry as set even when building fails, so
      a retry with a smaller size would leave no pool at all. The fallback
      therefore happens per thread, inside the handler: 256 MiB, then 64 MiB,
@@ -71,7 +77,11 @@ an empty report). See
      created even at that size, the process prints one error (`rigor: could
      not start the analysis thread pool: …`) and exits 70, the reference's
      `EXIT_INTERNAL_ERROR` — not 1, which means findings; it does not
-     continue into a later `GlobalPoolAlreadyInitialized` panic.
+     continue into a later `GlobalPoolAlreadyInitialized` panic. (A
+     per-command degrade to a one-thread pool on the command thread's own
+     256 MiB stack — rayon's `use_current_thread`, the reference's
+     sequential default — was considered and deferred: it cannot serve
+     `lsp`/`mcp`, so it would be a per-command mode. Exit 70 is uniform.)
    - The `coverage --workers=N` pool uses the same handler.
    - The command's own stack never stops a command from starting (it can
      always fall back to the process main thread); a pool with no worker

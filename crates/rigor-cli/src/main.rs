@@ -120,8 +120,12 @@ const EXIT_INTERNAL_ERROR: u8 = 70;
 /// The command thread's entry: claim the analysis stack, then the pool.
 fn run_command_with_pool() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    if needs_analysis_pool(&args) && !threads::configure_global_pool() {
-        return ExitCode::from(EXIT_INTERNAL_ERROR);
+    if needs_analysis_pool(&args) {
+        if !threads::configure_global_pool() {
+            return ExitCode::from(EXIT_INTERNAL_ERROR);
+        }
+    } else {
+        threads::disable_global_pool();
     }
     dispatch(&args)
 }
@@ -130,11 +134,14 @@ fn run_command_with_pool() -> ExitCode {
 /// built first. The help and version surfaces print static text and never
 /// touch rayon, so they skip the pool build: on a host too starved to
 /// spawn even one 2 MiB worker they still answer instead of exiting 70
-/// (rigor-rs#678). Every other command keeps the pool-first ordering — the
-/// safe side, since a command that reached rayon before
-/// `configure_global_pool` ran would build rayon's default pool on std's
-/// default worker stacks (2 MiB, or `RUST_MIN_STACK`) — the #412
-/// regression.
+/// (rigor-rs#678). The skip is fail-closed — [`threads::disable_global_pool`]
+/// poisons the one-shot registry, so a skipped path that reached rayon
+/// would panic rather than build rayon's default pool on std's small
+/// worker stacks (2 MiB, or `RUST_MIN_STACK`), the #412 regression. Every
+/// other command keeps the pool-first ordering. `help <cmd>` re-dispatches
+/// `<cmd> --help`, which returns from the command's option parser before
+/// any rayon call (`tests/static_commands_no_pool.rs` pins this for every
+/// catalogue command).
 fn needs_analysis_pool(args: &[String]) -> bool {
     !matches!(
         args.first().map(String::as_str),
