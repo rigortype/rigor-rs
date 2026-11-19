@@ -390,7 +390,16 @@ impl<'i> Typer<'i> {
             // Any miss ⇒ fall through to Dynamic[top] (silent). Note: a `Foo.new`
             // receiver is intercepted earlier in `type_call` (before the constant
             // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
-            Node::ConstantRead { name, span, .. } => {
+            Node::ConstantRead { name, span, dynamic_base, .. } => {
+                // The reference's `type_of_constant_path` falls back to Dynamic
+                // when `qualified_name_or_nil` is nil — a dynamic base anywhere
+                // in the chain (`self::X`, `k::X`, `self.class::X`). C5 and the
+                // singleton gates resolve a static name; applying them here types
+                // `self::X` as the lexically visible `X = 1` and fires
+                // `call.undefined-method` where the oracle is silent (rigor-rs#655).
+                if *dynamic_base {
+                    return interner.untyped();
+                }
                 // Both the C5 literal-fold and the C1 shadow gate resolve against
                 // the use site's lexical prefix (Ruby constant lookup), so compute
                 // it once.
@@ -1147,10 +1156,13 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Option<TypeId> {
-        let Node::ConstantRead { name, .. } = ast.get(receiver) else {
+        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(receiver) else {
             return None;
         };
-        if name.is_empty() || CLASS_RETURNING_NEW.contains(&name.as_str()) {
+        // rigor-rs#655: `self::Array.new` / `k::Array.new` have no static name
+        // (`qualified_name_or_nil` is nil); minting an instance here fires
+        // `call.undefined-method` on the result where the oracle is silent.
+        if *dynamic_base || name.is_empty() || CLASS_RETURNING_NEW.contains(&name.as_str()) {
             return None;
         }
 

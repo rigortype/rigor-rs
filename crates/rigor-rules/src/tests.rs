@@ -1649,6 +1649,60 @@ fn project_class_collision_is_silent() {
     assert!(diags.is_empty(), "project-class collision must be silent, got {diags:?}");
 }
 
+/// rigor-rs#655: a dynamic-base constant path (`self::X`, `k::X`,
+/// `self.class::X`) has no static name (`qualified_name_or_nil` is nil), so
+/// the reference types it Dynamic. The port used to run C5 / C1 / `.new` /
+/// singleton-literal / object-constant dispatch against the trailing name.
+#[test]
+fn dynamic_base_constant_read_does_not_fold() {
+    assert!(
+        run(b"class C; X = 1; self::X.bogus; end\n").is_empty(),
+        "self::X must not fold the lexical C5 value"
+    );
+    assert!(
+        run(b"class C; X = 1; def self.m; self::X.bogus; end; end\n").is_empty(),
+        "self::X inside def self.m must not fold"
+    );
+    assert!(
+        run(b"class C; X = 1; def m; self.class::X.bogus; end; end\n").is_empty(),
+        "self.class::X must not fold"
+    );
+    assert!(
+        run(b"class C; X = 1; def f(k); k::X.bogus; end; end\n").is_empty(),
+        "k::X must not fold"
+    );
+    assert!(
+        run(b"class C; self::Integer.bogus; end\n").is_empty(),
+        "self::Integer must not singleton-type"
+    );
+    assert!(
+        run(b"self::Array.new.bogus\n").is_empty(),
+        "self::Array.new must not mint an instance"
+    );
+    assert!(
+        run(b"class C; def self.one; 1; end; end; self::C.one.bogus\n").is_empty(),
+        "self::C.one must not take the singleton-literal fold"
+    );
+    assert!(
+        run(b"self::ENV.keys.bogus\n").is_empty(),
+        "self::ENV.keys must not take the object-constant arm"
+    );
+    // Must-still-fire: a static name still folds / singleton-types / mints.
+    let d = run(b"class C; X = 1; X.bogus; end\n");
+    assert_eq!(d.len(), 1, "bare X.bogus must still fire, got {d:?}");
+    assert_eq!(d[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(d[0].message, "undefined method `bogus' for 1");
+    let d = run(b"class C; X = 1; C::X.bogus; end\n");
+    assert_eq!(d.len(), 1, "C::X.bogus must still fire, got {d:?}");
+    assert_eq!(d[0].rule_id, CALL_UNDEFINED_METHOD);
+    let d = run(b"Integer.bogus\n");
+    assert_eq!(d.len(), 1, "bare Integer.bogus must still fire, got {d:?}");
+    assert_eq!(d[0].message, "undefined method `bogus' for singleton(Integer)");
+    let d = run(b"class C; def self.one; 1; end; end; C.one.bogus\n");
+    assert_eq!(d.len(), 1, "C.one.bogus must still fire, got {d:?}");
+    assert_eq!(d[0].rule_id, CALL_UNDEFINED_METHOD);
+}
+
 #[test]
 fn secure_random_hex_is_silent_extend_surface() {
     // `SecureRandom.hex` — its class methods come via an `extend`ed module, so
