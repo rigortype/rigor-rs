@@ -81,12 +81,6 @@ pub struct LoweredAst {
     /// for the AST's lifetime and preserved by `Clone` (a clone is the same
     /// file).
     file_key: FileKey,
-    /// Per-INSTANCE identity: a fresh counter on every `lower_with_key`,
-    /// preserved by `Clone` (a clone holds the same nodes, so memos keyed on
-    /// it stay valid). The arena pointer cannot serve — a freed AST's
-    /// address re-enters service for a later one, and `(ptr, len)` then
-    /// aliases two different trees (rigor-rs#424).
-    uid: u64,
     /// Upstream #540 (`fc3b8b42`) — every site in this file that MUTATES a
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
@@ -226,6 +220,9 @@ struct CarrierSpans {
     /// Line-start table for this file's source (rigor-rs#642). Lives behind
     /// the `CarrierSpans` box so it does not inflate `LoweredAst`.
     line_index: Arc<LineIndex>,
+    /// Per-instance identity (rigor-rs#424). Rides the box so a `u64` does
+    /// not push `enum Lowered` past `clippy::large_enum_variant`.
+    uid: u64,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -267,7 +264,7 @@ impl LoweredAst {
     /// keyed on the AST itself (reach, dead-set, type-of); never equal
     /// across two `lower` calls even at the same arena address.
     pub fn uid(&self) -> u64 {
-        self.uid
+        self.carrier_spans.uid
     }
 
     /// Upstream #540's mutation census for this file, in walk order. See
@@ -688,6 +685,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         iterated_bodies: builder.iterated_body_spans,
         next_args: builder.next_arg_spans,
         line_index: Arc::new(LineIndex::from_starts(builder.line_starts, source.len())),
+        uid: NEXT_AST_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();
@@ -701,7 +699,6 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         nodes: builder.nodes,
         root,
         file_key,
-        uid: NEXT_AST_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         const_mutations,
         element_mutations,
         local_read_starts,
