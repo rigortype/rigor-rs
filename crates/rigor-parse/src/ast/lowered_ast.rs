@@ -16,6 +16,12 @@ use super::{collect_ancestry_facts, AncestryFacts, collect_const_mutations, Buil
 static NEXT_ANONYMOUS_FILE_KEY: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(1);
 
+/// Per-instance identity of a [`LoweredAst`]. Fresh on every `lower_with_key`,
+/// so two AST instances never share a memo key even when a freed arena's
+/// address is reused (rigor-rs#424).
+static NEXT_AST_UID: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
+
 /// Stable identity of the FILE an AST was lowered from (issue #102).
 ///
 /// Some analysis facts are per-FILE — the reference's in-source CONSTANT VALUE
@@ -214,6 +220,9 @@ struct CarrierSpans {
     /// Line-start table for this file's source (rigor-rs#642). Lives behind
     /// the `CarrierSpans` box so it does not inflate `LoweredAst`.
     line_index: Arc<LineIndex>,
+    /// Per-instance identity (rigor-rs#424). Rides the box so a `u64` does
+    /// not push `enum Lowered` past `clippy::large_enum_variant`.
+    uid: u64,
 }
 
 /// Hand-written so `{:?}` stays a CONTENT rendering: `file_key` is extrinsic
@@ -249,6 +258,13 @@ impl LoweredAst {
     /// that drops the AST but still needs positions.
     pub fn share_line_index(&self) -> Arc<LineIndex> {
         Arc::clone(&self.carrier_spans.line_index)
+    }
+
+    /// The per-instance identity — see the field's docs. For memo tables
+    /// keyed on the AST itself (reach, dead-set, type-of); never equal
+    /// across two `lower` calls even at the same arena address.
+    pub fn uid(&self) -> u64 {
+        self.carrier_spans.uid
     }
 
     /// Upstream #540's mutation census for this file, in walk order. See
@@ -669,6 +685,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         iterated_bodies: builder.iterated_body_spans,
         next_args: builder.next_arg_spans,
         line_index: Arc::new(LineIndex::from_starts(builder.line_starts, source.len())),
+        uid: NEXT_AST_UID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
     });
     let mut paren_unwrapped = builder.paren_unwrapped;
     paren_unwrapped.sort_unstable();

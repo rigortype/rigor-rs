@@ -230,7 +230,7 @@ impl<'i> Typer<'i> {
         if !self.lexical_scopes.is_empty() {
             return self.enclosing_prefix(span).to_vec();
         }
-        let key = ast as *const rigor_parse::LoweredAst as usize;
+        let key = ast.uid() as usize;
         let scopes = {
             let mut memo = self.own_lexical_scopes.borrow_mut();
             match &*memo {

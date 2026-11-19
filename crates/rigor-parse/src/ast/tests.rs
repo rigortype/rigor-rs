@@ -1976,3 +1976,14 @@ fn lowers_the_prism_types_no_fixture_holds() {
     }
 }
 
+/// rigor-rs#424: two `lower` calls mint distinct `uid`s even when the bytes
+/// (and so the arena length) match. Memo tables keyed on the AST pointer
+/// aliased a freed tree onto the next one of the same size.
+#[test]
+fn lowered_ast_uid_is_per_instance() {
+    let a = lower(&crate::parse(b"1 + 1\n"));
+    let b = lower(&crate::parse(b"1 + 1\n"));
+    assert_ne!(a.uid(), b.uid());
+    assert_eq!(a.uid(), a.clone().uid());
+}
+
