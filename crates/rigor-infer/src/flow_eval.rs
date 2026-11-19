@@ -3113,7 +3113,7 @@ impl<'i> Typer<'i> {
                 let vspan = ast.get(*value).span();
                 widen_flow_writes(rebinds, vspan, env, interner);
                 self.drop_indexed_rebinds(rebinds, vspan, env);
-                self.widen_mutated_locals(ast, mutations, indexed, *value, vspan, env, interner);
+                self.widen_mutated_locals(ast, mutations.iter(), indexed, *value, vspan, env, interner);
                 self.bind_statement(ast, id, env, interner);
                 // An `h[k]` index target stores through `[]=` on the POST-binding
                 // scope — `swap, swap[:a] = swap, 1` stores into the object `swap`
@@ -3124,7 +3124,7 @@ impl<'i> Typer<'i> {
                 // as a straight-line `h[k] = v` gets.
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
                     for (_, tspan, _) in targets.index_writes() {
-                        self.widen_mutated_locals(ast, mutations, indexed, id, tspan, env, interner);
+                        self.widen_mutated_locals(ast, mutations.iter(), indexed, id, tspan, env, interner);
                     }
                 }
             }
@@ -3163,17 +3163,15 @@ impl<'i> Typer<'i> {
                             .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                             .cloned()
                             .collect();
-                        let live_mutations: Vec<_> = mutations
+                        let live_mutations = mutations
                             .iter()
                             .filter(|(w, _, m, _)| {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                            })
-                            .cloned()
-                            .collect();
+                            });
                         widen_flow_writes(&live_rebinds, span, env, interner);
                         self.drop_indexed_rebinds(&live_rebinds, span, env);
                         self.widen_mutated_locals(
-                            ast, &live_mutations, indexed, id, span, env, interner,
+                            ast, live_mutations, indexed, id, span, env, interner,
                         );
                         for s in live {
                             self.bind_statement(ast, s, env, interner);
@@ -3188,13 +3186,11 @@ impl<'i> Typer<'i> {
                             .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                             .cloned()
                             .collect();
-                        let live_mutations: Vec<_> = mutations
+                        let live_mutations = mutations
                             .iter()
                             .filter(|(w, _, m, _)| {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                            })
-                            .cloned()
-                            .collect();
+                            });
                         // rigor-rs#443 — the post-`if` env JOINS a conditional
                         // write's value with the entry type, not a blanket
                         // `Dynamic`: `v = nil if p` on `v = nil` keeps `nil`
@@ -3300,7 +3296,7 @@ impl<'i> Typer<'i> {
                         }
                         self.drop_indexed_rebinds(&live_rebinds, span, env);
                         self.widen_mutated_locals(
-                            ast, &live_mutations, indexed, id, span, env, interner,
+                            ast, live_mutations, indexed, id, span, env, interner,
                         );
                     }
                 }
@@ -3317,16 +3313,14 @@ impl<'i> Typer<'i> {
                     .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                     .cloned()
                     .collect();
-                let live_mutations: Vec<_> = mutations
+                let live_mutations = mutations
                     .iter()
                     .filter(|(w, _, m, _)| {
                         dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                    })
-                    .cloned()
-                    .collect();
+                    });
                 widen_flow_writes(&live_rebinds, span, env, interner);
                 self.drop_indexed_rebinds(&live_rebinds, span, env);
-                self.widen_mutated_locals(ast, &live_mutations, indexed, id, span, env, interner);
+                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
             }
             other => {
                 let span = other.span();
@@ -3341,16 +3335,14 @@ impl<'i> Typer<'i> {
                     .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                     .cloned()
                     .collect();
-                let live_mutations: Vec<_> = mutations
+                let live_mutations = mutations
                     .iter()
                     .filter(|(w, _, m, _)| {
                         dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                    })
-                    .cloned()
-                    .collect();
+                    });
                 widen_flow_writes(&live_rebinds, span, env, interner);
                 self.drop_indexed_rebinds(&live_rebinds, span, env);
-                self.widen_mutated_locals(ast, &live_mutations, indexed, id, span, env, interner);
+                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
             }
         }
     }
@@ -3380,10 +3372,15 @@ impl<'i> Typer<'i> {
     /// `Scope#with_indexed_narrowing`) through [`Self::apply_mutation_effects`].
     // too_many_arguments: shared replay context — a bundle struct would obscure.
     #[allow(clippy::too_many_arguments)]
-    fn widen_mutated_locals(
+    // `mutations` is an ITERATOR, not a slice: the `bind_check_statement`
+    // arms that dead-gate the table used to `.cloned().collect()` a filtered
+    // Vec per statement — two `String` clones plus a `ShapeKey` clone per
+    // entry, O(mutations) per replayed call subtree — the largest single
+    // allocation stream of rigor-rs#658's mutator chain.
+    fn widen_mutated_locals<'m>(
         &self,
         ast: &LoweredAst,
-        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        mutations: impl Iterator<Item = &'m (rigor_parse::Span, String, String, Option<ShapeKey>)>,
         indexed: &IndexedFlow,
         root: NodeId,
         span: rigor_parse::Span,

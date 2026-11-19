@@ -187,6 +187,114 @@ type ExprHit<T> = (T, Rc<[u32]>, Rc<[TruthyKey]>);
 /// `type_of` memo payload: the carrier plus whether it embeds no interner ids.
 type TypeOfOut = (Type, bool);
 
+/// One stored `type_of` answer for an env-SENSITIVE `Node::Call` — the
+/// [`ExprEntry`] dependency record plus the env context the answer was
+/// computed under (rigor-rs#658). An env-free call's answer stands under
+/// every env; an env-sensitive one's stands only under the env that
+/// produced it, so the env rides the entry — fingerprinted for the cheap
+/// reject, snapshotted for the airtight check.
+struct EnvExprEntry {
+    /// Every `seen` key the computation tested (interned), sorted.
+    tested: Rc<[u32]>,
+    /// `tested` folded into 64 bits.
+    tested_bits: u64,
+    /// The tested keys its starting stack held, sorted.
+    present: Box<[u32]>,
+    /// The folds it saw re-entered, same rule as [`MemoEntry::folding`].
+    folding: Rc<[TruthyKey]>,
+    /// Order-independent fingerprint of the env at compute time — a fast
+    /// reject before [`Self::env`] is walked.
+    env_fp: u64,
+    /// The env bindings verbatim; a fingerprint match is confirmed
+    /// against this — the `TypeId`s are only meaningful under
+    /// [`Self::interner`], which is why that is compared first.
+    env: Rc<Vec<(Box<str>, rigor_types::TypeId)>>,
+    /// `Typer::def_scope` at compute time — `type_of` reads it
+    /// (`LocalVariableOpWrite`, `decline_fold_gap`), so it is part of the
+    /// context an entry is valid for.
+    def_scope: Option<rigor_parse::Span>,
+    /// The interner `env`'s ids belong to (its address). A `TypeId` is an
+    /// index into one interner; under another the snapshot compares
+    /// nonsense, so the interner must match before it is consulted.
+    interner: usize,
+    out: TypeOfOut,
+}
+
+impl EnvExprEntry {
+    /// The env context plus the stack-dependency answer — see
+    /// [`ExprEntry::matches`].
+    fn matches(
+        &self,
+        stack: &[u32],
+        env_fp: u64,
+        env: &crate::TypeEnv,
+        def_scope: Option<rigor_parse::Span>,
+        interner: usize,
+    ) -> bool {
+        self.env_fp == env_fp
+            && self.def_scope == def_scope
+            && self.interner == interner
+            && self.env.len() == env.len()
+            && self
+                .env
+                .iter()
+                .all(|(n, t)| env.get(n.as_ref()) == Some(t))
+            && deps_match(self.tested_bits, &self.tested, &self.present, stack)
+    }
+}
+
+/// The env-sensitive counterpart of [`expr_entry_hit`]: the dep-match loop
+/// with [`EnvExprEntry::matches`]'s env test folded in.
+fn env_expr_entry_hit(
+    entries: &mut Vec<EnvExprEntry>,
+    stack: &[u32],
+    running: &std::collections::HashSet<TruthyKey>,
+    landed: &std::collections::HashMap<TruthyKey, Option<bool>>,
+    env_fp: u64,
+    env: &crate::TypeEnv,
+    def_scope: Option<rigor_parse::Span>,
+    interner: usize,
+) -> Option<ExprHit<TypeOfOut>> {
+    let mut found = None;
+    let mut i = 0;
+    while i < entries.len() {
+        let e = &entries[i];
+        if !e.matches(stack, env_fp, env, def_scope, interner) {
+            i += 1;
+            continue;
+        }
+        if e.folding
+            .iter()
+            .all(|p| running.contains(p) || landed.get(p) == Some(&None))
+        {
+            found = Some(i);
+            break;
+        }
+        entries.remove(i);
+    }
+    found.map(|i| {
+        entries[..=i].rotate_right(1);
+        let e = &entries[0];
+        (e.out.clone(), e.tested.clone(), e.folding.clone())
+    })
+}
+
+/// An order-independent fingerprint of an env's `(name, TypeId)` pairs,
+/// under the interner that minted the ids. Order-independence is required —
+/// `HashMap` iteration order is not part of the context a computation
+/// read, only the bindings are.
+fn env_fingerprint(env: &crate::TypeEnv) -> u64 {
+    let mut acc = 0u64;
+    for (name, ty) in env {
+        let mut h = FastHasher::default();
+        h.write(name.as_bytes());
+        h.write_u64(name.len() as u64);
+        h.write_u64(ty.index() as u64);
+        acc = acc.wrapping_add(h.finish());
+    }
+    acc
+}
+
 /// Per-node table keyed by `(node id, seen.len())`.
 type ExprTable<T> = FastMap<(u32, usize), Vec<ExprEntry<T>>>;
 
@@ -249,6 +357,13 @@ pub(crate) struct ReachMemo {
     /// [`Typer::type_of_memo`]), so a hit re-interns it under whatever
     /// interner asks (rigor-rs#424).
     type_ofs: ExprTable<TypeOfOut>,
+    /// `type_of` answers for env-SENSITIVE `Node::Call` subtrees
+    /// (rigor-rs#658): same table shape as `type_ofs`, each entry
+    /// additionally carrying the env context it is valid under. Without it
+    /// every `check_env_at` replay of a mutator chain's call re-types the
+    /// whole remaining suffix — `v.push(1).push(1).…` at N links cost
+    /// O(N²) `type_call` levels, on top of the replay's own applies.
+    type_env_ofs: FastMap<(u32, usize), Vec<EnvExprEntry>>,
     /// Every `seen` key tested on this AST, interned, so dependencies are
     /// lists of small ids. Reset with the AST only while no computation is
     /// in progress — the frames hold ids too.
@@ -271,6 +386,7 @@ impl ReachMemo {
             self.expr_scalars.clear();
             self.expr_reaches.clear();
             self.type_ofs.clear();
+            self.type_env_ofs.clear();
         }
     }
 
@@ -717,5 +833,120 @@ impl<'i> Typer<'i> {
             |(_, free)| *free,
         )
         .0
+    }
+
+    /// [`Typer::expr_memo`] for `type_of` on an env-SENSITIVE `Node::Call`
+    /// subtree (rigor-rs#658): the same `(ast, dead)` window, key shape and
+    /// dependency record as [`Typer::type_of_memo`], but each entry also
+    /// carries the env it was computed under — fingerprint + verbatim
+    /// snapshot — plus `def_scope` and the interner identity, which
+    /// [`EnvExprEntry::matches`] checks exactly before the stack
+    /// dependency answer is trusted. `compute` has the same contract as
+    /// `type_of_memo`'s: the `Type` the call interned and whether it
+    /// embeds no interner ids.
+    ///
+    /// `type_of` routes a call here only when its subtree reads env and
+    /// `env` is small (the snapshot+compare is O(env), so a bound keeps a
+    /// large method env from paying it per call site); every other env-
+    /// sensitive call types uncached exactly as before.
+    /// `interner_id` is the interner's address — the caller passes it
+    /// rather than a borrow so the `compute` closure keeps its `&mut`
+    /// (the env snapshot's `TypeId`s are only meaningful under it).
+    pub(crate) fn type_of_env_memo(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &crate::TypeEnv,
+        interner_id: usize,
+        compute: impl FnOnce(&Self) -> TypeOfOut,
+    ) -> Type {
+        let ast_id = ast_identity(ast);
+        let dead = self.current_dead(ast);
+        let env_fp = env_fingerprint(env);
+        let def_scope = self.def_scope.get();
+        let key = (id.0, 0usize);
+        let hit = {
+            let mut memo = self.reach_memo.borrow_mut();
+            if memo.ast != ast_id {
+                let mut frames = self.reach_frames.borrow_mut();
+                if frames.frames.is_empty() {
+                    memo.keys.clear();
+                    frames.marks.clear();
+                }
+            }
+            memo.reset_unless_valid(ast_id, &dead);
+            let stack = memo.stack_ids(&[]);
+            match memo.type_env_ofs.get_mut(&key) {
+                Some(entries) => env_expr_entry_hit(
+                    entries,
+                    &stack,
+                    &self.truthy_in_flight.borrow(),
+                    &self.truthy_memo.borrow(),
+                    env_fp,
+                    env,
+                    def_scope,
+                    interner_id,
+                ),
+                None => None,
+            }
+        };
+        let seen: Vec<String> = Vec::new();
+        if let Some((out, tested, folding)) = hit {
+            self.reach_frames.borrow_mut().record(stack_id(&seen), &tested, &folding);
+            if audit_mode() {
+                let again = compute(self);
+                assert!(
+                    again == out,
+                    "rigor-rs#658 reach memo audit: type_of_env_memo({id:?}) memo {out:?} != \
+                     recomputed {again:?} in {:?}",
+                    ast.file_key(),
+                );
+            }
+            return out.0;
+        }
+        let stack = stack_id(&seen);
+        self.reach_frames.borrow_mut().push_reach(stack);
+        let out = compute(self);
+        let (mut tested, folding) = {
+            let mut frames = self.reach_frames.borrow_mut();
+            let Some(MemoFrame::Reach { tested, folding, .. }) = frames.frames.pop() else {
+                unreachable!("reach memo frames out of balance");
+            };
+            frames.record(stack, &tested, &folding);
+            (tested, folding)
+        };
+        if out.1 && same_dead(&dead, &self.current_dead(ast)) {
+            let mut memo = self.reach_memo.borrow_mut();
+            if memo.valid_for(ast_id, &dead) {
+                tested.sort_unstable();
+                let mut present: Vec<u32> = memo
+                    .stack_ids(&seen[..])
+                    .into_iter()
+                    .filter(|id| tested.binary_search(id).is_ok())
+                    .collect();
+                present.sort_unstable();
+                let entries = memo.type_env_ofs.entry(key).or_default();
+                entries.truncate(MAX_ENTRIES_PER_KEY - 1);
+                entries.insert(
+                    0,
+                    EnvExprEntry {
+                        tested_bits: tested.iter().fold(0, |bits, &id| bits | id_bit(id)),
+                        tested: tested.into(),
+                        present: present.into(),
+                        folding: folding.into(),
+                        env_fp,
+                        env: Rc::new(
+                            env.iter()
+                                .map(|(n, t)| (n.clone().into_boxed_str(), *t))
+                                .collect(),
+                        ),
+                        def_scope,
+                        interner: interner_id,
+                        out: out.clone(),
+                    },
+                );
+            }
+        }
+        out.0
     }
 }

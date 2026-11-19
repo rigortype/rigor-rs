@@ -17,6 +17,7 @@
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use ruby_rbs::node::{
     parse, AliasKind, AttributeKind, ClassNode, InterfaceNode, MethodDefinitionKind,
@@ -229,6 +230,22 @@ type ArityEnvelope = Option<Arity>;
 /// nilable bit on the instance side and `ret_instance` on the singleton
 /// side.
 type MethodSlot = (Option<&'static str>, ArityEnvelope, bool);
+
+/// rigor-rs#658 — the per-`method` answers a class's [`CoreData::method_memo`]
+/// entry carries. Every value is `Copy` or an interned `&'static` borrow into
+/// `classes`, so a hit borrows nothing from the map.
+#[derive(Default)]
+struct MethodMemo {
+    /// `lookup_on_chain(ancestors(class), method)` — the shared walk of
+    /// [`CoreData::method_return`] and [`CoreData::method_return_nilable`].
+    lookup: HashMap<Box<str>, Option<MethodSlot>>,
+    /// [`CoreData::method_tuple_return`]'s FIRST-definer ancestor (the
+    /// first chain member declaring `method`); the tuple descriptor itself
+    /// stays borrowed from that entry's `tuple_returns`.
+    tuple_definer: HashMap<Box<str>, Option<&'static str>>,
+    /// [`CoreData::method_return_block_free`]'s answer.
+    block_free: HashMap<Box<str>, Option<&'static str>>,
+}
 
 /// rigor-rs#482 — one declaration's overloading reopens and the originals it
 /// brings for keys an earlier reopen left pending, taken out of the entry
@@ -1028,6 +1045,21 @@ pub struct CoreData {
     /// Issue #129: the `rigor:v1:conforms-to` scan tables (see
     /// [`conformance`]). Read only by [`Self::conformance_findings`].
     conformance: conformance::ConformanceData,
+    /// rigor-rs#658 — memoized [`Self::ancestors`] chains, keyed by the
+    /// class's interned `classes` key. The chain is a pure function of
+    /// `classes` (immutable once loaded), but each answer rebuilt a `Vec`
+    /// + `HashSet` and re-hashed every ancestor name — a `v.push(1)` × N
+    /// chain re-collected `Array`'s chain per `type_call` level, the
+    /// sampled `collect` / hashing hot leaves. `Mutex` keeps `CoreData:
+    /// Sync` for the file-parallel walk.
+    ancestors_memo: Mutex<HashMap<&'static str, Arc<(Vec<&'static str>, bool)>>>,
+    /// rigor-rs#658 — per-(class, method) instance-method resolution
+    /// answers, keyed by the class's interned `classes` key then the method
+    /// name. The short-key instance lookups all begin
+    /// `ancestors(class)` + `lookup_*_on_chain(method)`, and a receiver
+    /// chain's `type_call` asked the same `("Array", "push")` queries once
+    /// per level.
+    method_memo: Mutex<HashMap<&'static str, MethodMemo>>,
 }
 
 impl CoreData {
@@ -1434,6 +1466,8 @@ impl CoreData {
                 type_names,
                 synthesized_type_names,
                 conformance,
+                ancestors_memo: Mutex::new(HashMap::new()),
+                method_memo: Mutex::new(HashMap::new()),
             };
         }
         // Fallback: nothing parsed (shouldn't happen) ⇒ hardcoded stub. The stub
@@ -2242,12 +2276,83 @@ impl CoreData {
         if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
             return self.qualified_method_return_core(class_name, method).map(|(r, _)| r);
         }
-        let (chain, _) = self.ancestors(class_name);
-        let ret = self.lookup_on_chain(&chain, method).and_then(|(ret, _, _)| ret);
+        let ret = self
+            .chain_method_lookup(class_name, method)
+            .and_then(|(ret, _, _)| ret);
         self.resolve_call_site_return(ret, class_name)
     }
 
-    /// Resolve the [`SELF_RETURN`] sentinel against the class the lookup was
+    /// `lookup_on_chain(ancestors(class_name), method)` through the
+    /// per-(class, method) memo — the shared walk of [`Self::method_return`]
+    /// and [`Self::method_return_nilable`] (rigor-rs#658: a receiver chain's
+    /// `type_call` asked the same `("Array", "push")` query per level). A
+    /// class the short map does not hold computes the plain walk (its chain
+    /// declines at once) — the qualified branch sits ABOVE every caller.
+    fn chain_method_lookup(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<MethodSlot> {
+        let Some((&key, _)) = self.classes.get_key_value(class_name) else {
+            let (chain, _) = self.ancestors(class_name);
+            return self.lookup_on_chain(&chain, method);
+        };
+        if let Some(hit) = self
+            .method_memo
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|m| m.lookup.get(method))
+        {
+            return *hit;
+        }
+        let (chain, _) = self.ancestors(class_name);
+        let out = self.lookup_on_chain(&chain, method);
+        self.method_memo
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .lookup
+            .insert(method.into(), out);
+        out
+    }
+
+    /// [`Self::method_tuple_return`]'s first-definer ancestor, through the
+    /// per-(class, method) memo. `None` means no ancestor declared `method`
+    /// at all — the tuple answer is then `None` either way.
+    fn tuple_definer(&self, class_name: &str, method: &str) -> Option<&'static str> {
+        let Some((&key, _)) = self.classes.get_key_value(class_name) else {
+            return None;
+        };
+        if let Some(hit) = self
+            .method_memo
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|m| m.tuple_definer.get(method))
+        {
+            return *hit;
+        }
+        let (chain, _) = self.ancestors(class_name);
+        let mut out = None;
+        for anc in chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.methods.contains_key(method) {
+                    out = Some(anc);
+                    break;
+                }
+            }
+        }
+        self.method_memo
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .tuple_definer
+            .insert(method.into(), out);
+        out
+    }
     /// QUERIED with (the receiver), yielding that class's interned key so the
     /// result round-trips to a Nominal the rules can witness against. A receiver
     /// the index does not model resolves to `None` (⇒ Dynamic), never to the
@@ -2274,15 +2379,14 @@ impl CoreData {
         if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
             return self.qualified_method_tuple_return(class_name, method);
         }
-        let (chain, _) = self.ancestors(class_name);
-        for anc in chain {
-            if let Some(entry) = self.classes.get(anc) {
-                if entry.methods.contains_key(method) {
-                    return entry.tuple_returns.get(method).map(|v| v.as_slice());
-                }
-            }
-        }
-        None
+        // rigor-rs#658 — the definer memo: the FIRST ancestor declaring
+        // `method` (the walk's own answer), then the descriptor borrowed
+        // from THAT entry exactly as the walk returned it.
+        let definer = self.tuple_definer(class_name, method)?;
+        self.classes
+            .get(definer)
+            .and_then(|entry| entry.tuple_returns.get(method))
+            .map(|v| v.as_slice())
     }
 
     /// The singleton twin of [`Self::method_tuple_return`]
@@ -2468,8 +2572,7 @@ impl CoreData {
         if !self.classes.contains_key(class_name) && self.qualified.contains_key(class_name) {
             return self.qualified_method_return_core(class_name, method);
         }
-        let (chain, _) = self.ancestors(class_name);
-        self.lookup_on_chain(&chain, method)
+        self.chain_method_lookup(class_name, method)
             .and_then(|(ret, _, nilable)| {
                 self.resolve_call_site_return(ret, class_name).map(|c| (c, nilable))
             })
@@ -2607,11 +2710,28 @@ impl CoreData {
         class_name: &str,
         method: &str,
     ) -> Option<&'static str> {
-        if !self.classes.contains_key(class_name) {
+        let Some((&key, _)) = self.classes.get_key_value(class_name) else {
             return None;
+        };
+        if let Some(hit) = self
+            .method_memo
+            .lock()
+            .unwrap()
+            .get(&key)
+            .and_then(|m| m.block_free.get(method))
+        {
+            return *hit;
         }
         let (chain, _) = self.ancestors(class_name);
-        self.lookup_block_free_return_on_chain(&chain, method, 0)
+        let out = self.lookup_block_free_return_on_chain(&chain, method, 0);
+        self.method_memo
+            .lock()
+            .unwrap()
+            .entry(key)
+            .or_default()
+            .block_free
+            .insert(method.into(), out);
+        out
     }
 
     fn lookup_block_free_return_on_chain(
@@ -4155,11 +4275,30 @@ impl CoreData {
     /// name referenced along the way is NOT in the loaded set (so absence must
     /// not be witnessed).
     fn ancestors(&self, class_name: &str) -> (Vec<&'static str>, bool) {
+        // rigor-rs#658 — the chain is a pure function of `classes`; memoize
+        // it once per queried class (`Array`'s chain was re-collected per
+        // `type_call` level of a mutator chain). A class name the tables
+        // do not hold cannot key the memo — `collect` declines it at once.
+        let Some((&key, _)) = self.classes.get_key_value(class_name) else {
+            let mut order: Vec<&'static str> = Vec::new();
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut complete = true;
+            self.collect(class_name, &mut order, &mut seen, &mut complete, true);
+            return (order, complete);
+        };
+        if let Some(hit) = self.ancestors_memo.lock().unwrap().get(&key) {
+            return (**hit).clone();
+        }
         let mut order: Vec<&'static str> = Vec::new();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut complete = true;
         self.collect(class_name, &mut order, &mut seen, &mut complete, true);
-        (order, complete)
+        let out = (order, complete);
+        self.ancestors_memo
+            .lock()
+            .unwrap()
+            .insert(key, Arc::new(out.clone()));
+        out
     }
 
     fn collect(
@@ -4546,6 +4685,8 @@ impl CoreData {
             type_names: HashSet::new(),
             synthesized_type_names: HashSet::new(),
             conformance: conformance::ConformanceData::default(),
+            ancestors_memo: Mutex::new(HashMap::new()),
+            method_memo: Mutex::new(HashMap::new()),
         }
     }
 
