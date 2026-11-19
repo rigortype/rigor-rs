@@ -149,6 +149,13 @@ impl<'i> Typer<'i> {
             if marks.ivar_reset_within(span) {
                 Self::widen_ivars(env, interner);
             }
+            // Capture the pre-loop env: `replay_one` + `apply_def_local_marks`
+            // join/widen the body's writes, and the ADR-56 continuation must
+            // overlay the *entry* seed afterwards (rigor-rs#638).
+            let loop_entry = match ast.get(stmt) {
+                Node::Loop { body, kind, .. } => Some((body.clone(), *kind, env.clone())),
+                _ => None,
+            };
             if guards.is_empty() && !wild {
                 self.replay_one(ast, &marks, env, stmt, interner, returns);
             } else {
@@ -159,6 +166,25 @@ impl<'i> Typer<'i> {
             // `s = "a"; items.each { |i| s << i }`): the reference widens it,
             // the replay declines it (`def_local_marks`).
             self.apply_def_local_marks(ast, env, span, interner);
+            if let Some((body, kind, entry)) = loop_entry {
+                use crate::def_local_marks::ExitKind as K;
+                let jumps =
+                    marks.has_exit_within(span, &[K::Break, K::Next, K::Redo, K::Retry]);
+                let once = matches!(
+                    kind,
+                    rigor_parse::LoopKind::While { begin_modifier: true }
+                        | rigor_parse::LoopKind::Until { begin_modifier: true }
+                );
+                if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
+                    if let Some(bindings) =
+                        self.loop_rebind_fixpoint(ast, &entry, &body, interner)
+                    {
+                        for (n, ty) in bindings {
+                            env.insert(n, ty);
+                        }
+                    }
+                }
+            }
             // Code after a statement that always leaves (`return`, `raise`,
             // `break`) is unreachable: the reference types it in a scope the
             // replay cannot reproduce, so it reads every local as unknown.
@@ -415,20 +441,12 @@ impl<'i> Typer<'i> {
                         .filter(|r| written.iter().any(|w| w == r))
                         .map(str::to_string)
                         .collect();
-                    // ADR-56 slice B: bounded rebind fixpoint in the replay
-                    // env (rigor-rs#638). Overlay the continuation after the
-                    // single-pass join so a body write to a non-suspect name
-                    // survives (`w = nil` seeded, `w = 1` in the body) and a
-                    // stabilizing self-op (`x |= 1`) does not shed a sibling
-                    // dead-arm pin.
-                    let fix =
-                        self.loop_rebind_fixpoint(ast, env, &body, interner);
+                    // ADR-56 slice B: the single-pass join (nil-injection +
+                    // carried names). The bounded rebind fixpoint overlays
+                    // the continuation after `apply_def_local_marks` in
+                    // [`Self::replay_statements`] so a loop-body rebind does
+                    // not wipe the converged pins (rigor-rs#638).
                     self.join_arm_writes(ast, env, &[(&body, &carried), (&[], &[])], interner, returns);
-                    if let Some(bindings) = fix {
-                        for (n, ty) in bindings {
-                            env.insert(n, ty);
-                        }
-                    }
                 }
                 // A `return` recorded inside the body typed its value at
                 // its source position, but the loop carries later writes
@@ -3165,6 +3183,42 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(&live_rebinds, span, env, interner);
                 self.drop_indexed_rebinds(&live_rebinds, span, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+            }
+            Node::Loop { body, kind, .. } => {
+                use crate::def_local_marks::ExitKind as K;
+                let span = ast.get(id).span();
+                let (body, kind) = (body.clone(), *kind);
+                let marks = self.def_local_marks(ast);
+                let jumps =
+                    marks.has_exit_within(span, &[K::Break, K::Next, K::Redo, K::Retry]);
+                let once = matches!(
+                    kind,
+                    rigor_parse::LoopKind::While { begin_modifier: true }
+                        | rigor_parse::LoopKind::Until { begin_modifier: true }
+                );
+                let entry = env.clone();
+                let live_rebinds: Vec<_> = rebinds
+                    .iter()
+                    .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                    .cloned()
+                    .collect();
+                let live_mutations = mutations
+                    .iter()
+                    .filter(|(w, _, m, _)| {
+                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                    });
+                widen_flow_writes(&live_rebinds, span, env, interner);
+                self.drop_indexed_rebinds(&live_rebinds, span, env);
+                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+                if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
+                    if let Some(bindings) =
+                        self.loop_rebind_fixpoint(ast, &entry, &body, interner)
+                    {
+                        for (n, ty) in bindings {
+                            env.insert(n, ty);
+                        }
+                    }
+                }
             }
             other => {
                 let span = other.span();
