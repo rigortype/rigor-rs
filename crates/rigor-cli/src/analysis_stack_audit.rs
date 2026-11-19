@@ -19,10 +19,11 @@
 //!   `ruby_prism::parse`, and `crate::`/`self::`/`super::parse` inside
 //!   rigor-parse) — called or taken as a value — or a `use` importing
 //!   the bare `parse` leaf;
-//! - `ThreadPoolBuilder::new()`, `thread::Builder::new()`, `thread::spawn`
-//!   or `thread::scope` — called or taken as a value — unless the same
-//!   builder chain names `spawn_pool_thread` or `ANALYSIS_STACK_BYTES`,
-//!   or the site is in the `threads` helper module itself.
+//! - `ThreadPoolBuilder::new()`/`::default()`, `thread::Builder::new()`,
+//!   `thread::spawn` or `thread::scope` — called or taken as a value —
+//!   unless the same builder chain names `spawn_pool_thread` or
+//!   `ANALYSIS_STACK_BYTES`, or the site is in the `threads` helper
+//!   module itself.
 //!
 //! Call patterns are token sequences: whitespace around `::` and before
 //! `(` (legal Rust, and `cargo fmt --check` is not a gate here) does not
@@ -31,7 +32,10 @@
 //! (`…::*`) a flagged root flags too.
 //!
 //! `#[cfg(test)]` items are skipped, as are the files `#[cfg(test)] mod x;`
-//! declarations resolve to. Everything else is production code: a hit must
+//! declarations resolve to. A `#[cfg(test)]` that does not open an item
+//! keyword (a field, variant, parameter or match arm) masks only itself —
+//! whatever follows it stays production. Everything else is production
+//! code: a hit must
 //! be justified by an [`ALLOW_LIST`] entry carrying a one-line reason. An
 //! entry pins the exact hit count, so a moved, duplicated or removed site
 //! fails the audit until its entry is updated.
@@ -111,6 +115,7 @@ const PARSE_CALLS_INTERNAL: &[&[&str]] = &[
 /// allow-list entry outside `THREADS_MODULE`.
 const THREAD_BUILDERS: &[&[&str]] = &[
     &["ThreadPoolBuilder", "::", "new", "("],
+    &["ThreadPoolBuilder", "::", "default", "("],
     &["thread", "::", "Builder", "::", "new", "("],
 ];
 const THREAD_SPAWNS: &[&[&str]] = &[&["thread", "::", "spawn"], &["thread", "::", "scope"]];
@@ -362,15 +367,21 @@ fn use_item_spans(text: &str) -> Vec<(usize, usize)> {
 /// already excludes them AND the use-item extents it also hands in)
 /// reaching a flagged symbol:
 ///
-/// - a `parse` leaf under `rigor_parse` — plus `crate`/`self`/`super`
-///   inside rigor-parse, where they reach the crate root — `use
-///   rigor_parse::parse`, `use rigor_parse::{lower, parse}`;
+/// - a `parse` leaf under `rigor_parse` or `ruby_prism` — plus
+///   `crate`/`self`/`super` inside rigor-parse, where they reach the
+///   crate root — `use rigor_parse::parse`, `use rigor_parse::{lower,
+///   parse}`, `use ruby_prism::{ParseResult, parse}`;
 /// - a `spawn`/`scope`/`Builder` leaf under a `thread` segment (`use
 ///   std::thread::spawn`, `use std::thread::{spawn}`), plus the same
 ///   under any deeper path (`crossbeam::thread::scope`);
+/// - a `ruby_prism` segment aliased or globbed at a deeper position —
+///   `use rigor_parse::ruby_prism as prism`, `use
+///   rigor_parse::ruby_prism::*` — through lib.rs's `pub use ruby_prism;`;
 /// - an ALIAS or GLOB that renames a flagged root out of the call
 ///   patterns' reach: `use rigor_parse as rp` (`rp::parse`),
-///   `use rigor_parse::{self as rp}`, `use std::thread as t`
+///   `use rigor_parse::{self as rp}`, `use ruby_prism as prism`
+///   (`prism::parse`), `use rigor_parse::ruby_prism as prism` (through
+///   lib.rs's `pub use ruby_prism;`), `use std::thread as t`
 ///   (`t::spawn`), `use std::thread::{self as t}`,
 ///   `use rayon::ThreadPoolBuilder as TPB`, `use rigor_parse::*`
 ///   (`parse(src)`), `use std::thread::*` (`spawn(job)`).
@@ -383,8 +394,11 @@ fn flagged_uses(
     for &(at, end) in uses {
         let item = &text[at + 3..end - 1];
         let toks: Vec<(usize, &str)> = ident_spans(item).collect();
-        let roots: &[&str] =
-            if internal { &["rigor_parse", "crate", "self", "super"] } else { &["rigor_parse"] };
+        let roots: &[&str] = if internal {
+            &["rigor_parse", "ruby_prism", "crate", "self", "super"]
+        } else {
+            &["rigor_parse", "ruby_prism"]
+        };
         let first = toks.first().map_or("", |t| t.1);
         let pair = |x: &str, y: &str| {
             toks.windows(2).any(|w| w[0].1 == x && w[1].1 == y)
@@ -421,6 +435,17 @@ fn flagged_uses(
         if pair("ThreadPoolBuilder", "as") {
             out.push((at, "use:alias-or-glob".to_string()));
         }
+        // `ruby_prism` at a deeper path position — `use rigor_parse::
+        // ruby_prism as prism` through lib.rs's `pub use ruby_prism;`, or
+        // `use rigor_parse::ruby_prism::*` — hides the root the call
+        // patterns key on. (A first-position `ruby_prism` is covered by
+        // the `roots` branch above.)
+        if first != "ruby_prism"
+            && (pair("ruby_prism", "as")
+                || toks.iter().any(|t| t.1 == "ruby_prism" && after_ident_is_glob(item, *t)))
+        {
+            out.push((at, "use:alias-or-glob".to_string()));
+        }
     }
     out
 }
@@ -449,8 +474,11 @@ fn after_ident_is_glob(s: &str, tok: (usize, &str)) -> bool {
 /// The `#[cfg(test)]` items' byte extents: the `#` through the item's `;`
 /// or the `}` closing its `{` — whichever comes first at bracket depth 0.
 /// `#[…]` attributes between the attribute and its item are skipped too.
-/// `cfg(all(test, …))` is not recognised — none exist; a new one needs a
-/// case here rather than an allow-list entry.
+/// When the attribute does not open an item keyword (`ITEM_KEYWORDS`) it
+/// sits on a field, variant, parameter or match arm, and only the
+/// attribute itself is masked — masking on would swallow the item after
+/// it. `cfg(all(test, …))` is not recognised — none exist; a new one
+/// needs a case here rather than an allow-list entry.
 fn cfg_test_spans(text: &str) -> Vec<(usize, usize)> {
     let b = text.as_bytes();
     let mut spans = Vec::new();
@@ -460,7 +488,11 @@ fn cfg_test_spans(text: &str) -> Vec<(usize, usize)> {
             b'#' => match cfg_test_attr(b, i) {
                 Some(end) => {
                     let start = item_start(b, end);
-                    let close = item_end(b, start);
+                    let close = if ITEM_KEYWORDS.contains(&ident_at(text, start)) {
+                        item_end(b, start)
+                    } else {
+                        end // attribute on a non-item position: mask only it
+                    };
                     spans.push((i, close));
                     close
                 }
@@ -471,6 +503,31 @@ fn cfg_test_spans(text: &str) -> Vec<(usize, usize)> {
     }
     spans
 }
+
+/// The first word after `#[cfg(test)]` (and any attributes it carries)
+/// must open an item. On a non-item position — a struct field, enum
+/// variant, parameter or match arm — `item_end` would run past it to the
+/// next `{` or `;` and swallow whatever item follows, so only the
+/// attribute itself is masked.
+const ITEM_KEYWORDS: &[&str] = &[
+    "pub",
+    "mod",
+    "fn",
+    "use",
+    "impl",
+    "const",
+    "static",
+    "struct",
+    "enum",
+    "type",
+    "trait",
+    "unsafe",
+    "async",
+    "extern",
+    "union",
+    "macro_rules",
+    "macro",
+];
 
 /// `#[ cfg ( test ) ]` at `at` (the `#`): the index just past `]`.
 fn cfg_test_attr(b: &[u8], at: usize) -> Option<usize> {

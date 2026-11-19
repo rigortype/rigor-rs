@@ -16,15 +16,20 @@ blanked text and fails on:
   `crate`/`self`/`super::parse` (rigor-parse files only) — called or taken
   as a value;
 - **thread creation**: `thread::spawn`, `thread::scope`,
-  `thread::Builder::new(`, `ThreadPoolBuilder::new(` — unless the builder
-  chain names `spawn_pool_thread`/`ANALYSIS_STACK_BYTES`, or the file is
-  `rigor-cli/src/threads.rs`;
-- **`use` smuggling**: bare `parse` leaf under those roots, `spawn`/`scope`/
-  `Builder` under a `thread` segment, and `as`-aliases or `*` globs of any
-  flagged root.
+  `thread::Builder::new(`, `ThreadPoolBuilder::new(`/ `::default(` — unless
+  the builder chain names `spawn_pool_thread`/`ANALYSIS_STACK_BYTES`, or
+  the file is `rigor-cli/src/threads.rs`;
+- **`use` smuggling**: bare `parse` leaf under those roots or `ruby_prism`,
+  `spawn`/`scope`/`Builder` under a `thread` segment, and `as`-aliases or
+  `*` globs of any flagged root — including `ruby_prism` aliased or
+  globbed at a deeper position (`use rigor_parse::ruby_prism as p`,
+  through lib.rs's `pub use ruby_prism;`).
 
-`#[cfg(test)]` items are skipped by extent (`;` or the matching `}`), and
-files `#[cfg(test)] mod x;` resolves to are skipped whole (Rust 2018 module
+`#[cfg(test)]` items are skipped by extent (`;` or the matching `}`) when
+an item keyword follows the attribute — on a field, variant, parameter
+or match arm only the attribute itself is masked, so the next item is
+not swallowed with it. Files `#[cfg(test)] mod x;` resolves to are
+skipped whole (Rust 2018 module
 resolution: `foo.rs`→`foo/x.rs`, `lib`/`main`/`mod.rs`→`x.rs`; nested
 `mod a { mod b; }` followed). `use` items mask call patterns so each site
 reports once under its `use:*` tag. The `ALLOW_LIST` pins (file, tag, count,
@@ -50,16 +55,21 @@ no entry — `.spawn_handler(…spawn_pool_thread)` is chain-proven.
   which `configure_global_pool` already sized; only thread *creation*
   bypasses the stack.
 - **Deliberately conservative elsewhere**: `cfg(all(test))`/`cfg_attr`
-  items scan as production (false flag, never a miss); a builder chain
-  split across statements flags (allow-list it with a reason, or chain
-  inline like `coverage.rs`).
+  items scan as production (a false flag there, never a miss); a builder
+  chain split across statements flags (allow-list it with a reason, or
+  chain inline like `coverage.rs`).
 
 ## Accepted limits (pathological, disclosed in the PR)
 
 `#[path]` modules outside `src/`, `include!` of non-src code, re-export
-indirection (`pub use std::thread as workers` → `crate::workers::spawn`),
-macro-invented call text. A human reviewer can spot these in a diff; the
-scan cannot.
+indirection deeper than the hop-one `use` items the scan does flag (e.g.
+a leaf re-exported through a `pub mod` chain under a non-`thread` name),
+macro-invented call text, builder `type`/`Default` aliases
+(`type B = std::thread::Builder`, `let b: ThreadPoolBuilder =
+Default::default()`, `<Builder>::new()`), `extern crate … as`,
+`Builder::new` taken as a function value, a stack-proof token in an
+unrelated chain link, and `+ use<>` precise capture (masked as a `use`
+item). A human reviewer can spot these in a diff; the scan cannot.
 
 ## Process note — review delegation stalled
 
