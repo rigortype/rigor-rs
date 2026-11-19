@@ -48,7 +48,7 @@ jobs:
             kinds: "elsifchain:24990 ifmod:12490 unlessmod:12490 rescuechain:24990 andand:24990 chain:24990 whenchain:24990"
             minm: "defined ifmod:12490 elsifchain:24990"
     env:
-      RIGOR_STACK_DATA: ${{ runner.temp }}/stack-data
+      RIGOR_STACK_DATA: stack-data
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
@@ -81,7 +81,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stack-${{ matrix.set }}
-          path: ${{ env.RIGOR_STACK_DATA }}/*.tsv
+          path: stack-data/*.tsv
           if-no-files-found: ignore
 
   # Prism's caps and the in-process per-mode stack minima — the ADR's
@@ -92,7 +92,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     env:
-      RIGOR_STACK_DATA: ${{ runner.temp }}/stack-data
+      RIGOR_STACK_DATA: stack-data
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.88
@@ -138,7 +138,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: stack-probe
-          path: ${{ env.RIGOR_STACK_DATA }}/*.tsv
+          path: stack-data/*.tsv
           if-no-files-found: ignore
 
   # Windows: the deep_nesting regression test once (rigor-rs#428). The

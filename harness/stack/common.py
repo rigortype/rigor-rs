@@ -17,8 +17,8 @@ import tempfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(os.path.dirname(HERE))
-DATA = os.environ.get("RIGOR_STACK_DATA") or os.path.join(
-    tempfile.gettempdir(), "rigor-stack-data")
+DATA = os.path.abspath(os.environ.get("RIGOR_STACK_DATA") or os.path.join(
+    tempfile.gettempdir(), "rigor-stack-data"))
 TRIALS = os.path.join(DATA, "trials")
 PROBE_SRC = os.path.join(HERE, "depthprobe")
 PROBE = os.environ.get("RIGOR_STACK_PROBE") or os.path.join(
