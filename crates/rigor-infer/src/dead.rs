@@ -519,8 +519,21 @@ impl<'i> Typer<'i> {
         // reused a fuel-starved or wrong-context first fold is caught here.
         // Meaningful only for a scan entered with an empty `seen` (a nested
         // scan's visits legitimately read its own stack context).
+        // rigor-rs#437 fold-order audit (RIGOR_REACH_MEMO_AUDIT): record the
+        // truthiness each `if`'s own scan visit answered AND the partial
+        // dead set it answered under, then refold every predicate fresh at
+        // scan end against THAT SAME partial set — a visit that reused a
+        // fuel-starved or wrong-context first fold is caught. The partial
+        // set is recorded per visit because the settled answer CAN differ
+        // legitimately across a loop back-edge (`if s` before `if d`'s dead
+        // `s = nil` arm records): that is the scan's inherent source-order
+        // limit, not a memo bug — flagging it would flake the audit on real
+        // corpora.
+        // Meaningful only for a scan entered with an empty `seen` (a nested
+        // scan's visits legitimately read its own stack context).
         let fold_audit = crate::reach_memo::audit_mode() && seen.is_empty();
-        let mut scanned_preds: Vec<(NodeId, Option<bool>)> = Vec::new();
+        let mut scanned_preds: Vec<(NodeId, Option<bool>, std::rc::Rc<DeadPositions>)> =
+            Vec::new();
         // Publish the accumulator to re-entrant callers only where a recursion
         // point follows AND it changed — the publish clones the recorded arms,
         // so doing it per node is O(nodes x arms) on generated-parser files;
@@ -544,7 +557,11 @@ impl<'i> Typer<'i> {
                     publish(&dead, &mut dirty);
                     let folded_truthy = self.expr_truthiness(ast, *predicate, seen);
                     if fold_audit {
-                        scanned_preds.push((*predicate, folded_truthy));
+                        scanned_preds.push((
+                            *predicate,
+                            folded_truthy,
+                            self.dead_partial.borrow().clone(),
+                        ));
                     }
                     let Some(truthy) = folded_truthy else {
                         continue;
@@ -625,6 +642,28 @@ impl<'i> Typer<'i> {
                 _ => {}
             }
         }
+        if fold_audit {
+            for (pred, used, partial) in scanned_preds {
+                // Refold against the partial set the visit ran under, with
+                // the pred itself marked in-flight — exactly the scan
+                // visit's context, so a self-referential reach sees the
+                // same re-entry `None`. The panic then catches only folds
+                // whose answer depends on WHO computed them, not on how
+                // far the scan had walked.
+                *self.dead_partial.borrow_mut() = partial;
+                let pkey = (ast.uid() as usize, pred.0);
+                self.truthy_in_flight.borrow_mut().insert(pkey);
+                let fresh = self.expr_truthiness_fold(ast, pred, &mut Vec::new());
+                self.truthy_in_flight.borrow_mut().remove(&pkey);
+                assert_eq!(
+                    fresh, used,
+                    "rigor-rs#437 fold-order audit: predicate {pred:?} scan visit folded \
+                     {used:?} but a fresh refold under the same partial dead set gives \
+                     {fresh:?} in {:?}",
+                    ast.file_key(),
+                );
+            }
+        }
         self.dead_in_flight.set(false);
         // Evict the scan-time truthiness answers: they read the PARTIAL dead
         // set, so post-scan callers refold against the settled one.
@@ -634,17 +673,6 @@ impl<'i> Typer<'i> {
         }
         let dead = std::rc::Rc::new(dead);
         *self.dead_cache.borrow_mut() = Some((key, dead.clone()));
-        if fold_audit {
-            for (pred, used) in scanned_preds {
-                let fresh = self.expr_truthiness_fold(ast, pred, &mut Vec::new());
-                assert_eq!(
-                    fresh, used,
-                    "rigor-rs#437 fold-order audit: predicate {pred:?} scan visit folded \
-                     {used:?} but a settled refold gives {fresh:?} in {:?}",
-                    ast.file_key(),
-                );
-            }
-        }
         dead
     }
 
@@ -684,7 +712,16 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
     ) -> Option<bool> {
         let key = (ast.uid() as usize, pred.0);
-        if seen.is_empty() {
+        // An empty `seen` is context-free only when NOTHING is folding: a
+        // call that arrives while other predicates fold (a `&mut Vec::new()`
+        // caller inside a reach, e.g. `loop_edges`) can answer differently
+        // than a true top-level visit — an ancestor's re-entry `None` would
+        // land in the flat memo permanently (design-review of #437). Those
+        // calls route to the contextual table, whose dependency record
+        // validates the context a hit reproduces.
+        let canonical =
+            seen.is_empty() && self.truthy_in_flight.borrow().is_empty();
+        if canonical {
             if let Some(hit) = self.truthy_memo.borrow().get(&key) {
                 return *hit;
             }
@@ -697,7 +734,7 @@ impl<'i> Typer<'i> {
             return None;
         }
         let mut provisional = false;
-        let out = if seen.is_empty() {
+        let out = if canonical {
             // A canonical fold that runs to completion is memoized, so the
             // reach computations around it depend only on its answer
             // (rigor-rs#422).

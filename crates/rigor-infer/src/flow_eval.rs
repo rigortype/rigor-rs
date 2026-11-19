@@ -179,20 +179,24 @@ impl<'i> Typer<'i> {
             // written name to `Dynamic`, which the exactness gate then reads
             // as an untrusted verdict (rigor-rs#437). `replay_one`'s `if`
             // arm already joins undecided arms and — under `loop_pass` —
-            // takes a decided predicate's live arm only. A write statement
-            // (`s = (if d then 2 else w = "x"; 3 end)`) is replayed the same
-            // way — `type_of` elides a decided `if`'s dead arm and
-            // `widen_shell` drops the dead arm's stale writes. Ivar and
-            // class/global decisions stay opaque: their edge semantics the
-            // pass does not model.
+            // takes a decided Constant predicate's live arm only. A write
+            // whose value IS an `if` (`s = (if d then 2 else w = "x"; 3
+            // end)`) is replayed the same way — `type_of` elides a decided
+            // `if`'s dead arm and `widen_shell` drops the dead arm's stale
+            // writes. Other decision shapes (`x = t && v`, `x = t&.m`, a
+            // `case` value) stay opaque — `type_of`'s narrowing for them
+            // was never in the fixpoint's trust base — and ivar or
+            // class/global decisions stay opaque regardless.
             let modelled = self.loop_pass.get()
-                && matches!(
-                    ast.get(stmt),
-                    Node::If { .. }
-                        | Node::LocalVariableWrite { .. }
-                        | Node::LocalVariableOpWrite { .. }
-                        | Node::MultiWrite { .. }
-                )
+                && (matches!(ast.get(stmt), Node::If { .. })
+                    || match ast.get(stmt) {
+                        Node::LocalVariableWrite { value, .. }
+                        | Node::LocalVariableOpWrite { value, .. }
+                        | Node::MultiWrite { value, .. } => {
+                            matches!(ast.get(*value), Node::If { .. })
+                        }
+                        _ => false,
+                    })
                 && !marks.decision_reset_within(span)
                 && marks
                     .decision_cg_reads_within(span, self.def_scope.get())
@@ -321,17 +325,27 @@ impl<'i> Typer<'i> {
                 // reference: the dead arm never runs. A decided one replays
                 // the live arm; an undecided one (`if true && false`) is not
                 // modelled and declines.
-                let folded = self.known_polarity(ast, env, *predicate, interner);
+                let pred_ty = self.type_of(ast, *predicate, env, interner);
+                let folded = self.predicate_polarity(interner, pred_ty);
                 let literal = crate::def_local_marks::literal_like(ast, *predicate);
                 if literal && folded.is_none() {
                     self.replay_discard(ast, env, &[then_body, else_body], interner, returns);
                     Self::widen_names(env, &marks.written_within(span), interner);
-                } else if literal || (self.loop_pass.get() && folded.is_some()) {
+                } else if literal
+                    || (self.loop_pass.get()
+                        && folded.is_some()
+                        && matches!(interner.get(pred_ty), Type::Constant(_)))
+                {
                     // Under `loop_pass` a decided non-literal predicate
                     // takes only its live arm too — the reference's per-pass
                     // `live_branch_for_if` kills the dead edge, so a write
                     // there (`if d … else t = nil end` on a pinned `d`)
-                    // never reaches the pass env (rigor-rs#437).
+                    // never reaches the pass env (rigor-rs#437). The elide
+                    // is restricted to value-pinned (`Constant`) predicates:
+                    // a `Nominal`/`Tuple` answer could be an optimistic
+                    // carrier the reference declines to elide (its
+                    // `OptimisticOrigin` channel has no port yet), where
+                    // skipping the arm sheds a pin the reference keeps.
                     let (live, dead) =
                         if folded == Some(!*is_unless) { (then_body, else_body) } else { (else_body, then_body) };
                     if crate::def_local_marks::body_span(ast, dead)
@@ -354,10 +368,7 @@ impl<'i> Typer<'i> {
                     // `[1].empty?` — is the reference's folded `if`, which
                     // narrows nothing, so its arm keeps the pin (`h.frob`
                     // fires `for [1]`).
-                    let binds: [Vec<(String, TypeId)>; 2] = if self
-                        .known_polarity(ast, env, *predicate, interner)
-                        .is_some()
-                    {
+                    let binds: [Vec<(String, TypeId)>; 2] = if folded.is_some() {
                         [Vec::new(), Vec::new()]
                     } else {
                         [
@@ -1019,9 +1030,13 @@ impl<'i> Typer<'i> {
         if names.is_empty() {
             return None;
         }
+        // Save/restore for a NESTED call: a `loop_continuation` inside this
+        // body's replay must hand the flag back to the outer pass, not reset
+        // it (design-review N5).
+        let prev_loop_pass = self.loop_pass.replace(true);
         macro_rules! structural {
             () => {{
-                self.loop_pass.set(false);
+                self.loop_pass.set(prev_loop_pass);
                 return self
                     .loop_cap_widening(ast, env, body, interner)
                     .map(|(tracked, suspect)| LoopContinuation::Structural(tracked, suspect));
@@ -1047,12 +1062,18 @@ impl<'i> Typer<'i> {
                 structural!();
             }
         }
-        // A `Dynamic` SEED is tolerated: a name the body unconditionally
-        // rebinds each pass overwrites it anyway (`s = u`, a Dynamic param,
-        // then `s = (if d then 2 else w = "x"; 3 end)` — rigor-rs#437's x5),
-        // and one the pass never writes or writes conditionally still exits
-        // `Dynamic`, which the pass-exit check below declines on. The gate
-        // that must hold is value-exactness of every tracked pass EXIT.
+        // Every tracked seed must be value-exact: a `Dynamic` seed means
+        // the pass never observed the name — and where the reference holds
+        // a precise seed that MOVES (`nil` → `nil | 2`), an absorbing
+        // `Dynamic` would converge a pass earlier and keep pins the
+        // reference's cap widen sheds (design-review of #437).
+        if names.iter().any(|n| {
+            env.get(n)
+                .map(|&t| Self::type_has_decline(interner, t))
+                .unwrap_or(false)
+        }) {
+            structural!();
+        }
         let nil = interner.nil();
         // Pre-existing names only: a body-first local's `nil` seed must not
         // leak into the body (reference `loop_pass_entry` /
@@ -1114,7 +1135,7 @@ impl<'i> Typer<'i> {
                 break;
             }
         }
-        self.loop_pass.set(false);
+        self.loop_pass.set(prev_loop_pass);
         Some(LoopContinuation::Fixpoint(assumption))
     }
 
