@@ -7,6 +7,11 @@ actual stack (never "the platform default").
 Amended 2026-11-19 ([#679](https://github.com/rigortype/rigor-rs/issues/679)): the last
 resort is an explicit 2 MiB `stack_size`, never `thread::Builder`'s no-size
 default, which honours `RUST_MIN_STACK`.
+Amended 2026-11-19 ([#678](https://github.com/rigortype/rigor-rs/issues/678)): a pool
+with no worker at all exits 70 (the reference's `EXIT_INTERNAL_ERROR`),
+not 1; `help` / `version` / `upgrade` skip the pool build and instead
+poison the one-shot registry so a skipped path that reached rayon panics;
+and `coverage --workers` discloses a scoped-pool build failure.
 Measured on release builds (aarch64 macOS, toolchain 1.88, the toolchain the
 release binaries use).
 
@@ -52,7 +57,16 @@ an empty report). See
      the command thread still tries the explicit 2 MiB spawn before
      running inline.
    - The command thread then builds the global rayon pool, once, with a
-     spawn handler that gives each worker the stack. `build_global` is
+     spawn handler that gives each worker the stack — unless the command
+     only prints static text (`help`, `version`, `upgrade`, or the bare
+     command list), which never touches rayon and so skips the build; on a
+     host too starved for even one worker those commands still answer
+     (rigor-rs#678). The skip is fail-closed: instead of building, it runs
+     a `build_global` whose spawn handler always fails — the failed build
+     still consumes the one-shot registry, so a skipped path that reached
+     rayon panics rather than silently building a default pool on std's
+     small stacks (`disable_global_pool`; `tests/static_commands_no_pool.rs`
+     runs `help <cmd>` for every catalogue command). `build_global` is
      one-shot: rayon marks the registry as set even when building fails, so
      a retry with a smaller size would leave no pool at all. The fallback
      therefore happens per thread, inside the handler: 256 MiB, then 64 MiB,
@@ -61,11 +75,17 @@ an empty report). See
      inflate past the point the last-resort spawn itself fails). If no
      worker can be
      created even at that size, the process prints one error (`rigor: could
-     not start the analysis thread pool: …`) and exits; it does not
-     continue into a later `GlobalPoolAlreadyInitialized` panic.
+     not start the analysis thread pool: …`) and exits 70, the reference's
+     `EXIT_INTERNAL_ERROR` — not 1, which means findings; it does not
+     continue into a later `GlobalPoolAlreadyInitialized` panic. (A
+     per-command degrade to a one-thread pool on the command thread's own
+     256 MiB stack — rayon's `use_current_thread`, the reference's
+     sequential default — was considered and deferred: it cannot serve
+     `lsp`/`mcp`, so it would be a per-command mode. Exit 70 is uniform.)
    - The `coverage --workers=N` pool uses the same handler.
-   - A large stack never stops a command from starting (the command thread
-     can always fall back to the process main thread). A thread that falls
+   - The command's own stack never stops a command from starting (it can
+     always fall back to the process main thread); a pool with no worker
+     at all does stop it, with the exit-70 line above. A thread that falls
      back prints one stderr line per process; the normal path prints
      nothing. The line names what was actually used: "64 MiB", "2 MiB", or
      "the process main thread" — never "the platform default".

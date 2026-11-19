@@ -1292,3 +1292,60 @@ fn bundled_name_tables_match_the_pinned_reference() {
          table in crates/rigor-cli/src/main.rs (UPSTREAM.md step 6)"
     );
 }
+
+// rigor-rs#678: a failed pool build is EXIT_INTERNAL_ERROR, and commands
+// that only print static text never build the pool at all.
+
+fn argv(args: &[&str]) -> Vec<String> {
+    args.iter().map(|s| s.to_string()).collect()
+}
+
+#[test]
+fn pool_build_failure_is_the_references_internal_error_code() {
+    // `ExitCode` has no `PartialEq`; pin the number through `Debug`.
+    assert_eq!(
+        format!("{:?}", ExitCode::from(EXIT_INTERNAL_ERROR)),
+        format!("{:?}", ExitCode::from(70)),
+        "EXIT_INTERNAL_ERROR must stay 70, the reference's CLI::EXIT_INTERNAL_ERROR"
+    );
+    assert_ne!(EXIT_INTERNAL_ERROR, 1, "70 must stay distinct from findings");
+    assert_ne!(EXIT_INTERNAL_ERROR, 64, "70 must stay distinct from usage");
+}
+
+#[test]
+fn static_text_commands_skip_the_pool_build() {
+    for args in [
+        &[][..],
+        &["-h"][..],
+        &["--help"][..],
+        &["help"][..],
+        &["help", "check"][..],
+        &["version"][..],
+        &["--version"][..],
+        &["-v"][..],
+        &["-V"][..],
+        &["upgrade"][..],
+    ] {
+        assert!(
+            !needs_analysis_pool(&argv(args)),
+            "{args:?} must not build the rayon pool"
+        );
+    }
+}
+
+#[test]
+fn analysis_commands_build_the_pool_first() {
+    for args in [
+        &["check"][..],
+        &["check", "--help"][..],
+        &["coverage", "--workers=2"][..],
+        &["lsp"][..],
+        &["sig-gen"][..],
+        &["nonesuch"][..],
+    ] {
+        assert!(
+            needs_analysis_pool(&argv(args)),
+            "{args:?} must build the rayon pool before dispatch"
+        );
+    }
+}

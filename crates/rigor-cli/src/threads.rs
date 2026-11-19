@@ -12,9 +12,15 @@
 //! - the command thread on Windows: an explicit 2 MiB stack, then the
 //!   process main thread (1 MiB).
 //!
-//! A large stack never stops a command from starting. A pool that cannot
-//! be built at all prints one error and the command returns failure; it
-//! does not continue into a later `GlobalPoolAlreadyInitialized` panic.
+//! The command's own stack never stops a command from starting — it can
+//! always fall back to the process main thread. A pool with no worker at
+//! all does: it prints one error and the command exits 70 (the reference's
+//! `EXIT_INTERNAL_ERROR`, rigor-rs#678); it does not continue into a later
+//! `GlobalPoolAlreadyInitialized` panic. Commands that only print static
+//! text (`help`, `version`, `upgrade`) skip the pool build and poison the
+//! one-shot registry instead ([`disable_global_pool`]), so they still
+//! answer on a host too starved for even one worker — and a skipped path
+//! that reached rayon would panic rather than build a default pool.
 
 use std::io;
 use std::process::ExitCode;
@@ -175,7 +181,9 @@ where
                 std::panic::resume_unwind(payload);
             }
             let code = code.lock().unwrap_or_else(PoisonError::into_inner).take();
-            code.unwrap_or(ExitCode::FAILURE)
+            // Unreachable (the command runs exactly once); if reached, the
+            // command never produced a code — a could-not-run, so 70.
+            code.unwrap_or(ExitCode::from(crate::EXIT_INTERNAL_ERROR))
         }
         Err(_) => {
             note_stack(StackKind::ProcessMainThread);
@@ -183,9 +191,27 @@ where
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .take();
-            command.map(|c| c()).unwrap_or(ExitCode::FAILURE)
+            // Unreachable (the command is taken exactly once); if reached,
+            // the command never ran — a could-not-run, so 70.
+            command
+                .map(|c| c())
+                .unwrap_or(ExitCode::from(crate::EXIT_INTERNAL_ERROR))
         }
     }
+}
+
+/// Poison the global pool for a command that never runs analysis. A failed
+/// `build_global` still consumes the one-shot registry (see
+/// [`configure_global_pool`]), so it leaves the registry permanently unset:
+/// any rayon use after this point panics instead of silently building a
+/// default pool on std's small worker stacks — the #412 regression a
+/// whitelisted command that grew analysis would otherwise reintroduce
+/// (rigor-rs#678). The spawn handler fails before any worker exists, so no
+/// thread is spawned.
+pub(crate) fn disable_global_pool() {
+    let _ = rayon::ThreadPoolBuilder::new()
+        .spawn_handler(|_| Err(io::Error::other("a static-text command")))
+        .build_global();
 }
 
 /// The rayon `spawn_handler` for every analysis pool: each worker gets the
@@ -217,8 +243,9 @@ where
 /// when building it fails, so it is never retried with other settings. The
 /// stack fallback happens per thread, inside the spawn handler. If no
 /// worker can be created even at 2 MiB, this prints
-/// one error and returns `false` so the command can exit; a later parallel
-/// stage would otherwise panic with `GlobalPoolAlreadyInitialized`.
+/// one error and returns `false` so the command can exit 70
+/// (`EXIT_INTERNAL_ERROR`); a later parallel stage would otherwise panic
+/// with `GlobalPoolAlreadyInitialized`.
 pub(crate) fn configure_global_pool() -> bool {
     match rayon::ThreadPoolBuilder::new()
         .spawn_handler(spawn_pool_thread)
