@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
-"""Where does `rigor check` spend its time on a deep file? Starts the run on a
-big worker stack, waits DELAY s, runs macOS `sample` for DUR s, and prints the
+"""Where does `rigor check` spend its time on a deep file? Starts the run, waits DELAY s, runs macOS `sample` for DUR s, and prints the
 heaviest frames of the busy thread (sample's "Sort by top of stack" list).
 
 Usage: profile.py CLI KIND N [--delay S] [--dur S] [--out F]
@@ -24,7 +23,8 @@ a = ap.parse_args()
 rigor = cli(a.cli)
 d, files = make_trial(a.kind, a.n, True)
 try:
-    env = dict(os.environ, RUST_MIN_STACK=str(4096 << 20))
+    env = dict(os.environ)
+    env.pop("RUST_MIN_STACK", None)
     p = subprocess.Popen([rigor, "check", "--format", "json"] + files, cwd=d, env=env,
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     time.sleep(a.delay)

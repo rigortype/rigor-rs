@@ -111,7 +111,7 @@ jobs:
       # the uncapped sets probe to a million links and include shapes whose
       # Prism parse is itself quadratic.
       - name: caps
-        run: python3 harness/stack/caps.py array call block if paren begin defined super yield def class hash and ivopw interp while unless case lambda module sclass doblock rescue rcall idx splat kwsplat regex ternary assign opassign pow bang not uminus blockparam ret masgn arrparen bangparen splatparen parenbegin defparen lambdaparen interpparen andparen ifparen notparen
+        run: python3 harness/stack/caps.py array call block if paren begin defined super yield def class hash and ivopw interp while unless case lambda module sclass doblock rescue rcall idx splat kwsplat regex ternary assign opassign pow bang not uminus blockparam arrparen bangparen splatparen parenbegin defparen lambdaparen interpparen andparen ifparen notparen
 
       - name: uncapped parse behaviour at size
         run: |

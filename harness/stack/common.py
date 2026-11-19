@@ -50,7 +50,10 @@ UNCAPPED_IN_SCOPE = ["defchain", "defretchain", "blkinchain", "classchain",
                      "defifmod"]
 TYPED_FIELD = ["rescuechain", "elsifchain", "whenchain"]
 # Capped shapes outside the #279 table CAPS carries: caps.py measures them.
-MIXED = ["ret", "masgn", "arrparen", "bangparen", "splatparen", "parenbegin",
+# (`ret` and `masgn` also exist in depthprobe's gen table but produce invalid
+# Ruby at any size — `return (` is a void-value error and `a, (b) = 1` an
+# unexpected write target — so they are error shapes, not nesting shapes.)
+MIXED = ["arrparen", "bangparen", "splatparen", "parenbegin",
          "defparen", "lambdaparen", "interpparen", "andparen", "ifparen",
          "notparen"]
 
