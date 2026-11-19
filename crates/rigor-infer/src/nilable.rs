@@ -5,6 +5,7 @@
 //! nilable-source classification it seeds from.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rigor_parse::{Compound, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, Type, TypeId};
@@ -184,7 +185,7 @@ impl<'i> Typer<'i> {
                         self.nil_flow_scope(
                             ast, &body, tenv, nenv, penv, writes, rebinds, interner, out
                         );
-                        widen_flow_writes(writes, span, tenv, interner);
+                        widen_flow_writes(writes.iter(), span, tenv, interner);
                         widen_penv_writes(writes, span, penv);
                         for (w, name) in writes {
                             if span.0 <= w.0 && w.1 <= span.1 {
@@ -221,7 +222,7 @@ impl<'i> Typer<'i> {
                 let src = self.nilable_source_class(ast, value, tenv, penv, interner);
                 let prov = self.array_new_nominal_provenance(ast, value, tenv, interner);
                 let vty = self.type_of(ast, value, tenv, interner);
-                tenv.insert(name.clone(), vty);
+                tenv.insert(Rc::from(name.as_str()), vty);
                 // A rebind invalidates the local's indexed-narrowing slot
                 // records, exactly as `apply_subtree_effects` drops them for
                 // every rebind in a subtree — without this a `s[k] ||= v`
@@ -257,7 +258,7 @@ impl<'i> Typer<'i> {
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     nenv.remove(&name);
                     penv.remove(&name);
-                    tenv.insert(name.clone(), ty);
+                    tenv.insert(Rc::from(name.as_str()), ty);
                     drop_indexed_narrowings(tenv, &name);
                 }
                 // An `h[k]` index target stores through `[]=` on the
@@ -276,18 +277,18 @@ impl<'i> Typer<'i> {
                     // The store also invalidates the slot's `||=` record
                     // (`invalidate_indexed_write`, rigor-rs#342).
                     if let Some(key) = crate::flow_writes::index_target_drop_key(key) {
-                        tenv.remove(&crate::indexed_narrowing_key(&name, &key));
+                        tenv.remove(crate::indexed_narrowing_key(&name, &key).as_str());
                     }
-                    let pre = tenv.get(&name).copied();
+                    let pre = tenv.get(name.as_str()).copied();
                     let widened = pre
                         .and_then(|pre| self.widen_mutated_binding(pre, "[]=", interner));
-                    widen_flow_writes(writes, tspan, tenv, interner);
+                    widen_flow_writes(writes.iter(), tspan, tenv, interner);
                     // The index-target store is a MUTATION, not a rebind:
                     // `widen_mutated_binding` declining (`None` — the binding is
                     // already a `Nominal`/`Dynamic`) keeps the binding it had,
                     // it does not fall back to `widen_flow_writes`' Dynamic.
                     if let Some(pre) = pre {
-                        tenv.insert(name, widened.unwrap_or(pre));
+                        tenv.insert(Rc::from(name.as_str()), widened.unwrap_or(pre));
                     }
                 }
             }
@@ -299,7 +300,7 @@ impl<'i> Typer<'i> {
                 nenv.remove(&name);
                 penv.remove(&name);
                 let u = interner.untyped();
-                tenv.insert(name.clone(), u);
+                tenv.insert(Rc::from(name.as_str()), u);
                 drop_indexed_narrowings(tenv, &name);
             }
             Node::Call { .. } | Node::IndexWrite { .. } | Node::AttrWrite { .. } => {
@@ -334,9 +335,9 @@ impl<'i> Typer<'i> {
                     if let Some(key) =
                         crate::flow_writes::index_target_drop_key(key.clone())
                     {
-                        tenv.remove(&crate::indexed_narrowing_key(name, &key));
+                        tenv.remove(crate::indexed_narrowing_key(name, &key).as_str());
                     }
-                    if let Some(&pre) = tenv.get(name) {
+                    if let Some(&pre) = tenv.get(name.as_str()) {
                         // The store is a MUTATION: a declined widening keeps
                         // the prior binding rather than falling back to
                         // `widen_flow_writes`' Dynamic.
@@ -347,7 +348,7 @@ impl<'i> Typer<'i> {
                         ));
                     }
                 }
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes.iter(), span, tenv, interner);
                 widen_penv_writes(writes, span, penv);
                 nenv.clear();
                 for (name, w) in widened {
@@ -360,7 +361,7 @@ impl<'i> Typer<'i> {
                     // the nilable `x = s[k]` source is gone; rigor-rs#352
                     // review).
                     if !rebound_within(rebinds, span, &name) {
-                        tenv.insert(name, w);
+                        tenv.insert(Rc::from(name.as_str()), w);
                     }
                 }
             }
@@ -375,9 +376,9 @@ impl<'i> Typer<'i> {
                         if let Some(key) =
                             crate::flow_writes::index_target_drop_key(key.clone())
                         {
-                            tenv.remove(&crate::indexed_narrowing_key(name, &key));
+                            tenv.remove(crate::indexed_narrowing_key(name, &key).as_str());
                         }
-                        if let Some(&pre) = tenv.get(name) {
+                        if let Some(&pre) = tenv.get(name.as_str()) {
                             widened.push((
                                 name.clone(),
                                 self.widen_mutated_binding(pre, "[]=", interner)
@@ -386,7 +387,7 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes.iter(), span, tenv, interner);
                 widen_penv_writes(writes, span, penv);
                 nenv.clear();
                 for (name, w) in widened {
@@ -395,7 +396,7 @@ impl<'i> Typer<'i> {
                     // pre-rescue `[]=` widening must not reinsert
                     // (`rescue => s[0]; s = "q"` — rigor-rs#352 review).
                     if !rebound_within(rebinds, span, &name) {
-                        tenv.insert(name, w);
+                        tenv.insert(Rc::from(name.as_str()), w);
                     }
                 }
             }
@@ -405,7 +406,7 @@ impl<'i> Typer<'i> {
             // backstop — no fact survives an unmodeled construct). No descent.
             other => {
                 let span = other.span();
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes.iter(), span, tenv, interner);
                 widen_penv_writes(writes, span, penv);
                 nenv.clear();
             }
@@ -498,11 +499,11 @@ impl<'i> Typer<'i> {
                                 drop_key.as_ref(),
                                 tenv,
                             );
-                            if let Some(&pre) = tenv.get(name) {
+                            if let Some(&pre) = tenv.get(name.as_str()) {
                                 if let Some(widened) =
                                     self.widen_mutated_binding(pre, &method, interner)
                                 {
-                                    tenv.insert(name.clone(), widened);
+                                    tenv.insert(Rc::from(name.as_str()), widened);
                                 }
                             }
                         }
@@ -525,7 +526,7 @@ impl<'i> Typer<'i> {
                     let mut bnenv: HashMap<String, &'static str> = HashMap::new();
                     let mut bpenv = penv.clone();
                     for name in &bound {
-                        btenv.remove(name);
+                        btenv.remove(name.as_str());
                         bpenv.remove(name.as_str());
                     }
                     // A block body starts without the enclosing match
@@ -538,7 +539,7 @@ impl<'i> Typer<'i> {
                         interner, out,
                     );
                     nenv.clear();
-                    widen_flow_writes(writes, call_span, tenv, interner);
+                    widen_flow_writes(writes.iter(), call_span, tenv, interner);
                     widen_penv_writes(writes, call_span, penv);
                 }
             }
@@ -591,7 +592,7 @@ impl<'i> Typer<'i> {
                         // `eval_index_or_write` does.
                         let stored = if operand && matches!(compound, Compound::Or) {
                             let tracked = tenv
-                                .get(name)
+                                .get(name.as_str())
                                 .is_some_and(|&pre| self.fully_tracked_type(pre, interner));
                             if tracked {
                                 indices.first().and_then(|&k| {
@@ -609,15 +610,15 @@ impl<'i> Typer<'i> {
                         } else {
                             None
                         };
-                        if let Some(&pre) = tenv.get(name) {
+                        if let Some(&pre) = tenv.get(name.as_str()) {
                             if let Some(widened) =
                                 self.widen_mutated_binding(pre, "[]=", interner)
                             {
-                                tenv.insert(name.clone(), widened);
+                                tenv.insert(Rc::from(name.as_str()), widened);
                             }
                         }
                         if let Some((key, stored)) = stored {
-                            tenv.insert(key, stored);
+                            tenv.insert(Rc::from(key.as_str()), stored);
                         }
                     }
                 }
@@ -819,7 +820,7 @@ impl<'i> Typer<'i> {
             if let Node::LocalVariableRead { name, .. } = ast.get(recv) {
                 if let Some(key) = crate::stable_index_key(ast.get(args[0])) {
                     if let Some(&recorded) =
-                        tenv.get(&crate::indexed_narrowing_key(name, &key))
+                        tenv.get(crate::indexed_narrowing_key(name, &key).as_str())
                     {
                         return self
                             .non_nil_fragment(recorded, interner)

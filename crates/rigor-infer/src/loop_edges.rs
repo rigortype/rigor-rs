@@ -23,6 +23,8 @@ use rigor_index::ClassOrdering;
 use rigor_parse::{LoopKind, LoweredAst, Node, NodeId, Span, StatementsKind};
 use rigor_types::{Interner, Scalar, Type, TypeId};
 
+use std::rc::Rc;
+
 use crate::Typer;
 
 /// One edge's effect on a local's carrier `T`.
@@ -195,7 +197,7 @@ impl<'i> Typer<'i> {
             if !self.loop_edge_keeps(ast, id, &name, ty, LoopSide::Exit, interner) {
                 let u = interner.untyped();
                 crate::flow_writes::drop_indexed_narrowings(env, &name);
-                env.insert(name, u);
+                env.insert(Rc::from(name.as_str()), u);
             }
         }
     }

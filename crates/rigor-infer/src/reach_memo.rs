@@ -40,6 +40,7 @@
 //! `RIGOR_REACH_MEMO_AUDIT=1` recomputes on every hit and panics on a
 //! mismatch.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
@@ -111,7 +112,70 @@ type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 const MAX_ENTRIES_PER_KEY: usize = 128;
 
 /// An `expr_truthiness` memo key: `([`LoweredAst::uid`], predicate node)`.
-type TruthyKey = (usize, u32);
+pub(crate) type TruthyKey = (usize, u32);
+
+/// The most `kills` cells [`ReachMemo::kill_scans`] may hold. Rows are
+/// unbounded in the statement list's length and in their count; without a
+/// bound a file could trade the quadratic scan the rows exist to remove
+/// (rigor-rs#424) for quadratic memory. Past it the map clears and new rows
+/// stop being built until the next `(ast, dead)` window — the scans then
+/// cost what they did before the rows existed.
+pub(crate) const MAX_KILL_CELLS: usize = 1 << 21;
+
+/// One [`Typer::kill_prefix`] row's key: the statement list's identity (its
+/// arena slice address and length — stable for an `LoweredAst`'s lifetime,
+/// and the rows die with the memo's `(ast, dead)` window anyway), the
+/// target's name (an ivar's `@`/`@@`/`$` sigil cannot collide with a local
+/// spelling), and `seen.len()` — the fold fuel the caps in `expr_scalar`,
+/// `root_reach` and `def_exits` read. The stack's CONTENTS are not part of
+/// the key (two reads of one local carry different `name@offset` keys);
+/// each [`KillSeg`] carries the [`MemoEntry`] dependency record of the
+/// tests its evaluation made instead.
+pub(crate) type KillKey = (usize, usize, Box<str>, usize);
+
+/// One extension segment of a [`KillScan`] row: the cells before `end` were
+/// folded under the dependency record the segment carries — every `seen`
+/// key the evaluations tested (and which of them the building stack held),
+/// plus the folds they saw re-entered. A prefix reaching into the segment
+/// is reusable only by a stack answering those tests the same way
+/// ([`deps_match`]) AND while every re-entered fold still answers `None` —
+/// the [`MemoEntry`] rules, verbatim.
+pub(crate) struct KillSeg {
+    /// `kills` is covered through this index (exclusive).
+    pub(crate) end: usize,
+    /// The folds the evaluations saw re-entered.
+    pub(crate) folding: Rc<[TruthyKey]>,
+    /// Every `seen` key the evaluations tested (interned), sorted.
+    pub(crate) tested: Rc<[u32]>,
+    /// `tested` folded into 64 bits ([`id_bit`]).
+    pub(crate) tested_bits: u64,
+    /// The tested keys the building stack held, sorted.
+    pub(crate) present: Rc<[u32]>,
+}
+
+/// The running prefix fold of `definitely_assigns` over one statement list
+/// (rigor-rs#424). `kills[i]` is the span of the last statement in
+/// `body[..=i]` that definitely assigns — the answer the `body[..pos]` scan
+/// in [`Typer::latest_definite_assignment`] computes for `pos = i + 1`.
+/// Without it N reads in one flat statement list (`x_i = 1 if y` × N)
+/// rescan the prefix per read — O(N²) `definitely_assigns` calls.
+pub(crate) struct KillScan {
+    /// `kills[i]`: the last definitely-assigning span in `body[..=i]`.
+    pub(crate) kills: Vec<Option<Span>>,
+    /// One [`KillSeg`] per extension, in order.
+    pub(crate) segs: Vec<KillSeg>,
+}
+
+/// The dependencies a `kill_prefix` extension collects while it runs —
+/// every `seen` test ([`Typer::seen_contains`]) and every re-entered fold
+/// ([`Typer::note_truthy_reentry`]) lands on the top recording, and a
+/// nested extension's pop merges it into the enclosing one (an outer
+/// segment's cells were folded through the inner evaluations too).
+#[derive(Default)]
+pub(crate) struct KillRec {
+    pub(crate) tested: Vec<u32>,
+    pub(crate) folding: Vec<TruthyKey>,
+}
 
 /// One stored answer.
 struct MemoEntry {
@@ -134,13 +198,13 @@ struct MemoEntry {
 }
 
 /// The bit an interned id sets in [`MemoEntry::tested_bits`].
-fn id_bit(id: u32) -> u64 {
+pub(crate) fn id_bit(id: u32) -> u64 {
     1 << (id % 64)
 }
 
 /// Whether a stack holding the (distinct) interned keys `stack` answers
 /// every test the recorded computation made the way its starting stack did.
-fn deps_match(tested_bits: u64, tested: &[u32], present: &[u32], stack: &[u32]) -> bool {
+pub(crate) fn deps_match(tested_bits: u64, tested: &[u32], present: &[u32], stack: &[u32]) -> bool {
     let mut held = 0;
     for id in stack {
         if tested_bits & id_bit(*id) != 0 && tested.binary_search(id).is_ok() {
@@ -210,7 +274,7 @@ struct EnvExprEntry {
     /// The env bindings verbatim; a fingerprint match is confirmed
     /// against this — the `TypeId`s are only meaningful under
     /// [`Self::interner`], which is why that is compared first.
-    env: Rc<Vec<(Box<str>, rigor_types::TypeId)>>,
+    env: Rc<Vec<(Rc<str>, rigor_types::TypeId)>>,
     /// `Typer::def_scope` at compute time — `type_of` reads it
     /// (`LocalVariableOpWrite`, `decline_fold_gap`), so it is part of the
     /// context an entry is valid for.
@@ -384,17 +448,31 @@ pub(crate) struct ReachMemo {
     /// lists of small ids. Reset with the AST only while no computation is
     /// in progress — the frames hold ids too.
     keys: FastMap<String, u32>,
+    /// `latest_definite_assignment`'s prefix folds per [`KillKey`]
+    /// (rigor-rs#424) — the same `(ast, dead)` validity window as
+    /// `entries`: a `definitely_assigns` answer reads the dead set
+    /// (`dead.covers`), the `seen` stack (in the key) and the truthiness
+    /// memo (the per-segment `folds` records), nothing else mutable.
+    pub(crate) kill_scans: FastMap<KillKey, KillScan>,
+    /// Total `kills` cells over `kill_scans`, for [`MAX_KILL_CELLS`].
+    pub(crate) kill_cells: usize,
+    /// `true` once `kill_cells` overflowed in this window — new rows stop
+    /// being built until the next reset.
+    pub(crate) kill_overflowed: bool,
+    /// The [`KillRec`] stack of `kill_prefix` extensions in progress —
+    /// transient, one push per extension, not part of the validity window.
+    pub(crate) kill_rec: RefCell<Vec<KillRec>>,
 }
 
 impl ReachMemo {
     /// Whether the entries belong to `ast` and `dead`.
-    fn valid_for(&self, ast: (usize, usize), dead: &Option<Rc<DeadPositions>>) -> bool {
+    pub(crate) fn valid_for(&self, ast: (usize, usize), dead: &Option<Rc<DeadPositions>>) -> bool {
         self.ast == ast && same_dead(&self.dead, dead)
     }
 
     /// Start over for `ast` and `dead` unless the entries already belong to
     /// them.
-    fn reset_unless_valid(&mut self, ast: (usize, usize), dead: &Option<Rc<DeadPositions>>) {
+    pub(crate) fn reset_unless_valid(&mut self, ast: (usize, usize), dead: &Option<Rc<DeadPositions>>) {
         if !self.valid_for(ast, dead) {
             self.ast = ast;
             self.dead = dead.clone();
@@ -404,10 +482,13 @@ impl ReachMemo {
             self.type_ofs.clear();
             self.type_env_ofs.clear();
             self.truthys.clear();
+            self.kill_scans.clear();
+            self.kill_cells = 0;
+            self.kill_overflowed = false;
         }
     }
 
-    fn intern(&mut self, key: &str) -> u32 {
+    pub(crate) fn intern(&mut self, key: &str) -> u32 {
         if let Some(&id) = self.keys.get(key) {
             return id;
         }
@@ -418,7 +499,7 @@ impl ReachMemo {
 
     /// The interned ids of the keys on `stack` (a key never interned was
     /// never tested, so it cannot matter to any entry).
-    fn stack_ids(&self, stack: &[String]) -> Vec<u32> {
+    pub(crate) fn stack_ids(&self, stack: &[String]) -> Vec<u32> {
         stack.iter().filter_map(|k| self.keys.get(k.as_str()).copied()).collect()
     }
 }
@@ -461,7 +542,7 @@ impl MemoFrames {
 
     /// Record dependencies in the innermost frame when it is a computation:
     /// the tested keys only when it runs on stack `stack`.
-    fn record(&mut self, stack: usize, tested: &[u32], folding: &[TruthyKey]) {
+    pub(crate) fn record(&mut self, stack: usize, tested: &[u32], folding: &[TruthyKey]) {
         let depth = self.frames.len();
         let Some(MemoFrame::Reach { seen, stamp, tested: t, folding: f, .. }) = self.frames.last_mut()
         else {
@@ -492,7 +573,7 @@ impl MemoFrames {
 }
 
 /// Same dead-set object (or both absent).
-fn same_dead(a: &Option<Rc<DeadPositions>>, b: &Option<Rc<DeadPositions>>) -> bool {
+pub(crate) fn same_dead(a: &Option<Rc<DeadPositions>>, b: &Option<Rc<DeadPositions>>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => Rc::ptr_eq(a, b),
@@ -508,14 +589,14 @@ pub(crate) fn audit_mode() -> bool {
     })
 }
 
-fn ast_identity(ast: &LoweredAst) -> (usize, usize) {
+pub(crate) fn ast_identity(ast: &LoweredAst) -> (usize, usize) {
     (ast.uid() as usize, ast.len())
 }
 
 /// The address that identifies a `seen` stack. The `Vec` itself, not its
 /// buffer: a push may move the buffer, never the borrowed `Vec`.
 #[allow(clippy::ptr_arg)]
-fn stack_id(seen: &Vec<String>) -> usize {
+pub(crate) fn stack_id(seen: &Vec<String>) -> usize {
     seen as *const Vec<String> as usize
 }
 
@@ -526,6 +607,21 @@ impl<'i> Typer<'i> {
     #[allow(clippy::ptr_arg)] // the `Vec`'s address identifies the stack
     pub(crate) fn seen_contains(&self, seen: &Vec<String>, key: &str) -> bool {
         let stack = stack_id(seen);
+        // A `kill_prefix` extension in progress takes the test as a
+        // dependency of the segment it is folding.
+        let rec_active = self.reach_memo.borrow().kill_rec.borrow().last().is_some();
+        if rec_active {
+            let id = self.reach_memo.borrow_mut().intern(key);
+            if let Some(rec) = self
+                .reach_memo
+                .borrow()
+                .kill_rec
+                .borrow_mut()
+                .last_mut()
+            {
+                rec.tested.push(id);
+            }
+        }
         let mut frames = self.reach_frames.borrow_mut();
         if matches!(frames.frames.last(), Some(MemoFrame::Reach { seen: s, .. }) if *s == stack) {
             let id = self.reach_memo.borrow_mut().intern(key);
@@ -537,6 +633,15 @@ impl<'i> Typer<'i> {
     /// The fold of `pred` re-entered and answered `None`: the `local_reach`
     /// computations in progress hold only while that fold is still running.
     pub(crate) fn note_truthy_reentry(&self, pred: TruthyKey) {
+        {
+            let memo = self.reach_memo.borrow();
+            let mut recs = memo.kill_rec.borrow_mut();
+            if let Some(rec) = recs.last_mut() {
+                if !rec.folding.contains(&pred) {
+                    rec.folding.push(pred);
+                }
+            }
+        }
         self.reach_frames.borrow_mut().record(0, &[], &[pred]);
     }
 
@@ -553,7 +658,7 @@ impl<'i> Typer<'i> {
     /// running a scan — the same resolution order: the settled set when it
     /// is cached for `ast`, else the partial set while a scan is in flight,
     /// else none (a call would start the scan).
-    fn current_dead(&self, ast: &LoweredAst) -> Option<Rc<DeadPositions>> {
+    pub(crate) fn current_dead(&self, ast: &LoweredAst) -> Option<Rc<DeadPositions>> {
         let key = ast.uid() as usize;
         if let Some((cached_key, cached)) = &*self.dead_cache.borrow() {
             if *cached_key == key {
@@ -974,7 +1079,7 @@ impl<'i> Typer<'i> {
                         env_fp,
                         env: Rc::new(
                             env.iter()
-                                .map(|(n, t)| (n.clone().into_boxed_str(), *t))
+                                .map(|(n, t)| (n.clone(), *t))
                                 .collect(),
                         ),
                         def_scope,

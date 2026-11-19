@@ -1075,3 +1075,40 @@ fn break_arg_attr_write_keeps_indexed_narrowing() {
         );
     }
 }
+
+/// rigor-rs#424 review F2: `FlowEffects::rebinds_within`/`mutations_within`
+/// must yield entries in TABLE (arena post-order) order, not start order.
+/// For `h.default = (h[:a] ||= 1)` the OUTER `default=` mutator starts
+/// earlier but sits LATER in the table than the nested `h[:a] ||= 1`
+/// op-write; applying it first dropped the indexed narrowing before the
+/// record was stored, so `h[:a].upcase` saw `1` — a false positive the
+/// reference never emits.
+#[test]
+fn nested_index_write_inside_attr_mutator_keeps_narrowing() {
+    for src in [
+        &b"h = {a: 1}\nh.default = (h[:a] ||= 1)\nh[:a].upcase\n"[..],
+        &b"x = (h = {a: 1}; h.default = (h[:a] ||= 1))\nh[:a].upcase\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(diags.is_empty(), "expected zero diagnostics: {diags:?}");
+    }
+}
+
+/// rigor-rs#424 review F1: `coll_join_envs_delta` re-joins only the env
+/// keys the walk inserted since the edge fork (`CollCtx::dirty`). A
+/// block/lambda-bound local's mutation lands on the block env while the
+/// write collector drops it — before dirty-key tracking the join kept one
+/// edge's carrier and these all fired where the reference is silent.
+#[test]
+fn block_bound_collection_mutated_under_condition_silent() {
+    for src in [
+        &b"def f(xs)\n  xs.map do |u|\n    args = [1, 2]\n    args << u unless u.nil?\n    args.frobnicate_zzz\n  end\nend\n"[..],
+        &b"def f(xs)\n  xs.each do |u|\n    h = {a: 1}\n    if u\n      h[:b] = 2\n    end\n    h.frobnicate_zzz\n  end\nend\n"[..],
+        &b"def f(xs)\n  xs.each do |u|\n    a = []\n    case u when 1 then a << u end\n    a.frobnicate_zzz\n  end\nend\n"[..],
+        &b"def f(xs)\n  loop do\n    a = [1]\n    a.push(2) if xs\n    a.frobnicate_zzz\n    break\n  end\nend\n"[..],
+        &b"def f(es)\n  es.map do |entry|\n    base_entry = {name: entry}\n    base_entry[:details] = entry.to_s if entry\n    base_entry.frobnicate_zzz\n  end\nend\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(diags.is_empty(), "expected zero diagnostics: {diags:?}");
+    }
+}

@@ -5,6 +5,7 @@
 //! and the branch-join and kill helpers the pass threads its env through.
 
 use std::collections::{HashMap, HashSet};
+use std::rc::Rc;
 
 use rigor_index::ClassOrdering;
 use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
@@ -14,7 +15,7 @@ use crate::{
     collect_flow_writes, indexed_flow_writes, multi_target_binder,
     widen_flow_writes, TypeEnv, Typer,
 };
-use crate::flow_writes::is_shape_mutator;
+use crate::flow_writes::{is_shape_mutator, writes_within};
 
 /// One local's class fact inside the narrowing flow pass
 /// ([`Typer::class_narrowing_pass`]). `Narrowed` requires a `Dynamic`/`Top`
@@ -329,6 +330,11 @@ impl<'i> Typer<'i> {
         };
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
+        // Every consumer below keeps its own in-`span` containment check —
+        // the table's ORDER is not semantic — so sorting by start lets each
+        // call slice it to `writes_within` instead of scanning O(file
+        // writes) once per `if`/`case`/call (rigor-rs#424).
+        writes.sort_by_key(|(w, _)| w.0);
         let mut tenv = TypeEnv::new();
         let mut cenv = Facts::default();
         let coarse = coarse_locals(ast, &body);
@@ -471,7 +477,7 @@ impl<'i> Typer<'i> {
                 // pre-write fact (`value = value.frobnicate if value.is_a?(…)`).
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 let vty = self.type_of(ast, value, tenv, interner);
-                tenv.insert(name.clone(), vty);
+                tenv.insert(Rc::from(name.as_str()), vty);
                 // Rebinding invalidates the narrowing (probe a4; `scope.rb:194`).
                 cenv.kill_local(&name);
             }
@@ -481,15 +487,15 @@ impl<'i> Typer<'i> {
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     cenv.kill_local(&name);
-                    tenv.insert(name, ty);
+                    tenv.insert(Rc::from(name.as_str()), ty);
                 }
                 // An `h[k]` index target MUTATES `h` through `[]=` on the
                 // post-binding scope (rigor-rs#134): it kills a `Narrowed` /
                 // chain fact like a `h.mut!(…)` call (`kill_cenv_narrowed`),
                 // not a rebind's full `kill_local`.
                 for (_, tspan, _) in targets.index_writes() {
-                    widen_flow_writes(writes, tspan, tenv, interner);
-                    kill_cenv_narrowed(writes, tspan, cenv);
+                    widen_flow_writes(writes_within(writes, tspan).iter(), tspan, tenv, interner);
+                    kill_cenv_narrowed(writes_within(writes, tspan), tspan, cenv);
                 }
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
@@ -497,7 +503,7 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 cenv.kill_local(&name);
                 let u = interner.untyped();
-                tenv.insert(name, u);
+                tenv.insert(Rc::from(name.as_str()), u);
             }
             Node::Call { .. } | Node::IndexWrite { .. } | Node::AttrWrite { .. } => {
                 self.class_flow_expr(ast, id, tenv, cenv, coarse, writes, interner, out, stmt_position);
@@ -597,8 +603,8 @@ impl<'i> Typer<'i> {
             | Node::VariableWrite { span, .. }
             | Node::ConstantWrite { span, .. } => {
                 let span = *span;
-                widen_flow_writes(writes, span, tenv, interner);
-                kill_cenv_writes(writes, span, cenv);
+                widen_flow_writes(writes_within(writes, span).iter(), span, tenv, interner);
+                kill_cenv_writes(writes_within(writes, span), span, cenv);
             }
             // `begin`/`rescue`/`else`/`ensure`. The flat `body` holds the
             // protected statements, each clause's exception constants and
@@ -627,7 +633,7 @@ impl<'i> Typer<'i> {
                     cenv.kill_local(name);
                 }
                 self.class_flow_scope(ast, &body, tenv, cenv, coarse, writes, interner, out, stmt_position);
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes_within(writes, span).iter(), span, tenv, interner);
                 // The body was DESCENDED into `cenv` itself, so a rebind inside
                 // already removed the fact: no edge evidence is needed and no
                 // span kill either (probes `bot_in_begin`, `bot_after_begin`).
@@ -654,12 +660,12 @@ impl<'i> Typer<'i> {
                 if let Some(p) = predicate {
                     self.class_flow_expr(ast, p, tenv, cenv, coarse, writes, interner, out, false);
                 }
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes_within(writes, span).iter(), span, tenv, interner);
                 // The BODY is not descended, so a rebind inside it is invisible
                 // to the edge evidence: keep the entry `Bot` but kill by span
                 // (probe `bot_after_while`).
                 join_cenv(cenv, &[]);
-                kill_cenv_writes(writes, span, cenv);
+                kill_cenv_writes(writes_within(writes, span), span, cenv);
             }
             // A statement-position `&&`/`||`. Descend both operands to record
             // uses of an OUTER fact — valid on both edges, and the reference
@@ -675,19 +681,19 @@ impl<'i> Typer<'i> {
                 let (left, right, span) = (*left, *right, *span);
                 self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
                 self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
-                widen_flow_writes(writes, span, tenv, interner);
-                kill_cenv_narrowed(writes, span, cenv);
+                widen_flow_writes(writes_within(writes, span).iter(), span, tenv, interner);
+                kill_cenv_narrowed(writes_within(writes, span), span, cenv);
             }
             // Any other statement (`case`/`in`/lambda/range/…) is UNMODELED:
             // widen `tenv` for the locals it writes and CLEAR ALL facts
             // (decline backstop). No descent.
             other => {
                 let span = other.span();
-                widen_flow_writes(writes, span, tenv, interner);
+                widen_flow_writes(writes_within(writes, span).iter(), span, tenv, interner);
                 // No descent, so no edge evidence: the entry `Bot` rides through
                 // (nothing inside can widen it) and a rebind in the span kills.
                 join_cenv(cenv, &[]);
-                kill_cenv_writes(writes, span, cenv);
+                kill_cenv_writes(writes_within(writes, span), span, cenv);
             }
         }
     }
@@ -898,10 +904,10 @@ impl<'i> Typer<'i> {
                         // so keep the entry `Bot` and kill by span instead.
                         None => {
                             join_cenv(cenv, &[]);
-                            kill_cenv_writes(writes, call_span, cenv);
+                            kill_cenv_writes(writes_within(writes, call_span), call_span, cenv);
                         }
                     }
-                    widen_flow_writes(writes, call_span, tenv, interner);
+                    widen_flow_writes(writes_within(writes, call_span).iter(), call_span, tenv, interner);
                 }
                 // Invalidation: kill the fact of every local with a recorded
                 // write/mutation span INSIDE this call — covers a
@@ -911,7 +917,7 @@ impl<'i> Typer<'i> {
                 // already threaded by the expression-position write arms, so
                 // what is left here is MUTATION, which cannot revive a `Bot`
                 // (probe `bot_mutator_use`).
-                kill_cenv_narrowed(writes, call_span, cenv);
+                kill_cenv_narrowed(writes_within(writes, call_span), call_span, cenv);
             }
             Node::Logical { left, right, span, .. } => {
                 // `&&`/`||`. Stage 3b-1: the up-front `cenv.clear()` is GONE.
@@ -925,7 +931,7 @@ impl<'i> Typer<'i> {
                 let (left, right, span) = (*left, *right, *span);
                 self.class_flow_expr(ast, left, tenv, cenv, coarse, writes, interner, out, false);
                 self.class_flow_expr(ast, right, tenv, cenv, coarse, writes, interner, out, false);
-                kill_cenv_narrowed(writes, span, cenv);
+                kill_cenv_narrowed(writes_within(writes, span), span, cenv);
             }
             // A write in EXPRESSION position (`f(value = x, value.frobnicate)`)
             // must thread its rebind IMMEDIATELY: Ruby evaluates arguments
@@ -938,7 +944,7 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let vty = self.type_of(ast, value, tenv, interner);
-                tenv.insert(name.clone(), vty);
+                tenv.insert(Rc::from(name.as_str()), vty);
                 cenv.kill_local(&name);
             }
             Node::MultiWrite { targets, value, .. } => {
@@ -947,14 +953,14 @@ impl<'i> Typer<'i> {
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
                     cenv.kill_local(&name);
-                    tenv.insert(name, ty);
+                    tenv.insert(Rc::from(name.as_str()), ty);
                 }
                 // An `h[k]` index target MUTATES `h` through `[]=` on the
                 // post-binding scope (rigor-rs#134): kill only the
                 // `Narrowed` / chain facts a mutation drops.
                 for (_, tspan, _) in targets.index_writes() {
-                    widen_flow_writes(writes, tspan, tenv, interner);
-                    kill_cenv_narrowed(writes, tspan, cenv);
+                    widen_flow_writes(writes_within(writes, tspan).iter(), tspan, tenv, interner);
+                    kill_cenv_narrowed(writes_within(writes, tspan), tspan, cenv);
                 }
             }
             Node::LocalVariableOpWrite { name, value, .. } => {
@@ -962,7 +968,7 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 cenv.kill_local(&name);
                 let u = interner.untyped();
-                tenv.insert(name, u);
+                tenv.insert(Rc::from(name.as_str()), u);
             }
             // A ternary is an expression-position `Node::If` (Prism parses it as
             // an IfNode); `propagate_if_branches` (`scope_indexer.rb:2742`)
@@ -1043,7 +1049,7 @@ impl<'i> Typer<'i> {
                 self.class_flow_expr(
                     ast, value, tenv, cenv, coarse, writes, interner, out, false,
                 );
-                kill_cenv_narrowed(writes, wspan, cenv);
+                kill_cenv_narrowed(writes_within(writes, wspan), wspan, cenv);
             }
             // `h.attr ||= v` / `h.attr &&= v` / `h.attr op= v` — a compound
             // ATTRIBUTE write. Receiver and RHS are expression-position
@@ -1182,7 +1188,7 @@ impl<'i> Typer<'i> {
                     continue;
                 }
                 let ty = tenv
-                    .get(name)
+                    .get(name.as_str())
                     .copied()
                     .unwrap_or_else(|| interner.untyped());
                 // An untyped carrier is the GUARD map's domain — `rule
@@ -1219,7 +1225,7 @@ impl<'i> Typer<'i> {
                           interner: &mut Interner| {
             for name in &predicate_subjects {
                 let ty = tenv
-                    .get(name)
+                    .get(name.as_str())
                     .copied()
                     .unwrap_or_else(|| interner.untyped());
                 // An untyped carrier is the GUARD map's domain — `rule
@@ -1263,7 +1269,13 @@ impl<'i> Typer<'i> {
         };
         // The subject facts as they stood at `if` entry — `Keep` arms
         // restore from here (`apply_guards` rewrites a guard-named fact).
-        let saved_facts = cenv.locals.clone();
+        // Only `predicate_subjects` names are ever read back, so this is a
+        // filtered clone — a full `cenv.locals.clone()` costs O(file locals)
+        // per `if` (rigor-rs#424).
+        let saved_facts: HashMap<String, ClassFact> = predicate_subjects
+            .iter()
+            .filter_map(|n| cenv.locals.get(n.as_str()).map(|f| (n.clone(), f.clone())))
+            .collect();
         // Stage 3a-1: the predicate yields a guard map for EACH edge (`&&`/`||`
         // /`!` recursion — [`Typer::analyse_predicate`]). A plain class guard
         // still yields facts on the truthy edge only, so the pre-3a-1 behavior
@@ -1275,7 +1287,7 @@ impl<'i> Typer<'i> {
         let (truthy_edge, truthy_t_env) = {
             let mut t = tenv.clone();
             for (name, ty) in edge_binds(tenv, true, interner) {
-                t.insert(name, ty);
+                t.insert(Rc::from(name.as_str()), ty);
             }
             let mut c = cenv.clone();
             self.apply_guards(&truthy_g, ast, tenv, &mut c, coarse, interner);
@@ -1298,7 +1310,7 @@ impl<'i> Typer<'i> {
             // `local.is_a?(C)` still contributes NOTHING here (`c1g`).
             let mut t = tenv.clone();
             for (name, ty) in falsey_edge_binds {
-                t.insert(name, ty);
+                t.insert(Rc::from(name.as_str()), ty);
             }
             let mut c = cenv.clone();
             self.apply_guards(&falsey_g, ast, tenv, &mut c, coarse, interner);
@@ -1323,12 +1335,12 @@ impl<'i> Typer<'i> {
         // branch-established `Narrowed` fact never survives a merge below.
         {
             let entry = tenv.clone();
-            for (wspan, name) in writes {
+            for (wspan, name) in writes_within(writes, if_span) {
                 if !(if_span.0 <= wspan.0 && wspan.1 <= if_span.1) {
                     continue;
                 }
                 let mut absent = |env: &TypeEnv| {
-                    env.get(name).copied().unwrap_or_else(|| interner.untyped())
+                    env.get(name.as_str()).copied().unwrap_or_else(|| interner.untyped())
                 };
                 let t_ty = if truthy_terminates {
                     absent(&entry)
@@ -1341,7 +1353,7 @@ impl<'i> Typer<'i> {
                     absent(&falsey_t_env)
                 };
                 let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
-                tenv.insert(name.clone(), j);
+                tenv.insert(Rc::from(name.as_str()), j);
             }
         }
         // Stage 3a-3: `join_cenv` wipes every chain fact, so snapshot them for
@@ -1358,8 +1370,15 @@ impl<'i> Typer<'i> {
         // branch bodies are always descended here, so the chain edges carry real
         // evidence and the chain half is enabled — gated on the predicate's own
         // local mentions (see `locals_in_span`).
-        let predicate_locals = locals_in_span(ast, ast.get(predicate).span());
-        retain_joined_facts(cenv, &pre_join, &edges, writes, if_span, Some(&predicate_locals));
+        let predicate_locals = locals_in_span(self, ast, ast.get(predicate).span());
+        retain_joined_facts(
+            cenv,
+            &pre_join,
+            &edges,
+            writes_within(writes, if_span),
+            if_span,
+            Some(&predicate_locals),
+        );
         // … PLUS the #533 widening, which is the one fact that flows the other
         // way through the join: `untyped ∪ anything` is `untyped`, so a branch
         // that widened a local widens it for everything after the `if` (row
@@ -1372,7 +1391,7 @@ impl<'i> Typer<'i> {
                 (truthy_edge.clone(), truthy_terminates),
                 (falsey_edge.clone(), falsey_terminates),
             ],
-            writes,
+            writes_within(writes, if_span),
             if_span,
         );
 
@@ -1385,11 +1404,11 @@ impl<'i> Typer<'i> {
         // edge reads `Empty` (`return if h.is_a?(Array)` leaves `h`
         // unreachable on `[1, 2]` — oracle-silent, rigor-rs#451 review).
         for name in &predicate_subjects {
-            if writes.iter().any(|(ws, n)| n == name && if_span.0 <= ws.0 && ws.1 <= if_span.1) {
+            if writes_within(writes, if_span).iter().any(|(ws, n)| n == name && if_span.0 <= ws.0 && ws.1 <= if_span.1) {
                 continue;
             }
             let ty = tenv
-                .get(name)
+                .get(name.as_str())
                 .copied()
                 .unwrap_or_else(|| interner.untyped());
             if matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
@@ -1424,7 +1443,7 @@ impl<'i> Typer<'i> {
             match crate::loop_edges::join(t_live, f_live) {
                 Edge::Other => {
                     let u = interner.untyped();
-                    tenv.insert(name.clone(), u);
+                    tenv.insert(Rc::from(name.as_str()), u);
                     cenv.locals.insert(name.clone(), ClassFact::Widened);
                 }
                 Edge::Keep => {
@@ -1457,7 +1476,7 @@ impl<'i> Typer<'i> {
         // and the reference emits nothing there (probe `t_both_terminate` — a
         // measured would-be FP).
         let rewritten = |local: &str| {
-            writes.iter().any(|(ws, n)| n == local && if_span.0 <= ws.0 && ws.1 <= if_span.1)
+            writes_within(writes, if_span).iter().any(|(ws, n)| n == local && if_span.0 <= ws.0 && ws.1 <= if_span.1)
         };
         if stmt_position && truthy_terminates != falsey_terminates {
             let carried = if falsey_terminates { &truthy_g } else { &falsey_g };
@@ -1667,7 +1686,7 @@ impl<'i> Typer<'i> {
                     let mintable = g.mintable
                         && g.classes.len() == 1
                         && !coarse.contains(local)
-                        && match tenv.get(local) {
+                        && match tenv.get(local.as_str()) {
                             None => true, // unbound ⇒ untyped (Dynamic[top])
                             Some(&ty) => {
                                 matches!(interner.get(ty), Type::Dynamic(_) | Type::Top)
@@ -2315,7 +2334,7 @@ impl<'i> Typer<'i> {
                 _ => None,
             })
             .filter(|local| !coarse.contains(local))
-            .filter(|local| match tenv.get(local) {
+            .filter(|local| match tenv.get(local.as_str()) {
                 None => true, // unbound ⇒ untyped (Dynamic[top])
                 Some(&ty) => matches!(interner.get(ty), Type::Dynamic(_) | Type::Top),
             });
@@ -2421,7 +2440,7 @@ impl<'i> Typer<'i> {
             edges.push(c);
             edge_terminates.push(!else_body.is_empty() && branch_terminates(ast, &else_body));
         }
-        widen_flow_writes(writes, case_span, tenv, interner);
+        widen_flow_writes(writes_within(writes, case_span).iter(), case_span, tenv, interner);
         // A `case`/`in` clause is not descended, so its rebinds are invisible to
         // the edge evidence — kill by span as well as by edge.
         join_cenv(cenv, &edges);
@@ -2435,12 +2454,12 @@ impl<'i> Typer<'i> {
         let subject_excl: Vec<String> = subject.iter().chain(bot_subject.iter()).cloned().collect();
         let joined_subject: Vec<(String, Option<ClassFact>)> =
             subject_excl.iter().map(|n| (n.clone(), cenv.locals.get(n).cloned())).collect();
-        let predicate_locals = predicate.map(|p| locals_in_span(ast, ast.get(p).span()));
+        let predicate_locals = predicate.map(|p| locals_in_span(self, ast, ast.get(p).span()));
         retain_joined_facts(
             cenv,
             &pre_join,
             &edges,
-            writes,
+            writes_within(writes, case_span),
             case_span,
             predicate_locals.as_ref().filter(|_| all_descended),
         );
@@ -2458,8 +2477,8 @@ impl<'i> Typer<'i> {
         // engines fire after the `case`.
         let widened_edges: Vec<(Facts, bool)> =
             edges.iter().cloned().zip(edge_terminates.iter().copied()).collect();
-        propagate_widened(cenv, &widened_edges, writes, case_span);
-        kill_cenv_writes(writes, case_span, cenv);
+        propagate_widened(cenv, &widened_edges, writes_within(writes, case_span), case_span);
+        kill_cenv_writes(writes_within(writes, case_span), case_span, cenv);
     }
 }
 
@@ -2815,18 +2834,19 @@ fn retain_joined_facts(
 /// declines the restore for every address rooted at it, mirroring the
 /// any-mention widening [`Facts::kill_chains_rooted_at`] already applies to
 /// calls.
-fn locals_in_span(ast: &LoweredAst, span: rigor_parse::Span) -> HashSet<String> {
+/// The local read/write NAMES inside `span` — the [`ReachIndex`] span scan
+/// (the arena walk this used to run once per `if`/`case` predicate,
+/// rigor-rs#424's residual quadratic).
+fn locals_in_span(typer: &Typer<'_>, ast: &LoweredAst, span: rigor_parse::Span) -> HashSet<String> {
     let mut out = HashSet::new();
-    for (_, n) in ast.iter() {
-        let (name, nspan) = match n {
-            Node::LocalVariableRead { name, span } => (name, span),
-            Node::LocalVariableWrite { name, span, .. }
-            | Node::LocalVariableOpWrite { name, span, .. } => (name, span),
+    for n in typer.reach_index(ast).nodes_within(ast, span) {
+        let name = match ast.get(n) {
+            Node::LocalVariableRead { name, .. }
+            | Node::LocalVariableWrite { name, .. }
+            | Node::LocalVariableOpWrite { name, .. } => name,
             _ => continue,
         };
-        if span.0 <= nspan.0 && nspan.1 <= span.1 {
-            out.insert(name.clone());
-        }
+        out.insert(name.clone());
     }
     out
 }

@@ -33,6 +33,7 @@
 //! output is byte-identical regardless of N.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -1233,7 +1234,7 @@ impl<'a> FileScanner<'a> {
                 } else {
                     self.trusted_value_type(value, env)
                 };
-                env.insert(name.clone(), ty);
+                env.insert(Rc::from(name.as_str()), ty);
                 events.push((stmt_end, name, ty));
             }
             rigor_parse::Node::Statements { body, .. } => {
@@ -1969,7 +1970,7 @@ fn materialize_env(events: &[(usize, String, TypeId)], pos: usize) -> TypeEnv {
     let mut env = TypeEnv::new();
     for (end, name, ty) in events {
         if *end <= pos {
-            env.insert(name.clone(), *ty);
+            env.insert(Rc::from(name.as_str()), *ty);
         }
     }
     env

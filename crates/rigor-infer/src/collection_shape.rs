@@ -5,10 +5,12 @@
 //! Array or Hash receiver.
 
 use std::collections::HashMap;
+use std::rc::Rc;
 
 use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{ClassId, Interner, ShapeKey, Type, TypeId};
 
+use crate::flow_writes::writes_within;
 use crate::{
     block_bound_names, collect_flow_writes, collect_rebind_writes, indexed_flow_writes,
     multi_target_binder, rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer,
@@ -92,8 +94,15 @@ impl<'i> Typer<'i> {
         };
         let mut writes = collect_flow_writes(ast);
         writes.extend(indexed_flow_writes(ast, self.source));
+        // Start-sorted so `writes_within` slices it (every consumer keeps its
+        // own span filter; the order is not semantic — rigor-rs#424).
+        writes.sort_by_key(|(w, _)| w.0);
         let rebinds = collect_rebind_writes(ast);
-        let ctx = CollCtx { writes: &writes, rebinds: &rebinds };
+        let ctx = CollCtx {
+            writes: &writes,
+            rebinds: &rebinds,
+            dirty: std::cell::RefCell::new(Vec::new()),
+        };
         let mut tenv = TypeEnv::new();
         self.coll_flow_scope(ast, &body, &mut tenv, &ctx, interner, &mut out, true);
         out
@@ -188,7 +197,7 @@ impl<'i> Typer<'i> {
                 // A recovery carrier's writes may not run, or not in this order:
                 // the uses in it are recorded as before, then its writes widen.
                 if kind == StatementsKind::Recovered {
-                    widen_flow_writes(ctx.writes, span, tenv, interner);
+                    widen_flow_writes(writes_within(ctx.writes, span).iter(), span, tenv, interner);
                 }
             }
             Node::LocalVariableWrite { .. }
@@ -240,9 +249,9 @@ impl<'i> Typer<'i> {
             // unmutated binding instead of landing unconditionally, and
             // `receiver_descriptor`'s missing `Type::Union` arm silences the
             // call that follows.
-            Node::BeginRescue { body, main_body, ensure_body, clauses, .. } => {
-                let (body, main_body, ensure_body, clauses) =
-                    (body.clone(), main_body.clone(), ensure_body.clone(), clauses.clone());
+            Node::BeginRescue { body, main_body, ensure_body, clauses, span, .. } => {
+                let (body, main_body, ensure_body, clauses, begin_span) =
+                    (body.clone(), main_body.clone(), ensure_body.clone(), clauses.clone(), *span);
                 if clauses.is_empty() {
                     self.coll_flow_scope(ast, &main_body, tenv, ctx, interner, out, stmt_position);
                     self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
@@ -262,6 +271,7 @@ impl<'i> Typer<'i> {
                 }
                 let else_body: Vec<NodeId> =
                     body.iter().copied().filter(|s| !covered.contains(s)).collect();
+                let mark = ctx.dirty.borrow().len();
                 let mut exit = tenv.clone();
                 self.coll_flow_scope(ast, &main_body, &mut exit, ctx, interner, out, stmt_position);
                 self.coll_flow_scope(ast, &else_body, &mut exit, ctx, interner, out, stmt_position);
@@ -285,8 +295,10 @@ impl<'i> Typer<'i> {
                     // fires is outside this pass's Array/Hash envelope, a
                     // coverage residual not a witness.
                     if let Some(name) = &cl.bound_name {
-                        arm.insert(
-                            name.clone(),
+                        coll_env_insert(
+                            ctx,
+                            &mut arm,
+                            name,
                             self.coll_rescue_exception_ty(ast, cl, interner),
                         );
                     }
@@ -299,7 +311,7 @@ impl<'i> Typer<'i> {
                             .and_then(|&ty| self.coll_widen_for_mutator(interner, ty, "[]="));
                         if let Some(cls) = cls {
                             if let Some(ty) = self.coll_nominal(interner, cls) {
-                                arm.insert(name.clone(), ty);
+                                coll_env_insert(ctx, &mut arm, name, ty);
                             }
                         }
                     }
@@ -332,9 +344,15 @@ impl<'i> Typer<'i> {
                             out,
                             stmt_position,
                         );
-                        exit = self.coll_join_envs(&exit, &rerun, interner);
+                        exit = {
+                            let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
+                            self.coll_join_envs_delta(&exit, &rerun, &changed, interner)
+                        };
                     } else if !Self::coll_arm_terminates(ast, &cl.body) {
-                        exit = self.coll_join_envs(&exit, &arm, interner);
+                        exit = {
+                            let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
+                            self.coll_join_envs_delta(&exit, &arm, &changed, interner)
+                        };
                     }
                 }
                 *tenv = exit;
@@ -348,14 +366,14 @@ impl<'i> Typer<'i> {
             // narrowing changes is widened too (`until h.is_a?(Unknown)`).
             Node::Loop { span, .. } => {
                 let span = *span;
-                widen_flow_writes(ctx.writes, span, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, span).iter(), span, tenv, interner);
                 self.widen_loop_exits_within(ast, span, tenv, interner);
             }
             // Unmodeled statement (ivar writes, …): widen every
             // local it writes and do NOT descend.
             other => {
                 let span = other.span();
-                widen_flow_writes(ctx.writes, span, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, span).iter(), span, tenv, interner);
                 self.widen_loop_exits_within(ast, span, tenv, interner);
             }
         }
@@ -401,14 +419,14 @@ impl<'i> Typer<'i> {
                 // Record the use BEFORE any of the call's own effects — the
                 // receiver read happens first (`output << 'a'` reads the seed).
                 if let Some(name) = &local {
-                    if let Some(&ty) = tenv.get(name) {
+                    if let Some(&ty) = tenv.get(name.as_str()) {
                         self.record_coll_snap(out, id, ty, interner);
                     }
                 }
                 // The mutator's effect is decided by the PRE-call carrier
                 // (`widen_for_mutator`, `mutation_widening.rb:209`).
                 let widened = match local.as_ref().and_then(|name| {
-                    let ty = *tenv.get(name)?;
+                    let ty = *tenv.get(name.as_str())?;
                     self.coll_widen_for_mutator(interner, ty, method)
                         .map(|c| (name.clone(), c, ty))
                 }) {
@@ -434,7 +452,7 @@ impl<'i> Typer<'i> {
                     // mutator entry itself, and argument-position mutations via
                     // `indexed_flow_writes`); the modeled mutator effect is
                     // re-applied below.
-                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    widen_flow_writes(writes_within(ctx.writes, call_span).iter(), call_span, tenv, interner);
                 } else if stmt_position {
                     // The block body evaluates in a CHILD env seeded from the
                     // outer one (uses inside the block are recorded there) —
@@ -445,13 +463,13 @@ impl<'i> Typer<'i> {
                     let pre = tenv.clone();
                     let mut btenv = tenv.clone();
                     for name in &bound {
-                        btenv.remove(name);
+                        btenv.remove(name.as_str());
                     }
                     self.coll_flow_scope(ast, block_body, &mut btenv, ctx, interner, out, true);
                     // … then every write the call span contains widens (a block
                     // REBIND of a captured local is visible outside and kills the
                     // carrier — probe m15) …
-                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    widen_flow_writes(writes_within(ctx.writes, call_span).iter(), call_span, tenv, interner);
                     // … and finally `widen_after_block` (`mutation_widening.rb:144`)
                     // re-applies the mutations. That routine is a SYNTACTIC walk
                     // of the block body against the OUTER scope, NOT a join of the
@@ -469,7 +487,7 @@ impl<'i> Typer<'i> {
                         }
                         if !rebound_within(ctx.rebinds, call_span, &name) {
                             if let Some(ty) = self.coll_nominal(interner, cls) {
-                                tenv.insert(name, ty);
+                                coll_env_insert(ctx, tenv, name.as_str(), ty);
                             }
                         }
                     }
@@ -477,14 +495,14 @@ impl<'i> Typer<'i> {
                     // Expression-position block: no descent (the position rule),
                     // and every contained write widens — and so does a nested
                     // loop's exit-edge local (upstream #1359).
-                    widen_flow_writes(ctx.writes, call_span, tenv, interner);
+                    widen_flow_writes(writes_within(ctx.writes, call_span).iter(), call_span, tenv, interner);
                     self.widen_loop_exits_within(ast, call_span, tenv, interner);
                 }
                 // Keep-nominal widening — unless something inside the call
                 // REBOUND the same local (`output << (output = x)`).
                 if let Some((name, ty)) = widened {
                     if !rebound_within(ctx.rebinds, call_span, &name) {
-                        tenv.insert(name, ty);
+                        coll_env_insert(ctx, tenv, name.as_str(), ty);
                     }
                 }
             }
@@ -521,12 +539,12 @@ impl<'i> Typer<'i> {
                 // Record the use BEFORE the write's own effects, as the `Call`
                 // arm does (`output[k] += 1` reads the seed).
                 if let Some(name) = &local {
-                    if let Some(&ty) = tenv.get(name) {
+                    if let Some(&ty) = tenv.get(name.as_str()) {
                         self.record_coll_snap(out, id, ty, interner);
                     }
                 }
                 let widened = match local.as_ref().and_then(|name| {
-                    let ty = *tenv.get(name)?;
+                    let ty = *tenv.get(name.as_str())?;
                     self.coll_widen_for_mutator(interner, ty, "[]=")
                         .map(|c| (name.clone(), c, ty))
                 }) {
@@ -548,10 +566,10 @@ impl<'i> Typer<'i> {
                 // Every write the statement span contains widens (the index
                 // write's own entry plus anything nested in the operands); the
                 // modeled `[]=` effect is re-applied below.
-                widen_flow_writes(ctx.writes, wspan, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, wspan).iter(), wspan, tenv, interner);
                 if let Some((name, ty)) = widened {
                     if !rebound_within(ctx.rebinds, wspan, &name) {
-                        tenv.insert(name, ty);
+                        coll_env_insert(ctx, tenv, name.as_str(), ty);
                     }
                 }
             }
@@ -574,7 +592,7 @@ impl<'i> Typer<'i> {
                     self.coll_flow_expr(ast, r, tenv, ctx, interner, out, false);
                 }
                 self.coll_flow_expr(ast, value, tenv, ctx, interner, out, false);
-                widen_flow_writes(ctx.writes, wspan, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, wspan).iter(), wspan, tenv, interner);
             }
             // `&&`/`||` — the RHS may not execute, so its effects are unmodeled:
             // evaluate both sides on a THROWAWAY env (uses are still recorded
@@ -584,7 +602,7 @@ impl<'i> Typer<'i> {
                 let mut scratch = tenv.clone();
                 self.coll_flow_expr(ast, left, &mut scratch, ctx, interner, out, false);
                 self.coll_flow_expr(ast, right, &mut scratch, ctx, interner, out, false);
-                widen_flow_writes(ctx.writes, lspan, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, lspan).iter(), lspan, tenv, interner);
                 self.widen_loop_exits_within(ast, lspan, tenv, interner);
             }
             Node::LocalVariableWrite { name, value, .. } => {
@@ -593,21 +611,21 @@ impl<'i> Typer<'i> {
                 // the statement's own position (the narrowing pass's probe p1).
                 self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
                 let vty = self.type_of(ast, value, tenv, interner);
-                tenv.insert(name, vty);
+                coll_env_insert(ctx, tenv, name.as_str(), vty);
             }
             Node::MultiWrite { targets, value, .. } => {
                 let (targets, value) = (targets.clone(), *value);
                 self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
                 for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
-                    tenv.insert(name, ty);
+                    coll_env_insert(ctx, tenv, name.as_str(), ty);
                 }
                 // An `h[k]` index target stores through `[]=` on the
                 // post-binding scope — widen each receiver's carrier after the
                 // bindings, as `h[k] = v` does (`eval_multi_write` →
                 // `IndexWriteWidening`, rigor-rs#134).
                 for (_, tspan, _) in targets.index_writes() {
-                    widen_flow_writes(ctx.writes, tspan, tenv, interner);
+                    widen_flow_writes(writes_within(ctx.writes, tspan).iter(), tspan, tenv, interner);
                 }
             }
             // Op-writes (`output += [1]`) are unmodeled — the reference folds
@@ -617,7 +635,7 @@ impl<'i> Typer<'i> {
                 let (name, value) = (name.clone(), *value);
                 self.coll_flow_expr(ast, value, tenv, ctx, interner, out, false);
                 let u = interner.untyped();
-                tenv.insert(name, u);
+                coll_env_insert(ctx, tenv, name.as_str(), u);
             }
             Node::If { .. } => {
                 self.coll_flow_if(ast, id, tenv, ctx, interner, out, false);
@@ -630,7 +648,7 @@ impl<'i> Typer<'i> {
             // literal, an interpolation, a pattern, …).
             other => {
                 let span = other.span();
-                widen_flow_writes(ctx.writes, span, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, span).iter(), span, tenv, interner);
                 self.widen_loop_exits_within(ast, span, tenv, interner);
             }
         }
@@ -654,20 +672,24 @@ impl<'i> Typer<'i> {
         out: &mut HashMap<NodeId, CollSnap>,
         stmt_position: bool,
     ) {
-        let Node::If { predicate, then_body, else_body, is_unless, .. } = ast.get(id) else {
+        let Node::If { predicate, then_body, else_body, is_unless, span } = ast.get(id) else {
             return;
         };
-        let (predicate, is_unless) = (*predicate, *is_unless);
+        let (predicate, is_unless, if_span) = (*predicate, *is_unless, *span);
         let (then_body, else_body) = (then_body.clone(), else_body.clone());
         // The predicate evaluates first, in the pre-conditional bindings.
         self.coll_flow_expr(ast, predicate, tenv, ctx, interner, out, false);
+        let mark = ctx.dirty.borrow().len();
         let (truthy, falsey) =
             if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
         let mut t = tenv.clone();
         self.coll_flow_scope(ast, truthy, &mut t, ctx, interner, out, stmt_position);
         let mut f = tenv.clone();
         self.coll_flow_scope(ast, falsey, &mut f, ctx, interner, out, stmt_position);
-        *tenv = self.coll_join_envs(&t, &f, interner);
+        *tenv = {
+            let changed = self.coll_join_changed(ast, ctx, if_span, mark);
+            self.coll_join_envs_delta(&t, &f, &changed, interner)
+        };
     }
 
     /// Thread one `case`/`when`. Every clause body runs on a clone of the
@@ -695,12 +717,13 @@ impl<'i> Typer<'i> {
         if let Some(p) = predicate {
             self.coll_flow_expr(ast, p, tenv, ctx, interner, out, false);
         }
+        let mark = ctx.dirty.borrow().len();
         // The no-match path: the pre-`case` bindings, unchanged.
         let mut acc = tenv.clone();
         for br in branches {
             let Node::When { conditions, body, .. } = ast.get(br) else {
                 // `case`/`in` pattern carrier — unmodeled, no descent.
-                widen_flow_writes(ctx.writes, case_span, tenv, interner);
+                widen_flow_writes(writes_within(ctx.writes, case_span).iter(), case_span, tenv, interner);
                 self.widen_loop_exits_within(ast, case_span, tenv, interner);
                 return;
             };
@@ -710,11 +733,17 @@ impl<'i> Typer<'i> {
                 self.coll_flow_expr(ast, cond, &mut t, ctx, interner, out, false);
             }
             self.coll_flow_scope(ast, &body, &mut t, ctx, interner, out, stmt_position);
-            acc = self.coll_join_envs(&acc, &t, interner);
+            acc = {
+                let changed = self.coll_join_changed(ast, ctx, case_span, mark);
+                self.coll_join_envs_delta(&acc, &t, &changed, interner)
+            };
         }
         let mut e = tenv.clone();
         self.coll_flow_scope(ast, &else_body, &mut e, ctx, interner, out, stmt_position);
-        *tenv = self.coll_join_envs(&acc, &e, interner);
+        *tenv = {
+            let changed = self.coll_join_changed(ast, ctx, case_span, mark);
+            self.coll_join_envs_delta(&acc, &e, &changed, interner)
+        };
     }
 
     /// Whether a rescue arm's post-scope joins the post-`begin` flow at all —
@@ -1039,7 +1068,7 @@ impl<'i> Typer<'i> {
             .collect();
         hits.sort_by_key(|(s, _, _)| *s);
         for (_, name, method) in hits {
-            let Some(&cur) = carriers.get(&name).or_else(|| pre.get(&name)) else {
+            let Some(&cur) = carriers.get(name.as_str()).or_else(|| pre.get(name.as_str())) else {
                 continue;
             };
             let Some(cls) = self.coll_widen_for_mutator(interner, cur, &method) else {
@@ -1395,6 +1424,85 @@ impl<'i> Typer<'i> {
     /// pass's standing decline (probes m18/m20).
     ///
     /// [`join_flow_envs`]: crate::join_flow_envs
+    /// [`coll_join_envs`] specialized to edges seeded from the same env and
+    /// descended over one span: every name that can differ between the edges
+    /// is a recorded in-span write, an arm-established binding (`rescue =>
+    /// e`, a `rescue => h[:k]` receiver — the collector keeps those out of
+    /// `writes`), or a loop-exit widened local, so the join takes over the
+    /// `a` edge env and re-joins just those names — instead of rehashing
+    /// O(file locals) per `if`/`case`/rescue arm (rigor-rs#424's
+    /// sequential-`if` row).
+    fn coll_join_envs_delta(
+        &self,
+        base: &TypeEnv,
+        other: &TypeEnv,
+        changed: &[String],
+        interner: &mut Interner,
+    ) -> TypeEnv {
+        #[cfg(debug_assertions)]
+        let expect = self.coll_join_envs(base, other, interner);
+        let mut out = base.clone();
+        let u = interner.untyped();
+        for name in changed {
+            let (a, b) = (
+                out.get(name.as_str()).copied(),
+                other.get(name.as_str()).copied(),
+            );
+            let v = match (a, b) {
+                // A write the edges never landed (an unevaluated `when`
+                // condition, a dead arm) binds nothing on either — the
+                // whole-env join produces no entry, so produce none.
+                (None, None) => continue,
+                (Some(av), Some(bv)) if av == bv => continue,
+                (Some(av), Some(bv)) => {
+                    self.coll_union_carrier(interner, av, bv).unwrap_or(u)
+                }
+                _ => u,
+            };
+            out.insert(Rc::from(name.as_str()), v);
+        }
+        #[cfg(debug_assertions)]
+        debug_assert_eq!(
+            out, expect,
+            "delta join diverged — an env mutation escaped the `writes` table"
+        );
+        out
+    }
+
+    /// The `changed` set [`coll_join_envs_delta`] re-joins: the in-`span`
+    /// `writes` slice (the `widen_flow_writes` widenings, which do not go
+    /// through [`coll_env_insert`]), the keys the walker inserted since
+    /// `mark` was taken on [`CollCtx::dirty`] (every arm-level binding,
+    /// block-bound or otherwise), and the locals a loop's exit edge widens
+    /// inside `span` — `widen_loop_exit` overwrites them without going
+    /// through the insert helper or a write record.
+    fn coll_join_changed(
+        &self,
+        ast: &LoweredAst,
+        ctx: &CollCtx<'_>,
+        span: rigor_parse::Span,
+        mark: usize,
+    ) -> Vec<String> {
+        let mut out: Vec<String> = writes_within(ctx.writes, span)
+            .iter()
+            .map(|(_, n)| n.clone())
+            .collect();
+        out.extend(
+            ctx.dirty.borrow()[mark..]
+                .iter()
+                .map(|n| n.to_string()),
+        );
+        let idx = self.reach_index(ast);
+        for id in idx.nodes_within(ast, span) {
+            if let Node::Loop { .. } = ast.get(id) {
+                for name in self.loop_predicate_locals(ast, id) {
+                    out.push(name);
+                }
+            }
+        }
+        out
+    }
+
     fn coll_join_envs(&self, a: &TypeEnv, b: &TypeEnv, interner: &mut Interner) -> TypeEnv {
         let u = interner.untyped();
         let mut out = TypeEnv::with_capacity(a.len());
@@ -1780,4 +1888,23 @@ struct CollCtx<'a> {
     /// REBINDS only (no mutator entries) — used to veto the keep-nominal
     /// widening when the call that mutates also reassigns the same local.
     rebinds: &'a [(rigor_parse::Span, String)],
+    /// Every key the walk `insert`s into any env, in insert order. A
+    /// `coll_flow_*` edge env is insert-only (its writes land on
+    /// [`coll_flow_stmt`]/[`coll_flow_expr`]'s `tenv`), but the write
+    /// collector does not see them all — a block/lambda-bound local's
+    /// write OR mutation, a `rescue => e`/`rescue => h[:k]` binding live
+    /// outside `writes` — so an edge's changed set reads `dirty[mark..]`
+    /// rather than a syntax enumeration (rigor-rs#424 review F1: a
+    /// block-local `args << u` mutation is out of `writes` AND out of the
+    /// local-write nodes).
+    dirty: std::cell::RefCell<Vec<Rc<str>>>,
+}
+
+/// `env.insert` that also records the key for [`coll_join_changed`]'s
+/// `changed` set — an edge descent's env mutations are exactly these
+/// inserts plus the `writes`-table widenings and the loop-exit widenings
+/// [`coll_join_changed`] adds itself.
+fn coll_env_insert(ctx: &CollCtx<'_>, env: &mut TypeEnv, name: &str, ty: TypeId) {
+    ctx.dirty.borrow_mut().push(Rc::from(name));
+    env.insert(Rc::from(name), ty);
 }

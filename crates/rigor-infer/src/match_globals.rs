@@ -25,6 +25,7 @@
 //! a String / Symbol / nil / untyped receiver, or on a regexp literal.
 
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, Type};
@@ -73,9 +74,9 @@ pub(crate) fn proven(tenv: &TypeEnv) -> bool {
 fn record(tenv: &mut TypeEnv, groups: &BTreeSet<i64>, interner: &mut Interner) {
     forget(tenv);
     let u = interner.untyped();
-    tenv.insert(MATCH_KEY.to_string(), u);
+    tenv.insert(Rc::from(MATCH_KEY), u);
     for &n in groups {
-        tenv.insert(group_key(n), u);
+        tenv.insert(Rc::from(group_key(n)), u);
     }
 }
 
@@ -95,7 +96,7 @@ impl<'i> Typer<'i> {
         }
         let ty = self.type_of(ast, arg, tenv, interner);
         matches!(interner.get(ty), Type::Constant(Scalar::Int(n))
-            if *n > 0 && tenv.contains_key(&group_key(*n)))
+            if *n > 0 && tenv.contains_key(group_key(*n).as_str()))
     }
 
     /// Update the match state after statement `id` ran.

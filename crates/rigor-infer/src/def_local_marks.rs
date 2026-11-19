@@ -819,17 +819,17 @@ impl<'i> Typer<'i> {
             DefLocalMarks::within(&marks.mutations, span).chain(DefLocalMarks::within(&marks.escapes, span))
         {
             for name in names {
-                if let Some(&ty) = env.get(name) {
+                if let Some(&ty) = env.get(name.as_str()) {
                     if !mutation_stable(interner, ty) {
-                        env.insert(name.clone(), untyped);
+                        env.insert(Rc::from(name.as_str()), untyped);
                     }
                 }
             }
         }
         for names in DefLocalMarks::within(&marks.rebinds, span) {
             for name in names {
-                if env.get(name).is_some() {
-                    env.insert(name.clone(), untyped);
+                if env.get(name.as_str()).is_some() {
+                    env.insert(Rc::from(name.as_str()), untyped);
                 }
             }
         }
@@ -903,9 +903,9 @@ impl<'i> Typer<'i> {
             for (name, &t) in env.iter() {
                 if is_ivar(name)
                     && !matches!(interner.get(t), Type::Dynamic(_))
-                    && !out.iter().any(|o| o == name)
+                    && !out.iter().any(|o| o.as_str() == &**name)
                 {
-                    out.push(name.clone());
+                    out.push(name.to_string());
                 }
             }
         }
@@ -917,7 +917,7 @@ impl<'i> Typer<'i> {
     pub fn widen_names(env: &mut TypeEnv, names: &[String], interner: &mut Interner) {
         let untyped = interner.untyped();
         for n in names {
-            env.insert(n.clone(), untyped);
+            env.insert(Rc::from(n.as_str()), untyped);
         }
     }
 

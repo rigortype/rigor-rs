@@ -256,7 +256,7 @@ impl<'i> Typer<'i> {
             if let Node::LocalVariableRead { name, .. } = ast.get(receiver) {
                 if let Some(key) = crate::stable_index_key(ast.get(args[0])) {
                     if let Some(&recorded) =
-                        env.get(&crate::indexed_narrowing_key(name, &key))
+                        env.get(crate::indexed_narrowing_key(name, &key).as_str())
                     {
                         return recorded;
                     }
