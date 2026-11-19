@@ -4,6 +4,9 @@ Status: accepted 2026-10-28 (issue [#412](https://github.com/rigortype/rigor-rs/
 Amended 2026-11-19 ([#431](https://github.com/rigortype/rigor-rs/issues/431)): the command
 thread reserves its stack before the rayon pool; fallback wording names the
 actual stack (never "the platform default").
+Amended 2026-11-19 ([#679](https://github.com/rigortype/rigor-rs/issues/679)): the last
+resort is an explicit 2 MiB `stack_size`, never `thread::Builder`'s no-size
+default, which honours `RUST_MIN_STACK`.
 Measured on release builds (aarch64 macOS, toolchain 1.88, the toolchain the
 release binaries use).
 
@@ -43,17 +46,20 @@ an empty report). See
      (`ulimit -v`, `vm.overcommit_memory=2`) cannot leave the command on a
      smaller stack than master's 8 MiB main thread (rigor-rs#431).
    - On Unix the command thread tries 256 MiB then 64 MiB; if both fail it
-     runs inline on the process main thread (8 MiB) rather than spawning at
-     Rust's 2 MiB default. On Windows the main thread is only 1 MiB, so the
-     command thread still tries that 2 MiB spawn default before running
-     inline.
+     runs inline on the process main thread (`ulimit -s`, 8 MiB by default
+     but possibly less — a host could leave it under a 2 MiB spawn) rather
+     than spawning at 2 MiB. On Windows the main thread is only 1 MiB, so
+     the command thread still tries the explicit 2 MiB spawn before
+     running inline.
    - The command thread then builds the global rayon pool, once, with a
      spawn handler that gives each worker the stack. `build_global` is
      one-shot: rayon marks the registry as set even when building fails, so
      a retry with a smaller size would leave no pool at all. The fallback
      therefore happens per thread, inside the handler: 256 MiB, then 64 MiB,
-     then Rust's 2 MiB spawn default (`thread::Builder` with no
-     `stack_size` — not the OS main-thread stack). If no worker can be
+     then an explicit 2 MiB (`stack_size(2 << 20)` — not the OS main-thread
+     stack, and never the no-size default, which `RUST_MIN_STACK` could
+     inflate past the point the last-resort spawn itself fails). If no
+     worker can be
      created even at that size, the process prints one error (`rigor: could
      not start the analysis thread pool: …`) and exits; it does not
      continue into a later `GlobalPoolAlreadyInitialized` panic.
@@ -61,9 +67,8 @@ an empty report). See
    - A large stack never stops a command from starting (the command thread
      can always fall back to the process main thread). A thread that falls
      back prints one stderr line per process; the normal path prints
-     nothing. The line names what was actually used: "64 MiB", "Rust's 2 MiB
-     spawn default", or "the process main thread" — never "the platform
-     default".
+     nothing. The line names what was actually used: "64 MiB", "2 MiB", or
+     "the process main thread" — never "the platform default".
 2. **A depth bound of 25,000** (`rigor_parse::MAX_NESTING_DEPTH`):
    - Depth is counted in Prism child edges; the program node is depth 1.
    - `rigor_parse::parse_bounded` measures it right after the parse, before
@@ -216,7 +221,7 @@ memory. Medians over interleaved runs; every variant produced identical output:
   thread's 256 MiB reservation counts against the commit limit: one command
   thread plus one per core. The command thread claims first (rigor-rs#431),
   so the pool's ncpu × 256 MiB cannot spend the budget and leave the
-  command on Rust's 2 MiB spawn default. Default heuristic overcommit,
+  command on a 2 MiB spawn. Default heuristic overcommit,
   macOS and Windows only reserve. Windows creates threads with
   `STACK_SIZE_PARAM_IS_A_RESERVATION`.
 - **Debug builds** reuse the release-calibrated 256 MiB. Debug frames are
