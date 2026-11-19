@@ -1966,3 +1966,87 @@ fn sclass_target_def_files_on_the_sclass_owner() {
         Some(Scalar::Str("s".to_string()))
     );
 }
+
+// --- rigor-rs#637: the chain-walk budgets count the root entry ------------
+
+/// `n` project modules chained `W0 include W1 …` (every one a known user:
+/// an include edge or, for the last, a `def`), under the caller's prefix.
+fn module_chain(n: usize) -> String {
+    let mut s = String::new();
+    for i in 0..n {
+        if i + 1 < n {
+            s.push_str(&format!("module W{i}; include W{}; end\n", i + 1));
+        } else {
+            s.push_str(&format!("module W{i}; def d; end; end\n"));
+        }
+    }
+    s
+}
+
+#[test]
+fn object_mixin_chain_limit_counts_the_owner_entry() {
+    // `ResolutionChain::LIMIT` counts the chain's root entry, so a top-level
+    // `include` chain of exactly CHAIN_LIMIT (100) project modules already
+    // truncates and `object_mixin_may_define` must answer `true` — the
+    // walk's `seen` starts holding the `<toplevel-include>` pseudo-owner.
+    let core = CoreIndex::new();
+    let mut src = module_chain(99);
+    src.push_str("include W0\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.object_mixin_may_define(&core, "yy", true));
+    assert!(!idx.object_mixin_may_define(&core, "yy", false));
+    let mut src = module_chain(100);
+    src.push_str("include W0\n");
+    let (_b, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.object_mixin_may_define(&core, "yy", true));
+    assert!(idx.object_mixin_may_define(&core, "yy", false));
+}
+
+#[test]
+fn object_mixin_chain_limit_is_one_budget_per_owner() {
+    // Every file's top-level `include`s file under the ONE
+    // `<toplevel-include>` owner, so two 60-module chains share its budget:
+    // 1 + 120 > 100 truncates even though neither chain alone would.
+    let core = CoreIndex::new();
+    let mut src = String::new();
+    for i in 0..60 {
+        src.push_str(&format!("module A{i}; include A{}; end\n", i + 1));
+    }
+    src.push_str("module A60; def d; end; end\n");
+    for i in 0..60 {
+        src.push_str(&format!("module B{i}; include B{}; end\n", i + 1));
+    }
+    src.push_str("module B60; def d; end; end\ninclude A0\ninclude B0\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.object_mixin_may_define(&core, "yy", true));
+}
+
+#[test]
+fn ancestor_mixin_chain_limit_counts_the_ancestor_entry() {
+    // `chain_answers?`'s chain is rooted at the RBS ancestor itself, so its
+    // entry counts too: `Integer.include(W0)` with 100 modules truncates.
+    let core = CoreIndex::new();
+    let mut src = module_chain(99);
+    src.push_str("Integer.include(W0)\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.core_ancestor_may_answer(&core, "Integer", "yy"));
+    let mut src = module_chain(100);
+    src.push_str("Integer.include(W0)\n");
+    let (_b, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.core_ancestor_may_answer(&core, "Integer", "yy"));
+}
+
+#[test]
+fn singleton_mixin_chain_limit_counts_the_root_entry() {
+    // `extends_answer?`'s singleton chain roots at the class object itself:
+    // `Comparable`'s singleton entry plus 100 modules truncates.
+    let core = CoreIndex::new();
+    let mut src = module_chain(99);
+    src.push_str("module Comparable; extend W0; end\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
+    let mut src = module_chain(100);
+    src.push_str("module Comparable; extend W0; end\n");
+    let (_b, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
+}

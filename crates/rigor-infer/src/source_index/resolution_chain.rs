@@ -52,7 +52,7 @@ const CHAIN_LIMIT: usize = 100;
 /// (`records_name`, `macro_named`, `external_may_define`) are asked per call.
 #[derive(Default)]
 pub(crate) struct ObjectMixins {
-    /// A walk's per-edge `seen` passed [`CHAIN_LIMIT`]: uncertainty — every
+    /// A walk's per-owner `seen` passed [`CHAIN_LIMIT`]: uncertainty — every
     /// method may be defined, unconditionally.
     cut: bool,
     /// Some edge spells no name (`include m`, `include(*MODS)`): an unknown
@@ -753,62 +753,74 @@ impl SourceIndex {
             })
     }
 
-    /// The one-time half of [`Self::object_mixin_may_define`]: every seed edge
-    /// into `Object`'s mixin side walked as a union (the walk the removed
-    /// `mixin_edge_may_define` ran per edge, minus the per-method answers).
-    /// Each seed walks with its own `seen`, exactly as the per-edge calls did,
-    /// so [`CHAIN_LIMIT`] still counts the modules reachable from ONE edge.
+    /// The one-time half of [`Self::object_mixin_may_define`]: `Object`'s
+    /// mixin side walked as the reference's two instance chains — the
+    /// `answer_on_chain` calls `Inference::ObjectMixins` makes on its
+    /// `EDGE_OWNERS`, one `ResolutionChain` rooted at the
+    /// `<toplevel-include>` pseudo-owner (every file's top-level `include`s
+    /// file under it) and one at `Object` (`include M` in `class Object`
+    /// plus its listed edges). Each owner's edges therefore share ONE
+    /// [`CHAIN_LIMIT`] budget, and the chain's root entry counts toward it —
+    /// the reference counts every project entry, its root included
+    /// (rigor-rs#637).
     fn collect_object_mixins(&self) -> ObjectMixins {
         let mut m = ObjectMixins::default();
-        let mut seeds: Vec<(String, String)> = Vec::new();
-        let mut seeded: HashSet<(String, String)> = HashSet::new();
+        let mut groups: Vec<(String, Vec<String>)> = Vec::new();
+        let mut raws: Vec<String> = Vec::new();
         for r in &self.ancestry.toplevel_includes {
-            if seeded.insert((String::new(), r.clone())) {
-                seeds.push((String::new(), r.clone()));
+            if !raws.contains(r) {
+                raws.push(r.clone());
             }
+        }
+        if !raws.is_empty() {
+            groups.push((String::new(), std::mem::take(&mut raws)));
         }
         if let Some(obj) = self.override_classes.get("Object") {
             for r in &obj.includes {
-                if seeded.insert(("Object".to_string(), r.clone())) {
-                    seeds.push(("Object".to_string(), r.clone()));
+                if !raws.contains(r) {
+                    raws.push(r.clone());
                 }
             }
             m.object_records = self.known_user("Object");
         }
         if let Some(listed) = self.ancestry.include_listed.get("Object") {
             for r in listed {
-                if seeded.insert(("Object".to_string(), r.clone())) {
-                    seeds.push(("Object".to_string(), r.clone()));
+                if !raws.contains(r) {
+                    raws.push(r.clone());
                 }
             }
         }
-        for (owner, raw) in seeds {
+        if !raws.is_empty() {
+            groups.push(("Object".to_string(), raws));
+        }
+        for (owner, raws) in groups {
             if m.cut {
                 break;
             }
-            self.collect_mixin_edge(&owner, &raw, &mut m);
+            self.collect_owner_edges(&owner, raws, &mut m);
         }
         m
     }
 
-    /// One seed edge's closure walk for [`Self::collect_object_mixins`]. Every
-    /// method-dependent question is deferred: a marker edge sets `unnamed`, a
-    /// wildcard/hook-dirty module sets `tainted`, a known-user module joins
-    /// `modules`, and an edge resolving to nothing or to a non-`known_user`
-    /// project module joins `opaque` (which keeps the `(from, raw)` pair — the
-    /// per-method `external_may_define` needs the writer's lexical scope).
-    fn collect_mixin_edge(&self, owner: &str, raw: &str, m: &mut ObjectMixins) {
-        if mixin_marker(raw) {
-            m.unnamed = true;
-            return;
-        }
-        // The question is a union over the module's ancestry, not "which
+    /// One owner chain's closure walk for [`Self::collect_object_mixins`].
+    /// `seen` starts holding `owner` — the chain's root entry counts against
+    /// [`CHAIN_LIMIT`] exactly as `ResolutionChain`'s `cut_position` counts it
+    /// (`""` stands in for the `<toplevel-include>` pseudo-entry, which names
+    /// no module the walk can reach). Every method-dependent question is
+    /// deferred: a marker edge sets `unnamed`, a wildcard/hook-dirty module
+    /// sets `tainted`, a known-user module joins `modules`, and an edge
+    /// resolving to nothing or to a non-`known_user` project module joins
+    /// `opaque` (which keeps the `(from, raw)` pair — the per-method
+    /// `external_may_define` needs the writer's lexical scope).
+    fn collect_owner_edges(&self, owner: &str, raws: Vec<String>, m: &mut ObjectMixins) {
+        // The question is a union over the modules' ancestry, not "which
         // definer does Ruby call", so the closure is walked directly: an order
         // the port cannot vouch for (a fork, a multi-file mark) does not matter
         // here, and declining on it silenced every receiver in a project whose
         // included module merely had one (concurrent-ruby's `Concurrent`).
-        let mut queue: Vec<(String, String)> = vec![(owner.to_string(), raw.to_string())];
-        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: Vec<(String, String)> =
+            raws.into_iter().map(|r| (owner.to_string(), r)).collect();
+        let mut seen: HashSet<String> = [owner.to_string()].into_iter().collect();
         while let Some((from, raw)) = queue.pop() {
             if mixin_marker(&raw) {
                 m.unnamed = true;
@@ -998,7 +1010,10 @@ impl SourceIndex {
             .into_iter()
             .filter(|(_, raw)| !mixin_marker(raw))
             .collect();
-        let mut seen: HashSet<String> = HashSet::new();
+        // `chain_answers?`'s `ResolutionChain` root is a project entry itself,
+        // so the walk's [`CHAIN_LIMIT`] budget starts one entry spent
+        // (rigor-rs#637).
+        let mut seen: HashSet<String> = [a.to_string()].into_iter().collect();
         while let Some((from, raw)) = queue.pop() {
             if mixin_marker(&raw) {
                 if open && !hook_only {
@@ -1092,7 +1107,9 @@ impl SourceIndex {
             .filter(|r| !mixin_marker(r))
             .map(|r| (q.to_string(), r))
             .collect();
-        let mut seen: HashSet<String> = HashSet::new();
+        // `q`'s singleton chain counts its root entry — the singleton class
+        // object — toward [`CHAIN_LIMIT`] (rigor-rs#637).
+        let mut seen: HashSet<String> = [q.to_string()].into_iter().collect();
         while let Some((from, raw)) = queue.pop() {
             if mixin_marker(&raw) {
                 continue;
