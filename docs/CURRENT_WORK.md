@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #424 modifier-if** (PR #669): subsequent-first exit + compact_children; 10k `if true` 2.16s→0.52s; 0 FP. [note](notes/20261119-issue-424-modifier-if.md)
 - **2026-11-19 #670 CLOSED** (PR #671): class-guard `dynamic_base` — 13 master FPs gone, sweep 0 FP/360. → #672/#673. [note](notes/20261119-issue-670-dynamic-base-class-guard.md)
 - **2026-11-19 #655+#661 CLOSED** (PR #668): dynamic-base `ConstantRead` skips C5/C1; 0 FP. [note](notes/20261119-issue-655-dynamic-base-const.md)
 - **2026-11-19 #637 CLOSED** (PR #664): CHAIN_LIMIT counts the root; 100-module include silent; 0 FP. [note](notes/20261119-issue-637-chain-limit.md)
@@ -83,7 +84,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; probes byte-identical, 0 OVER, unit tests cover the fixture blind spot. → #621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
 
-- **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in every mixin list — computed class-body `include`/`send` opens the class (`taint_unrecorded_mixin`, `taint_computed_send`/`local_send_names`/`opens_self`, `extend_hook_taint`, `unnamed_mixin_on_chain`); scalar-path decline only, unions still fire. ~60 probe rows match; 2-round review closed 5 findings; sweep unmeasurable (no corpora). → #617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
+- **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in mixin lists; computed class-body `include`/`send` opens the class; scalar-path decline only. ~60 probes; 0 OVER. → #617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
 - **2026-11-18 #448 frame-local specials + DefinitionContext** (PR #613): `UNCOLOURED_READS`; `{$~,$_}` writes on `!shared_slot`; `BodyCtx` ports `definition_context.rb`. effects 0 OVER. → #614/#616. [note](notes/20261118-issue-448-frame-local-specials.md)
 - **2026-11-18 #376 bundled-name tables tied to the pin** (PR #609): `BUNDLED_SKILL_NAMES` had desynced (oracle 18 skills, port 17); entry added + `bundled_name_tables_match_the_pinned_reference` re-derives both from the submodule. 0 FP/8,251; → #610/#611. [note](notes/20261118-issue-376-bundled-name-tie.md)
 - **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer set + `class <<`-composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. 3 review rounds, ~135 probe rows identical; follow-ups #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
