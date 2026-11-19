@@ -11,7 +11,7 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494, plus the
+▶ NEXT: the ADR-127 floor's coverage cost; follow-ups #491–#493, plus the
 repin's filed residuals #600, #605.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #431 CLOSED** (PR #675): command thread reserves its stack before the rayon pool — a capped host can no longer strand it on Rust's 2 MiB default; fallback messages name the actual stack. ADR-0045 amended; → #676–#679. [note](notes/20261119-issue-431-stack-fallback-order.md)
 - **2026-11-19 #424 modifier-if** (PR #669): subsequent-first exit + compact_children; 10k `if true` 2.16s→0.52s; 0 FP. [note](notes/20261119-issue-424-modifier-if.md)
 - **2026-11-19 #670 CLOSED** (PR #671): class-guard `dynamic_base` — 13 master FPs gone, sweep 0 FP/360. → #672/#673. [note](notes/20261119-issue-670-dynamic-base-class-guard.md)
 - **2026-11-19 #655+#661 CLOSED** (PR #668): dynamic-base `ConstantRead` skips C5/C1; 0 FP. [note](notes/20261119-issue-655-dynamic-base-const.md)
@@ -82,13 +83,13 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 - **2026-11-19 #603 CLOSED** (PR #623): alias floor `selection_branches` + `ReceiverAlias.candidates` + carrier marks; 4 FP + ~130 probes; 2-round Approved. → #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
 
-- **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; probes byte-identical, 0 OVER, unit tests cover the fixture blind spot. → #621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
+- **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; 0 OVER. → #621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
 
 - **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in mixin lists; computed class-body `include`/`send` opens the class; scalar-path decline only. ~60 probes; 0 OVER. → #617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
 - **2026-11-18 #448 frame-local specials + DefinitionContext** (PR #613): `UNCOLOURED_READS`; `{$~,$_}` writes on `!shared_slot`; `BodyCtx` ports `definition_context.rb`. effects 0 OVER. → #614/#616. [note](notes/20261118-issue-448-frame-local-specials.md)
-- **2026-11-18 #376 bundled-name tables tied to the pin** (PR #609): `BUNDLED_SKILL_NAMES` had desynced (oracle 18 skills, port 17); entry added + `bundled_name_tables_match_the_pinned_reference` re-derives both from the submodule. 0 FP/8,251; → #610/#611. [note](notes/20261118-issue-376-bundled-name-tie.md)
-- **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer set + `class <<`-composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. 3 review rounds, ~135 probe rows identical; follow-ups #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
-- **2026-11-18 upstream re-pin `v0.4.7 → v0.4.8`** (PR #599, human-merged) — mixin-call recording rework + #2677 alias-floor copy-link slice ported; three review rounds closed 13 blocking findings (partial include, transitive links, send mutations, dead-arm links, `*` over-decline); **0 FP fixture + ~8.7K-file sweep, 959/1063**; residuals #600, #603–#605. [note](notes/20261115-repin-v048.md)
+- **2026-11-18 #376 bundled-name tables tied to the pin** (PR #609): `BUNDLED_SKILL_NAMES` desynced (oracle 18, port 17); a test re-derives both tables from the submodule. 0 FP/8,251; → #610/#611. [note](notes/20261118-issue-376-bundled-name-tie.md)
+- **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer + composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. ~135 probes; → #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
+- **2026-11-18 upstream re-pin `v0.4.7 → v0.4.8`** (PR #599, human-merged) — mixin-call recording rework + #2677 alias-floor copy-link slice ported; three review rounds closed 13 blocking findings; **0 FP fixture + ~8.7K-file sweep, 959/1063**; residuals #600, #603–#605. [note](notes/20261115-repin-v048.md)
 - **2026-11-12 #405 class-guard record drop** (PR #591): class guards drop rooted `h[k]` records via a decline-side `record_guards` overlay. 18 master FPs closed, 0 FP/658; follow-ups #595/#596. [note](notes/20261112-issue-405-class-guard-records.md)
 - **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` exit guards record `$~` + mandatory `$N`; `Regexp.last_match` no longer a nil source. 0 FP/658; follow-ups #597/#598. [note](notes/20261112-issue-449-match-globals.md)
 - **2026-11-12 #438 `class_ivar_scope` memo key** (PR #588): reads in one class body share the `IvarScope`; required shapes ~pre-#432 RSS, output byte-identical. [note](notes/20261112-issue-438-ivar-scope-memo.md)
