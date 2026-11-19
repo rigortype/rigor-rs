@@ -2063,3 +2063,43 @@ fn constant_path_chain_lowers_each_level_with_uniform_flags() {
         assert_eq!(reads(src), want, "constant path lowering drifted for {src:?}");
     }
 }
+
+#[test]
+fn modifier_if_chain_lowers_each_link() {
+    // rigor-rs#424: `1 if x if x…` is two Prism levels per link. Walking the
+    // then-arm before noticing there is no `else` made `unconditional_exit`
+    // quadratic; the chain must still lower one `If` per link.
+    let n = 64;
+    let src = format!("1{}\n", " if x".repeat(n));
+    let ast = lower(&crate::parse(src.as_bytes()));
+    let ifs = ast.iter().filter(|(_, node)| matches!(node, Node::If { .. })).count();
+    assert_eq!(ifs, n, "modifier-if chain of {n} links");
+}
+
+#[test]
+fn modifier_unless_chain_lowers_each_link() {
+    let n = 64;
+    let src = format!("1{}\n", " unless x".repeat(n));
+    let ast = lower(&crate::parse(src.as_bytes()));
+    let ifs = ast.iter().filter(|(_, node)| matches!(node, Node::If { .. })).count();
+    assert_eq!(ifs, n, "modifier-unless chain of {n} links");
+}
+
+#[test]
+fn if_else_both_return_still_lowers_both_arms() {
+    // The subsequent-first short-circuit must not drop a real else slot:
+    // both arms returning is still an unconditional exit of the `if`.
+    let ast = lower(&crate::parse(b"if c\n  return 1\nelse\n  return 2\nend\n"));
+    let (_, node) = ast
+        .iter()
+        .find(|(_, n)| matches!(n, Node::If { .. }))
+        .expect("if must lower");
+    match node {
+        Node::If { then_body, else_body, is_unless, .. } => {
+            assert!(!is_unless);
+            assert!(!then_body.is_empty(), "then arm preserved");
+            assert!(!else_body.is_empty(), "else arm preserved");
+        }
+        _ => unreachable!(),
+    }
+}

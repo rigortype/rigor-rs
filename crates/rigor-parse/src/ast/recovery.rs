@@ -1143,20 +1143,26 @@ pub(crate) fn unconditional_exit(node: &PrismNode<'_>) -> bool {
         return paren.body().is_some_and(|b| unconditional_exit(&b));
     }
     if let Some(if_node) = node.as_if_node() {
+        // An `if` without `else`/`elsif` never exits: the implicit falsey
+        // path lives. Checking `subsequent` first keeps a modifier-if chain
+        // (`1 if a if a…`) O(links) — walking the then-arm first re-scanned
+        // the remaining suffix at every level (rigor-rs#424).
+        let Some(sub) = if_node.subsequent() else {
+            return false;
+        };
         return if_node
             .statements()
             .is_some_and(|s| unconditional_exit(&s.as_node()))
-            && if_node
-                .subsequent()
-                .is_some_and(|s| unconditional_exit(&s));
+            && unconditional_exit(&sub);
     }
     if let Some(unless_node) = node.as_unless_node() {
+        let Some(else_clause) = unless_node.else_clause() else {
+            return false;
+        };
         return unless_node
             .statements()
             .is_some_and(|s| unconditional_exit(&s.as_node()))
-            && unless_node
-                .else_clause()
-                .is_some_and(|e| unconditional_exit(&e.as_node()));
+            && unconditional_exit(&else_clause.as_node());
     }
     false
 }
@@ -1263,20 +1269,22 @@ fn rescue_arm_exits(node: &PrismNode<'_>) -> bool {
         return paren.body().is_some_and(|b| rescue_arm_exits(&b));
     }
     if let Some(if_node) = node.as_if_node() {
+        let Some(sub) = if_node.subsequent() else {
+            return false;
+        };
         return if_node
             .statements()
             .is_some_and(|s| rescue_arm_exits(&s.as_node()))
-            && if_node
-                .subsequent()
-                .is_some_and(|s| rescue_arm_exits(&s));
+            && rescue_arm_exits(&sub);
     }
     if let Some(unless_node) = node.as_unless_node() {
+        let Some(else_clause) = unless_node.else_clause() else {
+            return false;
+        };
         return unless_node
             .statements()
             .is_some_and(|s| rescue_arm_exits(&s.as_node()))
-            && unless_node
-                .else_clause()
-                .is_some_and(|e| rescue_arm_exits(&e.as_node()));
+            && rescue_arm_exits(&else_clause.as_node());
     }
     false
 }

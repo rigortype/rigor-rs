@@ -6,7 +6,8 @@ script regenerates it against a release `rigor` binary (default
 `target/release/rigor`). Data stays out of the repo.
 
 Default is the `**` row the first PR of #424 lands (800 and 1600 links).
-`--all` adds the call / `+` / constant-path rows the later PRs own.
+`--all` adds the call / `+` / constant-path rows, the local-read residuals,
+and the modifier-`if` row.
 
 Usage:
   python3 harness/time_nesting.py
@@ -31,6 +32,10 @@ OTHERS = [
     ("call", [10_000, 20_000]),
     ("plus", [10_000, 20_000]),
     ("const", [10_000, 20_000]),
+    ("vpow", [800, 1_600]),
+    ("vplus", [10_000, 20_000]),
+    ("xcall", [10_000, 20_000]),
+    ("modif", [5_000, 10_000]),
 ]
 
 
@@ -43,6 +48,14 @@ def generate(kind: str, n: int) -> str:
         return "+".join(["1"] * n) + "\n"
     if kind == "const":
         return "::".join(["A"] * n) + "\n"
+    if kind == "vpow":
+        return "v = 2\n" + " ** ".join(["v"] * n) + "\n"
+    if kind == "vplus":
+        return "v = 1\n" + "+".join(["v"] * n) + "\n"
+    if kind == "xcall":
+        return "x = foo\n" + "x" + ".a" * n + "\n"
+    if kind == "modif":
+        return "1" + " if x" * n + "\n"
     raise SystemExit(f"unknown kind {kind!r}")
 
 
@@ -75,7 +88,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--all",
         action="store_true",
-        help="also time call / + / constant-path rows (later #424 PRs)",
+        help="also time call / + / const / local-read / modifier-if rows",
     )
     args = ap.parse_args(argv[1:])
     rigor = Path(args.bin)
