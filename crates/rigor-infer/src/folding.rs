@@ -336,6 +336,20 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         }
     }
 
+    // `<<` / `>>` take a Bignum count too: past `i128` only its sign matters
+    // (`1 >> 99999999999999999999` is `0`; `<<` blows the bit limit either
+    // way it is reached) — same argument handling as [`fold_bigint`]'s.
+    if let ("<<" | ">>", [b]) = (method, args) {
+        let shift = match b {
+            Scalar::Int(v) => i128::from(*v),
+            Scalar::BigInt(d) => d
+                .parse::<i128>()
+                .unwrap_or(if d.starts_with('-') { i128::MIN } else { i128::MAX }),
+            _ => return None,
+        };
+        return shift_result(a, if method == "<<" { shift } else { shift.saturating_neg() });
+    }
+
     // Binary on a single Integer argument.
     let b = match args {
         [Scalar::Int(b)] => *b,
@@ -416,12 +430,6 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         "&" => Some(Scalar::Int(a & b)),
         "|" => Some(Scalar::Int(a | b)),
         "^" => Some(Scalar::Int(a ^ b)),
-        // Shifts: a negative count is the opposite direction (Ruby folds it),
-        // and an out-of-i64 result promotes to `Scalar::BigInt` inside the
-        // reference's bit limit — `i64::checked_shl` only guarded the COUNT,
-        // so `2 << 63` silently wrapped to `0` (rigor-rs#682).
-        "<<" => shift_result(a, i128::from(b)),
-        ">>" => shift_result(a, -i128::from(b)),
         _ => None,
     }
 }
@@ -716,9 +724,10 @@ fn big_scalar(spelling: String) -> Option<Scalar> {
 
 /// Folds on a `Scalar::BigInt` receiver (rigor-rs#682). Only the members
 /// whose answer reads straight off the decimal spelling — predicates, sign
-/// ops, `to_s`, `succ`/`pred`, and integer comparisons — are folded; binary
-/// arithmetic (`+`, `*`, `**`, `<<`, `&`, …) needs the operand width the core
-/// does not model and declines to the RBS answer, the zero-FP-safe side.
+/// ops, `to_s`, `succ`/`pred`, integer comparisons, and `<<`/`>>` — are
+/// folded; other binary arithmetic (`+`, `*`, `**`, `&`, …) needs the operand
+/// width the core does not model and declines to the RBS answer, the
+/// zero-FP-safe side.
 fn fold_bigint(d: &str, method: &str, args: &[Scalar]) -> Option<Scalar> {
     let negative = d.starts_with('-');
     match (method, args) {
@@ -1127,13 +1136,15 @@ fn decimal_pow(a: i64, b: u64) -> Option<String> {
         return None; // 0 ** b never overflows; unreachable in practice.
     }
     let negative = a < 0 && b % 2 == 1;
-    let base: u64 = a.unsigned_abs();
-    // digits little-endian (digits[0] = ones place).
+    let base: u128 = u128::from(a.unsigned_abs());
+    // digits little-endian (digits[0] = ones place). The multiply runs in
+    // `u128`: `9 * i64::MAX` alone exceeds `u64` (the wrap the PR #693 review
+    // caught on `9223372036854775807 ** 2`).
     let mut digits: Vec<u8> = vec![1];
     for _ in 0..b {
-        let mut carry: u64 = 0;
+        let mut carry: u128 = 0;
         for d in digits.iter_mut() {
-            let cur = (*d as u64) * base + carry;
+            let cur = u128::from(*d) * base + carry;
             *d = (cur % 10) as u8;
             carry = cur / 10;
         }
@@ -1151,10 +1162,6 @@ fn decimal_pow(a: i64, b: u64) -> Option<String> {
     }
     for d in digits.iter().rev() {
         out.push((b'0' + d) as char);
-    }
-    // The caller only reaches this on checked_pow overflow; guard anyway.
-    if digits.len() <= 19 && !negative {
-        return None;
     }
     Some(out)
 }
@@ -1228,6 +1235,18 @@ mod tests {
         assert_eq!(fold(&i(1), "**", &[i(4294967296)]), Some(i(1)));
         assert_eq!(fold(&i(-1), "**", &[i(4294967297)]), Some(i(-1)));
         assert_eq!(fold(&i(-1), "**", &[i(4294967296)]), Some(i(1)));
+        // `decimal_pow`'s inner multiply runs in `u128`: `9 * i64::MAX`
+        // exceeds `u64` — the wrap gave a wrong literal (PR #693 review).
+        assert_eq!(
+            fold(&i(i64::MAX), "**", &[i(2)]),
+            Some(big("85070591730234615847396907784232501249"))
+        );
+        // `<<`/`>>` take a Bignum count — only its sign matters at that size.
+        assert_eq!(fold(&i(1), ">>", &[big("99999999999999999999")]), Some(i(0)));
+        assert_eq!(fold(&i(-8), ">>", &[big("99999999999999999999")]), Some(i(-1)));
+        assert_eq!(fold(&i(1), "<<", &[big("-99999999999999999999")]), Some(i(0)));
+        assert_eq!(fold(&i(5), "<<", &[big("99999999999999999999")]), None);
+        assert_eq!(fold(&i(5), ">>", &[big("-99999999999999999999")]), None);
         assert_eq!(fold(&i(i64::MIN), "abs", &[]), Some(big("9223372036854775808")));
         assert_eq!(fold(&i(i64::MAX), "succ", &[]), Some(big("9223372036854775808")));
         assert_eq!(fold(&i(i64::MIN), "pred", &[]), Some(big("-9223372036854775809")));
