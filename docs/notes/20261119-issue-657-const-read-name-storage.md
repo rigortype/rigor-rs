@@ -1,8 +1,8 @@
 # #657: ConstRead prefix-shared names; bounded `knows_*`; one chain walk
 
-PR #660 (`2a8724f`) — **Approved, READY, unmerged**: merge waits on older PR
-#659 (overlaps `rbs.rs`/`reach_memo.rs`); then rebase + merge per the
-self-merge rules. Ledger line lands at merge.
+PR #660 (head `86a6e29`) — **Approved + fix-confirmation, READY, unmerged**:
+merge waits on older PR #659 (overlaps `rbs.rs`/`reach_memo.rs`); then rebase
++ merge per the self-merge rules. Ledger line lands at merge.
 
 ## What was slow
 
@@ -27,6 +27,9 @@ enclosing prefix into `HashSet<String>` (O(depth²) of each).
   longer name cannot be present).
 - `add_declared` → `DeclaredNames = HashSet<ConstName, FastHasher>`: the
   census names are prefixes of one join too; `contains(&str)` stays exact.
+  Plus (design-companion follow-up, `86a6e29`) longest-first insert with
+  early stop — the set is prefix-closed, so a hit means every shorter prefix
+  is present: nested `module A`×d went O(d³)→O(d²) bytes hashed.
 
 ## Measured (release `check`, implementer's host)
 
@@ -43,4 +46,8 @@ gitlab-foss `lib/` (1,200 files each; reviewer re-diffed 3,665 more); sweep
 **0 FP**, gaps 360 unmoved; 19+14 probe rows matched (`ERB::Util.h` diverges
 identically on master — pre-existing gap). Ordinary-code time/RSS flat.
 Reviewer filed #661 (`(Object)::String.new.nope` — pre-existing FP, same
-family as #655).
+family as #655). Companion follow-ups: #662 (`loop_edges` `Subject::Const`
+materialises a String per level — O(d³) on a deep path in a predicate, the
+largest reachable residual: ~29 s at 10k), #663 (`sig-gen` prefix joins).
+Nested-module residual after `86a6e29` (~31 s/1.2 GB at 4k, master 68.7 s) is
+the per-level `Vec<String>` prefix clones — different mechanism, unfixed.
