@@ -42,6 +42,8 @@ ap.add_argument("--only", default="main,worker,at64,at2,inline,minm")
 ap.add_argument("--out", default=os.path.join(DATA, "e2e.tsv"))
 ap.add_argument("--sub", default="check")
 ap.add_argument("--timeout", type=int, default=1800)
+ap.add_argument("--minm-budget", type=int, default=None,
+                help="pin the inline-forcing ulimit -v MiB instead of probing it")
 a = ap.parse_args()
 rigor = cli(a.cli)
 only = a.only.split(",")
@@ -140,7 +142,7 @@ def budget_for(key):
 
 def minm(kind, n):
     """Smallest `ulimit -s` MiB on which the INLINE run survives."""
-    v = budget_for("inline")
+    v = a.minm_budget or budget_for("inline")
     if v is None:
         return "n/a", "no inline budget (ulimit -v not honoured?)"
 

@@ -127,7 +127,7 @@ try:
         p.wait()
     err = p.stderr.read().decode("utf-8", "replace")
     m = re.search(r"thread '([^']*)'.*has overflowed its stack", err)
-    print("%s\t%s\t%d\t%s%s%s\trc=%s\t%s\t%s" % (a.cli, a.kind, a.n, "on-disk" if a.on_disk else "buffer",
+    print("%s\t%s\t%d\t%s%s\trc=%s\t%s\t%s" % (a.cli, a.kind, a.n, "on-disk" if a.on_disk else "buffer",
           "+sibling" if a.sibling else "",
           p.returncode, " ".join(events), ("OVERFLOW thread=" + m.group(1)) if m else ""), flush=True)
 finally:
