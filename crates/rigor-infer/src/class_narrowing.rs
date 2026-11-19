@@ -2168,9 +2168,10 @@ impl<'i> Typer<'i> {
 
     /// The statically-known name of a `ConstantRead`/`ConstantPath` node (both
     /// lower to `ConstantRead`), resolved lexically at `use_span`'s prefix —
-    /// or `None` when the node is not a static constant OR a project
-    /// declaration shadows the name ([`SourceIndex::constant_shadowed`] —
-    /// decline entirely; this slice never narrows to a project nominal).
+    /// or `None` when the node is not a static constant (`dynamic_base`, the
+    /// reference's `qualified_name_or_nil` answering nil — rigor-rs#670) OR a
+    /// project declaration shadows the name ([`SourceIndex::constant_shadowed`]
+    /// — decline entirely; this slice never narrows to a project nominal).
     ///
     /// S2 (2026-08-08): the name is additionally resolved to a QUALIFIED KEY
     /// here, at MINT time, because this is where the use site's lexical
@@ -2187,10 +2188,13 @@ impl<'i> Typer<'i> {
         id: NodeId,
         use_span: rigor_parse::Span,
     ) -> Option<String> {
-        let Node::ConstantRead { name, .. } = ast.get(id) else {
+        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(id) else {
             return None;
         };
-        if name.is_empty() {
+        // A dynamic base (`k::String`, `self::String`, `self.class::String`)
+        // is not a static class: the trailing name is a lenient render, and
+        // the reference's `static_class_name` returns nil (rigor-rs#670).
+        if name.is_empty() || *dynamic_base {
             return None;
         }
         let prefix = self.enclosing_prefix(use_span);
@@ -2212,10 +2216,10 @@ impl<'i> Typer<'i> {
         id: NodeId,
         use_span: rigor_parse::Span,
     ) -> Option<(String, bool)> {
-        let Node::ConstantRead { name, .. } = ast.get(id) else {
+        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(id) else {
             return None;
         };
-        if name.is_empty() {
+        if name.is_empty() || *dynamic_base {
             return None;
         }
         let prefix = self.enclosing_prefix(use_span);

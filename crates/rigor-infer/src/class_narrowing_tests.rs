@@ -135,6 +135,36 @@ fn class_narrowing_logical_predicate_narrows_truthy_only() {
     assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
 }
 
+/// rigor-rs#670: a class-guard operand with a dynamic base must not narrow
+/// — `qualified_name_or_nil` is nil, so the trailing name is not a static
+/// class. Must-still-fire: a static `String` / `::String` still narrows.
+#[test]
+fn class_narrowing_dynamic_base_operand_declines() {
+    for src in [
+        "class C; def m(x); if x.is_a?(self.class::String); x.bogus; end; end; end\n",
+        "class C; def self.m(x); if x.is_a?(self::String); x.bogus; end; end; end\n",
+        "def m(x, k); if x.is_a?(k::String); x.bogus; end; end\n",
+        "def m(x, k); case x; when k::String; x.bogus; end; end\n",
+    ] {
+        let (ast, snaps) = class_snaps(src.as_bytes());
+        assert!(
+            !snaps.contains_key(&call_named(&ast, "bogus")),
+            "dynamic-base operand must not narrow: {src}"
+        );
+    }
+    for src in [
+        "def m(x); if x.is_a?(String); x.bogus; end; end\n",
+        "def m(x); if x.is_a?(::String); x.bogus; end; end\n",
+    ] {
+        let (ast, snaps) = class_snaps(src.as_bytes());
+        assert_eq!(
+            snaps.get(&call_named(&ast, "bogus")).map(String::as_str),
+            Some("String"),
+            "static operand must still narrow: {src}"
+        );
+    }
+}
+
 /// Decline: a project declaration shadowing the constant kills the
 /// narrowing entirely (never narrow to the project nominal in this slice).
 #[test]
