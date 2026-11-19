@@ -1481,18 +1481,29 @@ pub(crate) type DeclaredNames = HashSet<ConstName, BuildHasherDefault<FastHasher
 /// ONCE and each level recorded by its byte length — O(path) bytes instead of
 /// the O(path²) the per-level `join("::")` wrote.
 fn add_declared(out: &mut DeclaredNames, prefix: &[String]) {
+    // The `::` goes between segments (`i > 0`), exactly as the old
+    // `join("::")` — a leading empty segment would join `"::B"`, not `"B"`
+    // (unreachable: decl paths never lead with an empty segment).
     let mut full = String::new();
     let mut lens = Vec::with_capacity(prefix.len());
-    for seg in prefix {
-        if !full.is_empty() {
+    for (i, seg) in prefix.iter().enumerate() {
+        if i > 0 {
             full.push_str("::");
         }
         full.push_str(seg);
         lens.push(full.len());
     }
     let full: std::sync::Arc<str> = std::sync::Arc::from(full);
-    for len in lens {
-        out.insert(ConstName::prefix_of(&full, len));
+    // Insert LONGEST first and stop at the first name already present: the
+    // census is prefix-closed (this is its only writer and it always inserts
+    // every enclosing prefix), so a hit means every shorter prefix is in too.
+    // Exact — and a decl under depth-d nesting stops after ~2 probes instead
+    // of re-hashing all d ancestors (#657 follow-up: nested `module A` chains
+    // were O(d³) bytes hashed here).
+    for len in lens.iter().rev() {
+        if !out.insert(ConstName::prefix_of(&full, *len)) {
+            break;
+        }
     }
 }
 
