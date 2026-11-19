@@ -1,0 +1,174 @@
+# The ADR-0045 stack-measurement screen (rigor-rs#428; tools: harness/stack/).
+#
+# Measurement, not a gate: it re-records the stack budgets on platforms the
+# ADR was never measured on. Trigger it by hand (workflow_dispatch) after a
+# toolchain bump or a lowering change. It also runs on pull_request when the
+# tools, this workflow, or the bound/stack mechanics themselves change —
+# workflow_dispatch cannot fire on a workflow that is not yet on the default
+# branch, so the numbers for the PR that lands this file come from the
+# pull_request trigger.
+name: stack-measure
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'harness/stack/**'
+      - '.github/workflows/stack.yml'
+      - 'crates/rigor-parse/src/depth.rs'
+      - 'crates/rigor-cli/src/threads.rs'
+      - 'crates/rigor-cli/tests/deep_nesting.rs'
+      - 'rust-toolchain.toml'
+
+concurrency:
+  group: stack-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The ~80-shape survival screen plus the bound rows, split for wall time.
+  # e2e.py probes the runner's rung-forcing `ulimit -v` budgets itself, so the
+  # at64 / at2 / inline / minm columns are the post-#431 fallback behaviour.
+  screen:
+    name: x86_64 screen (${{ matrix.set }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - set: capped-a
+            kinds: "array call block if paren begin defined super yield def class hash and ivopw interp while unless case"
+          - set: capped-b
+            kinds: "lambda module sclass doblock rescue rcall idx splat kwsplat regex ternary assign opassign pow bang not uminus blockparam"
+          - set: uncapped
+            kinds: "chain:5000 plus:5000 minus:5000 andand:5000 oror:5000 kwand:5000 orkw:5000 index:5000 safenav:5000 argchain:5000 blkchain:5000 callblk:5000 cpath:5000 shovel:5000 lt:5000 ifmod:5000 unlessmod:5000 rescmod:5000 whilemod:5000 strcat:5000 chain:20000 andand:20000 index:20000 cpath:20000"
+          - set: scope-typed
+            kinds: "defchain:5000 defretchain:5000 blkinchain:5000 classchain:5000 asgnchain:5000 ivchain:5000 ifchain:5000 defplus:5000 deforor:5000 defifmod:5000 rescuechain:5000 elsifchain:5000 whenchain:5000"
+          - set: bound
+            kinds: "elsifchain:24990 ifmod:12490 unlessmod:12490 rescuechain:24990 andand:24990 chain:24990 whenchain:24990"
+            minm: "defined ifmod:12490 elsifchain:24990"
+    env:
+      RIGOR_STACK_DATA: ${{ runner.temp }}/stack-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      # bindgen (ruby-prism-sys / ruby-rbs-sys) needs libclang at build time.
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stack-measure
+
+      - name: Build rigor (release)
+        run: cargo build --release --locked -p rigor-cli
+
+      - name: Screen ${{ matrix.set }}
+        run: python3 harness/stack/e2e.py release ${{ matrix.kinds }} --only main,worker,at64,at2,inline
+
+      # The pipeline floor on the inline run — minm bisects ulimit -s, so it
+      # is only run for the representative rows (the bound rows are slow).
+      - name: minm rows
+        if: matrix.minm
+        run: python3 harness/stack/e2e.py release ${{ matrix.minm }} --only minm
+
+      - name: Upload data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stack-${{ matrix.set }}
+          path: ${{ env.RIGOR_STACK_DATA }}/*.tsv
+          if-no-files-found: ignore
+
+  # Prism's caps and the in-process per-mode stack minima — the ADR's
+  # mechanical numbers (848 B/unit parser, ~1.34 KiB/level lower_jumps, the
+  # 93 B/level C walk). Independent of the thread-ladder changes.
+  probe:
+    name: caps + per-mode min stacks
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      RIGOR_STACK_DATA: ${{ runner.temp }}/stack-data
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stack-measure
+
+      # caps.py builds depthprobe on first use. Capped + mixed kinds only:
+      # the uncapped sets probe to a million links and include shapes whose
+      # Prism parse is itself quadratic.
+      - name: caps
+        run: python3 harness/stack/caps.py array call block if paren begin defined super yield def class hash and ivopw interp while unless case lambda module sclass doblock rescue rcall idx splat kwsplat regex ternary assign opassign pow bang not uminus blockparam ret masgn arrparen bangparen splatparen parenbegin defparen lambdaparen interpparen andparen ifparen notparen
+
+      - name: uncapped parse behaviour at size
+        run: |
+          P=$RIGOR_STACK_DATA/target/release/depthprobe
+          $P errors chain 100000; $P errors cpath 100000; $P errors index 100000
+          $P errors rescuechain 100000; $P errors whenchain 50000; $P errors elsifchain 50000
+
+      - name: per-mode min stacks
+        run: |
+          python3 harness/stack/probe_min.py parse array 9999
+          python3 harness/stack/probe_min.py visit array 9999
+          python3 harness/stack/probe_min.py lower defined 9998
+          python3 harness/stack/probe_min.py lower def 4999
+          python3 harness/stack/probe_min.py lower class 4999
+          python3 harness/stack/probe_min.py lower chain 5000 20000
+          python3 harness/stack/probe_min.py lower andand 5000 20000
+          python3 harness/stack/probe_min.py lower cpath 5000 20000
+          python3 harness/stack/probe_min.py --kib cguard elsifchain 24990
+          python3 harness/stack/probe_min.py parse chain 5000 20000
+          python3 harness/stack/probe_min.py parse ifmod 5000 20000
+
+      - name: Upload data
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stack-probe
+          path: ${{ env.RIGOR_STACK_DATA }}/*.tsv
+          if-no-files-found: ignore
+
+  # Windows: the deep_nesting regression test once (rigor-rs#428). The
+  # windows-latest image ships LLVM/libclang for bindgen; the job is not a
+  # gate — a red result is a finding to record, not a build failure.
+  windows:
+    name: deep_nesting (windows-latest)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - name: Locate libclang
+        shell: pwsh
+        run: |
+          $candidates = "C:\Program Files\LLVM\bin", "C:\Program Files (x86)\LLVM\bin"
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
+          if ($found) {
+            "LIBCLANG_PATH=$found" >> $env:GITHUB_ENV
+            "libclang: $found"
+          } else {
+            choco install -y llvm --version 20.1.0
+            "LIBCLANG_PATH=C:\Program Files\LLVM\bin" >> $env:GITHUB_ENV
+          }
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: stack-measure-win
+
+      - name: deep_nesting tests
+        run: cargo test --locked -p rigor-cli --test deep_nesting -- --nocapture
