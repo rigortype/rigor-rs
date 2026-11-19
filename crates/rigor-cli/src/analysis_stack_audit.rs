@@ -33,7 +33,8 @@
 //!
 //! `#[cfg(test)]` items are skipped, as are the files `#[cfg(test)] mod x;`
 //! declarations resolve to. A `#[cfg(test)]` that does not open an item
-//! keyword (a field, variant, parameter or match arm) masks only itself —
+//! (a field, variant, parameter or match arm — including a `pub`-qualified
+//! field, whose `pub` is itself an item keyword) masks only itself —
 //! whatever follows it stays production. Everything else is production
 //! code: a hit must
 //! be justified by an [`ALLOW_LIST`] entry carrying a one-line reason. An
@@ -475,11 +476,11 @@ fn after_ident_is_glob(s: &str, tok: (usize, &str)) -> bool {
 /// The `#[cfg(test)]` items' byte extents: the `#` through the item's `;`
 /// or the `}` closing its `{` — whichever comes first at bracket depth 0.
 /// `#[…]` attributes between the attribute and its item are skipped too.
-/// When the attribute does not open an item keyword (`ITEM_KEYWORDS`) it
-/// sits on a field, variant, parameter or match arm, and only the
-/// attribute itself is masked — masking on would swallow the item after
-/// it. `cfg(all(test, …))` is not recognised — none exist; a new one
-/// needs a case here rather than an allow-list entry.
+/// When the attribute does not open an item (`opens_item` — a field,
+/// variant, parameter or match arm, including a `pub`/`pub(…)`-qualified
+/// field) only the attribute itself is masked — masking on would swallow
+/// the item after it. `cfg(all(test, …))` is not recognised — none
+/// exist; a new one needs a case here rather than an allow-list entry.
 fn cfg_test_spans(text: &str) -> Vec<(usize, usize)> {
     let b = text.as_bytes();
     let mut spans = Vec::new();
@@ -489,7 +490,7 @@ fn cfg_test_spans(text: &str) -> Vec<(usize, usize)> {
             b'#' => match cfg_test_attr(b, i) {
                 Some(end) => {
                     let start = item_start(b, end);
-                    let close = if ITEM_KEYWORDS.contains(&ident_at(text, start)) {
+                    let close = if opens_item(text, start) {
                         item_end(b, start)
                     } else {
                         end // attribute on a non-item position: mask only it
@@ -505,11 +506,35 @@ fn cfg_test_spans(text: &str) -> Vec<(usize, usize)> {
     spans
 }
 
+/// Whether the word at `start` opens an item the attribute should mask
+/// whole (`ITEM_KEYWORDS`), with one carve-out: `pub` is an item keyword
+/// AND a field/variant visibility — `struct S { #[cfg(test)] pub x: u8 }`,
+/// `struct T(#[cfg(test)] pub u8)`. For `pub`, the word after any `(…)`
+/// visibility group (`pub(crate)`, `pub(in a::b)`) decides: an item
+/// keyword opens `pub fn`/`pub(crate) mod`/…; anything else is a field
+/// name or type, and the attribute masks only itself — `item_end` would
+/// otherwise run past the enclosing `}` and swallow the next item
+/// (rigor-rs#653).
+fn opens_item(text: &str, start: usize) -> bool {
+    let b = text.as_bytes();
+    let first = ident_at(text, start);
+    if first != "pub" {
+        return ITEM_KEYWORDS.contains(&first);
+    }
+    let mut i = skip_ws(b, start + first.len());
+    if b.get(i) == Some(&b'(') {
+        i = close_of(b, i) + 1;
+    }
+    ITEM_KEYWORDS.contains(&ident_at(text, skip_ws(b, i)))
+}
+
 /// The first word after `#[cfg(test)]` (and any attributes it carries)
 /// must open an item. On a non-item position — a struct field, enum
 /// variant, parameter or match arm — `item_end` would run past it to the
 /// next `{` or `;` and swallow whatever item follows, so only the
-/// attribute itself is masked.
+/// attribute itself is masked. `pub` needs a look one word deeper
+/// (`opens_item`): it opens `pub fn`/`pub(crate) mod`/… but also heads a
+/// visibility-qualified field.
 const ITEM_KEYWORDS: &[&str] = &[
     "pub",
     "mod",
@@ -557,8 +582,10 @@ fn item_start(b: &[u8], mut i: usize) -> usize {
 
 /// The byte after an item: `;` at bracket depth 0 (`mod x;`, `use a;`,
 /// `static x: T = v;`), else the `}` matching the first depth-0 `{`
-/// (`mod x {…}`, `fn`, `impl`, a block expression). End of file counts as
-/// the end.
+/// (`mod x {…}`, `fn`, `impl`, a block expression). A `}` at depth 0 is a
+/// bracket the item never opened — it closes the block the position sits
+/// in — so the scan stops there too rather than running past the
+/// enclosing item (rigor-rs#653). End of file counts as the end.
 fn item_end(b: &[u8], from: usize) -> usize {
     let mut depth = 0usize;
     for i in from..b.len() {
@@ -567,6 +594,7 @@ fn item_end(b: &[u8], from: usize) -> usize {
             b')' | b']' => depth = depth.saturating_sub(1),
             b';' if depth == 0 => return i + 1,
             b'{' if depth == 0 => return close_of(b, i) + 1,
+            b'}' if depth == 0 => return i,
             _ => {}
         }
     }
@@ -763,4 +791,68 @@ fn blank(src: &str) -> String {
 fn raw_quote(s: &[u8]) -> Option<usize> {
     let hashes = s.iter().take_while(|&&c| c == b'#').count();
     (s.get(hashes) == Some(&b'"')).then_some(hashes)
+}
+
+/// rigor-rs#653: `#[cfg(test)]` on a `pub`-qualified field masks only the
+/// attribute — `pub` is itself an item keyword, so the whole-item extent
+/// used to run past the struct's `}` to the next `{` and swallow that
+/// item (hits inside it went unflagged).
+#[test]
+fn cfg_test_span_on_pub_field_masks_only_the_attribute() {
+    // (source, masked text). `pub` on an item masks the item; on a field,
+    // variant or other non-item position only the attribute.
+    for (src, want) in [
+        // the issue's repro: the attribute masks only itself, so the
+        // trailing item's `thread::spawn` stays visible to the audit
+        (
+            "struct S { #[cfg(test)] pub probe: u8, real: u8 }\nfn run() { thread::spawn(|| {}); }",
+            "#[cfg(test)]",
+        ),
+        ("struct T(#[cfg(test)] pub u8);", "#[cfg(test)]"),
+        ("struct T(#[cfg(test)] pub (u8, u8));", "#[cfg(test)]"),
+        ("enum E { #[cfg(test)] pub V { x: u8 } }", "#[cfg(test)]"),
+        (
+            "struct S { #[cfg(test)] pub(crate) probe: u8 }",
+            "#[cfg(test)]",
+        ),
+        (
+            "#[cfg(test)] pub fn helper() {}",
+            "#[cfg(test)] pub fn helper() {}",
+        ),
+        (
+            "#[cfg(test)] pub(crate) async fn helper() {}",
+            "#[cfg(test)] pub(crate) async fn helper() {}",
+        ),
+        (
+            "#[cfg(test)] pub(in crate::a) mod m { fn f() {} }",
+            "#[cfg(test)] pub(in crate::a) mod m { fn f() {} }",
+        ),
+        ("#[cfg(test)] pub use a::b;", "#[cfg(test)] pub use a::b;"),
+        (
+            "#[cfg(test)] pub static X: u8 = 1;",
+            "#[cfg(test)] pub static X: u8 = 1;",
+        ),
+        // a keyword in a non-item position stops at the `}` the item
+        // never opened instead of running on to the next `{`
+        (
+            "struct S { #[cfg(test)] static x: u8 } fn after() { thread::spawn(|| {}); }",
+            "#[cfg(test)] static x: u8 ",
+        ),
+    ] {
+        let spans = cfg_test_spans(&blank(src));
+        assert_eq!(spans.len(), 1, "{src}");
+        assert_eq!(&src[spans[0].0..spans[0].1], want, "{src}");
+    }
+
+    // End to end on the repro: the `thread::spawn` after the attribute is
+    // a live hit, not masked inside a swollen `#[cfg(test)]` extent.
+    let src =
+        "struct S { #[cfg(test)] pub probe: u8, real: u8 }\nfn run() { thread::spawn(|| {}); }";
+    let text = blank(src);
+    let spans = cfg_test_spans(&text);
+    let active = |at: usize| !spans.iter().any(|&(s, e)| at >= s && at < e);
+    assert_eq!(
+        find_seq(&text, &["thread", "::", "spawn"], &active).len(),
+        1
+    );
 }
