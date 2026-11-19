@@ -164,7 +164,7 @@ impl<'i> Typer<'i> {
             // method env from paying it per call site; beyond it the call
             // types uncached, exactly as env-sensitive calls always have.
             if env.len() <= ENV_TYPE_MEMO_MAX {
-                let interner_id = &*interner as *const rigor_types::Interner as usize;
+                let interner_id = interner.uid();
                 let ty = self.type_of_env_memo(ast, id, env, interner_id, |s| {
                     let tid = s.type_of_uncached(ast, id, env, interner);
                     let ty = interner.get(tid);

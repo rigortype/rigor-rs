@@ -2675,17 +2675,36 @@ impl<'i> Typer<'i> {
             }
         }
         let mut marks = PathMarks::default();
+        // `window` is the intersection of the node's ancestors' spans: a
+        // node is marked only when its own span nests inside every
+        // ancestor, mirroring the recursive walks, which only descend a
+        // child whose span CONTAINS `wspan`. Most Prism nodes nest, but a
+        // heredoc's interpolated parts sit in the body while the
+        // `InterpolatedString` node's span is the `<<~T` opener — the
+        // parts escape, get no mark, and the callers' fallback then
+        // reproduces the recursion's off-child answer verbatim
+        // (rigor-rs#658 heredoc row: `if … #{v.push(1)} … end` used to
+        // drop the mutation where the recursion minted `for Integer`).
         let mut stack = vec![(
             root,
             PathFlags { uncond: true, operand: true, writeback: false },
+            ast.get(root).span(),
         )];
-        while let Some((id, flags)) = stack.pop() {
+        while let Some((id, flags, window)) = stack.pop() {
             let node = ast.get(id);
+            let nspan = node.span();
             // Ancestors mark before their descendants exist on the stack,
             // so `or_insert` keeps the OUTERMOST node's flags on a shared
             // span — exactly as the recursive walks stop at the first node
-            // whose span is `wspan`.
-            marks.by_span.entry(node.span()).or_insert(flags);
+            // whose span is `wspan`. A node whose span escapes an
+            // ancestor's gets NO mark — the fallback answers it.
+            if nspan.0 >= window.0 && nspan.1 <= window.1 {
+                marks.by_span.entry(nspan).or_insert(flags);
+            }
+            let child_window = (
+                window.0.max(nspan.0),
+                window.1.min(nspan.1),
+            );
             let lenient = matches!(
                 node,
                 Node::Statements {
@@ -2720,6 +2739,7 @@ impl<'i> Typer<'i> {
                         operand: flags.operand && (edge == FlowEdge::Uncond || lenient),
                         writeback,
                     },
+                    child_window,
                 ));
             }
         }

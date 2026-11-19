@@ -213,10 +213,11 @@ struct EnvExprEntry {
     /// (`LocalVariableOpWrite`, `decline_fold_gap`), so it is part of the
     /// context an entry is valid for.
     def_scope: Option<rigor_parse::Span>,
-    /// The interner `env`'s ids belong to (its address). A `TypeId` is an
-    /// index into one interner; under another the snapshot compares
-    /// nonsense, so the interner must match before it is consulted.
-    interner: usize,
+    /// The interner `env`'s ids belong to ([`rigor_types::Interner::uid`]).
+    /// A `TypeId` is an index into one interner; under another the
+    /// snapshot compares nonsense, so the interner must match before it
+    /// is consulted.
+    interner: u64,
     out: TypeOfOut,
 }
 
@@ -229,7 +230,7 @@ impl EnvExprEntry {
         env_fp: u64,
         env: &crate::TypeEnv,
         def_scope: Option<rigor_parse::Span>,
-        interner: usize,
+        interner: u64,
     ) -> bool {
         self.env_fp == env_fp
             && self.def_scope == def_scope
@@ -256,7 +257,7 @@ fn env_expr_entry_hit(
     env_fp: u64,
     env: &crate::TypeEnv,
     def_scope: Option<rigor_parse::Span>,
-    interner: usize,
+    interner: u64,
 ) -> Option<ExprHit<TypeOfOut>> {
     let mut found = None;
     let mut i = 0;
@@ -852,15 +853,15 @@ impl<'i> Typer<'i> {
     /// `env` is small (the snapshot+compare is O(env), so a bound keeps a
     /// large method env from paying it per call site); every other env-
     /// sensitive call types uncached exactly as before.
-    /// `interner_id` is the interner's address — the caller passes it
-    /// rather than a borrow so the `compute` closure keeps its `&mut`
+    /// `interner_id` is [`rigor_types::Interner::uid`] — the caller passes
+    /// it rather than a borrow so the `compute` closure keeps its `&mut`
     /// (the env snapshot's `TypeId`s are only meaningful under it).
     pub(crate) fn type_of_env_memo(
         &self,
         ast: &LoweredAst,
         id: NodeId,
         env: &crate::TypeEnv,
-        interner_id: usize,
+        interner_id: u64,
         compute: impl FnOnce(&Self) -> TypeOfOut,
     ) -> Type {
         let ast_id = ast_identity(ast);

@@ -3,13 +3,22 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
 use crate::ty::{Scalar, Type, TypeId};
+
+/// The next [`Interner::uid`].
+static NEXT_UID: AtomicU64 = AtomicU64::new(1);
 
 /// Arena + hash-cons map. Every structurally-equal `Type` interns to the same
 /// [`TypeId`], so identity comparison of `TypeId`s decides structural equality
 /// of the (shallow) carrier.
 pub struct Interner {
+    /// A process-unique id — memo keys compare this instead of an address,
+    /// which a dropped interner's replacement can reuse (rigor-rs#658:
+    /// `infer_one_return` drops a scratch interner per method in the same
+    /// stack slot).
+    uid: u64,
     arena: Vec<Type>,
     dedup: HashMap<Type, TypeId>,
     // Cached ids of the pre-interned atomics.
@@ -30,6 +39,7 @@ impl Interner {
     /// Build an interner with the common atomics pre-interned.
     pub fn new() -> Self {
         let mut me = Interner {
+            uid: NEXT_UID.fetch_add(1, AtomicOrdering::Relaxed),
             arena: Vec::new(),
             dedup: HashMap::new(),
             // placeholders, overwritten just below
@@ -45,6 +55,11 @@ impl Interner {
         me.true_ = me.intern(Type::Constant(Scalar::Bool(true)));
         me.false_ = me.intern(Type::Constant(Scalar::Bool(false)));
         me
+    }
+
+    /// The process-unique id minted at construction — see the field docs.
+    pub fn uid(&self) -> u64 {
+        self.uid
     }
 
     /// Intern a carrier, returning its (deduplicated) handle.
