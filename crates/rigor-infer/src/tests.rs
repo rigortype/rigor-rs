@@ -2383,8 +2383,81 @@ fn loop_stabilizing_op_write_keeps_constant_pins() {
     assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
 }
 
+
+/// rigor-rs#638 review: the replay verdict is only trusted when every
+/// tracked pass exit is value-exact. `x = g(x)` declines (`g` types
+/// `Dynamic`), and `join(Dynamic, Dynamic)` makes the name LOOK stable —
+/// so the run falls back to the structural criterion, which caps the
+/// sibling pin exactly as the reference's last-pass widen does.
+#[test]
+fn loop_fixpoint_declined_exit_falls_back_to_structural_cap() {
+    let src = b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = g(x)\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "a declined tracked exit must not read as converged, got {:?}",
+        i.get(ty)
+    );
+}
+
+/// Same gate, decision-decline shape: `i += 1 if i < 3` guards on a typed
+/// local, so the pass declines `i` and the structural cap sheds `t`'s pin
+/// (the reference is silent on `if t` here).
+#[test]
+fn loop_fixpoint_guarded_op_write_falls_back_to_structural_cap() {
+    let src = b"def f(c)\n  t = 1; i = 0\n  while c\n    if false; t = nil; end\n    i += 1 if i < 3\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "a guard-read decline must not read as converged, got {:?}",
+        i.get(ty)
+    );
+}
+
+/// A logical-growth RHS (`x = (x || 0) + 1`) is a self-read the fold
+/// cannot decide — the exit declines and the structural cap stands.
+#[test]
+fn loop_fixpoint_logical_growth_falls_back_to_structural_cap() {
+    let src = b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = (x || 0) + 1\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "a growing self-read must not read as converged, got {:?}",
+        i.get(ty)
+    );
+}
+
 /// A capped loop's widen lands on the POST-JOIN env, not the entry env:
-/// `w`'s own body write (`w = 1` under a `w = nil` seed) survives the cap
 /// pass the reference's way — `Integer | NilClass`, never a minted `nil` —
 /// so `if w` keeps no `Constant`/`NilClass` pin to fire on (rigor-rs#435
 /// review: the entry-env overlay turned this into an always-falsey FP).
