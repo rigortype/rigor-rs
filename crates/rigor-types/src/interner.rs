@@ -571,17 +571,16 @@ mod tests {
         }
         let n = (rng.below(3) + 1) as u32;
         let kids = pick(i, rng, n);
-        match rng.below(10) {
+        match rng.below(11) {
             0 => i.intern(Type::Tuple(kids)),
             1 => i.intern(Type::Union(kids)),
             2 => i.intern(Type::Intersection(kids)),
             3 => i.intern(Type::HashShape(
                 kids.iter()
-                    .enumerate()
-                    .map(|(n, &v)| ShapeMember {
-                        key: ShapeKey::Sym(format!("k{n}")),
+                    .map(|&v| ShapeMember {
+                        key: ShapeKey::Sym(format!("k{}", rng.below(4))),
                         value: v,
-                        optional: n % 2 == 0,
+                        optional: rng.below(2) == 0,
                     })
                     .collect(),
             )),
@@ -589,8 +588,7 @@ mod tests {
                 class: ClassId(rng.below(3) as u32),
                 members: kids
                     .iter()
-                    .enumerate()
-                    .map(|(n, &v)| (format!("m{n}"), v))
+                    .map(|&v| (format!("m{}", rng.below(4)), v))
                     .collect(),
             }),
             5 => i.intern(Type::Nominal {
@@ -606,6 +604,10 @@ mod tests {
                 removed: *kids.last().unwrap(),
             }),
             8 => i.intern(Type::Complement(kids[0])),
+            9 => i.intern(Type::App {
+                uri: crate::ty::HktUri(format!("uri{}", rng.below(3))),
+                args: kids,
+            }),
             _ => i.intern(Type::Dynamic(kids[0])),
         }
     }
