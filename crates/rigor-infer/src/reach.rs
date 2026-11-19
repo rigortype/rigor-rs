@@ -908,6 +908,19 @@ impl<'i> Typer<'i> {
             {
                 continue;
             }
+            // Absorption (rigor-rs#441): [`Reach::UNKNOWN`] is `join`'s top
+            // element and `Some(None)` is `pin_join`'s, so once BOTH hold
+            // every remaining write joins into the same `(reach, pin)` —
+            // the loop is then pure cost, about W^4 for W conditional
+            // self-rewrites of one local inside a loop (regexp_parser's
+            // `scanner.rb` sat in that band). The guard sits after the two
+            // `continue`s so a write that cannot reach the read is still
+            // skipped, never consulted; the pin half is load-bearing — a
+            // `reach`-only break would stop while pin could still move,
+            // changing the tuple this returns (and what the memo stores).
+            if reach == Reach::UNKNOWN && pin == Some(None) {
+                break;
+            }
             reach = reach.join(match *write {
                 LocalWrite::Plain(v) => {
                     pin = pin_join(pin, self.expr_scalar(ast, v, seen));
