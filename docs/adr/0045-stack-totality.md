@@ -1,6 +1,9 @@
 # Stack totality: 256 MiB analysis threads and a 25,000-level depth bound
 
 Status: accepted 2026-10-28 (issue [#412](https://github.com/rigortype/rigor-rs/issues/412)).
+Amended 2026-11-19 ([#431](https://github.com/rigortype/rigor-rs/issues/431)): the command
+thread reserves its stack before the rayon pool; fallback wording names the
+actual stack (never "the platform default").
 Measured on release builds (aarch64 macOS, toolchain 1.88, the toolchain the
 release binaries use).
 
@@ -34,20 +37,33 @@ an empty report). See
 
 1. **Every analysis thread gets a 256 MiB stack**
    (`rigor_parse::ANALYSIS_STACK_BYTES`, spawned by `rigor-cli/src/threads.rs`):
-   - `main` first builds the global rayon pool, once, with a spawn handler
-     that gives each worker the stack. `build_global` is one-shot: rayon
-     marks the registry as set even when building fails, so a retry with a
-     smaller size would leave no pool at all. The fallback therefore happens
-     per thread, inside the handler: 256 MiB, then 64 MiB, then the platform
-     default.
-   - `main` then runs the whole command on a spawned thread named `main`, so
-     panic and overflow messages read as before. It falls back the same way,
-     and runs the command on the process's main thread if no thread can be
-     created at all.
+   - `main` first starts the command thread (named `main`, so panic and
+     overflow messages read as before). That thread reserves its stack
+     **before** the rayon pool, so a host that caps total reservations
+     (`ulimit -v`, `vm.overcommit_memory=2`) cannot leave the command on a
+     smaller stack than master's 8 MiB main thread (rigor-rs#431).
+   - On Unix the command thread tries 256 MiB then 64 MiB; if both fail it
+     runs inline on the process main thread (8 MiB) rather than spawning at
+     Rust's 2 MiB default. On Windows the main thread is only 1 MiB, so the
+     command thread still tries that 2 MiB spawn default before running
+     inline.
+   - The command thread then builds the global rayon pool, once, with a
+     spawn handler that gives each worker the stack. `build_global` is
+     one-shot: rayon marks the registry as set even when building fails, so
+     a retry with a smaller size would leave no pool at all. The fallback
+     therefore happens per thread, inside the handler: 256 MiB, then 64 MiB,
+     then Rust's 2 MiB spawn default (`thread::Builder` with no
+     `stack_size` — not the OS main-thread stack). If no worker can be
+     created even at that size, the process prints one error (`rigor: could
+     not start the analysis thread pool: …`) and exits; it does not
+     continue into a later `GlobalPoolAlreadyInitialized` panic.
    - The `coverage --workers=N` pool uses the same handler.
-   - A large stack never stops a command from starting. A thread that falls
-     back prints one stderr line per process ("could not reserve 256 MiB
-     thread stacks …"); the normal path prints nothing.
+   - A large stack never stops a command from starting (the command thread
+     can always fall back to the process main thread). A thread that falls
+     back prints one stderr line per process; the normal path prints
+     nothing. The line names what was actually used: "64 MiB", "Rust's 2 MiB
+     spawn default", or "the process main thread" — never "the platform
+     default".
 2. **A depth bound of 25,000** (`rigor_parse::MAX_NESTING_DEPTH`):
    - Depth is counted in Prism child edges; the program node is depth 1.
    - `rigor_parse::parse_bounded` measures it right after the parse, before
@@ -179,9 +195,11 @@ memory. Medians over interleaved runs; every variant produced identical output:
   shape with 2 lines; the 256 MiB stacks raise the threshold about 30×.
 - **A file past the bound that also has syntax errors** reports the depth
   refusal instead of its parse errors. The bound is checked before the
-  parse-error branch, so a refused tree is never walked. On master,
-  `x.a…×30000` followed by `)` reported `unexpected ')', ignoring it`. This
-  sits inside the divergence region, where the reference exits 70.
+  parse-error branch, so a refused tree is never walked. This also applies
+  to LSP buffers: `didOpen` / `didChange` publish the refusal finding, not
+  the buffer's parse errors. On master, `x.a…×30000` followed by `)`
+  reported `unexpected ')', ignoring it`. This sits inside the divergence
+  region, where the reference exits 70.
 - **Prism's own parse is quadratic on `&&`, `||`, `and` and `or` chains**, so
   refusing such a file still pays for the parse: `Prism.parse_success?` takes
   0.8 s at 30k links, 4.0 s at 60k and 14.8 s at 120k. "Time binds before
@@ -196,8 +214,10 @@ memory. Medians over interleaved runs; every variant produced identical output:
     unreadable ones.
 - **Linux strict overcommit.** Under `vm.overcommit_memory = 2`, every
   thread's 256 MiB reservation counts against the commit limit: one command
-  thread plus one per core. Default heuristic overcommit, macOS and Windows
-  only reserve. Windows creates threads with
+  thread plus one per core. The command thread claims first (rigor-rs#431),
+  so the pool's ncpu × 256 MiB cannot spend the budget and leave the
+  command on Rust's 2 MiB spawn default. Default heuristic overcommit,
+  macOS and Windows only reserve. Windows creates threads with
   `STACK_SIZE_PARAM_IS_A_RESERVATION`.
 - **Debug builds** reuse the release-calibrated 256 MiB. Debug frames are
   10–40× larger, so a debug binary still overflows on some capped kinds near

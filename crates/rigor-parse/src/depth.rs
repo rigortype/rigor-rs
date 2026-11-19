@@ -27,7 +27,9 @@ pub const MAX_NESTING_DEPTH: usize = 25_000;
 /// The stack every analysis thread runs on: the command thread rigor-cli
 /// spawns, and every rayon worker, both in the global pool and in
 /// `coverage --workers`. A host that cannot reserve it falls back to 64 MiB,
-/// then to the platform default (rigor-cli `threads.rs`).
+/// then to Rust's 2 MiB spawn default for pool workers; the command thread
+/// on Unix runs on the process main thread instead (rigor-cli `threads.rs`,
+/// rigor-rs#431).
 ///
 /// Sized for a tree at [`MAX_NESTING_DEPTH`], measured on release aarch64
 /// builds (ADR-0045):

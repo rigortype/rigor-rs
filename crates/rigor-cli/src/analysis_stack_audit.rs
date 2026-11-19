@@ -41,8 +41,9 @@
 //! fails the audit until its entry is updated.
 //!
 //! `rayon::spawn`/`rayon::scope`/`par_iter` are NOT flagged: their work
-//! lands on the global pool, which `configure_global_pool` has already
-//! given the analysis stack. Only thread CREATION can bypass it.
+//! lands on the global pool, which `configure_global_pool` (the first step
+//! of the command thread, rigor-rs#431) has already given the analysis
+//! stack. Only thread CREATION can bypass it.
 //!
 //! Modelled on `rigor-parse`'s `family_inventory.rs` — `blank`, `close_of`
 //! and the identifier helpers are copied verbatim.
