@@ -2778,3 +2778,29 @@ fn def_local_env_binds_a_rescue_reference() {
     ];
     check_def_local_rows("def_local_env_binds_a_rescue_reference", rows);
 }
+
+/// rigor-rs#427: the two composite-type predicates walk an explicit stack, so
+/// an inferred carrier deeper than any bounded call stack still answers.
+#[test]
+fn deep_carriers_do_not_overflow_type_predicates() {
+    const DEPTH: usize = 200_000;
+    let mut i = Interner::new();
+    let one = i.int(1);
+    let mut deep = one;
+    for _ in 0..DEPTH {
+        deep = i.intern(Type::Tuple(vec![deep]));
+    }
+    let index = CoreIndex::new();
+    let handle = std::thread::Builder::new()
+        .stack_size(512 * 1024)
+        .spawn(move || {
+            (
+                nested_pinned_literal(&i, deep, false),
+                composite_holds_unsound(&i, &index, deep),
+            )
+        })
+        .unwrap();
+    // A Tuple-of-Constant chain: a nested pinned literal is found; no union or
+    // bare-generic member, so the composite holds nothing unsound.
+    assert_eq!(handle.join().unwrap(), (true, false));
+}
