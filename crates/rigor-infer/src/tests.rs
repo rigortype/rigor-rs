@@ -2390,6 +2390,33 @@ fn loop_decided_if_arm_keeps_pin_after_fuel_starved_first_fold() {
     assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
 }
 
+/// rigor-rs#437 review: a name the port CANNOT type before the loop
+/// (`s ||= nil` — the replay doesn't model the write, so `s`'s seed is
+/// `Dynamic`) where the reference knows it is `nil`: the seed-exactness
+/// gate must decline the fixpoint, or the pass converges a turn early and
+/// keeps `t`'s pin where the reference's cap widen sheds it. Reviewer
+/// counterexample: `if t` must NOT fold.
+#[test]
+fn loop_untyped_seed_still_forces_structural_cap() {
+    let src = b"def f(c, e)\n  d = 1; t = 1\n  s = nil\n  s ||= nil\n  while c\n    if d then y = 2 else t = nil end\n    if s then y = 1 end\n    s = t\n  end\n  if t then y = 3 end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "an untyped seed must keep the structural cap, got {:?}",
+        i.get(ty)
+    );
+}
+
 /// The order-sensitive twin (rigor-rs#437, oracle-probed): with the
 /// CONDITIONAL write last (`if s` after `if d`), `y` is still moving on the
 /// cap pass, so the widen sheds every tracked pin — `if t` must NOT fold.

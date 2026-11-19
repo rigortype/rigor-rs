@@ -104,6 +104,18 @@ x4/x6 rows are constrained the same way.
   #691), (d)4 `landed` first-completion under two memos (unchanged
   pre-#437 semantics; noted).
 - Grok 4.6 second opinion: provider quota exhausted (402) — no review.
+- Opus 5.5 gate review (on the pre-tightening head aa0076d): `Needs fix`
+  — (1) new FP family from the removed seed gate: `s ||= nil`, `s, =
+  nil`, `s = (k && 1)` etc. minted early convergence keeping `t`'s pin —
+  fixed by the full restore, reviewer-verified on a scratch build, now
+  pinned by `loop_untyped_seed_still_forces_structural_cap`; (2) the
+  first-cut settled-set fold-order audit panicked on fixture 130, v5,
+  backedge and two sweep files, and `run_snapshot.rb` swallows panic
+  stderr — fixed by the same-partial-set rescope (verified via stderr
+  grep over all 173 corpus files + the flagged sweep files); (3) the
+  nested-loop flag clobber — fixed (prev restore); (4) PR body: `Refs`
+  not `Closes` (x5's `zz` undelivered), x5's "before" state, audit gate
+  restated.
 
 ## Follow-ups
 
