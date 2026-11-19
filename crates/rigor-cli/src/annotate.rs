@@ -155,7 +155,7 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
     let env = typer.build_toplevel_env(&ast, &mut interner);
 
     let line_types =
-        collect_line_types(&ast, &typer, &source_index, &index, &env, &mut interner, &source);
+        collect_line_types(&ast, &typer, &source_index, &index, &env, &mut interner);
 
     match format.as_str() {
         "json" => emit_json(&line_types),
@@ -165,16 +165,11 @@ pub fn cmd_annotate(args: &[String]) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-/// The 1-based line a byte offset sits on.
-fn line_of(source: &str, offset: usize) -> usize {
-    crate::line_col(source, offset).0
-}
-
 /// The 1-based line a node's span ENDS on (the last character, since the span's
 /// end offset is exclusive).
-fn end_line(source: &str, node: &Node) -> usize {
+fn end_line(lines: &rigor_parse::LineIndex, node: &Node) -> usize {
     let (_start, end) = node.span();
-    line_of(source, end.saturating_sub(1))
+    lines.line(end.saturating_sub(1))
 }
 
 /// Resolve every source line to the type of the expression it evaluates to,
@@ -186,8 +181,8 @@ fn collect_line_types(
     index: &CoreIndex,
     env: &TypeEnv,
     interner: &mut Interner,
-    source: &str,
 ) -> BTreeMap<usize, String> {
+    let lines = ast.line_index();
     let describe = |interner: &Interner, ty| crate::type_display::describe(interner, index, source_index, ty);
     // The type string a node evaluates to: a `def` → its method-name symbol
     // (`:greet`); an assignment → its RHS value (the reference `StatementEvaluator`
@@ -222,7 +217,7 @@ fn collect_line_types(
     statement_ids.sort_unstable();
     statement_ids.dedup();
     for id in &statement_ids {
-        let line = end_line(source, ast.get(*id));
+        let line = end_line(lines, ast.get(*id));
         let s = type_at(*id, interner);
         by_line.insert(line, s);
     }
@@ -236,7 +231,7 @@ fn collect_line_types(
             continue;
         }
         let (start, end) = node.span();
-        let line = end_line(source, node);
+        let line = end_line(lines, node);
         let span = end.saturating_sub(start);
         match widest.get(&line) {
             Some((best, _)) if *best >= span => {}
@@ -258,7 +253,7 @@ fn collect_line_types(
     // the return cannot be inferred the annotation is dropped.
     for (id, node) in ast.iter() {
         if let Node::Definition { name: Some(_), has_explicit_return, body, .. } = node {
-            let start_line = line_of(source, ast.get(id).span().0);
+            let start_line = lines.line(ast.get(id).span().0);
             match def_return_type(ast, typer, body, *has_explicit_return, env, interner, &describe) {
                 Some(t) => {
                     by_line.insert(start_line, t);
@@ -409,7 +404,7 @@ pub fn annotations_json(index: &CoreIndex, source: &str) -> Result<String, Strin
     let mut interner = Interner::new();
     let env = typer.build_toplevel_env(&ast, &mut interner);
     let line_types =
-        collect_line_types(&ast, &typer, &source_index, index, &env, &mut interner, source);
+        collect_line_types(&ast, &typer, &source_index, index, &env, &mut interner);
     Ok(annotations_json_string(&line_types))
 }
 
@@ -425,7 +420,7 @@ mod tests {
         let typer = Typer::with_source(&index, &source_index);
         let mut interner = Interner::new();
         let env = typer.build_toplevel_env(&ast, &mut interner);
-        collect_line_types(&ast, &typer, &source_index, &index, &env, &mut interner, src)
+        collect_line_types(&ast, &typer, &source_index, &index, &env, &mut interner)
     }
 
     fn annotate(src: &str) -> String {

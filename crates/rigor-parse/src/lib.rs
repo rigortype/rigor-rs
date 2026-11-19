@@ -18,6 +18,9 @@ pub use depth::{parse_bounded, TooDeep, ANALYSIS_STACK_BYTES, MAX_NESTING_DEPTH}
 pub mod mutators;
 /// ADR-17 — the `pre_eval:` scanner (`ProjectPatchedScanner`'s walk).
 pub mod pre_eval;
+/// Shared line-start table (rigor-rs#642): one scan, O(log lines) per offset.
+pub mod line_index;
+pub use line_index::LineIndex;
 
 pub use ast::{
     lower, lower_with_key, AncestryFacts, BlockParamKind, GATED_FEATURES, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, MIXIN_UNNAMED, ConstMutation, FileKey, HashKey, HashKeyTag,
@@ -59,10 +62,12 @@ pub fn looks_like_erb_template(source: &[u8]) -> bool {
 /// `comment.location.start_column + 1` on ASCII.
 ///
 /// Prism's `Location` exposes only a start byte offset (no 1-based line), so the
-/// line is derived by counting newlines in `source` up to that offset. `source`
-/// MUST be the same byte slice that was parsed. The comment text is the verbatim
-/// `# ...` source slice, lossily decoded from UTF-8 (invalid bytes become the
-/// replacement character — the directives are ASCII, so this never drops them).
+/// line is derived from [`LineIndex`] — the same table the lowering builder
+/// already computed (rigor-rs#642). `source` MUST be the same byte slice that
+/// was parsed, and `lines` MUST have been built from it. The comment text is
+/// the verbatim `# ...` source slice, lossily decoded from UTF-8 (invalid bytes
+/// become the replacement character — the directives are ASCII, so this never
+/// drops them).
 ///
 /// Total and panic-free: a malformed comment offset is clamped to the source
 /// length, and the empty/inverted range that `as_slice` would panic on is
@@ -71,16 +76,8 @@ pub fn looks_like_erb_template(source: &[u8]) -> bool {
 pub fn comment_lines(
     result: &ruby_prism::ParseResult<'_>,
     source: &[u8],
+    lines: &LineIndex,
 ) -> Vec<(usize, usize, String)> {
-    // Precompute the byte offset of every line start so each comment's line is a
-    // binary search instead of a re-scan from the top of the file.
-    let mut line_starts: Vec<usize> = vec![0];
-    for (i, &b) in source.iter().enumerate() {
-        if b == b'\n' {
-            line_starts.push(i + 1);
-        }
-    }
-
     let mut out = Vec::new();
     for comment in result.comments() {
         // `=begin … =end` embedded documents are ignored by the reference —
@@ -98,9 +95,7 @@ pub fn comment_lines(
         } else {
             String::new()
         };
-        // 1-based line: number of line-starts at or before `start`.
-        let line = line_starts.partition_point(|&ls| ls <= start);
-        out.push((line, start, text));
+        out.push((lines.line(start), start, text));
     }
     out
 }

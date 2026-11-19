@@ -2005,14 +2005,17 @@ fn analyze_files(
                 if result.errors().next().is_some() {
                     return Lowered::Unparseable(parse_diagnostics(&result));
                 }
-                let comments = rigor_parse::comment_lines(&result, &source_bytes);
                 // Issue #102: the AST carries the file's CANONICAL-path identity,
                 // which is what the per-file constant gate compares. `check`
                 // lowers each discovered path exactly once, so this is the same
                 // partition the old per-`lower()` counter drew — but it is now a
                 // property of the FILE, so a re-lowering (the LSP) and a
                 // persisted harvest agree with it too.
-                Lowered::Parsed(lower_with_key(&result, FileKey::for_path(Path::new(path))), comments)
+                // Comments read the AST's line index (rigor-rs#642) so this
+                // path does not scan the file a second time.
+                let ast = lower_with_key(&result, FileKey::for_path(Path::new(path)));
+                let comments = rigor_parse::comment_lines(&result, &source_bytes, ast.line_index());
+                Lowered::Parsed(ast, comments)
             }));
             match lowered {
                 // A discovery-only file that cannot be parsed contributes no
@@ -2129,12 +2132,12 @@ fn analyze_files(
                 // failures the user cannot silence away"). So a parse error is
                 // not re-stamped by `severity_profile:`, not silenced by
                 // `disable:`, and not silenced by a `# rigor:disable` marker.
-                let starts = line_starts(&source);
+                let lines = rigor_parse::LineIndex::new(source.as_bytes());
                 for diag in diags {
                     findings.push((
                         order,
                         path.clone(),
-                        line_col_at(&source, &starts, diag.start_offset),
+                        lines.line_col(diag.start_offset),
                         diag,
                     ));
                 }
@@ -2238,15 +2241,13 @@ fn analyze_files(
                     // `suppression.empty`) is produced into the SAME list BEFORE
                     // `filter_suppressed`, so a marker can suppress its own complaint.
                     diags.extend(rigor_rules::suppression_marker_diagnostics(&p.comments));
-                    // One line-start table per file (rigor-rs#636): every
-                    // offset below resolves by binary search, not by
-                    // `line_col`'s O(prefix) walk per diagnostic.
-                    let starts = line_starts(&p.source);
+                    // The AST's line index (rigor-rs#642 / #636): every offset
+                    // below resolves by binary search, not by an O(prefix) walk
+                    // per diagnostic, and without a second file scan.
+                    let lines = p.ast.line_index();
                     let with_lines: Vec<(usize, Diagnostic)> = diags
                         .into_iter()
-                        .map(|diag| {
-                            (line_col_at(&p.source, &starts, diag.start_offset).0, diag)
-                        })
+                        .map(|diag| (lines.line(diag.start_offset), diag))
                         .collect();
                     let mut local = Vec::new();
                     for (_line, mut diag) in
@@ -2296,7 +2297,7 @@ fn analyze_files(
                         local.push((
                             p.order,
                             p.path.clone(),
-                            line_col_at(&p.source, &starts, diag.start_offset),
+                            lines.line_col(diag.start_offset),
                             diag,
                         ));
                     }
@@ -2689,7 +2690,7 @@ type Finding = (usize, String, (usize, usize), Diagnostic);
 
 /// A run's findings: `(input-order, path, (line, column), diagnostic)`
 /// tuples. The position is resolved ONCE where the row is produced (stage 3
-/// and the parse-error drain build a [`line_starts`] table per file; run- and
+/// and the parse-error drain read a [`rigor_parse::LineIndex`] per file; run- and
 /// path-level rows carry `(1, 1)`): the tuple used to lug a full clone of the
 /// file's source so the renderers could re-walk it per row — O(diagnostics ×
 /// file bytes) in both memory and time, rigor-rs#636's 160 s / ~49 GB
@@ -3591,7 +3592,7 @@ fn print_rendered(
 }
 
 /// Project each finding's stored 1-based (line, column) — resolved once at
-/// production ([`line_col_at`]) — into the fields the CI formatters read.
+/// production ([`rigor_parse::LineIndex::line_col`]) — into the fields the CI formatters read.
 /// `rule_id` is rigor-rs's qualified rule (the `builtin` family is kept bare
 /// in `rule_id`).
 fn to_rendered(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> Vec<Rendered<'_>> {
@@ -3701,54 +3702,7 @@ fn push_kv_num(buf: &mut String, key: &str, value: usize) {
 /// real corpora reported the same diagnostic at a different column than the
 /// reference — a parity break on 8 of the 24 survey FP candidates.
 fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
-    if source.is_empty() {
-        return (1, 1);
-    }
-    let clamped = byte_offset.min(source.len());
-    let mut line = 1usize;
-    let mut line_start = 0usize;
-    for (i, b) in source.as_bytes().iter().enumerate() {
-        if i >= clamped {
-            break;
-        }
-        if *b == b'\n' {
-            line += 1;
-            line_start = i + 1;
-        }
-    }
-    // Column = byte count between the line start and the offset, plus 1.
-    (line, clamped - line_start + 1)
-}
-
-/// Byte offset of every line start in `source`: `[0]`, then `i + 1` per
-/// `\n` — the same table `rigor_parse`'s lowering builder computes for its
-/// node lines and drops with the `LoweredAst`. Build it ONCE per source and
-/// resolve with [`line_col_at`]: the findings path resolves EVERY diagnostic
-/// against the same file, and `line_col`'s byte walk is O(prefix) per call —
-/// O(diagnostics × file bytes), the quadratic behind rigor-rs#636's 160 s
-/// wall on a 60k-diagnostic file.
-fn line_starts(source: &str) -> Vec<usize> {
-    let mut starts = Vec::with_capacity(source.len() / 64 + 1);
-    starts.push(0);
-    for (i, &b) in source.as_bytes().iter().enumerate() {
-        if b == b'\n' {
-            starts.push(i + 1);
-        }
-    }
-    starts
-}
-
-/// [`line_col`] over a precomputed [`line_starts`] table — the binary-search
-/// form of its byte walk, O(log lines) per call with identical output.
-fn line_col_at(source: &str, starts: &[usize], byte_offset: usize) -> (usize, usize) {
-    let clamped = byte_offset.min(source.len());
-    // `starts[0] == 0` keeps the partition point ≥ 1, and it IS the 1-based
-    // line: a `\n` AT the offset starts the NEXT line (recorded as `i + 1`,
-    // excluded by `<=`), matching the walk's `i >= clamped` break. An
-    // out-of-range clamped offset lands on the final start — the walk's
-    // clamped result too.
-    let line = starts.partition_point(|&s| s <= clamped);
-    (line, clamped - starts[line - 1] + 1)
+    rigor_parse::LineIndex::new(source.as_bytes()).line_col(byte_offset)
 }
 
 /// One diagnostic per raw Prism parse ERROR, in Prism's own order.
