@@ -454,23 +454,67 @@ fn main_self_literal(n: &PrismNode<'_>) -> bool {
     body.len() == 1 && literal(&body[0])
 }
 
-/// `node.compact_child_nodes` — every direct child, in visit order.
+/// Direct children of `n`, in visit order.
 ///
-/// The previous visitor walked the whole subtree just to keep depth==1
-/// nodes; a modifier-`if` chain then re-walked each remaining suffix
-/// (rigor-rs#424). Invoking the type-specific child walk on the root and
-/// collecting `visit` without descending matches Prism's compact list.
+/// Control-flow kinds ([`main_self_control_flow`]) use a type-specific
+/// child walk that does not descend: a modifier-`if` chain otherwise
+/// re-walked each remaining suffix (rigor-rs#424). Prism's `visit_if_node`
+/// (and while/begin) flatten the `StatementsNode` into those children;
+/// that is sound here because the wrapper is itself a control-flow kind.
+/// Every other kind keeps the depth==1 visitor — `CallNode` / `DefNode`
+/// / `ParametersNode` are not on the control-flow list, and emptying
+/// them dropped mixin-taint writes inside blocks (`send(m, …)`).
 fn compact_children<'pr>(n: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
+    if main_self_control_flow(n) {
+        struct Direct<'pr> {
+            out: Vec<PrismNode<'pr>>,
+        }
+        impl<'pr> Visit<'pr> for Direct<'pr> {
+            fn visit(&mut self, node: &PrismNode<'pr>) {
+                self.out.push(node_copy(node));
+            }
+        }
+        let mut c = Direct { out: Vec::new() };
+        walk_compact_root(&mut c, n);
+        c.out
+    } else {
+        compact_children_visit(n)
+    }
+}
+
+/// Master's depth==1 visitor: walk the whole subtree, keep only the
+/// nodes entered at depth 1. Used for kinds [`walk_compact_root`] does
+/// not list.
+fn compact_children_visit<'pr>(n: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
     struct Children<'pr> {
+        depth: usize,
         out: Vec<PrismNode<'pr>>,
     }
     impl<'pr> Visit<'pr> for Children<'pr> {
-        fn visit(&mut self, node: &PrismNode<'pr>) {
-            self.out.push(node_copy(node));
+        fn visit_branch_node_enter(&mut self, node: PrismNode<'pr>) {
+            if self.depth == 1 {
+                self.out.push(node);
+            }
+            self.depth += 1;
+        }
+        fn visit_branch_node_leave(&mut self) {
+            self.depth -= 1;
+        }
+        fn visit_leaf_node_enter(&mut self, node: PrismNode<'pr>) {
+            if self.depth == 1 {
+                self.out.push(node);
+            }
+            self.depth += 1;
+        }
+        fn visit_leaf_node_leave(&mut self) {
+            self.depth -= 1;
         }
     }
-    let mut c = Children { out: Vec::new() };
-    walk_compact_root(&mut c, n);
+    let mut c = Children {
+        depth: 0,
+        out: Vec::new(),
+    };
+    c.visit(n);
     c.out
 }
 
@@ -2083,5 +2127,57 @@ mod tests {
         for src in no {
             assert!(scan(src).is_empty(), "{}", String::from_utf8_lossy(src));
         }
+    }
+
+    fn program_stmt<'a>(result: &'a ruby_prism::ParseResult<'a>) -> ruby_prism::Node<'a> {
+        result
+            .node()
+            .as_program_node()
+            .expect("program")
+            .statements()
+            .body()
+            .iter()
+            .next()
+            .expect("one statement")
+    }
+
+    /// Callers besides `main_self_visit` pass Call/Def/Parameters; emptying
+    /// those dropped mixin-taint writes (PR #669 review).
+    #[test]
+    fn compact_children_of_a_call_with_block_includes_the_block() {
+        let result = crate::parse(b"[1].each { m = :include }\n");
+        let stmt = program_stmt(&result);
+        assert!(stmt.as_call_node().is_some());
+        let kids = super::compact_children(&stmt);
+        assert!(
+            kids.iter().any(|k| k.as_block_node().is_some()),
+            "CallNode block must be a compact child (got {})",
+            kids.len()
+        );
+    }
+
+    #[test]
+    fn compact_children_of_def_self_is_nonempty() {
+        let result = crate::parse(b"def self.go\n  m = :extend\nend\n");
+        let stmt = program_stmt(&result);
+        assert!(stmt.as_def_node().is_some());
+        let kids = super::compact_children(&stmt);
+        assert!(
+            !kids.is_empty(),
+            "DefNode compact children must include the body"
+        );
+    }
+
+    #[test]
+    fn compact_children_of_if_still_reaches_the_then_call() {
+        let result = crate::parse(b"foo if x\n");
+        let stmt = program_stmt(&result);
+        assert!(stmt.as_if_node().is_some());
+        let kids = super::compact_children(&stmt);
+        assert!(
+            kids.iter().any(|k| k.as_call_node().is_some() || k.as_statements_node().is_some()),
+            "IfNode compact children must include the then-arm (got {})",
+            kids.len()
+        );
     }
 }
