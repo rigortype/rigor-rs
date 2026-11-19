@@ -12,9 +12,13 @@
 //! - the command thread on Windows: an explicit 2 MiB stack, then the
 //!   process main thread (1 MiB).
 //!
-//! A large stack never stops a command from starting. A pool that cannot
-//! be built at all prints one error and the command returns failure; it
-//! does not continue into a later `GlobalPoolAlreadyInitialized` panic.
+//! The command's own stack never stops a command from starting — it can
+//! always fall back to the process main thread. A pool with no worker at
+//! all does: it prints one error and the command exits 70 (the reference's
+//! `EXIT_INTERNAL_ERROR`, rigor-rs#678); it does not continue into a later
+//! `GlobalPoolAlreadyInitialized` panic. Commands that only print static
+//! text (`help`, `version`, `upgrade`) never reach the pool build, so
+//! they still answer on a host too starved for even one worker.
 
 use std::io;
 use std::process::ExitCode;
@@ -217,8 +221,9 @@ where
 /// when building it fails, so it is never retried with other settings. The
 /// stack fallback happens per thread, inside the spawn handler. If no
 /// worker can be created even at 2 MiB, this prints
-/// one error and returns `false` so the command can exit; a later parallel
-/// stage would otherwise panic with `GlobalPoolAlreadyInitialized`.
+/// one error and returns `false` so the command can exit 70
+/// (`EXIT_INTERNAL_ERROR`); a later parallel stage would otherwise panic
+/// with `GlobalPoolAlreadyInitialized`.
 pub(crate) fn configure_global_pool() -> bool {
     match rayon::ThreadPoolBuilder::new()
         .spawn_handler(spawn_pool_thread)

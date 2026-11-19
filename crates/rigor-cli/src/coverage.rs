@@ -569,7 +569,15 @@ fn scan_paths(
             .spawn_handler(crate::threads::spawn_pool_thread)
             .build()
             .map(|pool| pool.install(scan_all))
-            .unwrap_or_else(|_| scan_all()),
+            // A scoped pool that cannot be built falls back to the global
+            // pool; disclose it so the run is not silently un-sized
+            // (rigor-rs#678).
+            .unwrap_or_else(|e| {
+                eprintln!(
+                    "rigor coverage: could not build the --workers pool ({e}); using the global pool"
+                );
+                scan_all()
+            }),
         None => scan_all(),
     };
 

@@ -111,18 +111,34 @@ fn main() -> ExitCode {
     threads::run_command_thread(run_command_with_pool)
 }
 
+/// The reference's `EXIT_INTERNAL_ERROR` (`rigor/cli.rb`, #609): a run
+/// rigor could not start or finish. Distinct from 1 (findings) and 64
+/// (usage), so a CI step can tell "rigor could not start" from "rigor
+/// found findings" (rigor-rs#678).
+const EXIT_INTERNAL_ERROR: u8 = 70;
+
 /// The command thread's entry: claim the analysis stack, then the pool.
 fn run_command_with_pool() -> ExitCode {
-    if !threads::configure_global_pool() {
-        return ExitCode::FAILURE;
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if needs_analysis_pool(&args) && !threads::configure_global_pool() {
+        return ExitCode::from(EXIT_INTERNAL_ERROR);
     }
-    run_command()
+    dispatch(&args)
 }
 
-/// The command dispatch, on the thread [`main`] starts.
-fn run_command() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
-    dispatch(&args)
+/// `true` when the command may run analysis and so needs the rayon pool
+/// built first. The help and version surfaces print static text and never
+/// touch rayon, so they skip the pool build: on a host too starved to
+/// spawn even one 2 MiB worker they still answer instead of exiting 70
+/// (rigor-rs#678). Every other command keeps the pool-first ordering — the
+/// safe side, since a command that reached rayon before
+/// `configure_global_pool` ran would build a default pool on unbounded
+/// stacks.
+fn needs_analysis_pool(args: &[String]) -> bool {
+    !matches!(
+        args.first().map(String::as_str),
+        None | Some("-h" | "--help" | "help" | "version" | "--version" | "-v" | "-V" | "upgrade")
+    )
 }
 
 /// `CLI#run` + `CLI#dispatch` over the full argv (`help <command>` re-enters
