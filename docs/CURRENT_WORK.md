@@ -62,6 +62,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #427 walkers** (PR #680): stackless first-difference `Interner::cmp` + iterative `literal_seed`/sig-gen predicates; 200k-pair SIGABRT→`Less`; byte-identical; 0 FP; Approved×2. → #685. [note](notes/20261119-issue-427-iterative-walkers.md)
 - **2026-11-19 #638 MERGED** (PR #674): exact-gated loop fixpoint replay; #435 structural fallback on declines. 0 FP/360; Approved. → #681–#684. [note](notes/20261119-issue-638-loop-fixpoint.md)
 - **2026-11-19 #431 CLOSED** (PR #675): command thread reserves its stack before the rayon pool — a capped host can no longer strand it on Rust's 2 MiB default; fallback messages name the actual stack. ADR-0045 amended; → #676–#679. [note](notes/20261119-issue-431-stack-fallback-order.md)
 - **2026-11-19 #424 modifier-if** (PR #669): subsequent-first exit + compact_children; 10k `if true` 2.16s→0.52s; 0 FP. [note](notes/20261119-issue-424-modifier-if.md)
