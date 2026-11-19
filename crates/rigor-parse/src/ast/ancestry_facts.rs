@@ -455,34 +455,79 @@ fn main_self_literal(n: &PrismNode<'_>) -> bool {
 }
 
 /// `node.compact_child_nodes` — every direct child, in visit order.
+///
+/// The previous visitor walked the whole subtree just to keep depth==1
+/// nodes; a modifier-`if` chain then re-walked each remaining suffix
+/// (rigor-rs#424). Invoking the type-specific child walk on the root and
+/// collecting `visit` without descending matches Prism's compact list.
 fn compact_children<'pr>(n: &PrismNode<'pr>) -> Vec<PrismNode<'pr>> {
     struct Children<'pr> {
-        depth: usize,
         out: Vec<PrismNode<'pr>>,
     }
     impl<'pr> Visit<'pr> for Children<'pr> {
-        fn visit_branch_node_enter(&mut self, node: PrismNode<'pr>) {
-            if self.depth == 1 {
-                self.out.push(node);
-            }
-            self.depth += 1;
-        }
-        fn visit_branch_node_leave(&mut self) {
-            self.depth -= 1;
-        }
-        fn visit_leaf_node_enter(&mut self, node: PrismNode<'pr>) {
-            if self.depth == 1 {
-                self.out.push(node);
-            }
-            self.depth += 1;
-        }
-        fn visit_leaf_node_leave(&mut self) {
-            self.depth -= 1;
+        fn visit(&mut self, node: &PrismNode<'pr>) {
+            self.out.push(node_copy(node));
         }
     }
-    let mut c = Children { depth: 0, out: Vec::new() };
-    c.visit(n);
+    let mut c = Children { out: Vec::new() };
+    walk_compact_root(&mut c, n);
     c.out
+}
+
+/// Drive Prism's per-type child visitor on `n` so [`compact_children`]'s
+/// `visit` sees only the compact (direct) children.
+fn walk_compact_root<'pr>(v: &mut impl Visit<'pr>, n: &PrismNode<'pr>) {
+    if let Some(node) = n.as_statements_node() {
+        ruby_prism::visit_statements_node(v, &node);
+    } else if let Some(node) = n.as_begin_node() {
+        ruby_prism::visit_begin_node(v, &node);
+    } else if let Some(node) = n.as_rescue_node() {
+        ruby_prism::visit_rescue_node(v, &node);
+    } else if let Some(node) = n.as_else_node() {
+        ruby_prism::visit_else_node(v, &node);
+    } else if let Some(node) = n.as_ensure_node() {
+        ruby_prism::visit_ensure_node(v, &node);
+    } else if let Some(node) = n.as_if_node() {
+        ruby_prism::visit_if_node(v, &node);
+    } else if let Some(node) = n.as_unless_node() {
+        ruby_prism::visit_unless_node(v, &node);
+    } else if let Some(node) = n.as_case_node() {
+        ruby_prism::visit_case_node(v, &node);
+    } else if let Some(node) = n.as_case_match_node() {
+        ruby_prism::visit_case_match_node(v, &node);
+    } else if let Some(node) = n.as_when_node() {
+        ruby_prism::visit_when_node(v, &node);
+    } else if let Some(node) = n.as_in_node() {
+        ruby_prism::visit_in_node(v, &node);
+    } else if let Some(node) = n.as_while_node() {
+        ruby_prism::visit_while_node(v, &node);
+    } else if let Some(node) = n.as_until_node() {
+        ruby_prism::visit_until_node(v, &node);
+    } else if let Some(node) = n.as_for_node() {
+        ruby_prism::visit_for_node(v, &node);
+    } else if let Some(node) = n.as_parentheses_node() {
+        ruby_prism::visit_parentheses_node(v, &node);
+    } else if let Some(node) = n.as_and_node() {
+        ruby_prism::visit_and_node(v, &node);
+    } else if let Some(node) = n.as_or_node() {
+        ruby_prism::visit_or_node(v, &node);
+    } else if let Some(node) = n.as_rescue_modifier_node() {
+        ruby_prism::visit_rescue_modifier_node(v, &node);
+    } else if let Some(node) = n.as_local_variable_write_node() {
+        ruby_prism::visit_local_variable_write_node(v, &node);
+    } else if let Some(node) = n.as_instance_variable_write_node() {
+        ruby_prism::visit_instance_variable_write_node(v, &node);
+    } else if let Some(node) = n.as_global_variable_write_node() {
+        ruby_prism::visit_global_variable_write_node(v, &node);
+    } else if let Some(node) = n.as_constant_write_node() {
+        ruby_prism::visit_constant_write_node(v, &node);
+    } else if let Some(node) = n.as_multi_write_node() {
+        ruby_prism::visit_multi_write_node(v, &node);
+    } else if let Some(node) = n.as_arguments_node() {
+        ruby_prism::visit_arguments_node(v, &node);
+    } else if let Some(node) = n.as_array_node() {
+        ruby_prism::visit_array_node(v, &node);
+    }
 }
 
 /// `MainSelfCalls.collect(body)` (upstream v0.4.8 #3007) — the span keys of
