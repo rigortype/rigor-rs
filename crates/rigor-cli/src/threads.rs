@@ -172,7 +172,7 @@ fn process_main_stack_bytes() -> u64 {
     // counts as the default the ladder assumes.
     let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
     if unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } == 0 {
-        unsafe { limit.assume_init() }.rlim_cur as u64
+        unsafe { limit.assume_init() }.rlim_cur
     } else {
         8 << 20
     }
@@ -538,7 +538,7 @@ mod tests {
         let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
         let rc = unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) };
         assert_eq!(rc, 0, "getrlimit works on every test host");
-        let expected = unsafe { limit.assume_init() }.rlim_cur as u64;
+        let expected = unsafe { limit.assume_init() }.rlim_cur;
         assert_eq!(process_main_stack_bytes(), expected);
     }
 }
