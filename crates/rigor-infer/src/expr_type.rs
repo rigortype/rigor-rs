@@ -1018,7 +1018,7 @@ impl<'i> Typer<'i> {
         self.predicate_polarity(interner, ty)
     }
 
-    fn predicate_polarity(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
+    pub(crate) fn predicate_polarity(&self, interner: &Interner, ty: TypeId) -> Option<bool> {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) | Type::Constant(Scalar::Bool(false)) => Some(false),
             Type::Constant(_)
