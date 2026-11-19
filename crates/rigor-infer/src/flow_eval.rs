@@ -2425,16 +2425,27 @@ impl<'i> Typer<'i> {
         // join, so a nested block's captured `[]=` lands nowhere
         // (`for i in xs; break (x.each { h[:a] = 9 }); end` keeps the
         // record — rigor-rs#363 review).
+        // rigor-rs#658 — the three `path_*` predicates answer from ONE DFS's
+        // marks rather than re-walking the shared path prefix per mutation
+        // (a `local.<mutator>` chain went cubic); a `wspan` no node carries
+        // falls back to the recursive walk.
+        let marks = self.path_marks(ast, root);
         if method == "[]="
             && !ast.in_bare_locals_only_carrier(wspan)
-            && self.path_content_writeback(ast, root, wspan)
+            && marks
+                .writeback(wspan)
+                .unwrap_or_else(|| self.path_content_writeback(ast, root, wspan))
         {
             drop_indexed_narrowings(env, name);
         }
         let evaluated = uncond
-            && (self.path_unconditional(ast, root, wspan)
+            && (marks
+                .uncond(wspan)
+                .unwrap_or_else(|| self.path_unconditional(ast, root, wspan))
                 || (indexed.operand_spans.contains(&wspan)
-                    && self.path_operand_evaluated(ast, root, wspan)));
+                    && marks
+                        .operand(wspan)
+                        .unwrap_or_else(|| self.path_operand_evaluated(ast, root, wspan))));
         // The `h[k] ||= v` record computes on the PRE-widening env
         // (`eval_index_or_write`: `index_write_stored_type(node, scope)`
         // before `IndexWriteWidening.widen`, then `with_indexed_narrowing`).
@@ -2626,7 +2637,11 @@ impl<'i> Typer<'i> {
         // Element mutators live in ordinary expression positions (argument
         // lists, splats), so the lenient operand path — not the strict
         // carrier mint — decides whether the call ran.
-        if !self.path_operand_evaluated(ast, root, m.span) {
+        if !self
+            .path_marks(ast, root)
+            .operand(m.span)
+            .unwrap_or_else(|| self.path_operand_evaluated(ast, root, m.span))
+        {
             env.remove(&lookup);
             return;
         }
@@ -2641,6 +2656,80 @@ impl<'i> Typer<'i> {
                 env.remove(&lookup);
             }
         }
+    }
+
+    /// [`PathMarks`] for `root`, through the small LRU on the typer: one DFS
+    /// over `root`'s subtree recording the flag each of the three
+    /// `path_*` walks would derive edge-by-edge — the same total ONE deep
+    /// walk spends, then shared by every contained mutation (rigor-rs#658:
+    /// the walks' shared prefixes made a `v.push(1)` × N chain cubic).
+    fn path_marks(&self, ast: &LoweredAst, root: NodeId) -> std::rc::Rc<PathMarks> {
+        let key = (ast.uid() as usize, root);
+        {
+            let mut cache = self.path_marks.borrow_mut();
+            if let Some(pos) = cache.iter().position(|&(k, _)| k == key) {
+                let entry = cache.remove(pos);
+                let marks = entry.1.clone();
+                cache.push(entry);
+                return marks;
+            }
+        }
+        let mut marks = PathMarks::default();
+        let mut stack = vec![(
+            root,
+            PathFlags { uncond: true, operand: true, writeback: false },
+        )];
+        while let Some((id, flags)) = stack.pop() {
+            let node = ast.get(id);
+            // Ancestors mark before their descendants exist on the stack,
+            // so `or_insert` keeps the OUTERMOST node's flags on a shared
+            // span — exactly as the recursive walks stop at the first node
+            // whose span is `wspan`.
+            marks.by_span.entry(node.span()).or_insert(flags);
+            let lenient = matches!(
+                node,
+                Node::Statements {
+                    kind: StatementsKind::Recovered | StatementsKind::Jump(_),
+                    ..
+                }
+            );
+            for (child, edge) in self.flow_children(node) {
+                // `path_content_writeback`'s edge test, verbatim: a
+                // `Barrier`, or a body child of a `while`/`until` loop (a
+                // `for` — no `predicate` — joins rather than writing back,
+                // and an index-target `for` misreads as `while` without
+                // the empty-index gate).
+                let writeback = flags.writeback
+                    || edge == FlowEdge::Barrier
+                    || matches!(
+                        node,
+                        Node::Loop {
+                            predicate: Some(_),
+                            index,
+                            index_writes,
+                            body,
+                            ..
+                        } if body.contains(&child)
+                            && index.is_empty()
+                            && index_writes.is_empty()
+                    );
+                stack.push((
+                    child,
+                    PathFlags {
+                        uncond: flags.uncond && edge == FlowEdge::Uncond,
+                        operand: flags.operand && (edge == FlowEdge::Uncond || lenient),
+                        writeback,
+                    },
+                ));
+            }
+        }
+        let marks = std::rc::Rc::new(marks);
+        let mut cache = self.path_marks.borrow_mut();
+        if cache.len() >= 8 {
+            cache.remove(0);
+        }
+        cache.push((key, marks.clone()));
+        marks
     }
 
     /// Whether `wspan`'s position inside `id` sits on an all-`Uncond` descent
@@ -3366,11 +3455,19 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> Vec<(rigor_parse::Span, String, TypeId)> {
+        if indexed.slot_writes.is_empty() {
+            return Vec::new();
+        }
+        let marks = self.path_marks(ast, root);
         indexed
             .slot_writes
             .iter()
             .filter(|w| w.span.0 >= span.0 && w.span.1 <= span.1)
-            .filter(|w| self.path_operand_evaluated(ast, root, w.span))
+            .filter(|w| {
+                marks
+                    .operand(w.span)
+                    .unwrap_or_else(|| self.path_operand_evaluated(ast, root, w.span))
+            })
             .filter_map(|w| {
                 self.slot_stored_type(ast, w, env, interner)
                     .map(|ty| (w.span, indexed_narrowing_key(&w.name, &w.key), ty))
@@ -4427,6 +4524,51 @@ enum FlowEdge {
     /// A scope that captures the whole env rather than evaluating inline —
     /// a literal block body, a lambda, a `def`/`class`/`module` body.
     Barrier,
+}
+
+/// The flags one node carries in [`PathMarks`] — what each `path_*`
+/// predicate's edge walk would have derived for the path from the replay
+/// root to the node.
+#[derive(Clone, Copy)]
+struct PathFlags {
+    /// [`Typer::path_unconditional`]: every edge on the path `Uncond`.
+    uncond: bool,
+    /// [`Typer::path_operand_evaluated`]: every edge `Uncond`, or out of a
+    /// `Recovered`/`Jump` carrier.
+    operand: bool,
+    /// [`Typer::path_content_writeback`]: some edge on the path a content
+    /// write-back boundary (`Barrier`, or a `while`/`until` body child).
+    writeback: bool,
+}
+
+/// rigor-rs#658 — one DFS's worth of `path_*` answers for a replay `root`,
+/// keyed by node span. The mutator replay asks the three predicates once
+/// per contained mutation from the same root; the recursive walks shared
+/// their path prefixes, so a `v.push(1)` × N chain went cubic. A `wspan`
+/// that is no node's own span (a `for`/multi-write index target, an
+/// operand write inside a larger node) has no entry — the caller falls
+/// back to the recursive walk, keeping the off-child rules verbatim.
+#[derive(Default)]
+pub(crate) struct PathMarks {
+    by_span: HashMap<rigor_parse::Span, PathFlags>,
+}
+
+impl PathMarks {
+    /// [`Typer::path_unconditional`]'s answer when `wspan` is some node's
+    /// own span; `None` when no node carries it.
+    fn uncond(&self, wspan: rigor_parse::Span) -> Option<bool> {
+        self.by_span.get(&wspan).map(|f| f.uncond)
+    }
+
+    /// [`Typer::path_operand_evaluated`]'s answer, like [`Self::uncond`].
+    fn operand(&self, wspan: rigor_parse::Span) -> Option<bool> {
+        self.by_span.get(&wspan).map(|f| f.operand)
+    }
+
+    /// [`Typer::path_content_writeback`]'s answer, like [`Self::uncond`].
+    fn writeback(&self, wspan: rigor_parse::Span) -> Option<bool> {
+        self.by_span.get(&wspan).map(|f| f.writeback)
+    }
 }
 
 /// The flat check env plus the data [`Typer::check_env_at`] needs to
