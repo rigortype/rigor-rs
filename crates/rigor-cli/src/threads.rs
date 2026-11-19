@@ -6,10 +6,10 @@
 //! ([`configure_global_pool`]) so workers cannot spend the reservation
 //! budget first. `coverage --workers` uses the same spawn handler. A host
 //! that cannot reserve 256 MiB falls back to 64 MiB, then:
-//! - pool workers: Rust's 2 MiB spawn default;
-//! - the command thread on Unix: the process main thread (8 MiB), never a
-//!   spawned thread smaller than that;
-//! - the command thread on Windows: Rust's 2 MiB spawn default, then the
+//! - pool workers: an explicit 2 MiB stack;
+//! - the command thread on Unix: the process main thread (`ulimit -s`,
+//!   8 MiB by default), never a spawned thread smaller than that could be;
+//! - the command thread on Windows: an explicit 2 MiB stack, then the
 //!   process main thread (1 MiB).
 //!
 //! A large stack never stops a command from starting. A pool that cannot
@@ -25,30 +25,30 @@ use rigor_parse::ANALYSIS_STACK_BYTES;
 /// One spawn attempt's closure.
 pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// The stack sizes tried in turn for pool workers; `None` is Rust's 2 MiB
-/// spawn default (`thread::Builder` with no `stack_size`), not the OS
-/// main-thread stack.
-pub(crate) const STACK_FALLBACK: [Option<usize>; 3] =
-    [Some(ANALYSIS_STACK_BYTES), Some(64 << 20), None];
+/// The stack sizes tried in turn for pool workers. The last resort is an
+/// explicit 2 MiB `stack_size`, never `thread::Builder`'s no-size default:
+/// the default honours `RUST_MIN_STACK`, so it could be larger or smaller
+/// than 2 MiB, and a large value could fail the last-resort spawn itself
+/// (rigor-rs#679).
+pub(crate) const STACK_FALLBACK: [usize; 3] =
+    [ANALYSIS_STACK_BYTES, 64 << 20, 2 << 20];
 
 /// Stack sizes tried for the command thread. On Unix the process main
-/// thread is already 8 MiB, so we never spawn at Rust's 2 MiB default: if
-/// 256 MiB and 64 MiB both fail, the command runs inline.
+/// thread is already `ulimit -s` (8 MiB by default), so we never spawn at
+/// 2 MiB: if 256 MiB and 64 MiB both fail, the command runs inline.
 #[cfg(unix)]
-pub(crate) const COMMAND_THREAD_SIZES: &[Option<usize>] =
-    &[Some(ANALYSIS_STACK_BYTES), Some(64 << 20)];
+pub(crate) const COMMAND_THREAD_SIZES: &[usize] =
+    &[ANALYSIS_STACK_BYTES, 64 << 20];
 
-/// On Windows the process main thread is 1 MiB, smaller than Rust's 2 MiB
-/// spawn default, so the command thread still tries that default.
+/// On Windows the process main thread is 1 MiB, smaller than 2 MiB, so the
+/// command thread still tries that spawn before running inline.
 #[cfg(not(unix))]
-pub(crate) const COMMAND_THREAD_SIZES: &[Option<usize>] = &STACK_FALLBACK;
+pub(crate) const COMMAND_THREAD_SIZES: &[usize] = &STACK_FALLBACK;
 
 /// What a fallback actually used, for the one stderr line per process.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StackKind {
     Reserved(usize),
-    /// `thread::Builder` with no `stack_size`: Rust's 2 MiB spawn default.
-    RustSpawnDefault,
     /// The command ran on the process main thread because no spawn worked.
     ProcessMainThread,
 }
@@ -63,13 +63,13 @@ pub(crate) enum StackKind {
 ///
 /// `spawn` is injected so a test can fail chosen sizes.
 pub(crate) fn spawn_fallback<J, H, S>(
-    sizes: &[Option<usize>],
+    sizes: &[usize],
     job: J,
     mut spawn: S,
-) -> io::Result<(H, Option<usize>)>
+) -> io::Result<(H, usize)>
 where
     J: FnOnce() + Send + 'static,
-    S: FnMut(Option<usize>, Job) -> io::Result<H>,
+    S: FnMut(usize, Job) -> io::Result<H>,
 {
     let slot = Arc::new(Mutex::new(Some(job)));
     let mut last_err = None;
@@ -90,14 +90,11 @@ where
 }
 
 /// A `std::thread::Builder` for one attempt, detached.
-fn std_spawn(name: Option<String>) -> impl FnMut(Option<usize>, Job) -> io::Result<()> {
+fn std_spawn(name: Option<String>) -> impl FnMut(usize, Job) -> io::Result<()> {
     move |size, job| {
-        let mut builder = std::thread::Builder::new();
+        let mut builder = std::thread::Builder::new().stack_size(size);
         if let Some(name) = &name {
             builder = builder.name(name.clone());
-        }
-        if let Some(size) = size {
-            builder = builder.stack_size(size);
         }
         builder.spawn(job).map(drop)
     }
@@ -106,7 +103,6 @@ fn std_spawn(name: Option<String>) -> impl FnMut(Option<usize>, Job) -> io::Resu
 fn describe_stack(kind: StackKind) -> String {
     match kind {
         StackKind::Reserved(bytes) => format!("{} MiB", bytes >> 20),
-        StackKind::RustSpawnDefault => "Rust's 2 MiB spawn default".to_string(),
         StackKind::ProcessMainThread => "the process main thread".to_string(),
     }
 }
@@ -119,13 +115,6 @@ pub(crate) fn stack_warning(kind: StackKind) -> String {
         ANALYSIS_STACK_BYTES >> 20,
         describe_stack(kind)
     )
-}
-
-fn size_to_kind(size: Option<usize>) -> StackKind {
-    match size {
-        Some(bytes) => StackKind::Reserved(bytes),
-        None => StackKind::RustSpawnDefault,
-    }
 }
 
 /// One stderr line per process when a thread got less than
@@ -149,23 +138,21 @@ pub(crate) fn pool_build_error_line(err: &dyn std::fmt::Display) -> String {
 
 /// Run `command` on the command thread: named `main`, so panic and overflow
 /// messages read as they did when the command ran on the process's main
-/// thread. If no thread of at least 64 MiB (Unix) / including Rust's 2 MiB
-/// spawn default (elsewhere) can be created, it runs on the main thread
-/// itself.
+/// thread. If no thread of at least 64 MiB (Unix) / down to an explicit
+/// 2 MiB (elsewhere) can be created, it runs on the main thread itself.
 pub(crate) fn run_command_thread(command: fn() -> ExitCode) -> ExitCode {
     run_command_thread_with(COMMAND_THREAD_SIZES, command, |size, job| {
-        let mut builder = std::thread::Builder::new().name("main".to_string());
-        if let Some(size) = size {
-            builder = builder.stack_size(size);
-        }
-        builder.spawn(job)
+        std::thread::Builder::new()
+            .name("main".to_string())
+            .stack_size(size)
+            .spawn(job)
     })
 }
 
 /// [`run_command_thread`] with the spawn injected (tests).
-fn run_command_thread_with<S, F>(sizes: &[Option<usize>], command: F, spawn: S) -> ExitCode
+fn run_command_thread_with<S, F>(sizes: &[usize], command: F, spawn: S) -> ExitCode
 where
-    S: FnMut(Option<usize>, Job) -> io::Result<std::thread::JoinHandle<()>>,
+    S: FnMut(usize, Job) -> io::Result<std::thread::JoinHandle<()>>,
     F: FnOnce() -> ExitCode + Send + 'static,
 {
     let command = Arc::new(Mutex::new(Some(command)));
@@ -183,7 +170,7 @@ where
         spawn,
     ) {
         Ok((handle, size)) => {
-            note_stack(size_to_kind(size));
+            note_stack(StackKind::Reserved(size));
             if let Err(payload) = handle.join() {
                 std::panic::resume_unwind(payload);
             }
@@ -206,18 +193,18 @@ where
 pub(crate) fn spawn_pool_thread(thread: rayon::ThreadBuilder) -> io::Result<()> {
     let name = thread.name().map(str::to_string);
     let size = spawn_pool_thread_with(thread, &STACK_FALLBACK, std_spawn(name))?;
-    note_stack(size_to_kind(size));
+    note_stack(StackKind::Reserved(size));
     Ok(())
 }
 
 /// [`spawn_pool_thread`] with the sizes and the spawn injected (tests).
 fn spawn_pool_thread_with<S>(
     thread: rayon::ThreadBuilder,
-    sizes: &[Option<usize>],
+    sizes: &[usize],
     spawn: S,
-) -> io::Result<Option<usize>>
+) -> io::Result<usize>
 where
-    S: FnMut(Option<usize>, Job) -> io::Result<()>,
+    S: FnMut(usize, Job) -> io::Result<()>,
 {
     spawn_fallback(sizes, move || thread.run(), spawn).map(|((), size)| size)
 }
@@ -229,7 +216,7 @@ where
 /// `build_global` is one-shot: rayon marks the global registry as set even
 /// when building it fails, so it is never retried with other settings. The
 /// stack fallback happens per thread, inside the spawn handler. If no
-/// worker can be created even at Rust's 2 MiB spawn default, this prints
+/// worker can be created even at 2 MiB, this prints
 /// one error and returns `false` so the command can exit; a later parallel
 /// stage would otherwise panic with `GlobalPoolAlreadyInitialized`.
 pub(crate) fn configure_global_pool() -> bool {
@@ -253,19 +240,15 @@ mod tests {
     /// An injected spawn that refuses every size in `refuse` and otherwise
     /// spawns a real thread at that size, recording what it was asked for.
     fn refusing(
-        refuse: Vec<Option<usize>>,
-        asked: Arc<Mutex<Vec<Option<usize>>>>,
-    ) -> impl FnMut(Option<usize>, Job) -> io::Result<std::thread::JoinHandle<()>> {
+        refuse: Vec<usize>,
+        asked: Arc<Mutex<Vec<usize>>>,
+    ) -> impl FnMut(usize, Job) -> io::Result<std::thread::JoinHandle<()>> {
         move |size, job| {
             asked.lock().unwrap().push(size);
             if refuse.contains(&size) {
                 return Err(io::Error::other("refused"));
             }
-            let mut builder = std::thread::Builder::new();
-            if let Some(size) = size {
-                builder = builder.stack_size(size);
-            }
-            builder.spawn(job)
+            std::thread::Builder::new().stack_size(size).spawn(job)
         }
     }
 
@@ -279,23 +262,23 @@ mod tests {
             move || {
                 counted.fetch_add(1, Ordering::SeqCst);
             },
-            refusing(vec![Some(ANALYSIS_STACK_BYTES)], Arc::clone(&asked)),
+            refusing(vec![ANALYSIS_STACK_BYTES], Arc::clone(&asked)),
         )
         .unwrap();
         handle.join().unwrap();
-        assert_eq!(size, Some(64 << 20));
+        assert_eq!(size, 64 << 20);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
         assert_eq!(
             *asked.lock().unwrap(),
-            vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)]
+            vec![ANALYSIS_STACK_BYTES, 64 << 20]
         );
     }
 
     #[test]
-    fn rust_spawn_default_is_the_last_pool_resort() {
+    fn an_explicit_two_mib_is_the_last_pool_resort() {
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&runs);
-        let refuse = vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)];
+        let refuse = vec![ANALYSIS_STACK_BYTES, 64 << 20];
         let (handle, size) = spawn_fallback(
             &STACK_FALLBACK,
             move || {
@@ -305,7 +288,7 @@ mod tests {
         )
         .unwrap();
         handle.join().unwrap();
-        assert_eq!(size, None);
+        assert_eq!(size, 2 << 20);
         assert_eq!(runs.load(Ordering::SeqCst), 1);
     }
 
@@ -335,7 +318,7 @@ mod tests {
             COMMAND_THREAD_SIZES,
             exit_42,
             refusing(
-                vec![Some(ANALYSIS_STACK_BYTES)],
+                vec![ANALYSIS_STACK_BYTES],
                 Arc::new(Mutex::new(Vec::new())),
             ),
         );
@@ -363,11 +346,11 @@ mod tests {
         assert_eq!(format!("{inline:?}"), format!("{:?}", ExitCode::from(42)));
         assert_eq!(
             *asked.lock().unwrap(),
-            vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)]
+            vec![ANALYSIS_STACK_BYTES, 64 << 20]
         );
         assert!(
-            !asked.lock().unwrap().contains(&None),
-            "Unix must not spawn the command at Rust's 2 MiB default"
+            !asked.lock().unwrap().contains(&(2 << 20)),
+            "Unix must not spawn the command at an explicit 2 MiB"
         );
     }
 
@@ -377,16 +360,14 @@ mod tests {
         let spawn_log = Arc::clone(&events);
         let body_log = Arc::clone(&events);
         let code = run_command_thread_with(
-            &[Some(64 << 20)],
+            &[64 << 20],
             move || {
                 body_log.lock().unwrap().push("body");
                 ExitCode::SUCCESS
             },
             move |size, job| {
                 spawn_log.lock().unwrap().push("spawn");
-                std::thread::Builder::new()
-                    .stack_size(size.unwrap())
-                    .spawn(job)
+                std::thread::Builder::new().stack_size(size).spawn(job)
             },
         );
         assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
@@ -399,12 +380,9 @@ mod tests {
         assert!(mib64.contains("using 64 MiB"), "{mib64}");
         assert!(!mib64.contains("platform default"), "{mib64}");
 
-        let rust_default = stack_warning(StackKind::RustSpawnDefault);
-        assert!(
-            rust_default.contains("using Rust's 2 MiB spawn default"),
-            "{rust_default}"
-        );
-        assert!(!rust_default.contains("platform default"), "{rust_default}");
+        let two_mib = stack_warning(StackKind::Reserved(2 << 20));
+        assert!(two_mib.contains("using 2 MiB"), "{two_mib}");
+        assert!(!two_mib.contains("platform default"), "{two_mib}");
 
         let inline = stack_warning(StackKind::ProcessMainThread);
         assert!(inline.contains("using the process main thread"), "{inline}");
@@ -427,7 +405,7 @@ mod tests {
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(2)
             .spawn_handler(move |thread| {
-                let mut spawn = refusing(vec![Some(ANALYSIS_STACK_BYTES)], Arc::clone(&asked_in));
+                let mut spawn = refusing(vec![ANALYSIS_STACK_BYTES], Arc::clone(&asked_in));
                 let size = spawn_pool_thread_with(thread, &STACK_FALLBACK, move |size, job| {
                     spawn(size, job).map(drop)
                 })?;
@@ -441,7 +419,7 @@ mod tests {
             (1..=100u64).into_par_iter().sum()
         });
         assert_eq!(sum, 5050);
-        assert_eq!(*sizes.lock().unwrap(), vec![Some(64 << 20); 2]);
+        assert_eq!(*sizes.lock().unwrap(), vec![64 << 20; 2]);
         assert_eq!(asked.lock().unwrap().len(), 4);
     }
 }
