@@ -3,8 +3,11 @@
 //! resolves eval receivers against.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::BuildHasherDefault;
 
-use rigor_parse::{LoweredAst, Node, NodeId, Span};
+use rigor_parse::{ConstName, LoweredAst, Node, NodeId, Span};
+
+use crate::reach_memo::FastHasher;
 
 // ==========================================================================
 // Pass 1c/1d — def-attribution walk (upstream `fb781023`, rigortype/rigor#1135,
@@ -261,7 +264,7 @@ fn decl_body_cx(cx: &DefCx, name: &str, rooted: bool, self_anchored: bool) -> De
 /// arena-resident defs it cannot.
 pub(crate) fn walk_defs(
     ast: &LoweredAst,
-    declared: &HashSet<String>,
+    declared: &DeclaredNames,
     tables: &mut DefTables,
     visited: &mut HashSet<NodeId>,
     node: NodeId,
@@ -823,7 +826,7 @@ fn singleton_operand_prefix(
     ast: &LoweredAst,
     operand: Option<NodeId>,
     cx: &DefCx,
-    declared: &HashSet<String>,
+    declared: &DeclaredNames,
 ) -> Vec<String> {
     let Some(op) = operand else {
         return Vec::new();
@@ -864,7 +867,7 @@ fn eval_receiver_prefix(
     self_prefix: &[String],
     lexical: &[String],
     unnameable: bool,
-    declared: &HashSet<String>,
+    declared: &DeclaredNames,
 ) -> Option<Vec<String>> {
     // `return self_prefix if receiver.nil? || receiver.is_a?(SelfNode)` — a
     // BARE `class_eval` keeps the enclosing self exactly like `self.class_eval`
@@ -915,7 +918,7 @@ fn eval_const_prefix(
     rendered: &str,
     rooted: bool,
     lexical: &[String],
-    declared: &HashSet<String>,
+    declared: &DeclaredNames,
 ) -> Vec<String> {
     let segments: Vec<&str> = rendered.split("::").collect();
     if rooted || lexical.is_empty() {
@@ -929,7 +932,7 @@ fn eval_const_prefix(
     for n in (1..=lexical.len()).rev() {
         let entry = lexical[..n].join("::");
         let candidate = format!("{entry}::{}", segments[0]);
-        if declared.contains(&candidate) {
+        if declared.contains(candidate.as_str()) {
             let mut prefix: Vec<String> = candidate.split("::").map(str::to_string).collect();
             prefix.extend(segments[1..].iter().map(|s| (*s).to_string()));
             return prefix;
@@ -1086,7 +1089,7 @@ enum DefFrame {
 /// strictly contain it, applied outermost-first.
 pub(crate) fn file_orphan_defs(
     ast: &LoweredAst,
-    declared: &HashSet<String>,
+    declared: &DeclaredNames,
     visited: &HashSet<NodeId>,
     tables: &mut DefTables,
 ) {
@@ -1453,18 +1456,43 @@ fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
 /// inside one is a SyntaxError); bare declarations under an unnameable cref
 /// (`class <<`, anonymous factory blocks) name nothing, while explicit-base
 /// paths still re-anchor lexically.
-pub(crate) fn collect_declared_names(ast: &LoweredAst) -> HashSet<String> {
-    let mut out = HashSet::new();
+///
+/// Membership is queried by `&str` only, so the set stores [`ConstName`]
+/// prefix shares under the FxHasher-scheme [`FastHasher`] (rigor-rs#657):
+/// `add_declared` inserts every enclosing prefix of a decl path, which for a
+/// depth-n header stored and SipHash'ed O(n²) bytes (~750 MB, ~1.3 s at 20k).
+pub(crate) fn collect_declared_names(ast: &LoweredAst) -> DeclaredNames {
+    let mut out = DeclaredNames::default();
     collect_declared_names_at(ast, ast.root(), &[], false, &mut out);
     out
 }
 
+/// The declared-name census — every name a `ConstName` prefix-share under the
+/// crate's own multiply-rotate hasher (the keys are the analysis's own names,
+/// not attacker-chosen input). Lookups stay `contains(&str)`-exact through
+/// `ConstName`'s `Borrow<str>`.
+pub(crate) type DeclaredNames = HashSet<ConstName, BuildHasherDefault<FastHasher>>;
+
 /// `add_declared_name` — every enclosing prefix joins the census: a file
 /// declaring `S::A::B` necessarily has `S` and `S::A` to declare it under, so
 /// an `A::B` eval receiver inside `class S` resolves `S::A::B`.
-fn add_declared(out: &mut HashSet<String>, prefix: &[String]) {
-    for i in 1..=prefix.len() {
-        out.insert(prefix[..i].join("::"));
+///
+/// Every inserted name is a prefix of the one full join, so the join is built
+/// ONCE and each level recorded by its byte length — O(path) bytes instead of
+/// the O(path²) the per-level `join("::")` wrote.
+fn add_declared(out: &mut DeclaredNames, prefix: &[String]) {
+    let mut full = String::new();
+    let mut lens = Vec::with_capacity(prefix.len());
+    for seg in prefix {
+        if !full.is_empty() {
+            full.push_str("::");
+        }
+        full.push_str(seg);
+        lens.push(full.len());
+    }
+    let full: std::sync::Arc<str> = std::sync::Arc::from(full);
+    for len in lens {
+        out.insert(ConstName::prefix_of(&full, len));
     }
 }
 
@@ -1473,7 +1501,7 @@ fn collect_declared_names_at(
     node: NodeId,
     prefix: &[String],
     unnameable_cref: bool,
-    out: &mut HashSet<String>,
+    out: &mut DeclaredNames,
 ) {
     match ast.get(node) {
         Node::ClassDef {

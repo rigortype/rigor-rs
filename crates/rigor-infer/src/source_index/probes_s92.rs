@@ -643,7 +643,7 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
         for (_, node) in ast.iter() {
             if let Node::ConstantRead { name, .. } = node {
                 if !name.is_empty()
-                    && !idx.classes.contains_key(name)
+                    && !idx.classes.contains_key(name.as_str())
                     && (core.knows_class(name) || core.knows_qualified_class(name))
                 {
                     idx.register(name);

@@ -28,6 +28,7 @@
 //! precisely still get their children lowered (and so analysed).
 
 mod block_params;
+mod const_name;
 mod hash_keys;
 mod multi_target;
 mod definitions;
@@ -44,6 +45,7 @@ mod builder;
 
 use crate::ruby_prism;
 pub use block_params::BlockParamKind;
+pub use const_name::ConstName;
 pub(crate) use block_params::*;
 pub use hash_keys::{HashKey, HashKeyTag};
 pub use multi_target::{IndexTargetKey, IndexWrites, MultiTarget, MultiTargets};

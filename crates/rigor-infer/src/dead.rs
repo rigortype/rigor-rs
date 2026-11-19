@@ -956,7 +956,7 @@ impl<'i> Typer<'i> {
                             }
                         } else {
                             frames.clear();
-                            frames.push((name.clone(), true));
+                            frames.push((name.to_string(), true));
                         }
                     }
                     // `class << <other>` — the context is unchanged.
@@ -1195,7 +1195,7 @@ impl<'i> Typer<'i> {
                         {
                             let op = match ast.get(args[0]) {
                                 Node::ConstantRead { name: class, .. } => DeadOp::Isa {
-                                    class: class.clone(),
+                                    class: class.to_string(),
                                     exact: method == "instance_of?",
                                     holds: polarity,
                                 },

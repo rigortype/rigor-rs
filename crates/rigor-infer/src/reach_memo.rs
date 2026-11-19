@@ -58,9 +58,11 @@ type ReachOut = (Reach, Option<Scalar>);
 /// A multiply-rotate hasher (the `FxHasher` scheme) for the memo's own maps:
 /// every `seen` test interns a short key and every lookup hashes the stack,
 /// which SipHash made a visible share of the profile. The keys are the
-/// analysis's own spans and names, not attacker-chosen input.
+/// analysis's own spans and names, not attacker-chosen input. `pub(crate)`
+/// for the other name-hashed maps whose keys are likewise our own
+/// (rigor-rs#657's declared-name census).
 #[derive(Default)]
-struct FastHasher(u64);
+pub(crate) struct FastHasher(u64);
 
 impl Hasher for FastHasher {
     fn write(&mut self, bytes: &[u8]) {

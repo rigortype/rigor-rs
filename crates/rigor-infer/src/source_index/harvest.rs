@@ -254,7 +254,7 @@ impl SourceIndex {
                     && (core.knows_class(name) || core.knows_qualified_class(name))
                     && seen_names.insert(name.as_str())
                 {
-                    h.rbs_constant_names.push(name.clone());
+                    h.rbs_constant_names.push(name.to_string());
                 }
             }
             // rigor-rs#368 — a bare `rescue => e` binds `e` to `StandardError`

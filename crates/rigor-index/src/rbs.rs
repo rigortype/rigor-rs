@@ -946,6 +946,14 @@ pub struct CoreData {
     /// `class name -> entry`. Keys are `&'static str` (leaked once at load) so
     /// resolved return-class names can flow out as `&'static str`.
     classes: HashMap<&'static str, ClassEntry>,
+    /// Byte length of the longest key in `classes` — the early-out bound for
+    /// [`Self::knows_class`] (rigor-rs#657: a deep `A::A::…` `ConstantRead`
+    /// hashes its whole ~depth² name otherwise; a name longer than every
+    /// registered key cannot be present, so the hash is skipped).
+    max_class_key_len: usize,
+    /// The same bound for `toplevel_classes` / `qualified`.
+    max_toplevel_key_len: usize,
+    max_qualified_key_len: usize,
     /// Short names that were declared at GENUINE top level (empty namespace) in
     /// at least one declaration — e.g. `class Time` ⇒ `"Time"`, but a name that
     /// only ever appears namespaced (`class Process::Status`) is NOT here. Used
@@ -1421,6 +1429,9 @@ impl CoreData {
         if !classes.is_empty() {
             return Self {
                 source,
+                max_class_key_len: classes.keys().map(|k| k.len()).max().unwrap_or(0),
+                max_toplevel_key_len: toplevel_classes.iter().map(|k| k.len()).max().unwrap_or(0),
+                max_qualified_key_len: qualified.keys().map(|k| k.len()).max().unwrap_or(0),
                 classes,
                 toplevel_classes,
                 project_sig_classes,
@@ -1503,9 +1514,11 @@ impl CoreData {
         !builder.classes.is_empty()
     }
 
-    /// Whether the class is in the loaded set.
+    /// Whether the class is in the loaded set. A name longer than every
+    /// registered key cannot be present — checked BEFORE hashing so a
+    /// pathologically long `ConstantRead` name (rigor-rs#657) stays O(1).
     pub fn knows_class(&self, class_name: &str) -> bool {
-        self.classes.contains_key(class_name)
+        class_name.len() <= self.max_class_key_len && self.classes.contains_key(class_name)
     }
 
 
@@ -1518,7 +1531,8 @@ impl CoreData {
     /// short name is not falsely resolved to the namespaced stdlib class
     /// (defect 2). Instance-method behavior and `knows_class` are unchanged.
     pub fn knows_toplevel_class(&self, class_name: &str) -> bool {
-        self.toplevel_classes.contains(class_name)
+        class_name.len() <= self.max_toplevel_key_len
+            && self.toplevel_classes.contains(class_name)
     }
 
     /// ADR-0042 Slice 1: whether `qname` (a fully qualified name like
@@ -1527,7 +1541,7 @@ impl CoreData {
     /// key — each qualified name is its own entry. This is the Slice-2 seam;
     /// no existing rule calls it yet.
     pub fn knows_qualified_class(&self, qname: &str) -> bool {
-        self.qualified.contains_key(qname)
+        qname.len() <= self.max_qualified_key_len && self.qualified.contains_key(qname)
     }
 
     /// ADR-0042 Slice 1: resolve a bare short name to its qualified key, but
@@ -4525,6 +4539,9 @@ impl CoreData {
         let toplevel_classes: HashSet<&'static str> = classes.keys().copied().collect();
         Self {
             source: RbsSource::Stub,
+            max_class_key_len: classes.keys().map(|k| k.len()).max().unwrap_or(0),
+            max_toplevel_key_len: toplevel_classes.iter().map(|k| k.len()).max().unwrap_or(0),
+            max_qualified_key_len: 0,
             classes,
             toplevel_classes,
             project_sig_classes: HashSet::new(),
