@@ -15,8 +15,24 @@ submodule rather than tracked against a drifting local checkout.
 |---|---|
 | Upstream repo | `git@github.com:rigortype/rigor.git` |
 | Submodule path | `reference/rigor` |
-| **Pinned ref** | **`v0.4.7`** (2026-11-03) |
-| Commit | `f7595e28` |
+| **Pinned ref** | **`v0.4.8`** (2026-11-15) |
+| Commit | `bbea1bac4` |
+
+> **`v0.4.7 → v0.4.8` (2026-11-15): 1,504 commits, the largest delta yet — WIP.**
+> `core_overlay/bigdecimal.rbs` is new (#2969), `resolv.rbs` gained `singleton(T)`
+> overloads, and the ActiveSupport plugin sig grew `NumericWithFormat#to_fs`
+> (#2918); vendored gem sigs, capability roles and the effects catalogue are
+> byte-identical. The oracle now needs **ruby >= 4.0** (gemspec floor) plus host
+> gems `rbs 4.2.0`, `prism 1.9.0`, `language_server-protocol`, `bigdecimal 4.1.3`.
+> The raw bump left 4 fixture FPs in 2 fixtures: the `main.include` reading
+> widened (#2995/#3004/#3007 — `self.include`, send spellings except
+> `public_send`, control-flow/def/value-position/iterator-block includes all
+> count) — **ported** in `ancestry_facts.rs` — and the alias-mutation floor
+> (#2677) — **copy-link slice ported** in `flow_writes`/`flow_eval`
+> (element/ivar/argument/foreign links + the gradual `widen_store` answer open
+> at rigor-rs#600). Fixture gate: **0 unregistered, 959/1063 matched.** The
+> sweep was not run (no corpora on the bump host). See the
+> [note](docs/notes/20261115-repin-v048.md).
 
 > **`v0.4.6 → v0.4.7` (2026-11-05): 909 commits, step eight (last).** Re-vendored
 > `vendored_gem_sigs/{bundler,rubygems}` and the ActiveSupport plugin sig. The raw bump
@@ -480,7 +496,21 @@ chasing a non-bug.)
    ([ADR-0039](docs/adr/0039-shape-typing-tier.md)) — `ARRAY_NEW_TUPLE_LIMIT`
    (grep `method_dispatcher.rb`, empirically probe `Array.new(n)`-slice
    possible-nil around the boundary) and, once ported, the other
-   `constant_folding.rb` / `shape_dispatch.rb` limits.
+   `constant_folding.rb` / `shape_dispatch.rb` limits. The bundled-name tables
+   are another such surface: `BUNDLED_PLUGIN_NAMES` / `BUNDLED_SKILL_NAMES`
+   in `crates/rigor-cli/src/main.rs` (the `Unknown plugin:`/`Unknown skill:`
+   error surface) and `BUNDLED_PLUGIN_GEMS` in `config.rs` all transcribe
+   directories of the reference's `plugins/` + `examples/` + `skills/` trees,
+   and a bump that adds or removes a bundled directory desyncs them silently
+   (v0.4.8 added `rigor-rbs-contract`; #376). Re-derive them here with
+   `cargo test -p rigor-cli bundled_` —
+   `bundled_name_tables_match_the_pinned_reference` and
+   `bundled_plugin_gems_match_the_pin` rebuild each table from the populated
+   submodule the way the upstream `discover` methods do and fail on any
+   drift. Both tests skip where the submodule is unpopulated (CI's
+   `build + test` job checks out without submodules, and `gate.sh` tests only
+   crates the branch touched), which is why THIS step, not a gate, is the
+   tie.
 7. **Re-run the corpus gates on the RELEASE binary** — `cargo build --offline
    --release -p rigor-cli`, then `python3 harness/fp_audit.py --gaps --sweep`
    (must be 0 FP) and `python3 harness/gap_census.py --sweep` for the new gap

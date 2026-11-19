@@ -29,12 +29,50 @@
 use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{AncestryFacts, MixinSide, MIXIN_WILDCARD};
+use rigor_parse::{AncestryFacts, MixinSide, MIXIN_UNNAMED, MIXIN_WILDCARD};
+
+/// `?` ([`MIXIN_UNNAMED`]) rides beside `*` ([`MIXIN_WILDCARD`]) in every list
+/// the census writes — `UNNAMED_LIST` is `["*", "?"]` — so a name-reader that
+/// treated `?` as a resolvable name would answer wrongly wherever the
+/// reference's `includes_of` / `discovered_extends` hold no such name. Every
+/// marker check reads both.
+fn mixin_marker(n: &str) -> bool {
+    n == MIXIN_WILDCARD || n == MIXIN_UNNAMED
+}
 
 use super::{DefKind, SourceIndex};
 
 /// `ResolutionChain::LIMIT` — the project entries a chain may hold.
 const CHAIN_LIMIT: usize = 100;
+
+/// The method-independent half of `object_mixin_may_define` (rigor-rs#464):
+/// `Object`'s mixin closure collected once per index instead of re-walked per
+/// diagnostic. Every member below is a SET the per-edge walks of the removed
+/// `mixin_edge_may_define` would have unioned over — the per-method questions
+/// (`records_name`, `macro_named`, `external_may_define`) are asked per call.
+#[derive(Default)]
+pub(crate) struct ObjectMixins {
+    /// A walk's per-edge `seen` passed [`CHAIN_LIMIT`]: uncertainty — every
+    /// method may be defined, unconditionally.
+    cut: bool,
+    /// Some edge spells no name (`include m`, `include(*MODS)`): an unknown
+    /// surface. Answers a bare call only.
+    unnamed: bool,
+    /// Some reached module carries a wildcard include or a hook-dirty edge.
+    /// Answers a bare call only.
+    tainted: bool,
+    /// `known_user("Object")` — `Object`'s own `records_name` is asked per
+    /// method.
+    object_records: bool,
+    /// The reachable `known_user` project modules, deduped across seeds.
+    modules: Vec<String>,
+    module_set: HashSet<String>,
+    /// Edges resolving to nothing or to a non-`known_user` project module:
+    /// `(from, raw, declared)`. Each asks `macro_named` on `declared` and
+    /// `external_may_define` on `(from, raw)` per method.
+    opaque: Vec<(String, String, Option<String>)>,
+    opaque_set: HashSet<(String, String)>,
+}
 
 /// The merged per-owner ancestry facts ([`AncestryFacts`] across files).
 #[derive(Default)]
@@ -66,6 +104,10 @@ pub(crate) struct AncestryIndex {
     /// Upstream v0.4.5 (#2086): per owner candidate, its receiver-form
     /// instance mixins ([`AncestryFacts::receiver_mixins`]).
     receiver_listed: HashMap<String, Vec<String>>,
+    /// Upstream v0.4.8 (#2991): owners defining an `extend`-triggered hook
+    /// ([`AncestryFacts::extend_hook_owners`]) — `extend_reshapes_instance?`'s
+    /// `defines_any?` half.
+    extend_hook_owners: HashSet<String>,
 }
 
 impl AncestryIndex {
@@ -91,6 +133,7 @@ impl AncestryIndex {
         self.possible.extend(facts.possible_methods.iter().cloned());
         self.contested.extend(facts.contested_visibilities.iter().cloned());
         self.dirty.extend(facts.dirty_owners.iter().cloned());
+        self.extend_hook_owners.extend(facts.extend_hook_owners.iter().cloned());
         self.def_owners.extend(facts.def_owners.iter().cloned());
         self.required_features.extend(facts.required_features.iter().cloned());
         self.required_segments.extend(facts.required_segments.iter().cloned());
@@ -346,16 +389,93 @@ impl SourceIndex {
         Some(Chain { entries, retro, marks })
     }
 
+    /// `ResolutionChain::Builder#mark` — the mark a node carries on its
+    /// instance side: the names `include`/`prepend` wrote (the `["*", "?"]`
+    /// markers among them), plus [`SourceIndex::extend_hook_taint`]. Neither
+    /// marker counts toward the `multi_file` edge count (the reference's
+    /// `!multi_file` reads `includes_of` — names — against `*`).
     fn mark_of(&self, node: &str) -> Option<Mark> {
-        let listed = self.ancestry.include_listed.get(node).cloned().unwrap_or_default();
+        let mut listed = self.ancestry.include_listed.get(node).cloned().unwrap_or_default();
+        let mut taint = self.extend_hook_taint(node);
         let edges = self.override_classes.get(node).map_or(0, |e| e.includes.len())
-            + listed.iter().filter(|n| *n != MIXIN_WILDCARD).count();
+            + listed
+                .iter()
+                .filter(|n| *n != MIXIN_WILDCARD && *n != MIXIN_UNNAMED)
+                .count();
         let multi_file =
             edges >= 2 && self.ancestry.decl_files.get(node).copied().unwrap_or(0) >= 2;
-        if listed.is_empty() && !multi_file {
+        if listed.is_empty() && taint.is_empty() && !multi_file {
             return None;
         }
+        listed.append(&mut taint);
         Some(Mark { node: node.to_string(), listed, multi_file })
+    }
+
+    /// Upstream v0.4.8 (#2991/#3006, `DiscoveryIndex#extend_hook_taint` +
+    /// `extend_reshapes_instance?`): a module `name` extends whose hook may
+    /// mix modules into the extender's instance side — its mark also lists
+    /// `["*", "?"]` when such a module's own include side names a module the
+    /// walk cannot name, `["*"]` when it only taints order, nothing when no
+    /// extended module reshapes.
+    fn extend_hook_taint(&self, name: &str) -> Vec<String> {
+        let mut found = false;
+        for raw in self.singleton_raws(name) {
+            let Some(resolved) = self.resolve_override_ancestor(name, &raw) else {
+                continue;
+            };
+            if !self.extend_reshapes_instance(&resolved) {
+                continue;
+            }
+            if self
+                .ancestry
+                .include_listed
+                .get(&resolved)
+                .is_some_and(|l| l.iter().any(|n| n == MIXIN_UNNAMED))
+            {
+                return vec![MIXIN_WILDCARD.to_string(), MIXIN_UNNAMED.to_string()];
+            }
+            found = true;
+        }
+        if found { vec![MIXIN_WILDCARD.to_string()] } else { Vec::new() }
+    }
+
+    /// `extend_reshapes_instance?` — a `*` on the module's own include side
+    /// plus a hook `extend` runs on the extended module (`extended` /
+    /// `extend_object` on its singleton, `included` / `append_features` /
+    /// `prepended` / `prepend_features` / `inherited` on its instances — the
+    /// census's [`AncestryFacts::extend_hook_owners`]).
+    fn extend_reshapes_instance(&self, resolved: &str) -> bool {
+        self.ancestry.wildcard_include(resolved)
+            && self.ancestry.extend_hook_owners.contains(resolved)
+    }
+
+    /// Upstream v0.4.8 (#2991/#3006, `ResolutionChain#unnamed_mixin?` +
+    /// `DiscoveryIndex.unnamed_mixin_on_chain?`): whether a class on
+    /// `class_name`'s instance-side chain lists a mixin no name spells — a
+    /// computed or unrecorded `include` (`include(*MODS)`, `include m`,
+    /// `include M, h`, a computed `send` that may be a mixin, a hook's
+    /// `base.include M`) opens the class: the unnamed module may define any
+    /// name, so a `def`-side reader declines. The marks are the ones the
+    /// chain build reaches — a chain the port cannot settle keeps the marks
+    /// it gathered, as the reference's own build does.
+    pub fn unnamed_mixin_on_chain(&self, class_name: &str) -> bool {
+        self.chain_marks(class_name)
+            .iter()
+            .any(|m| m.listed.iter().any(|n| n == MIXIN_UNNAMED))
+    }
+
+    /// `ResolutionChain::Builder#marks` over `class`'s chain — collected even
+    /// for a chain the build cannot settle (`unnamed_mixin?` reads them).
+    fn chain_marks(&self, class: &str) -> Vec<Mark> {
+        if !self.override_classes.contains_key(class) {
+            // A class with no project declaration still carries the marks its
+            // receiver-form edges wrote (`X.include(*M)` on a sig-only class).
+            return self.mark_of(class).into_iter().collect();
+        }
+        let mut b =
+            Builder { idx: self, nodes: Vec::new(), stack: Vec::new(), failed: false, forks: 0 };
+        let _ = b.lin(class);
+        b.nodes.iter().filter_map(|n| self.mark_of(n)).collect()
     }
 
     /// `Relevance.discharged?` — a mark does not move the first definer of
@@ -610,31 +730,77 @@ impl SourceIndex {
     /// port cannot chain, a wildcard or hook-dirty entry, and a private or
     /// singleton-only RBS declaration all answer `true` where the reference may
     /// not, which only declines more.
+    ///
+    /// The mixin closure itself is method-independent, so it is collected ONCE
+    /// per index ([`Self::collect_object_mixins`], memoised in
+    /// `object_mixins`) and each call only asks the per-method questions of the
+    /// collected sets — the same union the per-edge walks of
+    /// `mixin_edge_may_define` produced (rigor-rs#464).
     pub fn object_mixin_may_define(&self, core: &CoreIndex, method: &str, explicit: bool) -> bool {
-        let mut edges: Vec<(&str, &str)> =
-            self.ancestry.toplevel_includes.iter().map(|r| ("", r.as_str())).collect();
-        if let Some(obj) = self.override_classes.get("Object") {
-            edges.extend(obj.includes.iter().map(|r| ("Object", r.as_str())));
-            if self.known_user("Object") && self.records_name("Object", method) {
-                return true;
-            }
+        let m = self.object_mixins.get_or_init(|| self.collect_object_mixins());
+        if m.cut
+            || (!explicit && (m.unnamed || m.tainted))
+            || (m.object_records && self.records_name("Object", method))
+        {
+            return true;
         }
-        if let Some(listed) = self.ancestry.include_listed.get("Object") {
-            edges.extend(listed.iter().map(|r| ("Object", r.as_str())));
-        }
-        edges.into_iter().any(|(owner, raw)| self.mixin_edge_may_define(core, owner, raw, method, explicit))
+        m.modules
+            .iter()
+            .any(|q| self.records_name(q, method) || self.macro_named(q, method))
+            || m.opaque.iter().any(|(from, raw, declared)| {
+                declared.as_deref().is_some_and(|q| self.macro_named(q, method))
+                    || external_may_define(core, from, raw, method, explicit)
+            })
     }
 
-    fn mixin_edge_may_define(
-        &self,
-        core: &CoreIndex,
-        owner: &str,
-        raw: &str,
-        method: &str,
-        explicit: bool,
-    ) -> bool {
-        if raw == MIXIN_WILDCARD {
-            return !explicit;
+    /// The one-time half of [`Self::object_mixin_may_define`]: every seed edge
+    /// into `Object`'s mixin side walked as a union (the walk the removed
+    /// `mixin_edge_may_define` ran per edge, minus the per-method answers).
+    /// Each seed walks with its own `seen`, exactly as the per-edge calls did,
+    /// so [`CHAIN_LIMIT`] still counts the modules reachable from ONE edge.
+    fn collect_object_mixins(&self) -> ObjectMixins {
+        let mut m = ObjectMixins::default();
+        let mut seeds: Vec<(String, String)> = Vec::new();
+        let mut seeded: HashSet<(String, String)> = HashSet::new();
+        for r in &self.ancestry.toplevel_includes {
+            if seeded.insert((String::new(), r.clone())) {
+                seeds.push((String::new(), r.clone()));
+            }
+        }
+        if let Some(obj) = self.override_classes.get("Object") {
+            for r in &obj.includes {
+                if seeded.insert(("Object".to_string(), r.clone())) {
+                    seeds.push(("Object".to_string(), r.clone()));
+                }
+            }
+            m.object_records = self.known_user("Object");
+        }
+        if let Some(listed) = self.ancestry.include_listed.get("Object") {
+            for r in listed {
+                if seeded.insert(("Object".to_string(), r.clone())) {
+                    seeds.push(("Object".to_string(), r.clone()));
+                }
+            }
+        }
+        for (owner, raw) in seeds {
+            if m.cut {
+                break;
+            }
+            self.collect_mixin_edge(&owner, &raw, &mut m);
+        }
+        m
+    }
+
+    /// One seed edge's closure walk for [`Self::collect_object_mixins`]. Every
+    /// method-dependent question is deferred: a marker edge sets `unnamed`, a
+    /// wildcard/hook-dirty module sets `tainted`, a known-user module joins
+    /// `modules`, and an edge resolving to nothing or to a non-`known_user`
+    /// project module joins `opaque` (which keeps the `(from, raw)` pair — the
+    /// per-method `external_may_define` needs the writer's lexical scope).
+    fn collect_mixin_edge(&self, owner: &str, raw: &str, m: &mut ObjectMixins) {
+        if mixin_marker(raw) {
+            m.unnamed = true;
+            return;
         }
         // The question is a union over the module's ancestry, not "which
         // definer does Ruby call", so the closure is walked directly: an order
@@ -644,10 +810,8 @@ impl SourceIndex {
         let mut queue: Vec<(String, String)> = vec![(owner.to_string(), raw.to_string())];
         let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
-            if raw == MIXIN_WILDCARD {
-                if !explicit {
-                    return true;
-                }
+            if mixin_marker(&raw) {
+                m.unnamed = true;
                 continue;
             }
             match self.resolve_override_ancestor(&from, &raw) {
@@ -655,9 +819,12 @@ impl SourceIndex {
                     if !seen.insert(q.clone()) {
                         continue;
                     }
-                    // `ResolutionChain::LIMIT`: a cut chain is uncertainty.
+                    // `ResolutionChain::LIMIT`: a cut chain is uncertainty —
+                    // the answer is `true` for every method, so collecting
+                    // can stop.
                     if seen.len() > CHAIN_LIMIT {
-                        return true;
+                        m.cut = true;
+                        return;
                     }
                     // A wildcard edge (an include the walk cannot name) or a
                     // hook may hide a definer; only a bare call counts that,
@@ -665,39 +832,44 @@ impl SourceIndex {
                     // a receiver call skips every unknown module (an
                     // `include('x')` matcher in a spec's `module Concurrent`
                     // body would otherwise silence the whole project).
-                    if (!explicit
-                        && (self.ancestry.wildcard_include(&q) || self.ancestry.dirty.contains(&q)))
-                        || self.records_name(&q, method)
-                        || self.macro_named(&q, method)
-                    {
-                        return true;
+                    if self.ancestry.wildcard_include(&q) || self.ancestry.dirty.contains(&q) {
+                        m.tainted = true;
                     }
-                    let mut edges: Vec<String> = self
-                        .override_classes
-                        .get(&q)
-                        .map(|e| e.includes.clone())
-                        .unwrap_or_default();
-                    if let Some(listed) = self.ancestry.include_listed.get(&q) {
-                        edges.extend(listed.iter().cloned());
+                    if m.module_set.insert(q.clone()) {
+                        m.modules.push(q.clone());
                     }
-                    for (_, names) in self.ancestry.groups.get(&q).into_iter().flatten() {
-                        edges.extend(names.iter().cloned());
-                    }
-                    for e in edges {
+                    for e in self.object_mixin_edges(&q) {
                         queue.push((q.clone(), e));
                     }
                 }
+                // A declared module's class-body macro may name it (#2094) —
+                // the `Some` half — and any raw spelling may be an ancestor
+                // RBS knows (`external_may_define`). Both are per-method
+                // questions; the edge itself is method-independent.
                 other => {
-                    // #2094: a declared module's class-body macro may name it.
-                    if other.is_some_and(|q| self.macro_named(&q, method))
-                        || external_may_define(core, &from, &raw, method, explicit)
-                    {
-                        return true;
+                    if m.opaque_set.insert((from.clone(), raw.clone())) {
+                        m.opaque.push((from, raw, other));
                     }
                 }
             }
         }
-        false
+    }
+
+    /// The mixin edges `mixin_edge_may_define` enqueued for `q`: its direct
+    /// `include`s, its listed (unpositioned) edges and its statement groups.
+    fn object_mixin_edges(&self, q: &str) -> Vec<String> {
+        let mut edges: Vec<String> = self
+            .override_classes
+            .get(q)
+            .map(|e| e.includes.clone())
+            .unwrap_or_default();
+        if let Some(listed) = self.ancestry.include_listed.get(q) {
+            edges.extend(listed.iter().cloned());
+        }
+        for (_, names) in self.ancestry.groups.get(q).into_iter().flatten() {
+            edges.extend(names.iter().cloned());
+        }
+        edges
     }
 }
 
@@ -824,11 +996,11 @@ impl SourceIndex {
         let mut queue: Vec<(String, String)> = self
             .instance_mixin_edges(a)
             .into_iter()
-            .filter(|(_, raw)| raw != MIXIN_WILDCARD)
+            .filter(|(_, raw)| !mixin_marker(raw))
             .collect();
         let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
-            if raw == MIXIN_WILDCARD {
+            if mixin_marker(&raw) {
                 if open && !hook_only {
                     return true;
                 }
@@ -904,7 +1076,7 @@ impl SourceIndex {
         let listed = self.ancestry.extend_listed.get(q).into_iter().flatten();
         let harvested = self.override_classes.get(q).into_iter().flat_map(|e| e.extends.iter());
         for raw in listed.chain(harvested) {
-            if raw != MIXIN_WILDCARD && !out.contains(raw) {
+            if !mixin_marker(raw) && !out.contains(raw) {
                 out.push(raw.clone());
             }
         }
@@ -917,12 +1089,12 @@ impl SourceIndex {
         let mut queue: Vec<(String, String)> = self
             .singleton_raws(q)
             .into_iter()
-            .filter(|r| r != MIXIN_WILDCARD)
+            .filter(|r| !mixin_marker(r))
             .map(|r| (q.to_string(), r))
             .collect();
         let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
-            if raw == MIXIN_WILDCARD {
+            if mixin_marker(&raw) {
                 continue;
             }
             if let Some(m) = self.resolve_override_ancestor(&from, &raw) {
@@ -956,7 +1128,7 @@ impl SourceIndex {
             || self
                 .singleton_raws(owner)
                 .iter()
-                .filter(|r| *r != MIXIN_WILDCARD)
+                .filter(|r| !mixin_marker(r))
                 .any(|raw| self.entry_hook_capable(core, owner, raw))
     }
 
@@ -987,10 +1159,10 @@ impl SourceIndex {
             .any(|n| {
                 let open = !OBJECT_ROOTS.contains(&n.as_str());
                 let raws = self.singleton_raws(n);
-                if self.singleton_truncated(n) || (open && raws.iter().any(|r| r == MIXIN_WILDCARD)) {
+                if self.singleton_truncated(n) || (open && raws.iter().any(|r| mixin_marker(r))) {
                     return true;
                 }
-                raws.iter().filter(|r| *r != MIXIN_WILDCARD).any(|raw| {
+                raws.iter().filter(|r| !mixin_marker(r)).any(|raw| {
                     // v0.4.6 review: level 0 of the reference's singleton
                     // chain holds the extended module's own include/prepend
                     // closure too (`module Ext; include Inner`), read as the

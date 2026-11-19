@@ -45,8 +45,8 @@ use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
 use std::sync::OnceLock;
 
-use rigor_parse::{LoweredAst, Span};
-use rigor_types::Scalar;
+use rigor_parse::{LoweredAst, NodeId, Span};
+use rigor_types::{Scalar, Type};
 
 use crate::dead::DeadPositions;
 use crate::reach::Reach;
@@ -108,7 +108,7 @@ type FastMap<K, V> = HashMap<K, V, BuildHasherDefault<FastHasher>>;
 /// ran.
 const MAX_ENTRIES_PER_KEY: usize = 128;
 
-/// An `expr_truthiness` memo key: `(ast address, predicate node)`.
+/// An `expr_truthiness` memo key: `([`LoweredAst::uid`], predicate node)`.
 type TruthyKey = (usize, u32);
 
 /// One stored answer.
@@ -136,34 +136,119 @@ fn id_bit(id: u32) -> u64 {
     1 << (id % 64)
 }
 
+/// Whether a stack holding the (distinct) interned keys `stack` answers
+/// every test the recorded computation made the way its starting stack did.
+fn deps_match(tested_bits: u64, tested: &[u32], present: &[u32], stack: &[u32]) -> bool {
+    let mut held = 0;
+    for id in stack {
+        if tested_bits & id_bit(*id) != 0 && tested.binary_search(id).is_ok() {
+            if !present.contains(id) {
+                return false;
+            }
+            held += 1;
+        }
+    }
+    held == present.len()
+}
+
 impl MemoEntry {
     /// Whether a stack holding the (distinct) interned keys `stack` answers
     /// every test this computation made the way its starting stack did.
     fn matches(&self, stack: &[u32]) -> bool {
-        let mut held = 0;
-        for id in stack {
-            if self.tested_bits & id_bit(*id) != 0 && self.tested.binary_search(id).is_ok() {
-                if !self.present.contains(id) {
-                    return false;
-                }
-                held += 1;
-            }
-        }
-        held == self.present.len()
+        deps_match(self.tested_bits, &self.tested, &self.present, stack)
     }
+}
+
+/// One stored `expr_scalar` / `expr_reach` answer — the [`MemoEntry`]
+/// dependency record minus the local root these per-expression walks do not
+/// have (the node id in the key already says which expression it is for).
+struct ExprEntry<T> {
+    /// Every `seen` key the computation tested (interned), sorted.
+    tested: Rc<[u32]>,
+    /// `tested` folded into 64 bits.
+    tested_bits: u64,
+    /// The tested keys its starting stack held, sorted.
+    present: Box<[u32]>,
+    /// The folds it saw re-entered, same rule as [`MemoEntry::folding`].
+    folding: Rc<[TruthyKey]>,
+    out: T,
+}
+
+impl<T> ExprEntry<T> {
+    fn matches(&self, stack: &[u32]) -> bool {
+        deps_match(self.tested_bits, &self.tested, &self.present, stack)
+    }
+}
+
+/// What [`expr_entry_hit`] returns: the stored answer plus the dependency
+/// record handed to the enclosing computation.
+type ExprHit<T> = (T, Rc<[u32]>, Rc<[TruthyKey]>);
+
+/// `type_of` memo payload: the carrier plus whether it embeds no interner ids.
+type TypeOfOut = (Type, bool);
+
+/// Per-node table keyed by `(node id, seen.len())`.
+type ExprTable<T> = FastMap<(u32, usize), Vec<ExprEntry<T>>>;
+
+/// The newest usable `ExprEntry` in `entries` for `stack` — the matching
+/// half of `local_reach`'s hit loop (the `root` test does not apply: the key
+/// names the node). MRU first; an entry whose fold landed on a value is
+/// dropped rather than matched, exactly as [`Typer::local_reach`] does.
+fn expr_entry_hit<T: Clone>(
+    entries: &mut Vec<ExprEntry<T>>,
+    stack: &[u32],
+    running: &std::collections::HashSet<TruthyKey>,
+    landed: &std::collections::HashMap<TruthyKey, Option<bool>>,
+) -> Option<ExprHit<T>> {
+    let mut found = None;
+    let mut i = 0;
+    while i < entries.len() {
+        let e = &entries[i];
+        if !e.matches(stack) {
+            i += 1;
+            continue;
+        }
+        if e.folding
+            .iter()
+            .all(|p| running.contains(p) || landed.get(p) == Some(&None))
+        {
+            found = Some(i);
+            break;
+        }
+        entries.remove(i);
+    }
+    found.map(|i| {
+        entries[..=i].rotate_right(1);
+        let e = &entries[0];
+        (e.out.clone(), e.tested.clone(), e.folding.clone())
+    })
 }
 
 /// The memo: entries per `(use span, skip_class_guards, seen.len())`, valid
 /// for one `(AST identity, dead-set object)` pair.
 #[derive(Default)]
 pub(crate) struct ReachMemo {
-    /// The AST identity (address, arena length) the entries belong to.
+    /// The AST identity ([`LoweredAst::uid`], arena length) the entries
+    /// belong to.
     ast: (usize, usize),
     /// The dead set the entries were computed against — held, so its address
     /// cannot be reused by a later set while the memo compares against it.
     dead: Option<Rc<DeadPositions>>,
     /// Most recently used first; at most [`MAX_ENTRIES_PER_KEY`] per key.
     entries: FastMap<(Span, bool, usize), Vec<MemoEntry>>,
+    /// `expr_scalar` answers per `(node, base stack depth)` — the same
+    /// `(ast, dead)` validity window as `entries`, and the same dependency
+    /// record per entry. A deep right-nested chain (`2 ** 2 ** …`,
+    /// rigor-rs#424) is what re-walked its whole remaining suffix per level
+    /// without this.
+    expr_scalars: ExprTable<Option<Scalar>>,
+    /// `expr_reach` answers under the same keying.
+    expr_reaches: ExprTable<Reach>,
+    /// `type_of` answers for env-free `Node::Call` subtrees — [`TypeOfOut`]:
+    /// only a `Type` that embeds no interner ids is stored (see
+    /// [`Typer::type_of_memo`]), so a hit re-interns it under whatever
+    /// interner asks (rigor-rs#424).
+    type_ofs: ExprTable<TypeOfOut>,
     /// Every `seen` key tested on this AST, interned, so dependencies are
     /// lists of small ids. Reset with the AST only while no computation is
     /// in progress — the frames hold ids too.
@@ -183,6 +268,9 @@ impl ReachMemo {
             self.ast = ast;
             self.dead = dead.clone();
             self.entries.clear();
+            self.expr_scalars.clear();
+            self.expr_reaches.clear();
+            self.type_ofs.clear();
         }
     }
 
@@ -288,7 +376,7 @@ fn audit_mode() -> bool {
 }
 
 fn ast_identity(ast: &LoweredAst) -> (usize, usize) {
-    (ast as *const LoweredAst as usize, ast.len())
+    (ast.uid() as usize, ast.len())
 }
 
 /// The address that identifies a `seen` stack. The `Vec` itself, not its
@@ -333,7 +421,7 @@ impl<'i> Typer<'i> {
     /// is cached for `ast`, else the partial set while a scan is in flight,
     /// else none (a call would start the scan).
     fn current_dead(&self, ast: &LoweredAst) -> Option<Rc<DeadPositions>> {
-        let key = ast as *const LoweredAst as usize;
+        let key = ast.uid() as usize;
         if let Some((cached_key, cached)) = &*self.dead_cache.borrow() {
             if *cached_key == key {
                 return Some(cached.clone());
@@ -477,5 +565,157 @@ impl<'i> Typer<'i> {
             }
         }
         out
+    }
+
+    /// The memoizing front of the per-expression walks [`Typer::expr_scalar`]
+    /// and [`Typer::expr_reach`] (rigor-rs#424). Those are called once per
+    /// call-site argument (`arg_reach`), and each level of a deep chain
+    /// re-walks its whole remaining suffix — `2 ** 2 ** …` cost cubic time
+    /// before the per-node memo. The entries live in the SAME `(ast, dead)`
+    /// window as the `local_reach` ones and carry the same dependency
+    /// record: a computation that tested `seen` is reused only on a stack
+    /// answering those tests identically, one that saw a re-entered fold
+    /// only while that fold still answers `None`, and a computation whose
+    /// dead set moved under it is never stored.
+    ///
+    /// `map` selects which of the two node-keyed tables the entry lives in;
+    /// `compute` is the uncached body.
+    fn expr_memo<T>(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+        map: impl Fn(&mut ReachMemo) -> &mut ExprTable<T>,
+        compute: impl FnOnce(&Self, &LoweredAst, NodeId, &mut Vec<String>) -> T,
+        store_if: impl Fn(&T) -> bool,
+    ) -> T
+    where
+        T: Clone + PartialEq + std::fmt::Debug,
+    {
+        let ast_id = ast_identity(ast);
+        let dead = self.current_dead(ast);
+        let key = (id.0, seen.len());
+        let hit = {
+            let mut memo = self.reach_memo.borrow_mut();
+            if memo.ast != ast_id {
+                // Same interner housekeeping as `local_reach`'s front.
+                let mut frames = self.reach_frames.borrow_mut();
+                if frames.frames.is_empty() {
+                    memo.keys.clear();
+                    frames.marks.clear();
+                }
+            }
+            memo.reset_unless_valid(ast_id, &dead);
+            let stack = memo.stack_ids(seen);
+            match map(&mut memo).get_mut(&key) {
+                Some(entries) => expr_entry_hit(
+                    entries,
+                    &stack,
+                    &self.truthy_in_flight.borrow(),
+                    &self.truthy_memo.borrow(),
+                ),
+                None => None,
+            }
+        };
+        if let Some((out, tested, folding)) = hit {
+            // The hit's dependencies are the enclosing computation's too.
+            self.reach_frames.borrow_mut().record(stack_id(seen), &tested, &folding);
+            if audit_mode() {
+                let again = compute(self, ast, id, seen);
+                assert!(
+                    again == out,
+                    "rigor-rs#422 reach memo audit: expr_memo({id:?}, seen={seen:?}) memo \
+                     {out:?} != recomputed {again:?} in {:?}",
+                    ast.file_key(),
+                );
+            }
+            return out;
+        }
+        let base = seen.len();
+        let stack = stack_id(seen);
+        self.reach_frames.borrow_mut().push_reach(stack);
+        let out = compute(self, ast, id, seen);
+        let (mut tested, folding) = {
+            let mut frames = self.reach_frames.borrow_mut();
+            let Some(MemoFrame::Reach { tested, folding, .. }) = frames.frames.pop() else {
+                unreachable!("reach memo frames out of balance");
+            };
+            frames.record(stack, &tested, &folding);
+            (tested, folding)
+        };
+        if store_if(&out)
+            && same_dead(&dead, &self.current_dead(ast))
+        {
+            let mut memo = self.reach_memo.borrow_mut();
+            if memo.valid_for(ast_id, &dead) {
+                tested.sort_unstable();
+                let mut present: Vec<u32> = memo
+                    .stack_ids(&seen[..base])
+                    .into_iter()
+                    .filter(|id| tested.binary_search(id).is_ok())
+                    .collect();
+                present.sort_unstable();
+                let entries = map(&mut memo).entry(key).or_default();
+                entries.truncate(MAX_ENTRIES_PER_KEY - 1);
+                entries.insert(
+                    0,
+                    ExprEntry {
+                        tested_bits: tested.iter().fold(0, |bits, &id| bits | id_bit(id)),
+                        tested: tested.into(),
+                        present: present.into(),
+                        folding: folding.into(),
+                        out: out.clone(),
+                    },
+                );
+            }
+        }
+        out
+    }
+
+    /// [`Typer::expr_memo`] for `expr_scalar` — see its docs for the
+    /// validity and dependency discipline (rigor-rs#424).
+    pub(crate) fn expr_scalar_memo(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+        compute: impl FnOnce(&Self, &LoweredAst, NodeId, &mut Vec<String>) -> Option<Scalar>,
+    ) -> Option<Scalar> {
+        self.expr_memo(ast, id, seen, |m| &mut m.expr_scalars, compute, |_| true)
+    }
+
+    /// [`Typer::expr_memo`] for `expr_reach` — see its docs for the
+    /// validity and dependency discipline (rigor-rs#424).
+    pub(crate) fn expr_reach_memo(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+        compute: impl FnOnce(&Self, &LoweredAst, NodeId, &mut Vec<String>) -> Reach,
+    ) -> Reach {
+        self.expr_memo(ast, id, seen, |m| &mut m.expr_reaches, compute, |_| true)
+    }
+
+    /// [`Typer::expr_memo`] for `type_of` on an env-free `Node::Call`
+    /// subtree (rigor-rs#424). `compute` returns the `Type` the call
+    /// interned and whether it embeds NO interner ids (resolved through the
+    /// interner that produced it — `Dynamic[top]` is free, `Dynamic` over a
+    /// later id is not). Only free answers are stored, so a hit can
+    /// re-intern the `Type` under the caller's interner.
+    pub(crate) fn type_of_memo(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        compute: impl FnOnce(&Self) -> (Type, bool),
+    ) -> Type {
+        self.expr_memo(
+            ast,
+            id,
+            &mut Vec::new(),
+            |m| &mut m.type_ofs,
+            |s, _a, _i, _seen| compute(s),
+            |(_, free)| *free,
+        )
+        .0
     }
 }

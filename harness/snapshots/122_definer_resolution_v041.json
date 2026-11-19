@@ -3,6 +3,20 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
+      "line": 196,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 206,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `upcase' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 247,
       "column": 16,
       "severity": "error",

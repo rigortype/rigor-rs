@@ -3,52 +3,38 @@
   "diagnostics": [
     {
       "rule": "call.undefined-method",
-      "line": 20,
-      "column": 9,
-      "severity": "error",
-      "message": "undefined method `zork' for 1"
-    },
-    {
-      "rule": "call.undefined-method",
-      "line": 26,
+      "line": 32,
       "column": 6,
       "severity": "error",
       "message": "undefined method `zork' for 1"
     },
     {
       "rule": "call.undefined-method",
-      "line": 36,
+      "line": 42,
       "column": 13,
       "severity": "error",
       "message": "undefined method `zzz' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 38,
+      "line": 44,
       "column": 20,
       "severity": "error",
       "message": "undefined method `zzz' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 40,
+      "line": 46,
       "column": 16,
       "severity": "error",
       "message": "undefined method `zzz' for String"
     },
     {
       "rule": "call.undefined-method",
-      "line": 42,
+      "line": 48,
       "column": 15,
       "severity": "error",
       "message": "undefined method `zzz' for Array"
-    },
-    {
-      "rule": "flow.always-truthy-condition",
-      "line": 21,
-      "column": 4,
-      "severity": "warning",
-      "message": "condition is always falsey (the surrounding flow proves it folds to a constant)"
     }
   ]
 }

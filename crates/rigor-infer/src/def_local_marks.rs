@@ -557,6 +557,44 @@ impl DefLocalMarks {
             .collect()
     }
 
+    /// The local reads inside `span`, with each read's start position — the
+    /// loop-cap walk needs positions to tell an assumption read (before the
+    /// name's first body write) from a read of the body's own binding.
+    pub(crate) fn read_positions_within(&self, span: Span) -> Vec<(usize, &str)> {
+        let i = self.reads.partition_point(|r| r.0 < span.0);
+        self.reads[i..]
+            .iter()
+            .take_while(|r| r.0 < span.1)
+            .filter(|r| r.1 <= span.1)
+            .map(|r| (r.0, r.2.as_str()))
+            .collect()
+    }
+
+    /// The decision spans inside `span` (`if`/`case`/loop predicates,
+    /// `&&`/`||` lefts, `&.` receivers) — the loop-cap walk consults each
+    /// decision's own read set.
+    pub(crate) fn decision_spans_within(&self, span: Span) -> Vec<(usize, usize)> {
+        let i = self.decisions.partition_point(|d| d.0 < span.0);
+        self.decisions[i..]
+            .iter()
+            .take_while(|d| d.0 < span.1)
+            .filter(|d| d.1 <= span.1)
+            .copied()
+            .collect()
+    }
+
+    /// The nested `def`/`class`/`module` body spans inside `span` — writes
+    /// inside one bind a different local scope.
+    pub(crate) fn nested_scopes_within(&self, span: Span) -> Vec<Span> {
+        let i = self.scopes.partition_point(|s| s.0 < span.0);
+        self.scopes[i..]
+            .iter()
+            .take_while(|s| s.0 < span.1)
+            .filter(|s| s.1 <= span.1 && **s != span)
+            .copied()
+            .collect()
+    }
+
     /// Whether any local read inside `span` names one of `names`.
     pub(crate) fn reads_any_within(&self, span: Span, names: &[String]) -> bool {
         let i = self.reads.partition_point(|r| r.0 < span.0);
@@ -726,7 +764,7 @@ impl<'i> Typer<'i> {
     /// The marks of `ast`, built on first use and memoized per `ast`
     /// identity (the `reach_index` keying).
     pub fn def_local_marks(&self, ast: &LoweredAst) -> Rc<DefLocalMarks> {
-        let key = (ast as *const LoweredAst as usize, ast.len());
+        let key = (ast.uid() as usize, ast.len());
         if let Some((cached_key, marks)) = &*self.def_marks.borrow() {
             if *cached_key == key {
                 return marks.clone();

@@ -29,7 +29,7 @@ use serde_json::{json, Value};
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, Typer};
-use rigor_parse::{comment_lines, lower, parse_bounded};
+use rigor_parse::{comment_lines, lower, parse_bounded, LineIndex};
 use rigor_rules::{
     analyze_with_source, catalog, filter_suppressed, shadowed_rescue_diagnostics,
     suppression_marker_diagnostics, Diagnostic,
@@ -342,29 +342,29 @@ fn tool_check(ctx: &ServerContext, args: &Value) -> Result<String, String> {
             Ok(parsed) => parsed,
             Err(too_deep) => return Err(too_deep.message()),
         };
-        let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
+        let comments = comment_lines(&result, &bytes, ast.line_index());
         let src = SourceIndex::build_with_pre_eval(&ast, &ctx.index, ctx.pre_eval.clone());
         let mut interner = Interner::new();
         let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
         diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
         // ADR-47 WD5 — dead version-guard arms, before `suppression.*` joins.
         let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
-        Ok((diags, comments))
+        Ok((diags, comments, ast.share_line_index()))
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())??;
 
-    let (mut diags, comments) = analysed;
+    let (mut diags, comments, lines) = analysed;
     diags.extend(suppression_marker_diagnostics(&comments));
     let with_lines: Vec<(usize, Diagnostic)> =
-        diags.into_iter().map(|d| (line_col(source, d.start_offset).0, d)).collect();
+        diags.into_iter().map(|d| (lines.line(d.start_offset), d)).collect();
     let kept = filter_suppressed(with_lines, &comments);
 
     let items: Vec<Value> = kept
         .into_iter()
         .filter(|(_, d)| !ctx.disable.suppresses(d.rule_id))
         .map(|(_, d)| {
-            let (line, column) = line_col(source, d.start_offset);
+            let (line, column) = lines.line_col(d.start_offset);
             let mut obj = json!({
                 "path": path,
                 "line": line,
@@ -398,22 +398,22 @@ fn tool_triage(ctx: &ServerContext, args: &Value) -> Result<String, String> {
             Ok(parsed) => parsed,
             Err(too_deep) => return Err(too_deep.message()),
         };
-        let comments = comment_lines(&result, &bytes);
         let ast = lower(&result);
+        let comments = comment_lines(&result, &bytes, ast.line_index());
         let src = SourceIndex::build_with_pre_eval(&ast, &ctx.index, ctx.pre_eval.clone());
         let mut interner = Interner::new();
         let mut diags = analyze_with_source(&ast, &mut interner, &ctx.index, &src);
         diags.extend(shadowed_rescue_diagnostics(&ast, &ctx.index, &src, source));
         // ADR-47 WD5 — dead version-guard arms, before `suppression.*` joins.
         let diags = rigor_rules::filter_dead_version_guard_arms(diags, &ast);
-        Ok((diags, comments))
+        Ok((diags, comments, ast.share_line_index()))
     }))
     .map_err(|_| "internal error: analysis panicked on this source".to_string())??;
 
-    let (mut diags, comments) = analysed;
+    let (mut diags, comments, lines) = analysed;
     diags.extend(suppression_marker_diagnostics(&comments));
     let with_lines: Vec<(usize, Diagnostic)> =
-        diags.into_iter().map(|d| (line_col(source, d.start_offset).0, d)).collect();
+        diags.into_iter().map(|d| (lines.line(d.start_offset), d)).collect();
     let kept: Vec<Diagnostic> = filter_suppressed(with_lines, &comments)
         .into_iter()
         .filter(|(_, d)| !ctx.disable.suppresses(d.rule_id))
@@ -512,25 +512,27 @@ fn tool_explain(args: &Value) -> Result<String, String> {
 /// LSP `documentSymbol` handler uses).
 fn tool_outline(args: &Value) -> Result<String, String> {
     let source = args.get("source").and_then(Value::as_str).ok_or("missing `source` string")?;
-    let syms = panic::catch_unwind(AssertUnwindSafe(|| {
+    let analysed = panic::catch_unwind(AssertUnwindSafe(|| {
         // Past the depth bound (rigor-rs#412) the tool fails with the refusal.
         let parsed = match parse_bounded(source.as_bytes()) {
             Ok(parsed) => parsed,
             Err(too_deep) => return Err(too_deep.message()),
         };
-        Ok(crate::outline::build(&lower(&parsed)))
+        let ast = lower(&parsed);
+        Ok((crate::outline::build(&ast), ast.share_line_index()))
     }))
     .map_err(|_| "internal error: parsing panicked on this source".to_string())??;
 
-    let tree: Vec<Value> = syms.iter().map(|s| outline_json(s, source)).collect();
+    let (syms, lines) = analysed;
+    let tree: Vec<Value> = syms.iter().map(|s| outline_json(s, &lines)).collect();
     let report = json!({ "outline": tree, "count": syms.len() });
     serde_json::to_string_pretty(&report).map_err(|e| e.to_string())
 }
 
 /// Adapt a shared outline node into JSON with 1-based line ranges.
-fn outline_json(s: &crate::outline::SymNode, source: &str) -> Value {
-    let (start_line, _) = line_col(source, s.full.0);
-    let (end_line, _) = line_col(source, s.full.1.min(source.len()));
+fn outline_json(s: &crate::outline::SymNode, lines: &LineIndex) -> Value {
+    let start_line = lines.line(s.full.0);
+    let end_line = lines.line(s.full.1);
     let mut obj = json!({
         "name": s.name,
         "kind": s.kind.label(),
@@ -538,16 +540,9 @@ fn outline_json(s: &crate::outline::SymNode, source: &str) -> Value {
         "endLine": end_line,
     });
     if !s.children.is_empty() {
-        obj["children"] = Value::Array(s.children.iter().map(|c| outline_json(c, source)).collect());
+        obj["children"] = Value::Array(s.children.iter().map(|c| outline_json(c, lines)).collect());
     }
     obj
-}
-
-/// 1-based `(line, column)` from a byte offset — the same mapping the text/json
-/// reporters use. Delegates rather than re-deriving: a second copy of the column
-/// unit is a second place for it to drift away from the reference's byte columns.
-fn line_col(source: &str, byte_offset: usize) -> (usize, usize) {
-    crate::line_col(source, byte_offset)
 }
 
 #[cfg(test)]

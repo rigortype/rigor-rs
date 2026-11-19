@@ -117,8 +117,8 @@ fn stats_prints_the_run_summary() {
         .join("\n");
     let expected = "\nCheck targets\n  Ruby source files: 3\n\
         Type universe (symbol discovery; not analyzed for diagnostics)\n  \
-        RBS classes available: 1380\n    project sig/:        0\n    \
-        bundled (core+stdlib+gems): 1380\nProcess";
+        RBS classes available: 1381\n    project sig/:        0\n    \
+        bundled (core+stdlib+gems): 1381\nProcess";
     assert_eq!(body, expected, "{stderr}");
     assert!(stderr.contains("  Wall time:   "), "{stderr}");
     assert!(stderr.contains("  Memory peak: "), "{stderr}");

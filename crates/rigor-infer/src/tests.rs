@@ -2236,3 +2236,180 @@ fn core_singleton_name_is_string() {
     assert_eq!(idx.class_name_of(&i, interned), Some("String"), "Time.name must be String, got {ty:?}");
 }
 
+
+#[test]
+fn link_writes_read_case_begin_rescue_and_rescue_modifier_arms() {
+    // rigor-rs#603: `each_may_be` treats every `selection_branches`
+    // construct the same — `case`/`case in`, `begin`/`rescue` clauses,
+    // and the rescue modifier — not only `if`/`||`/`&&`.
+    for (src, want) in [
+        (b"f = [1]\ng = case c\nwhen true then f\nelse [3]\nend\n" as &[u8], true),
+        (b"f = [1]\ng = case x\nin Integer then f\nelse nil\nend\n", true),
+        (b"f = [1]\ng = begin\nf\nrescue\nnil\nend\n", true),
+        (b"f = [1]\ng = (f rescue nil)\n", true),
+        // `ensure` is not a selection branch — its statements do not
+        // contribute; the main body's `f` still does.
+        (b"f = [1]\ng = begin\nf\nensure\nnil\nend\n", true),
+        // A `while` body is not a selection — no link.
+        (b"f = [1]\ng = while c\nf\nend\n", false),
+    ] {
+        let ast = lower_src(src);
+        let links = &flow_writes::collect_indexed_flow(&ast).alias_links;
+        let has = links.iter().any(|(_, to, from)| to == "g" && from == "f");
+        assert_eq!(has, want, "{}", String::from_utf8_lossy(src));
+    }
+}
+
+#[test]
+fn a_write_value_names_itself_not_its_source() {
+    // `may_be_locals` answers the write's NAME upstream — `g = (h = f)`
+    // links `g` to `h`, and `h` to `f` by its own bind.
+    let ast = lower_src(b"f = [1]\ng = (h = f)\n");
+    let links = &flow_writes::collect_indexed_flow(&ast).alias_links;
+    let pairs: Vec<(&String, &String)> = links
+        .iter()
+        .map(|(_, to, from)| (to, from))
+        .collect();
+    let g: String = "g".into();
+    let h: String = "h".into();
+    let f: String = "f".into();
+    assert!(pairs.contains(&(&g, &h)));
+    assert!(pairs.contains(&(&h, &f)));
+    assert!(!pairs.contains(&(&g, &f)));
+}
+
+#[test]
+fn a_mutation_inside_its_receiver_reaches_an_earlier_link() {
+    // rigor-rs#603: upstream keys the reach on `write.end <=
+    // call.message_loc.start` — a copy inside the mutator's RECEIVER ran
+    // before `<<` fired; one inside a later argument did not.
+    let st = |src: &[u8]| flow_writes::stale_local_names(&lower_src(src));
+    let t = st(b"f = [1]\ng = f\n(g2 = f) << 2\n");
+    assert!(t.stale("g2"));
+    assert!(t.stale("f"));
+    // `f << (h = g)` — the `h`-copy runs after `<<`, so `h` keeps its pin
+    // while `g` (linked earlier) floors.
+    let t = st(b"f = [1]\ng = f\nf << (h = g)\n");
+    assert!(t.stale("f"));
+    assert!(t.stale("g"));
+    assert!(!t.stale("h"));
+}
+
+#[test]
+fn a_selection_receiver_names_each_arms_local() {
+    // `mutated_reads` walks `ReceiverAlias.candidates`: `if` arm lasts,
+    // logical operands, local writes/op-writes, and the last statement of
+    // a multi-statement parens — `begin`/`else`/`in` carriers name
+    // nothing.
+    let st = |src: &[u8]| flow_writes::stale_local_names(&lower_src(src));
+    assert!(st(b"g = [1]\nh = [2]\n(c ? g : h) << 2\n").stale("g"));
+    assert!(st(b"g = [1]\nh = [2]\n(c ? g : h) << 2\n").stale("h"));
+    assert!(st(b"(g ||= f) << 2\n").stale("g"));
+    assert!(st(b"g = [1]\n(x(); g) << 2\n").stale("g"));
+    // A real `begin` as the receiver names no local.
+    assert!(!st(b"g = [1]\n(begin g; end) << 2\n").stale("g"));
+    // `g.send(:<<, 2) { }` carries a block — the literal-target send
+    // declines, so no receiver mutation at all.
+    assert!(!st(b"f = [1]\ng = f\ng.send(:<<, 2) { }\n").stale("f"));
+    // `[]=` through a selection marks each arm's local too.
+    assert!(st(b"g = [1]\nh = [2]\n(c ? g : h)[0] = 9\n").stale("h"));
+}
+
+
+/// rigor-rs#435 (ADR-56 slice B): a loop body that does not converge inside
+/// the reference's 3-pass `BodyFixpoint` widens EVERY tracked name on the cap
+/// pass — `Constant -> Nominal` — so a dead-arm write (`if false; t = nil;
+/// end`) must not leave `t` value-pinned where the reference already lost the
+/// pin. The snapshot of `if t` after the loop must NOT be a `Type::Constant`.
+#[test]
+fn loop_cap_widens_tracked_names_when_body_never_converges() {
+    let src = b"def f(c)\n  t = 1\n  y = nil\n  while c\n    if false\n      t = nil\n    end\n    y = [y]\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "t must shed its pin once a tracked name fails to converge, got {:?}",
+        i.get(ty)
+    );
+}
+
+/// The convergent control for `loop_cap_widening`: a body whose tracked
+/// names settle inside two passes (`y = 2` joins `nil | 2` once, then holds)
+/// keeps the constant pins — `if t` still folds to `Constant[1]` and
+/// `flow.always-truthy-condition` fires on both engines.
+#[test]
+fn loop_converged_body_keeps_constant_pins() {
+    let src = b"def f(c)\n  t = 1\n  y = nil\n  while c\n    if false\n      t = nil\n    end\n    y = 2\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+}
+
+/// A capped loop's widen lands on the POST-JOIN env, not the entry env:
+/// `w`'s own body write (`w = 1` under a `w = nil` seed) survives the cap
+/// pass the reference's way — `Integer | NilClass`, never a minted `nil` —
+/// so `if w` keeps no `Constant`/`NilClass` pin to fire on (rigor-rs#435
+/// review: the entry-env overlay turned this into an always-falsey FP).
+#[test]
+fn loop_cap_widen_preserves_body_writes_to_non_suspect_names() {
+    let src = b"def f(c)\n  w = nil\n  i = 0\n  while c\n    w = 1\n    i += 1\n  end\n  if w\n    puts i\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_))
+            && index.class_name_of(&i, ty) != Some("NilClass"),
+        "w must keep its body write (widened), got {:?}",
+        i.get(ty)
+    );
+}
+#[test]
+fn nested_alternating_logical_guard_is_linear() {
+    // rigor-rs#453: `subject_edge` re-evaluated a Logical's left operand on
+    // the non-sequential edge, so 34 nested `&&`/`||` terms took ~14 s in
+    // release. Both edges in one pass is linear in the predicate.
+    let mut expr = String::from("ENV.key?(\"k0\")");
+    for i in 1..40 {
+        let op = if i % 2 == 1 { "&&" } else { "||" };
+        expr = format!("({expr} {op} x{i})");
+    }
+    let src = format!("if {expr}\n  1\nend\n");
+    let ast = lower_src(src.as_bytes());
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let start = std::time::Instant::now();
+    let _dead = typer.guard_suppressed_calls(&ast, &mut i);
+    let dt = start.elapsed();
+    assert!(
+        dt.as_millis() < 500,
+        "40 nested Logical terms took {dt:?} (must stay linear)"
+    );
+}
+

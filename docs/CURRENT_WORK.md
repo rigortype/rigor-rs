@@ -11,16 +11,17 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ## Now / Next
 
-▶ **NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494.**
+▶ NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494, plus the
+repin's filed residuals #600, #605.
 Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
   `--protection`/`--mutation` + `type-scan` deferred
   ([scoping call](notes/20260719-coverage-command-scoping.md)).
-- **Pin is `v0.4.7`** (rbs 4.2.0 vendored). Both
-  standing exception tables EMPTY; new entries are real findings
-  (`UPSTREAM.md` hazards + overlay/`sig/shims` trap).
+- **Pin is `v0.4.8` on master** (rbs 4.2.0 vendored). Both standing
+  exception tables EMPTY; new entries are real findings (`UPSTREAM.md`
+  hazards + overlay/`sig/shims` trap).
 
 State (verified 2026-11-05, at `v0.4.7`): harness **170 fixtures / 0
 unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 623
@@ -62,6 +63,25 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #427 display stack** (PR #648): `render_postorder`; wrap90 SIGABRT→exit 1, wrap70 identical; 0 FP; Opus Approved. `.map` still #424. → #650. [note](notes/20261119-issue-427-iterative-type-display.md)
+- **2026-11-19 #424 `**` row** (PR #649): env-free call memos — 800 `**` 38s→0.5s; literal `x.a`/`1+` 20k under bar; 0 FP/8,251; Opus Approved. Const-path + local-rooted remain. [note](notes/20261119-issue-424-pow-chain.md)
+- **2026-11-19 #642 CLOSED** (PR #644): one `LineIndex` on `LoweredAst` (`CarrierSpans` box); MCP/LSP/annotate/stage 3 share it — LSP publish 2.89s→0.36s, MCP 4.26s→0.54s (20k diags); byte-identical; 0 FP; Opus Approved. [note](notes/20261119-issue-642-shared-line-index.md)
+- **2026-11-19 #435 CLOSED** (PR #634): loop-cap widen — structural `loop_cap_widening` + post-join `apply_loop_cap_widen` (ADR-56 slice B); m1/m2/o8 match, r3 silent; 0 FP, 0 gaps closed/opened; Opus Approved. → #638–#640. [note](notes/20261119-issue-435-loop-cap-widen.md)
+- **2026-11-19 #453 CLOSED** (PR #645): one-pass Logical `subject_edges` — 34 terms 14.05s→0.10s, 68 0.08s; byte-identical vs master (7k files); 0 FP/8,251; Opus Approved. → #646/#647. [note](notes/20261119-issue-453-logical-one-pass.md)
+- **2026-11-19 #636 CLOSED** (PR #641): findings store resolved `(line, column)` (`line_starts` at production), not a per-diag source clone + `line_col` walk — 60k-diag 169s/~49 GB → 1.8s/141 MB; byte-identical; 0 FP; Opus Approved. → #642/#643. [note](notes/20261119-issue-636-findings-line-index.md)
+- **2026-11-19 #464 CLOSED** (PR #635): `object_mixin_may_define` collects `Object`'s mixin closure once (`ObjectMixins` `OnceLock`) — synthetic 4.7s → 0.66s (≈0.86× vs no-include); byte-identical; 0 FP; Opus Approved. "283 s" → #636; `CHAIN_LIMIT` #637. [note](notes/20261119-issue-464-object-mixin-memo.md)
+- **2026-11-19 #346 CLOSED** (PR #630): config `~`/`~/` via MRI `Dir.home` NSS (`HOME` → `getpwnam(getlogin())` → `getpwuid`); `~name` literal (`ConfigPath`); `--config` `~`. Probes identical; Opus+Grok Approved. → #631–#633. [note](notes/20261119-issue-346-tilde-dir-home.md)
+- **2026-11-19 #614 CLOSED** (PR #624): `LocalOwnership` ports `constructor?`/`class_call?` + `singleton` — `.new` allocates on a constant path, `x.class`, or SINGLETON self. 2 OVER + 3 UNDER; Approved. → #629. [note](notes/20261119-issue-614-local-ownership-allocation.md)
+
+- **2026-11-19 #603 CLOSED** (PR #623): alias floor `selection_branches` + `ReceiverAlias.candidates` + carrier marks; 4 FP + ~130 probes; 2-round Approved. → #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
+
+- **2026-11-19 #615 CLOSED** (PR #620): effects `walk_namespace` ports `declaration_prefix`/`rooted?` — rooted `class ::Path` RESETS the unit prefix; probes byte-identical, 0 OVER, unit tests cover the fixture blind spot. → #621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
+
+- **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"` in every mixin list — computed class-body `include`/`send` opens the class (`taint_unrecorded_mixin`, `taint_computed_send`/`local_send_names`/`opens_self`, `extend_hook_taint`, `unnamed_mixin_on_chain`); scalar-path decline only, unions still fire. ~60 probe rows match; 2-round review closed 5 findings; sweep unmeasurable (no corpora). → #617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
+- **2026-11-18 #448 frame-local specials + DefinitionContext** (PR #613): `UNCOLOURED_READS`; `{$~,$_}` writes on `!shared_slot`; `BodyCtx` ports `definition_context.rb`. effects 0 OVER. → #614/#616. [note](notes/20261118-issue-448-frame-local-specials.md)
+- **2026-11-18 #376 bundled-name tables tied to the pin** (PR #609): v0.4.8's `rigor-rbs-contract` had already desynced `BUNDLED_SKILL_NAMES` (oracle lists 18 skills, port listed 17); entry added + `bundled_name_tables_match_the_pinned_reference` re-derives both tables from the submodule (skips unpopulated; step-6 bump run is the tie — gate.sh sees no crates on a gitlink-only bump). 0 FP/8,251; follow-ups #610/#611. [note](notes/20261118-issue-376-bundled-name-tie.md)
+- **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block writer set + `class <<`-composition contexts ported; `psych_key_to_s` mirrors `ToRuby#deserialize`. 3 review rounds, ~135 probe rows identical; follow-ups #606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
+- **2026-11-18 upstream re-pin `v0.4.7 → v0.4.8`** (PR #599, human-merged) — mixin-call recording rework + #2677 alias-floor copy-link slice ported; three review rounds closed 13 blocking findings (partial include, transitive links, send mutations, dead-arm links, `*` over-decline); **0 FP fixture + ~8.7K-file sweep, 959/1063**; residuals #600, #603–#605. [note](notes/20261115-repin-v048.md)
 - **2026-11-12 #405 class-guard record drop** (PR #591): class guards drop rooted `h[k]` records via a decline-side `record_guards` overlay. 18 master FPs closed, 0 FP/658; follow-ups #595/#596. [note](notes/20261112-issue-405-class-guard-records.md)
 - **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` exit guards record `$~` + mandatory `$N`; `Regexp.last_match` no longer a nil source. 0 FP/658; follow-ups #597/#598. [note](notes/20261112-issue-449-match-globals.md)
 - **2026-11-12 #438 `class_ivar_scope` memo key** (PR #588): reads in one class body share the `IvarScope`; required shapes ~pre-#432 RSS, output byte-identical. [note](notes/20261112-issue-438-ivar-scope-memo.md)
@@ -92,7 +112,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — member is the erased class of the value's `stmt_value_type`; union-carrier stores widen per-arm. **0 FP / 9,337**; #132. [note](notes/20260921-issue-128-store-value-typing.md).
 - **2026-09-21 upstream re-pin `v0.3.8 → v0.3.9`** (447 commits): **0 FP / 9,337, gaps 799→892**, 108 fixtures, 0 OVER. Raw bump: 4 FPs in three families (`declines_bot?` shaped carriers, rooted `::RUBY_VERSION`, `MutationRejoin`). Residues: #128–#130. [note](notes/20260921-repin-v039.md).
 - **2026-09-09 #123 CLOSED — 26 holes = THREE defects** — `overlay/` loads LAST, chain LAZY: **22** `module ::Kernel` keyed `Gem::Kernel`; **5** `prepend` uningested; **6** SELF-TYPE unrecorded. **26→0**, 0 FP / 9204 — DORMANT until `check_call`'s declaration-only conjunct drops. [note](notes/20260909-qualified-ancestor-closure-holes.md).
-- **2026-09-09 the 799 gaps ADJUDICATED** — partitioned by MECHANISM: **395 sit behind decisions**; the 71-row bucket rests on ONE over-narrow rbs signature. `check` exited 0 on unparseable files (PR #125); ADR-0033's leniency premise expired → #123/#124. [799](notes/20260909-gap-adjudication-799.md) / [gems](notes/20260909-declared-unwitnessed-gem-classes.md).
+- **2026-09-09 the 799 gaps ADJUDICATED** — partitioned by MECHANISM: **395 sit behind decisions**; the 71-row bucket rests on ONE over-narrow rbs signature. `check` exited 0 on unparseable files (PR #125); ADR-0033's leniency premise expired → #123/#124. [799](notes/20260909-gap-adjudication-799.md).
 - **2026-09-09 #118 CLOSED** (PR #120) — generic dispatch declines to `Dynamic[top]` when the join is at risk AND an argument is reference-untyped: **13 FPs closed, 0 matched lost**. Blanket "nilable declines" cost TEN folded rows — untypedness is what stops folding. [note](notes/20260909-generic-dispatch-untyped-arg.md).
 - **2026-09-09 upstream re-pin `v0.3.4 → v0.3.8`** (924 commits / 4 releases) — **0 FP / 9204, gaps 820→799**, harness 98→**105** fixtures. Raw bump = 7 fixture retractions + 12 sweep FPs = **SIX families**, each bisected+ported. Residues: 20 resolvable-`super` rows. [note](notes/20260909-repin-v038.md) / [spec](notes/20260909-repin-v038-port-spec.md) / [feedback 4](notes/20260909-upstream-feedback-batch4.md).
 - **2026-08-26/28 the effects GATE was lying, three times** (PRs #112/#115/#117) — deleted-arm byte-identity, `methods:{}` covering 2 of 4 producers, `omit?` inverting ADR-0043 §2. [s112](notes/20260826-s112-effects-instrument.md) / [s5](notes/20260826-effects-s5-probe.md) / [s116](notes/20260826-s116-snapshot-gate.md).

@@ -87,8 +87,8 @@ pub(crate) enum LocalEvent {
 /// The write collector's cache key: `(region, skip_defs, local name)`.
 type EventsKey = (Span, bool, String);
 
-/// [`Typer::reach_index`]'s memo: the index with the `(AST address, arena
-/// length)` identity it was built for.
+/// [`Typer::reach_index`]'s memo: the index with the `([`LoweredAst::uid`],
+/// arena length)` identity it was built for.
 pub(crate) type ReachIndexCache = Option<((usize, usize), Rc<ReachIndex>)>;
 
 /// The per-AST tables. See the module docs.
@@ -140,6 +140,14 @@ pub(crate) struct ReachIndex {
     retries: RefCell<HashMap<Span, bool>>,
     /// The collector's events per `(region, skip_defs, local)`.
     events: RefCell<HashMap<EventsKey, Rc<[LocalEvent]>>>,
+    /// Sorted start offsets of the nodes whose `type_of` can read `env` or
+    /// mutable typer state — `LocalVariableRead` / `VariableRead` (`env.get`),
+    /// `LocalVariableOpWrite` (its `def_scope` guard), `Node::Lambda` and
+    /// every block-bearing `Node::Call` (`type_block_call` clones `env` and
+    /// tests `env.contains_key` for captured names). A node whose span holds
+    /// none of their starts has an env-independent `type_of`, so
+    /// [`Typer::type_of`] may memoize it per (ast, dead set) — rigor-rs#424.
+    env_sensitive_starts: Vec<usize>,
 }
 
 /// The class-guard methods the write collector refuses on.
@@ -165,6 +173,7 @@ impl ReachIndex {
         let mut scopes = Vec::new();
         let mut closures: HashMap<String, Vec<Span>> = HashMap::new();
         let mut by_name: HashMap<String, Vec<NodeId>> = HashMap::new();
+        let mut env_sensitive_starts = Vec::new();
         let mut note = |name: &str, id: NodeId| {
             let ids = by_name.entry(name.to_string()).or_default();
             if ids.last() != Some(&id) {
@@ -176,6 +185,21 @@ impl ReachIndex {
             _ => None,
         };
         for (id, n) in ast.iter() {
+            match n {
+                Node::LocalVariableRead { span, .. }
+                | Node::VariableRead { span, .. }
+                | Node::LocalVariableOpWrite { span, .. }
+                | Node::Lambda { span, .. } => env_sensitive_starts.push(span.0),
+                Node::Call {
+                    span,
+                    block_body,
+                    block_span,
+                    ..
+                } if block_span.is_some() || !block_body.is_empty() => {
+                    env_sensitive_starts.push(span.0);
+                }
+                _ => {}
+            }
             match n {
                 Node::Definition { span, name, is_singleton_class, .. } => {
                     def_spans.push(*span);
@@ -297,6 +321,7 @@ impl ReachIndex {
         let mut by_start: Vec<(usize, NodeId)> =
             ast.iter().map(|(id, n)| (n.span().0, id)).collect();
         by_start.sort_unstable();
+        env_sensitive_starts.sort_unstable();
         ReachIndex {
             case_clauses: unevaluated_case_clause_spans(ast),
             by_start,
@@ -318,7 +343,18 @@ impl ReachIndex {
             unrecorded: RefCell::new(HashMap::new()),
             retries: RefCell::new(HashMap::new()),
             events: RefCell::new(HashMap::new()),
+            env_sensitive_starts,
         }
+    }
+
+    /// Whether `span` can hold an env-sensitive descendant — a local / ivar /
+    /// cvar / gvar read, an `op=` local write, a lambda or a block call — so
+    /// its `type_of` may depend on `env` or mutable typer state and must not
+    /// memoize (rigor-rs#424). Mirrors [`LoweredAst::reads_local_within`]:
+    /// the sensitive nodes' STARTS sort inside the containing node's span.
+    pub(crate) fn env_sensitive_within(&self, (lo, hi): Span) -> bool {
+        let i = self.env_sensitive_starts.partition_point(|&s| s < lo);
+        self.env_sensitive_starts.get(i).is_some_and(|&s| s < hi)
     }
 
     /// Whether `span` sits inside a `when` condition / `in` pattern.
@@ -652,10 +688,10 @@ impl ReachIndex {
 
 impl<'i> Typer<'i> {
     /// The [`ReachIndex`] of `ast`, built on first use and memoized on the
-    /// [`Typer`] per `ast` identity (the `dead_cache` keying, plus the arena
-    /// length as a guard against a reused address).
+    /// [`Typer`] per `ast` identity ([`LoweredAst::uid`], plus the arena
+    /// length).
     pub(crate) fn reach_index(&self, ast: &LoweredAst) -> Rc<ReachIndex> {
-        let key = (ast as *const LoweredAst as usize, ast.len());
+        let key = (ast.uid() as usize, ast.len());
         if let Some((cached_key, idx)) = &*self.reach_index.borrow() {
             if *cached_key == key {
                 return idx.clone();

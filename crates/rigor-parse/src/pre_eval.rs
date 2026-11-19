@@ -451,13 +451,13 @@ struct Scan<'a> {
     in_singleton: bool,
     vis: &'a VisibilityTable,
     guarded: &'a HashSet<(usize, usize)>,
-    line_starts: Vec<usize>,
+    line_index: crate::LineIndex,
     items: Vec<PreEvalItem>,
 }
 
 impl Scan<'_> {
     fn line(&self, offset: usize) -> usize {
-        self.line_starts.partition_point(|&s| s <= offset)
+        self.line_index.line(offset)
     }
 
     fn class_name(&self) -> Option<String> {
@@ -716,18 +716,12 @@ pub fn scan_pre_eval(source: &[u8]) -> Result<Vec<PreEvalItem>, PreEvalScanError
         found: HashSet::new(),
     };
     guards.visit(&root);
-    let mut line_starts = vec![0];
-    for (i, &b) in source.iter().enumerate() {
-        if b == b'\n' {
-            line_starts.push(i + 1);
-        }
-    }
     let mut scan = Scan {
         prefix: Vec::new(),
         in_singleton: false,
         vis: &table,
         guarded: &guards.found,
-        line_starts,
+        line_index: crate::LineIndex::new(source),
         items: Vec::new(),
     };
     scan.visit(&root);

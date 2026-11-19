@@ -98,3 +98,9 @@ lsp-types = "0.97.0"
 # `crossbeam_channel::Receiver`), so this direct pin adds no network fetch and
 # `--offline` keeps working; the version matches lsp-server's (0.5.x in the lock).
 crossbeam-channel = "0.5"
+# `Dir.home`'s HOME-less chain (config `~`/`~/` expansion, #346): MRI's
+# `rb_default_home_dir` asks `getpwnam(getlogin())` then `getpwuid(getuid())`
+# through NSS — on macOS that is OpenDirectory, which a `/etc/passwd` scan
+# cannot see. Reentrant `_r` forms; already in Cargo.lock (0.2.x).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

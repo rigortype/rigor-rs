@@ -59,6 +59,13 @@
     },
     {
       "rule": "call.undefined-method",
+      "line": 102,
+      "column": 48,
+      "severity": "error",
+      "message": "undefined method `frobnicate_zzz' for String"
+    },
+    {
+      "rule": "call.undefined-method",
       "line": 115,
       "column": 24,
       "severity": "error",

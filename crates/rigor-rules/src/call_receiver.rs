@@ -97,6 +97,23 @@ fn unenumerable_instance_receiver(index: &CoreIndex, class_name: &str) -> bool {
     unenumerable_receiver_class(class_name) || index.is_qualified_module(class_name)
 }
 
+/// Upstream v0.4.8 (#2991/#3006, `last_resort_surface_answers?`'s
+/// `unknown_mixin_includer?` arm): a class on the receiver's instance chain whose
+/// include side names a module the walk cannot name — `include(*MODS)`,
+/// `include m`, `include M, h`, a computed `send` that may be a mixin, a hook's
+/// `base.include M` — is open: the unnamed module may define any name, so the
+/// scalar rule declines exactly as it does on a module-typed receiver. Order-only
+/// taints (`include M; prepend M`, `extend(*EMODS)`, a receiverless `send` in a
+/// `def`, the `Module.new` argument #2975 keeps) still fire, as the oracle
+/// measures.
+///
+/// Read ONLY on the scalar path — the reference's `union_arm_blocks_undefined_fire?`
+/// and `arm_surface_may_answer?` do not ask it, so a `"a" | Foo` union over a
+/// `?`-open `Foo` still fires on both engines.
+fn unnamed_mixin_includer(source: &rigor_infer::SourceIndex, class_name: &str) -> bool {
+    source.unnamed_mixin_on_chain(class_name)
+}
+
 /// Upstream v0.4.5 (#2086 / issue #1722, `subclass_instance_may_answer?`'s
 /// `exact_literal_receiver?`): a value the engine built from a literal is
 /// exactly its class — a literal type, a tuple or a hash shape, or a union
@@ -390,6 +407,7 @@ pub(crate) fn check_call(
             // surface happens to model it.
             if unenumerable_instance_receiver(index, name)
                 || typer.source().ruby_library_reopen(index, name)
+                || unnamed_mixin_includer(typer.source(), name)
             {
                 return None;
             }
@@ -449,7 +467,9 @@ pub(crate) fn check_call(
     // answers only with a `CORE_CLASSES` name today, none of which is a module or a
     // metaclass, so this is defence in depth: it keeps the two instance paths
     // answering the same question the same way should that array ever widen.
-    if unenumerable_instance_receiver(index, class_name) {
+    if unenumerable_instance_receiver(index, class_name)
+        || unnamed_mixin_includer(typer.source(), class_name)
+    {
         return None;
     }
     if !index.knows_class(class_name) {
@@ -756,7 +776,9 @@ pub(crate) fn check_narrowed_call(
     // typed `Array` keeps the `Array` bound (subclass ordering), so `class_name`
     // there is `"Array"` and the witness still fires on both engines — row x11,
     // the control an "any module in the guard" test would have silenced.
-    if unenumerable_instance_receiver(index, class_name) {
+    if unenumerable_instance_receiver(index, class_name)
+        || unnamed_mixin_includer(typer.source(), class_name)
+    {
         return None;
     }
     // Accepted surfaces: the existing top-level one, the project's own `sig/`
@@ -878,8 +900,11 @@ pub(crate) fn check_collection_call(
         return None;
     }
     // Upstream v0.4.5 (#2086) — the carrier's exactness is not read here, so
-    // the subclass half is asked too (declines more).
-    if core_instance_may_answer(typer.source(), index, class_name, method, false) {
+    // the subclass half is asked too (declines more). #2991's open-chain arm
+    // rides beside it, as the scalar last-resort does.
+    if core_instance_may_answer(typer.source(), index, class_name, method, false)
+        || unnamed_mixin_includer(typer.source(), class_name)
+    {
         return None;
     }
     // ADR-17 — a `pre_eval:` patch on the receiver's walk.

@@ -103,7 +103,18 @@ impl<'i> Typer<'i> {
     /// reference unions them, so one untyped arm makes the whole value
     /// imprecise (row l31). A literal is precise; anything else goes through its
     /// root ([`Typer::chain_reach`]).
+    ///
+    /// Memoized per node through [`Typer::expr_reach_memo`]: `arg_reach` asks this
+    /// once per call-site argument, and each level of a deep chain recurses
+    /// into the next — without the memo a right-nested chain re-walks its
+    /// suffix per level and per call site (rigor-rs#424's cubic blow-up).
     fn expr_reach(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Reach {
+        self.expr_reach_memo(ast, id, seen, |s, a, i, seen| {
+            s.expr_reach_uncached(a, i, seen)
+        })
+    }
+
+    fn expr_reach_uncached(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> Reach {
         match ast.get(id) {
             Node::If {
                 predicate,
@@ -240,7 +251,24 @@ impl<'i> Typer<'i> {
     /// Shares `seen` with the reach walk — a local's read is keyed exactly as
     /// [`Typer::root_reach`] keys a `Local` root, so a self-referential write
     /// (`while c; v = "abc"[v]; end`) terminates on the decline side.
+    ///
+    /// Memoized per node through [`Typer::expr_scalar_memo`] (rigor-rs#424); a
+    /// literal leaf answers without touching the memo.
     pub(crate) fn expr_scalar(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+    ) -> Option<Scalar> {
+        if let Some(scalar) = literal_scalar(ast, id) {
+            return Some(scalar);
+        }
+        self.expr_scalar_memo(ast, id, seen, |s, a, i, seen| {
+            s.expr_scalar_uncached(a, i, seen)
+        })
+    }
+
+    fn expr_scalar_uncached(
         &self,
         ast: &LoweredAst,
         id: NodeId,

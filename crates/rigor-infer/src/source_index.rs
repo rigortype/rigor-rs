@@ -686,6 +686,15 @@ pub struct SourceIndex {
     /// DECLINE, except that a patch Ruby refuses on an explicit receiver
     /// answers nothing. See [`Self::pre_eval_may_answer`].
     pre_eval_patches: Option<std::sync::Arc<PreEvalPatches>>,
+    /// rigor-rs#464 — the lazily collected `Object` mixin closure
+    /// [`Self::object_mixin_may_define`] reads. RUNTIME CACHE, not index
+    /// state: the closure's inputs are frozen once the merge finishes, so the
+    /// first call computes it and every later diagnostic reuses it (before
+    /// this, each `undefined-method` / `unresolved-toplevel` diagnostic
+    /// re-walked the whole closure). Deliberately absent from the s92
+    /// fingerprint — it holds no harvest content, only a derived view of
+    /// fields the fingerprint already covers.
+    object_mixins: std::sync::OnceLock<resolution_chain::ObjectMixins>,
 }
 
 /// ADR-0023 tier-4b call-site param-binding descriptor (see

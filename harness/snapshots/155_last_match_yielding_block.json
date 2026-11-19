@@ -31,6 +31,13 @@
     },
     {
       "rule": "call.possible-nil-receiver",
+      "line": 77,
+      "column": 8,
+      "severity": "error",
+      "message": "possible nil receiver: `[]' is undefined on NilClass"
+    },
+    {
+      "rule": "call.possible-nil-receiver",
       "line": 87,
       "column": 8,
       "severity": "error",
