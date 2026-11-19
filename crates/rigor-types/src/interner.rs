@@ -130,155 +130,166 @@ impl Interner {
     /// *resolved structure* (not raw index) so the order is stable regardless
     /// of interning sequence.
     ///
-    /// Iterative: an inferred carrier's depth is unbounded (rigor-rs#427), so
-    /// the structural walk runs on an explicit heap stack instead of the call
-    /// stack. Each popped [`CmpWork::Pair`] expands to the same left-to-right
-    /// comparison sequence the recursion produced, pushed in reverse so the
-    /// earliest pending unit sits on top; `Equal` atoms and same-id pairs are
-    /// never pushed (both are no-ops), so the stack holds live depth only.
+    /// Iterative, allocation-free: hash-consing dedups carriers by structure,
+    /// so two distinct `TypeId`s can never compare `Equal` — the FIRST
+    /// differing unit of the left-to-right expansion decides the whole
+    /// comparison. Each level scans its leading atoms and descends into its
+    /// first differing child pair (everything after it is moot), reproducing
+    /// the recursion's order and early exit with no call stack and no work
+    /// stack — depth is bounded by neither (rigor-rs#427).
     pub fn cmp(&self, a: TypeId, b: TypeId) -> Ordering {
-        let mut stack = vec![CmpWork::Pair(a, b)];
-        while let Some(work) = stack.pop() {
-            match work {
-                CmpWork::Atom(ord) => {
-                    if ord != Ordering::Equal {
-                        return ord;
+        let (mut a, mut b) = (a, b);
+        'pairs: loop {
+            if a == b {
+                return Ordering::Equal;
+            }
+            let (ta, tb) = (self.get(a), self.get(b));
+            let tag = ta.tag().cmp(&tb.tag());
+            if tag != Ordering::Equal {
+                return tag;
+            }
+            match (ta, tb) {
+                (Type::Constant(x), Type::Constant(y)) => return x.cmp(y),
+                (
+                    Type::IntegerRange { min: amin, max: amax },
+                    Type::IntegerRange { min: bmin, max: bmax },
+                ) => return amin.cmp(bmin).then(amax.cmp(bmax)),
+                (
+                    Type::Nominal { class: ac, args: aargs },
+                    Type::Nominal { class: bc, args: bargs },
+                ) => {
+                    let c = ac.cmp(bc);
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                    match first_differing(aargs, bargs) {
+                        Some((x, y)) => {
+                            a = x;
+                            b = y;
+                        }
+                        None => return aargs.len().cmp(&bargs.len()),
                     }
                 }
-                CmpWork::Pair(x, y) => {
-                    if x == y {
-                        continue;
+                // Singleton has no args: order solely by its ClassId.
+                (Type::Singleton(ac), Type::Singleton(bc)) => return ac.cmp(bc),
+                (Type::Tuple(x), Type::Tuple(y))
+                | (Type::Intersection(x), Type::Intersection(y))
+                | (Type::Union(x), Type::Union(y)) => match first_differing(x, y) {
+                    Some((x, y)) => {
+                        a = x;
+                        b = y;
                     }
-                    let (ta, tb) = (self.get(x), self.get(y));
-                    let tag = ta.tag().cmp(&tb.tag());
-                    if tag != Ordering::Equal {
-                        return tag;
+                    None => return x.len().cmp(&y.len()),
+                },
+                (Type::HashShape(x), Type::HashShape(y)) => {
+                    // Member count, then per member: key, optional flag, then
+                    // the value pair — the first differing value decides.
+                    let by_len = x.len().cmp(&y.len());
+                    if by_len != Ordering::Equal {
+                        return by_len;
                     }
-                    match (ta, tb) {
-                        (Type::Constant(x), Type::Constant(y)) => {
-                            push_cmp_atom(&mut stack, x.cmp(y))
+                    for (mx, my) in x.iter().zip(y.iter()) {
+                        let k = mx.key.cmp(&my.key);
+                        if k != Ordering::Equal {
+                            return k;
                         }
-                        (
-                            Type::IntegerRange { min: amin, max: amax },
-                            Type::IntegerRange { min: bmin, max: bmax },
-                        ) => {
-                            push_cmp_atom(&mut stack, amax.cmp(bmax));
-                            push_cmp_atom(&mut stack, amin.cmp(bmin));
+                        let o = mx.optional.cmp(&my.optional);
+                        if o != Ordering::Equal {
+                            return o;
                         }
-                        (
-                            Type::Nominal { class: ac, args: aargs },
-                            Type::Nominal { class: bc, args: bargs },
-                        ) => {
-                            push_cmp_slice(&mut stack, aargs, bargs);
-                            push_cmp_atom(&mut stack, ac.cmp(bc));
+                        if mx.value != my.value {
+                            a = mx.value;
+                            b = my.value;
+                            continue 'pairs;
                         }
-                        // Singleton has no args: order solely by its ClassId.
-                        (Type::Singleton(ac), Type::Singleton(bc)) => {
-                            push_cmp_atom(&mut stack, ac.cmp(bc))
+                    }
+                    return Ordering::Equal;
+                }
+                (
+                    Type::DataInstance { class: ac, members: am },
+                    Type::DataInstance { class: bc, members: bm },
+                ) => {
+                    // Class, then member count, then per member: the name and
+                    // the value pair.
+                    let c = ac.cmp(bc);
+                    if c != Ordering::Equal {
+                        return c;
+                    }
+                    let by_len = am.len().cmp(&bm.len());
+                    if by_len != Ordering::Equal {
+                        return by_len;
+                    }
+                    for ((an, av), (bn, bv)) in am.iter().zip(bm.iter()) {
+                        let n = an.cmp(bn);
+                        if n != Ordering::Equal {
+                            return n;
                         }
-                        (Type::Tuple(x), Type::Tuple(y)) => {
-                            push_cmp_slice(&mut stack, x, y)
+                        if av != bv {
+                            a = *av;
+                            b = *bv;
+                            continue 'pairs;
                         }
-                        (Type::HashShape(x), Type::HashShape(y)) => {
-                            // Per member: key, optional flag, then the value
-                            // pair; the member-count atom leads the sequence.
-                            for (mx, my) in x.iter().zip(y.iter()).rev() {
-                                push_cmp_pair(&mut stack, mx.value, my.value);
-                                push_cmp_atom(&mut stack, mx.optional.cmp(&my.optional));
-                                push_cmp_atom(&mut stack, mx.key.cmp(&my.key));
-                            }
-                            push_cmp_atom(&mut stack, x.len().cmp(&y.len()));
-                        }
-                        (
-                            Type::DataInstance { class: ac, members: am },
-                            Type::DataInstance { class: bc, members: bm },
-                        ) => {
-                            // Class first, then count, then per member the
-                            // name atom and the value pair.
-                            for ((an, av), (bn, bv)) in am.iter().zip(bm.iter()).rev() {
-                                push_cmp_pair(&mut stack, *av, *bv);
-                                push_cmp_atom(&mut stack, an.cmp(bn));
-                            }
-                            push_cmp_atom(&mut stack, am.len().cmp(&bm.len()));
-                            push_cmp_atom(&mut stack, ac.cmp(bc));
-                        }
-                        (
-                            Type::Refined { base: ab, refinement: ar },
-                            Type::Refined { base: bb, refinement: br },
-                        ) => {
-                            push_cmp_atom(&mut stack, ar.cmp(br));
-                            push_cmp_pair(&mut stack, *ab, *bb);
-                        }
-                        (
-                            Type::App { uri: au, args: aa },
-                            Type::App { uri: bu, args: ba },
-                        ) => {
-                            push_cmp_slice(&mut stack, aa, ba);
-                            push_cmp_atom(&mut stack, au.cmp(bu));
-                        }
-                        (Type::Intersection(x), Type::Intersection(y)) => {
-                            push_cmp_slice(&mut stack, x, y)
-                        }
-                        (
-                            Type::Difference { base: ab, removed: ar },
-                            Type::Difference { base: bb, removed: br },
-                        ) => {
-                            push_cmp_pair(&mut stack, *ar, *br);
-                            push_cmp_pair(&mut stack, *ab, *bb);
-                        }
-                        (Type::Complement(x), Type::Complement(y)) => {
-                            push_cmp_pair(&mut stack, *x, *y)
-                        }
-                        (Type::Dynamic(x), Type::Dynamic(y)) => {
-                            push_cmp_pair(&mut stack, *x, *y)
-                        }
-                        (Type::Union(x), Type::Union(y)) => {
-                            push_cmp_slice(&mut stack, x, y)
-                        }
-                        // Tag-only carriers (Top, Bottom, Void, SelfType,
-                        // Instance, ClassType) are fully ordered by tag,
-                        // already handled above.
-                        _ => {}
+                    }
+                    return Ordering::Equal;
+                }
+                (
+                    Type::Refined { base: ab, refinement: ar },
+                    Type::Refined { base: bb, refinement: br },
+                ) => {
+                    if ab != bb {
+                        a = *ab;
+                        b = *bb;
+                    } else {
+                        return ar.cmp(br);
                     }
                 }
+                (Type::App { uri: au, args: aa }, Type::App { uri: bu, args: ba }) => {
+                    let u = au.cmp(bu);
+                    if u != Ordering::Equal {
+                        return u;
+                    }
+                    match first_differing(aa, ba) {
+                        Some((x, y)) => {
+                            a = x;
+                            b = y;
+                        }
+                        None => return aa.len().cmp(&ba.len()),
+                    }
+                }
+                (
+                    Type::Difference { base: ab, removed: ar },
+                    Type::Difference { base: bb, removed: br },
+                ) => {
+                    if ab != bb {
+                        a = *ab;
+                        b = *bb;
+                    } else if ar != br {
+                        a = *ar;
+                        b = *br;
+                    } else {
+                        return Ordering::Equal;
+                    }
+                }
+                (Type::Complement(x), Type::Complement(y))
+                | (Type::Dynamic(x), Type::Dynamic(y)) => {
+                    a = *x;
+                    b = *y;
+                }
+                // Tag-only carriers (Top, Bottom, Void, SelfType, Instance,
+                // ClassType) are fully ordered by tag, already handled above.
+                _ => return Ordering::Equal,
             }
         }
-        Ordering::Equal
     }
 }
 
-/// One pending unit of [`Interner::cmp`]'s structural walk: an `Atom` is a
-/// scalar ordering resolved eagerly at expansion time (a `ClassId`, key or
-/// arity comparison); a `Pair` defers a child-carrier comparison so the walk
-/// never recurses (rigor-rs#427).
-enum CmpWork {
-    Atom(Ordering),
-    Pair(TypeId, TypeId),
-}
-
-/// Push a scalar ordering unless it is `Equal` (a no-op in the sequence).
-fn push_cmp_atom(stack: &mut Vec<CmpWork>, ord: Ordering) {
-    if ord != Ordering::Equal {
-        stack.push(CmpWork::Atom(ord));
-    }
-}
-
-/// Push a child comparison unless both ids coincide (always `Equal`).
-fn push_cmp_pair(stack: &mut Vec<CmpWork>, x: TypeId, y: TypeId) {
-    if x != y {
-        stack.push(CmpWork::Pair(x, y));
-    }
-}
-
-/// The pending work of a lexicographic slice comparison, pushed in reverse:
-/// the length tie-break first (evaluated last), then the pairwise children
-/// last-first — the same order the recursion's zipped walk plus trailing
-/// `a.len().cmp(&b.len())` produced.
-fn push_cmp_slice(stack: &mut Vec<CmpWork>, a: &[TypeId], b: &[TypeId]) {
-    push_cmp_atom(stack, a.len().cmp(&b.len()));
-    for (&x, &y) in a.iter().zip(b.iter()).rev() {
-        push_cmp_pair(stack, x, y);
-    }
+/// The first pair of differing ids between two member slices (the unit the
+/// comparison descends into), or `None` when every shared position agrees.
+fn first_differing(a: &[TypeId], b: &[TypeId]) -> Option<(TypeId, TypeId)> {
+    a.iter()
+        .zip(b.iter())
+        .find(|&(&x, &y)| x != y)
+        .map(|(&x, &y)| (x, y))
 }
 
 #[cfg(test)]
@@ -422,5 +433,204 @@ mod tests {
             .unwrap();
         // Class 1 < Class 2 at the leaf decides the whole comparison.
         assert_eq!(handle.join().unwrap(), Ordering::Less);
+    }
+
+    /// The recursive `cmp` this PR replaced, kept verbatim as the differential
+    /// oracle for [`Interner::cmp`]'s equivalence fuzz.
+    fn recursive_cmp(i: &Interner, a: TypeId, b: TypeId) -> Ordering {
+        fn cmp_slice(i: &Interner, a: &[TypeId], b: &[TypeId]) -> Ordering {
+            for (x, y) in a.iter().zip(b.iter()) {
+                let c = recursive_cmp(i, *x, *y);
+                if c != Ordering::Equal {
+                    return c;
+                }
+            }
+            a.len().cmp(&b.len())
+        }
+        if a == b {
+            return Ordering::Equal;
+        }
+        let (ta, tb) = (i.get(a), i.get(b));
+        let tag = ta.tag().cmp(&tb.tag());
+        if tag != Ordering::Equal {
+            return tag;
+        }
+        match (ta, tb) {
+            (Type::Constant(x), Type::Constant(y)) => x.cmp(y),
+            (
+                Type::IntegerRange { min: amin, max: amax },
+                Type::IntegerRange { min: bmin, max: bmax },
+            ) => amin.cmp(bmin).then(amax.cmp(bmax)),
+            (
+                Type::Nominal { class: ac, args: aargs },
+                Type::Nominal { class: bc, args: bargs },
+            ) => ac.cmp(bc).then_with(|| cmp_slice(i, aargs, bargs)),
+            (Type::Singleton(ac), Type::Singleton(bc)) => ac.cmp(bc),
+            (Type::Tuple(x), Type::Tuple(y)) => cmp_slice(i, x, y),
+            (Type::HashShape(x), Type::HashShape(y)) => {
+                let by_len = x.len().cmp(&y.len());
+                if by_len != Ordering::Equal {
+                    return by_len;
+                }
+                for (mx, my) in x.iter().zip(y.iter()) {
+                    let k = mx.key.cmp(&my.key);
+                    if k != Ordering::Equal {
+                        return k;
+                    }
+                    let o = mx.optional.cmp(&my.optional);
+                    if o != Ordering::Equal {
+                        return o;
+                    }
+                    let v = recursive_cmp(i, mx.value, my.value);
+                    if v != Ordering::Equal {
+                        return v;
+                    }
+                }
+                Ordering::Equal
+            }
+            (
+                Type::DataInstance { class: ac, members: am },
+                Type::DataInstance { class: bc, members: bm },
+            ) => {
+                let c = ac.cmp(bc);
+                if c != Ordering::Equal {
+                    return c;
+                }
+                let by_len = am.len().cmp(&bm.len());
+                if by_len != Ordering::Equal {
+                    return by_len;
+                }
+                for ((an, av), (bn, bv)) in am.iter().zip(bm.iter()) {
+                    let n = an.cmp(bn);
+                    if n != Ordering::Equal {
+                        return n;
+                    }
+                    let v = recursive_cmp(i, *av, *bv);
+                    if v != Ordering::Equal {
+                        return v;
+                    }
+                }
+                Ordering::Equal
+            }
+            (
+                Type::Refined { base: ab, refinement: ar },
+                Type::Refined { base: bb, refinement: br },
+            ) => recursive_cmp(i, *ab, *bb).then(ar.cmp(br)),
+            (Type::App { uri: au, args: aa }, Type::App { uri: bu, args: ba }) => {
+                au.cmp(bu).then_with(|| cmp_slice(i, aa, ba))
+            }
+            (Type::Intersection(x), Type::Intersection(y)) => cmp_slice(i, x, y),
+            (
+                Type::Difference { base: ab, removed: ar },
+                Type::Difference { base: bb, removed: br },
+            ) => recursive_cmp(i, *ab, *bb).then_with(|| recursive_cmp(i, *ar, *br)),
+            (Type::Complement(x), Type::Complement(y)) => recursive_cmp(i, *x, *y),
+            (Type::Dynamic(x), Type::Dynamic(y)) => recursive_cmp(i, *x, *y),
+            (Type::Union(x), Type::Union(y)) => cmp_slice(i, x, y),
+            _ => Ordering::Equal,
+        }
+    }
+
+    /// A deterministic xorshift so the fuzz needs no dev-dependency.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n
+        }
+    }
+
+    /// A random shallow tree of carrier shapes covering every `cmp` arm that
+    /// produces children (Tuple/Union/Intersection/HashShape/DataInstance/
+    /// Nominal/App args, Refined/Difference/Complement/Dynamic wrappers).
+    fn random_ty(i: &mut Interner, rng: &mut XorShift, depth: u32) -> TypeId {
+        let pick = |i: &mut Interner, rng: &mut XorShift, n: u32| -> Vec<TypeId> {
+            (0..n)
+                .map(|_| random_ty(i, rng, depth.saturating_sub(1)))
+                .collect()
+        };
+        if depth == 0 {
+            return match rng.below(6) {
+                0 => i.top(),
+                1 => i.bottom(),
+                2 => i.int(rng.below(8) as i64),
+                3 => i.intern(Type::Constant(Scalar::Str(format!("s{}", rng.below(4))))),
+                4 => i.intern(Type::IntegerRange {
+                    min: Some(rng.below(4) as i64),
+                    max: Some(4 + rng.below(4) as i64),
+                }),
+                _ => i.intern(Type::Singleton(ClassId(rng.below(4) as u32))),
+            };
+        }
+        let n = (rng.below(3) + 1) as u32;
+        let kids = pick(i, rng, n);
+        match rng.below(10) {
+            0 => i.intern(Type::Tuple(kids)),
+            1 => i.intern(Type::Union(kids)),
+            2 => i.intern(Type::Intersection(kids)),
+            3 => i.intern(Type::HashShape(
+                kids.iter()
+                    .enumerate()
+                    .map(|(n, &v)| ShapeMember {
+                        key: ShapeKey::Sym(format!("k{n}")),
+                        value: v,
+                        optional: n % 2 == 0,
+                    })
+                    .collect(),
+            )),
+            4 => i.intern(Type::DataInstance {
+                class: ClassId(rng.below(3) as u32),
+                members: kids
+                    .iter()
+                    .enumerate()
+                    .map(|(n, &v)| (format!("m{n}"), v))
+                    .collect(),
+            }),
+            5 => i.intern(Type::Nominal {
+                class: ClassId(rng.below(4) as u32),
+                args: kids,
+            }),
+            6 => i.intern(Type::Refined {
+                base: kids[0],
+                refinement: crate::ty::RefinementId(rng.below(3) as u32),
+            }),
+            7 => i.intern(Type::Difference {
+                base: kids[0],
+                removed: *kids.last().unwrap(),
+            }),
+            8 => i.intern(Type::Complement(kids[0])),
+            _ => i.intern(Type::Dynamic(kids[0])),
+        }
+    }
+
+    #[test]
+    fn cmp_matches_the_recursion_on_random_types() {
+        // Differential fuzz: the stackless loop vs the verbatim recursion,
+        // ~50k pairs over trees of depth <= 4. The loop relies on "distinct
+        // ids are never deep-equal", so also assert it never returns Equal
+        // for distinct ids.
+        let mut rng = XorShift(0x9E3779B97F4A7C15);
+        let mut i = Interner::new();
+        let mut pool: Vec<TypeId> = Vec::new();
+        for _ in 0..300 {
+            pool.push(random_ty(&mut i, &mut rng, 3));
+        }
+        for _ in 0..50_000 {
+            let a = pool[rng.below(pool.len() as u64) as usize];
+            let b = pool[rng.below(pool.len() as u64) as usize];
+            let got = i.cmp(a, b);
+            let want = recursive_cmp(&i, a, b);
+            assert_eq!(got, want, "cmp diverged on {a:?} vs {b:?}");
+            if a != b {
+                assert_ne!(got, Ordering::Equal, "distinct ids compared Equal");
+            }
+        }
     }
 }
