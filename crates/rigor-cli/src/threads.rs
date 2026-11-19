@@ -24,7 +24,8 @@
 
 use std::io;
 use std::process::ExitCode;
-use std::sync::{Arc, Mutex, Once, PoisonError};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, PoisonError};
 
 use rigor_parse::ANALYSIS_STACK_BYTES;
 
@@ -51,7 +52,7 @@ pub(crate) const COMMAND_THREAD_SIZES: &[usize] =
 #[cfg(not(unix))]
 pub(crate) const COMMAND_THREAD_SIZES: &[usize] = &STACK_FALLBACK;
 
-/// What a fallback actually used, for the one stderr line per process.
+/// What a fallback actually used, for its stderr line.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum StackKind {
     Reserved(usize),
@@ -113,26 +114,75 @@ fn describe_stack(kind: StackKind) -> String {
     }
 }
 
-/// The one stderr line a fallback prints. Named so tests can pin the wording.
+/// The stderr line a newly-worst fallback prints. Named so tests can pin
+/// the wording.
 pub(crate) fn stack_warning(kind: StackKind) -> String {
     format!(
-        "rigor: could not reserve {} MiB thread stacks, using {}; \
-         deeply nested files may overflow",
+        "rigor: could not reserve {} MiB thread stacks; some analysis \
+         threads are using {}; deeply nested files may overflow",
         ANALYSIS_STACK_BYTES >> 20,
         describe_stack(kind)
     )
 }
 
-/// One stderr line per process when a thread got less than
-/// [`ANALYSIS_STACK_BYTES`]. Silent on the normal path.
+/// The smallest stack any analysis thread has reported, in bytes
+/// (`u64::MAX` before the first report).
+static WORST_STACK_BYTES: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// One stderr line per degradation level when a thread got less than
+/// [`ANALYSIS_STACK_BYTES`]; silent on the normal path.
+///
+/// The first process-wide line used to be the only one (`Once`), so a
+/// mild early fallback hid the worst case: rayon workers land on the
+/// fallback sizes serially (64 MiB, then 2 MiB) and the command thread's
+/// report races the pool build (rigor-rs#677). Now a stack reports only
+/// when it is strictly smaller than every stack reported before it, so
+/// each line is true when printed and the worst case always gets a line —
+/// at most one per distinct size, three on the real ladders.
 fn note_stack(kind: StackKind) {
-    static WARNED: Once = Once::new();
-    if matches!(kind, StackKind::Reserved(bytes) if bytes == ANALYSIS_STACK_BYTES) {
+    let bytes = match kind {
+        StackKind::Reserved(bytes) => bytes as u64,
+        StackKind::ProcessMainThread => process_main_stack_bytes(),
+    };
+    // A stack at or above the target is not a fallback: an inline command
+    // on an `RLIM_INFINITY` main thread reports nothing.
+    if bytes >= ANALYSIS_STACK_BYTES as u64 {
         return;
     }
-    WARNED.call_once(|| {
+    if report_if_worst(&WORST_STACK_BYTES, bytes) {
         eprintln!("{}", stack_warning(kind));
-    });
+    }
+}
+
+/// Record `bytes` in `worst`; `true` when it is strictly smaller than the
+/// previous smallest — the caller then prints its line.
+fn report_if_worst(worst: &AtomicU64, bytes: u64) -> bool {
+    worst.fetch_min(bytes, Ordering::Relaxed) > bytes
+}
+
+/// The stack the process main thread already has, for ranking an inline
+/// command run against the explicit fallbacks.
+#[cfg(unix)]
+fn process_main_stack_bytes() -> u64 {
+    // `RLIMIT_STACK` is the main thread's ceiling: 8 MiB by default, but a
+    // host can set it under the 2 MiB spawn the Unix ladder skips (the
+    // ADR-0045 "possibly less" case — the inline run is then the worst
+    // thread and must still get a line), or lift it to `RLIM_INFINITY`,
+    // where running inline is no fallback at all. An unreadable limit
+    // counts as the default the ladder assumes.
+    let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+    if unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) } == 0 {
+        unsafe { limit.assume_init() }.rlim_cur as u64
+    } else {
+        8 << 20
+    }
+}
+
+/// The Windows process main thread's reserve is 1 MiB — below the
+/// explicit 2 MiB the command thread tries before running inline.
+#[cfg(not(unix))]
+fn process_main_stack_bytes() -> u64 {
+    1 << 20
 }
 
 /// The one error a pool that cannot be built at all prints. Named so tests
@@ -262,7 +312,7 @@ pub(crate) fn configure_global_pool() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
     /// An injected spawn that refuses every size in `refuse` and otherwise
     /// spawns a real thread at that size, recording what it was asked for.
@@ -404,15 +454,24 @@ mod tests {
     #[test]
     fn fallback_messages_name_the_actual_stack() {
         let mib64 = stack_warning(StackKind::Reserved(64 << 20));
-        assert!(mib64.contains("using 64 MiB"), "{mib64}");
+        assert!(
+            mib64.contains("some analysis threads are using 64 MiB"),
+            "{mib64}"
+        );
         assert!(!mib64.contains("platform default"), "{mib64}");
 
         let two_mib = stack_warning(StackKind::Reserved(2 << 20));
-        assert!(two_mib.contains("using 2 MiB"), "{two_mib}");
+        assert!(
+            two_mib.contains("some analysis threads are using 2 MiB"),
+            "{two_mib}"
+        );
         assert!(!two_mib.contains("platform default"), "{two_mib}");
 
         let inline = stack_warning(StackKind::ProcessMainThread);
-        assert!(inline.contains("using the process main thread"), "{inline}");
+        assert!(
+            inline.contains("some analysis threads are using the process main thread"),
+            "{inline}"
+        );
         assert!(!inline.contains("platform default"), "{inline}");
     }
 
@@ -448,5 +507,38 @@ mod tests {
         assert_eq!(sum, 5050);
         assert_eq!(*sizes.lock().unwrap(), vec![64 << 20; 2]);
         assert_eq!(asked.lock().unwrap().len(), 4);
+    }
+
+    #[test]
+    fn a_strictly_worse_stack_reports_once() {
+        // A fresh atomic: the process-wide WORST_STACK_BYTES is shared, so
+        // the report logic is pinned here instead of through note_stack.
+        let worst = AtomicU64::new(u64::MAX);
+        let mib64 = 64 << 20;
+        let mib8 = 8 << 20;
+        let mib2 = 2 << 20;
+        let mib1 = 1 << 20;
+        // Each strictly smaller stack reports exactly once; anything equal
+        // or milder does not, whichever order they arrive in.
+        assert!(report_if_worst(&worst, mib64));
+        assert!(!report_if_worst(&worst, mib64));
+        assert!(report_if_worst(&worst, mib2));
+        assert!(!report_if_worst(&worst, mib8));
+        assert!(!report_if_worst(&worst, mib64));
+        assert!(report_if_worst(&worst, mib1));
+        assert!(!report_if_worst(&worst, mib1));
+        assert_eq!(worst.load(Ordering::Relaxed), mib1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_main_thread_ranks_by_its_real_limit() {
+        // Whatever this host's `ulimit -s` is, the rank uses the same
+        // number the kernel enforces — not an assumed 8 MiB.
+        let mut limit = std::mem::MaybeUninit::<libc::rlimit>::uninit();
+        let rc = unsafe { libc::getrlimit(libc::RLIMIT_STACK, limit.as_mut_ptr()) };
+        assert_eq!(rc, 0, "getrlimit works on every test host");
+        let expected = unsafe { limit.assume_init() }.rlim_cur as u64;
+        assert_eq!(process_main_stack_bytes(), expected);
     }
 }

@@ -86,9 +86,12 @@ an empty report). See
    - The command's own stack never stops a command from starting (it can
      always fall back to the process main thread); a pool with no worker
      at all does stop it, with the exit-70 line above. A thread that falls
-     back prints one stderr line per process; the normal path prints
-     nothing. The line names what was actually used: "64 MiB", "2 MiB", or
-     "the process main thread" — never "the platform default".
+     back prints one stderr line per degradation level — a stack reports
+     only when it is strictly smaller than every stack reported before it,
+     so a mild early fallback cannot hide the worst case (rigor-rs#677);
+     the normal path prints nothing. Each line names what was actually
+     used: "64 MiB", "2 MiB", or "the process main thread" — never "the
+     platform default".
 2. **A depth bound of 25,000** (`rigor_parse::MAX_NESTING_DEPTH`):
    - Depth is counted in Prism child edges; the program node is depth 1.
    - `rigor_parse::parse_bounded` measures it right after the parse, before
