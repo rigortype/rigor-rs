@@ -714,8 +714,8 @@ impl<'i> Typer<'i> {
         // dependency check (`landed`) — the pre-#437 flat memo's
         // first-completion semantics, kept for entries that saw a re-entry.
         let mut landed = self.truthy_landed.borrow_mut();
-        if !landed.contains_key(&key) {
-            landed.insert(key, out);
+        if let std::collections::hash_map::Entry::Vacant(e) = landed.entry(key) {
+            e.insert(out);
             provisional = true;
         }
         drop(landed);
