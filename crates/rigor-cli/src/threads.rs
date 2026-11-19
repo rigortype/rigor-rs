@@ -1,11 +1,20 @@
-//! The analysis threads' stacks (rigor-rs#412, ADR-0045).
+//! The analysis threads' stacks (rigor-rs#412, rigor-rs#431, ADR-0045).
 //!
 //! Every thread that parses, lowers or infers runs on a reserved
 //! [`ANALYSIS_STACK_BYTES`] stack: the command thread [`run_command_thread`]
-//! starts, and every rayon worker ([`configure_global_pool`],
-//! `coverage --workers`). A host that cannot reserve that much falls back to
-//! 64 MiB, then to the platform default. A large stack never stops a command
-//! from starting.
+//! starts first and reserves its stack, then builds the rayon pool
+//! ([`configure_global_pool`]) so workers cannot spend the reservation
+//! budget first. `coverage --workers` uses the same spawn handler. A host
+//! that cannot reserve 256 MiB falls back to 64 MiB, then:
+//! - pool workers: Rust's 2 MiB spawn default;
+//! - the command thread on Unix: the process main thread (8 MiB), never a
+//!   spawned thread smaller than that;
+//! - the command thread on Windows: Rust's 2 MiB spawn default, then the
+//!   process main thread (1 MiB).
+//!
+//! A large stack never stops a command from starting. A pool that cannot
+//! be built at all prints one error and the command returns failure; it
+//! does not continue into a later `GlobalPoolAlreadyInitialized` panic.
 
 use std::io;
 use std::process::ExitCode;
@@ -16,9 +25,33 @@ use rigor_parse::ANALYSIS_STACK_BYTES;
 /// One spawn attempt's closure.
 pub(crate) type Job = Box<dyn FnOnce() + Send + 'static>;
 
-/// The stack sizes tried in turn; `None` is the platform default.
+/// The stack sizes tried in turn for pool workers; `None` is Rust's 2 MiB
+/// spawn default (`thread::Builder` with no `stack_size`), not the OS
+/// main-thread stack.
 pub(crate) const STACK_FALLBACK: [Option<usize>; 3] =
     [Some(ANALYSIS_STACK_BYTES), Some(64 << 20), None];
+
+/// Stack sizes tried for the command thread. On Unix the process main
+/// thread is already 8 MiB, so we never spawn at Rust's 2 MiB default: if
+/// 256 MiB and 64 MiB both fail, the command runs inline.
+#[cfg(unix)]
+pub(crate) const COMMAND_THREAD_SIZES: &[Option<usize>] =
+    &[Some(ANALYSIS_STACK_BYTES), Some(64 << 20)];
+
+/// On Windows the process main thread is 1 MiB, smaller than Rust's 2 MiB
+/// spawn default, so the command thread still tries that default.
+#[cfg(not(unix))]
+pub(crate) const COMMAND_THREAD_SIZES: &[Option<usize>] = &STACK_FALLBACK;
+
+/// What a fallback actually used, for the one stderr line per process.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum StackKind {
+    Reserved(usize),
+    /// `thread::Builder` with no `stack_size`: Rust's 2 MiB spawn default.
+    RustSpawnDefault,
+    /// The command ran on the process main thread because no spawn worked.
+    ProcessMainThread,
+}
 
 /// Spawn `job` with the first size in `sizes` that `spawn` accepts, and return
 /// the spawn's handle and that size.
@@ -70,29 +103,57 @@ fn std_spawn(name: Option<String>) -> impl FnMut(Option<usize>, Job) -> io::Resu
     }
 }
 
+fn describe_stack(kind: StackKind) -> String {
+    match kind {
+        StackKind::Reserved(bytes) => format!("{} MiB", bytes >> 20),
+        StackKind::RustSpawnDefault => "Rust's 2 MiB spawn default".to_string(),
+        StackKind::ProcessMainThread => "the process main thread".to_string(),
+    }
+}
+
+/// The one stderr line a fallback prints. Named so tests can pin the wording.
+pub(crate) fn stack_warning(kind: StackKind) -> String {
+    format!(
+        "rigor: could not reserve {} MiB thread stacks, using {}; \
+         deeply nested files may overflow",
+        ANALYSIS_STACK_BYTES >> 20,
+        describe_stack(kind)
+    )
+}
+
+fn size_to_kind(size: Option<usize>) -> StackKind {
+    match size {
+        Some(bytes) => StackKind::Reserved(bytes),
+        None => StackKind::RustSpawnDefault,
+    }
+}
+
 /// One stderr line per process when a thread got less than
 /// [`ANALYSIS_STACK_BYTES`]. Silent on the normal path.
-fn note_stack(size: Option<usize>) {
+fn note_stack(kind: StackKind) {
     static WARNED: Once = Once::new();
-    if size == Some(ANALYSIS_STACK_BYTES) {
+    if matches!(kind, StackKind::Reserved(bytes) if bytes == ANALYSIS_STACK_BYTES) {
         return;
     }
     WARNED.call_once(|| {
-        let got = size.map_or_else(|| "the platform default".to_string(), |s| format!("{} MiB", s >> 20));
-        eprintln!(
-            "rigor: could not reserve {} MiB thread stacks, using {got}; \
-             deeply nested files may overflow",
-            ANALYSIS_STACK_BYTES >> 20
-        );
+        eprintln!("{}", stack_warning(kind));
     });
+}
+
+/// The one error a pool that cannot be built at all prints. Named so tests
+/// can pin the wording; the command then returns failure instead of
+/// continuing into rayon's `GlobalPoolAlreadyInitialized`.
+pub(crate) fn pool_build_error_line(err: &dyn std::fmt::Display) -> String {
+    format!("rigor: could not start the analysis thread pool: {err}")
 }
 
 /// Run `command` on the command thread: named `main`, so panic and overflow
 /// messages read as they did when the command ran on the process's main
-/// thread. If no thread can be created at all, it runs on the main thread
+/// thread. If no thread of at least 64 MiB (Unix) / including Rust's 2 MiB
+/// spawn default (elsewhere) can be created, it runs on the main thread
 /// itself.
 pub(crate) fn run_command_thread(command: fn() -> ExitCode) -> ExitCode {
-    run_command_thread_with(&STACK_FALLBACK, command, |size, job| {
+    run_command_thread_with(COMMAND_THREAD_SIZES, command, |size, job| {
         let mut builder = std::thread::Builder::new().name("main".to_string());
         if let Some(size) = size {
             builder = builder.stack_size(size);
@@ -102,19 +163,27 @@ pub(crate) fn run_command_thread(command: fn() -> ExitCode) -> ExitCode {
 }
 
 /// [`run_command_thread`] with the spawn injected (tests).
-fn run_command_thread_with<S>(
-    sizes: &[Option<usize>],
-    command: fn() -> ExitCode,
-    spawn: S,
-) -> ExitCode
+fn run_command_thread_with<S, F>(sizes: &[Option<usize>], command: F, spawn: S) -> ExitCode
 where
     S: FnMut(Option<usize>, Job) -> io::Result<std::thread::JoinHandle<()>>,
+    F: FnOnce() -> ExitCode + Send + 'static,
 {
+    let command = Arc::new(Mutex::new(Some(command)));
     let code = Arc::new(Mutex::new(None));
     let out = Arc::clone(&code);
-    match spawn_fallback(sizes, move || *out.lock().unwrap_or_else(PoisonError::into_inner) = Some(command()), spawn) {
+    let cmd = Arc::clone(&command);
+    match spawn_fallback(
+        sizes,
+        move || {
+            let command = cmd.lock().unwrap_or_else(PoisonError::into_inner).take();
+            if let Some(command) = command {
+                *out.lock().unwrap_or_else(PoisonError::into_inner) = Some(command());
+            }
+        },
+        spawn,
+    ) {
         Ok((handle, size)) => {
-            note_stack(size);
+            note_stack(size_to_kind(size));
             if let Err(payload) = handle.join() {
                 std::panic::resume_unwind(payload);
             }
@@ -122,8 +191,12 @@ where
             code.unwrap_or(ExitCode::FAILURE)
         }
         Err(_) => {
-            note_stack(None);
-            command()
+            note_stack(StackKind::ProcessMainThread);
+            let command = command
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take();
+            command.map(|c| c()).unwrap_or(ExitCode::FAILURE)
         }
     }
 }
@@ -133,7 +206,7 @@ where
 pub(crate) fn spawn_pool_thread(thread: rayon::ThreadBuilder) -> io::Result<()> {
     let name = thread.name().map(str::to_string);
     let size = spawn_pool_thread_with(thread, &STACK_FALLBACK, std_spawn(name))?;
-    note_stack(size);
+    note_stack(size_to_kind(size));
     Ok(())
 }
 
@@ -149,18 +222,26 @@ where
     spawn_fallback(sizes, move || thread.run(), spawn).map(|((), size)| size)
 }
 
-/// Build the global rayon pool with [`spawn_pool_thread`]. It must run before
-/// anything uses rayon.
+/// Build the global rayon pool with [`spawn_pool_thread`]. It must run on
+/// the command thread, after that thread has reserved its stack and before
+/// anything uses rayon (rigor-rs#431).
 ///
 /// `build_global` is one-shot: rayon marks the global registry as set even
 /// when building it fails, so it is never retried with other settings. The
-/// stack fallback happens per thread, inside the spawn handler. It only fails
-/// when no thread can be created even at the platform default; the command
-/// then still starts, and a later parallel stage fails as it would have on
-/// master.
-pub(crate) fn configure_global_pool() {
-    if let Err(e) = rayon::ThreadPoolBuilder::new().spawn_handler(spawn_pool_thread).build_global() {
-        eprintln!("rigor: could not start the analysis thread pool: {e}");
+/// stack fallback happens per thread, inside the spawn handler. If no
+/// worker can be created even at Rust's 2 MiB spawn default, this prints
+/// one error and returns `false` so the command can exit; a later parallel
+/// stage would otherwise panic with `GlobalPoolAlreadyInitialized`.
+pub(crate) fn configure_global_pool() -> bool {
+    match rayon::ThreadPoolBuilder::new()
+        .spawn_handler(spawn_pool_thread)
+        .build_global()
+    {
+        Ok(()) => true,
+        Err(e) => {
+            eprintln!("{}", pool_build_error_line(&e));
+            false
+        }
     }
 }
 
@@ -204,11 +285,14 @@ mod tests {
         handle.join().unwrap();
         assert_eq!(size, Some(64 << 20));
         assert_eq!(runs.load(Ordering::SeqCst), 1);
-        assert_eq!(*asked.lock().unwrap(), vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)]);
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)]
+        );
     }
 
     #[test]
-    fn the_platform_default_is_the_last_resort() {
+    fn rust_spawn_default_is_the_last_pool_resort() {
         let runs = Arc::new(AtomicUsize::new(0));
         let counted = Arc::clone(&runs);
         let refuse = vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)];
@@ -248,17 +332,91 @@ mod tests {
     fn the_command_runs_on_a_fallback_thread_or_inline() {
         // `ExitCode` has no `PartialEq`; compare its `Debug` text.
         let fallback = run_command_thread_with(
-            &STACK_FALLBACK,
+            COMMAND_THREAD_SIZES,
             exit_42,
-            refusing(vec![Some(ANALYSIS_STACK_BYTES)], Arc::new(Mutex::new(Vec::new()))),
+            refusing(
+                vec![Some(ANALYSIS_STACK_BYTES)],
+                Arc::new(Mutex::new(Vec::new())),
+            ),
         );
         assert_eq!(format!("{fallback:?}"), format!("{:?}", ExitCode::from(42)));
         let inline = run_command_thread_with(
-            &STACK_FALLBACK,
+            COMMAND_THREAD_SIZES,
             exit_42,
-            refusing(STACK_FALLBACK.to_vec(), Arc::new(Mutex::new(Vec::new()))),
+            refusing(
+                COMMAND_THREAD_SIZES.to_vec(),
+                Arc::new(Mutex::new(Vec::new())),
+            ),
         );
         assert_eq!(format!("{inline:?}"), format!("{:?}", ExitCode::from(42)));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_command_thread_does_not_spawn_below_8_mib() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let inline = run_command_thread_with(
+            COMMAND_THREAD_SIZES,
+            exit_42,
+            refusing(COMMAND_THREAD_SIZES.to_vec(), Arc::clone(&asked)),
+        );
+        assert_eq!(format!("{inline:?}"), format!("{:?}", ExitCode::from(42)));
+        assert_eq!(
+            *asked.lock().unwrap(),
+            vec![Some(ANALYSIS_STACK_BYTES), Some(64 << 20)]
+        );
+        assert!(
+            !asked.lock().unwrap().contains(&None),
+            "Unix must not spawn the command at Rust's 2 MiB default"
+        );
+    }
+
+    #[test]
+    fn command_thread_is_spawned_before_the_command_body() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let spawn_log = Arc::clone(&events);
+        let body_log = Arc::clone(&events);
+        let code = run_command_thread_with(
+            &[Some(64 << 20)],
+            move || {
+                body_log.lock().unwrap().push("body");
+                ExitCode::SUCCESS
+            },
+            move |size, job| {
+                spawn_log.lock().unwrap().push("spawn");
+                std::thread::Builder::new()
+                    .stack_size(size.unwrap())
+                    .spawn(job)
+            },
+        );
+        assert_eq!(format!("{code:?}"), format!("{:?}", ExitCode::SUCCESS));
+        assert_eq!(*events.lock().unwrap(), ["spawn", "body"]);
+    }
+
+    #[test]
+    fn fallback_messages_name_the_actual_stack() {
+        let mib64 = stack_warning(StackKind::Reserved(64 << 20));
+        assert!(mib64.contains("using 64 MiB"), "{mib64}");
+        assert!(!mib64.contains("platform default"), "{mib64}");
+
+        let rust_default = stack_warning(StackKind::RustSpawnDefault);
+        assert!(
+            rust_default.contains("using Rust's 2 MiB spawn default"),
+            "{rust_default}"
+        );
+        assert!(!rust_default.contains("platform default"), "{rust_default}");
+
+        let inline = stack_warning(StackKind::ProcessMainThread);
+        assert!(inline.contains("using the process main thread"), "{inline}");
+        assert!(!inline.contains("platform default"), "{inline}");
+    }
+
+    #[test]
+    fn a_failed_pool_build_is_one_error_line() {
+        assert_eq!(
+            pool_build_error_line(&"thread spawn failed"),
+            "rigor: could not start the analysis thread pool: thread spawn failed"
+        );
     }
 
     #[test]

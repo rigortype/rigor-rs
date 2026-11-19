@@ -105,14 +105,18 @@ Run `rigor describe` for the next step on this project, or `rigor help --format=
 ";
 
 fn main() -> ExitCode {
-    // rigor-rs#412 (ADR-0045): every analysis thread gets a reserved
-    // `ANALYSIS_STACK_BYTES` stack, falling back to smaller sizes on hosts
-    // that cannot reserve it. The pool first, before anything uses rayon.
-    threads::configure_global_pool();
-    // The main thread's own stack is the platform's (8 MiB on macOS and
-    // Linux, 1 MiB on Windows), and Prism alone needs 8.1 MiB at its cap. So
-    // the command runs on a spawned thread named "main".
-    threads::run_command_thread(run_command)
+    // rigor-rs#431 (ADR-0045): the command thread reserves its stack before
+    // the rayon pool, so a host that caps total reservations cannot leave
+    // the command on a smaller stack than master's 8 MiB main thread.
+    threads::run_command_thread(run_command_with_pool)
+}
+
+/// The command thread's entry: claim the analysis stack, then the pool.
+fn run_command_with_pool() -> ExitCode {
+    if !threads::configure_global_pool() {
+        return ExitCode::FAILURE;
+    }
+    run_command()
 }
 
 /// The command dispatch, on the thread [`main`] starts.
