@@ -1,8 +1,7 @@
 # #657: ConstRead prefix-shared names; bounded `knows_*`; one chain walk
 
-PR #660 (head `86a6e29`) — **Approved + fix-confirmation, READY, unmerged**:
-merge waits on older PR #659 (overlaps `rbs.rs`/`reach_memo.rs`); then rebase
-+ merge per the self-merge rules. Ledger line lands at merge.
+PR #660 merged 2026-11-19 (`4c4a1c6`). Approved + fix-confirmation on
+`86a6e29`; rebased over #659 then merged under the owner-waiting rule.
 
 ## What was slow
 
