@@ -71,6 +71,13 @@ pub(crate) fn shape_key_to_scalar(k: &ShapeKey) -> Option<Scalar> {
 /// model the anonymous class, so the result stays Dynamic (silent).
 const CLASS_RETURNING_NEW: &[&str] = &["Struct", "Data", "Class"];
 
+/// The largest env an env-sensitive `Node::Call` memoizes under
+/// (rigor-rs#658): the entry's snapshot build and per-lookup compare are
+/// O(env), so a deep chain inside a big method env keeps the uncached
+/// path — a chain that large inside a large env is the rare shape, and
+/// the bound caps what a small-env file pays per call site.
+const ENV_TYPE_MEMO_MAX: usize = 32;
+
 impl<'i> Typer<'i> {
     /// C5: re-intern a harvested [`ConstLit`] against the local interner into the
     /// SAME carrier the Typer builds for the equivalent inline literal — a scalar
@@ -136,17 +143,35 @@ impl<'i> Typer<'i> {
         // without it each call site of a deep chain (`2 ** 2 ** …`,
         // `1 + 1 + …`, `x.a.a…`) re-types its remaining suffix, quadratic
         // per site and cubic over the arg-reach fanout.
-        if matches!(ast.get(id), Node::Call { .. })
-            && !self
+        if matches!(ast.get(id), Node::Call { .. }) {
+            if !self
                 .reach_index(ast)
                 .env_sensitive_within(ast.get(id).span())
-        {
-            let ty = self.type_of_memo(ast, id, |s| {
-                let tid = s.type_of_uncached(ast, id, env, interner);
-                let ty = interner.get(tid);
-                (ty.clone(), type_is_interner_free(ty, interner))
-            });
-            return interner.intern(ty);
+            {
+                let ty = self.type_of_memo(ast, id, |s| {
+                    let tid = s.type_of_uncached(ast, id, env, interner);
+                    let ty = interner.get(tid);
+                    (ty.clone(), type_is_interner_free(ty, interner))
+                });
+                return interner.intern(ty);
+            }
+            // rigor-rs#658 — an env-sensitive call memoizes against the
+            // env fingerprint + snapshot instead: every `check_env_at`
+            // replay of a mutator chain (`v.push(1).push(1).…`, N links)
+            // re-typed the whole remaining suffix without it, O(N²)
+            // `type_call` levels — with it each site pays one fresh level.
+            // The snapshot+compare is O(env), so a bound keeps a large
+            // method env from paying it per call site; beyond it the call
+            // types uncached, exactly as env-sensitive calls always have.
+            if env.len() <= ENV_TYPE_MEMO_MAX {
+                let interner_id = interner.uid();
+                let ty = self.type_of_env_memo(ast, id, env, interner_id, |s| {
+                    let tid = s.type_of_uncached(ast, id, env, interner);
+                    let ty = interner.get(tid);
+                    (ty.clone(), type_is_interner_free(ty, interner))
+                });
+                return interner.intern(ty);
+            }
         }
         self.type_of_uncached(ast, id, env, interner)
     }
