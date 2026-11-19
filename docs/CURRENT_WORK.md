@@ -13,7 +13,6 @@ note or ADR *first*. No status essays — hard byte budget.
 
 ▶ NEXT: the ADR-127 floor's coverage cost; follow-ups #489–#494, plus the
 repin's filed residuals #600, #605.
-Older open: #130, #132, #156, #159, #169–#171; #160 blocked.
 - **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
   ([plan](notes/20260718-compat-next-stage-plan.md)).
 - **CLI surface (v0.3.0 RC)** — `--bleeding-edge`, severity, `coverage` done;
@@ -63,12 +62,13 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-19 #655+#661 CLOSED** (PR #668): dynamic-base `ConstantRead` skips C5/C1; 0 FP; Approved. → #670. [note](notes/20261119-issue-655-dynamic-base-const.md)
-- **2026-11-19 #637 CLOSED** (PR #664): CHAIN_LIMIT counts the root; 100-module include silent; 0 FP; Approved. → #665–#667. [note](notes/20261119-issue-637-chain-limit.md)
-- **2026-11-19 #657 CLOSED** (PR #660): ConstName prefix-share + bounded `knows_*`; 20k 0.74s/749MB→0.26s/44MB; 0 FP; Approved. → #661–#663. [note](notes/20261119-issue-657-const-read-name-storage.md)
-- **2026-11-19 #658 CLOSED** (PR #659): PathMarks + CoreData + env-fp type_of; 2.5k push 49.5s→1.7s; 0 FP; Approved. [note](notes/20261119-issue-658-mutator-chains.md)
-- **2026-11-19 #429 CLOSED** (PR #601): `analysis_stack_audit` — unbounded parses + unsized-stack threads; Approved. → #652–#654. [note](notes/20261118-issue-429-analysis-stack-audit.md)
-- **2026-11-19 #424 const** (PR #651): `lower_constant_path`; 20k→0.72s; 0 FP; Approved. → #655–#658. [note](notes/20261119-issue-424-const-path.md)
+- **2026-11-19 #670 CLOSED** (PR #671): class-guard `dynamic_base` — 13 master FPs gone, sweep 0 FP/360. → #672/#673. [note](notes/20261119-issue-670-dynamic-base-class-guard.md)
+- **2026-11-19 #655+#661 CLOSED** (PR #668): dynamic-base `ConstantRead` skips C5/C1; 0 FP. [note](notes/20261119-issue-655-dynamic-base-const.md)
+- **2026-11-19 #637 CLOSED** (PR #664): CHAIN_LIMIT counts the root; 100-module include silent; 0 FP. [note](notes/20261119-issue-637-chain-limit.md)
+- **2026-11-19 #657 CLOSED** (PR #660): ConstName prefix-share + bounded `knows_*`; 20k 0.74s/749MB→0.26s/44MB; 0 FP. [note](notes/20261119-issue-657-const-read-name-storage.md)
+- **2026-11-19 #658 CLOSED** (PR #659): PathMarks + CoreData + env-fp type_of; 2.5k push 49.5s→1.7s; 0 FP. [note](notes/20261119-issue-658-mutator-chains.md)
+- **2026-11-19 #429 CLOSED** (PR #601): `analysis_stack_audit` — unbounded parses + unsized-stack threads. → #652–#654. [note](notes/20261118-issue-429-analysis-stack-audit.md)
+- **2026-11-19 #424 const** (PR #651): `lower_constant_path`; 20k→0.72s; 0 FP. → #655–#658. [note](notes/20261119-issue-424-const-path.md)
 - **2026-11-19 #427 display stack** (PR #648): `render_postorder`; wrap90 SIGABRT→exit 1; 0 FP; Approved. → #650. [note](notes/20261119-issue-427-iterative-type-display.md)
 - **2026-11-19 #424 `**` row** (PR #649): env-free call memos — 800 `**` 38s→0.5s; literal `x.a`/`1+` 20k under bar; 0 FP/8,251; Opus Approved. Const-path + local-rooted remain. [note](notes/20261119-issue-424-pow-chain.md)
 - **2026-11-19 #642 CLOSED** (PR #644): shared `LineIndex` on `LoweredAst`; LSP 2.89s→0.36s, MCP 4.26s→0.54s (20k diags); 0 FP; Approved. [note](notes/20261119-issue-642-shared-line-index.md)
