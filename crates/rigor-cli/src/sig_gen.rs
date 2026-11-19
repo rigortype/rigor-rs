@@ -2870,14 +2870,26 @@ fn classify(
 /// `Constant` is handled by the member-wise widening and does not count
 /// (`nested == false`).
 fn nested_pinned_literal(interner: &Interner, ty: TypeId, nested: bool) -> bool {
-    match interner.get(ty) {
-        Type::Constant(_) => nested,
-        Type::Union(ms) => ms.iter().any(|&m| nested_pinned_literal(interner, m, nested)),
-        Type::Tuple(es) => es.iter().any(|&e| nested_pinned_literal(interner, e, true)),
-        Type::HashShape(ms) => ms.iter().any(|m| nested_pinned_literal(interner, m.value, true)),
-        Type::Nominal { args, .. } => args.iter().any(|&a| nested_pinned_literal(interner, a, true)),
-        _ => false,
+    // `any` over the container tree on an explicit stack: an inferred
+    // carrier's depth is unbounded (rigor-rs#427). A hit is a `Constant`
+    // reached with `nested` set — `Union` propagates the flag unchanged,
+    // every other container sets it for its children.
+    let mut stack = vec![(ty, nested)];
+    while let Some((id, nested)) = stack.pop() {
+        match interner.get(id) {
+            Type::Constant(_) => {
+                if nested {
+                    return true;
+                }
+            }
+            Type::Union(ms) => stack.extend(ms.iter().map(|&m| (m, nested))),
+            Type::Tuple(es) => stack.extend(es.iter().map(|&e| (e, true))),
+            Type::HashShape(ms) => stack.extend(ms.iter().map(|m| (m.value, true))),
+            Type::Nominal { args, .. } => stack.extend(args.iter().map(|&a| (a, true))),
+            _ => {}
+        }
     }
+    false
 }
 
 /// A closed literal expression: literals, constant reads and array literals of
@@ -3065,18 +3077,56 @@ fn collect_explicit_returns(ast: &LoweredAst, sig: &MethodSig) -> Option<Vec<Opt
 /// `Hash[untyped, ...]` / its value union). Either way the byte output would
 /// differ from the reference's on a method both emit.
 fn composite_holds_unsound(interner: &Interner, index: &CoreIndex, ty: TypeId) -> bool {
-    let slot = |e: TypeId| match interner.get(e) {
-        Type::Union(_) => true,
-        Type::Nominal { class, args } => {
-            args.is_empty() && is_bare_generic_name(index.class_name_for_id(*class).unwrap_or(""))
-        }
-        _ => composite_holds_unsound(interner, index, e),
-    };
-    match interner.get(ty) {
-        Type::Tuple(elems) => elems.iter().any(|&e| slot(e)),
-        Type::HashShape(members) => members.iter().any(|m| slot(m.value)),
-        _ => false,
+    /// One composite member's verdict: a `Union` or an args-less `Nominal`
+    /// naming a bare generic is a HIT; a `Tuple`/`HashShape` DESCENDS (the
+    /// recursion's `_` arm re-entered the match — only containers iterate
+    /// members); anything else is inert.
+    enum Slot {
+        Hit,
+        Descend,
+        Inert,
     }
+    let slot = |e: TypeId| match interner.get(e) {
+        Type::Union(_) => Slot::Hit,
+        Type::Nominal { class, args } => {
+            if args.is_empty()
+                && is_bare_generic_name(index.class_name_for_id(*class).unwrap_or(""))
+            {
+                Slot::Hit
+            } else {
+                Slot::Inert
+            }
+        }
+        Type::Tuple(_) | Type::HashShape(_) => Slot::Descend,
+        _ => Slot::Inert,
+    };
+    // `any` over the Tuple/HashShape tree on an explicit stack: an inferred
+    // carrier's depth is unbounded (rigor-rs#427).
+    let mut stack = vec![ty];
+    while let Some(id) = stack.pop() {
+        match interner.get(id) {
+            Type::Tuple(elems) => {
+                for &e in elems {
+                    match slot(e) {
+                        Slot::Hit => return true,
+                        Slot::Descend => stack.push(e),
+                        Slot::Inert => {}
+                    }
+                }
+            }
+            Type::HashShape(members) => {
+                for m in members {
+                    match slot(m.value) {
+                        Slot::Hit => return true,
+                        Slot::Descend => stack.push(m.value),
+                        Slot::Inert => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 /// A method's inferred return type, or `None` for an empty body (reference

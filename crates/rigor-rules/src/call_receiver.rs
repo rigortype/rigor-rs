@@ -945,17 +945,37 @@ pub(crate) fn check_collection_call(
 /// keeps out a `Dynamic[top]` element (a block parameter the reference types
 /// and the port does not) and every element whose rendering depends on how
 /// the two engines type a call.
+///
+/// Iterative: an inferred carrier's depth is unbounded (rigor-rs#427), so the
+/// walk runs on an explicit stack. The ROOT must be a container — a bare
+/// `Constant` carrier is no seed — while descendants may be `Constant`
+/// leaves; a `HashShape` node additionally requires every member present
+/// (`!optional`), checked before its values descend.
 fn literal_seed(interner: &Interner, ty: rigor_types::TypeId) -> bool {
-    fn element(interner: &Interner, ty: rigor_types::TypeId) -> bool {
-        matches!(interner.get(ty), Type::Constant(_)) || literal_seed(interner, ty)
-    }
-    match interner.get(ty) {
-        Type::Tuple(members) => members.iter().all(|&m| element(interner, m)),
+    let mut stack: Vec<rigor_types::TypeId> = match interner.get(ty) {
+        Type::Tuple(members) => members.clone(),
         Type::HashShape(members) => {
-            members.iter().all(|m| !m.optional && element(interner, m.value))
+            if members.iter().any(|m| m.optional) {
+                return false;
+            }
+            members.iter().map(|m| m.value).collect()
         }
-        _ => false,
+        _ => return false,
+    };
+    while let Some(id) = stack.pop() {
+        match interner.get(id) {
+            Type::Constant(_) => {}
+            Type::Tuple(members) => stack.extend(members.iter().copied()),
+            Type::HashShape(members) => {
+                if members.iter().any(|m| m.optional) {
+                    return false;
+                }
+                stack.extend(members.iter().map(|m| m.value));
+            }
+            _ => return false,
+        }
     }
+    true
 }
 
 /// Apply `call.possible-nil-receiver` to a single call, firing from the
@@ -1015,4 +1035,82 @@ pub(crate) fn check_nil_receiver(
         receiver_type: None,
         method_name: Some(method.to_string()),
     })
+}
+
+#[cfg(test)]
+mod literal_seed_tests {
+    //! rigor-rs#427: `literal_seed` walks an inferred carrier of unbounded
+    //! depth; the explicit-stack version keeps the same `all`/`element`
+    //! semantics (root must be a container, leaves `Constant`, `HashShape`
+    //! members all required).
+    use super::*;
+    use rigor_types::ty::{ClassId, ShapeKey, ShapeMember};
+
+    /// `D` levels of `Tuple([…])` wrapped around `inner`.
+    fn nest(i: &mut Interner, inner: rigor_types::TypeId, d: usize) -> rigor_types::TypeId {
+        let mut t = inner;
+        for _ in 0..d {
+            t = i.intern(Type::Tuple(vec![t]));
+        }
+        t
+    }
+
+    fn member(key: &str, value: rigor_types::TypeId, optional: bool) -> ShapeMember {
+        ShapeMember {
+            key: ShapeKey::Sym(key.to_string()),
+            value,
+            optional,
+        }
+    }
+
+    #[test]
+    fn literal_seed_shape_semantics() {
+        let mut i = Interner::new();
+        let one = i.int(1);
+        // A bare Constant is not a seed — the root must be a container.
+        assert!(!literal_seed(&i, one));
+        // [1], [[1]], and the vacuous [] are seeds.
+        let t1 = i.intern(Type::Tuple(vec![one]));
+        assert!(literal_seed(&i, t1));
+        let t3 = nest(&mut i, one, 3);
+        assert!(literal_seed(&i, t3));
+        let empty = i.intern(Type::Tuple(vec![]));
+        assert!(literal_seed(&i, empty));
+        // A Dynamic/top element — or any non-Constant leaf — breaks the seed.
+        let top = i.top();
+        let t = i.intern(Type::Tuple(vec![one, top]));
+        assert!(!literal_seed(&i, t));
+        let nom = i.intern(Type::Nominal {
+            class: ClassId(9),
+            args: vec![],
+        });
+        let t = i.intern(Type::Tuple(vec![nom]));
+        assert!(!literal_seed(&i, t));
+        // HashShape: all-required literal members seed; an optional member —
+        // or a non-literal value — does not, nested or at the root.
+        let hs = i.intern(Type::HashShape(vec![member("a", one, false)]));
+        assert!(literal_seed(&i, hs));
+        let hs_opt = i.intern(Type::HashShape(vec![member("a", one, true)]));
+        assert!(!literal_seed(&i, hs_opt));
+        let wrapped = i.intern(Type::Tuple(vec![hs_opt]));
+        assert!(!literal_seed(&i, wrapped));
+        // …while a required HashShape inside a Tuple still seeds.
+        let wrapped = i.intern(Type::Tuple(vec![hs]));
+        assert!(literal_seed(&i, wrapped));
+    }
+
+    #[test]
+    fn literal_seed_deep_chain_uses_no_call_stack() {
+        // A `x = [x]` wrap chain grows a literal seed one level per line —
+        // deeper than any bounded thread stack held the recursion.
+        const DEPTH: usize = 200_000;
+        let mut i = Interner::new();
+        let one = i.int(1);
+        let t = nest(&mut i, one, DEPTH);
+        let handle = std::thread::Builder::new()
+            .stack_size(512 * 1024)
+            .spawn(move || literal_seed(&i, t))
+            .unwrap();
+        assert!(handle.join().unwrap());
+    }
 }
