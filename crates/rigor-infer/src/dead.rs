@@ -513,6 +513,14 @@ impl<'i> Typer<'i> {
                 .collect();
         }
         *self.dead_partial.borrow_mut() = std::rc::Rc::new(DeadPositions::default());
+        // rigor-rs#437 fold-order audit (RIGOR_REACH_MEMO_AUDIT): record the
+        // truthiness each `if`'s own scan visit answered, then refold every
+        // predicate fresh at scan end and panic on a mismatch — a visit that
+        // reused a fuel-starved or wrong-context first fold is caught here.
+        // Meaningful only for a scan entered with an empty `seen` (a nested
+        // scan's visits legitimately read its own stack context).
+        let fold_audit = crate::reach_memo::audit_mode() && seen.is_empty();
+        let mut scanned_preds: Vec<(NodeId, Option<bool>)> = Vec::new();
         // Publish the accumulator to re-entrant callers only where a recursion
         // point follows AND it changed — the publish clones the recorded arms,
         // so doing it per node is O(nodes x arms) on generated-parser files;
@@ -534,7 +542,11 @@ impl<'i> Typer<'i> {
                     ..
                 } => {
                     publish(&dead, &mut dirty);
-                    let Some(truthy) = self.expr_truthiness(ast, *predicate, seen) else {
+                    let folded_truthy = self.expr_truthiness(ast, *predicate, seen);
+                    if fold_audit {
+                        scanned_preds.push((*predicate, folded_truthy));
+                    }
+                    let Some(truthy) = folded_truthy else {
                         continue;
                     };
                     // `if` runs `then` on truthy; `unless` swaps the arms — the
@@ -618,9 +630,21 @@ impl<'i> Typer<'i> {
         // set, so post-scan callers refold against the settled one.
         for key in self.truthy_provisional.borrow_mut().drain() {
             self.truthy_memo.borrow_mut().remove(&key);
+            self.truthy_landed.borrow_mut().remove(&key);
         }
         let dead = std::rc::Rc::new(dead);
         *self.dead_cache.borrow_mut() = Some((key, dead.clone()));
+        if fold_audit {
+            for (pred, used) in scanned_preds {
+                let fresh = self.expr_truthiness_fold(ast, pred, &mut Vec::new());
+                assert_eq!(
+                    fresh, used,
+                    "rigor-rs#437 fold-order audit: predicate {pred:?} scan visit folded \
+                     {used:?} but a settled refold gives {fresh:?} in {:?}",
+                    ast.file_key(),
+                );
+            }
+        }
         dead
     }
 
@@ -630,11 +654,28 @@ impl<'i> Typer<'i> {
     /// always truthy, `Some(false)` = always falsey, `None` = live on both
     /// edges (the answer for `Bot` and every unfolded carrier).
     ///
-    /// Memoized on `(ast, pred)`: the fold re-enters through `expr_scalar` →
-    /// `local_reach` → `definitely_assigns` → `expr_truthiness`, so without
-    /// the memo every `if` on a read's path re-folds every other (the `seen`
-    /// fuel bounds DEPTH, not the per-predicate fanout — exponential on real
-    /// files). Re-entry to a predicate already folding answers `None`, the
+    /// Two memos, by the `seen` the fold runs under (rigor-rs#437):
+    ///
+    /// - **Canonical** (`truthy_memo`): a fold under an EMPTY `seen` — full
+    ///   fuel, no membership bias. It is what the `dead_positions` scan's
+    ///   own `if` visits and every post-scan top-level caller must see: the
+    ///   reference has no backward walk, so a predicate's truthiness is a
+    ///   property of its position, not of whichever walk first visited it.
+    /// - **Contextual** (`ReachMemo::truthys`, reached for `seen` non-empty):
+    ///   a nested fold's answer depends on the stack it ran under — the
+    ///   fuel caps and the `seen` membership tests — so it lives in the
+    ///   same `(ast, dead)`-epoch, `(pred, seen.len())`-keyed,
+    ///   dependency-recorded table as `expr_scalar`, where a hit must
+    ///   reproduce a recompute in THIS context. Without it a fold first
+    ///   visited deep inside another predicate's walk ran out of fuel,
+    ///   memoized `None`, and answered the scan's own later visit (the
+    ///   `if d then y = 2 else t = nil end` dead arm that stayed live).
+    ///
+    /// The fold re-enters through `expr_scalar` → `local_reach` →
+    /// `definitely_assigns` → `expr_truthiness`, so without the memo every
+    /// `if` on a read's path re-folds every other (the `seen` fuel bounds
+    /// DEPTH, not the per-predicate fanout — exponential on real files).
+    /// Re-entry to a predicate already folding answers `None`, the
     /// decline side.
     pub(crate) fn expr_truthiness(
         &self,
@@ -643,8 +684,10 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
     ) -> Option<bool> {
         let key = (ast.uid() as usize, pred.0);
-        if let Some(hit) = self.truthy_memo.borrow().get(&key) {
-            return *hit;
+        if seen.is_empty() {
+            if let Some(hit) = self.truthy_memo.borrow().get(&key) {
+                return *hit;
+            }
         }
         if !self.truthy_in_flight.borrow_mut().insert(key) {
             // The answer holds only while this fold runs: a reach
@@ -653,24 +696,43 @@ impl<'i> Typer<'i> {
             self.note_truthy_reentry(key);
             return None;
         }
-        // A fold that runs to completion is memoized below, so the reach
-        // computations around it depend only on its answer (rigor-rs#422).
-        let out = self.behind_truthy_barrier(|| self.expr_truthiness_fold(ast, pred, seen));
+        let mut provisional = false;
+        let out = if seen.is_empty() {
+            // A canonical fold that runs to completion is memoized, so the
+            // reach computations around it depend only on its answer
+            // (rigor-rs#422).
+            let out =
+                self.behind_truthy_barrier(|| self.expr_truthiness_fold(ast, pred, seen));
+            self.truthy_memo.borrow_mut().insert(key, out);
+            provisional = true;
+            out
+        } else {
+            self.expr_truthy_memo(ast, pred, seen)
+        };
         self.truthy_in_flight.borrow_mut().remove(&key);
+        // The FIRST completed answer feeds the reach memo's `folding`
+        // dependency check (`landed`) — the pre-#437 flat memo's
+        // first-completion semantics, kept for entries that saw a re-entry.
+        let mut landed = self.truthy_landed.borrow_mut();
+        if !landed.contains_key(&key) {
+            landed.insert(key, out);
+            provisional = true;
+        }
+        drop(landed);
         // A fold run inside `dead_positions` read the PARTIAL dead set —
         // cache it for the scan's own reuse, but stamp it provisional so the
         // scan's end evicts it and post-scan callers refold against the
         // settled set. Without the in-scan memo the re-entrant fanout is
         // exponential (mail's generated parsers: 1 s to >60 s per file).
-        self.truthy_memo.borrow_mut().insert(key, out);
-        if self.dead_in_flight.get() {
+        if provisional && self.dead_in_flight.get() {
             self.truthy_provisional.borrow_mut().insert(key);
         }
         out
     }
 
     /// The actual predicate fold behind [`Typer::expr_truthiness`]'s memo.
-    fn expr_truthiness_fold(
+    /// `pub(crate)` for [`Typer::expr_truthy_memo`] and the fold-order audit.
+    pub(crate) fn expr_truthiness_fold(
         &self,
         ast: &LoweredAst,
         pred: NodeId,

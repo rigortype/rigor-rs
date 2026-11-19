@@ -79,15 +79,27 @@ pub struct Typer<'i> {
     /// `definitely_assigns` → `expr_truthiness`, and without the memo every
     /// `if` on a read's statement path re-folds every other (the `seen` cap
     /// bounds DEPTH, not the per-predicate fanout: exponential on real
-    /// files). A completed answer is deterministic in `(ast, index)` — the
-    /// `seen` fuel can only shrink it, so caching a fuel-starved `None`
-    /// stays on the decline side.
+    /// files). Only CANONICAL answers live here — folds run under an
+    /// EMPTY `seen` (rigor-rs#437): a non-empty `seen` fold is
+    /// context-dependent (fuel AND `seen` membership) and lives in
+    /// [`crate::reach_memo::ReachMemo::truthys`] instead, keyed by
+    /// `(pred, seen.len())` inside the `(ast, dead)` epoch, so a
+    /// fuel-starved or differently-stacked first visit never answers a
+    /// later one.
     pub(crate) truthy_memo: RefCell<std::collections::HashMap<(usize, u32), Option<bool>>>,
+    /// The FIRST completed `expr_truthiness` answer per `(ast, pred)` —
+    /// never consulted by `expr_truthiness` itself, only by the reach
+    /// memo's `folding` dependency check (an entry that saw a re-entry
+    /// holds only while the predicate still answers `None`: still folding,
+    /// or landed on `None`). It preserves the pre-#437 flat memo's
+    /// first-completion semantics for that check.
+    pub(crate) truthy_landed: RefCell<std::collections::HashMap<(usize, u32), Option<bool>>>,
     /// The predicates whose `expr_truthiness` fold is on the stack. A
     /// re-entrant fold of the same node answers `None` — the decline half,
     /// mirroring `dead_in_flight`.
     pub(crate) truthy_in_flight: RefCell<std::collections::HashSet<(usize, u32)>>,
-    /// `truthy_memo` keys folded while a `dead_positions` scan was in flight:
+    /// `truthy_memo` / `truthy_landed` keys folded while a `dead_positions`
+    /// scan was in flight:
     /// their pins were read against the PARTIAL dead set — sound at the
     /// predicate's own scan position (the walk records arms in source order
     /// and a write can only pin a later read), but not necessarily against
@@ -113,6 +125,12 @@ pub struct Typer<'i> {
     /// of that `def` may be constant-folded by the reference
     /// ([`crate::def_local_marks::DefLocalMarks::narrowing_hot`]).
     pub def_scope: Cell<Option<rigor_parse::Span>>,
+    /// `true` while a [`Typer::loop_continuation`] fixpoint pass replays the
+    /// loop body (rigor-rs#437): the pass must model `if` decisions itself
+    /// (a decided predicate replays its live arm; an undecided one joins)
+    /// rather than going through `replay_opaque`'s blanket decline, whose
+    /// `Dynamic` exits would always force the untrusted structural verdict.
+    pub(crate) loop_pass: Cell<bool>,
     /// rigor-rs#422: the `local_reach` memo — entries keyed by the read and
     /// `seen.len()`, guarded by the `seen` membership answers they depend
     /// on, valid for one `(AST, dead-set object)` pair (see
@@ -160,13 +178,13 @@ impl<'i> Typer<'i> {
     /// Build a typer over a borrowed core index, with an EMPTY source index
     /// (no in-source typing). Kept for callers that predate tier-4.
     pub fn new(index: &'i CoreIndex) -> Self {
-        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()) }
+        Typer { index, source: empty_source(), folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_landed: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), loop_pass: Cell::new(false), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()) }
     }
 
     /// Build a typer over a borrowed core index AND a per-run [`SourceIndex`],
     /// enabling `X.new` instance typing and in-source method resolution.
     pub fn with_source(index: &'i CoreIndex, source: &'i SourceIndex) -> Self {
-        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()) }
+        Typer { index, source, folder: None, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_landed: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), loop_pass: Cell::new(false), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()) }
     }
 
     /// As [`Typer::with_source`], plus the ADR-0008 real-Ruby folder for
@@ -177,7 +195,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()) }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_landed: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), loop_pass: Cell::new(false), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from

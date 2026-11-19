@@ -2363,6 +2363,57 @@ fn loop_converged_body_keeps_constant_pins() {
     assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
 }
 
+/// rigor-rs#437: the canonical fold memo answers only EMPTY-`seen` folds;
+/// a nested fold that ran out of fuel inside another predicate's walk
+/// (`seen.len() >= 4` → `None`) can no longer poison the scan's own visit.
+/// Here `if d`'s first fold comes from `s = t`'s reach walk (a non-empty
+/// `seen`), which starved the arm kill and memoized `None`; with the
+/// canonical/contextual split the scan's own visit refolds canonically,
+/// `if d` records its dead `else` arm, and the loop pass replays only the
+/// live `then` arm — `y = 2` absorbs `if s`'s conditional write, the body
+/// converges inside two passes, and `t`'s `Constant[1]` survives for
+/// `if t` to fold (the oracle fires `always-truthy-condition`).
+#[test]
+fn loop_decided_if_arm_keeps_pin_after_fuel_starved_first_fold() {
+    let src = b"def f(c)\n  a = 1; b = a; cc = b; d = cc; s = nil; t = 1\n  while c\n    if s then y = 1 end\n    if d then y = 2 else t = nil end\n    s = t\n  end\n  if t then y = 3 end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert_eq!(i.get(ty), &Type::Constant(Scalar::Int(1)));
+}
+
+/// The order-sensitive twin (rigor-rs#437, oracle-probed): with the
+/// CONDITIONAL write last (`if s` after `if d`), `y` is still moving on the
+/// cap pass, so the widen sheds every tracked pin — `if t` must NOT fold.
+#[test]
+fn loop_decided_if_before_conditional_write_sheds_pins_at_cap() {
+    let src = b"def f(c)\n  a = 1; b = a; cc = b; d = cc; s = nil; t = 1\n  while c\n    if d then y = 2 else t = nil end\n    if s then y = 1 end\n    s = t\n  end\n  if t then y = 3 end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "a name still moving on the cap pass sheds every sibling pin, got {:?}",
+        i.get(ty)
+    );
+}
+
 /// rigor-rs#638: a value-stabilizing self-op (`x |= 1`) converges inside
 /// two BodyFixpoint passes, so the last-pass widen never runs and a sibling
 /// dead-arm pin stays `Constant[1]`.

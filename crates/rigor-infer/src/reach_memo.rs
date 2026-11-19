@@ -370,6 +370,16 @@ pub(crate) struct ReachMemo {
     /// whole remaining suffix — `v.push(1).push(1).…` at N links cost
     /// O(N²) `type_call` levels, on top of the replay's own applies.
     type_env_ofs: FastMap<(u32, usize), Vec<EnvExprEntry>>,
+    /// `expr_truthiness` answers for folds run under a NON-EMPTY `seen`
+    /// (rigor-rs#437): same key and dependency shape as `expr_scalars`. The
+    /// dead scan's own `if` visits and post-scan callers fold with an empty
+    /// `seen` — those land in the canonical [`Typer::truthy_memo`]. A
+    /// nested fold's answer depends on the stack it ran under (the fuel
+    /// caps AND `seen` membership), so it lives here where a hit must
+    /// reproduce a recompute in THIS context; a fuel-starved or
+    /// differently-stacked first visit can never answer a shallower or
+    /// differently-stacked later one.
+    truthys: ExprTable<Option<bool>>,
     /// Every `seen` key tested on this AST, interned, so dependencies are
     /// lists of small ids. Reset with the AST only while no computation is
     /// in progress — the frames hold ids too.
@@ -393,6 +403,7 @@ impl ReachMemo {
             self.expr_reaches.clear();
             self.type_ofs.clear();
             self.type_env_ofs.clear();
+            self.truthys.clear();
         }
     }
 
@@ -490,7 +501,7 @@ fn same_dead(a: &Option<Rc<DeadPositions>>, b: &Option<Rc<DeadPositions>>) -> bo
 }
 
 /// `RIGOR_REACH_MEMO_AUDIT` is set (to anything but empty or `0`).
-fn audit_mode() -> bool {
+pub(crate) fn audit_mode() -> bool {
     static AUDIT: OnceLock<bool> = OnceLock::new();
     *AUDIT.get_or_init(|| {
         std::env::var("RIGOR_REACH_MEMO_AUDIT").is_ok_and(|v| !v.is_empty() && v != "0")
@@ -590,7 +601,7 @@ impl<'i> Typer<'i> {
                     // while the dead set stands, so a fold that landed on
                     // `None` keeps answering `None`.
                     let running = self.truthy_in_flight.borrow();
-                    let landed = self.truthy_memo.borrow();
+                    let landed = self.truthy_landed.borrow();
                     let mut found = None;
                     let mut i = 0;
                     while i < entries.len() {
@@ -734,7 +745,7 @@ impl<'i> Typer<'i> {
                     entries,
                     &stack,
                     &self.truthy_in_flight.borrow(),
-                    &self.truthy_memo.borrow(),
+                    &self.truthy_landed.borrow(),
                 ),
                 None => None,
             }
@@ -792,6 +803,26 @@ impl<'i> Typer<'i> {
             }
         }
         out
+    }
+
+    /// [`Typer::expr_memo`] for `expr_truthiness`'s NON-EMPTY-`seen` folds
+    /// (rigor-rs#437) — same validity and dependency discipline as
+    /// `expr_scalar`. The empty-`seen` canonical path is memoized flat on
+    /// `Typer::truthy_memo` instead (it is context-free).
+    pub(crate) fn expr_truthy_memo(
+        &self,
+        ast: &LoweredAst,
+        pred: NodeId,
+        seen: &mut Vec<String>,
+    ) -> Option<bool> {
+        self.expr_memo(
+            ast,
+            pred,
+            seen,
+            |m| &mut m.truthys,
+            |s, a, p, seen| s.expr_truthiness_fold(a, p, seen),
+            |_| true,
+        )
     }
 
     /// [`Typer::expr_memo`] for `expr_scalar` — see its docs for the
@@ -887,7 +918,7 @@ impl<'i> Typer<'i> {
                     entries,
                     &stack,
                     &self.truthy_in_flight.borrow(),
-                    &self.truthy_memo.borrow(),
+                    &self.truthy_landed.borrow(),
                     env_fp,
                     env,
                     def_scope,

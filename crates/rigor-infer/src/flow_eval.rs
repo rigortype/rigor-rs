@@ -174,7 +174,30 @@ impl<'i> Typer<'i> {
                 }
                 _ => None,
             };
-            if guards.is_empty() && !wild {
+            // A `loop_continuation` pass must model `if` decisions itself:
+            // `replay_opaque` widens every typed decision subject and every
+            // written name to `Dynamic`, which the exactness gate then reads
+            // as an untrusted verdict (rigor-rs#437). `replay_one`'s `if`
+            // arm already joins undecided arms and — under `loop_pass` —
+            // takes a decided predicate's live arm only. A write statement
+            // (`s = (if d then 2 else w = "x"; 3 end)`) is replayed the same
+            // way — `type_of` elides a decided `if`'s dead arm and
+            // `widen_shell` drops the dead arm's stale writes. Ivar and
+            // class/global decisions stay opaque: their edge semantics the
+            // pass does not model.
+            let modelled = self.loop_pass.get()
+                && matches!(
+                    ast.get(stmt),
+                    Node::If { .. }
+                        | Node::LocalVariableWrite { .. }
+                        | Node::LocalVariableOpWrite { .. }
+                        | Node::MultiWrite { .. }
+                )
+                && !marks.decision_reset_within(span)
+                && marks
+                    .decision_cg_reads_within(span, self.def_scope.get())
+                    .is_empty();
+            if (guards.is_empty() || modelled) && !wild {
                 self.replay_one(ast, &marks, env, stmt, interner, returns);
             } else {
                 self.replay_opaque(ast, &marks, env, stmt, &guards, wild, interner, returns);
@@ -303,7 +326,12 @@ impl<'i> Typer<'i> {
                 if literal && folded.is_none() {
                     self.replay_discard(ast, env, &[then_body, else_body], interner, returns);
                     Self::widen_names(env, &marks.written_within(span), interner);
-                } else if literal {
+                } else if literal || (self.loop_pass.get() && folded.is_some()) {
+                    // Under `loop_pass` a decided non-literal predicate
+                    // takes only its live arm too — the reference's per-pass
+                    // `live_branch_for_if` kills the dead edge, so a write
+                    // there (`if d … else t = nil end` on a pinned `d`)
+                    // never reaches the pass env (rigor-rs#437).
                     let (live, dead) =
                         if folded == Some(!*is_unless) { (then_body, else_body) } else { (else_body, then_body) };
                     if crate::def_local_marks::body_span(ast, dead)
@@ -992,11 +1020,12 @@ impl<'i> Typer<'i> {
             return None;
         }
         macro_rules! structural {
-            () => {
+            () => {{
+                self.loop_pass.set(false);
                 return self
                     .loop_cap_widening(ast, env, body, interner)
                     .map(|(tracked, suspect)| LoopContinuation::Structural(tracked, suspect));
-            };
+            }};
         }
         // sig-gen's def-local replay keeps the structural verdict — its
         // body replay must keep declining the loops the reference's
@@ -1018,15 +1047,12 @@ impl<'i> Typer<'i> {
                 structural!();
             }
         }
-        // Every tracked seed must be value-exact: a `Dynamic` seed means
-        // the pass never observed the name.
-        if names.iter().any(|n| {
-            env.get(n)
-                .map(|&t| Self::type_has_decline(interner, t))
-                .unwrap_or(false)
-        }) {
-            structural!();
-        }
+        // A `Dynamic` SEED is tolerated: a name the body unconditionally
+        // rebinds each pass overwrites it anyway (`s = u`, a Dynamic param,
+        // then `s = (if d then 2 else w = "x"; 3 end)` — rigor-rs#437's x5),
+        // and one the pass never writes or writes conditionally still exits
+        // `Dynamic`, which the pass-exit check below declines on. The gate
+        // that must hold is value-exactness of every tracked pass EXIT.
         let nil = interner.nil();
         // Pre-existing names only: a body-first local's `nil` seed must not
         // leak into the body (reference `loop_pass_entry` /
@@ -1041,6 +1067,7 @@ impl<'i> Typer<'i> {
             .map(|n| (n.clone(), env.get(n).copied().unwrap_or(nil)))
             .collect();
         const CAP: usize = 3;
+        self.loop_pass.set(true);
         for iteration in 0..CAP {
             let last = iteration + 1 == CAP;
             let mut pass_env = env.clone();
@@ -1087,6 +1114,7 @@ impl<'i> Typer<'i> {
                 break;
             }
         }
+        self.loop_pass.set(false);
         Some(LoopContinuation::Fixpoint(assumption))
     }
 

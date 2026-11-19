@@ -729,6 +729,35 @@ impl DefLocalMarks {
         out
     }
 
+    /// [`Self::written_outside`] with each write's start position attached —
+    /// [`Typer::widen_shell`]'s dead-arm filter needs positions, not just
+    /// names (rigor-rs#437).
+    pub(crate) fn write_positions_outside(
+        &self,
+        span: Span,
+        bodies: &[Span],
+        skip_pos: Option<usize>,
+    ) -> Vec<(usize, &str)> {
+        let nested: Vec<(usize, usize)> = {
+            let i = self.scopes.partition_point(|s| s.0 < span.0);
+            self.scopes[i..]
+                .iter()
+                .take_while(|s| s.0 < span.1)
+                .filter(|s| s.1 <= span.1 && **s != span)
+                .copied()
+                .collect()
+        };
+        let i = self.writes.partition_point(|w| w.0 < span.0);
+        self.writes[i..]
+            .iter()
+            .take_while(|w| w.0 < span.1)
+            .filter(|w| Some(w.0) != skip_pos)
+            .filter(|w| !bodies.iter().any(|b| b.0 <= w.0 && w.0 < b.1))
+            .filter(|w| !nested.iter().any(|b| b.0 <= w.0 && w.0 < b.1))
+            .map(|w| (w.0, w.1.as_str()))
+            .collect()
+    }
+
     fn within(marks: &[(Span, Vec<String>)], (lo, hi): Span) -> impl Iterator<Item = &Vec<String>> {
         let i = marks.partition_point(|m| m.0 .0 < lo);
         marks[i..]
@@ -969,7 +998,22 @@ impl<'i> Typer<'i> {
             _ => None,
         };
         let bodies = self.stmt_bodies(ast, id);
-        let names = marks.written_outside(span, &bodies, skip);
+        let mut names = marks.written_outside(span, &bodies, skip);
+        if self.loop_pass.get() {
+            // rigor-rs#437: a write inside a folded-dead arm never runs, so
+            // it is not stale either — the loop pass would otherwise spoil
+            // a pin held only under a decided arm (`s = (if d then 2 else
+            // w = "x"; 3 end)` on a pinned `d` keeps `w`'s `1`).
+            let dead = self.dead_positions(ast, &mut Vec::new());
+            if dead.has_folded() {
+                let positions = marks.write_positions_outside(span, &bodies, skip);
+                names.retain(|n| {
+                    positions
+                        .iter()
+                        .any(|&(p, w)| w == n && !dead.covers((p, p)))
+                });
+            }
+        }
         Self::widen_names(env, &names, interner);
     }
 
