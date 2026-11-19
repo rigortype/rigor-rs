@@ -63,6 +63,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-19 #655+#661 CLOSED** (PR #668): dynamic-base `ConstantRead` skips C5/C1; 0 FP; Approved. → #670. [note](notes/20261119-issue-655-dynamic-base-const.md)
 - **2026-11-19 #637 CLOSED** (PR #664): CHAIN_LIMIT counts the root; 100-module include silent; 0 FP; Approved. → #665–#667. [note](notes/20261119-issue-637-chain-limit.md)
 - **2026-11-19 #657 CLOSED** (PR #660): ConstName prefix-share + bounded `knows_*`; 20k 0.74s/749MB→0.26s/44MB; 0 FP; Approved. → #661–#663. [note](notes/20261119-issue-657-const-read-name-storage.md)
 - **2026-11-19 #658 CLOSED** (PR #659): PathMarks + CoreData + env-fp type_of; 2.5k push 49.5s→1.7s; 0 FP; Approved. [note](notes/20261119-issue-658-mutator-chains.md)
@@ -75,7 +76,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-11-19 #453 CLOSED** (PR #645): one-pass Logical `subject_edges` — 34 terms 14s→0.10s; 0 FP; Approved. → #646/#647. [note](notes/20261119-issue-453-logical-one-pass.md)
 - **2026-11-19 #636 CLOSED** (PR #641): findings `(line, column)` at production; 60k-diag 169s/~49GB → 1.8s/141MB; 0 FP; Approved. → #642/#643. [note](notes/20261119-issue-636-findings-line-index.md)
 - **2026-11-19 #464 CLOSED** (PR #635): `object_mixin_may_define` collects `Object`'s mixin closure once (`ObjectMixins` `OnceLock`) — 4.7s → 0.66s; 0 FP; Approved. [note](notes/20261119-issue-464-object-mixin-memo.md)
-- **2026-11-19 #346 CLOSED** (PR #630): config `~`/`~/` via MRI `Dir.home` NSS (`HOME` → `getpwnam(getlogin())` → `getpwuid`); `~name` literal (`ConfigPath`); `--config` `~`. Probes identical; Opus+Grok Approved. → #631–#633. [note](notes/20261119-issue-346-tilde-dir-home.md)
+- **2026-11-19 #346 CLOSED** (PR #630): config `~` via `Dir.home` NSS; `~name` literal. Approved. → #631–#633. [note](notes/20261119-issue-346-tilde-dir-home.md)
 - **2026-11-19 #614 CLOSED** (PR #624): `LocalOwnership` ports `constructor?`/`class_call?` + `singleton` — `.new` allocates on a constant path, `x.class`, or SINGLETON self. 2 OVER + 3 UNDER; Approved. → #629. [note](notes/20261119-issue-614-local-ownership-allocation.md)
 
 - **2026-11-19 #603 CLOSED** (PR #623): alias floor `selection_branches` + `ReceiverAlias.candidates` + carrier marks; 4 FP + ~130 probes; 2-round Approved. → #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
