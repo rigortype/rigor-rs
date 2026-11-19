@@ -149,7 +149,7 @@ impl<'i> Typer<'i> {
         // directly and does NOT type the bare constant as `Singleton`, so no other
         // rule's view of a project constant changes. Any miss falls through
         // (Dynamic, silent) — a project constant still types Dynamic as before.
-        if let Node::ConstantRead { name, .. } = ast.get(receiver) {
+        if let Node::ConstantRead { name, dynamic_base: false, .. } = ast.get(receiver) {
             if !name.is_empty() {
                 // rigor-rs#450: a project-sig declaration answers ahead of
                 // the body fold, resolved lexically — `T.one` inside `module
@@ -388,7 +388,7 @@ impl<'i> Typer<'i> {
         // reference). Gated on the SAME lexical shadow predicate the
         // `ConstantRead` arm's C1 gate uses: a project `ENV` constant/class, or
         // a C5-harvested literal constant of that name, declines.
-        if let Node::ConstantRead { name, span, .. } = ast.get(receiver) {
+        if let Node::ConstantRead { name, span, dynamic_base: false, .. } = ast.get(receiver) {
             if let Some(decl_class) = self.index.object_constant_class(name) {
                 let prefix = self.enclosing_prefix(*span);
                 if !self.source.constant_shadowed(name, prefix)
