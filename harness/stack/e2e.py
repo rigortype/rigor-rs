@@ -31,6 +31,7 @@ import argparse
 import os
 import re
 import subprocess
+import sys
 import time
 
 from common import CAPS, DATA, cli, make_trial, rm
@@ -129,6 +130,8 @@ def probe_budgets():
         seen = {}
         for v in ladder:
             seen[v] = rung_at(v)
+        print("e2e: rung probe " + " ".join("%dM:%s" % (v, seen[v]) for v in ladder),
+              file=sys.stderr)
         if seen[ladder[-1]] in ("256", "noforce"):
             _budgets = {}  # ulimit -v not honoured (macOS): every budget is 256
             return _budgets
