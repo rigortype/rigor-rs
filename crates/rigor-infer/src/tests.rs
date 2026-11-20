@@ -2667,6 +2667,10 @@ fn loop_cap_compounds_logical_operand_self_reads() {
         // An unresolvable receiverless call declines to a stable
         // `Dynamic` union — converged, `t` keeps its pin.
         (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = foo(x)\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+        // A `for` index binding a leaf's foreign name makes the leaf
+        // unprovable — `x + k - 1` on `k = 0` moves, it does not fold
+        // to the seed's `x + 1 - 1`.
+        (b"def f(c)\n  t = 1; x = 0; k = 1\n  while c\n    if false; t = nil; end\n    for k in [0]; end\n    x = x + k - 1\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
     ] {
         let ast = lower_src(src);
         let index = CoreIndex::new();

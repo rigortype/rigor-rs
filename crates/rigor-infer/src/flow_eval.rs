@@ -1478,6 +1478,7 @@ impl<'i> Typer<'i> {
                         // compounds). A decline the reference resolves
                         // (`[1,2].fetch(x)`) keeps moving — compound.
                         let mut leaf_env = env.clone();
+                        let mut leaf_unprovable = false;
                         for (pos, r) in marks.read_positions_within(node.span()) {
                             if r == n {
                                 continue;
@@ -1486,9 +1487,30 @@ impl<'i> Typer<'i> {
                             // binding; anything else (`k = 0 if d`,
                             // `c2 && (k = 0)`, a block or op write) joins
                             // the entry binding back in — the conditional
-                            // arm still leaves `k` at its seed.
+                            // arm still leaves `k` at its seed. A write
+                            // with no readable value (`for k in …`, a
+                            // pattern bind) proves NOTHING — the leaf's
+                            // value is untrusted, so the site compounds.
                             let mut r_ty = None;
                             let mut entry_survives = false;
+                            let mut unprovable = false;
+                            // A `for` index is a write that never lands a
+                            // site (`Node::Loop.index`), so `live` misses
+                            // it — the bound element type is not provable
+                            // here either way.
+                            if ast.iter().any(|(_, m)| {
+                                matches!(m, Node::Loop { index, index_writes, span, kind, .. }
+                                    if matches!(kind, rigor_parse::LoopKind::For)
+                                        && body_span.0 <= span.0
+                                        && span.1 <= pos
+                                        && (index.iter().any(|(nm, _)| nm == r)
+                                            || index_writes
+                                                .iter()
+                                                .any(|(nm, _, _)| nm == r)))
+                            }) {
+                                leaf_unprovable = true;
+                                continue;
+                            }
                             for s in live
                                 .iter()
                                 .filter(|s| s.target == r && s.span.1 <= pos)
@@ -1497,15 +1519,22 @@ impl<'i> Typer<'i> {
                                 if !dominant {
                                     entry_survives = true;
                                 }
-                                if let Some(sv) = s.value_node {
-                                    let wv = self.type_of(ast, sv, env, interner);
-                                    r_ty = Some(match r_ty {
-                                        None => wv,
-                                        Some(prev) => {
-                                            rigor_types::Algebra::join(interner, prev, wv)
-                                        }
-                                    });
+                                match s.value_node {
+                                    Some(sv) => {
+                                        let wv = self.type_of(ast, sv, env, interner);
+                                        r_ty = Some(match r_ty {
+                                            None => wv,
+                                            Some(prev) => {
+                                                rigor_types::Algebra::join(interner, prev, wv)
+                                            }
+                                        });
+                                    }
+                                    None => unprovable = true,
                                 }
+                            }
+                            if unprovable {
+                                leaf_unprovable = true;
+                                continue;
                             }
                             if entry_survives {
                                 let e = env.get(r).copied().unwrap_or(nil);
@@ -1543,10 +1572,11 @@ impl<'i> Typer<'i> {
                                 );
                             !resolves
                         });
-                        let converged = rigor_types::Algebra::join(interner, vt, entry)
-                            == entry
-                            || (vt_decline
-                                && (!env.contains_key(n) || unresolvable));
+                        let converged = !leaf_unprovable
+                            && (rigor_types::Algebra::join(interner, vt, entry)
+                                == entry
+                                || (vt_decline
+                                    && (!env.contains_key(n) || unresolvable)));
                         if !converged {
                             self_compound.insert(site.span.0);
                             break 'site;
