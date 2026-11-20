@@ -55,6 +55,7 @@ POOL_ERR = "could not start the analysis thread pool"
 
 
 def sh_ulimit(args, v_mib=None, s_mib=None):
+    # bash, not /bin/sh: dash's ulimit has no working -v on Ubuntu.
     pre = []
     if v_mib:
         pre.append("ulimit -v %d" % (v_mib * 1024))
@@ -62,7 +63,7 @@ def sh_ulimit(args, v_mib=None, s_mib=None):
         pre.append("ulimit -s %d" % (s_mib * 1024))
     if not pre:
         return args
-    return ["/bin/sh", "-c", "%s && exec \"$@\"" % "; ".join(pre), "sh"] + args
+    return ["/bin/bash", "-c", "%s && exec \"$@\"" % "; ".join(pre), "sh"] + args
 
 
 def run(files, d, v_mib=None, s_mib=None, timeout=None):
@@ -76,9 +77,13 @@ def run(files, d, v_mib=None, s_mib=None, timeout=None):
     m = WARN.search(err)
     rung = {"64 MiB": "64", "2 MiB": "2", "the process main thread": "main"}.get(
         m.group(1) if m else "", "dead" if POOL_ERR in err else "256")
-    if r.returncode != 0 and not err.strip():
+    if (r.returncode in (126, 127)
+            or (r.returncode != 0 and not err.strip())
+            or "error while loading shared libraries" in err
+            or "Cannot allocate memory" in err):
         rung = "dead"  # the budget stopped even the exec
-    if "cannot modify limit" in err or "invalid option" in err:
+    if ("cannot modify limit" in err or "invalid option" in err
+            or "Illegal option" in err):
         rung = "noforce"  # ulimit itself failed (macOS has no working -v)
     mo = re.search(r"thread '([^']*)'.*has overflowed its stack", err)
     crashed = r.returncode < 0 or mo is not None
@@ -94,9 +99,13 @@ def trial(kind, n, two, v_mib=None, s_mib=None):
     d, files = make_trial(kind, n, two)
     try:
         r = run(files, d, v_mib, s_mib)
-        det = ("CRASH rc=%d thread=%s" % (r["rc"], r["thread"])) if r["crashed"] \
-            else "ok rc=%d rung=%s %.1fs" % (r["rc"], r["rung"], r["dt"])
-        _trials[key] = (not r["crashed"], det)
+        # Survival = check ran to a verdict: not a crash, not a dead pool/exec
+        # (rc 70 prints no diagnostics; it never analysed the file).
+        survived = not r["crashed"] and r["rung"] != "dead" and r["rc"] != 70
+        det = (("CRASH rc=%d thread=%s" % (r["rc"], r["thread"])) if r["crashed"]
+               else ("dead rc=%d" % r["rc"]) if not survived
+               else "ok rc=%d rung=%s %.1fs" % (r["rc"], r["rung"], r["dt"]))
+        _trials[key] = (survived, det)
         return _trials[key]
     finally:
         rm(d)
