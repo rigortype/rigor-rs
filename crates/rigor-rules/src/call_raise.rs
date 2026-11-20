@@ -101,6 +101,8 @@ pub(crate) fn raise_non_exception_diagnostics(
             source_family: "builtin",
             // JSON carries `method_name` but no `receiver_type` for this rule.
             receiver_type: None,
+            receiver_classes: None,
+
             method_name: Some(method),
         });
     }

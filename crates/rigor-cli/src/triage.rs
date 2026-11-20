@@ -791,6 +791,7 @@ mod tests {
             severity: sev,
             source_family: "builtin",
             receiver_type: receiver.map(str::to_string),
+            receiver_classes: None,
             method_name: method.map(str::to_string),
         }
     }

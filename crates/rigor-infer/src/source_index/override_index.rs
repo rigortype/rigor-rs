@@ -248,13 +248,13 @@ impl SourceIndex {
     }
 
     /// Upstream v0.4.3 (#1836): the `refine(T) { def … }` rows of the project
-    /// module `module` (qualified), as `(target as written, method names)`.
-    /// Empty for a name the project does not declare or that refines nothing.
-    pub fn refinements_of(&self, module: &str) -> Vec<(Option<&str>, &[String])> {
+    /// module `module` (qualified). Empty for a name the project does not
+    /// declare or that refines nothing.
+    pub fn refinements_of(&self, module: &str) -> &[super::Refinement] {
         self.override_classes
             .get(module)
-            .map(|e| e.refines.iter().map(|r| (r.target.as_deref(), r.names.as_slice())).collect())
-            .unwrap_or_default()
+            .map(|e| e.refines.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Whether the project's FIRST declaration of `qualified` was a `module`
@@ -449,7 +449,9 @@ pub(crate) fn collect_override_classes(
                 includes: includes.to_vec(),
                 extends: collect_body_extends(ast, body),
                 is_module: true,
-                refines: collect_body_refines(ast, body),
+                // Refined by [`super::refine_walk::scan_refinements`],
+                // attached in `harvest` once every entry is collected.
+                refines: Vec::new(),
             });
             let child_prefix = split_qualified(&qualified);
             for &child in body {
@@ -544,43 +546,10 @@ fn alias_adopted_methods(
 /// take — the `extend` half of the singleton ancestor surface the reference's
 /// ScopeIndexer folds into the extender's own singleton entries. Same
 /// direct-statement discipline as the parser's `include`/`prepend` capture.
-/// The `refine(T) { def … }` / `refine T do … end` statements of a module
-/// body: the target constant as written (`None` when it is not a plain
-/// constant) and every `def` name inside the block, nested statements
-/// included.
-fn collect_body_refines(ast: &LoweredAst, body: &[NodeId]) -> Vec<super::Refinement> {
-    let mut out = Vec::new();
-    for &child in body {
-        let Node::Call { receiver: None, method, args, block_span: Some(block), .. } =
-            ast.get(child)
-        else {
-            continue;
-        };
-        if method != "refine" || args.len() != 1 {
-            continue;
-        }
-        let target = match ast.get(args[0]) {
-            Node::ConstantRead { name, dynamic_base: false, self_anchored: false, .. }
-                if !name.is_empty() =>
-            {
-                Some(name.strip_prefix("::").unwrap_or(name).to_string())
-            }
-            _ => None,
-        };
-        let names = ast
-            .iter()
-            .filter(|(_, n)| {
-                matches!(n, Node::Definition { .. }) && {
-                    let s = n.span();
-                    block.0 <= s.0 && s.1 <= block.1
-                }
-            })
-            .flat_map(|(_, n)| super::harvest::def_names(n))
-            .collect();
-        out.push(super::Refinement { target, names });
-    }
-    out
-}
+/// The `refine` table rows (`refine(T) { … }`) are harvested by
+/// [`super::refine_walk::scan_refinements`], which also walks the
+/// `def`-context placements this old direct-statement scan could not see
+/// (rigor-rs#446).
 
 fn collect_body_extends(ast: &LoweredAst, body: &[NodeId]) -> Vec<String> {
     let mut out = Vec::new();

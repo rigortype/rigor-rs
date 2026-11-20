@@ -47,6 +47,8 @@ mod constants;
 mod literal_fold;
 mod def_attribution;
 mod override_index;
+mod refinement_reach;
+mod refine_walk;
 mod resolution_chain;
 mod ruby_library_roots;
 mod pre_eval;
@@ -62,6 +64,11 @@ pub(crate) use constants::*;
 pub(crate) use literal_fold::*;
 pub(crate) use def_attribution::*;
 pub use override_index::{lexical_scopes, method_body_spans};
+pub use refine_walk::scan_refinements;
+#[doc(hidden)]
+pub use refine_walk::RefineScan;
+#[doc(hidden)]
+pub use refinement_reach::UsingExpansion;
 pub use pre_eval::{PatchCall, PreEvalPatches};
 pub(crate) use override_index::*;
 
@@ -297,12 +304,21 @@ pub(crate) struct HarvestedOverrideClass {
 
 /// One `refine(T) { … }` block of a project module (upstream #1836's
 /// refinement-table rows, kind-less): the target constant as WRITTEN (`None`
-/// for a target that is not a plain constant, e.g. `refine(C.singleton_class)`)
-/// and every method name a `def` inside the block defines.
+/// for a target that is not a plain constant — the reference's
+/// class-wildcard row, which reaches every receiver — e.g.
+/// `refine(C.singleton_class)`, or a `refine` in a `def M.x` /
+/// `define_singleton_method` context where the census charges the module
+/// but cannot name the target, upstream's targets-wildcard row) and every
+/// method name the walk can prove the block defines. `names_wildcard`
+/// marks a row whose names the census could not read (a non-`def`
+/// statement it does not classify, or the whole `*` row of a deferred
+/// `refine`): the owner counts as refining every name its target reaches
+/// (rigor-rs#446).
 #[derive(Clone, Debug, Default)]
-pub(crate) struct Refinement {
-    pub(crate) target: Option<String>,
-    pub(crate) names: Vec<String>,
+pub struct Refinement {
+    pub target: Option<String>,
+    pub names: Vec<String>,
+    pub names_wildcard: bool,
 }
 
 /// One QUALIFIED constant name written by a single file, in walk order, with the
@@ -452,6 +468,10 @@ pub struct Harvest {
     discovered_decls: Vec<String>,
     /// Pass 4a, in walk order.
     fold_defs: Vec<HarvestedFoldDef>,
+    /// rigor-rs#446 — the file holds a `refine` in a context the census
+    /// could not charge to a module (`refine_walk::scan_refinements`'s
+    /// `global_wildcard`) ⇒ [`SourceIndex::refinement_wildcard`].
+    targets_wildcard: bool,
 }
 
 /// The per-run source-class index + instance-class registry. Built once per file.
@@ -707,6 +727,14 @@ pub struct SourceIndex {
     /// `method_missing`, so a call no def answers may still run a body
     /// against its arguments. Read only to WIDEN.
     floor_method_missing: bool,
+    /// rigor-rs#446 — a `refine` sat in a context the census could not
+    /// charge to a module (`def` instance bodies, `define_method` blocks,
+    /// `def <other>.x`, lambdas, non-keeps-self blocks): the reference
+    /// records `{*:{*:[*]}}`, which makes EVERY module in an in-effect
+    /// list opaque — so every `using`/`refined` region in the project
+    /// declines every refinement-declined rule inside it. See
+    /// [`Self::refinement_global_wildcard`].
+    refinement_wildcard: bool,
     /// The project config lists `pre_eval:` files. The port does not load
     /// them, so a definition there (#2183: a block callee that may rebind)
     /// is invisible; read only to DECLINE. See [`Self::pre_eval_declared`].

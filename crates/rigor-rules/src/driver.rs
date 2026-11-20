@@ -511,36 +511,22 @@ pub fn analyze_with_source_and_folder(
     // `type_of` transparently here.
     ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut out);
 
-    // Upstream v0.4.2 (ADR-121 WD7, rigor#1796): after a `using M` whose
-    // module the project does not declare (a gem's, or one from outside the
-    // analysed paths), its refinements are unreadable and may redefine any
-    // method of any class, so every rule that asks `refined_method_in_effect?`
-    // / `refined_redefinition_in_effect?` declines in the rest of that lexical
-    // scope. The port models no refinement, so it declines on every such
-    // `using` and on nothing else.
-    let opaque = opaque_using_regions(ast, source, &scopes);
-    if !opaque.is_empty() {
-        out.retain(|d| {
-            !(REFINEMENT_DECLINED_RULES.contains(&d.rule_id)
-                && opaque.iter().any(|r| r.0 <= d.start_offset && d.start_offset < r.1))
-        });
-    }
-
-    // Upstream v0.4.3 (#1836, rigor #1752): under a `using M` of a PROJECT
-    // module, a refinement of `Object`, `Module`, `Class` (a class receiver
-    // only), `Kernel` or `BasicObject`, or of a module a class may extend,
-    // reaches a call on a class or module object, which then types `Dynamic`.
-    // The port reads the module's `refine(T) { def … }` names but models no
-    // refined dispatch, so it withholds `call.undefined-method` for such a
-    // name on a class-object receiver — and, as a superset for an instance
-    // receiver, for any name the module refines on any target (the reference
-    // answers those through the refinement too).
-    let refined = refined_using_regions(ast, source, &scopes);
-    if !refined.is_empty() {
-        out.retain(|d| {
-            d.rule_id != crate::CALL_UNDEFINED_METHOD
-                || !refinement_reaches(index, source, &refined, d)
-        });
+    // The refinement declines (ADR-121 WD7, rigor-rs#446). One pass now
+    // carries all four activation shapes the reference walks
+    // (`in_effect_refinements.rb`): a `using`/`refined` of an unreadable
+    // module (opaque), a `using` whose module set the walk cannot expand
+    // or a non-constant `using`/`refined` argument (`unknown_refinement`),
+    // a `using`/`refined` of declared modules (include-expanded), and a
+    // `refine` block's own activation — each over its lexical or literal
+    // span. Name rules (`refined_method_in_effect?` readers) decline where
+    // a module refining the name is in effect; the redefinition rules
+    // (`refined_redefinition_in_effect?` — `call.wrong-arity` and
+    // `call.argument-type-mismatch`) decline where the receiver's own
+    // lookup cannot be proven to answer first
+    // (`RefinedDispatch::OwnMethod`).
+    let regions = refinement_regions(ast, source, index, &scopes);
+    if !regions.is_empty() {
+        out.retain(|d| !refinement_declined(index, source, &regions, d));
     }
 
     // Upstream v0.4.2 (#1700/#1701): a `require "prime"` in any analysed file
@@ -628,136 +614,388 @@ const REFINEMENT_DECLINED_RULES: &[&str] = &[
     crate::FLOW_ALWAYS_RAISES,
 ];
 
-/// The roots every class object's lookup reaches (the reference's
-/// `ClassObject::TAIL_CLASSES`, `Class` handled apart: a module object is no
-/// `Class`).
-const CLASS_OBJECT_ROOTS: &[&str] = &["Object", "Module", "Kernel", "BasicObject"];
+/// One refinement activation region — the four kinds
+/// `in_effect_refinements.rb` records, each carrying what the decline
+/// questions need of it.
+enum RefineRegion {
+    /// `opaque_in?` — an unreadable module is in effect: a `using` of a
+    /// name neither the project nor core/stdlib declares, a `.refined`
+    /// argument of the same kind, an expansion that met one, a `refine`
+    /// block whose charged owner is the wildcard, or the project-wide
+    /// `{*:{*:[*]}}` row making every module opaque. Declines every
+    /// [`REFINEMENT_DECLINED_RULES`] diagnostic inside it.
+    Opaque,
+    /// `UNKNOWN` — `unknown_refinement` sits in the in-effect list: a
+    /// non-constant `using`/`refined` argument or an expansion the chain
+    /// walk could not finish. Declines the redefinition rules outright
+    /// and the call-name rules wherever
+    /// [`rigor_infer::SourceIndex::refining_modules`] answers.
+    Unknown,
+    /// A resolved module set — `using`/`refined` of declared modules,
+    /// include-closure expanded. Name rules decline where a module
+    /// refining the name meets the set; the redefinition rules ask
+    /// [`rigor_infer::SourceIndex::own_method_answers`] over the set's
+    /// rows for the name.
+    Modules(Vec<String>),
+    /// A `refine` block's own activation, charged to `module`: the block
+    /// is covered, so `refinement_active?` answers true — the name rules
+    /// decline wherever `refining_modules` answers at all, and the
+    /// redefinition rules ask `own_method_answers` over `module`'s rows.
+    RefineBlock(String),
+}
 
-/// Whether a refinement in effect at `d` (one of `regions`: `(start, end,
-/// qualified module)`) may answer its `call.undefined-method` — see the
-/// v0.4.3 decline above. Every unreadable term answers `true` (decline).
-fn refinement_reaches(
+/// The name rules — `refined_method_in_effect?` readers — and the fixed
+/// receiver class each asks with when the diagnostic carries none.
+fn name_rule_class(d: &Diagnostic) -> Option<Vec<(String, bool)>> {
+    match d.rule_id {
+        crate::CALL_UNRESOLVED_TOPLEVEL => Some(vec![("Object".to_string(), false)]),
+        crate::CALL_POSSIBLE_NIL_RECEIVER => Some(vec![("NilClass".to_string(), false)]),
+        crate::FLOW_ALWAYS_RAISES => Some(vec![("Integer".to_string(), false)]),
+        crate::CALL_UNDEFINED_METHOD => {
+            Some(receiver_arms(d))
+        }
+        _ => None,
+    }
+}
+
+/// `d.receiver_classes` as `(class, singleton?)` pairs.
+fn receiver_arms(d: &Diagnostic) -> Vec<(String, bool)> {
+    d.receiver_classes
+        .as_deref()
+        .unwrap_or(&[])
+        .iter()
+        .map(|c| match c.strip_prefix("singleton(").and_then(|s| s.strip_suffix(')')) {
+            Some(inner) => (inner.to_string(), true),
+            None => (c.clone(), false),
+        })
+        .collect()
+}
+
+/// Whether the refinement regions covering `d`'s site decline it — the
+/// `refined_method_in_effect?` / `refined_redefinition_in_effect?` reads.
+fn refinement_declined(
     index: &CoreIndex,
     source: &rigor_infer::SourceIndex,
-    regions: &[(usize, usize, String)],
+    regions: &[(usize, usize, RefineRegion)],
     d: &Diagnostic,
 ) -> bool {
+    if !REFINEMENT_DECLINED_RULES.contains(&d.rule_id) {
+        return false;
+    }
     let Some(method) = d.method_name.as_deref() else {
         return false;
     };
-    // `singleton(X)` — a lone class or module object; anything else (an
-    // instance, a union) takes the any-target superset.
-    let object = d
-        .receiver_type
-        .as_deref()
-        .and_then(|r| r.strip_prefix("singleton(")?.strip_suffix(')'))
-        .filter(|x| !x.contains(['|', '(', ')']));
-    let is_module = |prefix: &[String], name: &str| -> Option<bool> {
-        match source.resolve_declared_constant_at(prefix, name) {
-            Some(q) => source.project_declares_module(&q),
-            None if index.is_module(name) || index.is_qualified_module(name) => Some(true),
-            None if index.knows_class(name) || index.knows_qualified_class(name) => Some(false),
-            None => None,
+    // The redefinition rules (`wrong-arity`, `argument-type-mismatch`) vs
+    // the call-name readers. `argument-type-mismatch`'s singleton flag is
+    // lost, so its receiver is read as instance — the decline direction.
+    enum Ask<'a> {
+        /// `refined_method_in_effect?` per receiver arm.
+        Names(&'a [(String, bool)]),
+        /// `refined_redefinition_in_effect?` on one receiver class.
+        Redefinition(String),
+    }
+    let arms_storage;
+    let ask = match d.rule_id {
+        crate::CALL_WRONG_ARITY | crate::CALL_ARGUMENT_TYPE_MISMATCH => {
+            let Some((class, _)) = receiver_arms(d).into_iter().next() else {
+                return false;
+            };
+            Ask::Redefinition(class)
+        }
+        _ => {
+            let Some(classes) = name_rule_class(d) else {
+                return false;
+            };
+            arms_storage = classes;
+            Ask::Names(&arms_storage)
         }
     };
+
+    let module_set_opaque = |modules: &[String]| {
+        source.refinement_global_wildcard()
+            || modules.iter().any(|m| {
+                source
+                    .refinements_of(m)
+                    .iter()
+                    .any(|r| r.target.is_none() && r.names_wildcard)
+            })
+    };
+    // `raw_targets` for the in-effect `modules` — the target spellings of
+    // every row recording `method` (a wildcard/names-wildcard row's `*`
+    // makes `own_method_answers` decline outright).
+    let raw_targets = |modules: &[String]| -> Vec<String> {
+        let mut targets = Vec::new();
+        for m in modules {
+            for r in source.refinements_of(m) {
+                if r.names_wildcard || r.names.iter().any(|n| n == method) {
+                    targets.push(r.target.clone().unwrap_or_else(|| "*".to_string()));
+                }
+            }
+        }
+        targets
+    };
+
     regions
         .iter()
         .filter(|(start, end, _)| *start <= d.start_offset && d.start_offset < *end)
-        .any(|(_, _, module)| {
-            let prefix: Vec<String> = module.split("::").map(str::to_string).collect();
-            source.refinements_of(module).into_iter().any(|(target, names)| {
-                if !names.iter().any(|n| n == method) {
-                    return false;
+        .any(|(_, _, region)| match region {
+            RefineRegion::Opaque => true,
+            RefineRegion::Unknown => match &ask {
+                Ask::Redefinition(_) => true,
+                Ask::Names(classes) => classes.iter().any(|(class, singleton)| {
+                    !source
+                        .refining_modules(index, class, method, *singleton)
+                        .is_empty()
+                }),
+            },
+            RefineRegion::Modules(modules) => {
+                if module_set_opaque(modules) {
+                    return true;
                 }
-                let Some(x) = object else { return true };
-                match target {
-                    None => true,
-                    Some(t) if CLASS_OBJECT_ROOTS.contains(&t) => true,
-                    Some("Class") => is_module(&[], x) != Some(true),
-                    // A module the class object may extend; an unknown
-                    // constant may be one.
-                    Some(t) => is_module(&prefix, t) != Some(false),
+                match &ask {
+                    Ask::Names(classes) => classes.iter().any(|(class, singleton)| {
+                        source
+                            .refining_modules(index, class, method, *singleton)
+                            .iter()
+                            .any(|m| modules.contains(m))
+                    }),
+                    Ask::Redefinition(class) => {
+                        let raw = raw_targets(modules);
+                        !raw.is_empty()
+                            && !source.own_method_answers(index, class, method, &raw)
+                    }
                 }
-            })
+            }
+            RefineRegion::RefineBlock(owner) => {
+                if module_set_opaque(std::slice::from_ref(owner)) {
+                    return true;
+                }
+                match &ask {
+                    // `refine_block && covers` — the block is active
+                    // regardless of membership, so any refining module
+                    // declines the name rules here.
+                    Ask::Names(classes) => classes.iter().any(|(class, singleton)| {
+                        !source
+                            .refining_modules(index, class, method, *singleton)
+                            .is_empty()
+                    }),
+                    Ask::Redefinition(class) => {
+                        let raw = raw_targets(std::slice::from_ref(owner));
+                        !raw.is_empty()
+                            && !source.own_method_answers(index, class, method, &raw)
+                    }
+                }
+            }
         })
 }
 
-/// The byte regions a PROJECT module's `using` is in effect over, with the
-/// module's qualified name — the declared half of [`opaque_using_regions`]'s
-/// scan (same lexical extent).
-fn refined_using_regions(
+/// The refinement activation regions of `ast` — the four kinds of
+/// [`RefineRegion`], collected from `using` calls, `…refined(…)` chains
+/// on proc literals, and the census walk's refine-block activations.
+fn refinement_regions(
     ast: &LoweredAst,
     source: &rigor_infer::SourceIndex,
+    index: &CoreIndex,
     scopes: &[(rigor_parse::Span, Vec<String>)],
-) -> Vec<(usize, usize, String)> {
+) -> Vec<(usize, usize, RefineRegion)> {
     let file_end = ast.iter().map(|(_, n)| n.span().1).max().unwrap_or(0);
-    let mut out = Vec::new();
+    let def_spans = rigor_infer::method_body_spans(ast);
+    let in_def = |off: usize| def_spans.iter().any(|s| s.0 <= off && off < s.1);
+    let enclosing = |span: rigor_parse::Span| -> (usize, &[String]) {
+        scopes
+            .iter()
+            .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
+            .min_by_key(|(s, _)| s.1 - s.0)
+            .map(|(s, p)| (s.1, p.as_slice()))
+            .unwrap_or((file_end, &[]))
+    };
+    let mut out: Vec<(usize, usize, RefineRegion)> = Vec::new();
     for (_, n) in ast.iter() {
-        let Node::Call { receiver: None, method, args, .. } = n else {
-            continue;
-        };
-        if method != "using" || args.len() != 1 {
-            continue;
-        }
-        let Node::ConstantRead { name, dynamic_base: false, self_anchored: false, rooted, .. } =
-            ast.get(args[0])
+        let Node::Call {
+            receiver,
+            method,
+            args,
+            ..
+        } = n
         else {
             continue;
         };
         let span = n.span();
-        let enclosing = scopes
-            .iter()
-            .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
-            .min_by_key(|(s, _)| s.1 - s.0);
-        let (end, prefix): (usize, &[String]) = match enclosing {
-            Some((s, p)) => (s.1, p.as_slice()),
-            None => (file_end, &[]),
-        };
-        let raw = if *rooted { format!("::{name}") } else { name.to_string() };
-        if let Some(module) = source.resolve_declared_constant_at(prefix, &raw) {
-            out.push((span.1, end, module));
+        let self_call = matches!(
+            receiver.map(|r| ast.get(r)),
+            None | Some(Node::SelfExpr { .. })
+        );
+        if method == "using" && self_call && args.len() == 1 && !in_def(span.0) {
+            let (end, prefix) = enclosing(span);
+            match ast.get(args[0]) {
+                Node::ConstantRead {
+                    name,
+                    dynamic_base: false,
+                    self_anchored: false,
+                    rooted,
+                    ..
+                } => {
+                    let raw = if *rooted {
+                        format!("::{name}")
+                    } else {
+                        name.to_string()
+                    };
+                    match source.resolve_declared_constant_at(prefix, &raw) {
+                        Some(module) => {
+                            out.push((span.1, end, expansion_region(source, index, &module)));
+                        }
+                        // A core/stdlib module refines nothing the walk
+                        // can see; its name still joins the in-effect
+                        // list (an activated module is never opaque).
+                        None if index.is_module(name)
+                            || index.is_qualified_module(name)
+                            || index.knows_class(name)
+                            || index.knows_qualified_class(name) =>
+                        {
+                            out.push((
+                                span.1,
+                                end,
+                                RefineRegion::Modules(vec![name.to_string()]),
+                            ));
+                        }
+                        None => {
+                            out.push((span.1, end, RefineRegion::Opaque));
+                        }
+                    }
+                }
+                Node::ConstantRead { .. } => {
+                    // A `self::` / dynamic-base path names nothing — the
+                    // unnameable spelling enters the list and is opaque.
+                    out.push((span.1, end, RefineRegion::Opaque));
+                }
+                // A non-constant `using` argument records the
+                // `unknown_refinement` activation — file-wide.
+                _ => out.push((0, file_end, RefineRegion::Unknown)),
+            }
+            continue;
+        }
+        if method == "refined" {
+            let Some(lit_span) = refined_literal_span(ast, *receiver) else {
+                continue;
+            };
+            let (_, prefix) = enclosing(span);
+            for &arg in args {
+                match ast.get(arg) {
+                    Node::ConstantRead {
+                        name,
+                        dynamic_base: false,
+                        self_anchored: false,
+                        rooted,
+                        ..
+                    } => {
+                        let raw = if *rooted {
+                            format!("::{name}")
+                        } else {
+                            name.to_string()
+                        };
+                        match source.resolve_declared_constant_at(prefix, &raw) {
+                            Some(module) => {
+                                out.push((
+                                    lit_span.0,
+                                    lit_span.1,
+                                    expansion_region(source, index, &module),
+                                ));
+                            }
+                            None if index.is_module(name)
+                                || index.is_qualified_module(name)
+                                || index.knows_class(name)
+                                || index.knows_qualified_class(name) =>
+                            {
+                                out.push((
+                                    lit_span.0,
+                                    lit_span.1,
+                                    RefineRegion::Modules(vec![name.to_string()]),
+                                ));
+                            }
+                            None => {
+                                out.push((lit_span.0, lit_span.1, RefineRegion::Opaque));
+                            }
+                        }
+                    }
+                    Node::ConstantRead { .. } => {
+                        out.push((lit_span.0, lit_span.1, RefineRegion::Opaque));
+                    }
+                    _ => out.push((lit_span.0, lit_span.1, RefineRegion::Unknown)),
+                }
+            }
+            continue;
+        }
+    }
+    for (span, owner) in rigor_infer::scan_refinements(ast).block_regions {
+        match owner {
+            Some(module) => out.push((span.0, span.1, RefineRegion::RefineBlock(module))),
+            // A wildcard-charged `refine` block is opaque inside itself.
+            None => out.push((span.0, span.1, RefineRegion::Opaque)),
         }
     }
     out
 }
 
-/// The byte regions an OPAQUE `using` is in effect over: from the end of a
-/// receiverless `using C` whose constant `C` the project does not declare
-/// (read in the call's lexical scope) to the end of the innermost enclosing
-/// class/module body, or of the file. A non-constant argument is opaque too.
-fn opaque_using_regions(
-    ast: &LoweredAst,
+/// `activated_modules`' outcome as a [`RefineRegion`].
+fn expansion_region(
     source: &rigor_infer::SourceIndex,
-    scopes: &[(rigor_parse::Span, Vec<String>)],
-) -> Vec<(usize, usize)> {
-    let file_end = ast.iter().map(|(_, n)| n.span().1).max().unwrap_or(0);
-    let mut out = Vec::new();
-    for (_, n) in ast.iter() {
-        let Node::Call { receiver: None, method, args, .. } = n else {
-            continue;
-        };
-        if method != "using" || args.len() != 1 {
-            continue;
-        }
-        let span = n.span();
-        let enclosing = scopes
-            .iter()
-            .filter(|(s, _)| s.0 <= span.0 && span.1 <= s.1)
-            .min_by_key(|(s, _)| s.1 - s.0);
-        let (end, prefix): (usize, &[String]) = match enclosing {
-            Some((s, p)) => (s.1, p.as_slice()),
-            None => (file_end, &[]),
-        };
-        let declared = match ast.get(args[0]) {
-            Node::ConstantRead { name, dynamic_base: false, self_anchored: false, rooted, .. } => {
-                let raw = if *rooted { format!("::{name}") } else { name.to_string() };
-                source.declares_constant_at(prefix, &raw)
-            }
-            _ => false,
-        };
-        if !declared {
-            out.push((span.1, end));
+    index: &CoreIndex,
+    module: &str,
+) -> RefineRegion {
+    match source.expand_using(index, module) {
+        rigor_infer::UsingExpansion::Modules(modules) => RefineRegion::Modules(modules),
+        rigor_infer::UsingExpansion::Unknown => RefineRegion::Unknown,
+        rigor_infer::UsingExpansion::Opaque => RefineRegion::Opaque,
+    }
+}
+
+/// `ProcLiterals.refinable_literal?` + `chain` — the span a `.refined` /
+/// `.dup` / `.clone` chain's literal base defines, when it is one: the
+/// `proc { … }` / `lambda { … }` / `-> { … }` / `Proc.new { … }` block.
+fn refined_literal_span(
+    ast: &LoweredAst,
+    receiver: Option<rigor_parse::NodeId>,
+) -> Option<rigor_parse::Span> {
+    let mut cur = receiver?;
+    loop {
+        match ast.get(cur) {
+            Node::Call {
+                receiver,
+                method,
+                args,
+                block_span,
+                ..
+            } => match method.as_str() {
+                "refined" => {
+                    cur = (*receiver)?;
+                }
+                "dup" | "clone" if args.is_empty() && block_span.is_none() => {
+                    cur = (*receiver)?;
+                }
+                "proc" | "lambda" if block_span.is_some() => {
+                    let recv_ok = match receiver.map(|r| ast.get(r)) {
+                        None => true,
+                        Some(Node::ConstantRead { name, .. }) => name == "Kernel",
+                        _ => false,
+                    };
+                    if recv_ok {
+                        return Some(block_span.unwrap());
+                    }
+                    return None;
+                }
+                "new" if block_span.is_some() => {
+                    if matches!(
+                        receiver.map(|r| ast.get(r)),
+                        Some(Node::ConstantRead { name, .. }) if name == "Proc"
+                    ) {
+                        return Some(block_span.unwrap());
+                    }
+                    return None;
+                }
+                _ => return None,
+            },
+            Node::Lambda { span, .. } => return Some(*span),
+            _ => return None,
         }
     }
-    out
 }

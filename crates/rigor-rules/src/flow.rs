@@ -80,6 +80,8 @@ pub(crate) fn check_always_truthy(
         severity,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     })
 }
@@ -181,6 +183,8 @@ pub(crate) fn check_unreachable_branch(
         severity,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     })
 }
@@ -263,6 +267,8 @@ pub(crate) fn check_always_raises(
         // Not a dispatch-typo rule; the receiver render / method fields are
         // carried for parity with the other call-family diagnostics.
         receiver_type: Some("Integer".to_string()),
+        receiver_classes: None,
+
         method_name: Some(method.to_string()),
     })
 }
@@ -444,6 +450,8 @@ pub(crate) fn dead_assignments_in_def(
             severity,
             source_family: "builtin",
             receiver_type: None,
+            receiver_classes: None,
+
             method_name: None,
         });
     }
@@ -522,6 +530,8 @@ pub(crate) fn duplicate_hash_key_diagnostics(ast: &LoweredAst, out: &mut Vec<Dia
                     severity: Severity::Warning,
                     source_family: "builtin",
                     receiver_type: None,
+                    receiver_classes: None,
+
                     method_name: None,
                 }),
                 None => {
@@ -572,6 +582,8 @@ fn gather_returns_in_ensure(ast: &LoweredAst, id: NodeId, out: &mut Vec<Diagnost
                 severity: Severity::Warning,
                 source_family: "builtin",
                 receiver_type: None,
+                receiver_classes: None,
+
                 method_name: None,
             });
             // The reference falls through to descend the return's children.

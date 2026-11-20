@@ -114,6 +114,7 @@ pub(crate) fn check_wrong_arity(
         severity,
         source_family: "builtin",
         receiver_type: Some(class_name.to_string()),
+receiver_classes: Some(vec![class_name.to_string()]),
         method_name: Some(method.to_string()),
     })
 }
@@ -872,7 +873,8 @@ pub(crate) fn check_argument_type_mismatch(
         message,
         severity,
         source_family: "builtin",
-        receiver_type: Some(class_name),
+        receiver_type: Some(class_name.clone()),
+receiver_classes: Some(vec![class_name]),
         method_name: Some(method.to_string()),
     })
 }

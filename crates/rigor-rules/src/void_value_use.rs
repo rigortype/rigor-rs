@@ -120,6 +120,8 @@ fn check_void_value_use(
         severity: Severity::Warning,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: Some(method),
     });
 }
