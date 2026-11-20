@@ -2216,17 +2216,16 @@ impl<'i> Typer<'i> {
         if name.is_empty() || *dynamic_base {
             return None;
         }
-        if *rooted || name.starts_with("::") {
+        if *rooted {
             // `lexical_class_name`'s rooted arm keeps the de-rooted spelling
             // UN-WALKED — `when ::Stat` inside `class File` names top-level
-            // `Stat`, never `File::Stat` (rigor-rs#672). The shadow check
-            // reads the top level only: a `File::Stat` declaration does not
-            // shadow a rooted `::Stat`.
-            let bare = name.trim_start_matches(':');
-            if self.source.constant_shadowed(bare, &[]) {
+            // `Stat`, never `File::Stat` (rigor-rs#672). Only a top-level
+            // project CLASS shadows it: `knows_class` (the
+            // `discovered_classes` analogue) keys classes, not const writes.
+            if self.source.knows_class(name) {
                 return None;
             }
-            return Some(bare.to_string());
+            return Some(name.to_string());
         }
         let prefix = self.enclosing_prefix(use_span);
         if self.source.constant_shadowed(name, prefix) {
@@ -2253,18 +2252,24 @@ impl<'i> Typer<'i> {
         if name.is_empty() || *dynamic_base {
             return None;
         }
-        if *rooted || name.starts_with("::") {
+        if *rooted {
             // `rooted_class_predicate_name` (upstream #614, rigor-rs#672): a
             // `::C` operand names the TOP level only — `is_a?(::Stat)` inside
             // `class File` never narrows to `File::Stat`. It answers `C` when
-            // an authoritative surface knows the top-level class and DECLINES
-            // outright (nil → no fact) when nothing does; a top-level project
-            // declaration takes the same assert-only `mintable: false` the
-            // unrooted arm gives lexically visible shadows.
-            let bare = name.trim_start_matches(':');
-            let shadowed = self.source.constant_shadowed(bare, &[]);
-            if shadowed || self.constant_names_a_known_class(bare) {
-                return Some((bare.to_string(), !shadowed));
+            // `class_known_to_scope?` holds — the RBS registry / project
+            // `sig/` (`constant_names_a_known_class`) or an in-source
+            // top-level class (`knows_class`, the `discovered_classes`
+            // analogue) — and DECLINES outright (nil → no fact) when nothing
+            // owns it. A project class takes the same assert-only
+            // `mintable: false` the unrooted arm gives lexical shadows.
+            // `class_known_to_scope?`: RBS / project `sig/` OR an in-source
+            // class — `class`/`module` (`knows_class`) or a meta-new write
+            // (`Foo = Struct.new`, the rest of `discovered_classes`).
+            if self.source.knows_class(name) || self.source.knows_meta_new_class(name) {
+                return Some((name.to_string(), false));
+            }
+            if self.constant_names_a_known_class(name) {
+                return Some((name.to_string(), true));
             }
             return None;
         }
@@ -2294,19 +2299,15 @@ impl<'i> Typer<'i> {
         // `rooted` is `Node::ConstantRead`'s flag — the lowering renders `::C`
         // UNROOTED, so the `starts_with` sniff the old code relied on was dead
         // and a rooted operand walked the lexical ladder (rigor-rs#672).
-        let (bare, absolute) = match name.strip_prefix("::") {
-            Some(rest) => (rest, true),
-            None => (name, rooted),
-        };
-        if !absolute {
+        if !rooted {
             for depth in (1..=prefix.len()).rev() {
-                let cand = format!("{}::{bare}", prefix[..depth].join("::"));
+                let cand = format!("{}::{name}", prefix[..depth].join("::"));
                 if self.constant_names_a_known_class(&cand) {
                     return cand;
                 }
             }
         }
-        bare.to_string()
+        name.to_string()
     }
 
     /// Whether `qname` names a class/module some AUTHORITATIVE surface knows —

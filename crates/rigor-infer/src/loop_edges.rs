@@ -666,7 +666,14 @@ impl<'i> Typer<'i> {
                 Node::ConstantRead { name, dynamic_base: false, rooted: true, .. }
                     if !name.is_empty() =>
                 {
-                    (name.trim_start_matches(':').to_string(), true)
+                    // Unorderable: a rooted `===`/`when` spelling that
+                    // `guard_constant` declined is not a known top-level
+                    // class. Minting it (`mintable: true`) lets
+                    // `class_ordering` treat the leaf as a nested RBS class
+                    // (`Stat` → `File::Stat`) and prove a false Disjoint,
+                    // so `x = [1]; case x; when ::Stat; …; end; x.foo`
+                    // fired after the guard (rigor-rs#672).
+                    (name.to_string(), false)
                 }
                 _ => return Edge::Other,
             },

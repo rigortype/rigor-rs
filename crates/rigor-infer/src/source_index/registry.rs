@@ -176,6 +176,14 @@ impl SourceIndex {
         self.classes.contains_key(name)
     }
 
+    /// Whether the project assigns `name` a meta-new class (`Foo =
+    /// Struct.new` / `Class.new` / `Module.new` / `Data.define`) — the
+    /// `discovered_classes` half of `class_known_to_scope?` that is not a
+    /// `class`/`module` declaration (rigor-rs#672).
+    pub(crate) fn knows_meta_new_class(&self, name: &str) -> bool {
+        self.meta_new_classes.contains(name)
+    }
+
     /// The DISCOVERED written superclass (last path component) of a source class,
     /// or `None` when the name is unknown OR is a source class/module WITHOUT a
     /// `class Foo < Bar` superclass (a bare `class Foo`/`module Foo` — the two are

@@ -21,6 +21,20 @@
       "column": 9,
       "severity": "error",
       "message": "undefined method `frobnicate_r6' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 67,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r9' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r12' for [1]"
     }
   ]
 }

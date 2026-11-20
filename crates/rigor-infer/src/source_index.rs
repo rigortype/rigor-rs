@@ -319,6 +319,11 @@ pub(crate) struct HarvestedConstWrite {
     /// literal). A repeat write never re-harvests, exactly as before.
     lit: Option<ConstLit>,
     writes: usize,
+    /// `meta_new_constant_rvalue?` — any write of this constant binds a class
+    /// (`Class.new`/`Module.new`/`Struct.new`/`Data.define`, rigor-rs#672).
+    /// Feeds `SourceIndex::meta_new_classes`, the `discovered_classes`
+    /// analogue `class_known_to_scope?` consults for `is_a?(::K)`.
+    meta_new: bool,
 }
 
 /// One project `def` site whose interprocedural literal-tail return may fold,
@@ -571,6 +576,13 @@ pub struct SourceIndex {
     /// globals, and a project that names one anywhere is reason enough to
     /// decline. Backs [`Self::project_writes_constant`].
     project_constant_write_names: HashSet<String>,
+    /// rigor-rs#672: qualified names the project assigns a meta-new class to
+    /// (`Foo = Struct.new` ⇒ `"Foo"`, `module M; Point = Data.define` ⇒
+    /// `"M::Point"`) — the `discovered_classes` half of the reference's
+    /// `class_known_to_scope?` that is not `class`/`module` declarations.
+    /// `is_a?(::Foo)` inside `module M` may NOT match `"M::Point"`: the
+    /// rooted operand names the top level only.
+    meta_new_classes: HashSet<String>,
     /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
     /// containing-namespace segment vectors keyed by the constant's last segment
     /// (`module Gitlab; module Database; module Partitioning; module Time` keys

@@ -474,6 +474,11 @@ impl SourceIndex {
                     .extend(indices.iter().copied());
             }
             idx.project_constant_write_names.extend(h.constant_write_bare_names.iter().cloned());
+            for w in &h.constant_writes {
+                if w.meta_new {
+                    idx.meta_new_classes.insert(w.qualified.clone());
+                }
+            }
         }
         // `subtract_def_methods` (`finalize_def_index`): cross-file method
         // suppression is for the project's OWN accessors/aliases — NOT plain

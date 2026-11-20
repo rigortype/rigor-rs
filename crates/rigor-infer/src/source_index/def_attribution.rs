@@ -956,7 +956,7 @@ fn collapse_object_owner(prefix: Vec<String>) -> Vec<String> {
 /// the bare constant receiver — a dynamic (`expr::Class`) or `self::`-rooted
 /// base does not name the factory, matching the reference's constant-receiver
 /// requirement.
-fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
+pub(crate) fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
     let Some(recv) = receiver else {
         return false;
     };
@@ -980,9 +980,43 @@ fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) ->
 /// `.freeze` tail (`K = Class.new { }.freeze.freeze`). Returns the factory
 /// CALL's id so the arm can split receiver/args (enclosing context) from the
 /// block (the written owner).
-fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Option<NodeId> {
-    // `K = K || <factory>` — an `||` whose left operand reads the written
-    // constant.
+fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, value: NodeId) -> Option<NodeId> {
+    let value = meta_new_unwrap(ast, write_name, value);
+    let Node::Call {
+        receiver,
+        method,
+        block_span,
+        ..
+    } = ast.get(value)
+    else {
+        return None;
+    };
+    if block_span.is_some() && is_meta_new_call(ast, *receiver, method) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// `meta_new_constant_rvalue?` — whether `K = <rvalue>` binds a class at all
+/// (rigor-rs#672): the four factory forms behind the same `K = K || …` and
+/// `.freeze` unwraps [`meta_new_rvalue`] applies, WITHOUT its block
+/// requirement — the reference registers the constant in `discovered_classes`
+/// for a block-less `K = Struct.new(:x)` too
+/// (`record_class_new_constant_decl`, `scope_indexer.rb:13196`), and
+/// `class_known_to_scope?` consults that table for `is_a?(::K)` operands.
+pub(crate) fn meta_new_class_rvalue(ast: &LoweredAst, write_name: &str, value: NodeId) -> bool {
+    match ast.get(meta_new_unwrap(ast, write_name, value)) {
+        Node::Call {
+            receiver, method, ..
+        } => is_meta_new_call(ast, *receiver, method),
+        _ => false,
+    }
+}
+
+/// The `K = K || <factory>` and repeated receiverful `.freeze` tail unwraps
+/// both meta-new recognisers share.
+fn meta_new_unwrap(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> NodeId {
     if let Node::Logical {
         left,
         right,
@@ -1002,8 +1036,6 @@ fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Opt
             }
         }
     }
-    // A `.freeze` tail, repeated — only a receiverful, argument-less,
-    // block-less call unwraps.
     loop {
         match ast.get(value) {
             Node::Call {
@@ -1018,20 +1050,7 @@ fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Opt
             _ => break,
         }
     }
-    let Node::Call {
-        receiver,
-        method,
-        block_span,
-        ..
-    } = ast.get(value)
-    else {
-        return None;
-    };
-    if block_span.is_some() && is_meta_new_call(ast, *receiver, method) {
-        Some(value)
-    } else {
-        None
-    }
+    value
 }
 
 /// `qualify` for an already-segmented write target: `K =` inside `Outer`

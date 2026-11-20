@@ -226,8 +226,14 @@ pub(crate) fn collect_literal_constants(
         }
         Node::ConstantWrite { name, value, .. } => {
             let qualified = qualify(prefix, name);
+            let meta_new = super::meta_new_class_rvalue(ast, name, *value);
             match seen.get(&qualified) {
-                Some(&at) => out[at].writes += 1,
+                Some(&at) => {
+                    out[at].writes += 1;
+                    // A repeat `K = <factory>` write still makes `K` a class
+                    // (rigor-rs#672).
+                    out[at].meta_new |= meta_new;
+                }
                 None => {
                     // Issue #540: a constant this file MUTATES is harvested
                     // Dynamic-wrapped, so a read no longer folds through the
@@ -244,6 +250,7 @@ pub(crate) fn collect_literal_constants(
                         namespace: prefix.to_vec(),
                         lit,
                         writes: 1,
+                        meta_new,
                     });
                 }
             }

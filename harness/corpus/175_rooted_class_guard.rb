@@ -53,3 +53,42 @@ if ::NoSuchZz === h
 else
   h[:a].frobnicate_r7
 end
+
+# Review (PR #708): a rooted operand naming an ASSIGNED class —
+# `discovered_classes` counts `K = Struct.new`/`Class.new`/`Data.define`,
+# so `is_a?(::Foo)` narrows rather than declining (only `foo_b` fires).
+Foo = Struct.new(:a)
+
+def rooted_assigned_isa
+  x = [1]
+  if x.is_a?(::Foo)
+    x.frobnicate_r8
+  else
+    x.frobnicate_r9
+  end
+  x.frobnicate_r10
+end
+
+# … and a rooted `===`/`when` over a SHAPED carrier whose bare name collides
+# with a nested RBS leaf (`Stat` vs `File::Stat`): the operand is
+# unorderable, so only the else arm fires — the call after stays silent.
+class File
+  def rooted_when_shaped
+    x = [1]
+    case x
+    when ::Stat
+      x.frobnicate_r11
+    else
+      x.frobnicate_r12
+    end
+    x.frobnicate_r13
+  end
+
+  def rooted_caseeq_shaped
+    x = [1]
+    if ::Stat === x
+      x.frobnicate_r14
+    end
+    x.frobnicate_r15
+  end
+end
