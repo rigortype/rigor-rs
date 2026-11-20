@@ -1724,6 +1724,113 @@ fn per_element_map_fold_declines_unmodelled_writes() {
     }
 }
 
+// --- rigor-rs#427: a block chain's answers store in the env memo ---------
+//
+// Every `.map`-chain node's answer is a deep `Tuple` that embeds interner
+// ids. `type_of_env_memo` is scoped to the interner's uid, so those answers
+// STORE and a later driver visit answers from the entry; before that was
+// understood, the `type_is_interner_free` store gate dropped every such
+// answer, and each driver visit (the rules walk every `Call` node)
+// re-typed its whole receiver suffix — and since a block call types its
+// receiver TWICE (the #479 literal-concat gate, then `type_block_call`),
+// the work DOUBLED per link: exponential in the chain (2^k − 1 events for
+// the k-th link's visit), and the issue's `.map` repro (100 links ×
+// 9000-deep blocks, 2^100 typing work) never finished.
+
+/// `[1]` + `blocks` × `.map { |y| [[…[y]…]] }` (each wrap `depth` deep) +
+/// `.foo` — the rigor-rs#427 `.map` repro at reference-survivable sizes.
+fn map_chain_src(blocks: usize, depth: usize) -> Vec<u8> {
+    let block = format!(".map {{ |y| {}y{} }}", "[".repeat(depth), "]".repeat(depth));
+    format!("[1]{}.foo\n", block.repeat(blocks)).into_bytes()
+}
+
+#[test]
+fn block_chain_answers_store_in_the_env_memo() {
+    let ast = lower_src(&map_chain_src(3, 2));
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    // Type every call node the way the driver does: one visit per `Call`.
+    let calls: Vec<_> = ast
+        .iter()
+        .filter(|(_, n)| matches!(n, Node::Call { .. }))
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(calls.len(), 4, "three map links plus the trailing .foo");
+    let env = typer.build_toplevel_env(&ast, &mut i);
+    for &id in &calls {
+        typer.type_of(&ast, id, &env, &mut i);
+    }
+    // The interner-bound Tuple answers must have STORED: an entry per map
+    // link (a 0 would mean every later visit re-types its whole suffix).
+    for (id, n) in ast.iter() {
+        if matches!(n, Node::Call { method, .. } if method == "map") {
+            assert!(
+                typer.reach_memo.borrow().env_type_entry_count(id) > 0,
+                "map node {id:?} must store its interner-bound answer"
+            );
+        }
+    }
+    // A depth-`d` wrap binds `y` to the receiver's ELEMENT — one level
+    // shallower than the link itself — so each link adds exactly `d`
+    // levels: 3 links of a depth-2 wrap over `[1]` nest `Tuple` exactly
+    // 1 + 3 × 2 = 7 deep down to the folded `1`. The memo must not move
+    // that answer. (Lowering pushes children before parents, so the
+    // OUTERMOST map — the one whose answer nests deepest — is the
+    // next-to-last call, just before the trailing `.foo`.)
+    const LINKS: usize = 3;
+    const DEPTH: usize = 2;
+    let outer = calls[calls.len() - 2];
+    let ty = typer.type_of(&ast, outer, &env, &mut i);
+    let mut cur = ty;
+    for _ in 0..(1 + LINKS * DEPTH) {
+        let Type::Tuple(elems) = i.get(cur).clone() else {
+            panic!(
+                "depth {} of Tuple, got {}",
+                1 + LINKS * DEPTH,
+                rigor_types::describe(&i, cur)
+            );
+        };
+        assert_eq!(elems.len(), 1, "each wrap nests exactly one element");
+        cur = elems[0];
+    }
+    assert_eq!(i.get(cur), &Type::Constant(Scalar::Int(1)));
+    // A memo hit re-interns the stored carrier under the SAME interner —
+    // a dedup hit — so a re-visit answers the identical TypeId.
+    assert_eq!(typer.type_of(&ast, outer, &env, &mut i), ty);
+}
+
+#[test]
+fn block_chain_types_once_per_driver_visit() {
+    // Small enough that an unmemoized regression FAILS the assertion in
+    // under a second rather than hanging CI: at 10 links the old store
+    // gate costs ~2^11 events (the 8-link measurement below was 757).
+    const LINKS: usize = 10;
+    let ast = lower_src(&map_chain_src(LINKS, 2));
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_env(&ast, &mut i);
+    let calls: Vec<_> = ast
+        .iter()
+        .filter(|(_, n)| matches!(n, Node::Call { .. }))
+        .map(|(id, _)| id)
+        .collect();
+    assert_eq!(calls.len(), LINKS + 1);
+    crate::block_call::reset_block_call_events();
+    for &id in &calls {
+        typer.type_of(&ast, id, &env, &mut i);
+    }
+    let events = crate::block_call::block_call_events();
+    assert!(
+        events <= LINKS as u64 + 2,
+        "each link must type once ({events} block-call events for {LINKS} links; \
+         unmemoized, the literal-concat gate types the receiver once and \
+         `type_block_call` once more, so each visit DOUBLES — an 8-link \
+         chain already costs 757 events, 2^k - 1 per visit)"
+    );
+}
+
 #[test]
 fn bignum_literal_pins_its_exact_value() {
     // rigor-rs#194 — a Bignum types `Constant(BigInt)` carrying its decimal

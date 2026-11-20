@@ -912,3 +912,35 @@ fn lsp_falls_back_to_the_cwd_and_discloses_when_the_named_root_is_unusable() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// rigor-rs#427 — the `.map` repro's LSP row. A didOpen of a deep block chain
+// must publish its diagnostics and leave the server alive enough to shut
+// down cleanly. The chain's every answer is an interner-bound deep `Tuple`;
+// before the env memo stored those, each driver visit re-typed the whole
+// receiver suffix — and a block call types its receiver twice, so the
+// work DOUBLED per link (exponential in the links), and the repro could
+// not finish. The 25×25 shape here keeps the committed test fast while
+// staying well past the depth any real file reaches (the corpus deepest
+// is 40).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn lsp_survives_didopen_of_a_deep_map_chain() {
+    let links = 25;
+    let depth = 25;
+    let block = format!(".map {{ |y| {}y{} }}", "[".repeat(depth), "]".repeat(depth));
+    let text = format!("[1]{}.zzz\n", block.repeat(links));
+    let project = TempDir::new("lsp-map-chain");
+    fs::write(project.path().join("chain.rb"), &text).unwrap();
+    let (findings, _) = lsp_session(project.path(), project.path(), serde_json::json!({}), "chain.rb", &text);
+    assert_eq!(findings.len(), 1, "the chain's undefined method: {findings:?}");
+    assert!(
+        findings[0].4.contains("undefined method `zzz'"),
+        "the finding is the chain's own: {:?}",
+        findings[0]
+    );
+    // The `zzz` receiver renders the folded 625-level Tuple — enough nesting
+    // that an engine that re-types the suffix per visit visibly hangs here.
+    assert!(findings[0].4.matches('[').count() > 100);
+}
