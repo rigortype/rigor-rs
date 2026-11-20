@@ -58,6 +58,31 @@ enum FoldMatch {
     At(Vec<usize>),
 }
 
+// `type_block_call` entries on THIS analysis thread — the rigor-rs#427
+// chain pin: a driver visit per chain node must not re-type the receiver
+// suffix, so a chain of N `.map` links costs N events, not N(N+1)/2.
+// Thread-local because the analysis is single-threaded per file while the
+// test harness runs tests in parallel on one global binary. (A plain
+// comment: a doc comment on a macro item is `unused_doc_comment`, which
+// CI's `-D warnings` turns fatal.)
+#[cfg(test)]
+thread_local! {
+    static BLOCK_CALL_EVENTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Test seam for [`BLOCK_CALL_EVENTS`] — reset before driving the driver
+/// pattern over an AST.
+#[cfg(test)]
+pub(crate) fn reset_block_call_events() {
+    BLOCK_CALL_EVENTS.with(|c| c.set(0));
+}
+
+/// Test seam for [`BLOCK_CALL_EVENTS`].
+#[cfg(test)]
+pub(crate) fn block_call_events() -> u64 {
+    BLOCK_CALL_EVENTS.with(std::cell::Cell::get)
+}
+
 /// A block-level jump the [`Typer::block_level_jumps`] scan collected: its
 /// span, its control-flow kind, and the lowered VALUE expressions of a valued
 /// `break e` / `next e` (empty for the argument-less forms).
@@ -98,6 +123,10 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
+        #[cfg(test)]
+        {
+            BLOCK_CALL_EVENTS.with(|c| c.set(c.get() + 1));
+        }
         // A block-bearing `X.new(...) { ... }` still constructs an `X` instance
         // (e.g. `Array.new(n) { |i| … } : Array`, `Hash.new { … } : Hash`), so it
         // types via the SHARED `.new` path — not the block-overload return below.

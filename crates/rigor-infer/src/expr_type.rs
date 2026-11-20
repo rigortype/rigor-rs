@@ -163,12 +163,18 @@ impl<'i> Typer<'i> {
             // The snapshot+compare is O(env), so a bound keeps a large
             // method env from paying it per call site; beyond it the call
             // types uncached, exactly as env-sensitive calls always have.
+            //
+            // Every carrier stores here (the `true` flag): the entry is
+            // scoped to this interner by uid, so embedded `TypeId`s are
+            // re-interned under the same arena on a hit — no
+            // cross-interner translation (rigor-rs#427: a block chain's
+            // answers are deep `Tuple`s, and requiring interner-freedom
+            // here kept every such chain unmemoized and quadratic).
             if env.len() <= ENV_TYPE_MEMO_MAX {
                 let interner_id = interner.uid();
                 let ty = self.type_of_env_memo(ast, id, env, interner_id, |s| {
                     let tid = s.type_of_uncached(ast, id, env, interner);
-                    let ty = interner.get(tid);
-                    (ty.clone(), type_is_interner_free(ty, interner))
+                    (interner.get(tid).clone(), true)
                 });
                 return interner.intern(ty);
             }
