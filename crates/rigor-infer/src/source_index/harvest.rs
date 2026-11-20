@@ -178,6 +178,7 @@ impl SourceIndex {
         h.toplevel_defs = std::mem::take(&mut tables.toplevel);
         h.macro_methods = std::mem::take(&mut tables.macro_methods);
         h.def_names = std::mem::take(&mut tables.def_names);
+        h.singleton_methods = std::mem::take(&mut tables.singleton_methods);
         h.file_defs = FileDefs {
             toplevel: std::mem::take(&mut tables.file_toplevel),
             methods: std::mem::take(&mut tables.file_methods),
@@ -479,6 +480,12 @@ impl SourceIndex {
             idx.defined_method_names.extend(h.defined_method_names.iter().cloned());
             for (owner, methods) in &h.macro_methods {
                 idx.discovered_methods
+                    .entry(owner.clone())
+                    .or_default()
+                    .extend(methods.iter().cloned());
+            }
+            for (owner, methods) in &h.singleton_methods {
+                idx.singleton_methods
                     .entry(owner.clone())
                     .or_default()
                     .extend(methods.iter().cloned());

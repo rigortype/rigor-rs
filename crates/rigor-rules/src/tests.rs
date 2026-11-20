@@ -5197,3 +5197,120 @@ fn atm_describe_label_flattens_nested_optionals_and_keeps_inner_separators() {
         ]
     );
 }
+
+// --- rigor-rs#666: project reopening of an RBS class keeps the singleton ---
+
+/// A TOPLEVEL `class`/`module` decl of an RBS-toplevel name is a reopen of
+/// `::name`, not a shadow: `class Integer; extend W` still resolves
+/// `Integer` to `singleton(Integer)`, and `Integer.zzz` witnesses exactly
+/// like the call-form `Integer.extend(W)`.
+#[test]
+fn reopened_rbs_class_still_witnesses_singleton() {
+    // The issue's three repros — a class-body `extend` on an RBS class or
+    // module must not silence `Class.zzz`.
+    for src in [
+        &b"module W0; def d; end; end\nclass Integer; extend W0; end\nInteger.zzz\n"[..],
+        &b"module W0; def d; end; end\nmodule Comparable; extend W0; end\nComparable.zzz\n"[..],
+        &b"module W0; def d; end; end\nmodule String; extend W0; end\nString.zzz\n"[..],
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert!(diags[0].message.contains("for singleton("), "{}", diags[0].message);
+    }
+    // Must-still-fire control: the call-form `Integer.extend(W0)` row.
+    let diags = run(b"module W0; def d; end; end\nInteger.extend(W0)\nInteger.zzz\n");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(
+        diags[0].message,
+        "undefined method `zzz' for singleton(Integer)"
+    );
+    // A bare reopen too: `class Integer; end` is `::Integer` itself.
+    let diags = run(b"class Integer; end\nInteger.zzz\n");
+    assert_eq!(diags.len(), 1);
+    assert_eq!(
+        diags[0].message,
+        "undefined method `zzz' for singleton(Integer)"
+    );
+}
+
+/// The silencers the reopen needs so a project contribution keeps answering:
+/// a singleton-side `def` (own / superclass chain / `class <<` /
+/// `def C.x` / `instance_eval` / `define_singleton_method`), and an
+/// `include`/`prepend` naming a module no side declares.
+#[test]
+fn reopened_rbs_class_singleton_silencers_hold() {
+    for src in [
+        // `def self.q` on the reopen (empty body included).
+        &b"class Integer\n  def self.q; end\nend\nInteger.q\n"[..],
+        // `def C.q` outside the class body names C's singleton.
+        &b"class Integer; end\ndef Integer.q; end\nInteger.q\n"[..],
+        &b"def Integer.q; end\nInteger.q\n"[..],
+        // `class << self` defs on the reopen.
+        &b"class Integer\n  class << self\n    def q; end\n  end\nend\nInteger.q\n"[..],
+        &b"class << Integer\n  def q; end\nend\nInteger.q\n"[..],
+        // `instance_eval` / `define_singleton_method` singleton defs.
+        &b"Integer.instance_eval { def q; end }\nInteger.q\n"[..],
+        &b"class Integer; define_singleton_method(:q) { }; end\nInteger.q\n"[..],
+        &b"class Integer\n  class << self\n    attr_accessor :q\n  end\nend\nInteger.q\n"[..],
+        // The written superclass chain's singleton defs.
+        &b"class Base; def self.q; end; end\nclass Integer < Base; end\nInteger.q\n"[..],
+        // An unresolvable `include`/`prepend` on the reopen opens the
+        // class object's surface (`unknown_mixin_includer?`'s singleton half).
+        &b"class Integer; include NonexistentMod; end\nInteger.zzz\n"[..],
+        &b"class Integer; prepend NonexistentMod; end\nInteger.zzz\n"[..],
+        // A project `method_missing` on the singleton side.
+        &b"class Integer\n  def self.method_missing(*a); end\nend\nInteger.zzz\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+}
+
+/// What the silencers must NOT cover: an INSTANCE def or attr on the reopen
+/// (`Integer.q` is a class-object call), a resolvable include (its own
+/// methods are instance-side), a `def self.q` on an RBS *ancestor* (the
+/// reference's singleton chain reads only project edges).
+#[test]
+fn reopened_rbs_class_singleton_still_fires() {
+    for (src, msg) in [
+        (
+            &b"class Integer\n  def q; end\nend\nInteger.q\n"[..],
+            "undefined method `q' for singleton(Integer)",
+        ),
+        (
+            &b"class Integer; attr_accessor :q; end\nInteger.q\n"[..],
+            "undefined method `q' for singleton(Integer)",
+        ),
+        (
+            &b"class Integer; include Comparable; end\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        (
+            &b"module M; def zzz; end; end\nclass Integer; include M; end\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        (
+            &b"class Numeric; def self.q; end; end\nInteger.q\n"[..],
+            "undefined method `q' for singleton(Integer)",
+        ),
+        // `def self.d` on the extended MODULE is not on Integer's singleton.
+        (
+            &b"module W0; def self.d; end; end\nclass Integer; extend W0; end\nInteger.d\n"[..],
+            "undefined method `d' for singleton(Integer)",
+        ),
+        // A `::`-rooted read escapes a nested `class Integer` shadow.
+        (
+            &b"module M\n  class Integer; end\n  ::Integer.zzz\nend\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].message, msg);
+    }
+    // A NESTED `class Integer` still shadows the un-rooted read inside it.
+    let diags = run(b"module M\n  class Integer; end\n  Integer.zzz\nend\n");
+    assert!(diags.is_empty(), "expected silent, got {diags:?}");
+}

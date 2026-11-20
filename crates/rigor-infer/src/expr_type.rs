@@ -398,7 +398,7 @@ impl<'i> Typer<'i> {
             // Any miss ⇒ fall through to Dynamic[top] (silent). Note: a `Foo.new`
             // receiver is intercepted earlier in `type_call` (before the constant
             // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
-            Node::ConstantRead { name, span, dynamic_base, .. } => {
+            Node::ConstantRead { name, span, dynamic_base, rooted, .. } => {
                 // The reference's `type_of_constant_path` falls back to Dynamic
                 // when `qualified_name_or_nil` is nil — a dynamic base anywhere
                 // in the chain (`self::X`, `k::X`, `self.class::X`). C5 and the
@@ -433,15 +433,24 @@ impl<'i> Typer<'i> {
                 {
                     return self.intern_const_lit(lit, interner);
                 }
-                // C1: replace the pre-C1 bare-name project-wide suppression
-                // (`!source.knows_class(name)`) with a LEXICALLY PRECISE
+                // C1: the pre-C1 bare-name project-wide suppression
+                // (`!source.knows_class(name)`) stays a LEXICALLY PRECISE
                 // shadow gate: a nested project `module Time` suppresses the
-                // core-RBS singleton only at use sites it is lexically visible
-                // from; a toplevel definition still suppresses everywhere. See
-                // `SourceIndex::constant_shadowed`.
+                // core-RBS singleton only at use sites it is lexically
+                // visible from. rigor-rs#666: a TOPLEVEL `class`/`module`
+                // decl of `name` is a REOPEN of `::name` — the same object
+                // the RBS names — so it does not suppress either (the
+                // reference resolves `class Integer` + `Integer.zzz` to
+                // `singleton(Integer)` and fires). A `::`-rooted read skips
+                // the gate outright: `::Integer` names the root whatever
+                // `module M; class Integer` does. See
+                // `SourceIndex::constant_shadowed_except_toplevel_reopen`.
                 if !name.is_empty()
                     && self.index.knows_toplevel_class(name)
-                    && !self.source.constant_shadowed(name, prefix)
+                    && (*rooted
+                        || !self
+                            .source
+                            .constant_shadowed_except_toplevel_reopen(name, prefix))
                 {
                     if let Some(class) = self.source.class_id(name) {
                         return interner.intern(Type::Singleton(class));

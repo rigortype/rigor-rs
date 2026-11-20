@@ -425,6 +425,15 @@ impl SourceIndex {
         self.definers
             .get(&(method.to_string(), kind))
             .is_some_and(|owners| owners.iter().any(|o| o == owner))
+            // The `:singleton` half of the reference's `classes[:methods]` —
+            // `record_def_method` stamps `def self.x`, `def C.x`, `class <<`,
+            // `instance_eval` defs and the singleton-side macros there, while
+            // `definers` holds only the fold walk's subset (rigor-rs#666).
+            || (kind == DefKind::Singleton
+                && self
+                    .singleton_methods
+                    .get(owner)
+                    .is_some_and(|m| m.contains(method)))
     }
 
     /// The overridable-method degrade gate (reference `overridden_in_project?`):
