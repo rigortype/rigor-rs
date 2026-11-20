@@ -158,10 +158,19 @@ fn resolve_constant(
     source_index: &SourceIndex,
     source: &str,
 ) -> Option<String> {
-    let Node::ConstantRead { name, span, .. } = ast.get(exc) else {
+    let Node::ConstantRead {
+        name,
+        span,
+        dynamic_base,
+        ..
+    } = ast.get(exc)
+    else {
         return None; // splat / local / call / dynamic ⇒ opaque.
     };
-    if name.is_empty() {
+    if name.is_empty() || *dynamic_base {
+        // `qualified_name_or_nil` is strict — a dynamic base (`k::ArgumentError`)
+        // yields nil even though the lenient name is the trailing segment
+        // (rigor-rs#673).
         return None; // un-namable dynamic constant.
     }
 
@@ -571,6 +580,20 @@ mod tests {
     fn dynamic_local_designator_is_opaque() {
         assert!(
             msgs("klass = ArgumentError\nbegin\n  x\nrescue StandardError\n  a\nrescue klass\n  b\nend\n")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn dynamic_base_path_designator_is_opaque() {
+        // `k::ArgumentError` — the strict name is nil even though the lenient
+        // trailing segment resolves (rigor-rs#673).
+        assert!(
+            msgs("k = Object.new\nbegin\n  x\nrescue k::StandardError\n  a\nrescue k::ArgumentError\n  b\nend\n")
+                .is_empty()
+        );
+        assert!(
+            msgs("k = Object.new\nbegin\n  x\nrescue StandardError\n  a\nrescue k::ArgumentError\n  b\nend\n")
                 .is_empty()
         );
     }

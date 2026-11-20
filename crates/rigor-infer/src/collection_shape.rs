@@ -849,7 +849,16 @@ impl<'i> Typer<'i> {
         let mut members = Vec::with_capacity(cl.exceptions.len());
         for &exc in &cl.exceptions {
             let ty = match ast.get(exc) {
-                Node::ConstantRead { name, .. } if !name.is_empty() => {
+                // A `dynamic_base` path (`k::ArgumentError`) resolves no
+                // class upstream — `rescue_exception_type` maps its
+                // non-Singleton member to `Dynamic[top]` — so its lenient
+                // trailing name must not certify (rigor-rs#673).
+                Node::ConstantRead {
+                    name,
+                    dynamic_base: false,
+                    ..
+                } if !name.is_empty() =>
+                {
                     nominal(name, interner)
                 }
                 _ => None,
