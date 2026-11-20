@@ -892,7 +892,17 @@ pub enum Node {
     /// `v => s`, `v in [s]`); empty for every other unmodeled write. The
     /// rebind/widen censuses (`flow_writes`) need the names to grade a pattern
     /// rebind like any other local write (rigor-rs#352 review).
-    UnmodeledWrite { span: Span, names: Vec<String> },
+    UnmodeledWrite {
+        span: Span,
+        names: Vec<String>,
+        /// rigor-rs#672: when this unmodeled write is a meta-new CONSTANT
+        /// write (`Foo ||= Struct.new`, `::Foo = Class.new`, `M::Foo ||= …`),
+        /// the AS-WRITTEN constant path — a leading `::` marks a rooted
+        /// target. The reference's `collect_class_decls` records these in
+        /// `discovered_classes`, which `class_known_to_scope?` consults for
+        /// `is_a?(::Foo)`-family operands.
+        meta_new_const: Option<String>,
+    },
     /// `alias new_name old_name` (Prism `AliasMethodNode`). Both operands are
     /// lowered so an interpolated name's calls stay reachable to the rule
     /// walk; the def-attribution walk reads the literal symbol names through

@@ -14,8 +14,8 @@ use crate::ruby_prism::Node as PrismNode;
 
 use super::{
     collect_defined_operand_children, collect_recoverable_children, is_unmodeled_write,
-    pattern_bound_locals, Builder, JumpKind, Node, NodeId, ScopeMarks, Span, StatementsKind,
-    UNMATCHED,
+    meta_new_write_name, pattern_bound_locals, Builder, JumpKind, Node, NodeId, ScopeMarks, Span,
+    StatementsKind, UNMATCHED,
 };
 
 impl<'src> Builder<'src> {
@@ -273,7 +273,17 @@ impl<'src> Builder<'src> {
             } else {
                 Vec::new()
             };
-            self.push(Node::UnmodeledWrite { span, names });
+            // `discovered_classes` census (rigor-rs#672): `Foo ||= X`,
+            // `::Foo = X` and `M::Foo ||= X` are unmodeled writes, but when
+            // the rvalue is a factory the write still names a class on the
+            // oracle — `class_known_to_scope?` consults the census for
+            // `is_a?(::Foo)`-family operands.
+            let meta_new_const = meta_new_write_name(node);
+            self.push(Node::UnmodeledWrite {
+                span,
+                names,
+                meta_new_const,
+            });
             let recovered = collect_recoverable_children(node, self.recovery_marks());
             if recovered.is_empty() {
                 return self.push(Node::Other { span, jump: None });

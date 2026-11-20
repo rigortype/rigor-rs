@@ -2050,3 +2050,33 @@ fn singleton_mixin_chain_limit_counts_the_root_entry() {
     let (_b, idx) = build_one(src.as_bytes(), &core);
     assert!(idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
 }
+
+#[test]
+fn meta_new_write_census_covers_or_path_nested_positions() {
+    // rigor-rs#672 review: `discovered_classes` (`collect_class_decls`)
+    // descends the whole tree and covers the or-write/path-write shapes the
+    // lowering drops — `is_a?(::Foo)`-family operands consult it.
+    let core = CoreIndex::new();
+    let src = b"Foo ||= Struct.new(:a)\n\
+                Bar ||= Class.new\n\
+                module M; ::Baz = Struct.new(:a); end\n\
+                module N; K::Qux = Data.define(:x); end\n\
+                [1].each { Blocked = Class.new }\n\
+                Mod = Struct.new(:a) if true\n\
+                Ctrl = 1\n\
+                Anded &&= Struct.new(:a)\n\
+                k = [M].first\n\
+                k::Dyn = Struct.new(:a)\n\
+                module P; Orm = Module.new; end\n";
+    let (_a, idx) = build_one(src, &core);
+    for name in ["Foo", "Bar", "Baz", "Blocked", "Mod"] {
+        assert!(idx.knows_meta_new_class(name), "{name}");
+    }
+    assert!(idx.knows_meta_new_class("N::K::Qux"));
+    assert!(idx.knows_meta_new_class("P::Orm"));
+    // `&&=` is not a `collect_class_decls` arm; `Ctrl = 1` binds no class;
+    // `k::Dyn`'s dynamic base is unnameable; `Baz` is rooted — never `M::Baz`.
+    for name in ["Anded", "Ctrl", "Dyn", "M::Baz", "Qux"] {
+        assert!(!idx.knows_meta_new_class(name), "{name}");
+    }
+}

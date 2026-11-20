@@ -321,7 +321,7 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
             // the oracle (`case v; in [s]; end`, `v => s`, `v in [s]`) —
             // counted so `widen_flow_writes` widens the rebound name like any
             // other write (rigor-rs#352 review). Not scan-visible.
-            Node::UnmodeledWrite { span, names } => names
+            Node::UnmodeledWrite { span, names, .. } => names
                 .iter()
                 .map(|name| (id, *span, name.clone(), false))
                 .collect(),
@@ -582,7 +582,7 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
             // plain write on the oracle (`case v; in [s]; end` inside a `for
             // s[0] in …` span makes the post-join `s` NOT the pre-loop String
             // — rigor-rs#352 review).
-            Node::UnmodeledWrite { span, names } => {
+            Node::UnmodeledWrite { span, names, .. } => {
                 out.extend(names.iter().map(|name| (id, *span, name.clone())));
             }
             _ => {}

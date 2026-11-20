@@ -287,7 +287,7 @@ fn case_condition_writes(ast: &LoweredAst, method_bodies: &[rigor_parse::Span]) 
             Node::MultiWrite { targets, span, .. } => {
                 names.extend(targets.bound_names().into_iter().map(|(n, _)| (n, *span)));
             }
-            Node::UnmodeledWrite { names: ns, span } => {
+            Node::UnmodeledWrite { names: ns, span, .. } => {
                 names.extend(ns.iter().map(|n| (n.clone(), *span)));
             }
             _ => continue,

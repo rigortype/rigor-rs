@@ -8,8 +8,8 @@ use rigor_index::CoreIndex;
 use rigor_parse::{FileKey, LoweredAst, Node};
 
 use super::{
-    collect_declared_names, collect_literal_constants, collect_override_classes, def_root_cx,
-    DefKind,
+    collect_declared_names, collect_literal_constants, collect_meta_new_writes,
+    collect_override_classes, def_root_cx, DefKind,
     file_orphan_defs, infer_method_returns, invert_definers, mutated_constant_names, walk_defs,
     walk_fold_defs, ConstLit, DefTables, FileDefs, FoldDefs, FoldSite, Harvest, HarvestedClass,
     HarvestedFoldDef, SourceIndex,
@@ -231,6 +231,10 @@ impl SourceIndex {
             let bare = w.qualified.rsplit("::").next().unwrap_or(&w.qualified).to_string();
             h.constant_write_bare_names.insert(bare);
         }
+        // `discovered_classes` (rigor-rs#672): every meta-new constant write,
+        // at ANY position — `collect_class_decls` descends the whole tree,
+        // and the or-write/path-write shapes ride `UnmodeledWrite`.
+        h.meta_new_names = collect_meta_new_writes(ast);
 
         // Pass 2: every `ConstantRead` whose `name` the FROZEN core knows, so the
         // merge can register an instance-class id for it. This lets both
@@ -474,11 +478,7 @@ impl SourceIndex {
                     .extend(indices.iter().copied());
             }
             idx.project_constant_write_names.extend(h.constant_write_bare_names.iter().cloned());
-            for w in &h.constant_writes {
-                if w.meta_new {
-                    idx.meta_new_classes.insert(w.qualified.clone());
-                }
-            }
+            idx.meta_new_classes.extend(h.meta_new_names.iter().cloned());
         }
         // `subtract_def_methods` (`finalize_def_index`): cross-file method
         // suppression is for the project's OWN accessors/aliases — NOT plain

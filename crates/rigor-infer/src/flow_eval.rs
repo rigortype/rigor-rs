@@ -1297,7 +1297,7 @@ impl<'i> Typer<'i> {
                         });
                     }
                 }
-                Node::UnmodeledWrite { span, names: writes } => {
+                Node::UnmodeledWrite { span, names: writes, .. } => {
                     for name in writes {
                         if !tracked.contains(name.as_str()) {
                             continue;

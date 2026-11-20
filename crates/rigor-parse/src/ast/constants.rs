@@ -196,6 +196,118 @@ pub(crate) fn strict_constant_path_string(node: &PrismNode<'_>) -> Option<String
     ConstPathChain::collect(node)?.strict()
 }
 
+/// `record_class_new_constant_decl` (`scope_indexer.rb:13196`) for the write
+/// shapes the lowered AST cannot model — `Foo ||= …`, `::Foo = …`,
+/// `M::Foo = …`, `M::Foo ||= …` (a plain `Foo = …` lowers to
+/// `Node::ConstantWrite` and is censused on the lowered side). Returns the
+/// AS-WRITTEN constant path — a leading `::` marks a rooted target — when the
+/// rvalue is one of the four factory calls behind the reference's
+/// `unwrap_or_guard` / `unwrap_freeze_tail` / `meta_new_constant_rvalue?`
+/// (rigor-rs#672). `var::K` and `self::K` targets decline, matching
+/// `meta_new_path_target_nameable?` / `self_anchored_tail`.
+pub(crate) fn meta_new_write_name(node: &PrismNode<'_>) -> Option<String> {
+    let (written, value) = if let Some(w) = node.as_constant_or_write_node() {
+        (constant_string(w.name().as_slice()), w.value())
+    } else if let Some(w) = node.as_constant_path_write_node() {
+        let target = w.target().as_node();
+        if self_anchored_constant_path(&target) {
+            return None;
+        }
+        let strict = strict_constant_path_string(&target)?;
+        let written = if rooted_constant_path(&target) {
+            format!("::{strict}")
+        } else {
+            strict
+        };
+        (written, w.value())
+    } else if let Some(w) = node.as_constant_path_or_write_node() {
+        let target = w.target().as_node();
+        if self_anchored_constant_path(&target) {
+            return None;
+        }
+        let strict = strict_constant_path_string(&target)?;
+        let written = if rooted_constant_path(&target) {
+            format!("::{strict}")
+        } else {
+            strict
+        };
+        (written, w.value())
+    } else {
+        return None;
+    };
+    meta_new_rvalue(&written, value).then_some(written)
+}
+
+/// `meta_new_rvalue` (`scope_indexer.rb:4960`): `K = K || <factory>` /
+/// `K ||= K || <factory>` unwraps when the left operand re-reads the written
+/// constant, then the repeated receiverful `.freeze` tail, then
+/// `meta_new_constant_rvalue?` — `Class.new` / `Module.new` / `Struct.new` /
+/// `Data.define` on a bare or `::`-rooted receiver. Argument-shape rules are
+/// deliberately NOT checked (same looseness as the lowered-side
+/// `is_meta_new_call`): an over-broad answer only ever costs coverage.
+fn meta_new_rvalue(written: &str, mut value: PrismNode<'_>) -> bool {
+    // `unwrap_or_guard`: `Foo ||= Foo || Struct.new(:a)` unwraps to the
+    // factory only when the left operand names the constant being written.
+    if let Some(or) = value.as_or_node() {
+        if strict_constant_path_string(&or.left()).as_deref()
+            == Some(written.trim_start_matches("::"))
+        {
+            value = or.right();
+        }
+    }
+    // `unwrap_freeze_tail`: `freeze` must be receiverful, argument-less,
+    // block-less and not `&.`.
+    while let Some(c) = value.as_call_node() {
+        if !(constant_string(c.name().as_slice()) == "freeze"
+            && c.receiver().is_some()
+            && c.arguments().is_none()
+            && c.block().is_none()
+            && !c.is_safe_navigation())
+        {
+            break;
+        }
+        value = c.receiver().unwrap();
+    }
+    let Some(call) = value.as_call_node() else {
+        return false;
+    };
+    let Some(recv) = call.receiver() else {
+        return false;
+    };
+    let method = constant_string(call.name().as_slice());
+    META_NEW_SELECTORS
+        .iter()
+        .any(|&(k, m)| m == method && meta_new_receiver(&recv, k))
+}
+
+/// The class-creating factory calls a constant write's rvalue can name —
+/// `META_NEW_SELECTORS`, shared with the lowered-side recogniser.
+const META_NEW_SELECTORS: &[(&str, &str)] = &[
+    ("Class", "new"),
+    ("Module", "new"),
+    ("Struct", "new"),
+    ("Data", "define"),
+];
+
+/// `meta_constant_receiver?` — a bare `Struct`/`Class`/`Module`/`Data` read,
+/// or the same name `::`-rooted (`::Struct.new` is a factory too); a
+/// `Foo::Struct` base is a different class entirely.
+fn meta_new_receiver(recv: &PrismNode<'_>, expected: &str) -> bool {
+    if let Some(cr) = recv.as_constant_read_node() {
+        return constant_string(cr.name().as_slice()) == expected;
+    }
+    match ConstPathChain::collect(recv) {
+        Some(chain) => {
+            chain.base.is_none()
+                && chain.nodes.len() == 1
+                && chain.nodes[0]
+                    .name()
+                    .is_some_and(|n| constant_string(n.as_slice()) == expected)
+        }
+        None => false,
+    }
+}
+
 /// Upstream #540 (`fc3b8b42`) — the whole-file mutation census behind the
 /// SourceIndex's two wideners, a faithful port of `ScopeIndexer`'s
 /// `collect_literal_receiver_mutations` / `walk_literal_receiver_mutations` /

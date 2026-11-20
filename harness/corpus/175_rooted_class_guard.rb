@@ -92,3 +92,36 @@ class File
     x.frobnicate_r15
   end
 end
+
+# Review (PR #708, round 3): `record_class_new_constant_decl` also counts
+# `Foo ||= …`, `::Foo = …`, `M::Foo = …` and writes inside blocks/modifiers —
+# the `collect_class_decls` every-child descent (rigor-rs#672).
+Ored ||= Struct.new(:a)
+
+def rooted_or_write
+  x = [1]
+  x.frobnicate_r16 unless x.is_a?(::Ored)
+end
+
+module M672
+  ::Pathy = Class.new
+end
+
+def rooted_path_write
+  x = [1]
+  x.frobnicate_r17 unless x.is_a?(::Pathy)
+end
+
+[1].each { NestedW = Struct.new(:a) }
+
+def rooted_block_write
+  x = [1]
+  x.frobnicate_r18 unless x.is_a?(::NestedW)
+end
+
+ModW = Class.new if true
+
+def rooted_modifier_write
+  x = [1]
+  x.frobnicate_r19 unless x.is_a?(::ModW)
+end
