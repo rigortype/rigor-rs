@@ -15,7 +15,9 @@
 //!    fails on a `configure_global_pool` call or any `ThreadPoolBuilder`
 //!    in `fn main`'s own body — no allow-list, because a stack-proven
 //!    builder there is still the inversion, a shape the repo-wide pass
-//!    above passes.
+//!    above passes. A `use` in that body that aliases or globs a pool
+//!    token is a finding too (rigor-rs#724) — it would rename the call
+//!    site out of the token matcher's reach.
 //!
 //! The deep-nesting tests cover only the call sites that exist today; a new
 //! subcommand or helper that skips either convention brings back the stack
@@ -148,9 +150,18 @@ const USE_LEAVES_THREAD: &[&str] = &["spawn", "scope", "Builder"];
 /// main`, the pool must not be built at all.
 const MAIN_POOL_TOKENS: &[&str] = &["configure_global_pool", "ThreadPoolBuilder"];
 
+/// The path segments a `use` glob inside `fn main`'s body reaches a pool
+/// token through (rigor-rs#724): `threads` holds
+/// `configure_global_pool`, `rayon` holds `ThreadPoolBuilder`. A glob of
+/// any other path is beyond what a text matcher can resolve — the same
+/// fixed-root limit `flagged_uses` discloses.
+const POOL_USE_ROOTS: &[&str] = &["threads", "rayon"];
+
 /// The advice every pool-ordering finding carries. There is no allow-list
 /// entry for these: a hit in `fn main` IS the rigor-rs#431 inversion, so
-/// the ordering can only regress by editing this audit.
+/// the ordering can only regress by editing this audit — or by deliberate
+/// indirection it cannot see, a helper `fn` defined OUTSIDE `fn main`'s
+/// body that makes the pool call for it (rigor-rs#724).
 const MAIN_POOL_ADVICE: &str = "the rayon pool is built from the command thread's body \
      (threads::run_command_thread(run_command_with_pool)), after that thread has reserved its \
      stack — building or configuring it in fn main lets the workers spend the reservation budget \
@@ -1067,8 +1078,11 @@ fn brace_glob_uses_flag_like_star_globs() {
 
 /// rigor-rs#676: the pool-ordering findings of one `fn main`-bearing
 /// file. A hit is a [`MAIN_POOL_TOKENS`] token inside the production
-/// `fn main`'s body — called, taken as a value or built, outside `use`
-/// items — and the production `fn main` count is pinned at exactly one:
+/// `fn main`'s body — called, taken as a value or built — or (rigor-rs#724)
+/// a `use` item in that body whose tree reaches a pool token behind an
+/// `as` alias or a glob ([`pool_use_hides_token`]); other `use` extents
+/// are masked as "not a call". The production `fn main` count is pinned
+/// at exactly one:
 /// none or several is itself a finding, so a rename or a merge can never
 /// let the check pass vacuously.
 fn main_pool_findings(text: &str, rel: &str) -> Vec<String> {
@@ -1105,7 +1119,51 @@ fn main_pool_findings(text: &str, rel: &str) -> Vec<String> {
             ));
         }
     }
+    // rigor-rs#724: a `use` in the body whose tree reaches a pool token
+    // behind an `as` alias or a glob renames the call site out of the
+    // token matcher's reach — flag the use itself (its extent stays
+    // masked above, so a token inside it does not also report).
+    for &(u_at, u_end) in &uses {
+        if !(open..close).contains(&u_at) || !no_test(u_at) {
+            continue;
+        }
+        if pool_use_hides_token(&text[u_at + 3..u_end - 1]) {
+            findings.push(format!(
+                "{rel}:{}: `use` aliases or globs a pool token in `fn main` — \
+                 {MAIN_POOL_ADVICE}",
+                line_of(text, u_at)
+            ));
+        }
+    }
     findings
+}
+
+/// Whether a `use` item's tree (the text between `use` and `;`) hides a
+/// [`MAIN_POOL_TOKENS`] token from the `fn main` token match
+/// (rigor-rs#724):
+///
+/// - the token leaf renamed — `use threads::configure_global_pool as
+///   go`, `use rayon::{ThreadPoolBuilder as TPB}`, or the `self`
+///   spelling `use threads::configure_global_pool::{self as go}`;
+/// - a glob of the token's module — `use threads::*`, `use
+///   threads::{run_command_thread, *}`, `use crate::threads::*`, `use
+///   rayon::*`.
+///
+/// A plain `use threads::configure_global_pool` stays silent: the name
+/// comes in unchanged, so any call still carries the token. An aliased
+/// SEGMENT (`use threads as t`, `use threads::{self as t}`) stays silent
+/// for the same reason — `t::configure_global_pool()` still names it.
+fn pool_use_hides_token(item: &str) -> bool {
+    let toks: Vec<(usize, &str)> = ident_spans(item).collect();
+    let pair = |x: &str, y: &str| toks.windows(2).any(|w| w[0].1 == x && w[1].1 == y);
+    if MAIN_POOL_TOKENS.iter().any(|&tok| pair(tok, "as")) {
+        return true;
+    }
+    if toks.iter().any(|t| MAIN_POOL_TOKENS.contains(&t.1)) && pair("self", "as") {
+        return true;
+    }
+    toks.iter()
+        .any(|&t| POOL_USE_ROOTS.contains(&t.1) && after_ident_is_glob(item, t))
 }
 
 /// The `(open, close)` of the first depth-0 `{` at or after `at` — a
@@ -1204,6 +1262,72 @@ fn main_pool_findings_flag_direct_configuration_only() {
         (
             "fn main() { use threads::configure_global_pool; configure_global_pool() }",
             vec!["`configure_global_pool` in `fn main`"],
+        ),
+        // rigor-rs#724: the alias renames the call site out of the
+        // token matcher's reach — flag the `use` itself
+        (
+            "fn main() -> ExitCode { use threads::configure_global_pool as go; \
+             if !go() { return code() } threads::run_command_thread(body) }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        (
+            "fn main() { use rayon::ThreadPoolBuilder as TPB; TPB::new().build_global(); }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        (
+            "fn main() { use rayon::{ThreadPoolBuilder as TPB}; TPB::new(); }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        (
+            "fn main() { use threads::configure_global_pool::{self as go}; go() }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        // a glob of the token's module is the same indirection, even
+        // though a bare call would still carry the token
+        (
+            "fn main() { use threads::*; run(body) }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        (
+            "fn main() { use threads::{run_command_thread, *}; run(body) }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        (
+            "fn main() { use crate::threads::*; run() }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        (
+            "fn main() { use rayon::*; run() }",
+            vec!["`use` aliases or globs a pool token in `fn main`"],
+        ),
+        // an aliased use AND a bare call are two findings
+        (
+            "fn main() { use threads::configure_global_pool as go; configure_global_pool() }",
+            vec![
+                "`use` aliases or globs a pool token in `fn main`",
+                "`configure_global_pool` in `fn main`",
+            ],
+        ),
+        // an aliased SEGMENT does not hide the token — the qualified
+        // call still names it and flags on its own
+        (
+            "fn main() { use threads as t; t::configure_global_pool() }",
+            vec!["`configure_global_pool` in `fn main`"],
+        ),
+        (
+            "fn main() { use threads::{self as t}; t::configure_global_pool() }",
+            vec!["`configure_global_pool` in `fn main`"],
+        ),
+        // a plain use of the token — braced or not — stays silent (the
+        // call flags itself), and a use outside the body is not its
+        // business
+        (
+            "fn main() { use threads::{configure_global_pool}; run(body) }",
+            Vec::new(),
+        ),
+        (
+            "use threads::configure_global_pool as go; fn main() { run() }",
+            Vec::new(),
         ),
         // a `#[cfg(test)]` sibling `fn main` is masked; the production
         // one stays clean
