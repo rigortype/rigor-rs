@@ -629,10 +629,16 @@ pub(crate) fn same_dead(a: &Option<Rc<DeadPositions>>, b: &Option<Rc<DeadPositio
 }
 
 /// `RIGOR_REACH_MEMO_AUDIT` is set (to anything but empty or `0`). The env
-/// read is cached in a tri-state (`0` unread, `1` off, `2` on) so a test can
-/// force it via [`set_audit_mode_for_test`] — an env var set from inside the
-/// test binary would race the first read.
+/// read is cached in a tri-state (`0` unread, `1` off, `2` on); a test can
+/// override it for its own thread via [`set_audit_mode_for_test`] — an env
+/// var set from inside the test binary would race the first read, and a
+/// process-global override would audit (and re-time) unrelated tests
+/// running in parallel.
 pub(crate) fn audit_mode() -> bool {
+    #[cfg(test)]
+    if let Some(on) = TEST_AUDIT.with(|t| t.get()) {
+        return on;
+    }
     match AUDIT.load(Ordering::Relaxed) {
         0 => {
             let on = std::env::var("RIGOR_REACH_MEMO_AUDIT")
@@ -647,12 +653,17 @@ pub(crate) fn audit_mode() -> bool {
 /// `audit_mode`'s tri-state — see its docs.
 static AUDIT: AtomicU8 = AtomicU8::new(0);
 
-/// Pin the audit flag for the rest of the test binary's run. The flag is
-/// process-global: other tests running in parallel get audited too — sound
-/// (the audit only asserts an invariant), just slower.
+#[cfg(test)]
+thread_local! {
+    static TEST_AUDIT: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// Pin the audit flag for the calling test's thread. Thread-local so a
+/// forced audit cannot leak into tests running in parallel (the recompute
+/// doubles their type-event counts).
 #[cfg(test)]
 pub(crate) fn set_audit_mode_for_test(on: bool) {
-    AUDIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+    TEST_AUDIT.with(|t| t.set(Some(on)));
 }
 
 pub(crate) fn ast_identity(ast: &LoweredAst) -> (usize, usize) {
