@@ -60,6 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-21 #439 CLOSED** (PR #753): reach-memo audit in CI; 0 FP. →#754. [note](notes/20261121-issue-439-reach-memo-audit-gate.md)
 - **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand — x-polarity gate, dominating-write cut, body-env leaf typing, `Integer#[]` fold; `x = [1,2][x] || 0` caps; 0 FP / sweep; 5 Opus rounds. →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
 - **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts the self-extend's instance-side entry (2+N, cut N≥99) + RBS-known fallback; live FP gone; 0 FP / 437 = master. →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
 - **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census, `using`/`.refined` regions, `own_method_answers` walk; 0 FP; review edges →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
@@ -134,8 +135,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-09-28/30 index-write + scope arc, folded** (#134–#332, #284–#334): index/splice writes widen receivers, operand env replay, closure shadowing, multi-valued args. 0 FP / 818. [index](notes/20260929-issue-134-index-widening.md)/[operand](notes/20260929-issue-136-operand-scope.md)
 - **2026-09-28/30 output, config + RBS parity, folded** (#162–#201, #281–#323): baseline, output bytes, project-`sig/` `use`, witness spelling, list keys, `exclude:`. 0 FP. [formats](notes/20260928-issue-163-output-formats.md)/[rbs-use](notes/20260929-issue-168-rbs-use.md)
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183 closed unmerged): full-parity review met the deepest infer file; branches keep the work. [note](notes/20260927-abandoned-infer-pr-stream.md).
-- **2026-09-25/28 fold + binder slices, folded** (#121–#166, #148–#283): lookup folds, rebind decline, `tap` once, binder carriers, splat arity, block-param shadow. 0 FP / 9,337. [rebind](notes/20260925-issue-133-jump-path-rebind.md)/[binder](notes/20260925-issues-151-153-binder-writes.md
-- **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver (`declaration_prefix` re-anchoring). **3,002→827 gaps, 0 FP**; fx 118; →#185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
+- **2026-09-25/28 fold + binder slices, folded** (#121–#166, #148–#283): lookup folds, rebind decline, `tap` once, binder carriers, splat arity, block-param shadow. 0 FP / 9,337. [rebind](notes/20260925-issue-133-jump-path-rebind.md)
+- **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver. 3,002→827 gaps, 0 FP; →#185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 39 FP families in review; **0 FP**; → #155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
 - **2026-09-25 re-pin `v0.3.9 → e59b7b89`** (1,030 commits): 0 FP / 9,337. Raw 8+9 FPs (#1021; `fb781023` unported, #141); 10 invisible retractions →#133–#138. [note](notes/20260925-repin-e59b7b89.md)
 - **2026-09-21 #128 CLOSED — store values named by their TYPED answer** (PR #131) — member is the erased class of the value's `stmt_value_type`. **0 FP / 9,337**; →#132. [note](notes/20260921-issue-128-store-value-typing.md).
