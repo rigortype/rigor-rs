@@ -67,13 +67,28 @@ for rep in range(a.reps):
         try:
             t = time.time()
             cmd = [rigor, "check", "--format", "json"] + files
+            env = dict(env, LC_ALL="C", LANG="C")
+            env.setdefault("MALLOC_ARENA_MAX", "2")
+            stderr = subprocess.DEVNULL
             if ulimit_v:
-                cmd = ["/bin/sh", "-c", 'ulimit -v %d && exec "$@"' % (ulimit_v * 1024), "sh"] + cmd
+                # bash, not /bin/sh: dash's ulimit has no working -v on Ubuntu.
+                cmd = ["/bin/bash", "-c",
+                       'ulimit -v %d && exec "$@"' % (ulimit_v * 1024), "sh"] + cmd
+                stderr = subprocess.PIPE
             p = subprocess.Popen(cmd, cwd=d, env=env,
-                                 stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+                                 stdout=subprocess.PIPE, stderr=stderr)
             out = p.stdout.read()
+            err = p.stderr.read() if ulimit_v else b""
             _, status, ru = os.wait4(p.pid, 0)
             dt = time.time() - t
+            rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
+            if ulimit_v and (rc in (126, 127) or not out
+                             or b"Illegal option" in err
+                             or b"cannot modify limit" in err
+                             or b"invalid option" in err):
+                raise SystemExit(
+                    "bench.py: ulimit -v=%d failed rc=%d: %s"
+                    % (ulimit_v, rc, err.decode("utf-8", "replace").strip()[:200]))
             res[name].append((dt, ru.ru_maxrss, ru.ru_utime + ru.ru_stime))
             digests[name].add(hashlib.sha256(out).hexdigest()[:12])
         finally:

@@ -82,12 +82,12 @@ What the screen measures instead:
 | deepest capped construct = 19,999 child edges | `depthprobe errors splat 9998` (or `paren`/`arrparen`): `prism_depth` |
 | `defined?` 13 MiB, `lower_jumps` ~1.34 KiB/level | `probe_min.py lower defined 9998` |
 | `def`/`class`/`module`/`class <<` 8 MiB lowering | `probe_min.py lower {def,class,module,sclass} 4999` |
-| Prism parser 8.1 MiB / 848 B per unit | `probe_min.py parse array 9999` |
-| chains ~0.95 KiB/level lowering, 5 MiB @5k / 19 MiB @20k | `probe_min.py lower chain 5000 20000` (plus `andand`, `index`, `cpath`) |
-| `1 if a…` / `elsif` ~1.43 KiB/level (pipeline) | `e2e.py` `minm` on `ifmod` / `elsifchain` at 5k/20k (Linux) |
+| Prism parser 8.1 MiB / 848 B per unit | `probe_min.py --kib parse array 9999` (8257 KiB; MiB mode rounds up to 9) |
+| chains ~0.95 KiB/level lowering | `probe_min.py --kib lower chain 5000 20000` (plus `andand`, `index`, `cpath`). The ADR's 5/19 MiB is the Oct #412 floor; re-record on drift |
+| `1 if a…` / `elsif` ~1.43 KiB/level (`class_flow_if`) | `probe_min.py --kib` on those shapes. `e2e.py --only minm` is the *pipeline* floor and only counts a trial that landed on the inline (`main`) rung |
 | Prism destroy ~48 B/link, ~144 B/`if`-modifier level | `probe_min.py parse` on `chain` vs `ifmod`, minus the parse-only part |
 | the bounded walk ~93 B/level release (2.3 MiB at the bound) | `probe_min.py --kib cguard elsifchain 24990` |
-| bound budget: `elsif` 24,990 → ~35 MiB, `if` modifier → 12,490 | `e2e.py release elsifchain:24990 ifmod:12490` (`minm`/`at64` columns) |
+| bound budget: `elsif` 24,990 → ~35 MiB, `if` modifier → 12,490 | aarch64 `minm` from #412. On Linux `e2e.py --only minm` often cannot force the inline rung at those depths (a 64 MiB spawn fits once `ulimit -v` is past ~96 MiB) and reports `missed` rather than a number |
 | "analyses all of these just under the bound" (+ times) | `accept.py release elsifchain:24990 ifmod:12490 rescuechain:24990 andand:24990 chain:24990`, `timeit.py` same |
 | refusal wording per surface | `surfaces.py release 30000`, `accept.py`, `lsp_probe.py` |
 | guard cost 0.055 s / 19,085 files, 0.84 s parse, max real depth 61 | `depthprobe guardbench FILES_TXT 3` over a corpus list |
@@ -114,5 +114,5 @@ pivot belonged to the scratch session's filenames.
 ## Requirements
 
 Python 3.14+; `cargo +1.88.0` (rustup) or `RIGOR_STACK_CARGO`; `lldb` and
-`objdump`/`nm` for `crashsite.py`/`frames.py` (macOS); a Bourne `ulimit` for
-the forced rungs (Linux).
+`objdump`/`nm` for `crashsite.py`/`frames.py` (macOS); **bash** `ulimit -v`
+for the forced rungs (Linux; dash's `ulimit -v` is a no-op on Ubuntu).

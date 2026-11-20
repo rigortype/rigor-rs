@@ -169,6 +169,10 @@ thread and for a worker, from 35 kinds:
 | `1 if a if a…`, `elsif` chains | ~1.43 KiB (`class_flow_if`) | 7 MiB | 28 MiB |
 | `rescue` clause lists | small | 1 MiB | – |
 
+The 5/19 MiB chain floors are the Oct #412 aarch64 numbers. Regenerating
+with `probe_min.py` on the current lowering (`--kib`) reads ~6 MiB / ~21 MiB
+(~10–20 % drift, same toolchain, more code in the frames).
+
 - Prism's destroy costs 48 B per call link and 144 B per `if`-modifier
   level: 46 MiB and 138 MiB at 1M links.
 - **Time binds before stack does.** `rigor check` is quadratic on chains: a
@@ -262,15 +266,22 @@ memory. Medians over interleaved runs; every variant produced identical output:
   carries.
 - **x86_64 Linux** is measured by the committed tools
   (`harness/stack/`, workflow `stack-measure`, rigor-rs#428; numbers below
-  from run 44651765611 on head `4b49407f`): the per-pass
-  minima track aarch64 (`lower defined` 13 MiB, `parse array` 8 MiB, the
-  C-walk 1,178 KiB), every capped and refusal cap is identical, and the
-  rung screen shows the 2 MiB rung crashes on the heaviest bound kinds
-  (SIGABRT, as the fallback warning says it may) while 64 MiB carries
-  them; the inline thread's `ulimit -s` floor measures 16 MiB for the
-  deepest capped kind and 345–384 MiB for bound-depth chains under the
-  Ruby-free sound subset (`RIGOR_NO_RUBY=1`: the sidecar cannot spawn
-  under a rung-forcing `ulimit -v`).
+  from run 44651765611 on head `4b49407f`, with the post-review
+  rung-gated columns still landing). The per-pass minima track aarch64
+  (`lower defined` 13 MiB, `parse array` 8 MiB / 8257 KiB, the C-walk
+  1,178 KiB); every capped and refusal cap is identical. The 64 MiB
+  rung is a narrow, scheduling-noisy band on the GH runner (`at64` is
+  often `n/a`); when it *is* forced, some capped kinds (`class`/`module`
+  at 4999) still die with SIGABRT whose stderr is *not* a stack overflow
+  (typically glibc's per-thread malloc arenas counting against
+  `RLIMIT_AS`). The 2 MiB rung likewise dies on many capped and bound
+  shapes by the same signal, not a confirmed overflow. The inline
+  (`ulimit -s`) floor is only a number when the trial landed on `main`:
+  `defined:9998` measured 16 MiB (`rung=main+2`); bound-depth chains
+  (`ifmod:12490`, `elsifchain:24990`) could not be forced onto `main`
+  once the scaled `ulimit -v` budget admitted a 64 MiB spawn, so those
+  rows report `missed`, not 345–384 MiB. The aarch64 35 MiB bound-budget
+  figure is the pipeline floor from #412, not regenerated on x86_64.
 - **Windows** is unmeasured: the port does not yet compile on
   `windows-latest` (rigor-rs#707); `stack-measure` runs the
   `deep_nesting` tests there once it does.
