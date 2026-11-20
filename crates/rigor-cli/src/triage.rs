@@ -216,9 +216,9 @@ pub fn cmd_triage(args: &[String]) -> ExitCode {
         crate::reference_has_ruby_files(&cfg, &path_refs),
     );
 
-    // (path, diagnostic) pairs — `path` rides the findings tuple, not the diag.
+    // (path, diagnostic) pairs — `path` rides the findings row, not the diag.
     let diags: Vec<DiagRef> =
-        findings.iter().map(|(_o, path, _src, d)| (path.as_str(), d)).collect();
+        findings.iter().map(|f| (f.path.as_str(), &f.diag)).collect();
 
     let report = analyze(&diags, top, sections.contains(&Section::Hints), include_info);
     match format.as_str() {

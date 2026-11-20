@@ -102,10 +102,11 @@ fn conformance_column_counts_characters() {
     // Oracle (PR #150 round 3): `type t = "é" %a{…}` puts the annotation
     // at column 16 upstream; bytes would say 17. One Unicode scalar per
     // character (here 16 before it), a combining mark counted apart.
+    // `line_char_col` is what `conformance_rows` calls — the row's column,
+    // not a shifted offset's byte column.
     let src = "iface\ntype t = \"é😀e\u{301}\" %a{x}\n";
     let off = src.find("%a").unwrap();
-    let fixed = off - char_column_delta(src, off);
-    assert_eq!(line_col(src, fixed), (2, 17));
+    assert_eq!(line_char_col(src, off), (2, 17));
     assert_eq!(char_column_delta("abc %a", 4), 0);
 }
 
@@ -122,7 +123,7 @@ fn line_col_start_of_line_and_eof() {
 
 
 /// Capture github output for a slice of findings without spawning a process.
-fn github_all(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> String {
+fn github_all(findings: &[Finding]) -> String {
     diagnostic_formats::render_github(&to_rendered(findings))
 }
 
@@ -132,17 +133,17 @@ fn github_empty_when_no_diagnostics() {
 }
 
 /// The REAL SARIF renderer's output, re-parsed.
-fn sarif_value(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> serde_json::Value {
+fn sarif_value(findings: &[Finding]) -> serde_json::Value {
     serde_json::from_str(&diagnostic_formats::render_sarif(&to_rendered(findings))).unwrap()
 }
 
-fn finding(rule: &'static str, sev: Severity, msg: &str) -> (usize, String, (usize, usize), Diagnostic) {
-    (0, "f.rb".to_string(), (1, 1), diag(rule, sev, msg))
+fn finding(rule: &'static str, sev: Severity, msg: &str) -> Finding {
+    Finding::run_level(0, "f.rb".to_string(), diag(rule, sev, msg))
 }
 
 /// A finding with NO rule — what `parse_diagnostics` produces.
-fn finding_ruleless(msg: &str) -> (usize, String, (usize, usize), Diagnostic) {
-    (0, "f.rb".to_string(), (1, 1), diag(rigor_rules::NO_RULE, Severity::Error, msg))
+fn finding_ruleless(msg: &str) -> Finding {
+    Finding::run_level(0, "f.rb".to_string(), diag(rigor_rules::NO_RULE, Severity::Error, msg))
 }
 
 #[test]
@@ -444,21 +445,21 @@ fn prepend_path_errors_severity_and_placement() {
         PathError { path: "x.txt".into(), not_found: false },
     ];
     // any_files = true ⇒ warnings, "(skipped)" suffix.
-    let mut findings = vec![(0usize, "a.rb".to_string(), (1, 1),
+    let mut findings = vec![Finding::run_level(0, "a.rb".to_string(),
         diag("call.undefined-method", Severity::Error, "boom"))];
     prepend_path_errors(&mut findings, &errs, true);
     assert_eq!(findings.len(), 3);
-    assert_eq!(findings[0].3.rule_id, "path.not-found");
-    assert_eq!(findings[0].3.severity, Severity::Warning);
-    assert!(findings[0].3.message.ends_with("(skipped)"));
-    assert_eq!(findings[1].3.rule_id, "path.not-ruby");
-    assert_eq!(findings[2].3.rule_id, "call.undefined-method", "code finding kept, after errors");
+    assert_eq!(findings[0].diag.rule_id, "path.not-found");
+    assert_eq!(findings[0].diag.severity, Severity::Warning);
+    assert!(findings[0].diag.message.ends_with("(skipped)"));
+    assert_eq!(findings[1].diag.rule_id, "path.not-ruby");
+    assert_eq!(findings[2].diag.rule_id, "call.undefined-method", "code finding kept, after errors");
 
     // any_files = false ⇒ errors, no suffix.
     let mut empty = Vec::new();
     prepend_path_errors(&mut empty, &errs, false);
-    assert_eq!(empty[0].3.severity, Severity::Error);
-    assert!(!empty[0].3.message.ends_with("(skipped)"));
+    assert_eq!(empty[0].diag.severity, Severity::Error);
+    assert!(!empty[0].diag.message.ends_with("(skipped)"));
 }
 
 // --- ADR-22 slice 5 `--baseline-strict` -------------------------------
@@ -621,7 +622,7 @@ fn analyze_files_discovers_config_paths_declarations() {
         false,
     );
     assert!(!io_err);
-    let messages: Vec<&str> = findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+    let messages: Vec<&str> = findings.iter().map(|f| f.diag.message.as_str()).collect();
     assert!(
         !messages.iter().any(|m| m.contains("`zz'")),
         "cross-file `attr_accessor :zz` suppresses; got {messages:?}"
@@ -679,7 +680,7 @@ fn analyze_files_declared_paths_resolve_against_config_dir() {
         false,
     );
     assert!(!io_err);
-    let messages: Vec<&str> = findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+    let messages: Vec<&str> = findings.iter().map(|f| f.diag.message.as_str()).collect();
     assert!(
         !messages.iter().any(|m| m.contains("`zz'")),
         "config-relative `paths:` sees cfg/lib's accessor; got {messages:?}"
@@ -728,7 +729,7 @@ fn analyze_files_dup_argv_does_not_widen() {
         false,
     );
     assert!(
-        one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+        one.iter().any(|f| f.diag.message.contains("`upcase'")),
         "widened discovery must see Foo#bar; got {one:?}"
     );
 
@@ -834,7 +835,7 @@ fn analyze_files_exclude_shrinks_widened_count() {
         false,
     );
     assert!(
-        one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+        one.iter().any(|f| f.diag.message.contains("`upcase'")),
         "widened discovery must see Foo#bar; got {one:?}"
     );
 
@@ -890,7 +891,7 @@ fn analyze_files_builtin_excludes_drop_discovery_items() {
         false,
     );
     let messages: Vec<&str> =
-        findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        findings.iter().map(|f| f.diag.message.as_str()).collect();
     // `Ok.new.zz.upcase` firing (Integer#upcase) proves ok.rb WAS
     // discovered; the absence of a SECOND `upcase` (Foo#bar's) proves
     // node_modules/x.rb was not.
@@ -957,7 +958,7 @@ fn analyze_files_repeated_paths_dedup_in_union() {
         false,
     );
     assert!(
-        one.iter().any(|(_, _, _, d)| d.message.contains("`upcase'")),
+        one.iter().any(|f| f.diag.message.contains("`upcase'")),
         "single-arg row still widens; got {one:?}"
     );
 
@@ -1001,7 +1002,7 @@ fn analyze_files_class_pattern_decided_exactly() {
         false,
     );
     let messages: Vec<&str> =
-        findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        findings.iter().map(|f| f.diag.message.as_str()).collect();
     assert!(
         !messages.iter().any(|m| m.contains("`upcase'")),
         "exact `fnmatch` decides the class pattern — foo.rb is excluded; got {messages:?}"
@@ -1052,7 +1053,7 @@ fn analyze_files_class_pattern_no_match_on_dup_argv() {
         false,
     );
     let messages: Vec<&str> =
-        findings.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+        findings.iter().map(|f| f.diag.message.as_str()).collect();
     assert!(
         !messages.iter().any(|m| m.contains("`upcase'")),
         "[q]zz.rb matches nothing — widened count stays equal; got {messages:?}"
@@ -1159,7 +1160,7 @@ fn a_real_panic_keeps_the_internal_panic_wording() {
     let _ = std::fs::remove_dir_all(&root);
 
     let internal: Vec<&Diagnostic> =
-        findings.iter().map(|(_, _, _, d)| d).filter(|d| d.rule_id == "internal-error").collect();
+        findings.iter().map(|f| &f.diag).filter(|d| d.rule_id == "internal-error").collect();
     assert_eq!(internal.len(), 1, "{findings:?}");
     // The payload text itself is whatever stage 3's isolation recovers;
     // the wording around it is the control.
@@ -1213,7 +1214,7 @@ fn a_file_past_the_depth_bound_carries_the_refusal_message() {
         .join()
         .unwrap();
     assert_eq!(findings.len(), 1, "{findings:?}");
-    let d = &findings[0].3;
+    let d = &findings[0].diag;
     assert_eq!(d.rule_id, "internal-error");
     assert_eq!(d.severity, Severity::Info);
     assert_eq!(
@@ -1384,15 +1385,14 @@ fn pre_eval_glob_directory_match_earns_not_found_row() {
     );
     let rows: Vec<_> = findings
         .iter()
-        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .filter(|f| f.diag.rule_id == "pre-eval.file-not-found")
         .collect();
     assert_eq!(rows.len(), 1, "one row for the directory match; got {findings:?}");
-    let (_, path, pos, d) = rows[0];
-    assert_eq!(path, ".rigor.yml");
-    assert_eq!(*pos, (1, 1));
-    assert_eq!(d.severity, Severity::Error);
+    assert_eq!(rows[0].path, ".rigor.yml");
+    assert_eq!((rows[0].line, rows[0].column), (1, 1));
+    assert_eq!(rows[0].diag.severity, Severity::Error);
     assert_eq!(
-        d.message,
+        rows[0].diag.message,
         format!(
             "pre_eval entry not found: {:?}. Pre-evaluation requires the file to exist on disk; \
              remove the entry or create the file before re-running analysis.",
@@ -1434,10 +1434,10 @@ fn pre_eval_glob_file_and_directory_rows_only_the_directory() {
     );
     let rows: Vec<_> = findings
         .iter()
-        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .filter(|f| f.diag.rule_id == "pre-eval.file-not-found")
         .collect();
     assert_eq!(rows.len(), 1, "the file match earns no row; got {findings:?}");
-    let d = &rows[0].3;
+    let d = &rows[0].diag;
     let dir = root.join("setup.d").display().to_string();
     assert!(
         d.message.contains(&format!("{dir:?}")),
@@ -1477,14 +1477,14 @@ fn pre_eval_glob_no_match_is_silent_literal_still_fires() {
     );
     let rows: Vec<_> = findings
         .iter()
-        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .filter(|f| f.diag.rule_id == "pre-eval.file-not-found")
         .collect();
     assert_eq!(rows.len(), 1, "the matchless glob is silent; got {findings:?}");
     let absent = root.join("absent.rb").display().to_string();
     assert!(
-        rows[0].3.message.contains(&format!("{absent:?}")),
+        rows[0].diag.message.contains(&format!("{absent:?}")),
         "the literal entry still earns its row; got {}",
-        rows[0].3.message
+        rows[0].diag.message
     );
     let _ = std::fs::remove_dir_all(&root);
 }
@@ -1529,7 +1529,7 @@ fn pre_eval_rows_follow_expanded_stream_order_and_uniq() {
     );
     let rows: Vec<_> = findings
         .iter()
-        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .filter(|f| f.diag.rule_id == "pre-eval.file-not-found")
         .collect();
     let expected: Vec<String> = ["x.d", "y.d", "lib/b.rb"]
         .iter()
@@ -1541,7 +1541,7 @@ fn pre_eval_rows_follow_expanded_stream_order_and_uniq() {
             )
         })
         .collect();
-    let got: Vec<&str> = rows.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+    let got: Vec<&str> = rows.iter().map(|f| f.diag.message.as_str()).collect();
     assert_eq!(
         got,
         expected.iter().map(String::as_str).collect::<Vec<_>>(),

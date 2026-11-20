@@ -224,14 +224,14 @@ fn run_current(
 
     Ok(findings
         .iter()
-        .map(|(_order, path, pos, diag)| diagnostic_value(path, *pos, diag))
+        .map(|f| diagnostic_value(&f.path, (f.line, f.column), &f.diag))
         .collect())
 }
 
 /// Build one diagnostic JSON object with the same fields (and omit-when-none
 /// rules) as `crate::print_json`, so identity + full-object echo are stable
 /// against a rigor-rs `check --format json` baseline. `(line, column)` rides
-/// the findings tuple — resolved once at production, not re-walked here.
+/// the findings row — resolved once at production, not re-walked here.
 fn diagnostic_value(path: &str, (line, col): (usize, usize), diag: &Diagnostic) -> Value {
     let mut map = serde_json::Map::new();
     map.insert("path".into(), json!(path));

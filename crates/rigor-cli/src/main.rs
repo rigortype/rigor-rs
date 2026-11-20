@@ -1039,10 +1039,9 @@ fn cmd_check(args: &[String]) -> ExitCode {
         match cfg.target_ruby_failure()
     {
         Some(message) => (
-            vec![(
-                0usize,
+            vec![Finding::run_level(
+                0,
                 ".rigor.yml".to_string(),
-                (1, 1),
                 Diagnostic {
                     rule_id: "configuration-error",
                     start_offset: 0,
@@ -1137,7 +1136,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // (BEFORE `apply_baseline_filter`), so the gate sees deficit drift a bucket
     // would otherwise silence. Only snapshot when the flag is set; a clone
     // avoids threading a borrow through the mutate-in-place filter below.
-    let raw_findings: Vec<(usize, String, (usize, usize), Diagnostic)> =
+    let raw_findings: Findings =
         if baseline_strict { findings.clone() } else { Vec::new() };
 
     // ADR-22 — baseline filter, applied LAST (after inline `# rigor:disable`
@@ -1203,7 +1202,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // finding (see `finding_fails_run`); a warning-only run — including a
     // warn-and-skip bad path alongside analyzed files — exits 0.
     let normal_fail =
-        had_io_error || findings.iter().any(|(_, _, _, d)| finding_fails_run(d));
+        had_io_error || findings.iter().any(|f| finding_fails_run(&f.diag));
 
     // Issue #812 — `--fail-on=SEVERITY` (the reference's `fail_on_violation?`):
     // a diagnostic at or above the threshold — over the SAME baseline-filtered
@@ -1211,7 +1210,7 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // `normal_fail`'s severity half.
     let fail_on_hit = findings
         .iter()
-        .any(|(_, _, _, d)| severity_rank(d.severity) >= severity_rank(fail_on));
+        .any(|f| severity_rank(f.diag.severity) >= severity_rank(fail_on));
 
     // ADR-22 slice 5 — the `--baseline-strict` gate runs LAST (after all normal
     // stdout diagnostics + stderr stats/silenced lines) so its report is the
@@ -1341,7 +1340,7 @@ fn severity_rank(s: Severity) -> u8 {
 ///   `... (continuing without baseline)`, and BOTH messages must appear in a run
 ///   with a malformed file, so we deliberately do not dedupe.
 fn baseline_strict_violation(
-    raw_findings: &[(usize, String, (usize, usize), Diagnostic)],
+    raw_findings: &[Finding],
     cfg: &Config,
     baseline_arg: &BaselineArg,
 ) -> bool {
@@ -1365,7 +1364,7 @@ fn baseline_strict_violation(
     let cwd = std::env::current_dir().ok();
     let entries: Vec<(String, &Diagnostic)> = raw_findings
         .iter()
-        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .map(|f| (relative_path(&f.path, cwd.as_deref()), &f.diag))
         .collect();
 
     let rows = baseline.audit(&entries);
@@ -1452,7 +1451,7 @@ fn finding_fails_run(d: &Diagnostic) -> bool {
 /// shared project source, applying config `exclude:`/`disable:` and inline
 /// `(findings, had_io_error, (rbs_total, rbs_project_sig))` — the counts
 /// feed the `check` run-stats summary (rigor-rs#502).
-type AnalysisOutcome = (Vec<(usize, String, (usize, usize), Diagnostic)>, bool, (usize, usize));
+type AnalysisOutcome = (Findings, bool, (usize, usize));
 
 /// `# rigor:disable` suppression. Returns [`AnalysisOutcome`] with
 /// findings in input order. The baseline filter is NOT applied here — that is
@@ -1641,7 +1640,7 @@ pub(crate) fn collect_rb_files(dir: &Path, out: &mut Vec<String>) {
 /// the run-level rows — so they land after any leading `pre-eval.*` rows
 /// `analyze_files` emitted but still ahead of every per-file finding.
 fn prepend_path_errors(
-    findings: &mut Vec<(usize, String, (usize, usize), Diagnostic)>,
+    findings: &mut Findings,
     errors: &[PathError],
     any_files: bool,
 ) {
@@ -1650,7 +1649,7 @@ fn prepend_path_errors(
     }
     let severity = if any_files { Severity::Warning } else { Severity::Error };
     let suffix = if any_files { " (skipped)" } else { "" };
-    let injected: Vec<(usize, String, (usize, usize), Diagnostic)> = errors
+    let injected: Findings = errors
         .iter()
         .map(|e| {
             let (rule, base): (&'static str, &str) = if e.not_found {
@@ -1668,7 +1667,7 @@ fn prepend_path_errors(
                 receiver_type: None,
                 method_name: None,
             };
-            (0usize, e.path.clone(), (1, 1), diag)
+            Finding::run_level(0, e.path.clone(), diag)
         })
         .collect();
     // The leading run-level span is `plugin_loader.*` rows then `pre-eval.*`
@@ -1677,8 +1676,8 @@ fn prepend_path_errors(
     // the per-file stream).
     let n_run = findings
         .iter()
-        .take_while(|(_, _, _, d)| {
-            d.rule_id.starts_with("plugin_loader.") || d.rule_id.starts_with("pre-eval.")
+        .take_while(|f| {
+            f.diag.rule_id.starts_with("plugin_loader.") || f.diag.rule_id.starts_with("pre-eval.")
         })
         .count();
     let tail = findings.split_off(n_run);
@@ -1717,7 +1716,7 @@ fn pre_eval_not_found_rows(
     profile: severity::Profile,
     user_overrides: &[(String, severity::ResolvedSeverity)],
     bleeding_overrides: &[(&str, severity::ResolvedSeverity)],
-) -> Vec<(usize, String, (usize, usize), Diagnostic)> {
+) -> Findings {
     if cfg.pre_eval.is_empty()
         || rigor_rules::config_disables_pre_eval(&cfg.disable, "pre-eval.file-not-found")
     {
@@ -1742,7 +1741,7 @@ fn pre_eval_not_found_rows(
     // entries produce — a glob and the same path spelled literally — earns
     // ONE row, at its first occurrence.
     let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
-    let mut rows: Vec<(usize, String, (usize, usize), Diagnostic)> = Vec::new();
+    let mut rows: Findings = Vec::new();
     for entry in &cfg.pre_eval {
         // `None` — a brace group or malformed pattern whose match set the
         // port cannot reproduce: the entry earns no row (declining).
@@ -1753,10 +1752,9 @@ fn pre_eval_not_found_rows(
             if !seen.insert(path.clone()) || std::path::Path::new(&path).is_file() {
                 continue;
             }
-            rows.push((
-                0usize,
+            rows.push(Finding::run_level(
+                0,
                 ".rigor.yml".to_string(),
-                (1, 1),
                 Diagnostic {
                     rule_id: "pre-eval.file-not-found",
                     start_offset: 0,
@@ -1860,8 +1858,8 @@ fn analyze_files(
         core_root.as_deref(),
     );
     let t_index = std::time::Instant::now();
-    // Each entry: (input_order_key, path, (line, column), diagnostic).
-    let mut findings: Vec<(usize, String, (usize, usize), Diagnostic)> = Vec::new();
+    // Each entry: a [`Finding`] (input-order key, path, line, column, diagnostic).
+    let mut findings: Findings = Vec::new();
     let mut had_io_error = false;
 
     // PROJECT PASS (ADR-0023 cross-file): parse+lower+HARVEST every file first,
@@ -2256,12 +2254,8 @@ fn analyze_files(
                 // `disable:`, and not silenced by a `# rigor:disable` marker.
                 let lines = rigor_parse::LineIndex::new(source.as_bytes());
                 for diag in diags {
-                    findings.push((
-                        order,
-                        path.clone(),
-                        lines.line_col(diag.start_offset),
-                        diag,
-                    ));
+                    let (line, column) = lines.line_col(diag.start_offset);
+                    findings.push(Finding { order, path: path.clone(), line, column, diag });
                 }
             }
             Stage1::IoError { path, msg } => {
@@ -2270,11 +2264,11 @@ fn analyze_files(
             }
             Stage1::Panic { order, path, msg } => {
                 eprintln!("{}", internal_panic_line(verb, &path, &msg));
-                findings.push((order, path, (1, 1), internal_error_diag(msg)));
+                findings.push(Finding::run_level(order, path, internal_error_diag(msg)));
             }
             Stage1::TooDeep { order, path, msg } => {
                 eprintln!("{}", depth_skip_line(verb, &path, &msg));
-                findings.push((order, path, (1, 1), depth_refusal_diag(msg)));
+                findings.push(Finding::run_level(order, path, depth_refusal_diag(msg)));
             }
         }
     }
@@ -2320,7 +2314,7 @@ fn analyze_files(
     // and, on a panic, the synthetic internal-error finding plus a DEFERRED
     // stderr line — all order-keyed, so the serial drain replays them in order.
     struct Stage3 {
-        findings: Vec<(usize, String, (usize, usize), Diagnostic)>,
+        findings: Findings,
         /// `(path, msg)` for a panic's deferred (in-order) stderr line.
         panic: Option<(String, String)>,
     }
@@ -2416,19 +2410,24 @@ fn analyze_files(
                                 }
                             }
                         }
-                        local.push((
-                            p.order,
-                            p.path.clone(),
-                            lines.line_col(diag.start_offset),
+                        let (line, column) = lines.line_col(diag.start_offset);
+                        local.push(Finding {
+                            order: p.order,
+                            path: p.path.clone(),
+                            line,
+                            column,
                             diag,
-                        ));
+                        });
                     }
                     Stage3 { findings: local, panic: None }
                 }
                 Err(panic_val) => {
                     let msg = panic_message(&panic_val);
-                    let finding =
-                        (p.order, p.path.clone(), (1, 1), internal_error_diag(msg.clone()));
+                    let finding = Finding::run_level(
+                        p.order,
+                        p.path.clone(),
+                        internal_error_diag(msg.clone()),
+                    );
                     Stage3 { findings: vec![finding], panic: Some((p.path.clone(), msg)) }
                 }
             }
@@ -2446,7 +2445,7 @@ fn analyze_files(
     let t_stage3 = std::time::Instant::now();
 
     // Restore input order (stage-1 panics and stage-3 findings interleave by order).
-    findings.sort_by_key(|(order, _, _, _)| *order);
+    findings.sort_by_key(|f| f.order);
 
     // The leading run-level span, in upstream `pre_file_diagnostics` order:
     // `plugin_loader.load-error` rows FIRST, then the `pre-eval.*` stream
@@ -2456,14 +2455,13 @@ fn analyze_files(
     // `severity_profile:` and `severity_overrides:` entirely upstream
     // (SeverityStamp is not applied to them — oracle: `plugin_loader: "off"`
     // leaves the row at error), so they carry their authored severity.
-    let mut run_rows: Vec<(usize, String, (usize, usize), Diagnostic)> = plugin_resolution
+    let mut run_rows: Findings = plugin_resolution
         .load_errors
         .iter()
         .map(|row| {
-            (
-                0usize,
+            Finding::run_level(
+                0,
                 ".rigor.yml".to_string(),
-                (1, 1),
                 Diagnostic {
                     rule_id: row.rule_id,
                     start_offset: 0,
@@ -2496,10 +2494,9 @@ fn analyze_files(
     for row in plugin_resolution.emitted.iter().filter(|row| {
         !rigor_rules::config_disables_plugin_row(&cfg.disable, row.source_family, row.rule_id)
     }) {
-        findings.push((
-            0usize,
+        findings.push(Finding::run_level(
+            0,
             ".rigor.yml".to_string(),
-            (1, 1),
             Diagnostic {
                 rule_id: row.rule_id,
                 start_offset: 0,
@@ -2638,7 +2635,7 @@ fn conformance_rows(
     profile: severity::Profile,
     user_overrides: &[(String, severity::ResolvedSeverity)],
     bleeding_overrides: &[(&str, severity::ResolvedSeverity)],
-) -> Vec<(usize, String, (usize, usize), Diagnostic)> {
+) -> Findings {
     let mut rows = Vec::new();
     for f in index.conformance_findings() {
         let resolved = severity::resolve(
@@ -2661,28 +2658,32 @@ fn conformance_rows(
         };
         // RBS reports the annotation's column in CHARACTERS (Unicode scalar
         // values: oracle-measured with 2-, 3- and 4-byte characters and a
-        // combining mark before it), where `line_col` counts bytes. Shift the
-        // offset back by the difference so the shared renderer prints the
-        // reference's column.
-        let delta = char_column_delta(source, f.start_offset);
+        // combining mark before it), where `line_col` counts bytes. The row
+        // stores the character column, while the diagnostic keeps honest
+        // offsets — the position is resolved once, here.
         let diag = Diagnostic {
             rule_id: f.rule_id(),
-            start_offset: f.start_offset - delta,
-            end_offset: f.end_offset.saturating_sub(delta),
+            start_offset: f.start_offset,
+            end_offset: f.end_offset,
             message: f.message(),
             severity,
             source_family: "builtin",
             receiver_type: None,
             method_name: None,
         };
-        rows.push((
-            usize::MAX,
-            f.file.to_string(),
-            line_col(source, diag.start_offset),
-            diag,
-        ));
+        let (line, column) = line_char_col(source, f.start_offset);
+        rows.push(Finding { order: usize::MAX, path: f.file.to_string(), line, column, diag });
     }
     rows
+}
+
+/// `(line, column)` of `offset` with the column counted in CHARACTERS — the
+/// unit RBS reports for `%a{…}` annotations — rather than [`line_col`]'s
+/// bytes. `delta` is a within-line difference, so the subtraction can never
+/// cross a line break (or underflow the 1-based column).
+fn line_char_col(source: &str, offset: usize) -> (usize, usize) {
+    let (line, column) = line_col(source, offset);
+    (line, column - char_column_delta(source, offset))
 }
 
 /// Bytes minus characters between the start of `offset`'s line and `offset`
@@ -2750,16 +2751,46 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
     }
 }
 
-/// One findings row — see [`Findings`].
-type Finding = (usize, String, (usize, usize), Diagnostic);
+/// One findings row — see [`Findings`]. Named fields, not the old
+/// `(order, path, (line, column), diagnostic)` tuple: a bare `usize` order
+/// key next to a `(usize, usize)` position was a silent transpose hazard.
+#[derive(Clone, Debug)]
+struct Finding {
+    /// Input-order sort key — consulted ONCE, by `findings.sort_by_key`
+    /// (stable, so equal keys keep insertion order) to interleave the
+    /// stage-1 and stage-3 per-file rows by the file's worklist index. Rows
+    /// produced after that sort carry documentary values: `0` on the
+    /// leading run-level span (prepended), `usize::MAX` on the trailing
+    /// `rigor:v1:conforms-to` rows (appended).
+    order: usize,
+    path: String,
+    /// 1-based line, resolved ONCE where the row is produced — stage 3 and
+    /// the parse-error drain read a [`rigor_parse::LineIndex`] per file;
+    /// run- and path-level rows carry `1` (see [`Finding::run_level`]).
+    line: usize,
+    /// 1-based column, resolved alongside `line`.
+    column: usize,
+    diag: Diagnostic,
+}
 
-/// A run's findings: `(input-order, path, (line, column), diagnostic)`
-/// tuples. The position is resolved ONCE where the row is produced (stage 3
-/// and the parse-error drain read a [`rigor_parse::LineIndex`] per file; run- and
-/// path-level rows carry `(1, 1)`): the tuple used to lug a full clone of the
-/// file's source so the renderers could re-walk it per row — O(diagnostics ×
-/// file bytes) in both memory and time, rigor-rs#636's 160 s / ~49 GB
-/// footprint on a 60k-diagnostic file.
+impl Finding {
+    /// A positionless row — run-level (`plugin_loader.*`, `pre-eval.*`,
+    /// `expansion.errors`, the `configuration-error` early return),
+    /// path-level, or a file's panic/depth-refusal sentinel — printed at
+    /// `1:1`. `order` is the file's own index for the sentinel rows so they
+    /// sort back beside that file's findings; for the run-level rows — made
+    /// after the sort, then prepended/appended — any value would do, so
+    /// `0`/`usize::MAX` document the intent.
+    fn run_level(order: usize, path: String, diag: Diagnostic) -> Self {
+        Self { order, path, line: 1, column: 1, diag }
+    }
+}
+
+/// A run's findings. The position is resolved ONCE where the row is produced
+/// (run- and path-level rows carry `1:1`): the row used to lug a full clone
+/// of the file's source so the renderers could re-walk it per row —
+/// O(diagnostics × file bytes) in both memory and time, rigor-rs#636's
+/// 160 s / ~49 GB footprint on a 60k-diagnostic file.
 type Findings = Vec<Finding>;
 
 /// The baseline subcommand switch tables — `parse_generate_options` /
@@ -2881,12 +2912,12 @@ fn baseline_analysis(
 /// Relativize findings against cwd, as the baseline matcher keys on
 /// project-root-relative paths (the reference's `Dir.pwd`).
 fn baseline_entries(
-    findings: &[(usize, String, (usize, usize), Diagnostic)],
+    findings: &[Finding],
 ) -> Vec<(String, &Diagnostic)> {
     let cwd = std::env::current_dir().ok();
     findings
         .iter()
-        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .map(|f| (relative_path(&f.path, cwd.as_deref()), &f.diag))
         .collect()
 }
 
@@ -3084,9 +3115,9 @@ fn write_baseline(
     // errors) are reported separately by `report_unbaselineable`.
     let mut no_rule_paths: Vec<String> = path_error_paths;
     no_rule_paths.extend(
-        findings.iter().filter(|(_, _, _, d)| d.qualified_rule().is_none()).map(|(_, p, _, _)| p.clone()),
+        findings.iter().filter(|f| f.diag.qualified_rule().is_none()).map(|f| f.path.clone()),
     );
-    let covered = entries.len() - findings.iter().filter(|(_, _, _, d)| d.qualified_rule().is_none()).count();
+    let covered = entries.len() - findings.iter().filter(|f| f.diag.qualified_rule().is_none()).count();
     eprintln!(
         "rigor: {verb} {output} ({} bucket(s) covering {covered} diagnostic(s); match-mode: {mode_str})",
         baseline.size(),
@@ -3466,9 +3497,9 @@ fn resolve_baseline_path(arg: &BaselineArg, cfg: &Config) -> Option<String> {
 /// matcher keys each diagnostic on its project-root-relative path, exactly as
 /// the reference normalizes `diag.path` against `Dir.pwd`.
 fn apply_baseline(
-    findings: Vec<(usize, String, (usize, usize), Diagnostic)>,
+    findings: Findings,
     path: &str,
-) -> Vec<(usize, String, (usize, usize), Diagnostic)> {
+) -> Findings {
     let baseline = match Baseline::load(Path::new(path)) {
         Ok(b) => b,
         Err(e) => {
@@ -3486,7 +3517,7 @@ fn apply_baseline(
     let cwd = std::env::current_dir().ok();
     let entries: Vec<(String, &Diagnostic)> = findings
         .iter()
-        .map(|(_, p, _, d)| (relative_path(p, cwd.as_deref()), d))
+        .map(|f| (relative_path(&f.path, cwd.as_deref()), &f.diag))
         .collect();
 
     let (surfaced_idx, silenced) = baseline.filter(&entries);
@@ -3562,7 +3593,7 @@ fn cleanpath_components(path: &str) -> (bool, Vec<String>) {
 /// `--format text`: the reference's `write_text_result` — `Diagnostic#to_s`
 /// rows plus the `No diagnostics` / `N error(s) in M file(s)` summary, all on
 /// stdout (see [`diagnostic_formats::render_text`]).
-fn print_text(findings: &[(usize, String, (usize, usize), Diagnostic)]) {
+fn print_text(findings: &[Finding]) {
     print!("{}", diagnostic_formats::render_text(&to_rendered(findings)));
 }
 
@@ -3575,45 +3606,45 @@ fn print_text(findings: &[(usize, String, (usize, usize), Diagnostic)]) {
 ///
 /// `path/line/column/rule` are always present; the harness reads these.
 /// Hand-rolled (no serde dependency) — the field set is small and fixed.
-fn print_json(findings: &[(usize, String, (usize, usize), Diagnostic)]) {
+fn print_json(findings: &[Finding]) {
     println!("{}", json_document(findings));
 }
 
 /// The `--format json` payload as a string. Split out of [`print_json`] so a
 /// test can assert on the exact bytes rather than re-implementing the writer.
-fn json_document(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> String {
+fn json_document(findings: &[Finding]) -> String {
     let mut buf = String::from("[");
-    for (idx, (_order, path, (line, col), diag)) in findings.iter().enumerate() {
+    for (idx, f) in findings.iter().enumerate() {
         if idx > 0 {
             buf.push(',');
         }
         buf.push('{');
         // Mandatory fields — always present.
-        push_kv_str(&mut buf, "path", path, true);
-        push_kv_num(&mut buf, "line", *line);
-        push_kv_num(&mut buf, "column", *col);
-        push_kv_str(&mut buf, "severity", diag.severity.as_str(), false);
+        push_kv_str(&mut buf, "path", &f.path, true);
+        push_kv_num(&mut buf, "line", f.line);
+        push_kv_num(&mut buf, "column", f.column);
+        push_kv_str(&mut buf, "severity", f.diag.severity.as_str(), false);
         // A ruleless diagnostic (a parse error) serialises as JSON `null`, the
         // reference's `"rule" => rule` with `rule` nil — NOT `""`, which is a
         // different `(rule, line, column)` key for `harness/lib.rb`'s `DiagKey`
         // and would score the row as a gap AND an unregistered extra at once.
-        match diag.qualified_rule() {
-            Some(rule) => push_kv_str(&mut buf, "rule", json_rule_name(diag, rule), false),
+        match f.diag.qualified_rule() {
+            Some(rule) => push_kv_str(&mut buf, "rule", json_rule_name(&f.diag, rule), false),
             None => push_kv_raw(&mut buf, "rule", "null"),
         }
-        push_kv_str(&mut buf, "source_family", diag.source_family, false);
-        push_kv_str(&mut buf, "message", &diag.message, false);
+        push_kv_str(&mut buf, "source_family", f.diag.source_family, false);
+        push_kv_str(&mut buf, "message", &f.diag.message, false);
 
         // Optional call-dispatch fields — omit when None.
-        if let Some(rt) = &diag.receiver_type {
+        if let Some(rt) = &f.diag.receiver_type {
             push_kv_str(&mut buf, "receiver_type", rt, false);
         }
-        if let Some(mn) = &diag.method_name {
+        if let Some(mn) = &f.diag.method_name {
             push_kv_str(&mut buf, "method_name", mn, false);
         }
 
         // Per-rule catalogue fields — omit for unknown rules (e.g. internal-error).
-        if let Some(entry) = catalog(diag.rule_id) {
+        if let Some(entry) = catalog(f.diag.rule_id) {
             push_kv_str(&mut buf, "evidence_tier", entry.evidence_tier, false);
             push_kv_str(&mut buf, "documentation_url", entry.documentation_url, false);
         }
@@ -3646,7 +3677,7 @@ fn json_rule_name<'a>(diag: &Diagnostic, qualified: &'a str) -> &'a str {
 /// document is printed with a trailing newline (`@out.puts(output) unless
 /// output.empty?`).
 fn print_rendered(
-    findings: &[(usize, String, (usize, usize), Diagnostic)],
+    findings: &[Finding],
     render: fn(&[Rendered]) -> String,
 ) {
     let rows = to_rendered(findings);
@@ -3660,16 +3691,16 @@ fn print_rendered(
 /// production ([`rigor_parse::LineIndex::line_col`]) — into the fields the CI formatters read.
 /// `rule_id` is rigor-rs's qualified rule (the `builtin` family is kept bare
 /// in `rule_id`).
-fn to_rendered(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> Vec<Rendered<'_>> {
+fn to_rendered(findings: &[Finding]) -> Vec<Rendered<'_>> {
     findings
         .iter()
-        .map(|(_order, path, (line, column), diag)| Rendered {
-            path,
-            line: *line,
-            column: *column,
-            severity: diag.severity,
-            rule_id: diag.qualified_rule(),
-            message: &diag.message,
+        .map(|f| Rendered {
+            path: &f.path,
+            line: f.line,
+            column: f.column,
+            severity: f.diag.severity,
+            rule_id: f.diag.qualified_rule(),
+            message: &f.diag.message,
         })
         .collect()
 }
@@ -3679,7 +3710,7 @@ fn to_rendered(findings: &[(usize, String, (usize, usize), Diagnostic)]) -> Vec<
 /// platform's annotations are emitted on top of the human output; for GitLab
 /// (artifact-based) and reviewdog-routed CIs a one-line hint goes to stderr when
 /// there are diagnostics. No-op when no CI is detected or detection is disabled.
-fn emit_ci_detected_output(findings: &[(usize, String, (usize, usize), Diagnostic)]) {
+fn emit_ci_detected_output(findings: &[Finding]) {
     let Some(platform) = ci_detector::detect() else {
         return;
     };
