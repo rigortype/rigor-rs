@@ -1686,6 +1686,100 @@ fn prepend_path_errors(
     findings.extend(tail);
 }
 
+/// `DiagnosticAggregator#pre_eval_diagnostics` (the not-found stream,
+/// ADR-17 slice 1) — a run-level `:error` row for each member of the
+/// EXPANDED `pre_eval:` stream that is not a FILE on disk (the reference's
+/// `File.file?` — a directory earns the row too). The reference expands
+/// every entry at CONFIG LOAD (`Configuration#expand_pre_eval_entries`:
+/// `Dir.glob` / `RootedGlob.glob`, sorted, `.uniq`) and runs `File.file?`
+/// over that list, so a glob whose matches include a directory earns a row
+/// naming that match (#345), a glob that matches nothing earns none, and a
+/// literal — or rooted-literal (#1956) — entry is the single match for
+/// itself. The port re-expands per entry here
+/// (`pre_eval::expand_entry_for_rows`) with SUBSET glob semantics: a match
+/// the reference's `Dir.glob` does not also produce would be an FP row, the
+/// wrong side of `check`'s zero-FP bar, so a brace group or malformed
+/// pattern whose match set the port cannot reproduce earns no row either
+/// (declining, never an FP).
+///
+/// Run-level, not per-file: upstream these lead `pre_file_diagnostics` —
+/// AHEAD of the `expansion.errors` rows `prepend_path_errors` splices in
+/// (which is why that fn skips leading `pre-eval.*` entries) — and since
+/// v0.4.3 (#1892) the `disable:` list reaches them through
+/// `filter_suppressed` (exact id or `pre-eval` token; `disable: [all]`
+/// leaves the row standing), while `severity_overrides:` /
+/// `severity_profile:` DO re-stamp them (`SeverityStamp.apply` covers the
+/// whole stream). The `path:` is the literal ".rigor.yml" upstream even
+/// under `--config` or a `.rigor.dist.yml` discovery — the aggregator
+/// hard-codes it.
+fn pre_eval_not_found_rows(
+    cfg: &Config,
+    profile: severity::Profile,
+    user_overrides: &[(String, severity::ResolvedSeverity)],
+    bleeding_overrides: &[(&str, severity::ResolvedSeverity)],
+) -> Vec<(usize, String, (usize, usize), Diagnostic)> {
+    if cfg.pre_eval.is_empty()
+        || rigor_rules::config_disables_pre_eval(&cfg.disable, "pre-eval.file-not-found")
+    {
+        return Vec::new();
+    }
+    // #1892/#1948: the `disable:` list reaches these rows — the exact id,
+    // the `pre-eval` family token, or (since v0.4.4) `all`
+    // (`config_disables_pre_eval`).
+    let sev = match severity::resolve(
+        "pre-eval.file-not-found",
+        severity::ResolvedSeverity::Error,
+        profile,
+        user_overrides,
+        bleeding_overrides,
+    ) {
+        severity::ResolvedSeverity::Off => return Vec::new(),
+        severity::ResolvedSeverity::Error => Severity::Error,
+        severity::ResolvedSeverity::Warning => Severity::Warning,
+        severity::ResolvedSeverity::Info => Severity::Info,
+    };
+    // The expanded stream's `.uniq` (`expand_pre_eval_entries`): a match two
+    // entries produce — a glob and the same path spelled literally — earns
+    // ONE row, at its first occurrence.
+    let mut seen: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut rows: Vec<(usize, String, (usize, usize), Diagnostic)> = Vec::new();
+    for entry in &cfg.pre_eval {
+        // `None` — a brace group or malformed pattern whose match set the
+        // port cannot reproduce: the entry earns no row (declining).
+        let Some(matches) = pre_eval::expand_entry_for_rows(entry) else {
+            continue;
+        };
+        for path in matches {
+            if !seen.insert(path.clone()) || std::path::Path::new(&path).is_file() {
+                continue;
+            }
+            rows.push((
+                0usize,
+                ".rigor.yml".to_string(),
+                (1, 1),
+                Diagnostic {
+                    rule_id: "pre-eval.file-not-found",
+                    start_offset: 0,
+                    end_offset: 0,
+                    // `{path.inspect}` upstream — `{:?}` renders the same
+                    // double-quoted string for a path.
+                    message: format!(
+                        "pre_eval entry not found: {path:?}. \
+                         Pre-evaluation requires the file to exist on disk; \
+                         remove the entry or create the file before \
+                         re-running analysis."
+                    ),
+                    severity: sev,
+                    source_family: "builtin",
+                    receiver_type: None,
+                    method_name: None,
+                },
+            ));
+        }
+    }
+    rows
+}
+
 /// `files`: the expanded `.rb` file list to ANALYZE (one work item per entry,
 /// duplicates kept). `argv_roots`: the path arguments as the user wrote them,
 /// or `None` when the run's roots came from the config `paths:` fallback —
@@ -2354,23 +2448,11 @@ fn analyze_files(
     // Restore input order (stage-1 panics and stage-3 findings interleave by order).
     findings.sort_by_key(|(order, _, _, _)| *order);
 
-    // ADR-17 slice 1 — `pre-eval.file-not-found`: a run-level `:error` row for
-    // each `pre_eval:` entry that is not a FILE on disk (the reference's
-    // `File.file?` — a directory earns the row too). Run-level, not per-file:
-    // upstream these lead `pre_file_diagnostics` — AHEAD of the
-    // `expansion.errors` rows `prepend_path_errors` splices in (which is why
-    // that fn skips leading `pre-eval.*` entries) — and since v0.4.3 (#1892)
-    // the `disable:` list reaches them through `filter_suppressed` (exact id
-    // or `pre-eval` token; `disable: [all]` leaves the row standing), while `severity_overrides:` / `severity_profile:`
-    // DO re-stamp them (`SeverityStamp.apply` covers the whole stream). The
-    // `path:` is the literal ".rigor.yml" upstream even under `--config` or a
-    // `.rigor.dist.yml` discovery — the aggregator hard-codes it. Glob-meta
-    // entries (`*`, `?`, `[`) are `Dir.glob`'d into concrete files upstream
-    // (`expand_pre_eval_entries`) and never earn this row, matched or not.
-    // `pre_file_diagnostics` order upstream: `plugin_loader.load-error` rows
-    // FIRST, then the pre-eval stream, then (streams the port does not carry)
-    // and finally `expansion.errors` — which `prepend_path_errors` splices in
-    // after the leading run-level rows. Load-error rows bypass `disable:`,
+    // The leading run-level span, in upstream `pre_file_diagnostics` order:
+    // `plugin_loader.load-error` rows FIRST, then the `pre-eval.*` stream
+    // (`pre_eval_not_found_rows`), then (streams the port does not carry)
+    // and finally `expansion.errors` — which `prepend_path_errors` splices
+    // in after the leading run-level rows. Load-error rows bypass `disable:`,
     // `severity_profile:` and `severity_overrides:` entirely upstream
     // (SeverityStamp is not applied to them — oracle: `plugin_loader: "off"`
     // leaves the row at error), so they carry their authored severity.
@@ -2396,57 +2478,12 @@ fn analyze_files(
         })
         .collect();
 
-    if !cfg.pre_eval.is_empty() {
-        // `expand_pre_eval_entries` ends in `.uniq` — a duplicated literal
-        // entry earns ONE row upstream, not one per mention.
-        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-        for entry in &cfg.pre_eval {
-            // #1892/#1948: the `disable:` list reaches these rows — the exact
-            // id, the `pre-eval` family token, or (since v0.4.4) `all`
-            // (`config_disables_pre_eval`).
-            if !seen.insert(entry.as_str())
-                || entry.contains(['*', '?', '['])
-                || std::path::Path::new(entry).is_file()
-                || rigor_rules::config_disables_pre_eval(&cfg.disable, "pre-eval.file-not-found")
-            {
-                continue;
-            }
-            let sev = match severity::resolve(
-                "pre-eval.file-not-found",
-                severity::ResolvedSeverity::Error,
-                profile,
-                &user_overrides,
-                &bleeding_overrides,
-            ) {
-                severity::ResolvedSeverity::Off => continue,
-                severity::ResolvedSeverity::Error => Severity::Error,
-                severity::ResolvedSeverity::Warning => Severity::Warning,
-                severity::ResolvedSeverity::Info => Severity::Info,
-            };
-            run_rows.push((
-                0usize,
-                ".rigor.yml".to_string(),
-                (1, 1),
-                Diagnostic {
-                    rule_id: "pre-eval.file-not-found",
-                    start_offset: 0,
-                    end_offset: 0,
-                    // `{path.inspect}` upstream — `{:?}` renders the same
-                    // double-quoted string for a path.
-                    message: format!(
-                        "pre_eval entry not found: {entry:?}. \
-                         Pre-evaluation requires the file to exist on disk; \
-                         remove the entry or create the file before \
-                         re-running analysis."
-                    ),
-                    severity: sev,
-                    source_family: "builtin",
-                    receiver_type: None,
-                    method_name: None,
-                },
-            ));
-        }
-    }
+    run_rows.extend(pre_eval_not_found_rows(
+        cfg,
+        profile,
+        &user_overrides,
+        &bleeding_overrides,
+    ));
     run_rows.append(&mut findings);
     findings = run_rows;
 

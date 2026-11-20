@@ -1349,3 +1349,203 @@ fn analysis_commands_build_the_pool_first() {
         );
     }
 }
+
+/// Issue #345 — a `pre_eval:` glob that matches a DIRECTORY earns the
+/// reference's `pre-eval.file-not-found` row for that match: upstream
+/// `Configuration#expand_pre_eval_entries` glob-expands every entry at
+/// config load and `DiagnosticAggregator#pre_eval_diagnostics` runs
+/// `File.file?` over the EXPANDED stream, so the directory is a stream
+/// member that fails the check (oracle: exit 1, one row at
+/// `.rigor.yml:1:1`).
+#[test]
+fn pre_eval_glob_directory_match_earns_not_found_row() {
+    let root = std::env::temp_dir().join(format!(
+        "rigor_preeval_dir_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(root.join("setup.d")).unwrap();
+    std::fs::write(root.join("lib/a.rb"), b"class A; end\n").unwrap();
+    std::fs::write(root.join(".rigor.yml"), b"pre_eval: [\"setup*\"]\n").unwrap();
+    let crate::config::ConfigRead::Parsed(cfg) = Config::read(&root.join(".rigor.yml")) else {
+        panic!("config must parse");
+    };
+    let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
+    let (findings, _io_err, _rbs) = analyze_files(
+        &[a_rb.as_str()],
+        Some(&[a_rb.as_str()]),
+        &cfg,
+        "check",
+        None,
+        &config::BleedingEdgeSelector::None,
+        false,
+    );
+    let rows: Vec<_> = findings
+        .iter()
+        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .collect();
+    assert_eq!(rows.len(), 1, "one row for the directory match; got {findings:?}");
+    let (_, path, pos, d) = rows[0];
+    assert_eq!(path, ".rigor.yml");
+    assert_eq!(*pos, (1, 1));
+    assert_eq!(d.severity, Severity::Error);
+    assert_eq!(
+        d.message,
+        format!(
+            "pre_eval entry not found: {:?}. Pre-evaluation requires the file to exist on disk; \
+             remove the entry or create the file before re-running analysis.",
+            root.join("setup.d").display().to_string()
+        )
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue #345 control — a glob matching one FILE and one directory earns
+/// exactly one row, for the directory: the file match passes the
+/// reference's `File.file?` and only the directory fails it (oracle: one
+/// row, exit 1).
+#[test]
+fn pre_eval_glob_file_and_directory_rows_only_the_directory() {
+    let root = std::env::temp_dir().join(format!(
+        "rigor_preeval_mix_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(root.join("setup.d")).unwrap();
+    std::fs::write(root.join("setup.rb"), b"class B; def gb = 1; end\n").unwrap();
+    std::fs::write(root.join("lib/a.rb"), b"class A; end\n").unwrap();
+    std::fs::write(root.join(".rigor.yml"), b"pre_eval: [\"setup*\"]\n").unwrap();
+    let crate::config::ConfigRead::Parsed(cfg) = Config::read(&root.join(".rigor.yml")) else {
+        panic!("config must parse");
+    };
+    let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
+    let (findings, _io_err, _rbs) = analyze_files(
+        &[a_rb.as_str()],
+        Some(&[a_rb.as_str()]),
+        &cfg,
+        "check",
+        None,
+        &config::BleedingEdgeSelector::None,
+        false,
+    );
+    let rows: Vec<_> = findings
+        .iter()
+        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .collect();
+    assert_eq!(rows.len(), 1, "the file match earns no row; got {findings:?}");
+    let d = &rows[0].3;
+    let dir = root.join("setup.d").display().to_string();
+    assert!(
+        d.message.contains(&format!("{dir:?}")),
+        "the row names the directory match; got {}",
+        d.message
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue #345 controls — a glob that matches nothing earns no row (upstream
+/// `expand_pre_eval_entry` degrades a matchless pattern silently), while a
+/// literal entry that is not a file still earns its row (ADR-17 slice 1,
+/// unchanged).
+#[test]
+fn pre_eval_glob_no_match_is_silent_literal_still_fires() {
+    let root = std::env::temp_dir().join(format!(
+        "rigor_preeval_none_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/a.rb"), b"class A; end\n").unwrap();
+    std::fs::write(root.join(".rigor.yml"), b"pre_eval: [\"nope*\", \"absent.rb\"]\n").unwrap();
+    let crate::config::ConfigRead::Parsed(cfg) = Config::read(&root.join(".rigor.yml")) else {
+        panic!("config must parse");
+    };
+    let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
+    let (findings, _io_err, _rbs) = analyze_files(
+        &[a_rb.as_str()],
+        Some(&[a_rb.as_str()]),
+        &cfg,
+        "check",
+        None,
+        &config::BleedingEdgeSelector::None,
+        false,
+    );
+    let rows: Vec<_> = findings
+        .iter()
+        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .collect();
+    assert_eq!(rows.len(), 1, "the matchless glob is silent; got {findings:?}");
+    let absent = root.join("absent.rb").display().to_string();
+    assert!(
+        rows[0].3.message.contains(&format!("{absent:?}")),
+        "the literal entry still earns its row; got {}",
+        rows[0].3.message
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// Issue #345 — the expanded stream's ORDER and `.uniq`: rows follow the
+/// config order of the entries (each entry's matches sorted, as
+/// `Dir.glob(..., sort: true)` / `RootedGlob.glob` yield them), a match two
+/// entries produce earns ONE row at its first occurrence, and a glob under
+/// a literal directory prefix (`RootedGlob.glob`) behaves the same.
+#[test]
+fn pre_eval_rows_follow_expanded_stream_order_and_uniq() {
+    let root = std::env::temp_dir().join(format!(
+        "rigor_preeval_order_{}_{}",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::create_dir_all(root.join("x.d")).unwrap();
+    std::fs::create_dir_all(root.join("y.d")).unwrap();
+    // A DIRECTORY spelled `b.rb` — the rooted glob matches it, and it is
+    // not a file.
+    std::fs::create_dir_all(root.join("lib/b.rb")).unwrap();
+    std::fs::write(root.join("lib/a.rb"), b"class A; end\n").unwrap();
+    std::fs::write(
+        root.join(".rigor.yml"),
+        b"pre_eval: [\"x*\", \"y.d\", \"y*\", \"lib/*.rb\"]\n",
+    )
+    .unwrap();
+    let crate::config::ConfigRead::Parsed(cfg) = Config::read(&root.join(".rigor.yml")) else {
+        panic!("config must parse");
+    };
+    let a_rb = root.join("lib/a.rb").to_string_lossy().into_owned();
+    let (findings, _io_err, _rbs) = analyze_files(
+        &[a_rb.as_str()],
+        Some(&[a_rb.as_str()]),
+        &cfg,
+        "check",
+        None,
+        &config::BleedingEdgeSelector::None,
+        false,
+    );
+    let rows: Vec<_> = findings
+        .iter()
+        .filter(|(_, _, _, d)| d.rule_id == "pre-eval.file-not-found")
+        .collect();
+    let expected: Vec<String> = ["x.d", "y.d", "lib/b.rb"]
+        .iter()
+        .map(|name| {
+            format!(
+                "pre_eval entry not found: {:?}. Pre-evaluation requires the file to exist on \
+                 disk; remove the entry or create the file before re-running analysis.",
+                root.join(name).display().to_string()
+            )
+        })
+        .collect();
+    let got: Vec<&str> = rows.iter().map(|(_, _, _, d)| d.message.as_str()).collect();
+    assert_eq!(
+        got,
+        expected.iter().map(String::as_str).collect::<Vec<_>>(),
+        "config order, one row per uniq'd match, rooted glob included"
+    );
+    let _ = std::fs::remove_dir_all(&root);
+}
