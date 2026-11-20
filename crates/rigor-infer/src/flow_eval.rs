@@ -640,7 +640,18 @@ impl<'i> Typer<'i> {
     ) -> TypeId {
         let mut members: Vec<TypeId> = Vec::new();
         for &ex in exceptions {
-            let Node::ConstantRead { name, span, .. } = ast.get(ex) else {
+            // A `dynamic_base` path (`k::ArgumentError`) is opaque: the
+            // reference types the node through the expression typer
+            // (`ErrorInfo.rescue_exception_type`), which answers a
+            // non-Singleton for it, so the member is `Dynamic[top]` — the
+            // lenient trailing name must NOT bind here (rigor-rs#673).
+            let Node::ConstantRead {
+                name,
+                span,
+                dynamic_base: false,
+                ..
+            } = ast.get(ex)
+            else {
                 return interner.untyped();
             };
             let Some(class) = self.index.class_id(name) else { return interner.untyped() };
@@ -2178,7 +2189,14 @@ impl<'i> Typer<'i> {
         let mut ty = interner.bottom();
         for &e in &clause.exceptions {
             let member = match ast.get(e) {
-                Node::ConstantRead { name, .. } => named(name, interner),
+                // A `dynamic_base` path types `Dynamic[top]` upstream
+                // (`rescue_exception_type` maps a non-Singleton member to
+                // untyped), never its lenient trailing name (rigor-rs#673).
+                Node::ConstantRead {
+                    name,
+                    dynamic_base: false,
+                    ..
+                } => named(name, interner),
                 _ => interner.untyped(),
             };
             ty = rigor_types::Algebra::join(interner, ty, member);

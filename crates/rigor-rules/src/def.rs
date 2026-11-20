@@ -172,9 +172,16 @@ fn collect_rescue_bindings(
                 // source registry (`rescue MyError => e` where `MyError` is a
                 // discovered project class fires too, probed).
                 [only] => match ast.get(*only) {
-                    Node::ConstantRead { name, .. }
-                        if !name.is_empty()
-                            && (index.knows_class(name) || source.knows_class(name)) =>
+                    // A `dynamic_base` path (`k::ArgumentError`) is opaque
+                    // upstream (`rescue_exception_type` types it non-Singleton
+                    // → `Dynamic[top]`); the lenient trailing name must not
+                    // bind (rigor-rs#673).
+                    Node::ConstantRead {
+                        name,
+                        dynamic_base: false,
+                        ..
+                    } if !name.is_empty()
+                        && (index.knows_class(name) || source.knows_class(name)) =>
                     {
                         Some(name.to_string())
                     }

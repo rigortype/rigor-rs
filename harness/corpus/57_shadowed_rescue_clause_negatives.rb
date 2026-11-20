@@ -119,3 +119,25 @@ rescue StandardError
 rescue ArgumentError # rigor:disable flow.shadowed-rescue-clause
   y = 3
 end
+
+# A designator with a DYNAMIC base (`k::ArgumentError`, `k` a local) is opaque
+# upstream: `qualified_name_or_nil` is strict and yields nil for it, so
+# neither the earlier nor the later clause certifies — no shadow row in either
+# direction (rigor-rs#673). `k` is bound so no other rule emits either.
+k = Object.new
+
+begin
+  y = 1
+rescue k::StandardError
+  y = 2
+rescue k::ArgumentError
+  y = 3
+end
+
+begin
+  y = 1
+rescue StandardError
+  y = 2
+rescue k::ArgumentError
+  y = 3
+end
