@@ -29,7 +29,7 @@
 //! `(` (legal Rust, and `cargo fmt --check` is not a gate here) does not
 //! bypass them, `spawn`/`scope` flag with or without `::<…>` turbofish or
 //! an immediate call, and a `use` that aliases (`… as x`) or globs
-//! (`…::*`) a flagged root flags too.
+//! (`…::*`, `…::{*}`, `…::{a, *}`) a flagged root flags too.
 //!
 //! `#[cfg(test)]` items are skipped, as are the files `#[cfg(test)] mod x;`
 //! declarations resolve to. A `#[cfg(test)]` that does not open an item
@@ -388,7 +388,10 @@ fn use_item_spans(text: &str) -> Vec<(usize, usize)> {
 ///   lib.rs's `pub use ruby_prism;`), `use std::thread as t`
 ///   (`t::spawn`), `use std::thread::{self as t}`,
 ///   `use rayon::ThreadPoolBuilder as TPB`, `use rigor_parse::*`
-///   (`parse(src)`), `use std::thread::*` (`spawn(job)`).
+///   (`parse(src)`), `use std::thread::*` (`spawn(job)`), and the same
+///   globs written with braces (`use rigor_parse::{*}`,
+///   `use std::thread::{a, *}`) — rustfmt collapses `::{*}` to `::*`,
+///   but `cargo fmt --check` is not a gate (rigor-rs#652).
 fn flagged_uses(
     text: &str,
     uses: &[(usize, usize)],
@@ -412,7 +415,8 @@ fn flagged_uses(
                 out.push((at, "use:parse".to_string()));
             }
             // `use rigor_parse as rp`, `use rigor_parse::{self as rp}`,
-            // `use rigor_parse::*` — the calls then escape the patterns.
+            // `use rigor_parse::*` / `use rigor_parse::{*}` — the calls
+            // then escape the patterns.
             if toks.get(1).is_some_and(|t| t.1 == "as")
                 || pair("self", "as")
                 || after_ident_is_glob(item, toks[0])
@@ -427,7 +431,8 @@ fn flagged_uses(
                 }
             }
             // `use std::thread as t`, `use std::thread::{self as t}`,
-            // `use std::thread::*` — `t::spawn`/`spawn` escape the patterns.
+            // `use std::thread::*` / `use std::thread::{*}` —
+            // `t::spawn`/`spawn` escape the patterns.
             if pair("thread", "as")
                 || pair("self", "as")
                 || toks.iter().any(|t| t.1 == "thread" && after_ident_is_glob(item, *t))
@@ -463,8 +468,14 @@ fn ident_spans(s: &str) -> impl Iterator<Item = (usize, &str)> + '_ {
         .map(move |i| (i, ident_at(s, i)))
 }
 
-/// Whether `tok` (an identifier span in `s`) is followed by `::*` — a glob
-/// leaf: `rigor_parse::*`, `std::thread::*`.
+/// Whether `tok` (an identifier span in `s`) is followed by a glob of
+/// that ident: `rigor_parse::*`, `std::thread::*`, the brace spelling
+/// `::{*}` (rigor-rs#652), or a mixed list that still globs
+/// (`::{a, *}`, `::{*, a}`). Nested child globs (`::{a::*}`,
+/// `::{a::{*}}`) are not a glob of `tok` itself. Nested anonymous
+/// groups (`::{{*}}`) still glob `tok` in Rust's grammar — they stay
+/// a disclosed limit of this matcher; a use-tree flattener would close
+/// them (rigor-rs#654).
 fn after_ident_is_glob(s: &str, tok: (usize, &str)) -> bool {
     let b = s.as_bytes();
     let mut i = skip_ws(b, tok.0 + tok.1.len());
@@ -472,7 +483,42 @@ fn after_ident_is_glob(s: &str, tok: (usize, &str)) -> bool {
         return false;
     }
     i = skip_ws(b, i + 2);
-    b.get(i) == Some(&b'*')
+    match b.get(i) {
+        Some(&b'*') => true,
+        Some(&b'{') => brace_group_has_self_glob(b, i),
+        _ => false,
+    }
+}
+
+/// A `*` list item of the `{...}` group at `open`, not a nested `a::*`.
+fn brace_group_has_self_glob(b: &[u8], open: usize) -> bool {
+    let close = close_of(b, open);
+    let mut depth = 0usize;
+    let mut i = open;
+    while i < close {
+        match b[i] {
+            b'{' => {
+                depth += 1;
+                i += 1;
+            }
+            b'}' => {
+                depth = depth.saturating_sub(1);
+                i += 1;
+            }
+            b'*' if depth == 1 && !preceded_by_colon_colon(b, i) => return true,
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// `*` immediately after `::` (whitespace skipped) is `a::*`, not `{, *}`.
+fn preceded_by_colon_colon(b: &[u8], star: usize) -> bool {
+    let mut j = star;
+    while j > 0 && b[j - 1].is_ascii_whitespace() {
+        j -= 1;
+    }
+    j >= 2 && &b[j - 2..j] == b"::"
 }
 
 /// The `#[cfg(test)]` items' byte extents: the `#` through the item's `;`
@@ -882,4 +928,115 @@ fn cfg_test_span_on_non_item_positions() {
             "{src}"
         );
     }
+}
+
+/// rigor-rs#652: a glob written with braces (`::{*}`, `::{a, *}`) is the
+/// same smuggle as `::*`. rustfmt collapses `::{*}` to `::*`, but fmt is
+/// not a gate, so both spellings — and mixed lists that still glob — must
+/// flag. Nested child globs (`::{a::*}`, `::{a::{*}}`) are not a glob of
+/// the parent ident.
+#[test]
+fn brace_glob_uses_flag_like_star_globs() {
+    for (src, name, want) in [
+        (" rigor_parse::*", "rigor_parse", true),
+        (" rigor_parse:: *", "rigor_parse", true),
+        (" rigor_parse :: *", "rigor_parse", true),
+        (" rigor_parse::{*}", "rigor_parse", true),
+        (" rigor_parse:: { * }", "rigor_parse", true),
+        (" rigor_parse :: { * }", "rigor_parse", true),
+        (" rigor_parse::{ * }", "rigor_parse", true),
+        (" rigor_parse::{a, *}", "rigor_parse", true),
+        (" rigor_parse::{*, a}", "rigor_parse", true),
+        (" rigor_parse::{a, * , b}", "rigor_parse", true),
+        (" std::thread::{*}", "thread", true),
+        (" std::thread::{spawn, *}", "thread", true),
+        (" std::{thread::{*}}", "thread", true),
+        (" std::{thread::*}", "thread", true),
+        (" rigor_parse::ruby_prism::{*}", "ruby_prism", true),
+        (" rigor_parse::{ruby_prism::{*}}", "ruby_prism", true),
+        (" rigor_parse::parse", "rigor_parse", false),
+        (" rigor_parse::{parse}", "rigor_parse", false),
+        (" rigor_parse::{a, parse}", "rigor_parse", false),
+        (" rigor_parse::{a::*}", "rigor_parse", false),
+        (" rigor_parse::{a::{*}}", "rigor_parse", false),
+        (" rigor_parse::{a::b, c::*}", "rigor_parse", false),
+        (" rigor_parse as rp", "rigor_parse", false),
+    ] {
+        let at = src.find(name).unwrap();
+        assert_eq!(
+            after_ident_is_glob(src, (at, &src[at..at + name.len()])),
+            want,
+            "{src}"
+        );
+    }
+
+    let tags = |src: &str, internal: bool| {
+        let text = blank(src);
+        let uses = use_item_spans(&text);
+        let mut tags: Vec<String> = flagged_uses(&text, &uses, internal)
+            .into_iter()
+            .map(|(_, tag)| tag)
+            .collect();
+        tags.sort();
+        tags
+    };
+    for src in [
+        "use rigor_parse::*;",
+        "use rigor_parse::{*};",
+        "use rigor_parse::{ * };",
+        "use rigor_parse :: { * };",
+        "use rigor_parse::{a, *};",
+        "use rigor_parse::{*, a};",
+    ] {
+        assert!(
+            tags(src, false).contains(&"use:alias-or-glob".to_string()),
+            "{src}"
+        );
+    }
+    for src in [
+        "use std::thread::*;",
+        "use std::thread::{*};",
+        "use std::thread::{ * };",
+        "use std::thread::{spawn, *};",
+        "use std::thread::{*, Builder};",
+        "use std::{thread::{*}};",
+        "use std::{thread::*};",
+    ] {
+        let got = tags(src, false);
+        assert!(got.contains(&"use:alias-or-glob".to_string()), "{src}: {got:?}");
+    }
+    // mixed `{spawn, *}` still names the leaf — keep the leaf tag too
+    assert!(
+        tags("use std::thread::{spawn, *};", false).contains(&"use:spawn".to_string())
+    );
+    for src in [
+        "use rigor_parse::{parse};",
+        "use rigor_parse::{a, parse};",
+        "use rigor_parse::{a::*};",
+        "use rigor_parse::{a::{*}};",
+        "use std::thread::{spawn};",
+        "use std::process::{*};",
+    ] {
+        assert!(
+            !tags(src, false).contains(&"use:alias-or-glob".to_string()),
+            "{src}"
+        );
+    }
+    // the issue's planted shape: the glob flags, so a later bare `parse`/
+    // `spawn` call is not an unguarded hole even though call-site patterns
+    // cannot see the imported leaf.
+    assert!(
+        tags(
+            "use rigor_parse::{*};\nfn f(src: &[u8]) { let _ = parse(src); }",
+            false,
+        )
+        .contains(&"use:alias-or-glob".to_string())
+    );
+    assert!(
+        tags(
+            "use std::thread::{*};\nfn f() { spawn(|| {}); }",
+            false,
+        )
+        .contains(&"use:alias-or-glob".to_string())
+    );
 }
