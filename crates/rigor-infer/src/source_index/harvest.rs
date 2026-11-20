@@ -233,8 +233,8 @@ impl SourceIndex {
         }
         // `discovered_classes` (rigor-rs#672): every meta-new constant write,
         // at ANY position — `collect_class_decls` descends the whole tree,
-        // and the or-write/path-write shapes ride `UnmodeledWrite`.
-        h.meta_new_names = collect_meta_new_writes(ast);
+        // and the or-write/path-write/`self::` shapes ride `UnmodeledWrite`.
+        collect_meta_new_writes(ast, &declared, &mut h.meta_new_names);
 
         // Pass 2: every `ConstantRead` whose `name` the FROZEN core knows, so the
         // merge can register an instance-class id for it. This lets both

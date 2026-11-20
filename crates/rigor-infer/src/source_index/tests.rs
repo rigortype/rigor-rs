@@ -2080,3 +2080,24 @@ fn meta_new_write_census_covers_or_path_nested_positions() {
         assert!(!idx.knows_meta_new_class(name), "{name}");
     }
 }
+
+#[test]
+fn meta_new_self_anchored_writes_resolve_rebound_self() {
+    let core = CoreIndex::new();
+    let src = b"module M; self::Foo = Struct.new(:a); end\n\
+                module M2; self::Bar ||= Class.new; end\n\
+                self::Top = Struct.new(:a)\n\
+                module M3; self::N::Deep = Data.define(:x); end\n";
+    let (_a, idx) = build_one(src, &core);
+    for name in ["M::Foo", "M2::Bar", "Top", "M3::N::Deep"] {
+        assert!(idx.knows_meta_new_class(name), "{name}");
+    }
+    let src = b"class C; class << self; self::InS = Struct.new(:a); end; end\n\
+                class C2; class << self; Bare = Struct.new(:a); end; end\n\
+                class C3; class << self; A::Path = Struct.new(:a); end; end\n";
+    let (_a, idx) = build_one(src, &core);
+    assert!(!idx.knows_meta_new_class("InS"));
+    assert!(!idx.knows_meta_new_class("Bare"));
+    assert!(!idx.knows_meta_new_class("C2::Bare"));
+    assert!(idx.knows_meta_new_class("C3::A::Path"));
+}

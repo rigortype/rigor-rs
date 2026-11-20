@@ -125,3 +125,34 @@ def rooted_modifier_write
   x = [1]
   x.frobnicate_r19 unless x.is_a?(::ModW)
 end
+
+# Review (PR #708, round 4): `self::`-anchored meta-new writes resolve
+# against the enclosing `self_prefix` — lexical by default, the eval
+# receiver inside `class_eval`, the written name inside a
+# `K = Class.new do` block (`self_anchored_decl_prefix`).
+module SelfM
+  self::Anch = Struct.new(:a)
+end
+
+def rooted_self_write
+  x = [1]
+  x.frobnicate_r20 unless x.is_a?(::SelfM::Anch)
+end
+
+EvalR.class_eval do
+  self::Ev = Class.new
+end
+
+def rooted_eval_self
+  x = [1]
+  x.frobnicate_r21 unless x.is_a?(::EvalR::Ev)
+end
+
+BlkR = Class.new do
+  self::InB = Struct.new(:a)
+end
+
+def rooted_block_self
+  x = [1]
+  x.frobnicate_r22 unless x.is_a?(::BlkR::InB)
+end

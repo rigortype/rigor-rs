@@ -63,6 +63,27 @@
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_r19' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 139,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r20' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 148,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r21' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 157,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r22' for [1]"
     }
   ]
 }

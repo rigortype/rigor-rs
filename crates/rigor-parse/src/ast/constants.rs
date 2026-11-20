@@ -209,34 +209,41 @@ pub(crate) fn meta_new_write_name(node: &PrismNode<'_>) -> Option<String> {
     let (written, value) = if let Some(w) = node.as_constant_or_write_node() {
         (constant_string(w.name().as_slice()), w.value())
     } else if let Some(w) = node.as_constant_path_write_node() {
-        let target = w.target().as_node();
-        if self_anchored_constant_path(&target) {
-            return None;
-        }
-        let strict = strict_constant_path_string(&target)?;
-        let written = if rooted_constant_path(&target) {
-            format!("::{strict}")
-        } else {
-            strict
-        };
-        (written, w.value())
+        (meta_new_path_target_name(&w.target().as_node())?, w.value())
     } else if let Some(w) = node.as_constant_path_or_write_node() {
-        let target = w.target().as_node();
-        if self_anchored_constant_path(&target) {
-            return None;
-        }
-        let strict = strict_constant_path_string(&target)?;
-        let written = if rooted_constant_path(&target) {
-            format!("::{strict}")
-        } else {
-            strict
-        };
-        (written, w.value())
+        (meta_new_path_target_name(&w.target().as_node())?, w.value())
     } else {
         return None;
     };
     meta_new_rvalue(&written, value).then_some(written)
 }
+
+/// The as-written name of a path-write target (`M::Foo`, `::Foo`,
+/// `self::Foo`) for [`meta_new_write_name`]. A `self::`-anchored tail keeps
+/// its marker — the census resolves it against the enclosing `self_prefix`
+/// (`meta_new_child_prefix`'s `self_anchored_tail` arm). `var::K` — a
+/// dynamic base — renders nothing (`qualified_name_or_nil` declines).
+fn meta_new_path_target_name(target: &PrismNode<'_>) -> Option<String> {
+    if self_anchored_constant_path(target) {
+        let chain = ConstPathChain::collect(target)?;
+        let mut written = String::from("self");
+        for (last, named) in chain.segments() {
+            if !named {
+                return None;
+            }
+            written.push_str("::");
+            written.push_str(&last);
+        }
+        return Some(written);
+    }
+    let strict = strict_constant_path_string(target)?;
+    Some(if rooted_constant_path(target) {
+        format!("::{strict}")
+    } else {
+        strict
+    })
+}
+
 
 /// `meta_new_rvalue` (`scope_indexer.rb:4960`): `K = K || <factory>` /
 /// `K ||= K || <factory>` unwraps when the left operand re-reads the written
