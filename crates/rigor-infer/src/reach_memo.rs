@@ -877,6 +877,7 @@ impl<'i> Typer<'i> {
     /// dead set changed while it ran (or `store` is `false` — the audit's
     /// recompute, which must leave the LRU untouched), and hand its
     /// dependencies to the enclosing computation.
+    #[allow(clippy::too_many_arguments)]
     fn local_reach_framed(
         &self,
         ast: &LoweredAst,
