@@ -44,7 +44,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{BuildHasherDefault, Hasher};
 use std::rc::Rc;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU8, Ordering};
 
 use rigor_parse::{LoweredAst, NodeId, Span};
 use rigor_types::{Scalar, Type};
@@ -483,6 +483,40 @@ impl ReachMemo {
         self.type_env_ofs.get(&(node.0, 0)).map_or(0, Vec::len)
     }
 
+    /// Counts of stored `local_reach` entries by whether they saw a
+    /// re-entered fold — `#[cfg(test)]` diagnostics for the rigor-rs#439
+    /// audit regressions.
+    #[cfg(test)]
+    pub(crate) fn folding_entry_counts(&self) -> (usize, usize) {
+        let mut with = 0;
+        let mut without = 0;
+        for es in self.entries.values() {
+            for e in es {
+                if e.folding.is_empty() {
+                    without += 1;
+                } else {
+                    with += 1;
+                }
+            }
+        }
+        (with, without)
+    }
+
+    /// Entries stored for one `local_reach` key — `#[cfg(test)]` for the
+    /// rigor-rs#439 pin that an audited hit's recompute does not push a
+    /// duplicate onto the per-key LRU.
+    #[cfg(test)]
+    pub(crate) fn reach_entry_count(
+        &self,
+        use_span: Span,
+        skip_class_guards: bool,
+        seen_len: usize,
+    ) -> usize {
+        self.entries
+            .get(&(use_span, skip_class_guards, seen_len))
+            .map_or(0, Vec::len)
+    }
+
     /// Start over for `ast` and `dead` unless the entries already belong to
     /// them.
     pub(crate) fn reset_unless_valid(&mut self, ast: (usize, usize), dead: &Option<Rc<DeadPositions>>) {
@@ -594,12 +628,31 @@ pub(crate) fn same_dead(a: &Option<Rc<DeadPositions>>, b: &Option<Rc<DeadPositio
     }
 }
 
-/// `RIGOR_REACH_MEMO_AUDIT` is set (to anything but empty or `0`).
+/// `RIGOR_REACH_MEMO_AUDIT` is set (to anything but empty or `0`). The env
+/// read is cached in a tri-state (`0` unread, `1` off, `2` on) so a test can
+/// force it via [`set_audit_mode_for_test`] — an env var set from inside the
+/// test binary would race the first read.
 pub(crate) fn audit_mode() -> bool {
-    static AUDIT: OnceLock<bool> = OnceLock::new();
-    *AUDIT.get_or_init(|| {
-        std::env::var("RIGOR_REACH_MEMO_AUDIT").is_ok_and(|v| !v.is_empty() && v != "0")
-    })
+    match AUDIT.load(Ordering::Relaxed) {
+        0 => {
+            let on = std::env::var("RIGOR_REACH_MEMO_AUDIT")
+                .is_ok_and(|v| !v.is_empty() && v != "0");
+            AUDIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
+            on
+        }
+        v => v == 2,
+    }
+}
+
+/// `audit_mode`'s tri-state — see its docs.
+static AUDIT: AtomicU8 = AtomicU8::new(0);
+
+/// Pin the audit flag for the rest of the test binary's run. The flag is
+/// process-global: other tests running in parallel get audited too — sound
+/// (the audit only asserts an invariant), just slower.
+#[cfg(test)]
+pub(crate) fn set_audit_mode_for_test(on: bool) {
+    AUDIT.store(if on { 2 } else { 1 }, Ordering::Relaxed);
 }
 
 pub(crate) fn ast_identity(ast: &LoweredAst) -> (usize, usize) {
@@ -749,8 +802,18 @@ impl<'i> Typer<'i> {
             // The hit's dependencies are the enclosing computation's too.
             self.reach_frames.borrow_mut().record(stack_id(seen), &tested, &folding);
             if audit_mode() {
-                let again =
-                    self.local_reach_framed(ast, root, use_span, seen, skip_class_guards, dead);
+                // The recompute must NOT store: a duplicate entry at the
+                // front of the per-key LRU would halve its effective cap
+                // (rigor-rs#439) and shadow the very entry being audited.
+                let again = self.local_reach_framed(
+                    ast,
+                    root,
+                    use_span,
+                    seen,
+                    skip_class_guards,
+                    dead,
+                    false,
+                );
                 assert!(
                     again == out,
                     "rigor-rs#422 reach memo audit: local_reach({root}, {use_span:?}, \
@@ -761,12 +824,13 @@ impl<'i> Typer<'i> {
             }
             return out;
         }
-        self.local_reach_framed(ast, root, use_span, seen, skip_class_guards, dead)
+        self.local_reach_framed(ast, root, use_span, seen, skip_class_guards, dead, true)
     }
 
     /// Compute under a fresh dependency frame, store the answer unless the
-    /// dead set changed while it ran, and hand its dependencies to the
-    /// enclosing computation.
+    /// dead set changed while it ran (or `store` is `false` — the audit's
+    /// recompute, which must leave the LRU untouched), and hand its
+    /// dependencies to the enclosing computation.
     fn local_reach_framed(
         &self,
         ast: &LoweredAst,
@@ -775,6 +839,7 @@ impl<'i> Typer<'i> {
         seen: &mut Vec<String>,
         skip_class_guards: bool,
         dead: Option<Rc<DeadPositions>>,
+        store: bool,
     ) -> ReachOut {
         let base = seen.len();
         let stack = stack_id(seen);
@@ -788,7 +853,7 @@ impl<'i> Typer<'i> {
             frames.record(stack, &tested, &folding);
             (tested, folding)
         };
-        if same_dead(&dead, &self.current_dead(ast)) {
+        if store && same_dead(&dead, &self.current_dead(ast)) {
             let mut memo = self.reach_memo.borrow_mut();
             if memo.valid_for(ast_identity(ast), &dead) {
                 tested.sort_unstable();
