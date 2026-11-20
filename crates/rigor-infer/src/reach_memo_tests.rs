@@ -80,6 +80,50 @@ fn audit_is_silent_on_the_membership_shape() {
     assert_eq!(audited, control, "audit changed the answers");
 }
 
+/// The re-entry rule itself: an entry that recorded a still-folding dep
+/// must stop answering once that fold lands on `Some`. On a build with the
+/// `folding` guard removed this fails — the stale entry survives the hit
+/// and its `folding` count never drops. Deterministic: it doesn't depend
+/// on the stale answer actually diverging.
+#[test]
+fn folding_dep_entry_is_dropped_once_its_pred_lands() {
+    crate::reach_memo::set_audit_mode_for_test(true);
+    let src = b"def f(c)\n  q = 1\n  while c\n    x = 2 if q\n    q = x\n    y = 3 if q\n  end\nend\n";
+    let ast = lower_src(src);
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let _ = typer.dead_positions(&ast, &mut Vec::new());
+    // The scan's entries live under the scan's dead-set Rc — the first
+    // post-scan reach resets the memo. Flush that reset, then repopulate:
+    // post-scan folds still see re-entries and store `folding` deps under
+    // the settled (None) dead context.
+    let mut warmup = Vec::new();
+    let _ = typer.local_reach(&ast, "q", (34, 35), &mut warmup, false);
+    drive(&typer, &ast);
+    let (root, span, skip, len, present, dep) = typer
+        .reach_memo
+        .borrow()
+        .first_folding_entry()
+        .expect("the shape must store at least one re-entry-dependent entry");
+    // The dep's fold lands on Some — the recorded answer's validity window
+    // is over.
+    typer.truthy_landed.borrow_mut().insert(dep, Some(true));
+    // Rebuild a stack that reproduces the entry's recorded membership
+    // answers: its `present` keys verbatim, padded with keys no real
+    // computation ever interned (they can't collide with `tested` ids).
+    let mut seen = present;
+    while seen.len() < len {
+        seen.push(format!("zz-filler-{}", seen.len()));
+    }
+    let before = typer.reach_memo.borrow().folding_entry_counts().0;
+    let _ = typer.local_reach(&ast, &root, span, &mut seen, skip);
+    let after = typer.reach_memo.borrow().folding_entry_counts().0;
+    assert!(
+        after < before,
+        "a hit on an entry whose fold dep has landed must drop it"
+    );
+}
+
 /// rigor-rs#439 item 4: an audited hit's recompute must not store — a
 /// duplicate at the front of the per-key LRU halves the effective cap (and
 /// could shadow the very entry being audited).

@@ -502,6 +502,41 @@ impl ReachMemo {
         (with, without)
     }
 
+    /// The first `local_reach` entry carrying a `folding` dependency —
+    /// `#[cfg(test)]` for the rigor-rs#439 re-entry regression. Returns
+    /// `(root, use_span, skip_class_guards, seen_len, present keys,
+    /// first dep)` so the test can rebuild a stack that passes the
+    /// membership check and proves the entry is dropped once its dep's
+    /// fold lands.
+    #[cfg(test)]
+    pub(crate) fn first_folding_entry(
+        &self,
+    ) -> Option<(String, Span, bool, usize, Vec<String>, TruthyKey)> {
+        let mut names: Vec<&str> = vec!["?"; self.keys.len()];
+        for (k, &id) in &self.keys {
+            names[id as usize] = k;
+        }
+        for ((span, skip, len), es) in &self.entries {
+            for e in es {
+                if e.folding.is_empty() {
+                    continue;
+                }
+                return Some((
+                    e.root.clone(),
+                    *span,
+                    *skip,
+                    *len,
+                    e.present
+                        .iter()
+                        .map(|&i| names[i as usize].to_string())
+                        .collect(),
+                    e.folding[0],
+                ));
+            }
+        }
+        None
+    }
+
     /// Entries stored for one `local_reach` key — `#[cfg(test)]` for the
     /// rigor-rs#439 pin that an audited hit's recompute does not push a
     /// duplicate onto the per-key LRU.
