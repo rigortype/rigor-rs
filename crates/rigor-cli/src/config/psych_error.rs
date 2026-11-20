@@ -112,9 +112,15 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
         }
         unsafe_libyaml::yaml_parser_set_encoding(parser, unsafe_libyaml::YAML_UTF8_ENCODING);
         unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
+
         let mut out = None;
         let mut parsed = true;
-        let mut bail = false;
+        // A collection tag whose visitor semantics the scan does not model
+        // stops RECORDING (`scan = false`) but the event drain must continue
+        // to the document's end: `Psych.safe_load` parses the document
+        // whole, THEN walks it, so a `Psych::SyntaxError` anywhere later in
+        // the document still outranks a death recorded before the tag.
+        let mut scan = true;
         loop {
             let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
             if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
@@ -123,10 +129,10 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
             }
             let kind = (*event.as_ptr()).type_;
             match kind {
-                unsafe_libyaml::YAML_ALIAS_EVENT if out.is_none() => {
+                unsafe_libyaml::YAML_ALIAS_EVENT if scan && out.is_none() => {
                     out = Some(SafeLoadRejection::Alias);
                 }
-                unsafe_libyaml::YAML_SCALAR_EVENT if out.is_none() => {
+                unsafe_libyaml::YAML_SCALAR_EVENT if scan && out.is_none() => {
                     let scalar = &(*event.as_ptr()).data.scalar;
                     let value = if scalar.value.is_null() {
                         String::new()
@@ -142,55 +148,72 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
                 }
                 unsafe_libyaml::YAML_MAPPING_START_EVENT
                 | unsafe_libyaml::YAML_SEQUENCE_START_EVENT => {
-                    let tag_ptr = if kind == unsafe_libyaml::YAML_MAPPING_START_EVENT {
+                    let mapping = kind == unsafe_libyaml::YAML_MAPPING_START_EVENT;
+                    let tag_ptr = if mapping {
                         (*event.as_ptr()).data.mapping_start.tag
                     } else {
                         (*event.as_ptr()).data.sequence_start.tag
                     };
                     let tag = c_string(tag_ptr.cast());
-                    if tag.as_deref().is_some_and(|t| t.starts_with("!ruby/")) {
-                        // serde_yaml rejects `!ruby/*` tags wholesale on its
-                        // own pass (exit 64 today), and the visitor semantics
-                        // a tagged COLLECTION would need — `resolve_class` per
-                        // tag arm plus `hash-with-ivars`'s partial member
-                        // walk — are #347's declared out-of-scope. Stop the
-                        // scan rather than mis-order the tag's own death or
-                        // invent a child-scalar death the reference does not
-                        // visit (probe: `x: !ruby/hash-with-ivars\n  other:
-                        // 2024-01-01` LOADS upstream).
-                        bail = true;
-                    } else if out.is_none() {
-                        out = collection_tag_death(
-                            tag.as_deref(),
-                            kind == unsafe_libyaml::YAML_MAPPING_START_EVENT,
-                        );
+                    if tag.as_deref().is_some_and(|t| collection_tag_bails(t, mapping)) {
+                        // A shape the scan declines: serde_yaml's own pass
+                        // decides this document (a `!ruby/*` tag dies there
+                        // at exit 64), or the visitor walks the node through
+                        // an arm outside `DisallowedClass` (`!omap` seq's
+                        // first/last member pairs, empty-name
+                        // `nil.allocate`). Either way the scan stops
+                        // recording rather than mis-order a death or name a
+                        // class the visitor never reached.
+                        scan = false;
+                    } else if scan && out.is_none() {
+                        out = collection_tag_death(tag.as_deref(), mapping);
                     }
                 }
                 _ => {}
             }
             unsafe_libyaml::yaml_event_delete(event.as_mut_ptr());
-            if bail
-                || kind == unsafe_libyaml::YAML_DOCUMENT_END_EVENT
+            if kind == unsafe_libyaml::YAML_DOCUMENT_END_EVENT
                 || kind == unsafe_libyaml::YAML_STREAM_END_EVENT
             {
                 break;
             }
         }
         unsafe_libyaml::yaml_parser_delete(parser);
+
         // A syntax error anywhere in the first document wins over every
         // visitor death: `Psych.safe_load` parses, THEN walks.
         if parsed { out } else { None }
     }
 }
 
+/// A collection tag whose upstream visitor arm the scan does NOT model —
+/// the document's fate is left to serde_yaml's own pass (which itself
+/// rejects `!ruby/*`) rather than guessed at:
+///
+/// - `!ruby/*` on a collection — `visit_Psych_Nodes_{Mapping,Sequence}`
+///   resolves the tag through per-tag `resolve_class` arms plus partial
+///   member walks (`hash-with-ivars` skips every key but `elements`/
+///   `ivars`, so `other: 2024-01-01` LOADS upstream): #347's declared
+///   out-of-scope.
+/// - `!omap`/`!!omap` on a SEQUENCE — the `Psych::Omap.new` arm visits only
+///   each element's FIRST/LAST child (`[1, 2024-01-01, 2]`'s middle member
+///   is never seen upstream) and `NoMethodError`s on a scalar element.
+/// - `!map:`/`!seq:` with an EMPTY name — `resolve_class('')` →
+///   `nil.allocate` → `NoMethodError`, outside the `DisallowedClass` model.
+fn collection_tag_bails(tag: &str, mapping: bool) -> bool {
+    tag.starts_with("!ruby/")
+        || (!mapping && (tag == "!omap" || tag == "tag:yaml.org,2002:omap"))
+        || (mapping && tag == "!map:")
+        || (!mapping && tag == "!seq:")
+}
+
 /// `Psych::DisallowedClass` for a COLLECTION's tag, if
 /// `visit_Psych_Nodes_{Mapping,Sequence}` resolves it through the restricted
 /// `ClassLoader` BEFORE its children — the non-`!ruby` slice of the `case
 /// o.tag` arms (probe-verified: `!set`/`!!set` → `Psych::Set`,
-/// `!omap`/`!!omap` → `Psych::Omap`, `!map:K`/`!seq:K`/`!str:K` → `K`; a
-/// `!omap` SEQUENCE takes the `Psych::Omap.new` arm and lives). An empty
-/// name (`!map:`) is upstream's `nil.allocate` `NoMethodError` — left
-/// unmodelled, like the scalar `!float` `ArgumentError`.
+/// `!omap`/`!!omap` → `Psych::Omap` on a MAPPING only, `!map:K`/`!seq:K`/
+/// `!str:K` → `K`). `!omap` sequences and empty `!map:`/`!seq:` names are
+/// [`collection_tag_bails`] shapes — the scan reaches here only past them.
 fn collection_tag_death(tag: Option<&str>, mapping: bool) -> Option<SafeLoadRejection> {
     let disallowed = |name: &str| Some(SafeLoadRejection::DisallowedClass(name.to_string()));
     match tag? {
@@ -212,6 +235,11 @@ fn collection_tag_death(tag: Option<&str>, mapping: bool) -> Option<SafeLoadReje
         t if mapping && t.starts_with("!str:") && t.len() > "!str:".len() => {
             disallowed(&t["!str:".len()..])
         }
+        // Everything else VISITS every child upstream — an empty name on
+        // the OPPOSITE kind (or an empty `!str:`) falls to the `else` arm
+        // (probe: `x: !map: [2024-01-01]`, `x: !seq: {a: 2024-01-01}` and
+        // `x: !str: {a: 2024-01-01}` all die `Date` on both engines), so a
+        // child death the scan records later is one the visitor reaches.
         _ => None,
     }
 }

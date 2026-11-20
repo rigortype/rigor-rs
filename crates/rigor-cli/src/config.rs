@@ -5258,11 +5258,11 @@ mod severity_config_tests {
         // Everything that stays legal: a bare anchor, any quoted or
         // block-styled scalar (Psych's `quoted` is `quoted_implicit`),
         // `!!str`/`!binary` tags, a date-shaped non-match, a `-`-led
-        // string, a Float/Integer tokenize result, a `!omap` SEQUENCE
-        // (`Psych::Omap.new`, a constant — no loader lookup), a
-        // timestamp-shaped scalar split by a non-ASCII space (Ruby's `\s`
-        // is ASCII; U+3000 is not whitespace upstream), and anything in a
-        // SECOND document `Psych.parse` never visits.
+        // string, a Float/Integer tokenize result, a `!set` SEQUENCE (the
+        // seq `else` arm — children visit), a timestamp-shaped scalar
+        // split by a non-ASCII space (Ruby's `\s` is ASCII; U+3000 is not
+        // whitespace upstream), and anything in a SECOND document
+        // `Psych.parse` never visits.
         for yaml in [
             "x: &a 5\n",
             "x: \"2024-01-01\"\n",
@@ -5276,7 +5276,7 @@ mod severity_config_tests {
             "x: 1:20\n",
             "x: .inf\n",
             "x: ~\n",
-            "x: !omap [a]\n",
+            "x: !set [a]\n",
             "x: 2024-01-01\u{3000}10:00:00\n",
             "x: 5\n---\ny: *a\n",
         ] {
@@ -5284,6 +5284,32 @@ mod severity_config_tests {
             assert!(
                 matches!(Config::read(&dir.join("ok.yml")), ConfigRead::Parsed(_)),
                 "{yaml:?} must load",
+            );
+        }
+        // Upstream shapes the scan DECLINES rather than guesses at: a
+        // `!omap` SEQUENCE's partial member walk (`a.children.first`/`last`
+        // only — `NoMethodError` on a scalar/alias element, middle members
+        // unvisited, and a typed child the walk does reach dies a death the
+        // bail loses) and the matching-kind empty name `!map:`/`!seq:`
+        // (`nil.allocate` `NoMethodError` before children). NOT an empty
+        // `!str:` — that arm keeps visiting (probe: `x: !str: {a:
+        // 2024-01-01}` dies `Date` on both engines), and a `[a, 1]` pair
+        // element loads on both. These load here; upstream's own fate
+        // varies (`NoMethodError`, a reached child's class, or a clean
+        // run) — issue #347's crash-shape scope.
+        for yaml in [
+            "x: !omap [a]\n",
+            "x: !omap [2024-01-01]\n",
+            "x: &a 5\ny: !omap [*a]\n",
+            "x: !omap\n  - a: 2024-01-01\n",
+            "x: !omap\n  - [a, 1]\n",
+            "x: !map: {a: 2024-01-01}\n",
+            "x: !seq: [2024-01-01]\n",
+        ] {
+            std::fs::write(dir.join("d.yml"), yaml).unwrap();
+            assert!(
+                matches!(Config::read(&dir.join("d.yml")), ConfigRead::Parsed(_)),
+                "{yaml:?} must decline, not die",
             );
         }
         // A `Psych::SyntaxError` outranks every visitor death upstream (the
@@ -5298,6 +5324,12 @@ mod severity_config_tests {
         for yaml in [
             "x: *a\ny: [unclosed\n",
             "x: 2024-01-01\nz: [unclosed\n",
+            // … and a LATER syntax error still outranks a death recorded
+            // before a declined `!ruby/*` collection tag — the scan stops
+            // recording at the tag but keeps draining events (issue #347
+            // review).
+            "x: *a\ny: !ruby/object:Foo {}\nz: [unclosed\n",
+            "x: 2024-01-01\ny: !ruby/object:Foo {}\nz: [unclosed\n",
             "x: !ruby/object:Foo bar\n",
             "x: !ruby/object:Foo\n  a: 2024-01-01\n",
             "x: !ruby/hash-with-ivars\n  other: 2024-01-01\n",
