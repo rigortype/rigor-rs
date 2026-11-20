@@ -68,9 +68,19 @@ enum Ctx {
     Singleton(String),
     /// The wildcard context: `{*:{*:[*]}}`.
     Wild,
-    /// A class's own context — `class`, `class << x`, `Class.new`,
-    /// `Struct.new`, `Data.define` bodies: a `refine` is a DSL, nothing.
+    /// A class's own context — `class`, `Class.new`, `Struct.new`,
+    /// `Data.define` bodies: a `refine` is a DSL, nothing (its `self` is a
+    /// class, and `Class` undefines `refine`, so the call is the class's
+    /// own method, #1689) — and so is every method inside it, whose `self`
+    /// is a class or one of its instances, never a module the census could
+    /// charge.
     Classy,
+    /// A class context whose INSTANCE side is the wildcard — a
+    /// `class << x` body or a `class X < Module` body: a `refine` directly
+    /// here is still the DSL (nothing), but the methods inside run on an
+    /// object the walk cannot name, so a `refine` in them charges the
+    /// global wildcard.
+    ClassyWild,
 }
 
 /// `RefineSelf::CORE_ITERATORS` — the core iteration methods whose block
@@ -145,13 +155,30 @@ fn walk(
             }
             prefix.pop();
         }
-        Node::ClassDef { name, body, .. } => {
+        Node::ClassDef {
+            name,
+            body,
+            superclass_path,
+            ..
+        } => {
             let pushed = !name.is_empty();
             if pushed {
                 prefix.push(name.clone());
             }
+            // `class_body(module_subclass)`: a plain class's instance side
+            // is {CLASS} — a `refine` in its methods is the class's own DSL
+            // and records nothing; a `Module` subclass's instances are
+            // modules the walk cannot name, so its methods charge the
+            // global wildcard (only the bare/`::`-rooted `Module`
+            // superclass counts — `M::Module` does not).
+            let class_ctx =
+                if superclass_path.as_deref() == Some("Module") {
+                    Ctx::ClassyWild
+                } else {
+                    Ctx::Classy
+                };
             for &child in body {
-                walk(ast, child, &Ctx::Classy, prefix, scan);
+                walk(ast, child, &class_ctx, prefix, scan);
             }
             if pushed {
                 prefix.pop();
@@ -163,14 +190,24 @@ fn walk(
             body,
             ..
         } => {
-            // `class << self` inside a module context keeps the module's
-            // name for the `def`s it holds; everywhere else a singleton
-            // class body is a class context.
-            let inner = match (ctx, singleton_operand) {
-                (Ctx::Named(owner), Some(op)) if matches!(ast.get(*op), Node::SelfExpr { .. }) => {
-                    Ctx::Singleton(owner.clone())
-                }
-                _ => Ctx::Classy,
+            // `class << self` keeps the module's name for the `def`s it
+            // holds (the reference's `runs_on` is the parent's singleton
+            // side: the module under a module body, {CLASS} under a class
+            // body, {MAIN} at the top level, the wildcard under a wildcard
+            // context). A `class << x` body runs on whatever `x` is — the
+            // walk cannot name it, so its methods charge the global
+            // wildcard, while a `refine` directly here is still the class's
+            // own DSL.
+            let self_op = matches!(
+                singleton_operand.map(|op| ast.get(op)),
+                Some(Node::SelfExpr { .. })
+            );
+            let inner = match ctx {
+                Ctx::Named(owner) if self_op => Ctx::Singleton(owner.clone()),
+                Ctx::Classy | Ctx::ClassyWild | Ctx::Singleton(_) if self_op => Ctx::Classy,
+                Ctx::Top if self_op => Ctx::Top,
+                Ctx::Wild | Ctx::WildNamed(_) if self_op => ctx.clone(),
+                _ => Ctx::ClassyWild,
             };
             for &child in body {
                 walk(ast, child, &inner, prefix, scan);
@@ -179,11 +216,17 @@ fn walk(
         Node::Definition {
             name: Some(_), body, ..
         } => {
-            // An instance `def`: the module's own method only inside its
-            // `class << self`; anywhere else the body runs on whatever
-            // object extends the owner — the wildcard context.
+            // An instance `def`: its context's `here` is the parent's
+            // INSTANCE side — the module's own method only inside its
+            // `class << self` (the module), a class or one of its
+            // instances inside a class body ({CLASS} — the refine there is
+            // the class's own DSL and records nothing, #1689), and
+            // whatever object extends the owner anywhere else (the
+            // wildcard).
             let inner = match ctx {
                 Ctx::Singleton(owner) => Ctx::Named(owner.clone()),
+                Ctx::Classy => Ctx::Classy,
+                Ctx::ClassyWild => Ctx::Wild,
                 _ => Ctx::Wild,
             };
             for &child in body {
@@ -198,9 +241,14 @@ fn walk(
             // `def self.x`: the module's own method only inside the
             // module's own context — `lexical_self_receiver?` asks
             // `here.is_a?(String)`, which the singleton-class context
-            // (`CLASS`) and every non-module context fail.
+            // (`CLASS`) and every non-module context fail. A class body's
+            // singleton side is {CLASS}, the top level's {MAIN}: a refine
+            // in such a method is the DSL / records nothing a `using`
+            // reaches; only the wildcard contexts keep charging.
             let inner = match ctx {
                 Ctx::Named(owner) => Ctx::Named(owner.clone()),
+                Ctx::Singleton(_) | Ctx::Classy | Ctx::ClassyWild => Ctx::Classy,
+                Ctx::Top => Ctx::Top,
                 _ => Ctx::Wild,
             };
             for &child in body {
@@ -307,7 +355,7 @@ fn walk(
                         scan.block_regions.push((span, None));
                         collect_nested_refine_regions(ast, block_body, scan);
                     }
-                    Ctx::Singleton(_) | Ctx::Classy => {
+                    Ctx::Singleton(_) | Ctx::Classy | Ctx::ClassyWild => {
                         // The class's own `refine` DSL: nothing records,
                         // nothing activates. A `refine` nested in the
                         // block still gets its own wildcard region.
@@ -362,12 +410,21 @@ fn block_context(
                 // (`runs_on` is its instance side) but the target is
                 // unreadable.
                 Ctx::Singleton(owner) => Ctx::WildNamed(owner.clone()),
+                // A class body's instance side is {CLASS}: the block is a
+                // method of the class, and a refine in it records nothing.
+                Ctx::Classy => Ctx::Classy,
+                // `class << x` / a `Module` subclass: the instance side is
+                // the wildcard, the method runs unnameable.
                 _ => Ctx::Wild,
             };
         }
         "define_singleton_method" => {
             return match ctx {
                 Ctx::Named(owner) => Ctx::WildNamed(owner.clone()),
+                // The singleton side of every class context is {CLASS}: the
+                // block is a class method, and a refine in it records
+                // nothing.
+                Ctx::Singleton(_) | Ctx::Classy | Ctx::ClassyWild => Ctx::Classy,
                 _ => Ctx::Wild,
             };
         }

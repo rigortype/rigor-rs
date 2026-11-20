@@ -59,8 +59,11 @@ Extra FPs the same machinery covers (probe-verified):
   argument-type-mismatch. Decline iff in-effect list nonempty AND
   (UNKNOWN or opaque in it OR `!RefinedDispatch::OwnMethod.answers?`).
   `OwnMethod.answers?`: raw in-effect rows for `name` (nil ⇒ own answers);
-  wildcard/unreadable key ⇒ no; levels walk — first level that is refined
-  or defines the name must define it (proven); `refined_off_levels?` — a
+  wildcard/unreadable key ⇒ no; levels walk (`shadowing_definer?`) — each
+  LEVEL is asked before its entries: a level a raw target names answers
+  false (the refinement displaces whatever the level defines — the
+  definer's own level included), and the first non-refined entry that
+  defines the name answers proven; `refined_off_levels?` — a
   raw module target off the receiver's levels ⇒ no (extend may put it
   ahead); a raw class off the levels ⇒ `placed_away?` decides;
   `subclass_refined?` — a project subclass whose own level is refined or
@@ -82,7 +85,7 @@ Extra FPs the same machinery covers (probe-verified):
   ANY other self-call ⇒ names incomplete (names-wildcard row per target).
   Calls inside `def`/`define_method` bodies and on other receivers do not
   classify.
-- Refine placement (`RefineSelf` contexts):
+- Refine placement (`RefineSelf` contexts, probed at the v0.4.8 pin):
   - module body / `def self.x` / `def` inside `class << self` of the module
     / keeps-self blocks (CORE_ITERATORS each/map/times/… on a literal or
     literal-bound named receiver) ⇒ OWN-METHOD, real rows `{T → names→[M]}`.
@@ -90,7 +93,16 @@ Extra FPs the same machinery covers (probe-verified):
     `define_singleton_method` block ⇒ `{*:{*:[M]}}` (`using M` ⇒ opaque).
   - instance `def`, `define_method` block, `def <other>.x`, lambda, a
     non-keeps-self block, `Module.new {}`, eval blocks ⇒ `{*:{*:[*]}}`
-    (GLOBAL: every module opaque ⇒ every `using` region declines all).
+    (GLOBAL: every module opaque ⇒ every `using` region declines all) —
+    EXCEPT in a class context, #1689: inside a class body every method's
+    `self` is a class or one of its instances, so a `refine` there (its
+    `def`s, its `def self.x`s, its `define_method` blocks) records
+    NOTHING (the call is the class's own DSL — `Class` undefines
+    `refine`). `class << x` bodies and `class X < Module` (only the
+    bare/`::`-rooted `Module` superclass) keep the global charge for the
+    methods inside them — their instance side is unnameable. A
+    `def self.x` at the top level or in a module's `class << self`
+    records nothing a `using` reaches either ({MAIN}/{CLASS}).
   - class bodies (`class <<` included), `Class.new`/`Struct.new`/
     `Data.define` blocks ⇒ DSL, nothing. `refine` at top level ⇒ rows
     under `""` (matches nothing). `refine` with no block / non-self
@@ -109,11 +121,14 @@ Extra FPs the same machinery covers (probe-verified):
   `(span, owner: Option<module>)`.
 - `refining_modules(core, class, method, singleton) -> Vec<String>`.
 - `own_method_answers(core, class, method, raw_targets) -> bool` — the
-  port's decline-side `OwnMethod`: first `level_names` entry that is a raw
-  target or the settled first definer; off-levels module target ⇒ false;
-  off-levels class target ⇒ false unless its complete ancestor list is
-  readable and excludes `class`; project subclass with refined/unreadable
-  own level ⇒ false. Singleton receivers ⇒ caller declines outright.
+  port's decline-side `OwnMethod`: first `level_names` entry at or before
+  the first proven definer that is a raw target ⇒ decline (the definer
+  read through `settled_definer` for project chains, `declaring_ancestor`
+  — the RBS declaration's own owner — for core receivers); off-levels
+  module target ⇒ false; off-levels class target ⇒ false unless its
+  complete ancestor list is readable and excludes `class`; project
+  subclass with refined/unreadable own level ⇒ false. Singleton receivers
+  ⇒ caller declines outright.
 - `expand_using(module)` → {modules, Unknown, Opaque} include closure.
 
 `rigor-rules` driver post-pass (replacing the two existing retains):

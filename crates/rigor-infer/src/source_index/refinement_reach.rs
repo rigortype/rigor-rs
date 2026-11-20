@@ -245,20 +245,33 @@ impl SourceIndex {
 
         // The proven first definer of `method` through `class`'s chain —
         // `None` is `defining_level`'s nil PLUS every case the port cannot
-        // prove, so the checks below stay decline-side only.
-        let definer = self.settled_definer(core, class, method, false, |n| {
-            self.override_classes.get(n).is_some_and(|e| {
-                e.methods.contains(method) || e.method_visibilities.contains_key(method)
+        // prove, so the checks below stay decline-side only. A CORE
+        // receiver has no project chain (`instance_chain` answers None),
+        // so the core side falls back to the RBS declaration's own owner
+        // (`declaring_ancestor`, the `declared_on_class?` arm of the
+        // reference's `RefinedDispatch.defines?`) — the walk below then
+        // sees a refined level at or before it (`refine(Comparable){
+        // def clamp}` + `1.clamp` declines; `refine(String){def center}`
+        // + `"x".center` declines at the definer itself).
+        let definer = self
+            .settled_definer(core, class, method, false, |n| {
+                self.override_classes.get(n).is_some_and(|e| {
+                    e.methods.contains(method) || e.method_visibilities.contains_key(method)
+                })
             })
-        });
+            .or_else(|| core.declaring_ancestor(class, method).map(str::to_string));
         match &definer {
             Some(d) => {
                 let Some(pos) = levels.iter().position(|l| l == d) else {
                     return false;
                 };
                 // A refined level at or before the first proven definer
-                // takes the dispatch.
-                if levels[..pos].iter().any(|l| targets.contains(l)) {
+                // takes the dispatch — the definer's own level included:
+                // the reference's walk asks each level before its entries,
+                // so a refinement naming the definer's level displaces the
+                // definer it defines (`refine(Comparable){def clamp}` +
+                // `1.clamp` declines).
+                if levels[..pos + 1].iter().any(|l| targets.contains(l)) {
                     return false;
                 }
             }
