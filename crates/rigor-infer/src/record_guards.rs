@@ -129,7 +129,7 @@ impl<'i> Typer<'i> {
                                 // `in C => x`) lowers to the constant.
                                 Node::BeginRescue { body, .. } => body
                                     .first()
-                                    .filter(|&&p| self.static_guard_class(ast, p))
+                                    .filter(|&&p| self.static_guard_class(ast, p, true))
                                     .map(|&p| ast.get(p).span().1),
                                 _ => None,
                             });
@@ -245,14 +245,14 @@ impl<'i> Typer<'i> {
                 ("!", []) => self.guarded_locals_into(ast, *r, out),
                 ("is_a?" | "kind_of?" | "instance_of?", [c]) => {
                     if let Some(name) = local(*r) {
-                        if self.static_guard_class(ast, *c) {
+                        if self.static_guard_class(ast, *c, false) {
                             out.push(name);
                         }
                     }
                 }
                 ("===", [a]) => {
                     if let Some(name) = local(*a) {
-                        let receiver_guards = self.static_guard_class(ast, *r)
+                        let receiver_guards = self.static_guard_class(ast, *r, true)
                             || matches!(ast.get(*r), Node::RegexpLit { .. } | Node::Range { .. });
                         if receiver_guards {
                             out.push(name);
@@ -266,18 +266,25 @@ impl<'i> Typer<'i> {
     }
 
     /// Whether `id` is a class operand the reference's class guard narrows
-    /// through: a static constant spelling (`static_class_name`), and for a
-    /// rooted `::C` one whose `C` is known (`rooted_class_predicate_name`).
-    fn static_guard_class(&self, ast: &LoweredAst, id: NodeId) -> bool {
+    /// through: a static constant spelling (`static_class_name`). What a
+    /// rooted `::C` needs differs by caller — `lexical_rooted: true` follows
+    /// `lexical_class_name` (`===` / `case` / `in`, which keep the de-rooted
+    /// spelling unconditionally), while `false` follows
+    /// `rooted_class_predicate_name` (`is_a?` / `kind_of?` / `instance_of?`,
+    /// which decline unless an authoritative surface knows the top-level
+    /// `C`). rigor-rs#672.
+    fn static_guard_class(&self, ast: &LoweredAst, id: NodeId, lexical_rooted: bool) -> bool {
         let Node::ConstantRead { name, dynamic_base, self_anchored, rooted, .. } = ast.get(id) else {
             return false;
         };
         if name.is_empty() || *dynamic_base || *self_anchored {
             return false;
         }
-        let bare = name.strip_prefix("::").unwrap_or(name);
+        let bare = name.trim_start_matches(':');
         if *rooted || name.starts_with("::") {
-            return self.constant_names_a_known_class(bare) || self.source.knows_class(bare);
+            return lexical_rooted
+                || self.constant_names_a_known_class(bare)
+                || self.source.knows_class(bare);
         }
         true
     }

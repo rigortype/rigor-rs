@@ -35,3 +35,21 @@ end
 def rooted_known(x)
   x.frobnicate_r5 if x.is_a?(::String)
 end
+
+# The slot-record half of the same split: `is_a?` declines a rooted unknown
+# operand outright (no scopes — `h[:a]`'s record survives and the else arm
+# fires), while `===` still narrows to the unknown `NoSuchZz` nominal, so
+# the guard's record cover drops the record (silent).
+h = {a: 1}
+h[:a] ||= "s"
+if h.is_a?(::NoSuchZz)
+  1
+else
+  h[:a].frobnicate_r6
+end
+
+if ::NoSuchZz === h
+  1
+else
+  h[:a].frobnicate_r7
+end
