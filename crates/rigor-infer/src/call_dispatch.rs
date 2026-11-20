@@ -4,7 +4,7 @@
 //! bare-nominal-join declines and in-source parameter bounds.
 
 use rigor_parse::{LoweredAst, Node, NodeId};
-use rigor_types::{Interner, Scalar, Type, TypeId};
+use rigor_types::{Interner, RefinementId, Scalar, Type, TypeId};
 
 use crate::{folding, ParamBoundReturn, TypeEnv, Typer};
 
@@ -598,6 +598,17 @@ impl<'i> Typer<'i> {
 
         // Tier 3 (-ish): resolve receiver class -> method return class.
         if let Some(class_name) = self.index.class_name_of(interner, recv_ty) {
+            // Reference `MethodDispatcher::ShapeDispatch` (`shape_dispatch.rb`)
+            // refinement projections: `Integer#to_s` / `#inspect` (and
+            // `Float#to_s`) answer the `decimal-int-string` /
+            // `non-empty-string` refinement carriers ahead of the flat RBS
+            // `String` (rigor-rs#696), and those carriers keep their
+            // refinement through the transformations ShapeDispatch knows.
+            if let Some(projected) =
+                self.refinement_projection(ast, recv_ty, method, args, env, interner)
+            {
+                return projected;
+            }
             // The instance twin of the singleton tuple arm above
             // (`"a-b".partition("-") : [String, String, String]`): a tuple return
             // types per-position instead of collapsing to `Dynamic[top]`.
@@ -1165,6 +1176,390 @@ impl<'i> Typer<'i> {
             }
         }
         false
+    }
+
+    /// Reference `MethodDispatcher::ShapeDispatch` (`shape_dispatch.rb`)
+    /// refinement projections over the carriers the port can name
+    /// (rigor-rs#696):
+    ///
+    /// - `integer_to_s_projection` — `Integer#to_s` / `#inspect` on a bare
+    ///   `Nominal[Integer]` answer `decimal-int-string` (no argument, or a
+    ///   `Constant[10]` base); any other single argument answers
+    ///   `non-empty-string` (`to_s(base)` never returns `""`, but a
+    ///   non-decimal base's digits match no registered refinement). More
+    ///   than one argument declines.
+    /// - `float_to_s_projection` — `Float#to_s` / `#inspect` (no argument)
+    ///   answer `non-empty-string`: a bare `Float` admits `NaN` / the
+    ///   infinities, so the floor is the total non-empty conversion.
+    /// - `dispatch_integer_range` — `to_s` on an `IntegerRange` whose lower
+    ///   bound is provably `>= 0` (a signed range declines entirely — the
+    ///   result could carry a `-`). The base argument must be statically
+    ///   known: a non-`Constant` base declines to RBS, unlike the
+    ///   `Nominal[Integer]` tier's non-empty floor.
+    /// - `REFINED_STRING_PROJECTIONS` (the `decimal_int` rows) —
+    ///   `upcase` / `downcase` on `decimal-int-string` are `refined_self`:
+    ///   digit-only strings are case-invariant.
+    /// - `dispatch_string_binary_from_arg` — `String + non-empty-string` is
+    ///   `non-empty-string` (the argument guarantees it) and `String * 0` is
+    ///   `""`; these apply to ANY `String`-typed receiver in the reference,
+    ///   so the arms sit on the `Nominal`/`Refined`/`Difference` rows alike.
+    /// - `empty_removal_projection` on `non-empty-string` —
+    ///   `size`/`length`/`bytesize` are `positive-int`, `empty?` is `false`,
+    ///   the `NON_EMPTY_STRING_PRESERVING_UNARY` family keeps the
+    ///   difference, `+` keeps it for any argument, and `*` repeats it for a
+    ///   provably positive count (`* 0` is `""`).
+    ///
+    /// Returns `None` (declines) for every other method or receiver — the
+    /// caller then runs ordinary RBS dispatch on the carrier's erased base
+    /// class, which is exactly what ShapeDispatch's own
+    /// `dispatch_nominal_size` fallback does.
+    fn refinement_projection(
+        &self,
+        ast: &LoweredAst,
+        recv_ty: TypeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        match interner.get(recv_ty).clone() {
+            Type::Nominal { class, .. } => match self.index.class_name_for_id(class) {
+                Some("Integer") => self
+                    .integer_to_s_projection(ast, method, args, env, interner)
+                    .or_else(|| {
+                        self.integer_binary_projection(ast, method, args, env, interner)
+                    }),
+                Some("Float") => self.float_to_s_projection(method, args, interner),
+                // `nominal_projection` + `dispatch_nominal_size`: the
+                // arg-driven String rows first, then the size selectors.
+                Some(name @ ("String" | "Array" | "Hash" | "Set" | "Range")) => {
+                    (if name == "String" {
+                        self.string_binary_projection(ast, method, args, env, interner)
+                    } else {
+                        None
+                    })
+                    .or_else(|| self.size_returning_projection(name, method, args, interner))
+                }
+                _ => None,
+            },
+            Type::IntegerRange { min, .. } => {
+                // `dispatch_integer_range` handles `to_s` only, and only when
+                // the range cannot produce a leading `-` (`inspect` declines).
+                if method == "to_s" && min.is_some_and(|lo| lo >= 0) {
+                    let base = self.to_s_base_argument(ast, args, env, interner)?;
+                    Some(if base == 10 {
+                        self.decimal_int_string(interner)?
+                    } else {
+                        self.non_empty_string(interner)?
+                    })
+                } else {
+                    None
+                }
+            }
+            Type::Refined { base, refinement } => {
+                if !self.is_refined_string(interner, base, refinement) {
+                    return None;
+                }
+                match method {
+                    // `%i[decimal_int upcase|downcase] => :refined_self`.
+                    "upcase" | "downcase" if args.is_empty() => Some(recv_ty),
+                    // `dispatch_refined` delegates the size selectors to the
+                    // String nominal tier (`non-negative-int`).
+                    "size" | "length" | "bytesize" if args.is_empty() => {
+                        Some(interner.intern(Type::IntegerRange { min: Some(0), max: None }))
+                    }
+                    // The `Refined` rows ShapeDispatch delegates to the
+                    // String nominal fallback for.
+                    "+" | "*" => {
+                        self.string_binary_projection(ast, method, args, env, interner)
+                    }
+                    _ => None,
+                }
+            }
+            Type::Difference { base, removed } => {
+                if self.empty_witness_base_class(interner, base, removed) != Some("String") {
+                    return None;
+                }
+                self.non_empty_string_projection(ast, recv_ty, method, args, env, interner)
+            }
+            _ => None,
+        }
+    }
+
+    /// `integer_to_s_projection` (`shape_dispatch.rb`): `to_s` /
+    /// `inspect` on a bare `Nominal[Integer]`.
+    fn integer_to_s_projection(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        match method {
+            "inspect" if args.is_empty() => self.decimal_int_string(interner),
+            "to_s" => match args.len() {
+                0 => self.decimal_int_string(interner),
+                1 => {
+                    let arg_ty = self.type_of(ast, args[0], env, interner);
+                    if Self::decimal_base(interner, arg_ty) {
+                        self.decimal_int_string(interner)
+                    } else {
+                        self.non_empty_string(interner)
+                    }
+                }
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+
+    /// `float_to_s_projection` (`shape_dispatch.rb`): `to_s` / `inspect`
+    /// (no argument) on a bare `Nominal[Float]` floor at `non-empty-string`.
+    fn float_to_s_projection(
+        &self,
+        method: &str,
+        args: &[NodeId],
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        if matches!(method, "to_s" | "inspect") && args.is_empty() {
+            self.non_empty_string(interner)
+        } else {
+            None
+        }
+    }
+
+    /// `dispatch_integer_binary_from_arg` (`shape_dispatch.rb`):
+    /// `Integer * Constant[0]` is `Constant[0]` on any Integer receiver.
+    fn integer_binary_projection(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        if method != "*" || args.len() != 1 {
+            return None;
+        }
+        let arg_ty = self.type_of(ast, args[0], env, interner);
+        if matches!(interner.get(arg_ty), Type::Constant(Scalar::Int(0))) {
+            Some(interner.intern(Type::Constant(Scalar::Int(0))))
+        } else {
+            None
+        }
+    }
+
+    /// `SIZE_RETURNING_NOMINALS` + `dispatch_nominal_size` / the
+    /// `Refined`/`Difference` delegation (`shape_dispatch.rb`): the
+    /// `size`-family selectors on a nominal collection/String tighten the
+    /// RBS `Integer` to `non_negative_int`. The `Refined[String]` delegate
+    /// takes the same `0..` answer (a `decimal-int-string` may be `"0"`);
+    /// the `non-empty-string` `Difference` has its own `positive-int` arm in
+    /// [`Self::non_empty_string_projection`].
+    fn size_returning_projection(
+        &self,
+        class_name: &str,
+        method: &str,
+        args: &[NodeId],
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        if !args.is_empty() {
+            return None;
+        }
+        let selector = match class_name {
+            "String" => matches!(method, "length" | "size" | "bytesize"),
+            "Array" | "Hash" | "Set" | "Range" => matches!(method, "size" | "length" | "count"),
+            _ => return None,
+        };
+        if selector {
+            Some(interner.intern(Type::IntegerRange { min: Some(0), max: None }))
+        } else {
+            None
+        }
+    }
+
+    /// `decimal_base?` (`shape_dispatch.rb`): the `to_s` base argument is
+    /// decimal iff it pins `Constant[10]`.
+    fn decimal_base(interner: &Interner, arg_ty: TypeId) -> bool {
+        matches!(interner.get(arg_ty), Type::Constant(Scalar::Int(10)))
+    }
+
+    /// `base_argument` (`shape_dispatch.rb`) for the `IntegerRange` tier:
+    /// the `to_s` base must be a statically known `Constant` Integer —
+    /// anything else declines (`None`), including an untyped argument.
+    fn to_s_base_argument(
+        &self,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<i64> {
+        match args {
+            [] => Some(10),
+            [arg] => {
+                let arg_ty = self.type_of(ast, *arg, env, interner);
+                match interner.get(arg_ty) {
+                    Type::Constant(Scalar::Int(v)) => Some(*v),
+                    // A Bignum `Constant` is an Integer too, and never 10.
+                    Type::Constant(Scalar::BigInt(_)) => Some(-1),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `dispatch_string_binary_from_arg` (`shape_dispatch.rb`): the
+    /// arg-driven `String` projections shared by every `String`-typed
+    /// receiver — `+` on a `non-empty-string` argument and `* 0`.
+    fn string_binary_projection(
+        &self,
+        ast: &LoweredAst,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let [arg] = args else { return None };
+        let arg_ty = self.type_of(ast, *arg, env, interner);
+        match method {
+            "+" if self.non_empty_string_compatible(interner, arg_ty) => {
+                self.non_empty_string(interner)
+            }
+            "*" if matches!(interner.get(arg_ty), Type::Constant(Scalar::Int(0))) => {
+                Some(interner.intern(Type::Constant(Scalar::Str(String::new()))))
+            }
+            _ => None,
+        }
+    }
+
+    /// `empty_removal_projection` (`shape_dispatch.rb`) over a
+    /// `non-empty-string` (`Difference[String, Constant[""]]`) receiver.
+    fn non_empty_string_projection(
+        &self,
+        ast: &LoweredAst,
+        recv_ty: TypeId,
+        method: &str,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        match (method, args.len()) {
+            // `size_returning_for_empty_removal` — String selectors.
+            ("size" | "length" | "bytesize", 0) => Some(interner.intern(
+                Type::IntegerRange { min: Some(1), max: None },
+            )),
+            // `empty_predicate_projection` — a non-empty String's `empty?`.
+            ("empty?", 0) => Some(interner.intern(Type::Constant(Scalar::Bool(false)))),
+            // `NON_EMPTY_STRING_PRESERVING_UNARY` — case and order
+            // transforms never reduce a string to `""`.
+            ("upcase" | "downcase" | "capitalize" | "swapcase" | "reverse", 0) => {
+                Some(recv_ty)
+            }
+            // `empty_string_binary`: concatenation keeps non-emptiness for
+            // ANY argument type.
+            ("+", 1) => Some(recv_ty),
+            // `non_empty_string_repeat`: `* 0` is `""`, a provably positive
+            // count keeps the difference, anything else declines to RBS.
+            ("*", 1) => {
+                let arg_ty = self.type_of(ast, args[0], env, interner);
+                match interner.get(arg_ty) {
+                    Type::Constant(Scalar::Int(0)) => {
+                        Some(interner.intern(Type::Constant(Scalar::Str(String::new()))))
+                    }
+                    Type::Constant(Scalar::Int(v)) if *v > 0 => Some(recv_ty),
+                    // A positive Bignum is past `i64` — always `>= 1`.
+                    Type::Constant(Scalar::BigInt(d)) if !d.starts_with('-') => {
+                        Some(recv_ty)
+                    }
+                    Type::IntegerRange { min: Some(0), max: Some(0) } => {
+                        Some(interner.intern(Type::Constant(Scalar::Str(String::new()))))
+                    }
+                    Type::IntegerRange { min: Some(lo), .. } if *lo >= 1 => Some(recv_ty),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// `Type::Combinator.non_empty_string_compatible?` — the carrier is a
+    /// `non-empty-string` `Difference` itself, an `Intersection` with such a
+    /// member, or a `Union` whose members all are.
+    fn non_empty_string_compatible(&self, interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty).clone() {
+            Type::Difference { base, removed } => {
+                self.empty_witness_base_class(interner, base, removed) == Some("String")
+            }
+            Type::Intersection(ms) => ms
+                .iter()
+                .any(|&m| self.non_empty_string_compatible(interner, m)),
+            Type::Union(ms) => {
+                !ms.is_empty()
+                    && ms.iter()
+                        .all(|&m| self.non_empty_string_compatible(interner, m))
+            }
+            _ => false,
+        }
+    }
+
+    /// `Difference#removes_empty_witness?` (`type/difference.rb`): `removed`
+    /// is the empty witness of a `Nominal` base (`""` for String, `0` for
+    /// Integer, `Tuple[]` for Array, `HashShape{}` for Hash); answers the
+    /// base's class name when it is.
+    fn empty_witness_base_class(
+        &self,
+        interner: &Interner,
+        base: TypeId,
+        removed: TypeId,
+    ) -> Option<&'static str> {
+        let Type::Nominal { class, .. } = interner.get(base) else {
+            return None;
+        };
+        let name = self.index.class_name_for_id(*class)?;
+        let is_empty_witness = match name {
+            "String" => {
+                matches!(interner.get(removed), Type::Constant(Scalar::Str(s)) if s.is_empty())
+            }
+            "Integer" => matches!(interner.get(removed), Type::Constant(Scalar::Int(0))),
+            "Array" => matches!(interner.get(removed), Type::Tuple(elems) if elems.is_empty()),
+            "Hash" => {
+                matches!(interner.get(removed), Type::HashShape(members) if members.is_empty())
+            }
+            _ => return None,
+        };
+        is_empty_witness.then_some(name)
+    }
+
+    /// The receiver is the `Refined[String, decimal_int]` carrier —
+    /// `decimal-int-string`, the only `Refined` the port mints today.
+    fn is_refined_string(&self, interner: &Interner, base: TypeId, refinement: RefinementId) -> bool {
+        refinement == RefinementId::DECIMAL_INT
+            && matches!(
+                interner.get(base),
+                Type::Nominal { class, .. }
+                    if self.index.class_name_for_id(*class) == Some("String")
+            )
+    }
+
+    /// `Type::Combinator.decimal_int_string` — `Refined[String, :decimal_int]`.
+    fn decimal_int_string(&self, interner: &mut Interner) -> Option<TypeId> {
+        let class = self.index.class_id("String")?;
+        let base = interner.intern(Type::Nominal { class, args: vec![] });
+        Some(interner.intern(Type::Refined {
+            base,
+            refinement: RefinementId::DECIMAL_INT,
+        }))
+    }
+
+    /// `Type::Combinator.non_empty_string` —
+    /// `Difference[String, Constant[""]]`.
+    fn non_empty_string(&self, interner: &mut Interner) -> Option<TypeId> {
+        let class = self.index.class_id("String")?;
+        let base = interner.intern(Type::Nominal { class, args: vec![] });
+        let empty = interner.intern(Type::Constant(Scalar::Str(String::new())));
+        Some(rigor_types::Algebra::difference(interner, base, empty))
     }
 
     /// Issue #479 — reference `LiteralStringFolding.fold_concat`

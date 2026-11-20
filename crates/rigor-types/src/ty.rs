@@ -25,6 +25,28 @@ pub struct ClassId(pub u32);
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, PartialOrd, Ord)]
 pub struct RefinementId(pub u32);
 
+impl RefinementId {
+    /// `:decimal_int` — `/\A-?\d+\z/` — the predicate the reference's
+    /// `integer_to_s_projection` puts on its `String` answer for
+    /// `Integer#to_s` / `Integer#inspect` (`shape_dispatch.rb`). On a
+    /// `String` base the reference's `Refined::CANONICAL_NAMES` renders it
+    /// `decimal-int-string`. The only refinement the port mints today
+    /// (rigor-rs#696).
+    pub const DECIMAL_INT: Self = Self(0);
+
+    /// The reference's `Refined::CANONICAL_NAMES` — a registered
+    /// `(base class name, predicate)` pair prints its kebab-case name
+    /// through `describe`; unregistered pairs fall back to the
+    /// `base & predicate?` operator form. The port mints only the
+    /// `("String", :decimal_int)` pair today.
+    pub fn canonical_name(base_class: &str, predicate: Self) -> Option<&'static str> {
+        match (base_class, predicate) {
+            ("String", Self::DECIMAL_INT) => Some("decimal-int-string"),
+            _ => None,
+        }
+    }
+}
+
 /// URI of a registered higher-kinded type constructor (ADR-20), e.g.
 /// `json::value`. Stored as an owned string; the defunctionalised constructor
 /// is resolved through the HKT registry elsewhere.

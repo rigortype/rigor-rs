@@ -715,6 +715,16 @@ impl CoreIndex {
             Type::Tuple(_) => Some("Array"),
             Type::HashShape(_) => Some("Hash"),
             Type::IntegerRange { .. } => Some("Integer"),
+            // Refinement/difference carriers erase to their base nominal for
+            // dispatch and witnessing (the reference's `erase_to_rbs` and
+            // ShapeDispatch's base delegation): `decimal-int-string` and
+            // `non-empty-string` dispatch as `String` (rigor-rs#696).
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                match interner.get(*base) {
+                    Type::Nominal { class, .. } => self.class_name_for_id(*class),
+                    _ => None,
+                }
+            }
             _ => None,
         }
     }
