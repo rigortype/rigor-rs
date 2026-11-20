@@ -183,3 +183,56 @@ class W1B
     end
   end
 end
+
+# Review (PR #708, round 7): a rooted QUALIFIED operand names its path as
+# written — `class Outer; class Inner` narrows `when ::Outer::Inner` (the
+# decl-shadow stays single-segment: only a bare `::C` a project class
+# literally names declines).
+class W2Outer
+  class W2Inner
+  end
+end
+module W2A
+  module W2B
+    class W2C
+    end
+  end
+end
+W2Ev.class_eval do
+  class self::W2F
+  end
+end
+
+def rooted_when_qualified_decl
+  x = [1]
+  case x
+  when ::W2Outer::W2Inner then x.frobnicate_r27
+  else x.frobnicate_r28
+  end
+end
+
+class W2K
+  def rooted_when_qualified_in_class
+    x = [1]
+    case x
+    when ::W2Outer::W2Inner then x.frobnicate_r29
+    else x.frobnicate_r30
+    end
+  end
+end
+
+def rooted_when_deep_decl
+  x = [1]
+  case x
+  when ::W2A::W2B::W2C then x.frobnicate_r31
+  else x.frobnicate_r32
+  end
+end
+
+def rooted_when_eval_decl
+  x = [1]
+  case x
+  when ::W2Ev::W2F then x.frobnicate_r33
+  else x.frobnicate_r34
+  end
+end

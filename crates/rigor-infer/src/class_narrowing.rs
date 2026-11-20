@@ -2219,10 +2219,13 @@ impl<'i> Typer<'i> {
         if *rooted {
             // `lexical_class_name`'s rooted arm keeps the de-rooted spelling
             // UN-WALKED — `when ::Stat` inside `class File` names top-level
-            // `Stat`, never `File::Stat` (rigor-rs#672). Only a top-level
-            // project CLASS shadows it: `knows_class` (the
-            // `discovered_classes` analogue) keys classes, not const writes.
-            if self.source.knows_discovered_decl(name) {
+            // `Stat`, never `File::Stat` (rigor-rs#672). Only a ONE-SEGMENT
+            // top-level project class shadows it: `knows_class`'s leaf key
+            // used to shadow `::M` for a nested `class A; class M`, and
+            // `discovered_decls`'s qualified keys would shadow
+            // `::Outer::Inner` — both are names the rooted operand narrows
+            // to on the oracle (rigor-rs#672 rounds 6–7).
+            if !name.contains("::") && self.source.knows_discovered_decl(name) {
                 return None;
             }
             return Some(name.to_string());

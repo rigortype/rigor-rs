@@ -98,6 +98,34 @@
       "column": 12,
       "severity": "error",
       "message": "undefined method `frobnicate_r26' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 210,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r28' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 219,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r30' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 228,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r32' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 236,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r34' for [1]"
     }
   ]
 }
