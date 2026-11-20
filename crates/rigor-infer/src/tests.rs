@@ -1730,9 +1730,12 @@ fn per_element_map_fold_declines_unmodelled_writes() {
 // ids. `type_of_env_memo` is scoped to the interner's uid, so those answers
 // STORE and a later driver visit answers from the entry; before that was
 // understood, the `type_is_interner_free` store gate dropped every such
-// answer, and each driver visit (the rules walk every `Call` node) re-typed
-// its whole receiver suffix — quadratic in the chain, and the issue's
-// `.map` repro (100 links × 9000-deep blocks) never finished.
+// answer, and each driver visit (the rules walk every `Call` node)
+// re-typed its whole receiver suffix — and since a block call types its
+// receiver TWICE (the #479 literal-concat gate, then `type_block_call`),
+// the work DOUBLED per link: exponential in the chain (2^k − 1 events for
+// the k-th link's visit), and the issue's `.map` repro (100 links ×
+// 9000-deep blocks, 2^100 typing work) never finished.
 
 /// `[1]` + `blocks` × `.map { |y| [[…[y]…]] }` (each wrap `depth` deep) +
 /// `.foo` — the rigor-rs#427 `.map` repro at reference-survivable sizes.
@@ -1799,7 +1802,10 @@ fn block_chain_answers_store_in_the_env_memo() {
 
 #[test]
 fn block_chain_types_once_per_driver_visit() {
-    const LINKS: usize = 40;
+    // Small enough that an unmemoized regression FAILS the assertion in
+    // under a second rather than hanging CI: at 10 links the old store
+    // gate costs ~2^11 events (the 8-link measurement below was 757).
+    const LINKS: usize = 10;
     let ast = lower_src(&map_chain_src(LINKS, 2));
     let idx = CoreIndex::new();
     let typer = Typer::new(&idx);
@@ -1819,8 +1825,9 @@ fn block_chain_types_once_per_driver_visit() {
     assert!(
         events <= LINKS as u64 + 2,
         "each link must type once ({events} block-call events for {LINKS} links; \
-         unmemoized it is LINKS(LINKS+1)/2 = {})",
-        LINKS * (LINKS + 1) / 2
+         unmemoized, the literal-concat gate types the receiver once and \
+         `type_block_call` once more, so each visit DOUBLES — an 8-link \
+         chain already costs 757 events, 2^k - 1 per visit)"
     );
 }
 

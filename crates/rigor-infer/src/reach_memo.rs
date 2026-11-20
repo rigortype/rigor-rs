@@ -1006,14 +1006,24 @@ impl<'i> Typer<'i> {
     /// it rather than a borrow so the `compute` closure keeps its `&mut`
     /// (the env snapshot's `TypeId`s are only meaningful under it).
     ///
+    /// Known key gap (rigor-rs#699's family): `Typer::loop_pass` — the
+    /// fixpoint replay that changes how `if` decisions re-type — is NOT
+    /// part of the entry key, like it is not part of the flat memo's. No
+    /// probe has reached a divergence through it (the loop-pass shapes all
+    /// decline before `type_of` matters; the 9k-file memo audit is clean),
+    /// but storing interner-bound answers widens the set an entry may
+    /// answer, so a future loop-pass reachability change must either fold
+    /// the flag into this key or invalidate the window when it flips.
+    ///
     /// Unlike the flat memo, ANY carrier may be stored, including one that
     /// embeds `TypeId`s: a hit requires the very interner that produced the
     /// ids (uid match), so they are re-interned — a dedup hit — under the
     /// same arena rather than translated across interners (rigor-rs#427:
     /// without this a block chain whose every answer is a deep `Tuple`
-    /// (`[1].map { |y| [[…[y]…]] }.map { … }`) never stores, and every
-    /// driver visit re-types its whole receiver suffix — quadratic in the
-    /// chain).
+    /// (`[1].map { |y| [[…[y]…]] }.map { … }`) never stores — and with a
+    /// block call typing its receiver twice, every driver visit then
+    /// DOUBLED the remaining suffix's work: exponential in the chain,
+    /// 2^k − 1 `type_block_call` events for the k-th link).
     pub(crate) fn type_of_env_memo(
         &self,
         ast: &LoweredAst,

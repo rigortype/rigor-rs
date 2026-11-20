@@ -60,7 +60,10 @@ enum FoldMatch {
 
 // `type_block_call` entries on THIS analysis thread — the rigor-rs#427
 // chain pin: a driver visit per chain node must not re-type the receiver
-// suffix, so a chain of N `.map` links costs N events, not N(N+1)/2.
+// suffix, so a chain of N `.map` links costs N events. (A block call types
+// its receiver TWICE — the #479 literal-concat gate and `type_block_call`
+// — so unmemoized each visit DOUBLES: 2^k − 1 events for the k-th link,
+// 757 for an 8-link chain.)
 // Thread-local because the analysis is single-threaded per file while the
 // test harness runs tests in parallel on one global binary. (A plain
 // comment: a doc comment on a macro item is `unused_doc_comment`, which

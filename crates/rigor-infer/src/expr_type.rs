@@ -169,7 +169,9 @@ impl<'i> Typer<'i> {
             // re-interned under the same arena on a hit — no
             // cross-interner translation (rigor-rs#427: a block chain's
             // answers are deep `Tuple`s, and requiring interner-freedom
-            // here kept every such chain unmemoized and quadratic).
+            // here kept every such chain unmemoized — and with a block
+            // call typing its receiver twice, unmemoized work DOUBLED per
+            // link: exponential in the chain).
             if env.len() <= ENV_TYPE_MEMO_MAX {
                 let interner_id = interner.uid();
                 let ty = self.type_of_env_memo(ast, id, env, interner_id, |s| {

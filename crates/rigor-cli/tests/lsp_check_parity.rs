@@ -918,9 +918,11 @@ fn lsp_falls_back_to_the_cwd_and_discloses_when_the_named_root_is_unusable() {
 // must publish its diagnostics and leave the server alive enough to shut
 // down cleanly. The chain's every answer is an interner-bound deep `Tuple`;
 // before the env memo stored those, each driver visit re-typed the whole
-// receiver suffix (quadratic in the links), and the repro could not finish.
-// The 25×25 shape here keeps the committed test fast while staying well
-// past the depth any real file reaches (the corpus deepest is 40).
+// receiver suffix — and a block call types its receiver twice, so the
+// work DOUBLED per link (exponential in the links), and the repro could
+// not finish. The 25×25 shape here keeps the committed test fast while
+// staying well past the depth any real file reaches (the corpus deepest
+// is 40).
 // ---------------------------------------------------------------------------
 
 #[test]
