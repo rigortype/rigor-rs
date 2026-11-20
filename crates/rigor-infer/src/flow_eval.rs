@@ -1238,6 +1238,11 @@ impl<'i> Typer<'i> {
             value_node: Option<NodeId>,
             compound: bool,
             unmodeled: bool,
+            /// A `LocalVariableWrite` / `InstanceVariableWrite` — whose
+            /// compound verdict `self_compound` re-derives per operand
+            /// (rigor-rs#683). Op-write and masgn sites keep the scan's
+            /// `compound`.
+            plain: bool,
         }
         let mut sites: Vec<Site> = Vec::new();
         for (_, n) in ast.iter() {
@@ -1252,13 +1257,13 @@ impl<'i> Typer<'i> {
                         continue;
                     }
                     let vs = ast.get(*value).span();
-                    // A bare `x = x` or a `x = x || v` / `x = x && v`
-                    // rebinding can only union with the entry binding — the
-                    // join is monotone and converges; every other self-read
-                    // (`y = [y]`, `x = f(x)`) compounds.
+                    // A plain self-write's compound verdict is re-derived
+                    // per operand post-`live` (`self_compound` below,
+                    // rigor-rs#683): `x = x || v` converges, but a self-read
+                    // buried in an operand (`x = [1, 2][x] || 0`,
+                    // `x = f(x)`) can compound.
                     let compound = marks.reads_within(vs).contains(&name.as_str())
-                        && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } if n2 == name)
-                        && !matches!(ast.get(*value), Node::Logical { .. });
+                        && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. } if n2 == name);
                     sites.push(Site {
                         target: name.clone(),
                         span: *span,
@@ -1266,6 +1271,7 @@ impl<'i> Typer<'i> {
                         value_node: Some(*value),
                         compound,
                         unmodeled: false,
+                        plain: true,
                     });
                 }
                 Node::LocalVariableOpWrite { name, value, op, span, .. } => {
@@ -1287,6 +1293,7 @@ impl<'i> Typer<'i> {
                         value_node: Some(*value),
                         compound,
                         unmodeled: false,
+                        plain: false,
                     });
                 }
                 Node::MultiWrite { targets, value, span, .. } => {
@@ -1305,6 +1312,7 @@ impl<'i> Typer<'i> {
                             value_node: Some(*value),
                             compound: false,
                             unmodeled: false,
+                            plain: false,
                         });
                     }
                 }
@@ -1320,6 +1328,7 @@ impl<'i> Typer<'i> {
                             value_node: None,
                             compound: false,
                             unmodeled: true,
+                            plain: false,
                         });
                     }
                 }
@@ -1338,6 +1347,117 @@ impl<'i> Typer<'i> {
                 .unwrap_or(usize::MAX)
         };
         let nil = interner.nil();
+        // rigor-rs#683 — a plain self-write compounds when a self-read feeds
+        // its result unboundedly. `x = x || v` only unions with the entry
+        // binding, but `x = [1, 2][x] || 0` / `x = x.succ || 0` / `x = f(x)`
+        // keep moving until the cap. Walk the value's `&&`/`||` tree: a leaf
+        // inherits an x-polarity gate — `x || R` evaluates `R` only while
+        // `x` is falsey (bounded), `x && R` while `x` is truthy, a leaf
+        // behind a statically-decided operand never (`x = 0 || f(x)`) — and
+        // an `&&` left operand contributes only its FALSEY part to the
+        // result ({nil,false}: bounded — `x = [x] && 0` converges). A leaf
+        // reading the name while it may be truthy compounds, unless the
+        // read is not an ASSUMPTION read — a name the body's earlier
+        // x-free write cut from the pass-entry binding (`x = 1; x = f(x)`)
+        // — or the operand's own type proves the write converged:
+        // `x + 0` folds back to the entry binding, `x[0]`'s `Integer`
+        // stays inside the entry's widened envelope (the reference's
+        // `0[0] -> 0` fold converges), and an unresolved `foo(x)`
+        // declines to `Dynamic`, which joins the binding into a stable
+        // `Dynamic`-union on the second pass.
+        let mut self_compound: HashSet<usize> = HashSet::new();
+        for site in &live {
+            if !site.plain || !site.compound {
+                continue;
+            }
+            let Some(v) = site.value_node else {
+                continue;
+            };
+            let n = site.target.as_str();
+            let entry = env.get(n).copied().unwrap_or(nil);
+            let widened = self.widen_value_pinned(entry, interner);
+            // A read at `p` sees the pass-entry binding iff no earlier live
+            // write of the name produced an x-free binding before it: a
+            // write that itself reads the name (`x = x`, `x = x || 0`,
+            // `x = [x]`) yields an assumption-DERIVED binding and does not
+            // cut; `x = 1` / `x = f()` does.
+            let assumption_read = |p: usize| {
+                live.iter()
+                    .filter(|s| s.target == n && s.span.1 <= p)
+                    .all(|s| match s.value {
+                        Some(sv) => marks.reads_within(sv).contains(&n),
+                        // An unmodeled write may or may not carry the
+                        // assumption — keep the read (compound is the
+                        // FP-safe side).
+                        None => true,
+                    })
+            };
+            // {FALSEY = 0b01, TRUTHY = 0b10}: the x-polarities under which
+            // this leaf's read can evaluate unboundedly.
+            let mut stack: Vec<(NodeId, u8)> = vec![(v, 0b11)];
+            'site: while let Some((id, gate)) = stack.pop() {
+                match ast.get(id) {
+                    Node::Logical { left, right, is_and, .. } => {
+                        let (left, right, is_and) = (*left, *right, *is_and);
+                        stack.push((left, if is_and { gate & 0b01 } else { gate }));
+                        let cond = if is_and {
+                            Self::logical_truthy_cond(ast, left, n)
+                        } else {
+                            Self::logical_falsey_cond(ast, left, n)
+                        };
+                        stack.push((right, gate & cond));
+                    }
+                    node => {
+                        // A bare `name` operand contributes the entry
+                        // binding itself — the monotone term.
+                        if matches!(node, Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. } if n2 == n) {
+                            continue;
+                        }
+                        // Gated to `name` falsey, or never: the read is
+                        // bounded by the {nil,false} set.
+                        if gate & 0b10 == 0 {
+                            continue;
+                        }
+                        let has_assumption_read = marks
+                            .read_positions_within(node.span())
+                            .iter()
+                            .any(|(p, r)| *r == n && assumption_read(*p));
+                        if !has_assumption_read {
+                            continue;
+                        }
+                        // The operand's type proves the write converged:
+                        // `x + 0` folds back to the entry binding (`vt ⊆
+                        // entry`); `x[0]`'s `Integer` codomain stays inside
+                        // the entry's widened envelope (`vt ⊆ widen(entry)`,
+                        // non-Constant so `x - 5`'s `0` cannot sneak in);
+                        // and a `Dynamic` operand joins the binding into a
+                        // stable union on the next pass — but only when the
+                        // decline is one the reference must share: a
+                        // receiverless call has no method to resolve
+                        // anywhere (`foo(x)`), and an unbound name's seed
+                        // is nil either way (`[1,2][x]` on a body-first
+                        // `x`). A decline the reference resolves
+                        // (`[1,2].fetch(x)`) keeps moving — compound.
+                        let vt = self.type_of(ast, id, env, interner);
+                        let vt_const = matches!(interner.get(vt), Type::Constant(_));
+                        let vt_decline = Self::type_has_decline(interner, vt);
+                        let converged = rigor_types::Algebra::join(interner, vt, entry)
+                            == entry
+                            || (!vt_const
+                                && rigor_types::Algebra::join(interner, vt, widened)
+                                    == widened)
+                            || (vt_decline
+                                && (!env.contains_key(n)
+                                    || matches!(node, Node::Call { receiver: None, .. })));
+                        if !converged {
+                            self_compound.insert(site.span.0);
+                            break 'site;
+                        }
+                    }
+                }
+            }
+        }
+
         // `moved`: a name whose binding can differ from its seed at ANY pass
         // — a write whose value types differently than the entry binding,
         // plus the propagated cases below. `suspect`: a name that can still
@@ -1351,7 +1471,14 @@ impl<'i> Typer<'i> {
                 if site.unmodeled {
                     grew |= suspect.insert(n.to_string());
                 }
-                if site.compound {
+                // For a plain write the per-operand pass is authoritative
+                // (its `site.compound` was only the scan's coarse
+                // "reads-self" flag); `x <op>=` and masgn keep it.
+                if if site.plain {
+                    self_compound.contains(&site.span.0)
+                } else {
+                    site.compound
+                } {
                     grew |= suspect.insert(n.to_string());
                 }
                 if !moved.contains(n) {
@@ -1431,6 +1558,86 @@ impl<'i> Typer<'i> {
             return None;
         }
         Some((names, suspect))
+    }
+
+    /// The `x`-polarities under which a `&&`/`||` operand can evaluate
+    /// FALSEY, as a bitmask `{FALSEY = 0b01, TRUTHY = 0b10}` over the
+    /// tracked name's polarity — the gate [`Self::loop_cap_widening`]
+    /// threads into right operands (rigor-rs#683). A bare `name` operand
+    /// is falsey exactly when `name` is; a `||` / `&&` composes
+    /// distributively (`a || b` falsey iff both are, `a && b` iff either
+    /// is); literals carry their static polarity; every other leaf may go
+    /// either way (conservative `0b11`).
+    fn logical_falsey_cond(ast: &LoweredAst, id: NodeId, name: &str) -> u8 {
+        match ast.get(id) {
+            Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. }
+                if n2 == name =>
+            {
+                0b01
+            }
+            Node::Logical { left, right, is_and, .. } => {
+                let (l, r) = (Self::logical_falsey_cond(ast, *left, name), Self::logical_falsey_cond(ast, *right, name));
+                if *is_and {
+                    l | r
+                } else {
+                    l & r
+                }
+            }
+            Node::NilLit { .. } | Node::FalseLit { .. } => 0b11,
+            Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::RegexpLit { .. }
+            | Node::RationalLit { .. }
+            | Node::ImaginaryLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::TrueLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. }
+            | Node::Range { .. }
+            | Node::Lambda { .. }
+            | Node::SelfExpr { .. } => 0,
+            _ => 0b11,
+        }
+    }
+
+    /// [`Self::logical_falsey_cond`]'s dual: the `x`-polarities under
+    /// which the operand can evaluate TRUTHY.
+    fn logical_truthy_cond(ast: &LoweredAst, id: NodeId, name: &str) -> u8 {
+        match ast.get(id) {
+            Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. }
+                if n2 == name =>
+            {
+                0b10
+            }
+            Node::Logical { left, right, is_and, .. } => {
+                let (l, r) = (Self::logical_truthy_cond(ast, *left, name), Self::logical_truthy_cond(ast, *right, name));
+                if *is_and {
+                    l & r
+                } else {
+                    l | r
+                }
+            }
+            Node::NilLit { .. } | Node::FalseLit { .. } => 0,
+            Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::RegexpLit { .. }
+            | Node::RationalLit { .. }
+            | Node::ImaginaryLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::TrueLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. }
+            | Node::Range { .. }
+            | Node::Lambda { .. }
+            | Node::SelfExpr { .. } => 0b11,
+            _ => 0b11,
+        }
     }
 
     /// Applies a capped fixpoint's last-pass widen to the caller's POST-JOIN
