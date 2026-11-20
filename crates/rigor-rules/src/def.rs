@@ -113,6 +113,8 @@ pub(crate) fn check_override_visibility(
         severity,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: Some(method.to_string()),
     })
 }
@@ -381,6 +383,8 @@ pub(crate) fn ivar_write_mismatch_diagnostics(
                 severity,
                 source_family: "builtin",
                 receiver_type: None,
+                receiver_classes: None,
+
                 method_name: None,
             });
         }

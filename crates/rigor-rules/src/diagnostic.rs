@@ -80,6 +80,12 @@ pub struct Diagnostic {
     pub source_family: &'static str,
     /// Rendered receiver class/type for call/def rules; `None` for other rules.
     pub receiver_type: Option<String>,
+    /// The receiver's dispatch class names for call rules — one entry per
+    /// union arm (a `singleton(X)` spelling marks a class-object arm),
+    /// `None` for other rules and where the receiver is not a class
+    /// (rigor-rs#446: the refinement decline asks per class, which the
+    /// rendered `receiver_type` cannot spell for literals or unions).
+    pub receiver_classes: Option<Vec<String>>,
     /// Called / defined method name for call/def rules; `None` otherwise.
     pub method_name: Option<String>,
 }

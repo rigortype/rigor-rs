@@ -159,6 +159,7 @@ fn stage3_stamp_never_silences_internal_error() {
         severity: Severity::Error,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
         method_name: None,
     };
     assert!(stamp.apply(&mut panic_diag), "internal-error survives an `off` config");

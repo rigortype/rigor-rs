@@ -298,7 +298,8 @@ pub(crate) fn check_call(
             message,
             severity,
             source_family: "builtin",
-            receiver_type: Some(receiver_render),
+            receiver_type: Some(receiver_render.clone()),
+receiver_classes: Some(vec![receiver_render]),
             method_name: Some(method.to_string()),
         });
     }
@@ -452,6 +453,7 @@ pub(crate) fn check_call(
                     severity,
                     source_family: "builtin",
                     receiver_type: Some(receiver_render),
+receiver_classes: Some(vec![name.to_string()]),
                     method_name: Some(method.to_string()),
                 });
             }
@@ -534,6 +536,7 @@ pub(crate) fn check_call(
         severity,
         source_family: "builtin",
         receiver_type: Some(receiver_render),
+receiver_classes: Some(vec![class_name.to_string()]),
         method_name: Some(method.to_string()),
     })
 }
@@ -697,6 +700,7 @@ fn check_union_call(
         severity,
         source_family: "builtin",
         receiver_type: Some(receiver_render),
+receiver_classes: Some(arm_classes),
         method_name: Some(method.to_string()),
     })
 }
@@ -832,6 +836,7 @@ pub(crate) fn check_narrowed_call(
         severity,
         source_family: "builtin",
         receiver_type: Some(receiver_render),
+receiver_classes: Some(vec![class_name.to_string()]),
         method_name: Some(method.to_string()),
     })
 }
@@ -935,6 +940,7 @@ pub(crate) fn check_collection_call(
         severity,
         source_family: "builtin",
         receiver_type: Some(receiver_render),
+receiver_classes: Some(vec![class_name.to_string()]),
         method_name: Some(method.to_string()),
     })
 }
@@ -1033,6 +1039,8 @@ pub(crate) fn check_nil_receiver(
         severity,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: Some(method.to_string()),
     })
 }

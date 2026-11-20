@@ -280,6 +280,8 @@ fn check_shadowed(
         severity,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     })
 }
