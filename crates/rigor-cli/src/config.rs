@@ -5209,13 +5209,32 @@ mod severity_config_tests {
             ("x: &a 2024-01-01\n", "unspecified class: Date"),
             // Non-`!ruby` tags still reach `tokenize` through
             // `deserialize`'s `else` arm (so does `!float`, inside
-            // `Float(tokenize)`).
+            // `Float(tokenize)`) — and `quoted` is libyaml's
+            // `quoted_implicit`, FALSE whenever a tag is written, so a
+            // TAGGED quoted scalar still tokenizes (issue #347 review).
             ("x: !foo 2024-01-01\n", "unspecified class: Date"),
             (
                 "x: !!timestamp 2024-01-01T00:00:00Z\n",
                 "unspecified class: Time",
             ),
             ("x: !float 2024-01-01\n", "unspecified class: Date"),
+            ("x: !foo \"2024-01-01\"\n", "unspecified class: Date"),
+            ("x: ! \"2024-01-01\"\n", "unspecified class: Date"),
+            ("x: !foo |-\n  2024-01-01\n", "unspecified class: Date"),
+            ("x: !!timestamp '2024-01-01'\n", "unspecified class: Date"),
+            ("x: !ruby/sym \"foo\"\n", "unspecified class: Symbol"),
+            // Collection tags `visit_Psych_Nodes_{Mapping,Sequence}`
+            // resolves BEFORE the children — the non-`!ruby` slice of its
+            // `case o.tag` (probe-verified: `!omap`/`!set` on a SEQUENCE
+            // are plain-collection arms and live).
+            ("x: !set\n  a: 1\n", "unspecified class: Psych::Set"),
+            ("x: !!set {a: 1}\n", "unspecified class: Psych::Set"),
+            ("x: !set\n  2024-01-01:\n", "unspecified class: Psych::Set"),
+            ("x: !omap\n  a: 1\n", "unspecified class: Psych::Omap"),
+            ("x: !!omap {a: 1}\n", "unspecified class: Psych::Omap"),
+            ("x: !map:Foo {a: 1}\n", "unspecified class: Foo"),
+            ("x: !seq:Foo [1]\n", "unspecified class: Foo"),
+            ("x: !str:Foo {a: 1}\n", "unspecified class: Foo"),
             // Document order picks the FIRST death …
             ("x: 2024-01-01\ny: *a\n", "unspecified class: Date"),
             ("y: *a\nx: 2024-01-01\n", "Psych::AliasesNotEnabled"),
@@ -5237,10 +5256,13 @@ mod severity_config_tests {
             }
         }
         // Everything that stays legal: a bare anchor, any quoted or
-        // block-styled scalar (Psych's `quoted` covers every non-plain
-        // style), `!!str`/`!binary` tags, a date-shaped non-match, a
-        // `-`-led string, a Float/Integer tokenize result, and anything in
-        // a SECOND document `Psych.parse` never visits.
+        // block-styled scalar (Psych's `quoted` is `quoted_implicit`),
+        // `!!str`/`!binary` tags, a date-shaped non-match, a `-`-led
+        // string, a Float/Integer tokenize result, a `!omap` SEQUENCE
+        // (`Psych::Omap.new`, a constant — no loader lookup), a
+        // timestamp-shaped scalar split by a non-ASCII space (Ruby's `\s`
+        // is ASCII; U+3000 is not whitespace upstream), and anything in a
+        // SECOND document `Psych.parse` never visits.
         for yaml in [
             "x: &a 5\n",
             "x: \"2024-01-01\"\n",
@@ -5254,6 +5276,8 @@ mod severity_config_tests {
             "x: 1:20\n",
             "x: .inf\n",
             "x: ~\n",
+            "x: !omap [a]\n",
+            "x: 2024-01-01\u{3000}10:00:00\n",
             "x: 5\n---\ny: *a\n",
         ] {
             std::fs::write(dir.join("ok.yml"), yaml).unwrap();
@@ -5266,11 +5290,17 @@ mod severity_config_tests {
         // document parses whole, then the visitor walks it) — these stay
         // the `not valid YAML` exit-64 surface; `!ruby/object:<other>` is a
         // `tokenize` `else` upstream but serde_yaml rejects the tag itself,
-        // a `!ruby/*` divergence left as-is (issue #347 scope).
+        // a `!ruby/*` divergence left as-is (issue #347 scope). A `!ruby/*`
+        // tag on a COLLECTION stops the scan too — serde_yaml rejects it on
+        // its own pass, and the visitor's per-tag `resolve_class` plus
+        // `hash-with-ivars`'s partial member walk are out of scope — so
+        // these keep exit-64 rather than naming a child scalar's class.
         for yaml in [
             "x: *a\ny: [unclosed\n",
             "x: 2024-01-01\nz: [unclosed\n",
             "x: !ruby/object:Foo bar\n",
+            "x: !ruby/object:Foo\n  a: 2024-01-01\n",
+            "x: !ruby/hash-with-ivars\n  other: 2024-01-01\n",
         ] {
             std::fs::write(dir.join("bad.yml"), yaml).unwrap();
             match Config::read(&dir.join("bad.yml")) {

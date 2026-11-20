@@ -114,6 +114,7 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
         unsafe_libyaml::yaml_parser_set_input_string(parser, text.as_ptr(), text.len() as u64);
         let mut out = None;
         let mut parsed = true;
+        let mut bail = false;
         loop {
             let mut event = MaybeUninit::<unsafe_libyaml::yaml_event_t>::uninit();
             if unsafe_libyaml::yaml_parser_parse(parser, event.as_mut_ptr()).fail {
@@ -121,28 +122,55 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
                 break;
             }
             let kind = (*event.as_ptr()).type_;
-            if out.is_none() {
-                out = match kind {
-                    unsafe_libyaml::YAML_ALIAS_EVENT => Some(SafeLoadRejection::Alias),
-                    unsafe_libyaml::YAML_SCALAR_EVENT => {
-                        let scalar = &(*event.as_ptr()).data.scalar;
-                        let value = if scalar.value.is_null() {
-                            String::new()
-                        } else {
-                            String::from_utf8_lossy(std::slice::from_raw_parts(
-                                scalar.value,
-                                scalar.length as usize,
-                            ))
-                            .into_owned()
-                        };
-                        let tag = c_string(scalar.tag.cast());
-                        scalar_rejection(tag.as_deref(), &value, scalar.style)
+            match kind {
+                unsafe_libyaml::YAML_ALIAS_EVENT if out.is_none() => {
+                    out = Some(SafeLoadRejection::Alias);
+                }
+                unsafe_libyaml::YAML_SCALAR_EVENT if out.is_none() => {
+                    let scalar = &(*event.as_ptr()).data.scalar;
+                    let value = if scalar.value.is_null() {
+                        String::new()
+                    } else {
+                        String::from_utf8_lossy(std::slice::from_raw_parts(
+                            scalar.value,
+                            scalar.length as usize,
+                        ))
+                        .into_owned()
+                    };
+                    let tag = c_string(scalar.tag.cast());
+                    out = scalar_rejection(tag.as_deref(), &value, scalar.quoted_implicit);
+                }
+                unsafe_libyaml::YAML_MAPPING_START_EVENT
+                | unsafe_libyaml::YAML_SEQUENCE_START_EVENT => {
+                    let tag_ptr = if kind == unsafe_libyaml::YAML_MAPPING_START_EVENT {
+                        (*event.as_ptr()).data.mapping_start.tag
+                    } else {
+                        (*event.as_ptr()).data.sequence_start.tag
+                    };
+                    let tag = c_string(tag_ptr.cast());
+                    if tag.as_deref().is_some_and(|t| t.starts_with("!ruby/")) {
+                        // serde_yaml rejects `!ruby/*` tags wholesale on its
+                        // own pass (exit 64 today), and the visitor semantics
+                        // a tagged COLLECTION would need — `resolve_class` per
+                        // tag arm plus `hash-with-ivars`'s partial member
+                        // walk — are #347's declared out-of-scope. Stop the
+                        // scan rather than mis-order the tag's own death or
+                        // invent a child-scalar death the reference does not
+                        // visit (probe: `x: !ruby/hash-with-ivars\n  other:
+                        // 2024-01-01` LOADS upstream).
+                        bail = true;
+                    } else if out.is_none() {
+                        out = collection_tag_death(
+                            tag.as_deref(),
+                            kind == unsafe_libyaml::YAML_MAPPING_START_EVENT,
+                        );
                     }
-                    _ => None,
-                };
+                }
+                _ => {}
             }
             unsafe_libyaml::yaml_event_delete(event.as_mut_ptr());
-            if kind == unsafe_libyaml::YAML_DOCUMENT_END_EVENT
+            if bail
+                || kind == unsafe_libyaml::YAML_DOCUMENT_END_EVENT
                 || kind == unsafe_libyaml::YAML_STREAM_END_EVENT
             {
                 break;
@@ -155,18 +183,52 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
     }
 }
 
+/// `Psych::DisallowedClass` for a COLLECTION's tag, if
+/// `visit_Psych_Nodes_{Mapping,Sequence}` resolves it through the restricted
+/// `ClassLoader` BEFORE its children — the non-`!ruby` slice of the `case
+/// o.tag` arms (probe-verified: `!set`/`!!set` → `Psych::Set`,
+/// `!omap`/`!!omap` → `Psych::Omap`, `!map:K`/`!seq:K`/`!str:K` → `K`; a
+/// `!omap` SEQUENCE takes the `Psych::Omap.new` arm and lives). An empty
+/// name (`!map:`) is upstream's `nil.allocate` `NoMethodError` — left
+/// unmodelled, like the scalar `!float` `ArgumentError`.
+fn collection_tag_death(tag: Option<&str>, mapping: bool) -> Option<SafeLoadRejection> {
+    let disallowed = |name: &str| Some(SafeLoadRejection::DisallowedClass(name.to_string()));
+    match tag? {
+        t if mapping && (t == "!set" || t == "tag:yaml.org,2002:set") => {
+            disallowed("Psych::Set")
+        }
+        t if mapping && (t == "!omap" || t == "tag:yaml.org,2002:omap") => {
+            disallowed("Psych::Omap")
+        }
+        // An empty name reaches `resolve_class('')` → `nil.allocate`
+        // (`NoMethodError`) upstream — a crash shape outside this scan's
+        // `DisallowedClass` model, left to the document's own fate.
+        t if mapping && t.starts_with("!map:") && t.len() > "!map:".len() => {
+            disallowed(&t["!map:".len()..])
+        }
+        t if !mapping && t.starts_with("!seq:") && t.len() > "!seq:".len() => {
+            disallowed(&t["!seq:".len()..])
+        }
+        t if mapping && t.starts_with("!str:") && t.len() > "!str:".len() => {
+            disallowed(&t["!str:".len()..])
+        }
+        _ => None,
+    }
+}
+
 /// `Psych::DisallowedClass` for one scalar event, if `safe_load`'s visitor
-/// raises it: `ToRuby#deserialize` returns `o.value` untouched for a QUOTED
-/// scalar (Psych's `quoted` covers every non-plain style — double/single
-/// quotes, literal and folded, verified against `Psych.parse` node
-/// attributes); an untagged plain scalar goes to `ScalarScanner#tokenize`;
+/// raises it: `ToRuby#deserialize` returns `o.value` untouched only when the
+/// scalar is QUOTED — and `Nodes::Scalar#quoted` is libyaml's
+/// `quoted_implicit`, which is FALSE whenever a tag is written (probe:
+/// `!foo "2024-01-01"` is `quoted=false` on `Psych.parse` and dies `Date`
+/// upstream). An untagged plain scalar goes to `ScalarScanner#tokenize`;
 /// explicit tags take `deserialize`'s `case o.tag` arms.
 fn scalar_rejection(
     tag: Option<&str>,
     value: &str,
-    style: unsafe_libyaml::yaml_scalar_style_t,
+    quoted: bool,
 ) -> Option<SafeLoadRejection> {
-    if style != unsafe_libyaml::YAML_PLAIN_SCALAR_STYLE {
+    if quoted {
         return None;
     }
     disallowed_class(tag, value).map(SafeLoadRejection::DisallowedClass)
@@ -227,12 +289,15 @@ fn tokenize_disallowed(s: &str) -> Option<String> {
     static ALPHA: OnceLock<Regex> = OnceLock::new();
     static TIME: OnceLock<Regex> = OnceLock::new();
     static DATE: OnceLock<Regex> = OnceLock::new();
+    // Ruby's `\s` is ASCII-only (`[ \t\r\n\f\v]`); Rust's `\s` is
+    // Unicode-aware, which would kill a timestamp-looking scalar separated
+    // by e.g. U+3000 (oracle loads it as a String — issue #347 review).
     let alpha = ALPHA.get_or_init(|| {
-        Regex::new(r"^[^\d.:-]?[\p{Alpha}_\s!@#$%^&*(){}<>|/\\~;=]+").unwrap()
+        Regex::new(r"^[^\d.:-]?[\p{Alpha}_ \t\r\n\x0b\x0c!@#$%^&*(){}<>|/\\~;=]+").unwrap()
     });
     let time = TIME.get_or_init(|| {
         Regex::new(
-            r"^-?[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt]|\s+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]*)?(?:\s*(?:Z|[-+][0-9]{1,2}:?(?:[0-9]{2})?))?$",
+            r"^-?[0-9]{4}-[0-9]{1,2}-[0-9]{1,2}(?:[Tt]|[ \t\r\n\x0b\x0c]+)[0-9]{1,2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]*)?(?:[ \t\r\n\x0b\x0c]*(?:Z|[-+][0-9]{1,2}:?(?:[0-9]{2})?))?$",
         )
         .unwrap()
     });
