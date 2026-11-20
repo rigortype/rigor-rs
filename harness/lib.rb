@@ -354,9 +354,18 @@ module RigorHarness
     []
   end
 
+  # A rigor-rs run that is not just divergent but INVALID — the binary
+  # crashed, reported an `internal-error` finding (the catch-all the CLI
+  # emits for a panicked analysis at info severity so the parity filter
+  # skips it — rigor-rs#439), or wrote a Rust panic to stderr. The gate
+  # must fail on it: a swallowed panic turns a coverage-zero fixture into
+  # a quiet PASS.
+  class HarnessError < StandardError; end
+
   # Run rigor-rs on a fixture.
   # Returns an array of diagnostic hashes in a normalized format compatible
   # with the reference output (adds `severity: "error"` since rigor-rs omits it).
+  # Raises HarnessError when the child panics or emits `internal-error`.
   def run_rigor_rs(fixture_path)
     abs_fixture = File.expand_path(fixture_path)
 
@@ -371,13 +380,14 @@ module RigorHarness
     if staged_fixture?(fixture_path)
       Dir.mktmpdir("rigor-harness-rs") do |tmpdir|
         stage_fixture_env(fixture_path, tmpdir)
-        stdout, stderr, _status = Open3.capture3(*cmd, chdir: tmpdir)
+        stdout, stderr, status = Open3.capture3(*cmd, chdir: tmpdir)
         parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path,
-                             project_config_fixture?(fixture_path) ? tmpdir : nil)
+                             project_config_fixture?(fixture_path) ? tmpdir : nil,
+                             status)
       end
     else
-      stdout, stderr, _status = Open3.capture3(*cmd)
-      parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path)
+      stdout, stderr, status = Open3.capture3(*cmd)
+      parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path, nil, status)
     end
   end
 
@@ -385,15 +395,36 @@ module RigorHarness
   # diagnostic array shared by both run paths. A diagnostic without `severity`
   # (older port builds) defaults to `"error"`; diagnostics are filtered to parity severities and the
   # fixture file.
-  def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path, tmpdir = nil)
+  def parse_rigor_rs_diags(stdout, stderr, abs_fixture, fixture_path, tmpdir = nil, status = nil)
     # Tag UTF-8 (Open3 returns ASCII-8BIT) so a non-ASCII message byte such as
     # the em-dash in `suppression.unknown-rule` does not break `JSON.parse`.
     stdout = stdout.dup.force_encoding("UTF-8")
     stderr = stderr.dup.force_encoding("UTF-8")
+
+    # rigor-rs#439: the panic surfaces are checked BEFORE severity filtering.
+    # `internal-error` is info-severity by design (kept out of parity), and a
+    # panicked child also writes `panicked at` on stderr. A plain non-zero
+    # exit is NOT invalid — `check` exits 1 whenever it reports an
+    # error-severity diagnostic — so the status only matters when no JSON
+    # output arrived at all (a crash that never reached the finding emit).
+    if (line = stderr.lines.find { |l| l.include?("panicked at") })
+      raise HarnessError, "rigor-rs panicked on #{fixture_path} — #{line.strip}"
+    end
+
     output = stdout.strip.empty? ? stderr.strip : stdout.strip
-    return [] if output.strip.empty?
+    if output.strip.empty?
+      unless status.nil? || status.success?
+        raise HarnessError,
+              "rigor-rs exited #{status.exitstatus} with no output on #{fixture_path}"
+      end
+      return []
+    end
 
     parsed = JSON.parse(output)
+    if (internal = parsed.find { |d| d["rule"] == "internal-error" })
+      raise HarnessError,
+            "rigor-rs reported internal-error on #{fixture_path} — #{internal["message"].to_s[0, 200]}"
+    end
     parsed.map do |d|
       d["severity"] ||= "error"
       d
@@ -596,8 +627,10 @@ module RigorHarness
 
   # Print the shared SUMMARY block and return the process exit code (0 PASS /
   # 1 FAIL). `mode_label` distinguishes the live gate from snapshot mode in the
-  # header.
-  def print_summary_and_exit_code(results, mode_label: "live reference")
+  # header. `internal_errors` lists fixture runs where rigor-rs crashed or
+  # reported `internal-error` (HarnessError from run_rigor_rs, rigor-rs#439) —
+  # any of them fails the gate.
+  def print_summary_and_exit_code(results, mode_label: "live reference", internal_errors: [])
     total_matched          = results.sum { |r| r.matched.size }
     total_missing          = results.sum { |r| r.missing.size }
     total_extra_registered = results.sum { |r| r.extra_registered.size }
@@ -621,11 +654,19 @@ module RigorHarness
     puts "  #{WARN} Coverage gaps (missing):  #{total_missing}  <-- expected; not a failure"
     puts "  #{TICK} Extra (registered):       #{total_extra_registered}  <-- excused divergences"
     puts "  #{CROSS} Extra (unregistered):     #{total_extra_unreg}  <-- FALSE POSITIVES / REGRESSIONS"
+    unless internal_errors.empty?
+      puts "  #{CROSS} Internal errors / panics:   #{internal_errors.size}  <-- INVALID RUNS"
+      internal_errors.each { |e| puts "      #{e}" }
+    end
     puts ""
     puts "  Coverage: #{total_matched}/#{total_ref_diags} = #{coverage_pct}%"
     puts ""
 
-    if total_extra_unreg > 0
+    if !internal_errors.empty?
+      puts "RESULT: FAIL — rigor-rs crashed or reported internal-error on " \
+           "#{internal_errors.size} fixture(s)."
+      1
+    elsif total_extra_unreg > 0
       puts "RESULT: FAIL — #{total_extra_unreg} unregistered false positive(s) detected."
       puts "  rigor-rs must never emit diagnostics the reference does not."
       puts "  Either fix the rigor-rs rule or add a registry entry with an upstream link."

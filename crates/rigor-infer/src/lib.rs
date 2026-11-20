@@ -135,6 +135,9 @@ pub fn build_toplevel_env(ast: &LoweredAst, interner: &mut Interner) -> TypeEnv 
 mod tests;
 
 #[cfg(test)]
+mod reach_memo_tests;
+
+#[cfg(test)]
 mod m2_go_slice_tests;
 
 #[cfg(test)]

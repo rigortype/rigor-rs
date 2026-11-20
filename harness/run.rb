@@ -42,11 +42,19 @@ def main
   registry = load_registry(DIVERGENCE_REGISTRY_PATH)
 
   results = []
+  internal_errors = []
 
   fixtures.each do |fixture_path|
     print "Running fixture: #{File.basename(fixture_path)} ... "
     ref_diags = run_reference(fixture_path)
-    rs_diags  = run_rigor_rs(fixture_path)
+    # A panicked / internal-error rigor-rs run is INVALID, not divergent:
+    # record it and run on so the summary shows every failure (rigor-rs#439).
+    rs_diags = begin
+      run_rigor_rs(fixture_path)
+    rescue HarnessError => e
+      internal_errors << e.message
+      []
+    end
     excused   = build_excused_set(registry, fixture_path)
     result    = compare_fixture(fixture_path, ref_diags, rs_diags, excused)
     results << result
@@ -56,7 +64,8 @@ def main
   # Per-fixture detailed report
   results.each { |r| print_fixture_report(r) }
 
-  exit(print_summary_and_exit_code(results, mode_label: "live reference"))
+  exit(print_summary_and_exit_code(results, mode_label: "live reference",
+                                            internal_errors: internal_errors))
 end
 
 main
