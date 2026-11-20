@@ -107,6 +107,24 @@ impl SourceIndex {
         // no other rule is affected.
         collect_override_classes(ast, ast.root(), &[], &mut h.override_classes);
 
+        // Upstream's refine census (rigor-rs#446): the file-wide
+        // `RefineSelf` context walk — per-module rows, the `*`-charged
+        // wildcard flag, and the refine-block activations the check-side
+        // driver re-reads through `scan_refinements(ast)`.
+        {
+            let scan = super::refine_walk::scan_refinements(ast);
+            h.targets_wildcard = scan.global_wildcard;
+            for (owner, row) in scan.rows {
+                if let Some(oc) = h
+                    .override_classes
+                    .iter_mut()
+                    .find(|oc| oc.qualified == owner)
+                {
+                    oc.refines.push(row);
+                }
+            }
+        }
+
         // Passes 1c + 1d (ADR-34; upstream `fb781023` / rigortype/rigor#1135 /
         // issue #141): PROJECT-WIDE toplevel method names (`toplevel_defs`,
         // for `call.unresolved-toplevel`) and per-class instance-method
@@ -381,6 +399,7 @@ impl SourceIndex {
         // includes — so this replay is exactly today's call sequence.
         for (file, (h, _)) in files.iter().enumerate() {
             let h = h.borrow();
+            idx.refinement_wildcard |= h.targets_wildcard;
             for oc in &h.override_classes {
                 idx.ingest_override_class(
                     file,

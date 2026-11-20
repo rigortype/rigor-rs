@@ -858,6 +858,8 @@ mod tests {
             severity: crate::Severity::Warning,
             source_family: "builtin",
             receiver_type: None,
+            receiver_classes: None,
+
             method_name: None,
         };
         let kept = filter_dead_version_guard_arms_with(

@@ -12,6 +12,8 @@ fn diag(rule_id: &'static str, severity: Severity, message: &str) -> Diagnostic 
         severity,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     }
 }

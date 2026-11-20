@@ -215,6 +215,8 @@ fn unknown_suppression_rule_diagnostic(marker: &str, token: &str, offset: usize)
         severity: Severity::Warning,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     }
 }
@@ -232,6 +234,8 @@ fn unknown_suppression_marker_diagnostic(marker: &str, offset: usize) -> Diagnos
         severity: Severity::Warning,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     }
 }
@@ -248,6 +252,8 @@ fn empty_suppression_diagnostic(marker: &str, offset: usize) -> Diagnostic {
         severity: Severity::Warning,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     }
 }

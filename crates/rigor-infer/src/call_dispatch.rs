@@ -1141,11 +1141,11 @@ impl<'i> Typer<'i> {
             let Some(module) = self.source.resolve_declared_constant_at(prefix, &raw) else {
                 continue;
             };
-            for (target, names) in self.source.refinements_of(&module) {
-                if !names.iter().any(|x| x == method) {
+            for row in self.source.refinements_of(&module) {
+                if !(row.names_wildcard || row.names.iter().any(|x| x == method)) {
                     continue;
                 }
-                match target {
+                match row.target.as_deref() {
                     None => return true,
                     Some(t)
                         if ["Object", "Module", "Kernel", "BasicObject"].contains(&t) =>

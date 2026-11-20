@@ -1050,6 +1050,8 @@ fn cmd_check(args: &[String]) -> ExitCode {
                     severity: Severity::Error,
                     source_family: "builtin",
                     receiver_type: None,
+                    receiver_classes: None,
+
                     method_name: None,
                 },
             )],
@@ -1665,6 +1667,8 @@ fn prepend_path_errors(
                 severity,
                 source_family: "builtin",
                 receiver_type: None,
+                receiver_classes: None,
+
                 method_name: None,
             };
             Finding::run_level(0, e.path.clone(), diag)
@@ -1770,6 +1774,8 @@ fn pre_eval_not_found_rows(
                     severity: sev,
                     source_family: "builtin",
                     receiver_type: None,
+                    receiver_classes: None,
+
                     method_name: None,
                 },
             ));
@@ -2470,6 +2476,8 @@ fn analyze_files(
                     severity: row.severity,
                     source_family: row.source_family,
                     receiver_type: None,
+                    receiver_classes: None,
+
                     method_name: None,
                 },
             )
@@ -2505,6 +2513,8 @@ fn analyze_files(
                 severity: row.severity,
                 source_family: row.source_family,
                 receiver_type: None,
+                receiver_classes: None,
+
                 method_name: None,
             },
         ));
@@ -2669,6 +2679,8 @@ fn conformance_rows(
             severity,
             source_family: "builtin",
             receiver_type: None,
+            receiver_classes: None,
+
             method_name: None,
         };
         let (line, column) = line_char_col(source, f.start_offset);
@@ -3834,6 +3846,8 @@ fn parse_diagnostics(result: &rigor_parse::ruby_prism::ParseResult<'_>) -> Vec<D
                 severity: Severity::Error,
                 source_family: "builtin",
                 receiver_type: None,
+                receiver_classes: None,
+
                 method_name: None,
             }
         })
@@ -3866,6 +3880,8 @@ fn internal_error_finding(message: String) -> Diagnostic {
         severity: Severity::Info,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     }
 }

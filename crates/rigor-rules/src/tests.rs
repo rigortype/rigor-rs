@@ -2530,6 +2530,8 @@ fn diag(rule: &'static str) -> Diagnostic {
         severity: Severity::Error,
         source_family: "builtin",
         receiver_type: None,
+        receiver_classes: None,
+
         method_name: None,
     }
 }
@@ -4915,6 +4917,167 @@ fn refinement_reaches_class_object_receivers_across_files() {
             + ":" + d.method_name.as_deref().unwrap_or(""))
         .collect();
     assert_eq!(rows, ["1:oo", "5:cc", "7:nothere"], "got {rows:?}");
+}
+
+/// rigor-rs#446 — the brief's three required forms, each oracle-probed at
+/// the v0.4.8 pin (`harness/probe.py`, `check` identical): the RULE id
+/// (`call.wrong-arity` declines under a `using`, T4), the NAME form (the
+/// census harvests `alias`/`alias_method`/`attr_reader`/`define_method`
+/// literals, T5) and the REGION form (a proc/lambda literal's `.refined(M)`
+/// chain declines inside, T9). Every form keeps a must-still-fire control.
+#[test]
+fn refinement_decline_rule_name_and_region_forms() {
+    let wrong_arity = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_WRONG_ARITY)
+            .map(|d| d.message)
+            .collect()
+    };
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+
+    // T4 — the rule id: `call.wrong-arity` declines under the `using`.
+    assert_eq!(
+        wrong_arity(
+            b"module R4\n  refine(String) { def center(a, b, c); end }\nend\nusing R4\n\"x\".center(1, 2, 3)\n"
+        ),
+        Vec::<String>::new()
+    );
+    // Control: without the `using` the same call still fires.
+    assert_eq!(
+        wrong_arity(b"\"x\".center(1, 2, 3)\n").len(),
+        1
+    );
+
+    // T5 — the name form: every census-harvested spelling declines.
+    assert_eq!(
+        undefined(
+            b"module R5\n  refine(String) do\n    alias_method :am, :upcase\n    alias al upcase\n    attr_reader :ar\n    define_method(:dm) { 1 }\n  end\nend\nusing R5\n\"q\".am\n\"q\".al\n\"q\".ar\n\"q\".dm\n"
+        ),
+        Vec::<String>::new()
+    );
+    // Control: a name the refinement does not define still fires.
+    assert_eq!(
+        undefined(b"module R5\n  refine(String) { def dm; end }\nend\nusing R5\n\"q\".nope\n").len(),
+        1
+    );
+
+    // T9 — the region form: `.refined(M)` on a proc/lambda/`Proc.new`
+    // literal puts M in effect over the literal's span.
+    assert_eq!(
+        undefined(
+            b"module R9\n  refine(String) { def zz9; end }\nend\nproc { \"a\".zz9 }.refined(R9)\n-> { \"b\".zz9 }.refined(R9)\nProc.new { \"c\".zz9 }.refined(R9)\n"
+        ),
+        Vec::<String>::new()
+    );
+    // Control: a `.refined` on a NON-literal receiver creates no region.
+    assert_eq!(
+        undefined(
+            b"module R9B\n  refine(String) { def zzb; end }\nend\nx = proc { \"a\".zzb }\nx.refined(R9B)\n"
+        ).len(),
+        1
+    );
+}
+
+/// rigor-rs#446 — `refined_redefinition_in_effect?`'s `OwnMethod` walk: a
+/// refined level AT the first definer takes the dispatch (the reference's
+/// `shadowing_definer?` asks each level before its entries), so the
+/// definer's own level declines too. The re-triage's T6 row
+/// (`refine(Comparable){def clamp}` + `1.clamp` — Comparable is the first
+/// definer) and the T4 shape (`refine(String){def center}` — String at
+/// position 0) both go silent; String's own definer still answers first
+/// under `refine(Comparable)`, so that control keeps firing.
+#[test]
+fn refined_redefinition_declines_at_the_definers_level() {
+    let wrong_arity = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_WRONG_ARITY)
+            .map(|d| d.message)
+            .collect()
+    };
+    // T6 as triaged: the refined level IS the first definer.
+    assert_eq!(
+        wrong_arity(
+            b"module RC\n  refine(Comparable) { def clamp(a, b, c); end }\nend\nusing RC\n1.clamp(1, 2, 3)\n"
+        ),
+        Vec::<String>::new()
+    );
+    // T4: the definer's own level is the refined target.
+    assert_eq!(
+        wrong_arity(
+            b"module R4\n  refine(String) { def center(a, b, c); end }\nend\nusing R4\n\"x\".center(1, 2, 3)\n"
+        ),
+        Vec::<String>::new()
+    );
+    // Control: String defines `center` ahead of the refined Comparable, so
+    // the receiver's own lookup answers first and the arity fires.
+    assert_eq!(
+        wrong_arity(
+            b"module R6\n  refine(Comparable) { def center(a, b, c); end }\nend\nusing R6\n\"x\".center(1, 2, 3)\n"
+        ).len(),
+        1
+    );
+}
+
+/// rigor-rs#446 — the `RefineSelf` placement walk's class contexts (#1689):
+/// a refine inside a class body's methods (`def`, `def self.x`, a
+/// `define_method` block) has `self` a class or one of its instances, so
+/// the census charges NOTHING — an unrelated `using` region is unaffected.
+/// A module body's instance def charges the global wildcard (its `self`
+/// is an unnameable includer), and so does a `Module` subclass's — its
+/// instances are modules the walk cannot name.
+#[test]
+fn refine_placement_class_contexts_charge_nothing() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    // A class body's instance `def`: the unrelated `using RB` fires.
+    assert_eq!(
+        undefined(
+            b"module RB; end\n\nclass C8\n  def mk\n    refine(String) { def www; end }\n  end\nend\nusing RB\n\"a\".qqq\n"
+        ).len(),
+        1
+    );
+    // A class body's `def self.x`.
+    assert_eq!(
+        undefined(
+            b"module RB; end\n\nclass C9\n  def self.mk\n    refine(String) { def www; end }\n  end\nend\nusing RB\n\"a\".qqq\n"
+        ).len(),
+        1
+    );
+    // A class body's `define_method` block.
+    assert_eq!(
+        undefined(
+            b"module RB; end\n\nclass C11\n  define_method(:mk) do\n    refine(String) { def www; end }\n  end\nend\nusing RB\n\"a\".qqq\n"
+        ).len(),
+        1
+    );
+    // Control: a MODULE body's instance def charges the global wildcard.
+    assert_eq!(
+        undefined(
+            b"module RB; end\n\nmodule MC\n  def mk\n    refine(String) { def www; end }\n  end\nend\nusing RB\n\"a\".qqq\n"
+        ),
+        Vec::<String>::new()
+    );
+    // Control: a `Module` subclass's instances are unnameable modules —
+    // its instance def charges the global wildcard too.
+    assert_eq!(
+        undefined(
+            b"module RB; end\n\nclass Xmod < Module\n  def mk\n    refine(String) { def www; end }\n  end\nend\nusing RB\n\"a\".qqq\n"
+        ),
+        Vec::<String>::new()
+    );
 }
 
 /// rigor-rs#472 item 3: a literal collection local inside a `def` names its

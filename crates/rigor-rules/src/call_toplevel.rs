@@ -134,6 +134,8 @@ pub(crate) fn unresolved_toplevel_diagnostics(
                 severity,
                 source_family: "builtin",
                 receiver_type: None,
+                receiver_classes: None,
+
                 method_name: Some(method.clone()),
             });
         }
