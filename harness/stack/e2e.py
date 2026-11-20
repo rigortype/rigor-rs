@@ -43,8 +43,9 @@ ap.add_argument("--only", default="main,worker,at64,at2,inline,minm")
 ap.add_argument("--out", default=os.path.join(DATA, "e2e.tsv"))
 ap.add_argument("--sub", default="check")
 ap.add_argument("--timeout", type=int, default=1800)
-ap.add_argument("--minm-budget", type=int, default=None,
-                help="pin the inline-forcing ulimit -v MiB instead of probing it")
+ap.add_argument("--minm-headroom", type=int, default=64,
+                help="ulimit -v headroom (MiB) above each ulimit -s under test;")
+                # must cover the load image + 2 MiB workers, stay < 64 MiB free
 a = ap.parse_args()
 rigor = cli(a.cli)
 only = a.only.split(",")
@@ -130,7 +131,8 @@ def trial(kind, n, two, v_mib=None, s_mib=None, no_ruby=False):
         # Survival = check ran to a verdict (rc 0 clean, 1 findings). Anything
         # else — a crash, a dead pool/exec, a could-not-start exit like the
         # sidecar's 69 or the pool's 70 — never analysed the file.
-        survived = not r["crashed"] and r["rung"] != "dead" and r["rc"] in (0, 1)
+        survived = (not r["crashed"] and r["rc"] in (0, 1)
+                    and r["rung"] not in ("dead", "noforce"))
         det = (("CRASH rc=%d thread=%s" % (r["rc"], r["thread"])) if r["crashed"]
                else ("dead rc=%d" % r["rc"]) if not survived
                else "ok rc=%d rung=%s %.1fs" % (r["rc"], r["rungs"], r["dt"]))
@@ -181,13 +183,19 @@ def budget_for(key):
 
 
 def minm(kind, n):
-    """Smallest `ulimit -s` MiB on which the INLINE run survives."""
-    v = a.minm_budget or budget_for("inline")
-    if v is None:
-        return "n/a", "no inline budget (ulimit -v not honoured?)"
+    """Smallest `ulimit -s` MiB on which the INLINE run survives. The
+    rung-forcing `ulimit -v` scales with the stack under test — the
+    process-main stack is itself charged to RLIMIT_AS, so the budget is
+    s + headroom: enough for the load image and 2 MiB pool workers, short
+    of the command thread's 64 MiB rung."""
+    hr = a.minm_headroom
+    # ulimit -v unhonoured (macOS) or unstartable: nothing to bisect.
+    if trial(kind, n, False, v_mib=65, s_mib=1, no_ruby=True)[1].startswith(
+            "dead"):
+        return "n/a", "ulimit -v/-s not honoured on this host"
 
     def ok(m):
-        return trial(kind, n, False, v_mib=v, s_mib=m, no_ruby=True)[0]
+        return trial(kind, n, False, v_mib=m + hr, s_mib=m, no_ruby=True)[0]
 
     lo, hi = 1, None
     while lo <= 512:
@@ -196,7 +204,8 @@ def minm(kind, n):
             break
         lo *= 2
     if hi is None:
-        return ">512", trial(kind, n, False, v_mib=v, s_mib=512, no_ruby=True)[1]
+        return ">512", trial(kind, n, False, v_mib=512 + hr, s_mib=512,
+                             no_ruby=True)[1]
     lo = hi // 2
     while hi - lo > 1:
         mid = (lo + hi) // 2
@@ -204,7 +213,8 @@ def minm(kind, n):
             hi = mid
         else:
             lo = mid
-    return str(hi), trial(kind, n, False, v_mib=v, s_mib=hi, no_ruby=True)[1]
+    return str(hi), trial(kind, n, False, v_mib=hi + hr, s_mib=hi,
+                          no_ruby=True)[1]
 
 
 out = open(a.out, "a")
