@@ -60,6 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-20 #643 CLOSED** (PR #725): named `Finding` struct + honest conformance `start_offset` (`line_char_col`); refactor, 0 FP / 437 gaps = master; triage/`pre_eval:` scan declines →#727, tuple leftovers →#728. [note](notes/20261120-issue-643-findings-tuple.md)
 - **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — `main_never_builds_the_pool_itself` fails on `configure_global_pool`/`ThreadPoolBuilder` in `fn main`'s body; planted inversion: threads unit test passes, audit fails at the line. Aliased-use hole →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
 - **2026-11-20 #345 CLOSED** (PR #720): pre_eval glob→dir earns not-found row; `.uniq`/order ported; 0 FP; dialect FPs + display-path/NFD →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
 - **2026-11-20 #652 CLOSED** (PR #719): brace globs `::{*}`/`::{a,*}` flag like `::*`; child globs leaf-silent; test-only, 0 FP; `self::*`/`::{{*}}` limits →#654. [note](notes/20261120-issue-652-brace-glob-audit.md)
@@ -154,5 +155,4 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-07-25 era, folded** — MultiWrite substrate s1+s2 (PRs #46/#47: arena lowering + `MultiTargetBinder`, RBS tuple returns — [spec](notes/20260725-multiwrite-substrate-spec.md)); LSP `exclude:` parity (PR #45, matrix 24→144); LSP stage-3 tail (PR #44).
 - **2026-07-18/19 era, folded** — LSP §12 S1–S4b + coverage/MCP/audit (PRs #33–#43); ADR-0042 gate slices; compat + `--bleeding-edge`; RC bump ([deliverables](notes/20260719-adr0042-gate-deliverables.md)).
 - **2026-07-17 era (folded)**: docs economy (`docs_check.py`, #21); Tier B/C CLOSED ([note](notes/20260717-tier-bc-track-closed.md)); ATM arc + constant-shadow gate, gitlab UM 356→179 ([spec](notes/20260717-atm-substrate-arc-plan.md)).
-- **2026-07-16 two MERGED inference slices** — `def.ivar-write-mismatch` (gitlab ivar gaps 2→0) + literal-tail return folding (gitlab always-truthy 28→16). 0 FP both. [ivar](notes/20260716-ivar-write-mismatch-spec.md) / [fold](notes/20260716-literal-tail-fold-spec.md).
 - **2026-07-16 v0.3.0-RC arc: pin `47ec8625` + 7 slices, ALL MERGED — rules fully ported.** [specs](notes/20260716-v030-upstream-gap-survey.md).
