@@ -60,6 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch's `decimal-int-string`/`non-empty-string` carriers minted — first live `Refined`/`Difference` (erase, display, `EMPTY_PRESERVING` mutation); corpus message drift 47→46, 0 FP / 437 gaps = master. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
 - **2026-11-20 #427 CLOSED** (PR #726): env memo stores uid-scoped interner-bound answers; the `.map` repro's unmemoized work DOUBLED per link → never-finishes → exit 1 ~68 s, lsp 72 s; byte-identical on 9,036 files, audit clean, 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
 - **2026-11-20 #643 CLOSED** (PR #725): named `Finding` struct + conformance `start_offset`; refactor, 0 FP / 437 gaps = master; →#727/#728. [note](notes/20261120-issue-643-findings-tuple.md)
 - **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — `main_never_builds_the_pool_itself` planted inversion: the threads unit test passes, the audit fails at the line. Aliased-use hole →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
