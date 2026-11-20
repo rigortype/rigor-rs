@@ -266,22 +266,26 @@ memory. Medians over interleaved runs; every variant produced identical output:
   carries.
 - **x86_64 Linux** is measured by the committed tools
   (`harness/stack/`, workflow `stack-measure`, rigor-rs#428; numbers below
-  from run 44651765611 on head `4b49407f`, with the post-review
-  rung-gated columns still landing). The per-pass minima track aarch64
-  (`lower defined` 13 MiB, `parse array` 8 MiB / 8257 KiB, the C-walk
-  1,178 KiB); every capped and refusal cap is identical. The 64 MiB
-  rung is a narrow, scheduling-noisy band on the GH runner (`at64` is
-  often `n/a`); when it *is* forced, some capped kinds (`class`/`module`
-  at 4999) still die with SIGABRT whose stderr is *not* a stack overflow
-  (typically glibc's per-thread malloc arenas counting against
-  `RLIMIT_AS`). The 2 MiB rung likewise dies on many capped and bound
-  shapes by the same signal, not a confirmed overflow. The inline
-  (`ulimit -s`) floor is only a number when the trial landed on `main`:
-  `defined:9998` measured 16 MiB (`rung=main+2`); bound-depth chains
-  (`ifmod:12490`, `elsifchain:24990`) could not be forced onto `main`
-  once the scaled `ulimit -v` budget admitted a 64 MiB spawn, so those
-  rows report `missed`, not 345–384 MiB. The aarch64 35 MiB bound-budget
-  figure is the pipeline floor from #412, not regenerated on x86_64.
+  from run 44666957483 on head `e6bc4f11`, sound subset
+  `RIGOR_NO_RUBY=1` on the forced columns — under a rung-forcing budget
+  the sidecar's spawn is the binding failure, not the stacks). The
+  per-pass minima track aarch64 (`lower defined` 13 MiB, `parse array`
+  8 MiB / 7,506 KiB, the C-walk 1,178 KiB); every capped and refusal
+  cap is identical to aarch64.
+  - **64 MiB workers carry every screened kind** except `elsif`/`when`
+    chains at the bound and `class`/`module`/`blockparam`, which die on
+    `alloc` — a heap failure under the same `RLIMIT_AS` that squeezed
+    the stacks, not an observed stack overflow.
+  - **2 MiB workers carry the capped kinds at their Prism caps and the
+    5k chains**; they die the same `alloc` death on 20k+ chains and
+    `class`/`module`. A 2 MiB-stack overflow was never observed: the
+    heap hits the wall first.
+  - **The inline floor** (`ulimit -s` on the process main thread):
+    `defined:9998` measures 16 MiB (`rung=main+2`). Bound-depth chains
+    could not be forced onto `main` — once the scaled budget admits a
+    64 MiB spawn the command thread takes it — so those rows report
+    `missed`. The aarch64 35 MiB bound figure stays the #412 pipeline
+    floor, not regenerated on x86_64.
 - **Windows** is unmeasured: the port does not yet compile on
   `windows-latest` (rigor-rs#707); `stack-measure` runs the
   `deep_nesting` tests there once it does.
