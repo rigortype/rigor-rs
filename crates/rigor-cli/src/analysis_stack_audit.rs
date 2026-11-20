@@ -8,6 +8,14 @@
 //!    `thread::spawn`, `thread::scope`, `thread::Builder` or a
 //!    `rayon::ThreadPoolBuilder` that does not route workers through
 //!    `spawn_pool_thread`.
+//! 3. `fn main` never builds the rayon pool itself (rigor-rs#431/#676):
+//!    the pool is built from the command thread's body, after that
+//!    thread has reserved its stack, so workers cannot spend the
+//!    reservation budget first. `main_never_builds_the_pool_itself`
+//!    fails on a `configure_global_pool` call or any `ThreadPoolBuilder`
+//!    in `fn main`'s own body — no allow-list, because a stack-proven
+//!    builder there is still the inversion, a shape the repo-wide pass
+//!    above passes.
 //!
 //! The deep-nesting tests cover only the call sites that exist today; a new
 //! subcommand or helper that skips either convention brings back the stack
@@ -131,6 +139,22 @@ const STACK_PROOF: &[&str] = &["spawn_pool_thread", "ANALYSIS_STACK_BYTES"];
 /// patterns: `use rigor_parse::parse` then `parse(src)`, `use
 /// std::thread::spawn` then `spawn(job)`.
 const USE_LEAVES_THREAD: &[&str] = &["spawn", "scope", "Builder"];
+
+/// Pool-building tokens that may not appear in `fn main`'s own body
+/// (rigor-rs#676): the pool is built from the command thread's body, so
+/// the command's stack is already reserved when workers take theirs. No
+/// trailing `(` on either — a function value or a bare builder name is
+/// the same hazard as a call — and no builder-chain exemption: in `fn
+/// main`, the pool must not be built at all.
+const MAIN_POOL_TOKENS: &[&str] = &["configure_global_pool", "ThreadPoolBuilder"];
+
+/// The advice every pool-ordering finding carries. There is no allow-list
+/// entry for these: a hit in `fn main` IS the rigor-rs#431 inversion, so
+/// the ordering can only regress by editing this audit.
+const MAIN_POOL_ADVICE: &str = "the rayon pool is built from the command thread's body \
+     (threads::run_command_thread(run_command_with_pool)), after that thread has reserved its \
+     stack — building or configuring it in fn main lets the workers spend the reservation budget \
+     first (the rigor-rs#431 inversion); move the call into the command body";
 
 #[test]
 fn production_code_uses_bounded_parse_and_analysis_threads() {
@@ -1039,4 +1063,169 @@ fn brace_glob_uses_flag_like_star_globs() {
         )
         .contains(&"use:alias-or-glob".to_string())
     );
+}
+
+/// rigor-rs#676: the pool-ordering findings of one `fn main`-bearing
+/// file. A hit is a [`MAIN_POOL_TOKENS`] token inside the production
+/// `fn main`'s body — called, taken as a value or built, outside `use`
+/// items — and the production `fn main` count is pinned at exactly one:
+/// none or several is itself a finding, so a rename or a merge can never
+/// let the check pass vacuously.
+fn main_pool_findings(text: &str, rel: &str) -> Vec<String> {
+    let b = text.as_bytes();
+    let spans = cfg_test_spans(text);
+    let no_test = |at: usize| !spans.iter().any(|&(s, e)| at >= s && at < e);
+    let uses = use_item_spans(text);
+    let mains = find_seq(text, &["fn", "main"], &no_test);
+    let mut findings = Vec::new();
+    let Some(&(at, _)) = mains.first() else {
+        findings.push(format!(
+            "{rel}: no production `fn main` — the pool-ordering audit (rigor-rs#676) \
+             cannot run; update it with the move"
+        ));
+        return findings;
+    };
+    if mains.len() > 1 {
+        let lines: Vec<String> = mains.iter().map(|&(a, _)| line_of(text, a).to_string()).collect();
+        findings.push(format!(
+            "{rel}: {} production `fn main`s (lines {}) — the pool-ordering audit \
+             (rigor-rs#676) pins exactly one; merge them or update the audit",
+            mains.len(),
+            lines.join(", ")
+        ));
+        return findings;
+    }
+    let (open, close) = item_body(b, at);
+    let active = |p: usize| (open..close).contains(&p) && !uses.iter().any(|&(s, e)| p >= s && p < e);
+    for tok in MAIN_POOL_TOKENS {
+        for (tok_at, _) in find_seq(text, &[tok], &active) {
+            findings.push(format!(
+                "{rel}:{}: `{tok}` in `fn main` — {MAIN_POOL_ADVICE}",
+                line_of(text, tok_at)
+            ));
+        }
+    }
+    findings
+}
+
+/// The `(open, close)` of the first depth-0 `{` at or after `at` — a
+/// `fn main` hit's body — through its matching `}`. The parameter
+/// list's `(`/`)` are crossed on the way, never mistaken for the body.
+fn item_body(b: &[u8], at: usize) -> (usize, usize) {
+    let mut depth = 0usize;
+    for i in at..b.len() {
+        match b[i] {
+            b'(' | b'[' => depth += 1,
+            b')' | b']' => depth = depth.saturating_sub(1),
+            b'{' if depth == 0 => return (i, close_of(b, i)),
+            _ => {}
+        }
+    }
+    panic!("`fn main` at byte {at} opens no body")
+}
+
+/// rigor-rs#676: the #431 ordering — the command thread reserves its
+/// stack BEFORE the rayon pool is built — rests on `fn main` routing
+/// through `threads::run_command_thread(run_command_with_pool)` and
+/// never touching the pool itself. The threads unit test
+/// `command_thread_is_spawned_before_the_command_body` pins only
+/// `run_command_thread_with`'s own spawn-before-body sequence and would
+/// still pass if `main` went back to configuring the pool directly, so
+/// this source check is the pin.
+#[test]
+fn main_never_builds_the_pool_itself() {
+    let path = workspace_root().join("crates/rigor-cli/src/main.rs");
+    let raw = fs::read_to_string(&path).unwrap_or_else(|e| panic!("{path:?}: {e}"));
+    let findings = main_pool_findings(&blank(&raw), "rigor-cli/src/main.rs");
+    assert!(
+        findings.is_empty(),
+        "pool-ordering audit (rigor-rs#676, #431): `fn main` must not build the rayon pool:\n{}",
+        findings.join("\n")
+    );
+}
+
+/// rigor-rs#676: `main_pool_findings` flags direct configuration only —
+/// the current `main` shape stays clean, every inversion shape (a call,
+/// a function value, a bare or stack-proven builder, a spaced qualifier)
+/// flags, and the boundaries hold: a call after `fn main`'s `}` is the
+/// command body's business, and a method call, an identifier that merely
+/// contains or abuts the token, a `use` inside the body and a
+/// `#[cfg(test)]` sibling are not hits. Zero or several production
+/// `fn main`s are findings, so the check cannot pass vacuously.
+#[test]
+fn main_pool_findings_flag_direct_configuration_only() {
+    for (src, want) in [
+        // the current shape: routing through the command thread only,
+        // the pool built in the command body (after main's `}`)
+        (
+            "fn main() -> ExitCode { threads::run_command_thread(run_command_with_pool) } \
+             fn run_command_with_pool() -> ExitCode { \
+             threads::configure_global_pool(); dispatch(&args) }",
+            Vec::new(),
+        ),
+        // the #431 inversion: the call moved back into main
+        (
+            "fn main() -> ExitCode { if !threads::configure_global_pool() { \
+             return code() } run(body) }",
+            vec!["`configure_global_pool` in `fn main`"],
+        ),
+        // a stack-proven builder in main — the repo-wide pass accepts
+        // this chain; in `fn main` it is still the inversion
+        (
+            "fn main() { rayon::ThreadPoolBuilder::new() \
+             .spawn_handler(spawn_pool_thread).build_global(); run() }",
+            vec!["`ThreadPoolBuilder` in `fn main`"],
+        ),
+        // `::default()` and a bare unqualified builder name
+        (
+            "fn main() { let pool = ThreadPoolBuilder::default().build_global(); }",
+            vec!["`ThreadPoolBuilder` in `fn main`"],
+        ),
+        // whitespace around `::` and before `(` cannot bypass the match
+        (
+            "fn main () { threads :: configure_global_pool ( ) }",
+            vec!["`configure_global_pool` in `fn main`"],
+        ),
+        // a function value is the same hazard as a call
+        (
+            "fn main() { let build = threads::configure_global_pool; }",
+            vec!["`configure_global_pool` in `fn main`"],
+        ),
+        // a method call is not the free function
+        ("fn main() { pool.configure_global_pool(); }", Vec::new()),
+        // a longer — or abutting — identifier is not the token
+        ("fn main() { configure_global_pool_twice(); }", Vec::new()),
+        ("fn main() { xconfigure_global_pool(); }", Vec::new()),
+        // a `use` inside the body is not a call; the call after it is
+        (
+            "fn main() { use threads::configure_global_pool; run(body) }",
+            Vec::new(),
+        ),
+        (
+            "fn main() { use threads::configure_global_pool; configure_global_pool() }",
+            vec!["`configure_global_pool` in `fn main`"],
+        ),
+        // a `#[cfg(test)]` sibling `fn main` is masked; the production
+        // one stays clean
+        (
+            "#[cfg(test)] mod t { fn main() { configure_global_pool() } } \
+             fn main() { run() }",
+            Vec::new(),
+        ),
+        // zero or several production `fn main`s never pass vacuously
+        (
+            "fn cli() { threads::configure_global_pool() }",
+            vec!["no production `fn main`"],
+        ),
+        (
+            "fn main() { a() } fn main() { b() }",
+            vec!["2 production `fn main`s"],
+        ),
+    ] {
+        let findings = main_pool_findings(&blank(src), "main.rs");
+        assert_eq!(findings.len(), want.len(), "{src}\n{findings:?}");
+        for w in &want {
+            assert!(findings.iter().any(|f| f.contains(w)), "{src}\n{findings:?}");
+        }
+    }
 }
