@@ -67,6 +67,18 @@ jobs:
       - name: Build rigor (release)
         run: cargo build --release --locked -p rigor-cli
 
+      # DIAG: what does ulimit -v actually do to the thread ladder here?
+      - name: ulimit -v diagnostic
+        if: matrix.set == 'bound'
+        run: |
+          printf 'x = 1\n' > /tmp/t.rb
+          echo "=== /proc/self/limits (as)"; grep 'Max address' /proc/self/limits
+          echo "=== overcommit"; cat /proc/sys/vm/overcommit_memory
+          for v in 4096 1024 512 256 128 96 64 48 32; do
+            echo "--- ulimit -v ${v}MiB"
+            bash -c "ulimit -v $((v*1024)) && ulimit -v && ./target/release/rigor check /tmp/t.rb" 2>&1 | head -6
+          done
+
       - name: Screen ${{ matrix.set }}
         run: python3 harness/stack/e2e.py release ${{ matrix.kinds }} --only main,worker,at64,at2,inline
 
