@@ -89,11 +89,17 @@ def sh_ulimit(args, v_mib=None, s_mib=None):
     return ["/bin/bash", "-c", "%s && exec \"$@\"" % "; ".join(pre), "sh"] + args
 
 
-def run(files, d, v_mib=None, s_mib=None, timeout=None):
+def run(files, d, v_mib=None, s_mib=None, timeout=None, no_ruby=False):
     args = sh_ulimit([rigor, a.sub] + (["--format", "json"] if a.sub == "check" else []) + files,
                      v_mib, s_mib)
+    env = dict(os.environ)
+    if no_ruby:
+        # The Ruby sidecar is a separate process, not part of rigor's thread
+        # stacks; under a rung-forcing budget its spawn is the binding
+        # failure, not the analysis. `off` runs the Ruby-free sound subset.
+        env["RIGOR_NO_RUBY"] = "1"
     t = time.time()
-    r = subprocess.run(args, cwd=d, capture_output=True, env=dict(os.environ),
+    r = subprocess.run(args, cwd=d, capture_output=True, env=env,
                        timeout=timeout or a.timeout)
     dt = time.time() - t
     err = r.stderr.decode("utf-8", "replace")
@@ -114,16 +120,17 @@ def run(files, d, v_mib=None, s_mib=None, timeout=None):
             "err": err.strip().splitlines()[0][:120] if err.strip() else ""}
 
 
-def trial(kind, n, two, v_mib=None, s_mib=None):
-    key = (kind, n, two, v_mib, s_mib)
+def trial(kind, n, two, v_mib=None, s_mib=None, no_ruby=False):
+    key = (kind, n, two, v_mib, s_mib, no_ruby)
     if key in _trials:
         return _trials[key]
     d, files = make_trial(kind, n, two)
     try:
-        r = run(files, d, v_mib, s_mib)
-        # Survival = check ran to a verdict: not a crash, not a dead pool/exec
-        # (rc 70 prints no diagnostics; it never analysed the file).
-        survived = not r["crashed"] and r["rung"] != "dead" and r["rc"] != 70
+        r = run(files, d, v_mib, s_mib, no_ruby=no_ruby)
+        # Survival = check ran to a verdict (rc 0 clean, 1 findings). Anything
+        # else — a crash, a dead pool/exec, a could-not-start exit like the
+        # sidecar's 69 or the pool's 70 — never analysed the file.
+        survived = not r["crashed"] and r["rung"] != "dead" and r["rc"] in (0, 1)
         det = (("CRASH rc=%d thread=%s" % (r["rc"], r["thread"])) if r["crashed"]
                else ("dead rc=%d" % r["rc"]) if not survived
                else "ok rc=%d rung=%s %.1fs" % (r["rc"], r["rungs"], r["dt"]))
@@ -180,7 +187,7 @@ def minm(kind, n):
         return "n/a", "no inline budget (ulimit -v not honoured?)"
 
     def ok(m):
-        return trial(kind, n, False, v_mib=v, s_mib=m)[0]
+        return trial(kind, n, False, v_mib=v, s_mib=m, no_ruby=True)[0]
 
     lo, hi = 1, None
     while lo <= 512:
@@ -189,7 +196,7 @@ def minm(kind, n):
             break
         lo *= 2
     if hi is None:
-        return ">512", trial(kind, n, False, v_mib=v, s_mib=512)[1]
+        return ">512", trial(kind, n, False, v_mib=v, s_mib=512, no_ruby=True)[1]
     lo = hi // 2
     while hi - lo > 1:
         mid = (lo + hi) // 2
@@ -197,7 +204,7 @@ def minm(kind, n):
             hi = mid
         else:
             lo = mid
-    return str(hi), trial(kind, n, False, v_mib=v, s_mib=hi)[1]
+    return str(hi), trial(kind, n, False, v_mib=v, s_mib=hi, no_ruby=True)[1]
 
 
 out = open(a.out, "a")
@@ -215,7 +222,8 @@ for spec in a.kinds:
             row.append(key + "=" + (trial(kind, n, True, v_mib=v)[1] if v is not None else "n/a"))
     if "inline" in only:
         v = budget_for("inline")
-        row.append("inline=" + (trial(kind, n, False, v_mib=v)[1] if v is not None else "n/a"))
+        row.append("inline=" + (trial(kind, n, False, v_mib=v, no_ruby=True)[1]
+                               if v is not None else "n/a"))
     if "minm" in only:
         mm, det = minm(kind, n)
         row.append("minm=%sMiB(%s)" % (mm, det))
