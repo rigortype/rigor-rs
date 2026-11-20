@@ -60,8 +60,9 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand — x-polarity gate, dominating-write cut, body-env leaf typing, `Integer#[]` fold; `x = [1,2][x] || 0` caps; 0 FP / sweep; 5 Opus rounds. →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
 - **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts the self-extend's instance-side entry (2+N, cut N≥99) + RBS-known fallback; live FP gone; 0 FP / 437 = master. →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
-- **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census names, `using`/`.refined` regions, `own_method_answers` definer walk (definer's own level + #1689 class-context placement fixed en route); 0 FP; review edges →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
+- **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census, `using`/`.refined` regions, `own_method_answers` walk; 0 FP; review edges →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
 - **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = the #412 tools on the post-#431 ladder + `stack.yml`; ADR-0045 x86_64 rungs (`alloc`, never a 2 MiB overflow); Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
 - **2026-11-20 #724 CLOSED** (PR #739): pool-audit `use` alias/glob of `configure_global_pool`/`ThreadPoolBuilder` in `fn main` flags (the #676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
 - **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch String carriers (`decimal-int-string`/`non-empty-string`); message drift 47→46, 0 FP / 437 = master. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
@@ -149,7 +150,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-08-23/25 re-pin `v0.3.2→v0.3.4` + survey (HOLD)** — 0 FP / 9204, gaps 841→820; raw bump opened **50 FPs**, retractions the diff can't see ([note](notes/20260823-repin-v034.md)); plugin drift + 404s ([survey](notes/20260825-upstream-survey-v034-master.md)).
 - **2026-08-09 unresolved-const-receiver carrier REJECTED at 0 rows** (PR #89, closed). [note](notes/20260809-unresolved-const-receiver-carrier.md)
 - **2026-08-09 re-pin `v0.3.1→v0.3.2` (+rbs 4.1.1), folded** — 0 FP / 9204, gaps 1125→841; shims→overlay; join-wipe; chain-guard meet. [repin](notes/20260809-repin-v032.md)/[join](notes/20260809-join-wipe-retention.md)/[meet](notes/20260809-chain-guard-meet.md)
-- **2026-08-08 era, folded (0 FP / 9204)** — narrowing/shape trio #70–#82 ([meet](notes/20260808-sequential-guard-meet.md)/[shape](notes/20260807-collection-shape-slice-spec.md)); `Object` bucket #85; harvest #83/#84 ([adjudication](notes/20260808-object-bucket-adjudication.md)/[harvest](notes/20260808-partial-constant-harvest-mini-spec.md)).
+- **2026-08-08 era, folded (0 FP / 9204)** — narrowing/shape trio #70–#82; `Object` bucket #85; harvest #83/#84.
 - **2026-08-07/08 class-narrowing arc CLOSED, measured stop** (#63–#79) — `narrow_class_other`: 19 closures + 11 master FPs, 0 FP / 9204. [spec](notes/20260807-class-narrowing-slice-spec.md)/[stage3](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-01/08 instruments + adjudication, folded** — 0-FP gate could pass VACUOUSLY ([note](notes/20260807-fp-audit-port-side-blind-spots.md)); gap CENSUS by MECHANISM ([note](notes/20260807-gap-census.md)); LSP reload keeps LAST GOOD ([lsp](notes/20260801-lsp-config-reload.md)).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup** (PR #64) — namespaced receivers route via the qualified registry; 14 closures (→1179), 0 FP / 9204; fx 82 pins Tier-3. [spec](notes/20260807-adr0042-s5-return-lookup-spec.md).
