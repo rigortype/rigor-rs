@@ -2658,12 +2658,9 @@ fn conformance_rows(
         };
         // RBS reports the annotation's column in CHARACTERS (Unicode scalar
         // values: oracle-measured with 2-, 3- and 4-byte characters and a
-        // combining mark before it), where `line_col` counts bytes. Subtract
-        // the difference from the ROW's column so the shared renderer prints
-        // the reference's column, while the stored diagnostic keeps honest
-        // offsets (`delta` is a within-line difference, so it never moves
-        // the column across a line break).
-        let delta = char_column_delta(source, f.start_offset);
+        // combining mark before it), where `line_col` counts bytes. The row
+        // stores the character column, while the diagnostic keeps honest
+        // offsets — the position is resolved once, here.
         let diag = Diagnostic {
             rule_id: f.rule_id(),
             start_offset: f.start_offset,
@@ -2674,16 +2671,19 @@ fn conformance_rows(
             receiver_type: None,
             method_name: None,
         };
-        let (line, column) = line_col(source, f.start_offset);
-        rows.push(Finding {
-            order: usize::MAX,
-            path: f.file.to_string(),
-            line,
-            column: column - delta,
-            diag,
-        });
+        let (line, column) = line_char_col(source, f.start_offset);
+        rows.push(Finding { order: usize::MAX, path: f.file.to_string(), line, column, diag });
     }
     rows
+}
+
+/// `(line, column)` of `offset` with the column counted in CHARACTERS — the
+/// unit RBS reports for `%a{…}` annotations — rather than [`line_col`]'s
+/// bytes. `delta` is a within-line difference, so the subtraction can never
+/// cross a line break (or underflow the 1-based column).
+fn line_char_col(source: &str, offset: usize) -> (usize, usize) {
+    let (line, column) = line_col(source, offset);
+    (line, column - char_column_delta(source, offset))
 }
 
 /// Bytes minus characters between the start of `offset`'s line and `offset`
@@ -2756,10 +2756,12 @@ fn cmd_baseline(args: &[String]) -> ExitCode {
 /// key next to a `(usize, usize)` position was a silent transpose hazard.
 #[derive(Clone, Debug)]
 struct Finding {
-    /// Input-order sort key (`findings.sort_by_key` is stable, so equal keys
-    /// keep insertion order): the file's worklist index for per-file rows,
-    /// `0` for leading run-level rows, `usize::MAX` for the trailing
-    /// `rigor:v1:conforms-to` rows.
+    /// Input-order sort key — consulted ONCE, by `findings.sort_by_key`
+    /// (stable, so equal keys keep insertion order) to interleave the
+    /// stage-1 and stage-3 per-file rows by the file's worklist index. Rows
+    /// produced after that sort carry documentary values: `0` on the
+    /// leading run-level span (prepended), `usize::MAX` on the trailing
+    /// `rigor:v1:conforms-to` rows (appended).
     order: usize,
     path: String,
     /// 1-based line, resolved ONCE where the row is produced — stage 3 and
@@ -2776,8 +2778,9 @@ impl Finding {
     /// `expansion.errors`, the `configuration-error` early return),
     /// path-level, or a file's panic/depth-refusal sentinel — printed at
     /// `1:1`. `order` is the file's own index for the sentinel rows so they
-    /// sort back beside that file's findings, `0` for leading run-level
-    /// rows, `usize::MAX` for trailing ones.
+    /// sort back beside that file's findings; for the run-level rows — made
+    /// after the sort, then prepended/appended — any value would do, so
+    /// `0`/`usize::MAX` document the intent.
     fn run_level(order: usize, path: String, diag: Diagnostic) -> Self {
         Self { order, path, line: 1, column: 1, diag }
     }

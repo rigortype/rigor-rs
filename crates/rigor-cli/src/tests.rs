@@ -102,10 +102,11 @@ fn conformance_column_counts_characters() {
     // Oracle (PR #150 round 3): `type t = "é" %a{…}` puts the annotation
     // at column 16 upstream; bytes would say 17. One Unicode scalar per
     // character (here 16 before it), a combining mark counted apart.
+    // `line_char_col` is what `conformance_rows` calls — the row's column,
+    // not a shifted offset's byte column.
     let src = "iface\ntype t = \"é😀e\u{301}\" %a{x}\n";
     let off = src.find("%a").unwrap();
-    let fixed = off - char_column_delta(src, off);
-    assert_eq!(line_col(src, fixed), (2, 17));
+    assert_eq!(line_char_col(src, off), (2, 17));
     assert_eq!(char_column_delta("abc %a", 4), 0);
 }
 
