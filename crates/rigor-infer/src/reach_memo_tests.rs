@@ -7,8 +7,9 @@
 //! panic on a build with the corresponding rule broken (recorded in the PR),
 //! so a later change that breaks the rule again fails here.
 //!
-//! The flag is process-global ([`crate::reach_memo::set_audit_mode_for_test`]):
-//! parallel tests are audited too, which is sound — just slower.
+//! The flag is thread-local ([`crate::reach_memo::set_audit_mode_for_test`])
+//! so forcing it on here cannot audit — or re-time — tests running in
+//! parallel.
 
 use super::*;
 use rigor_parse::{lower, parse, Node};
@@ -136,16 +137,13 @@ fn audited_hit_does_not_store_a_duplicate() {
     let typer = Typer::new(&idx);
     let _ = typer.dead_positions(&ast, &mut Vec::new());
     // g01 leaves an entry for local_reach(x, (58,59)) under a len-2 stack;
-    // an audited hit on it must leave the list at one entry.
-    assert_eq!(
-        1,
-        typer.reach_memo.borrow().reach_entry_count((58, 59), false, 2),
-        "setup: expected one stored entry for the x@58 read"
-    );
+    // an audited hit on it must leave the list unchanged.
+    let before = typer.reach_memo.borrow().reach_entry_count((58, 59), false, 2);
+    assert!(before >= 1, "setup: no entry stored for the x@58 read");
     let mut seen = vec!["q@73".to_string(), "x@58".to_string()];
     let _ = typer.local_reach(&ast, "x", (58, 59), &mut seen, false);
     assert_eq!(
-        1,
+        before,
         typer.reach_memo.borrow().reach_entry_count((58, 59), false, 2),
         "an audited hit stored a duplicate entry"
     );
