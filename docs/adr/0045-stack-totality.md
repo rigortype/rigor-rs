@@ -260,8 +260,17 @@ memory. Medians over interleaved runs; every variant produced identical output:
   Prism's cap. That is out of scope. The regression test
   (`rigor-cli/tests/deep_nesting.rs`) uses depths that a debug binary
   carries.
-- **x86_64 Linux and Windows** were not measured locally; the margins above
-  are aarch64 numbers. CI's x86_64 Linux job runs the regression test, in
-  debug, on every push. Windows is unmeasured.
+- **x86_64 Linux** is measured by the committed tools
+  (`harness/stack/`, workflow `stack-measure`, rigor-rs#428): the per-pass
+  minima track aarch64 (`lower defined` 13 MiB, `parse array` 8 MiB, the
+  C-walk 1,178 KiB), every capped and refusal cap is identical, and the
+  rung screen shows the 2 MiB rung crashes on the heaviest bound kinds
+  (SIGABRT, as the fallback warning says it may) while 64 MiB carries
+  them; the inline thread's `ulimit -s` floor measures 16 MiB for the
+  deepest capped kind and 345–384 MiB for bound-depth chains under the
+  Ruby-free sound subset.
+- **Windows** is unmeasured: the port does not yet compile on
+  `windows-latest` (rigor-rs#707); `stack-measure` runs the
+  `deep_nesting` tests there once it does.
 - **Below the bound nothing changes.** A file past it reports
   `internal-error`, where the reference aborts the whole run.
