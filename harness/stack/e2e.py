@@ -51,8 +51,30 @@ only = a.only.split(",")
 _trials = {}
 _budgets = None  # {"at64": MiB, "at2": MiB, "inline": MiB}
 
-WARN = re.compile(r"could not reserve 256 MiB thread stacks, using (.+?);")
+# The fallback warning (rigor-cli threads.rs): post-#703, one line per
+# strictly-worse rung: "some analysis threads are using 64 MiB" / "2 MiB",
+# or "some analysis runs on the process main thread (N MiB)". The pre-#703
+# "could not reserve ... using X" form is kept for older binaries.
+OLD_WARN = re.compile(
+    r"could not reserve \d+ MiB thread stacks, using (?:(\d+) MiB|the process main thread)")
 POOL_ERR = "could not start the analysis thread pool"
+
+
+def rungs(err):
+    """The fallback rungs a run landed on, weakest first. Empty = all 256."""
+    out = set()
+    if POOL_ERR in err:
+        return ["dead"]
+    if "some analysis runs on the process main thread" in err:
+        out.add("main")
+    if "some analysis threads are using 2 MiB" in err:
+        out.add("2")
+    if "some analysis threads are using 64 MiB" in err:
+        out.add("64")
+    m = OLD_WARN.search(err)
+    if m:
+        out.add(m.group(1) if m.group(1) else "main")
+    return [r for r in ("main", "2", "64") if r in out]
 
 
 def sh_ulimit(args, v_mib=None, s_mib=None):
@@ -75,21 +97,20 @@ def run(files, d, v_mib=None, s_mib=None, timeout=None):
                        timeout=timeout or a.timeout)
     dt = time.time() - t
     err = r.stderr.decode("utf-8", "replace")
-    m = WARN.search(err)
-    rung = {"64 MiB": "64", "2 MiB": "2", "the process main thread": "main"}.get(
-        m.group(1) if m else "", "dead" if POOL_ERR in err else "256")
-    if (r.returncode in (126, 127)
+    rg = rungs(err)
+    if ("cannot modify limit" in err or "invalid option" in err
+            or "Illegal option" in err):
+        rg = ["noforce"]  # ulimit itself failed (macOS has no working -v)
+    elif (r.returncode in (126, 127)
             or (r.returncode != 0 and not err.strip())
             or "error while loading shared libraries" in err
             or "Cannot allocate memory" in err):
-        rung = "dead"  # the budget stopped even the exec
-    if ("cannot modify limit" in err or "invalid option" in err
-            or "Illegal option" in err):
-        rung = "noforce"  # ulimit itself failed (macOS has no working -v)
+        rg = ["dead"]  # the budget stopped even the exec
     mo = re.search(r"thread '([^']*)'.*has overflowed its stack", err)
     crashed = r.returncode < 0 or mo is not None
-    return {"rc": r.returncode, "rung": rung, "crashed": crashed, "dt": dt,
-            "thread": mo.group(1) if mo else None,
+    return {"rc": r.returncode, "rung": rg[0] if rg else "256",
+            "rungs": "+".join(rg) if rg else "256", "crashed": crashed,
+            "dt": dt, "thread": mo.group(1) if mo else None,
             "err": err.strip().splitlines()[0][:120] if err.strip() else ""}
 
 
@@ -105,7 +126,7 @@ def trial(kind, n, two, v_mib=None, s_mib=None):
         survived = not r["crashed"] and r["rung"] != "dead" and r["rc"] != 70
         det = (("CRASH rc=%d thread=%s" % (r["rc"], r["thread"])) if r["crashed"]
                else ("dead rc=%d" % r["rc"]) if not survived
-               else "ok rc=%d rung=%s %.1fs" % (r["rc"], r["rung"], r["dt"]))
+               else "ok rc=%d rung=%s %.1fs" % (r["rc"], r["rungs"], r["dt"]))
         _trials[key] = (survived, det)
         return _trials[key]
     finally:
