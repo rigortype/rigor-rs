@@ -60,6 +60,8 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror — `AliasesNotEnabled`/`DisallowedClass` exit 1, parse-beats-visit, unmodelled arms decline; 5 review rounds, 0 FP every head. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
+
 - **2026-11-20 #672 CLOSED** (PR #708): rooted guard operands top-level; 0 FP, +3 dependabot rows →#714; →#709/#710. [note](notes/20261120-issue-672-rooted-class-guard.md)
 - **2026-11-20 #673 CLOSED** (PR #711): dynamic-base rescue designator (`k::X`) opaque — `dynamic_base` gates all five consumers. 0 FP. →#712. [note](notes/20261120-issue-673-rescue-dynamic-base.md)
 - **2026-11-20 #677 CLOSED** (PR #703): fallback warning: one line per new worst stack (real `RLIMIT_STACK` rank, quoted first refusal). →#676/#705. [note](notes/20261120-issue-677-stack-fallback-warn.md)
