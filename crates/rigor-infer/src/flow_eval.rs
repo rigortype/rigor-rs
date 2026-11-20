@@ -1238,6 +1238,15 @@ impl<'i> Typer<'i> {
             value_node: Option<NodeId>,
             compound: bool,
             unmodeled: bool,
+            /// A `LocalVariableWrite` / `InstanceVariableWrite` — whose
+            /// compound verdict `self_compound` re-derives per operand
+            /// (rigor-rs#683). Op-write and masgn sites keep the scan's
+            /// `compound`.
+            plain: bool,
+            /// A `LocalVariableOpWrite` — `x += v` / `x ||= v` / `x &&= v`.
+            /// Its RHS is an IMPLICIT self-read, so it can never cut a
+            /// later read off the pass-entry binding.
+            op: bool,
         }
         let mut sites: Vec<Site> = Vec::new();
         for (_, n) in ast.iter() {
@@ -1252,13 +1261,13 @@ impl<'i> Typer<'i> {
                         continue;
                     }
                     let vs = ast.get(*value).span();
-                    // A bare `x = x` or a `x = x || v` / `x = x && v`
-                    // rebinding can only union with the entry binding — the
-                    // join is monotone and converges; every other self-read
-                    // (`y = [y]`, `x = f(x)`) compounds.
+                    // A plain self-write's compound verdict is re-derived
+                    // per operand post-`live` (`self_compound` below,
+                    // rigor-rs#683): `x = x || v` converges, but a self-read
+                    // buried in an operand (`x = [1, 2][x] || 0`,
+                    // `x = f(x)`) can compound.
                     let compound = marks.reads_within(vs).contains(&name.as_str())
-                        && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } if n2 == name)
-                        && !matches!(ast.get(*value), Node::Logical { .. });
+                        && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. } if n2 == name);
                     sites.push(Site {
                         target: name.clone(),
                         span: *span,
@@ -1266,6 +1275,8 @@ impl<'i> Typer<'i> {
                         value_node: Some(*value),
                         compound,
                         unmodeled: false,
+                        plain: true,
+                        op: false,
                     });
                 }
                 Node::LocalVariableOpWrite { name, value, op, span, .. } => {
@@ -1287,6 +1298,8 @@ impl<'i> Typer<'i> {
                         value_node: Some(*value),
                         compound,
                         unmodeled: false,
+                        plain: false,
+                        op: true,
                     });
                 }
                 Node::MultiWrite { targets, value, span, .. } => {
@@ -1305,6 +1318,8 @@ impl<'i> Typer<'i> {
                             value_node: Some(*value),
                             compound: false,
                             unmodeled: false,
+                            plain: false,
+                            op: false,
                         });
                     }
                 }
@@ -1320,6 +1335,8 @@ impl<'i> Typer<'i> {
                             value_node: None,
                             compound: false,
                             unmodeled: true,
+                            plain: false,
+                            op: false,
                         });
                     }
                 }
@@ -1337,7 +1354,245 @@ impl<'i> Typer<'i> {
                 .min()
                 .unwrap_or(usize::MAX)
         };
+        // `for`-index writes never land a `Site` (`Node::Loop.index` /
+        // `index_writes`), and they bind the name for the WHOLE body
+        // window — a `for k` after the leaf still rebinds `k` on the same
+        // pass — so any `for` write of a leaf-read name makes its value
+        // unprovable here (the element type is not computed either way).
+        let mut for_writes: HashSet<String> = HashSet::new();
+        for (_, m) in ast.iter() {
+            let Node::Loop { index, index_writes, span, kind, .. } = m
+            else {
+                continue;
+            };
+            if matches!(kind, rigor_parse::LoopKind::For)
+                && body_span.0 <= span.0
+                && span.1 <= body_span.1
+                && !inside_nested(*span)
+            {
+                for_writes.extend(index.iter().map(|(nm, _)| nm.clone()));
+                for_writes.extend(index_writes.iter().map(|(nm, _, _)| nm.clone()));
+            }
+        }
         let nil = interner.nil();
+        // rigor-rs#683 — a plain self-write compounds when a self-read feeds
+        // its result unboundedly. `x = x || v` only unions with the entry
+        // binding, but `x = [1, 2][x] || 0` / `x = x.succ || 0` / `x = f(x)`
+        // keep moving until the cap. Walk the value's `&&`/`||` tree: a leaf
+        // inherits an x-polarity gate — `x || R` evaluates `R` only while
+        // `x` is falsey (bounded), `x && R` while `x` is truthy, a leaf
+        // behind a statically-decided operand never (`x = 0 || f(x)`) — and
+        // an `&&` left operand contributes only its FALSEY part to the
+        // result ({nil,false}: bounded — `x = [x] && 0` converges). A leaf
+        // reading the name while it may be truthy compounds, unless the
+        // read is not an ASSUMPTION read — a name the body's earlier
+        // x-free write cut from the pass-entry binding (`x = 1; x = f(x)`)
+        // — or the operand's own type proves the write converged:
+        // `x + 0` folds back to the entry binding, `x[0]`'s `Integer`
+        // stays inside the entry's widened envelope (the reference's
+        // `0[0] -> 0` fold converges), and an unresolved `foo(x)`
+        // declines to `Dynamic`, which joins the binding into a stable
+        // `Dynamic`-union on the second pass.
+        let mut self_compound: HashSet<usize> = HashSet::new();
+        for site in &live {
+            if !site.plain || !site.compound {
+                continue;
+            }
+            let Some(v) = site.value_node else {
+                continue;
+            };
+            let n = site.target.as_str();
+            let entry = env.get(n).copied().unwrap_or(nil);
+            // A write's new binding replaces the pass-entry binding only
+            // when the write always runs — a top-level body statement.
+            // `x = 0` dominates; `x = 0 if d`, `c2 && (x = 1)`, a
+            // `begin`/`rescue` or block write, and `x <op>=` (an implicit
+            // self-read) do not — the entry binding survives the untaken
+            // arm or joins the op's result.
+            let dominates = |s: &Site| {
+                !s.op
+                    && body.iter().any(|b| {
+                        let bn = ast.get(*b);
+                        matches!(
+                            bn,
+                            Node::LocalVariableWrite { .. }
+                                | Node::InstanceVariableWrite { .. }
+                                | Node::MultiWrite { .. }
+                                | Node::UnmodeledWrite { .. }
+                        ) && bn.span() == s.span
+                    })
+            };
+            // A read at `p` sees the pass-entry binding iff no earlier
+            // write of the name produced a DOMINATING x-free binding
+            // before it. A write that itself reads the name (`x = x`,
+            // `x = x || 0`, `x = [x]`) is assumption-derived and does not
+            // cut either.
+            let assumption_read = |p: usize| {
+                live.iter()
+                    .filter(|s| s.target == n && s.span.1 <= p)
+                    .all(|s| {
+                        if !dominates(s) {
+                            return true;
+                        }
+                        match s.value {
+                            Some(sv) => marks.reads_within(sv).contains(&n),
+                            // An unmodeled write may or may not carry the
+                            // assumption — keep the read (compound is the
+                            // FP-safe side).
+                            None => true,
+                        }
+                    })
+            };
+            // {FALSEY = 0b01, TRUTHY = 0b10}: the x-polarities under which
+            // this leaf's read can evaluate unboundedly.
+            let mut stack: Vec<(NodeId, u8)> = vec![(v, 0b11)];
+            'site: while let Some((id, gate)) = stack.pop() {
+                match ast.get(id) {
+                    Node::Logical { left, right, is_and, .. } => {
+                        let (left, right, is_and) = (*left, *right, *is_and);
+                        stack.push((left, if is_and { gate & 0b01 } else { gate }));
+                        let cond = if is_and {
+                            Self::logical_truthy_cond(ast, left, n)
+                        } else {
+                            Self::logical_falsey_cond(ast, left, n)
+                        };
+                        stack.push((right, gate & cond));
+                    }
+                    node => {
+                        // A bare `name` operand contributes the entry
+                        // binding itself — the monotone term.
+                        if matches!(node, Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. } if n2 == n) {
+                            continue;
+                        }
+                        // Gated to `name` falsey, or never: the read is
+                        // bounded by the {nil,false} set.
+                        if gate & 0b10 == 0 {
+                            continue;
+                        }
+                        let has_assumption_read = marks
+                            .read_positions_within(node.span())
+                            .iter()
+                            .any(|(p, r)| *r == n && assumption_read(*p));
+                        if !has_assumption_read {
+                            continue;
+                        }
+                        // The operand's type proves the write converged.
+                        // A foreign read sees the BODY's binding, not the
+                        // entry's — `k = 0` pre-loop then `k = 1` and
+                        // `x = x + k` inside must type the leaf as
+                        // `x + 1`, so overlay each earlier dominating
+                        // write's value type onto the entry env.
+                        // `x + 0` folds back to the entry binding (`vt ⊆
+                        // entry`; a nominal codomain like `x[0]`'s
+                        // `Integer` is NOT enough — `x.bit_length` types
+                        // `Integer` too and keeps moving inside it), and a
+                        // `Dynamic` operand joins the binding into a
+                        // stable union on the next pass — but only for a
+                        // decline the reference must share: the name is
+                        // unbound at entry (a body-first `x`'s nil seed
+                        // declines identically), or the leaf is a
+                        // receiverless call nothing resolves — no
+                        // toplevel `def`, no Object/Kernel surface, no
+                        // project `def` on the enclosing class (`foo(x)`
+                        // converges; a defined `g(x)` or `Rational(x)`
+                        // compounds). A decline the reference resolves
+                        // (`[1,2].fetch(x)`) keeps moving — compound.
+                        let mut leaf_env = env.clone();
+                        let mut leaf_unprovable = false;
+                        for (pos, r) in marks.read_positions_within(node.span()) {
+                            if r == n {
+                                continue;
+                            }
+                            // A DOMINATING write replaces the entry
+                            // binding; anything else (`k = 0 if d`,
+                            // `c2 && (k = 0)`, a block or op write) joins
+                            // the entry binding back in — the conditional
+                            // arm still leaves `k` at its seed. A write
+                            // with no readable value (`for k in …`, a
+                            // pattern bind) proves NOTHING — the leaf's
+                            // value is untrusted, so the site compounds.
+                            let mut r_ty = None;
+                            let mut entry_survives = false;
+                            let mut unprovable = false;
+                            if for_writes.contains(r) {
+                                leaf_unprovable = true;
+                                continue;
+                            }
+                            for s in live
+                                .iter()
+                                .filter(|s| s.target == r && s.span.1 <= pos)
+                            {
+                                let dominant = s.plain && dominates(s);
+                                if !dominant {
+                                    entry_survives = true;
+                                }
+                                match s.value_node {
+                                    Some(sv) => {
+                                        let wv = self.type_of(ast, sv, env, interner);
+                                        r_ty = Some(match r_ty {
+                                            None => wv,
+                                            Some(prev) => {
+                                                rigor_types::Algebra::join(interner, prev, wv)
+                                            }
+                                        });
+                                    }
+                                    None => unprovable = true,
+                                }
+                            }
+                            if unprovable {
+                                leaf_unprovable = true;
+                                continue;
+                            }
+                            if entry_survives {
+                                let e = env.get(r).copied().unwrap_or(nil);
+                                r_ty = Some(match r_ty {
+                                    None => e,
+                                    Some(prev) => {
+                                        rigor_types::Algebra::join(interner, prev, e)
+                                    }
+                                });
+                            }
+                            if let Some(wv) = r_ty {
+                                leaf_env.insert(Rc::from(r), wv);
+                            }
+                        }
+                        let vt = self.type_of(ast, id, &leaf_env, interner);
+                        let vt_decline = Self::type_has_decline(interner, vt);
+                        let unresolvable = matches!(node, Node::Call { receiver: None, method, .. } if {
+                            let scope = self
+                                .lexical_scopes
+                                .iter()
+                                .filter(|(s, _)| {
+                                    s.0 <= node.span().0 && node.span().1 <= s.1
+                                })
+                                .min_by_key(|(s, _)| s.1 - s.0)
+                                .map(|(_, segs)| segs.join("::"));
+                            let class_name = scope.as_deref().unwrap_or("Object");
+                            let resolves = self
+                                .source
+                                .is_toplevel_def(self.file_key, method)
+                                || self.index.class_has_method("Object", method)
+                                || self.source.project_declares_method(
+                                    self.file_key,
+                                    class_name,
+                                    method,
+                                );
+                            !resolves
+                        });
+                        let converged = !leaf_unprovable
+                            && (rigor_types::Algebra::join(interner, vt, entry)
+                                == entry
+                                || (vt_decline
+                                    && (!env.contains_key(n) || unresolvable)));
+                        if !converged {
+                            self_compound.insert(site.span.0);
+                            break 'site;
+                        }
+                    }
+                }
+            }
+        }
+
         // `moved`: a name whose binding can differ from its seed at ANY pass
         // — a write whose value types differently than the entry binding,
         // plus the propagated cases below. `suspect`: a name that can still
@@ -1351,7 +1606,14 @@ impl<'i> Typer<'i> {
                 if site.unmodeled {
                     grew |= suspect.insert(n.to_string());
                 }
-                if site.compound {
+                // For a plain write the per-operand pass is authoritative
+                // (its `site.compound` was only the scan's coarse
+                // "reads-self" flag); `x <op>=` and masgn keep it.
+                if if site.plain {
+                    self_compound.contains(&site.span.0)
+                } else {
+                    site.compound
+                } {
                     grew |= suspect.insert(n.to_string());
                 }
                 if !moved.contains(n) {
@@ -1431,6 +1693,86 @@ impl<'i> Typer<'i> {
             return None;
         }
         Some((names, suspect))
+    }
+
+    /// The `x`-polarities under which a `&&`/`||` operand can evaluate
+    /// FALSEY, as a bitmask `{FALSEY = 0b01, TRUTHY = 0b10}` over the
+    /// tracked name's polarity — the gate [`Self::loop_cap_widening`]
+    /// threads into right operands (rigor-rs#683). A bare `name` operand
+    /// is falsey exactly when `name` is; a `||` / `&&` composes
+    /// distributively (`a || b` falsey iff both are, `a && b` iff either
+    /// is); literals carry their static polarity; every other leaf may go
+    /// either way (conservative `0b11`).
+    fn logical_falsey_cond(ast: &LoweredAst, id: NodeId, name: &str) -> u8 {
+        match ast.get(id) {
+            Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. }
+                if n2 == name =>
+            {
+                0b01
+            }
+            Node::Logical { left, right, is_and, .. } => {
+                let (l, r) = (Self::logical_falsey_cond(ast, *left, name), Self::logical_falsey_cond(ast, *right, name));
+                if *is_and {
+                    l | r
+                } else {
+                    l & r
+                }
+            }
+            Node::NilLit { .. } | Node::FalseLit { .. } => 0b11,
+            Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::RegexpLit { .. }
+            | Node::RationalLit { .. }
+            | Node::ImaginaryLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::TrueLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. }
+            | Node::Range { .. }
+            | Node::Lambda { .. }
+            | Node::SelfExpr { .. } => 0,
+            _ => 0b11,
+        }
+    }
+
+    /// [`Self::logical_falsey_cond`]'s dual: the `x`-polarities under
+    /// which the operand can evaluate TRUTHY.
+    fn logical_truthy_cond(ast: &LoweredAst, id: NodeId, name: &str) -> u8 {
+        match ast.get(id) {
+            Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. }
+                if n2 == name =>
+            {
+                0b10
+            }
+            Node::Logical { left, right, is_and, .. } => {
+                let (l, r) = (Self::logical_truthy_cond(ast, *left, name), Self::logical_truthy_cond(ast, *right, name));
+                if *is_and {
+                    l & r
+                } else {
+                    l | r
+                }
+            }
+            Node::NilLit { .. } | Node::FalseLit { .. } => 0,
+            Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::RegexpLit { .. }
+            | Node::RationalLit { .. }
+            | Node::ImaginaryLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::TrueLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. }
+            | Node::Range { .. }
+            | Node::Lambda { .. }
+            | Node::SelfExpr { .. } => 0b11,
+            _ => 0b11,
+        }
     }
 
     /// Applies a capped fixpoint's last-pass widen to the caller's POST-JOIN

@@ -2570,13 +2570,15 @@ fn loop_stabilizing_op_write_keeps_constant_pins() {
 
 
 /// rigor-rs#638 review: the replay verdict is only trusted when every
-/// tracked pass exit is value-exact. `x = g(x)` declines (`g` types
-/// `Dynamic`), and `join(Dynamic, Dynamic)` makes the name LOOK stable —
-/// so the run falls back to the structural criterion, which caps the
-/// sibling pin exactly as the reference's last-pass widen does.
+/// tracked pass exit is value-exact. `x = [1, 2].fetch(x)` declines in
+/// the port (`fetch` types `Dynamic`), and `join(Dynamic, Dynamic)`
+/// makes the name LOOK stable — so the run falls back to the structural
+/// criterion, which caps the sibling pin exactly as the reference's
+/// last-pass widen does. (The oracle resolves `fetch`, so it caps too;
+/// a receiverless `g(x)`-style decline converges instead — rigor-rs#683.)
 #[test]
 fn loop_fixpoint_declined_exit_falls_back_to_structural_cap() {
-    let src = b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = g(x)\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let src = b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = [1, 2].fetch(x)\n  end\n  if t\n    y = 3\n  end\nend\n";
     let ast = lower_src(src);
     let index = CoreIndex::new();
     let typer = Typer::new(&index);
@@ -2638,6 +2640,76 @@ fn loop_fixpoint_logical_growth_falls_back_to_structural_cap() {
     assert!(
         !matches!(i.get(ty), Type::Constant(_)),
         "a growing self-read must not read as converged, got {:?}",
+        i.get(ty)
+    );
+}
+
+/// rigor-rs#683: a `||`-topped self-write is not blanket-convergent —
+/// `x = [1, 2][x] || 0` keeps moving (the operand's read can evaluate
+/// while `x` is truthy), so the cap sheds `t`'s pin; the monotone
+/// `x = x || 0` control must still read as converged.
+#[test]
+fn loop_cap_compounds_logical_operand_self_reads() {
+    for (src, converged) in [
+        // Operand self-read that can run while `x` is truthy: caps.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = [1, 2][x] || 0\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // The monotone `x = x || v` shape: converges, `t` keeps its pin.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = x || 0\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+        // `||`'s right operand evaluates only while `x` is falsey —
+        // bounded, converges.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = x || [1, 2][x]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+        // A nominal codomain is not convergence: `x.bit_length` types
+        // `Integer` but the reference folds a fresh constant per pass.
+        (b"def f(c)\n  t = 1; x = 8\n  while c\n    if false; t = nil; end\n    x = x.bit_length\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // A CONDITIONAL write does not cut the assumption: `x = 0 if d`
+        // leaves `x`'s pass-entry binding live for `[x]`'s read.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    x = 0 if d\n    if false; t = nil; end\n    x = [x]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // An unresolvable receiverless call declines to a stable
+        // `Dynamic` union — converged, `t` keeps its pin.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = foo(x)\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+        // A `for` index binding a leaf's foreign name makes the leaf
+        // unprovable — `x + k - 1` on `k = 0` moves, it does not fold
+        // to the seed's `x + 1 - 1`.
+        (b"def f(c)\n  t = 1; x = 0; k = 1\n  while c\n    if false; t = nil; end\n    for k in [0]; end\n    x = x + k - 1\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+    ] {
+        let ast = lower_src(src);
+        let index = CoreIndex::new();
+        let typer = Typer::new(&index);
+        let mut i = Interner::new();
+        let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+        let last_if = ast
+            .iter()
+            .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+            .last()
+            .expect("at least one if node");
+        let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+        assert_eq!(
+            matches!(i.get(ty), Type::Constant(_)),
+            converged,
+            "converged={converged} expected, got {:?} for {:?}",
+            i.get(ty),
+            String::from_utf8_lossy(src)
+        );
+    }
+
+    // A receiverless call a toplevel `def` RESOLVES is not a shared
+    // decline — `g` compounds the way the reference resolves it to.
+    let src = b"def g(v) = [v]\ndef f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = g(x)\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let source = crate::source_index::SourceIndex::build(&ast, &index);
+    let typer = Typer::with_source(&index, &source);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "a defined g(x) must compound, got {:?}",
         i.get(ty)
     );
 }

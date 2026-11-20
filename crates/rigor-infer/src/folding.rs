@@ -430,6 +430,11 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         "&" => Some(Scalar::Int(a & b)),
         "|" => Some(Scalar::Int(a | b)),
         "^" => Some(Scalar::Int(a ^ b)),
+        // Bit reference `n[i]` — `0[0] -> 0`, `5[2] -> 1`. A negative
+        // index reads `0`; past `i64` a non-negative receiver reads `0`
+        // and a negative one its sign bit (Ruby's two's-complement
+        // infinite width). `n[i, len]` declines here.
+        "[]" => Some(Scalar::Int(if b < 0 { 0 } else { (a >> b.min(63)) & 1 })),
         _ => None,
     }
 }
