@@ -902,6 +902,14 @@ pub enum Node {
         /// `discovered_classes`, which `class_known_to_scope?` consults for
         /// `is_a?(::Foo)`-family operands.
         meta_new_const: Option<String>,
+        /// rigor-rs#639: when this unmodeled write is an instance-variable
+        /// op/and/or write (`@x += v`, `@x ||= v`, `@x &&= v` — plain
+        /// `@x = v` is an owned [`Node::InstanceVariableWrite`]), the sigilled
+        /// name it binds and the write kind. The reference's
+        /// `loop_body_ivar_writes` counts these on a bound ivar; `names`
+        /// stays LOCAL-only (rigor-rs#352's pattern binds) so the rebind
+        /// censuses do not see them.
+        ivar_write: Option<IvarWrite>,
     },
     /// `alias new_name old_name` (Prism `AliasMethodNode`). Both operands are
     /// lowered so an interpolated name's calls stay reachable to the rule
@@ -1058,6 +1066,24 @@ impl Node {
             | Node::Alias { span, .. } => *span,
         }
     }
+}
+
+/// An instance-variable write the arena otherwise cannot name — see
+/// [`Node::UnmodeledWrite::ivar_write`] (rigor-rs#639).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct IvarWrite {
+    /// The sigilled ivar name (`"@x"`).
+    pub name: String,
+    /// `op=` compounds unconditionally; `||=` / `&&=` compound only when the
+    /// value re-reads the name (the implicit self-read lowers no
+    /// `VariableRead`).
+    pub op: OpWriteKind,
+    /// Whether the write's VALUE subtree reads the name back — the `||=` /
+    /// `&&=` self-read (`@x ||= [@x]`) that makes the write compound. The
+    /// RHS never lowers (see [`Node::UnmodeledWrite`]), so the parse walk
+    /// answers it from the Prism tree. Always `false` on an `Operator`
+    /// write — its implicit self-read already compounds.
+    pub rereads: bool,
 }
 
 /// Which operator-write a [`Node::LocalVariableOpWrite`] lowered from.

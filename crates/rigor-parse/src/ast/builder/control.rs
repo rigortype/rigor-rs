@@ -283,6 +283,8 @@ impl<'src> Builder<'src> {
                 names: pattern_bound_locals(&in_node.pattern()),
                 // An `in` pattern writes LOCALS, never a meta-new constant.
                 meta_new_const: None,
+                // …and never an ivar.
+                ivar_write: None,
             });
             // The pattern is matched in `in_arm_position` — typed, never
             // evaluated (rigor-rs#343); it is the dead half of the operand

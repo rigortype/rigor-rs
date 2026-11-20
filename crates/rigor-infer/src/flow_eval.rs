@@ -1029,19 +1029,28 @@ impl<'i> Typer<'i> {
     ) -> Option<LoopContinuation> {
         let marks = self.def_local_marks(ast);
         let body_span = crate::def_local_marks::body_span(ast, body)?;
-        let mut names: Vec<String> = Vec::new();
-        for name in marks.written_within(body_span) {
-            if crate::def_local_marks::is_ivar(&name) {
-                if env.contains_key(name.as_str()) {
-                    names.push(name);
-                }
-            } else {
-                names.push(name);
-            }
-        }
+        let (names, ivar_writes) = self.loop_tracked_names(ast, env, &marks, body_span);
         if names.is_empty() {
             return None;
         }
+        // A tracked ivar the env does not bind still seeds off its last
+        // in-scope write — `rebindable_ivar?` counts a WRITE binding the
+        // flat envs never record, and the pass replay must see the real
+        // entry binding to move the name (rigor-rs#639).
+        let mut seeded_env: Option<TypeEnv> = None;
+        for n in &names {
+            if !crate::def_local_marks::is_ivar(n) || env.contains_key(n.as_str()) {
+                continue;
+            }
+            let ty = match ivar_writes.get(n) {
+                Some(Some(v)) => self.type_of(ast, *v, env, interner),
+                _ => interner.untyped(),
+            };
+            seeded_env
+                .get_or_insert_with(|| env.clone())
+                .insert(Rc::from(n.as_str()), ty);
+        }
+        let env = seeded_env.as_ref().unwrap_or(env);
         // Save/restore for a NESTED call: a `loop_continuation` inside this
         // body's replay must hand the flag back to the outer pass, not reset
         // it (design-review N5).
@@ -1059,6 +1068,42 @@ impl<'i> Typer<'i> {
         // def-local pass declines, and the fixpoint would fold them.
         if self.def_scope.get().is_some() {
             structural!();
+        }
+        // rigor-rs#639 — a tracked name whose body holds a write the pass
+        // cannot replay (an ivar `x op= v` lowered to `UnmodeledWrite`, or a
+        // literal-name `instance_variable_set`) stays at its assumption
+        // inside every pass: the binding may be env-unbound, so even
+        // `widen_ivars` never lands on it. Its "stable" verdict is then a
+        // decline wearing a converged answer.
+        {
+            let nested = marks.nested_scopes_within(body_span);
+            let unmodelled = ast.iter().any(|(_, n)| {
+                let span = n.span();
+                if !(body_span.0 <= span.0 && span.1 <= body_span.1)
+                    || nested.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+                {
+                    return false;
+                }
+                match n {
+                    Node::UnmodeledWrite { ivar_write, .. } => ivar_write
+                        .as_ref()
+                        .is_some_and(|w| names.contains(&w.name)),
+                    Node::Call { receiver, method, args, args_plain_positional, .. } => {
+                        Self::ivar_set_literal_name(
+                            ast,
+                            receiver,
+                            method,
+                            args,
+                            *args_plain_positional,
+                        )
+                        .is_some_and(|name| names.iter().any(|n| n == name))
+                    }
+                    _ => false,
+                }
+            });
+            if unmodelled {
+                structural!();
+            }
         }
         // The pass does not model `loop_pass_entry` — the per-pass
         // predicate edge narrowing — so a predicate that reads or writes
@@ -1183,6 +1228,147 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// `loop_body_local_writes` + `loop_body_ivar_writes`: every local the
+    /// body writes textually (nested `def` / `class` / `module` scopes are
+    /// another local scope and stay out), plus the ivars bound at entry —
+    /// `CapturedLocals.rebindable_ivar?` wants a name the scope binds off a
+    /// WRITE, not merely its ADR-58 declaration seed. The replay env binds an
+    /// ivar it saw written (`replay_one`'s `InstanceVariableWrite` arm), so
+    /// `env.contains_key` answers there; the flat envs bind no ivar at all,
+    /// so an earlier in-scope write answers for them (rigor-rs#639).
+    ///
+    /// Also returns the in-scope ivar writes map (`name` → last value node
+    /// before the body, `None` for a write the arena cannot read) — the
+    /// caller overlays unbound tracked ivars' seeds from it.
+    fn loop_tracked_names(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        marks: &crate::def_local_marks::DefLocalMarks,
+        body_span: rigor_parse::Span,
+    ) -> (Vec<String>, std::collections::HashMap<String, Option<NodeId>>) {
+        let scope_writes = self.ivar_scope_writes(ast, marks, body_span);
+        let rebindable = |name: &str| {
+            env.contains_key(name) || scope_writes.contains_key(name)
+        };
+        let mut names: Vec<String> = Vec::new();
+        for name in marks.written_within(body_span) {
+            if crate::def_local_marks::is_ivar(&name) {
+                if rebindable(name.as_str()) {
+                    names.push(name);
+                }
+            } else {
+                names.push(name);
+            }
+        }
+        // Ivar writes carry no local mark: `@x op= v` lowers to
+        // `UnmodeledWrite` and `instance_variable_set` is a plain call
+        // (rigor-rs#639).
+        let nested = marks.nested_scopes_within(body_span);
+        for (_, n) in ast.iter() {
+            let span = n.span();
+            if !(body_span.0 <= span.0 && span.1 <= body_span.1)
+                || nested.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+            {
+                continue;
+            }
+            let name: Option<&str> = match n {
+                Node::InstanceVariableWrite { name, .. } => Some(name.as_str()),
+                Node::UnmodeledWrite { ivar_write, .. } => {
+                    ivar_write.as_ref().map(|w| w.name.as_str())
+                }
+                Node::Call { receiver, method, args, args_plain_positional, .. } => {
+                    Self::ivar_set_literal_name(ast, receiver, method, args, *args_plain_positional)
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                if rebindable(name) && !names.iter().any(|n| n == name) {
+                    names.push(name.to_string());
+                }
+            }
+        }
+        (names, scope_writes)
+    }
+
+    /// The ivar writes inside the loop's enclosing local scope before the
+    /// body — `name` → its LAST value node (`None` for a write the arena
+    /// cannot read, `@x op= v`), for [`Self::loop_tracked_names`]'s
+    /// `rebindable_ivar?` gate and the caller's seed overlay. Writes inside a
+    /// nested `def`/`class`/`module` run at another time and stay out.
+    fn ivar_scope_writes(
+        &self,
+        ast: &LoweredAst,
+        marks: &crate::def_local_marks::DefLocalMarks,
+        body_span: rigor_parse::Span,
+    ) -> std::collections::HashMap<String, Option<NodeId>> {
+        // Enclosing local scope's start: the smallest `lexical_scopes` span
+        // containing the body (the file root leaves 0).
+        let scope_start = self
+            .lexical_scopes
+            .iter()
+            .filter(|(s, _)| s.0 <= body_span.0 && body_span.1 <= s.1)
+            .map(|(s, _)| s.0)
+            .max()
+            .unwrap_or(0);
+        let nested = marks.nested_scopes_within((scope_start, body_span.0));
+        let mut out: std::collections::HashMap<String, Option<NodeId>> =
+            std::collections::HashMap::new();
+        for (_, n) in ast.iter() {
+            let span = n.span();
+            if !(scope_start <= span.0 && span.1 <= body_span.0)
+                || nested.iter().any(|s| s.0 <= span.0 && span.1 <= s.1)
+            {
+                continue;
+            }
+            match n {
+                Node::InstanceVariableWrite { name, value, .. } => {
+                    out.insert(name.clone(), Some(*value));
+                }
+                Node::UnmodeledWrite { ivar_write: Some(w), .. } => {
+                    out.insert(w.name.clone(), None);
+                }
+                Node::Call { receiver, method, args, args_plain_positional, .. } => {
+                    if let Some(name) =
+                        Self::ivar_set_literal_name(ast, receiver, method, args, *args_plain_positional)
+                    {
+                        out.insert(name.to_string(), Some(args[1]));
+                    }
+                }
+                _ => {}
+            }
+        }
+        out
+    }
+
+    /// `ReflectiveIvarWrite.literal_name`: `instance_variable_set` on an
+    /// implicit or `self` receiver with exactly two plain positional
+    /// arguments, the first a Symbol or String literal naming an ivar
+    /// (`:@n` / `"@n"`), writes that ivar. Any other argument list names no
+    /// single ivar (the reference's `unknown_target?` may write every bound
+    /// ivar — unmodelled here).
+    fn ivar_set_literal_name<'a>(
+        ast: &'a LoweredAst,
+        receiver: &Option<NodeId>,
+        method: &str,
+        args: &[NodeId],
+        args_plain_positional: bool,
+    ) -> Option<&'a str> {
+        if method != "instance_variable_set" || !args_plain_positional || args.len() != 2 {
+            return None;
+        }
+        match receiver {
+            None => {}
+            Some(r) if matches!(ast.get(*r), Node::SelfExpr { .. }) => {}
+            _ => return None,
+        }
+        let name = match ast.get(args[0]) {
+            Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => value.as_str(),
+            _ => return None,
+        };
+        crate::def_local_marks::is_ivar(name).then_some(name)
+    }
+
     /// ADR-56 slice B — the structural convergence criterion for the loop
     /// rebind fixpoint, the port of the reference's pass analysis
     /// (`StatementEvaluator#loop_rebind_fixpoint`'s suspect-name logic,
@@ -1204,51 +1390,39 @@ impl<'i> Typer<'i> {
         use std::collections::HashSet;
         use rigor_parse::OpWriteKind;
 
-        // `loop_body_local_writes` + `loop_body_ivar_writes`: every local the
-        // body writes textually (nested def/class/module scopes excluded),
-        // plus the ivars bound at entry (the `rebindable_ivar?` gate).
+        // `loop_body_local_writes` + `loop_body_ivar_writes` — see
+        // [`Self::loop_tracked_names`].
         let marks = self.def_local_marks(ast);
         let body_span = crate::def_local_marks::body_span(ast, body)?;
-        let mut names: Vec<String> = Vec::new();
-        for name in marks.written_within(body_span) {
-            if crate::def_local_marks::is_ivar(&name) {
-                if env.contains_key(name.as_str()) {
-                    names.push(name);
-                }
-            } else {
-                names.push(name);
-            }
-        }
+        let (names, ivar_writes) = self.loop_tracked_names(ast, env, &marks, body_span);
         if names.is_empty() {
             return None;
         }
+        // A tracked ivar the env does not bind still seeds off its last
+        // in-scope write — `rebindable_ivar?` counts a WRITE binding the
+        // flat envs never record, and the leaf and `moved` tests must see
+        // the real entry binding (rigor-rs#639).
+        let mut seeded_env: Option<TypeEnv> = None;
+        for n in &names {
+            if !crate::def_local_marks::is_ivar(n) || env.contains_key(n.as_str()) {
+                continue;
+            }
+            let ty = match ivar_writes.get(n) {
+                Some(Some(v)) => self.type_of(ast, *v, env, interner),
+                _ => interner.untyped(),
+            };
+            seeded_env
+                .get_or_insert_with(|| env.clone())
+                .insert(Rc::from(n.as_str()), ty);
+        }
+        let env = seeded_env.as_ref().unwrap_or(env);
         let tracked: HashSet<&str> = names.iter().map(String::as_str).collect();
         let nested = marks.nested_scopes_within(body_span);
         let inside_nested =
             |span: rigor_parse::Span| nested.iter().any(|s| s.0 <= span.0 && span.1 <= s.1);
         let dead = self.dead_positions(ast, &mut Vec::new());
 
-        // The body's live write sites. `value` is the RHS node — a `None`
-        // site is a write the port cannot read the value of (pattern binds,
-        // `for` indices), which can never prove convergence.
-        struct Site {
-            target: String,
-            span: rigor_parse::Span,
-            value: Option<rigor_parse::Span>,
-            value_node: Option<NodeId>,
-            compound: bool,
-            unmodeled: bool,
-            /// A `LocalVariableWrite` / `InstanceVariableWrite` — whose
-            /// compound verdict `self_compound` re-derives per operand
-            /// (rigor-rs#683). Op-write and masgn sites keep the scan's
-            /// `compound`.
-            plain: bool,
-            /// A `LocalVariableOpWrite` — `x += v` / `x ||= v` / `x &&= v`.
-            /// Its RHS is an IMPLICIT self-read, so it can never cut a
-            /// later read off the pass-entry binding.
-            op: bool,
-        }
-        let mut sites: Vec<Site> = Vec::new();
+        let mut sites: Vec<LoopCapSite> = Vec::new();
         for (_, n) in ast.iter() {
             let span = n.span();
             if !(body_span.0 <= span.0 && span.1 <= body_span.1) || inside_nested(span) {
@@ -1268,7 +1442,7 @@ impl<'i> Typer<'i> {
                     // `x = f(x)`) can compound.
                     let compound = marks.reads_within(vs).contains(&name.as_str())
                         && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. } if n2 == name);
-                    sites.push(Site {
+                    sites.push(LoopCapSite {
                         target: name.clone(),
                         span: *span,
                         value: Some(vs),
@@ -1291,7 +1465,7 @@ impl<'i> Typer<'i> {
                     let compound = matches!(op, OpWriteKind::Operator(_))
                         || (marks.reads_within(vs).contains(&name.as_str())
                             && !matches!(ast.get(*value), Node::LocalVariableRead { name: n2, .. } if n2 == name));
-                    sites.push(Site {
+                    sites.push(LoopCapSite {
                         target: name.clone(),
                         span: *span,
                         value: Some(vs),
@@ -1311,7 +1485,7 @@ impl<'i> Typer<'i> {
                         if !tracked.contains(name.as_str()) {
                             continue;
                         }
-                        sites.push(Site {
+                        sites.push(LoopCapSite {
                             target: name,
                             span: *span,
                             value: Some(vs),
@@ -1323,12 +1497,12 @@ impl<'i> Typer<'i> {
                         });
                     }
                 }
-                Node::UnmodeledWrite { span, names: writes, .. } => {
+                Node::UnmodeledWrite { span, names: writes, ivar_write, .. } => {
                     for name in writes {
                         if !tracked.contains(name.as_str()) {
                             continue;
                         }
-                        sites.push(Site {
+                        sites.push(LoopCapSite {
                             target: name.clone(),
                             span: *span,
                             value: None,
@@ -1339,11 +1513,63 @@ impl<'i> Typer<'i> {
                             op: false,
                         });
                     }
+                    // rigor-rs#639 — an ivar `x op= v` mirrors the local
+                    // op-write rule: an `Operator` write compounds
+                    // unconditionally (the implicit self-read lowers no
+                    // `VariableRead`), `||=`/`&&=` only when the value
+                    // re-reads the name. The RHS node is not linked, so the
+                    // write's own span stands in for `value`: every read
+                    // inside it came from the RHS (the LHS is not a read).
+                    if let Some(w) = ivar_write {
+                        if tracked.contains(w.name.as_str()) {
+                            let compound = matches!(w.op, OpWriteKind::Operator(_)) || w.rereads;
+                            sites.push(LoopCapSite {
+                                target: w.name.clone(),
+                                span: *span,
+                                value: Some(*span),
+                                value_node: None,
+                                compound,
+                                unmodeled: false,
+                                plain: false,
+                                op: true,
+                            });
+                        }
+                    }
+                }
+                Node::Call { receiver, method, args, args_plain_positional, span, .. } => {
+                    // rigor-rs#639 — `instance_variable_set(:@n, v)` on `self`
+                    // writes `@n` like a plain `@n = v`
+                    // (`ReflectiveIvarWrite.literal_name`); the value is the
+                    // second argument.
+                    if let Some(name) = Self::ivar_set_literal_name(
+                        ast,
+                        receiver,
+                        method,
+                        args,
+                        *args_plain_positional,
+                    ) {
+                        if tracked.contains(name) {
+                            let v = args[1];
+                            let vs = ast.get(v).span();
+                            let compound = marks.reads_within(vs).contains(&name)
+                                && !matches!(ast.get(v), Node::LocalVariableRead { name: n2, .. } | Node::VariableRead { name: n2, .. } if n2 == name);
+                            sites.push(LoopCapSite {
+                                target: name.to_string(),
+                                span: *span,
+                                value: Some(vs),
+                                value_node: Some(v),
+                                compound,
+                                unmodeled: false,
+                                plain: true,
+                                op: false,
+                            });
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-        let live: Vec<&Site> = sites.iter().filter(|s| !dead.covers(s.span)).collect();
+        let live: Vec<&LoopCapSite> = sites.iter().filter(|s| !dead.covers(s.span)).collect();
         // A name's first live write position in the body: a read of it left
         // of that position sees the pass-entry ASSUMPTION; a later read sees
         // the body's own binding.
@@ -1393,6 +1619,34 @@ impl<'i> Typer<'i> {
         // `0[0] -> 0` fold converges), and an unresolved `foo(x)`
         // declines to `Dynamic`, which joins the binding into a stable
         // `Dynamic`-union on the second pass.
+        // A write's new binding replaces the pass-entry binding only
+        // when the write always runs — a top-level body statement.
+        // `x = 0` dominates; `x = 0 if d`, `c2 && (x = 1)`, a
+        // `begin`/`rescue` or block write, and `x <op>=` (an implicit
+        // self-read) do not — the entry binding survives the untaken
+        // arm or joins the op's result.
+        let dominates = |s: &LoopCapSite| loop_write_dominates(ast, body, s);
+        // A read at `p` sees the pass-entry binding iff no earlier
+        // write of the name produced a DOMINATING `n`-free binding
+        // before it. A write that itself reads the name (`x = x`,
+        // `x = x || 0`, `x = [x]`) is assumption-derived and does not
+        // cut either.
+        let assumption_read = |n: &str, p: usize| {
+            live.iter()
+                .filter(|s| s.target == n && s.span.1 <= p)
+                .all(|s| {
+                    if !dominates(s) {
+                        return true;
+                    }
+                    match s.value {
+                        Some(sv) => marks.reads_within(sv).contains(&n),
+                        // An unmodeled write may or may not carry the
+                        // assumption — keep the read (compound is the
+                        // FP-safe side).
+                        None => true,
+                    }
+                })
+        };
         let mut self_compound: HashSet<usize> = HashSet::new();
         for site in &live {
             if !site.plain || !site.compound {
@@ -1403,46 +1657,6 @@ impl<'i> Typer<'i> {
             };
             let n = site.target.as_str();
             let entry = env.get(n).copied().unwrap_or(nil);
-            // A write's new binding replaces the pass-entry binding only
-            // when the write always runs — a top-level body statement.
-            // `x = 0` dominates; `x = 0 if d`, `c2 && (x = 1)`, a
-            // `begin`/`rescue` or block write, and `x <op>=` (an implicit
-            // self-read) do not — the entry binding survives the untaken
-            // arm or joins the op's result.
-            let dominates = |s: &Site| {
-                !s.op
-                    && body.iter().any(|b| {
-                        let bn = ast.get(*b);
-                        matches!(
-                            bn,
-                            Node::LocalVariableWrite { .. }
-                                | Node::InstanceVariableWrite { .. }
-                                | Node::MultiWrite { .. }
-                                | Node::UnmodeledWrite { .. }
-                        ) && bn.span() == s.span
-                    })
-            };
-            // A read at `p` sees the pass-entry binding iff no earlier
-            // write of the name produced a DOMINATING x-free binding
-            // before it. A write that itself reads the name (`x = x`,
-            // `x = x || 0`, `x = [x]`) is assumption-derived and does not
-            // cut either.
-            let assumption_read = |p: usize| {
-                live.iter()
-                    .filter(|s| s.target == n && s.span.1 <= p)
-                    .all(|s| {
-                        if !dominates(s) {
-                            return true;
-                        }
-                        match s.value {
-                            Some(sv) => marks.reads_within(sv).contains(&n),
-                            // An unmodeled write may or may not carry the
-                            // assumption — keep the read (compound is the
-                            // FP-safe side).
-                            None => true,
-                        }
-                    })
-            };
             // {FALSEY = 0b01, TRUTHY = 0b10}: the x-polarities under which
             // this leaf's read can evaluate unboundedly.
             let mut stack: Vec<(NodeId, u8)> = vec![(v, 0b11)];
@@ -1472,7 +1686,7 @@ impl<'i> Typer<'i> {
                         let has_assumption_read = marks
                             .read_positions_within(node.span())
                             .iter()
-                            .any(|(p, r)| *r == n && assumption_read(*p));
+                            .any(|(p, r)| *r == n && assumption_read(n, *p));
                         if !has_assumption_read {
                             continue;
                         }
@@ -1497,65 +1711,23 @@ impl<'i> Typer<'i> {
                         // converges; a defined `g(x)` or `Rational(x)`
                         // compounds). A decline the reference resolves
                         // (`[1,2].fetch(x)`) keeps moving — compound.
-                        let mut leaf_env = env.clone();
-                        let mut leaf_unprovable = false;
-                        for (pos, r) in marks.read_positions_within(node.span()) {
-                            if r == n {
-                                continue;
-                            }
-                            // A DOMINATING write replaces the entry
-                            // binding; anything else (`k = 0 if d`,
-                            // `c2 && (k = 0)`, a block or op write) joins
-                            // the entry binding back in — the conditional
-                            // arm still leaves `k` at its seed. A write
-                            // with no readable value (`for k in …`, a
+                        let Some(leaf_env) = self.loop_body_env_overlay(
+                            ast,
+                            &marks,
+                            env,
+                            body,
+                            &live,
+                            &for_writes,
+                            n,
+                            node.span(),
+                            interner,
+                        ) else {
+                            // An unprovable read binding (`for k in …`, a
                             // pattern bind) proves NOTHING — the leaf's
                             // value is untrusted, so the site compounds.
-                            let mut r_ty = None;
-                            let mut entry_survives = false;
-                            let mut unprovable = false;
-                            if for_writes.contains(r) {
-                                leaf_unprovable = true;
-                                continue;
-                            }
-                            for s in live
-                                .iter()
-                                .filter(|s| s.target == r && s.span.1 <= pos)
-                            {
-                                let dominant = s.plain && dominates(s);
-                                if !dominant {
-                                    entry_survives = true;
-                                }
-                                match s.value_node {
-                                    Some(sv) => {
-                                        let wv = self.type_of(ast, sv, env, interner);
-                                        r_ty = Some(match r_ty {
-                                            None => wv,
-                                            Some(prev) => {
-                                                rigor_types::Algebra::join(interner, prev, wv)
-                                            }
-                                        });
-                                    }
-                                    None => unprovable = true,
-                                }
-                            }
-                            if unprovable {
-                                leaf_unprovable = true;
-                                continue;
-                            }
-                            if entry_survives {
-                                let e = env.get(r).copied().unwrap_or(nil);
-                                r_ty = Some(match r_ty {
-                                    None => e,
-                                    Some(prev) => {
-                                        rigor_types::Algebra::join(interner, prev, e)
-                                    }
-                                });
-                            }
-                            if let Some(wv) = r_ty {
-                                leaf_env.insert(Rc::from(r), wv);
-                            }
-                        }
+                            self_compound.insert(site.span.0);
+                            break 'site;
+                        };
                         let vt = self.type_of(ast, id, &leaf_env, interner);
                         let vt_decline = Self::type_has_decline(interner, vt);
                         let unresolvable = matches!(node, Node::Call { receiver: None, method, .. } if {
@@ -1579,11 +1751,9 @@ impl<'i> Typer<'i> {
                                 );
                             !resolves
                         });
-                        let converged = !leaf_unprovable
-                            && (rigor_types::Algebra::join(interner, vt, entry)
-                                == entry
-                                || (vt_decline
-                                    && (!env.contains_key(n) || unresolvable)));
+                        let converged = rigor_types::Algebra::join(interner, vt, entry)
+                            == entry
+                            || (vt_decline && (!env.contains_key(n) || unresolvable));
                         if !converged {
                             self_compound.insert(site.span.0);
                             break 'site;
@@ -1594,10 +1764,46 @@ impl<'i> Typer<'i> {
         }
 
         // `moved`: a name whose binding can differ from its seed at ANY pass
-        // — a write whose value types differently than the entry binding,
-        // plus the propagated cases below. `suspect`: a name that can still
-        // move at pass >= 2 — the cap trigger.
+        // — a write whose value types differently than the seed binding,
+        // plus the propagated cases below. rigor-rs#639 — typed at the
+        // WRITE's body position, not the entry env: `k = y` reads the body's
+        // own `y`, so `y = [k]; k = y` marks `k` a pass-1 mover — the move
+        // the entry env cannot see. `suspect`: a name that can still move at
+        // pass >= 2 — the cap trigger.
         let mut moved: HashSet<String> = HashSet::new();
+        for site in &live {
+            let n = site.target.as_str();
+            // A pass-1 mover: the write's value at its body position is not
+            // the seed binding (`y = 2` for `y = nil` seeds it `nil | 2`).
+            let differs = match site.value_node {
+                Some(v) => {
+                    let vs = ast.get(v).span();
+                    match self.loop_body_env_overlay(
+                        ast,
+                        &marks,
+                        env,
+                        body,
+                        &live,
+                        &for_writes,
+                        n,
+                        vs,
+                        interner,
+                    ) {
+                        Some(site_env) => {
+                            self.type_of(ast, v, &site_env, interner)
+                                != env.get(n).copied().unwrap_or(nil)
+                        }
+                        // An unprovable read binding may differ — moved is
+                        // the FP-safe side.
+                        None => true,
+                    }
+                }
+                None => true,
+            };
+            if differs {
+                moved.insert(n.to_string());
+            }
+        }
         let mut suspect: HashSet<String> = HashSet::new();
         loop {
             let mut grew = false;
@@ -1615,22 +1821,6 @@ impl<'i> Typer<'i> {
                     site.compound
                 } {
                     grew |= suspect.insert(n.to_string());
-                }
-                if !moved.contains(n) {
-                    // A pass-1 mover: the write's value at the entry env is
-                    // not the seed binding (`y = 2` for `y = nil` seeds it
-                    // `nil | 2`).
-                    let differs = match site.value_node {
-                        Some(v) => {
-                            let vt = self.type_of(ast, v, env, interner);
-                            vt != env.get(n).copied().unwrap_or(nil)
-                        }
-                        None => true,
-                    };
-                    if differs {
-                        moved.insert(n.to_string());
-                        grew = true;
-                    }
                 }
                 // Assumption reads: a value read of a moved name that
                 // precedes the name's first body write sees the pass-entry
@@ -1693,6 +1883,76 @@ impl<'i> Typer<'i> {
             return None;
         }
         Some((names, suspect))
+    }
+
+    /// The env `vs`'s reads are typed under inside [`Self::loop_cap_widening`]:
+    /// `env` overlaid, per read position, with the join of that name's live
+    /// writes before it — a DOMINATING write's typed value replaces the
+    /// entry binding; anything else (`k = 0 if d`, `c2 && (k = 0)`, a block
+    /// or op write) joins the entry binding back in — the conditional arm
+    /// still leaves the name at its seed. `skip` (the site's own target)
+    /// keeps its entry binding. `None` when a read's binding is unprovable
+    /// — a `for` index write or a write with no readable value proves
+    /// NOTHING — the caller then treats the site as moved / compounding
+    /// (rigor-rs#683; shared by rigor-rs#639's write-position `moved` test).
+    #[allow(clippy::too_many_arguments)]
+    fn loop_body_env_overlay(
+        &self,
+        ast: &LoweredAst,
+        marks: &crate::def_local_marks::DefLocalMarks,
+        env: &TypeEnv,
+        body: &[NodeId],
+        live: &[&LoopCapSite],
+        for_writes: &std::collections::HashSet<String>,
+        skip: &str,
+        vs: rigor_parse::Span,
+        interner: &mut Interner,
+    ) -> Option<TypeEnv> {
+        let nil = interner.nil();
+        let mut out = env.clone();
+        for (pos, r) in marks.read_positions_within(vs) {
+            if r == skip {
+                continue;
+            }
+            if for_writes.contains(r) {
+                return None;
+            }
+            let mut r_ty = None;
+            let mut entry_survives = false;
+            for s in live
+                .iter()
+                .filter(|s| s.target == r && s.span.1 <= pos)
+            {
+                if !(s.plain && loop_write_dominates(ast, body, s)) {
+                    entry_survives = true;
+                }
+                match s.value_node {
+                    Some(sv) => {
+                        let wv = self.type_of(ast, sv, env, interner);
+                        r_ty = Some(match r_ty {
+                            None => wv,
+                            Some(prev) => {
+                                rigor_types::Algebra::join(interner, prev, wv)
+                            }
+                        });
+                    }
+                    // A write with no readable value (`for k in …`, a
+                    // pattern bind) proves NOTHING.
+                    None => return None,
+                }
+            }
+            if entry_survives {
+                let e = env.get(r).copied().unwrap_or(nil);
+                r_ty = Some(match r_ty {
+                    None => e,
+                    Some(prev) => rigor_types::Algebra::join(interner, prev, e),
+                });
+            }
+            if let Some(wv) = r_ty {
+                out.insert(Rc::from(r), wv);
+            }
+        }
+        Some(out)
     }
 
     /// The `x`-polarities under which a `&&`/`||` operand can evaluate
@@ -4066,6 +4326,12 @@ impl<'i> Typer<'i> {
                 let entry = env.clone();
                 let cont = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
                     self.loop_continuation(ast, &entry, predicate, &body, interner)
+                } else if !matches!(kind, rigor_parse::LoopKind::For) {
+                    // rigor-rs#639 — the join stays declined for a
+                    // jump/`begin…end while` body, but the structural cap
+                    // check still runs (a static scan needs no replay).
+                    self.loop_cap_widening(ast, &entry, &body, interner)
+                        .map(|(tracked, suspect)| LoopContinuation::Structural(tracked, suspect))
                 } else {
                     None
                 };
@@ -5044,6 +5310,12 @@ impl<'i> Typer<'i> {
                 // sibling pin (rigor-rs#638).
                 let cont = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
                     self.loop_continuation(ast, env, predicate, &body, interner)
+                } else if !matches!(kind, rigor_parse::LoopKind::For) {
+                    // rigor-rs#639 — the join stays declined for a
+                    // jump/`begin…end while` body, but the structural cap
+                    // check still runs (a static scan needs no replay).
+                    self.loop_cap_widening(ast, env, &body, interner)
+                        .map(|(tracked, suspect)| LoopContinuation::Structural(tracked, suspect))
                 } else {
                     None
                 };
@@ -5323,6 +5595,43 @@ fn drop_retry_edge_records(
             drop_indexed_narrowings(env, name);
         }
     }
+}
+
+/// A loop body's live write site, for [`Typer::loop_cap_widening`]. `value`
+/// is the RHS node — a `None` site is a write the port cannot read the value
+/// of (pattern binds, `for` indices), which can never prove convergence.
+struct LoopCapSite {
+    target: String,
+    span: rigor_parse::Span,
+    value: Option<rigor_parse::Span>,
+    value_node: Option<NodeId>,
+    compound: bool,
+    unmodeled: bool,
+    /// A `LocalVariableWrite` / `InstanceVariableWrite` — whose compound
+    /// verdict `self_compound` re-derives per operand (rigor-rs#683). Op-write
+    /// and masgn sites keep the scan's `compound`.
+    plain: bool,
+    /// A `LocalVariableOpWrite` — `x += v` / `x ||= v` / `x &&= v` — or an
+    /// ivar op/and/or write (rigor-rs#639). Its RHS is an IMPLICIT self-read,
+    /// so it can never cut a later read off the pass-entry binding.
+    op: bool,
+}
+
+/// Whether `s` is a top-level body write that always runs — the `dominates`
+/// predicate [`Typer::loop_cap_widening`]'s assumption-read and overlay
+/// walks share.
+fn loop_write_dominates(ast: &LoweredAst, body: &[NodeId], s: &LoopCapSite) -> bool {
+    !s.op
+        && body.iter().any(|b| {
+            let bn = ast.get(*b);
+            matches!(
+                bn,
+                Node::LocalVariableWrite { .. }
+                    | Node::InstanceVariableWrite { .. }
+                    | Node::MultiWrite { .. }
+                    | Node::UnmodeledWrite { .. }
+            ) && bn.span() == s.span
+        })
 }
 
 /// Half-open span containment.
