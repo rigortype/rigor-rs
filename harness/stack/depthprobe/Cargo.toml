@@ -1,0 +1,19 @@
+# #412 stack-measurement probe (harness/stack/). Standalone on purpose: its
+# own `[workspace]` keeps it out of the rigor-rs workspace, so it never builds
+# with the product and never picks up workspace deps. It depends on
+# rigor-parse by path (the real parser + lowering + depth walk), so a
+# toolchain or lowering change is re-measured, not stale.
+#
+#   cargo build --release      (builds rigor-parse + vendored ruby-prism too)
+#
+# Modes: see the module doc in src/main.rs.
+[package]
+name = "depthprobe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[dependencies]
+rigor-parse = { path = "../../../crates/rigor-parse" }

@@ -169,6 +169,10 @@ thread and for a worker, from 35 kinds:
 | `1 if a if a…`, `elsif` chains | ~1.43 KiB (`class_flow_if`) | 7 MiB | 28 MiB |
 | `rescue` clause lists | small | 1 MiB | – |
 
+The 5/19 MiB chain floors are the Oct #412 aarch64 numbers. Regenerating
+with `probe_min.py` on the current lowering (`--kib`) reads ~6 MiB / ~21 MiB
+(~10–20 % drift, same toolchain, more code in the frames).
+
 - Prism's destroy costs 48 B per call link and 144 B per `if`-modifier
   level: 46 MiB and 138 MiB at 1M links.
 - **Time binds before stack does.** `rigor check` is quadratic on chains: a
@@ -260,8 +264,30 @@ memory. Medians over interleaved runs; every variant produced identical output:
   Prism's cap. That is out of scope. The regression test
   (`rigor-cli/tests/deep_nesting.rs`) uses depths that a debug binary
   carries.
-- **x86_64 Linux and Windows** were not measured locally; the margins above
-  are aarch64 numbers. CI's x86_64 Linux job runs the regression test, in
-  debug, on every push. Windows is unmeasured.
+- **x86_64 Linux** is measured by the committed tools
+  (`harness/stack/`, workflow `stack-measure`, rigor-rs#428; numbers below
+  from run 44666957483 on head `e6bc4f11`, sound subset
+  `RIGOR_NO_RUBY=1` on the forced columns — under a rung-forcing budget
+  the sidecar's spawn is the binding failure, not the stacks). The
+  per-pass minima track aarch64 (`lower defined` 13 MiB, `parse array`
+  8 MiB / 7,506 KiB, the C-walk 1,178 KiB); every capped and refusal
+  cap is identical to aarch64.
+  - **64 MiB workers carry every screened kind** except `elsif`/`when`
+    chains at the bound and `class`/`module`/`blockparam`, which die on
+    `alloc` — a heap failure under the same `RLIMIT_AS` that squeezed
+    the stacks, not an observed stack overflow.
+  - **2 MiB workers carry the capped kinds at their Prism caps and the
+    5k chains**; they die the same `alloc` death on 20k+ chains and
+    `class`/`module`. A 2 MiB-stack overflow was never observed: the
+    heap hits the wall first.
+  - **The inline floor** (`ulimit -s` on the process main thread):
+    `defined:9998` measures 16 MiB (`rung=main+2`). Bound-depth chains
+    could not be forced onto `main` — once the scaled budget admits a
+    64 MiB spawn the command thread takes it — so those rows report
+    `missed`. The aarch64 35 MiB bound figure stays the #412 pipeline
+    floor, not regenerated on x86_64.
+- **Windows** is unmeasured: the port does not yet compile on
+  `windows-latest` (rigor-rs#707); `stack-measure` runs the
+  `deep_nesting` tests there once it does.
 - **Below the bound nothing changes.** A file past it reports
   `internal-error`, where the reference aborts the whole run.
