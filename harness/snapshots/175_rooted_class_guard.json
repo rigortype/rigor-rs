@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/175_rooted_class_guard.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r4' for File::Stat"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r5' for String"
+    }
+  ]
+}

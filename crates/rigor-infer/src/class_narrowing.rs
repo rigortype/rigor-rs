@@ -2207,7 +2207,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         use_span: rigor_parse::Span,
     ) -> Option<String> {
-        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(id) else {
+        let Node::ConstantRead { name, dynamic_base, rooted, .. } = ast.get(id) else {
             return None;
         };
         // A dynamic base (`k::String`, `self::String`, `self.class::String`)
@@ -2216,11 +2216,23 @@ impl<'i> Typer<'i> {
         if name.is_empty() || *dynamic_base {
             return None;
         }
+        if *rooted || name.starts_with("::") {
+            // `lexical_class_name`'s rooted arm keeps the de-rooted spelling
+            // UN-WALKED — `when ::Stat` inside `class File` names top-level
+            // `Stat`, never `File::Stat` (rigor-rs#672). The shadow check
+            // reads the top level only: a `File::Stat` declaration does not
+            // shadow a rooted `::Stat`.
+            let bare = name.trim_start_matches(':');
+            if self.source.constant_shadowed(bare, &[]) {
+                return None;
+            }
+            return Some(bare.to_string());
+        }
         let prefix = self.enclosing_prefix(use_span);
         if self.source.constant_shadowed(name, prefix) {
             return None;
         }
-        Some(self.resolve_constant_as_written(name, prefix))
+        Some(self.resolve_constant_as_written(name, prefix, false))
     }
 
     /// [`Typer::resolved_static_constant`] for the `is_a?`/`instance_of?` arm,
@@ -2235,15 +2247,30 @@ impl<'i> Typer<'i> {
         id: NodeId,
         use_span: rigor_parse::Span,
     ) -> Option<(String, bool)> {
-        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(id) else {
+        let Node::ConstantRead { name, dynamic_base, rooted, .. } = ast.get(id) else {
             return None;
         };
         if name.is_empty() || *dynamic_base {
             return None;
         }
+        if *rooted || name.starts_with("::") {
+            // `rooted_class_predicate_name` (upstream #614, rigor-rs#672): a
+            // `::C` operand names the TOP level only — `is_a?(::Stat)` inside
+            // `class File` never narrows to `File::Stat`. It answers `C` when
+            // an authoritative surface knows the top-level class and DECLINES
+            // outright (nil → no fact) when nothing does; a top-level project
+            // declaration takes the same assert-only `mintable: false` the
+            // unrooted arm gives lexically visible shadows.
+            let bare = name.trim_start_matches(':');
+            let shadowed = self.source.constant_shadowed(bare, &[]);
+            if shadowed || self.constant_names_a_known_class(bare) {
+                return Some((bare.to_string(), !shadowed));
+            }
+            return None;
+        }
         let prefix = self.enclosing_prefix(use_span);
         let shadowed = self.source.constant_shadowed(name, prefix);
-        Some((self.resolve_constant_as_written(name, prefix), !shadowed))
+        Some((self.resolve_constant_as_written(name, prefix, false), !shadowed))
     }
 
     /// Resolve a guard constant's SOURCE SPELLING to the qualified key it names,
@@ -2258,10 +2285,18 @@ impl<'i> Typer<'i> {
     /// witness gate declines it anyway (probes p2/p2b are reference-silent), and
     /// leaving it verbatim keeps `guard_meet_precise` seeing exactly what it saw
     /// before this slice.
-    pub(crate) fn resolve_constant_as_written(&self, name: &str, prefix: &[String]) -> String {
+    pub(crate) fn resolve_constant_as_written(
+        &self,
+        name: &str,
+        prefix: &[String],
+        rooted: bool,
+    ) -> String {
+        // `rooted` is `Node::ConstantRead`'s flag — the lowering renders `::C`
+        // UNROOTED, so the `starts_with` sniff the old code relied on was dead
+        // and a rooted operand walked the lexical ladder (rigor-rs#672).
         let (bare, absolute) = match name.strip_prefix("::") {
             Some(rest) => (rest, true),
-            None => (name, false),
+            None => (name, rooted),
         };
         if !absolute {
             for depth in (1..=prefix.len()).rev() {

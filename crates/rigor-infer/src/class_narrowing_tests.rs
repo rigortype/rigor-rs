@@ -1883,3 +1883,52 @@ fn class_narrowing_stage3a3_chain_fact_survives_its_own_reread() {
         assert_eq!(snaps.get(&id).map(String::as_str), Some("String"), "f11: both uses record");
     }
 }
+
+/// rigor-rs#672 — a `::`-rooted `is_a?` operand names the TOP level only:
+/// `::Stat` inside `class File` never resolves to `File::Stat`, and since
+/// nothing owns top-level `Stat` the guard declines outright — no fact, no
+/// narrowing (the reference's `rooted_class_predicate_name` answers nil).
+#[test]
+fn rooted_guard_operand_declines_when_toplevel_unknown() {
+    let (ast, snaps) = class_snaps(
+        b"class File\n  def m(x)\n    if x.is_a?(::Stat)\n      x.frobnicate_zzz\n    end\n  end\nend\n",
+    );
+    assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+}
+
+/// #672 controls — the UNROOTED spelling still walks the lexical ladder to
+/// `File::Stat`, and a rooted operand the top level knows narrows as before.
+#[test]
+fn rooted_guard_operand_keeps_toplevel_name() {
+    let (ast, snaps) = class_snaps(
+        b"class File\n  def m(x)\n    if x.is_a?(Stat)\n      x.frobnicate_zzz\n    end\n  end\nend\n",
+    );
+    assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("File::Stat"));
+
+    let (ast, snaps) = class_snaps(
+        b"class File\n  def m(x)\n    if x.is_a?(::String)\n      x.frobnicate_zzz\n    end\n  end\nend\n",
+    );
+    assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("String"));
+
+    let (ast, snaps) = class_snaps(
+        b"class File\n  def m(x)\n    if x.is_a?(::File::Stat)\n      x.frobnicate_zzz\n    end\n  end\nend\n",
+    );
+    assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("File::Stat"));
+}
+
+/// #672 — the `case`/`when` half (`lexical_class_name`'s rooted arm): the
+/// de-rooted spelling is kept UN-WALKED, so `when ::Stat` inside `class
+/// File` records `Stat` — an unknown nominal the witness gate declines —
+/// never `File::Stat`.
+#[test]
+fn rooted_when_operand_keeps_dewalked_spelling() {
+    let (ast, snaps) = class_snaps(
+        b"class File\n  def m(x)\n    case x\n    when ::Stat\n      x.frobnicate_zzz\n    end\n  end\nend\n",
+    );
+    assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("Stat"));
+
+    let (ast, snaps) = class_snaps(
+        b"class File\n  def m(x)\n    case x\n    when Stat\n      x.frobnicate_zzz\n    end\n  end\nend\n",
+    );
+    assert_eq!(snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str), Some("File::Stat"));
+}
