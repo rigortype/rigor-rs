@@ -52,6 +52,25 @@ pub const STRING_MUTATORS: &[&str] = &[
     "bitwise_xor!",
 ];
 
+/// Upstream's `StringMutation::EMPTY_PRESERVING` (`string_mutation.rb`): the
+/// [`STRING_MUTATORS`] that CANNOT leave a non-empty receiver empty, and so
+/// keep a `non-empty-string` refinement — the appenders (`<<`, `concat`,
+/// `insert`, `prepend`, `append_as_bytes`) and the rewrites that keep at
+/// least one character (`setbyte`, `force_encoding`, the case mappings,
+/// `reverse!`, `succ!` / `next!`, `squeeze!`, `unicode_normalize!`, and the
+/// bit operations, which keep every byte). A whitelist: a mutator missing
+/// here retracts the witness. The reference additionally keeps the witness
+/// for `tr!` / `tr_s!` whose replacement argument is provably non-empty
+/// (`TRANSLATORS`); the port's widening does not thread call-argument types,
+/// so a `tr!` on `non-empty-string` widens unconditionally — strictly less
+/// precise, never a wrong pin (rigor-rs#696).
+pub const STRING_MUTATOR_EMPTY_PRESERVING: &[&str] = &[
+    "<<", "concat", "insert", "prepend", "append_as_bytes", "setbyte", "force_encoding",
+    "upcase!", "downcase!", "capitalize!", "swapcase!", "reverse!", "succ!", "next!",
+    "squeeze!", "unicode_normalize!", "bit_set", "bit_clear", "bit_flip", "bitwise_not!",
+    "bitwise_and!", "bitwise_or!", "bitwise_xor!",
+];
+
 /// Upstream's `MutationWidening::SHAPE_MUTATORS` (`mutation_widening.rb:110`):
 /// `ARRAY_MUTATORS | HASH_MUTATORS | HashLookupMutation::MUTATORS |
 /// StringMutation::MUTATORS` — "could an in-place call on this name change its

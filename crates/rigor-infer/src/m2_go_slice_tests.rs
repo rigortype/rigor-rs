@@ -101,11 +101,12 @@ fn constant_receiver_declines_under_a_multi_value_argument() {
     assert_eq!(ty_of_last_recv_call(b"\"abc\"[1]\n"), "Constant[\"b\"]");
     // And the Kernel folds keep their answers on the same `1 | 2` local —
     // the reference joins their overloads to the conversion class
-    // (`Float(v)` -> `Float`, so `.to_s` -> `String`); the `multi` flag is
-    // only for a `Constant` receiver's member-wise fold.
+    // (`Float(v)` -> `Float`, so `.to_s` -> the `float_to_s_projection`
+    // floor `non-empty-string`, rigor-rs#696); the `multi` flag is only for
+    // a `Constant` receiver's member-wise fold.
     assert_eq!(
         ty_of_last_recv_call(b"def g(c)\n  v = 1\n  v = 2 if c\n  Float(v).to_s\nend\n"),
-        "Class<0>"
+        "Class<0> - Constant[\"\"]"
     );
 }
 

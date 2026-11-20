@@ -4153,6 +4153,43 @@ impl<'i> Typer<'i> {
             Type::Constant(Scalar::Str(_)) if STRING_MUTATORS.contains(&method) => {
                 mint("String", interner)
             }
+            // `StringMutation.widen_refined` (string_mutation.rb): a
+            // predicate refinement over String (`decimal-int-string`,
+            // `lowercase-string`) under a String mutator → its `String`
+            // base. ANY in-place mutation can falsify the predicate
+            // (`s.clear` leaves a `decimal-int-string` empty, `s << "A"` a
+            // `lowercase-string` mixed-case), so none keeps it — the base
+            // nominal answers directly.
+            Type::Refined { base, .. } if STRING_MUTATORS.contains(&method) => {
+                match interner.get(*base) {
+                    Type::Nominal { class, .. }
+                        if self.index.class_name_for_id(*class) == Some("String") =>
+                    {
+                        Some(*base)
+                    }
+                    _ => None,
+                }
+            }
+            // `RefinementMutation.widen` → `string_base`
+            // (refinement_mutation.rb / string_mutation.rb): a
+            // `non-empty-string` keeps its witness under the
+            // EMPTY_PRESERVING mutators (returns `None` — the binding
+            // stands); every other String mutator can leave the buffer
+            // empty, so it widens to the `String` base.
+            Type::Difference { base, removed } if STRING_MUTATORS.contains(&method) => {
+                let non_empty_string = matches!(interner.get(*base),
+                    Type::Nominal { class, .. }
+                        if self.index.class_name_for_id(*class) == Some("String"))
+                    && matches!(interner.get(*removed),
+                        Type::Constant(Scalar::Str(s)) if s.is_empty());
+                if non_empty_string
+                    && !crate::flow_writes::STRING_MUTATOR_EMPTY_PRESERVING.contains(&method)
+                {
+                    Some(*base)
+                } else {
+                    None
+                }
+            }
             Type::Union(members) => {
                 let members = members.clone();
                 let mut out = Vec::with_capacity(members.len());

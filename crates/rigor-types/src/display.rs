@@ -10,7 +10,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::algebra::is_bool_pair;
 use crate::interner::Interner;
-use crate::ty::{ClassId, Scalar, ShapeKey, ShapeMember, Type, TypeId};
+use crate::ty::{ClassId, RefinementId, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 /// The user-facing type display — a faithful port of the reference's
 /// `Type#describe(:short)` (`lib/rigor/type/*.rb`).
@@ -93,7 +93,10 @@ fn named_node<'m>(
 
         Type::Union(members) => named_union(i, members, at),
 
-        Type::Difference { base, removed } => format!("{} - {}", at(*base), at(*removed)),
+        Type::Difference { base, removed } => {
+            difference_canonical_name(i, *base, *removed, resolve, at)
+                .unwrap_or_else(|| format!("{} - {}", at(*base), at(*removed)))
+        }
         Type::Intersection(members) => members
             .iter()
             .map(|&m| at(m))
@@ -104,7 +107,18 @@ fn named_node<'m>(
         // Refinement / App / DataInstance carry names/tables the reference
         // resolves through machinery rigor-rs has not ported; render the closest
         // faithful approximation rather than leaking an internal id.
-        Type::Refined { base, .. } => at(*base).to_string(),
+        Type::Refined { base, refinement } => {
+            // `Refined#describe`: a registered `(base, predicate)` pair prints
+            // its canonical kebab name (`decimal-int-string`); an unregistered
+            // pair erases to the base rather than guessing a `base & pred?`
+            // spelling the port never mints.
+            match i.get(*base) {
+                Type::Nominal { class, .. } => resolve(*class)
+                    .and_then(|n| RefinementId::canonical_name(&n, *refinement))
+                    .map_or_else(|| at(*base).to_string(), str::to_string),
+                _ => at(*base).to_string(),
+            }
+        }
         Type::App { .. } => "App".to_string(),
         Type::DataInstance { class, members } => {
             let inner: Vec<String> = members
@@ -780,6 +794,45 @@ fn named_integer_range(min: Option<i64>, max: Option<i64>) -> String {
             let hi = hi.map_or_else(|| "max".to_string(), |v| v.to_string());
             format!("int<{lo}, {hi}>")
         }
+    }
+}
+
+/// The `Difference#canonical_name` shorthand (`type/difference.rb`): when
+/// `removed` is the *empty witness* of `base` (`Constant[""]` for String,
+/// `Constant[0]` for Integer, `Tuple[]` for Array, `HashShape{}` for Hash),
+/// the carrier prints its imported-built-in kebab name — `non-empty-string`,
+/// `non-zero-int`, `non-empty-array[T]`, `non-empty-hash[K, V]` — with the
+/// parameterised bases keeping their type-args in the canonical form.
+/// Anything else is `None` so the caller renders `base - removed`.
+fn difference_canonical_name<'m>(
+    i: &Interner,
+    base: TypeId,
+    removed: TypeId,
+    resolve: &dyn Fn(ClassId) -> Option<String>,
+    at: &'m dyn Fn(TypeId) -> &'m str,
+) -> Option<String> {
+    let Type::Nominal { class, args } = i.get(base) else {
+        return None;
+    };
+    let name = resolve(*class)?;
+    match name.as_str() {
+        "String" => matches!(i.get(removed), Type::Constant(Scalar::Str(s)) if s.is_empty())
+            .then(|| "non-empty-string".to_string()),
+        "Integer" => matches!(i.get(removed), Type::Constant(Scalar::Int(0)))
+            .then(|| "non-zero-int".to_string()),
+        "Array" => matches!(i.get(removed), Type::Tuple(elems) if elems.is_empty()).then(|| {
+            match args.first() {
+                Some(&elem) => format!("non-empty-array[{}]", at(elem)),
+                None => "non-empty-array".to_string(),
+            }
+        }),
+        "Hash" => matches!(i.get(removed), Type::HashShape(ms) if ms.is_empty()).then(|| {
+            match (args.first(), args.get(1)) {
+                (Some(&k), Some(&v)) => format!("non-empty-hash[{}, {}]", at(k), at(v)),
+                _ => "non-empty-hash".to_string(),
+            }
+        }),
+        _ => None,
     }
 }
 
