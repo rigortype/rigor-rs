@@ -2260,19 +2260,28 @@ impl<'i> Typer<'i> {
             // `::C` operand names the TOP level only — `is_a?(::Stat)` inside
             // `class File` never narrows to `File::Stat`. It answers `C` when
             // `class_known_to_scope?` holds — the RBS registry / project
-            // `sig/` (`constant_names_a_known_class`) or an in-source
-            // top-level class (`knows_class`, the `discovered_classes`
-            // analogue) — and DECLINES outright (nil → no fact) when nothing
-            // owns it. A project class takes the same assert-only
-            // `mintable: false` the unrooted arm gives lexical shadows.
-            // `class_known_to_scope?`: RBS / project `sig/` OR an in-source
-            // class — `class`/`module` (`knows_class`) or a meta-new write
-            // (`Foo = Struct.new`, the rest of `discovered_classes`).
-            if self.source.knows_discovered_class(name) {
-                return Some((name.to_string(), false));
-            }
+            // `sig/` (`constant_names_a_known_class`) OR an in-source class
+            // (`knows_discovered_class`, the `discovered_classes` analogue:
+            // `class`/`module` and meta-new writes like `Foo = Struct.new`)
+            // — and DECLINES outright (nil → no fact) when neither surface
+            // owns the name.
+            //
+            // The bundled answer wins the ORDER (rigor-rs#714):
+            // `class_known_to_scope?` is an OR, so an in-source declaration
+            // cannot veto a name the RBS also declares — dependabot's
+            // `module Bundler; class Source; class Git` monkey patch must not
+            // demote `instance_of?(::Bundler::Source::Git)` to assert-only,
+            // or the then-arm loses every row the reference's narrowing
+            // fires. The assert-only demotion stays for names ONLY the
+            // project declares (the unrooted arm's lexical-shadow
+            // `mintable: false`), and `knows_class`'s leaf key stays out of
+            // both arms (`class A; class M` never shadows `::M`,
+            // rigor-rs#672 round 6).
             if self.constant_names_a_known_class(name) {
                 return Some((name.to_string(), true));
+            }
+            if self.source.knows_discovered_class(name) {
+                return Some((name.to_string(), false));
             }
             return None;
         }

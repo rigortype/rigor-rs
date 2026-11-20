@@ -126,6 +126,27 @@
       "column": 10,
       "severity": "error",
       "message": "undefined method `frobnicate_r34' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 254,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r35' for URI::HTTP"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 258,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `revision' for URI::HTTP"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 262,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r37' for File::Stat"
     }
   ]
 }

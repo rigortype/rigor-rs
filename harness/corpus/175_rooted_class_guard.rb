@@ -236,3 +236,28 @@ def rooted_when_eval_decl
   else x.frobnicate_r34
   end
 end
+
+# rigor-rs#714 — a rooted operand whose FULL PATH the bundled RBS declares
+# narrows even when the project ALSO declares it in-source: the reference's
+# `class_known_to_scope?` is an OR (`environment.class_known?` ||
+# `discovered_classes.key?`), so an in-source reopening — dependabot's
+# `module Bundler; class Source; class Git` monkey patch, or `module URI;
+# class HTTP` here — cannot veto the bundled answer or demote the guard to
+# assert-only. `r37` is the must-still-fire control: a qualified rooted
+# operand the RBS knows and the project does NOT declare narrows as before.
+module URI
+  class HTTP
+  end
+end
+
+def rooted_isa_rbs_and_declared(x)
+  x.frobnicate_r35 if x.is_a?(::URI::HTTP)
+end
+
+def rooted_instanceof_rbs_and_declared(d)
+  d.source.revision if d.source.instance_of?(::URI::HTTP)
+end
+
+def rooted_isa_rbs_qualified(x)
+  x.frobnicate_r37 if x.is_a?(::File::Stat)
+end
