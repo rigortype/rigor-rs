@@ -1243,6 +1243,10 @@ impl<'i> Typer<'i> {
             /// (rigor-rs#683). Op-write and masgn sites keep the scan's
             /// `compound`.
             plain: bool,
+            /// A `LocalVariableOpWrite` — `x += v` / `x ||= v` / `x &&= v`.
+            /// Its RHS is an IMPLICIT self-read, so it can never cut a
+            /// later read off the pass-entry binding.
+            op: bool,
         }
         let mut sites: Vec<Site> = Vec::new();
         for (_, n) in ast.iter() {
@@ -1272,6 +1276,7 @@ impl<'i> Typer<'i> {
                         compound,
                         unmodeled: false,
                         plain: true,
+                        op: false,
                     });
                 }
                 Node::LocalVariableOpWrite { name, value, op, span, .. } => {
@@ -1294,6 +1299,7 @@ impl<'i> Typer<'i> {
                         compound,
                         unmodeled: false,
                         plain: false,
+                        op: true,
                     });
                 }
                 Node::MultiWrite { targets, value, span, .. } => {
@@ -1313,6 +1319,7 @@ impl<'i> Typer<'i> {
                             compound: false,
                             unmodeled: false,
                             plain: false,
+                            op: false,
                         });
                     }
                 }
@@ -1329,6 +1336,7 @@ impl<'i> Typer<'i> {
                             compound: false,
                             unmodeled: true,
                             plain: false,
+                            op: false,
                         });
                     }
                 }
@@ -1375,21 +1383,41 @@ impl<'i> Typer<'i> {
             };
             let n = site.target.as_str();
             let entry = env.get(n).copied().unwrap_or(nil);
-            let widened = self.widen_value_pinned(entry, interner);
-            // A read at `p` sees the pass-entry binding iff no earlier live
-            // write of the name produced an x-free binding before it: a
-            // write that itself reads the name (`x = x`, `x = x || 0`,
-            // `x = [x]`) yields an assumption-DERIVED binding and does not
-            // cut; `x = 1` / `x = f()` does.
+            // A read at `p` sees the pass-entry binding iff no earlier
+            // write of the name produced a DOMINATING x-free binding before
+            // it. Dominating = the write is itself a body statement
+            // (`x = 0` cuts; `x = 0 if d` does not — the assumption
+            // survives the untaken arm). A write that itself reads the
+            // name (`x = x`, `x = x || 0`, `x += v`) yields an
+            // assumption-DERIVED binding and does not cut either; an
+            // op-write's self-read is implicit and never cuts.
             let assumption_read = |p: usize| {
                 live.iter()
                     .filter(|s| s.target == n && s.span.1 <= p)
-                    .all(|s| match s.value {
-                        Some(sv) => marks.reads_within(sv).contains(&n),
-                        // An unmodeled write may or may not carry the
-                        // assumption — keep the read (compound is the
-                        // FP-safe side).
-                        None => true,
+                    .all(|s| {
+                        if s.op {
+                            return true;
+                        }
+                        let dominates = body.iter().any(|b| {
+                            let bn = ast.get(*b);
+                            matches!(
+                                bn,
+                                Node::LocalVariableWrite { .. }
+                                    | Node::InstanceVariableWrite { .. }
+                                    | Node::MultiWrite { .. }
+                                    | Node::UnmodeledWrite { .. }
+                            ) && bn.span() == s.span
+                        });
+                        if !dominates {
+                            return true;
+                        }
+                        match s.value {
+                            Some(sv) => marks.reads_within(sv).contains(&n),
+                            // An unmodeled write may or may not carry the
+                            // assumption — keep the read (compound is the
+                            // FP-safe side).
+                            None => true,
+                        }
                     })
             };
             // {FALSEY = 0b01, TRUTHY = 0b10}: the x-polarities under which
@@ -1427,28 +1455,38 @@ impl<'i> Typer<'i> {
                         }
                         // The operand's type proves the write converged:
                         // `x + 0` folds back to the entry binding (`vt ⊆
-                        // entry`); `x[0]`'s `Integer` codomain stays inside
-                        // the entry's widened envelope (`vt ⊆ widen(entry)`,
-                        // non-Constant so `x - 5`'s `0` cannot sneak in);
-                        // and a `Dynamic` operand joins the binding into a
-                        // stable union on the next pass — but only when the
-                        // decline is one the reference must share: a
-                        // receiverless call has no method to resolve
-                        // anywhere (`foo(x)`), and an unbound name's seed
-                        // is nil either way (`[1,2][x]` on a body-first
-                        // `x`). A decline the reference resolves
-                        // (`[1,2].fetch(x)`) keeps moving — compound.
+                        // entry`; a nominal codomain like `x[0]`'s
+                        // `Integer` is NOT enough — `x.bit_length` types
+                        // `Integer` too and keeps moving inside it), and a
+                        // `Dynamic` operand joins the binding into a
+                        // stable union on the next pass — but only for a
+                        // decline the reference must share: the name is
+                        // unbound at entry (a body-first `x`'s nil seed
+                        // declines identically), or the leaf is a
+                        // receiverless call no toplevel `def` or
+                        // Object/Kernel surface resolves (`foo(x)` — a
+                        // `def g` or Kernel method caps instead).
+                        // A decline the reference resolves
+                        // (`[1,2].fetch(x)`, a defined `g(x)`) keeps
+                        // moving — compound.
                         let vt = self.type_of(ast, id, env, interner);
-                        let vt_const = matches!(interner.get(vt), Type::Constant(_));
                         let vt_decline = Self::type_has_decline(interner, vt);
+                        let unresolvable = matches!(node, Node::Call { receiver: None, method, .. } if {
+                            let resolves = self
+                                .source
+                                .is_toplevel_def(self.file_key, method)
+                                || self.index.class_has_method("Object", method)
+                                || self.source.project_declares_method(
+                                    self.file_key,
+                                    "Object",
+                                    method,
+                                );
+                            !resolves
+                        });
                         let converged = rigor_types::Algebra::join(interner, vt, entry)
                             == entry
-                            || (!vt_const
-                                && rigor_types::Algebra::join(interner, vt, widened)
-                                    == widened)
                             || (vt_decline
-                                && (!env.contains_key(n)
-                                    || matches!(node, Node::Call { receiver: None, .. })));
+                                && (!env.contains_key(n) || unresolvable));
                         if !converged {
                             self_compound.insert(site.span.0);
                             break 'site;

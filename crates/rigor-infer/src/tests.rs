@@ -2658,6 +2658,15 @@ fn loop_cap_compounds_logical_operand_self_reads() {
         // `||`'s right operand evaluates only while `x` is falsey —
         // bounded, converges.
         (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = x || [1, 2][x]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+        // A nominal codomain is not convergence: `x.bit_length` types
+        // `Integer` but the reference folds a fresh constant per pass.
+        (b"def f(c)\n  t = 1; x = 8\n  while c\n    if false; t = nil; end\n    x = x.bit_length\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // A CONDITIONAL write does not cut the assumption: `x = 0 if d`
+        // leaves `x`'s pass-entry binding live for `[x]`'s read.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    x = 0 if d\n    if false; t = nil; end\n    x = [x]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // An unresolvable receiverless call declines to a stable
+        // `Dynamic` union — converged, `t` keeps its pin.
+        (b"def f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = foo(x)\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
     ] {
         let ast = lower_src(src);
         let index = CoreIndex::new();
@@ -2678,6 +2687,27 @@ fn loop_cap_compounds_logical_operand_self_reads() {
             String::from_utf8_lossy(src)
         );
     }
+
+    // A receiverless call a toplevel `def` RESOLVES is not a shared
+    // decline — `g` compounds the way the reference resolves it to.
+    let src = b"def g(v) = [v]\ndef f(c)\n  t = 1; x = 0\n  while c\n    if false; t = nil; end\n    x = g(x)\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let source = crate::source_index::SourceIndex::build(&ast, &index);
+    let typer = Typer::with_source(&index, &source);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    let ty = snaps.get(&last_if).copied().expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "a defined g(x) must compound, got {:?}",
+        i.get(ty)
+    );
 }
 
 /// A capped loop's widen lands on the POST-JOIN env, not the entry env:
