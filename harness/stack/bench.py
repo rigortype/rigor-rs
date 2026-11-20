@@ -69,17 +69,20 @@ for rep in range(a.reps):
             cmd = [rigor, "check", "--format", "json"] + files
             env = dict(env, LC_ALL="C", LANG="C")
             env.setdefault("MALLOC_ARENA_MAX", "2")
-            stderr = subprocess.DEVNULL
+            errf = tempfile.TemporaryFile(dir=d)
             if ulimit_v:
                 # bash, not /bin/sh: dash's ulimit has no working -v on Ubuntu.
+                # stderr goes to a file, not a PIPE: reading stdout first can
+                # deadlock if the fallback warnings fill stderr's buffer.
                 cmd = ["/bin/bash", "-c",
                        'ulimit -v %d && exec "$@"' % (ulimit_v * 1024), "sh"] + cmd
-                stderr = subprocess.PIPE
             p = subprocess.Popen(cmd, cwd=d, env=env,
-                                 stdout=subprocess.PIPE, stderr=stderr)
+                                 stdout=subprocess.PIPE, stderr=errf)
             out = p.stdout.read()
-            err = p.stderr.read() if ulimit_v else b""
             _, status, ru = os.wait4(p.pid, 0)
+            errf.seek(0)
+            err = errf.read()
+            errf.close()
             dt = time.time() - t
             rc = os.WEXITSTATUS(status) if os.WIFEXITED(status) else -1
             if ulimit_v and (rc in (126, 127) or not out

@@ -154,7 +154,7 @@ def trial(kind, n, two, v_mib=None, s_mib=None, no_ruby=False):
         survived = (r["analysed"] and not r["crashed"] and r["rc"] in (0, 1)
                     and r["rung"] not in ("dead", "noforce"))
         if r["crashed"]:
-            det = "CRASH rc=%d %s" % (r["rc"], r["cause"])
+            det = "CRASH rc=%d %s rung=%s" % (r["rc"], r["cause"], r["rungs"])
         elif not survived:
             det = "dead rc=%d rung=%s" % (r["rc"], r["rungs"])
         else:
@@ -269,7 +269,10 @@ for spec in a.kinds:
             if v is None:
                 row.append(key + "=n/a")
             else:
-                surv, det, rg = trial(kind, n, True, v_mib=v)
+                # no_ruby like inline/minm: under a rung-forcing budget the
+                # sidecar spawn (exit 69) is the binding failure, not the
+                # worker stacks this column measures.
+                surv, det, rg = trial(kind, n, True, v_mib=v, no_ruby=True)
                 row.append(key + "=" + fmt_forced(surv, det, rg, want))
     if "inline" in only:
         v = budget_for("inline")
