@@ -778,19 +778,22 @@ fn file_call_methods(
             Some(o) => o,
             None => &cx.lexical,
         };
+        let position_key: Option<String> = if position_owner.is_empty()
+            || (position_owner.len() == 1 && position_owner[0] == ANONYMOUS_META_OWNER)
+        {
+            None
+        } else {
+            Some(position_owner.join("::"))
+        };
         let owner_key: Option<String> = match receiver {
             Some(r) => match ast.get(r) {
                 Node::ConstantRead { name, dynamic_base: false, .. } if !name.is_empty() => {
                     Some(name.strip_prefix("::").unwrap_or(name).to_string())
                 }
-                Node::SelfExpr { .. } => (!position_owner.is_empty()).then(|| position_owner.join("::")),
+                Node::SelfExpr { .. } => position_key.clone(),
                 _ => None,
             },
-            None => {
-                (!position_owner.is_empty()
-                    && !(position_owner.len() == 1 && position_owner[0] == ANONYMOUS_META_OWNER))
-                .then(|| position_owner.join("::"))
-            }
+            None => position_key,
         };
         if let Some(key) = owner_key {
             if let Some(nm) = args.first().and_then(|a| literal_method_name(ast, *a)) {
