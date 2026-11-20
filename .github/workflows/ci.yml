@@ -108,6 +108,15 @@ jobs:
       - name: Snapshot parity gate
         run: ruby harness/run_snapshot.rb
 
+      # rigor-rs#439: the reach-memo audit is the only gate for the memo's
+      # `seen`-membership and re-entry rules — output diffs cannot see them.
+      # Cost measured on the debug build: ~2s over the 90s base run (the
+      # per-fixture process spawn dominates), so it runs on all fixtures.
+      - name: Reach memo audit
+        env:
+          RIGOR_REACH_MEMO_AUDIT: "1"
+        run: ruby harness/run_snapshot.rb
+
   # The committed snapshots must still be what the live reference says, at the
   # pinned submodule. Together with `parity` this is `harness/run.rb`, split so
   # neither half needs the other's toolchain: this job runs the reference only
