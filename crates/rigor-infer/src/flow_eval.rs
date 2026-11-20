@@ -1453,7 +1453,12 @@ impl<'i> Typer<'i> {
                         if !has_assumption_read {
                             continue;
                         }
-                        // The operand's type proves the write converged:
+                        // The operand's type proves the write converged.
+                        // A foreign read sees the BODY's binding, not the
+                        // entry's — `k = 0` pre-loop then `k = 1` and
+                        // `x = x + k` inside must type the leaf as
+                        // `x + 1`, so overlay each earlier dominating
+                        // write's value type onto the entry env.
                         // `x + 0` folds back to the entry binding (`vt ⊆
                         // entry`; a nominal codomain like `x[0]`'s
                         // `Integer` is NOT enough — `x.bit_length` types
@@ -1463,22 +1468,61 @@ impl<'i> Typer<'i> {
                         // decline the reference must share: the name is
                         // unbound at entry (a body-first `x`'s nil seed
                         // declines identically), or the leaf is a
-                        // receiverless call no toplevel `def` or
-                        // Object/Kernel surface resolves (`foo(x)` — a
-                        // `def g` or Kernel method caps instead).
-                        // A decline the reference resolves
-                        // (`[1,2].fetch(x)`, a defined `g(x)`) keeps
-                        // moving — compound.
-                        let vt = self.type_of(ast, id, env, interner);
+                        // receiverless call nothing resolves — no
+                        // toplevel `def`, no Object/Kernel surface, no
+                        // project `def` on the enclosing class (`foo(x)`
+                        // converges; a defined `g(x)` or `Rational(x)`
+                        // compounds). A decline the reference resolves
+                        // (`[1,2].fetch(x)`) keeps moving — compound.
+                        let mut leaf_env = env.clone();
+                        for (pos, r) in marks.read_positions_within(node.span()) {
+                            if r == n {
+                                continue;
+                            }
+                            let mut r_ty = None;
+                            for s in live
+                                .iter()
+                                .filter(|s| s.target == r && s.span.1 <= pos)
+                            {
+                                match s.value_node {
+                                    Some(sv) if s.plain => {
+                                        let wv = self.type_of(ast, sv, env, interner);
+                                        r_ty = Some(match r_ty {
+                                            None => wv,
+                                            Some(prev) => {
+                                                rigor_types::Algebra::join(interner, prev, wv)
+                                            }
+                                        });
+                                    }
+                                    _ => {
+                                        r_ty = None;
+                                        break;
+                                    }
+                                }
+                            }
+                            if let Some(wv) = r_ty {
+                                leaf_env.insert(Rc::from(r), wv);
+                            }
+                        }
+                        let vt = self.type_of(ast, id, &leaf_env, interner);
                         let vt_decline = Self::type_has_decline(interner, vt);
                         let unresolvable = matches!(node, Node::Call { receiver: None, method, .. } if {
+                            let scope = self
+                                .lexical_scopes
+                                .iter()
+                                .filter(|(s, _)| {
+                                    s.0 <= node.span().0 && node.span().1 <= s.1
+                                })
+                                .min_by_key(|(s, _)| s.1 - s.0)
+                                .map(|(_, segs)| segs.join("::"));
+                            let class_name = scope.as_deref().unwrap_or("Object");
                             let resolves = self
                                 .source
                                 .is_toplevel_def(self.file_key, method)
                                 || self.index.class_has_method("Object", method)
                                 || self.source.project_declares_method(
                                     self.file_key,
-                                    "Object",
+                                    class_name,
                                     method,
                                 );
                             !resolves
