@@ -303,7 +303,7 @@ impl<'i> Typer<'i> {
                 // `discovered_classes`' other half).
                 self.constant_names_a_known_class(name)
                     || self.source.knows_class(name)
-                    || self.source.knows_meta_new_class(name)
+                    || self.source.knows_discovered_class(name)
             }
         }
     }

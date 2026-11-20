@@ -1719,6 +1719,25 @@ fn meta_new_walk(
                 if let Some(q) = meta_new_write_qname(cx, written) {
                     out.push(q);
                 }
+                // `collect_meta_new_constant_decls?` for the OR/PATH write
+                // forms `meta_new_block_call` also covers: `Foo ||= X`,
+                // `M::Foo = X`, `::Foo = X`, `self::Foo = X` blocks rebind
+                // self to the write's own qualified name (`[]` under an
+                // unnameable cref). The factory call lives inside this
+                // node's `Statements{Recovered}` children.
+                let mut children = Vec::new();
+                def_walk_children(n, &mut children);
+                for child in children {
+                    if let Some(call_id) =
+                        meta_new_rvalue(ast, written.trim_start_matches("::"), child)
+                    {
+                        meta_new_block_walk(
+                            ast, declared, call_id, cx,
+                            meta_new_write_qname(cx, written).unwrap_or_default(),
+                            markers, resolved, out,
+                        );
+                    }
+                }
             }
         }
     }
@@ -1748,6 +1767,12 @@ fn meta_new_walk(
             // `self_prefix` resets to nil, `singleton_cref` becomes
             // `child_cref` — exactly `decl_body_cx`'s answer.
             let inner = decl_body_cx(cx, name, *rooted, *self_anchored);
+            // `collect_decl_body?` — the header registers ITS qualified name
+            // in `discovered_classes` when nameable (`singleton_cref` IS
+            // `child_cref`, and `lexical` is `[]` under it).
+            if !inner.singleton_cref && !inner.lexical.is_empty() {
+                out.push(inner.lexical.join("::"));
+            }
             for &child in body {
                 meta_new_walk(ast, declared, child, &inner, markers, resolved, out);
             }
@@ -1886,6 +1911,52 @@ fn meta_new_walk(
 /// `"::Foo"` (rooted) or `"self::Foo"` (self-anchored). Applies
 /// `record_class_new_constant_decl`'s `singleton_cref`/`nameable` gate, so a
 /// bare `K ||=` inside `class <<` declines while `A::K`/`::K` still name.
+/// The block-body descent of [`meta_new_walk`] for a meta-new write whose
+/// qualified name is `meta_self` — the `K = Class.new do …` rebind. `call_id`
+/// is the factory call `meta_new_rvalue` returned; its receiver/args walk in
+/// the enclosing context, the block body under `self_prefix = meta_self`.
+#[allow(clippy::too_many_arguments)]
+fn meta_new_block_walk(
+    ast: &LoweredAst,
+    declared: &DeclaredNames,
+    call_id: NodeId,
+    cx: &DefCx,
+    meta_self: String,
+    markers: &HashMap<rigor_parse::Span, Vec<String>>,
+    resolved: &mut HashSet<rigor_parse::Span>,
+    out: &mut Vec<String>,
+) {
+    let Node::Call {
+        receiver,
+        args,
+        block_body,
+        ..
+    } = ast.get(call_id)
+    else {
+        unreachable!("meta_new_rvalue only returns calls");
+    };
+    if let Some(r) = receiver {
+        meta_new_walk(ast, declared, *r, cx, markers, resolved, out);
+    }
+    for &arg in args {
+        meta_new_walk(ast, declared, arg, cx, markers, resolved, out);
+    }
+    let inner = DefCx {
+        lexical: cx.lexical.clone(),
+        owner: Some(if meta_self.is_empty() {
+            Vec::new()
+        } else {
+            meta_self.split("::").map(str::to_string).collect()
+        }),
+        in_singleton: false,
+        singleton_cref: cx.singleton_cref,
+        defs_side: cx.defs_side,
+    };
+    for &child in block_body {
+        meta_new_walk(ast, declared, child, &inner, markers, resolved, out);
+    }
+}
+
 fn meta_new_write_qname(cx: &DefCx, written: &str) -> Option<String> {
     if let Some(tail) = written.strip_prefix("self::") {
         // `meta_new_path_target_nameable?` — `self_base.any?` decides under an

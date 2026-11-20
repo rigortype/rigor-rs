@@ -2070,14 +2070,14 @@ fn meta_new_write_census_covers_or_path_nested_positions() {
                 module P; Orm = Module.new; end\n";
     let (_a, idx) = build_one(src, &core);
     for name in ["Foo", "Bar", "Baz", "Blocked", "Mod"] {
-        assert!(idx.knows_meta_new_class(name), "{name}");
+        assert!(idx.knows_discovered_class(name), "{name}");
     }
-    assert!(idx.knows_meta_new_class("N::K::Qux"));
-    assert!(idx.knows_meta_new_class("P::Orm"));
+    assert!(idx.knows_discovered_class("N::K::Qux"));
+    assert!(idx.knows_discovered_class("P::Orm"));
     // `&&=` is not a `collect_class_decls` arm; `Ctrl = 1` binds no class;
     // `k::Dyn`'s dynamic base is unnameable; `Baz` is rooted — never `M::Baz`.
     for name in ["Anded", "Ctrl", "Dyn", "M::Baz", "Qux"] {
-        assert!(!idx.knows_meta_new_class(name), "{name}");
+        assert!(!idx.knows_discovered_class(name), "{name}");
     }
 }
 
@@ -2090,14 +2090,40 @@ fn meta_new_self_anchored_writes_resolve_rebound_self() {
                 module M3; self::N::Deep = Data.define(:x); end\n";
     let (_a, idx) = build_one(src, &core);
     for name in ["M::Foo", "M2::Bar", "Top", "M3::N::Deep"] {
-        assert!(idx.knows_meta_new_class(name), "{name}");
+        assert!(idx.knows_discovered_class(name), "{name}");
     }
     let src = b"class C; class << self; self::InS = Struct.new(:a); end; end\n\
                 class C2; class << self; Bare = Struct.new(:a); end; end\n\
                 class C3; class << self; A::Path = Struct.new(:a); end; end\n";
     let (_a, idx) = build_one(src, &core);
-    assert!(!idx.knows_meta_new_class("InS"));
-    assert!(!idx.knows_meta_new_class("Bare"));
-    assert!(!idx.knows_meta_new_class("C2::Bare"));
-    assert!(idx.knows_meta_new_class("C3::A::Path"));
+    assert!(!idx.knows_discovered_class("InS"));
+    assert!(!idx.knows_discovered_class("Bare"));
+    assert!(!idx.knows_discovered_class("C2::Bare"));
+    assert!(idx.knows_discovered_class("C3::A::Path"));
+}
+
+#[test]
+fn discovered_classes_records_nested_decls_and_block_self() {
+    let core = CoreIndex::new();
+    // `class A; class M` keys `A::M`, never bare `M` (rigor-rs#672 round 4).
+    let (_a, idx) = build_one(b"class A; class M; end; end\nmodule B; module C; end; end\nclass D::E; end\n", &core);
+    for name in ["A::M", "B::C", "D::E", "A", "B"] {
+        assert!(idx.knows_discovered_class(name), "{name}");
+    }
+    // A compact `class D::E` declares `D::E` alone — `D` is not invented.
+    for name in ["M", "C", "E", "D"] {
+        assert!(!idx.knows_discovered_class(name), "{name}");
+    }
+    // A `Foo ||= <factory>`/`::Foo = <factory>` block's self is the write's
+    // own name (`collect_meta_new_constant_decls?` covers all four write
+    // shapes, not just `K =`).
+    let (_a, idx) = build_one(
+        b"Foo ||= Class.new do self::X = Struct.new(:a); end\n\
+          M::Bar = Class.new do self::Y = Struct.new(:a); end\n\
+          self::Zed = Class.new do self::Z = Struct.new(:a); end\n",
+        &core,
+    );
+    for name in ["Foo::X", "M::Bar::Y", "Zed::Z"] {
+        assert!(idx.knows_discovered_class(name), "{name}");
+    }
 }

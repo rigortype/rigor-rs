@@ -234,7 +234,7 @@ impl SourceIndex {
         // `discovered_classes` (rigor-rs#672): every meta-new constant write,
         // at ANY position — `collect_class_decls` descends the whole tree,
         // and the or-write/path-write/`self::` shapes ride `UnmodeledWrite`.
-        collect_meta_new_writes(ast, &declared, &mut h.meta_new_names);
+        collect_meta_new_writes(ast, &declared, &mut h.discovered_names);
 
         // Pass 2: every `ConstantRead` whose `name` the FROZEN core knows, so the
         // merge can register an instance-class id for it. This lets both
@@ -478,7 +478,7 @@ impl SourceIndex {
                     .extend(indices.iter().copied());
             }
             idx.project_constant_write_names.extend(h.constant_write_bare_names.iter().cloned());
-            idx.meta_new_classes.extend(h.meta_new_names.iter().cloned());
+            idx.discovered_classes.extend(h.discovered_names.iter().cloned());
         }
         // `subtract_def_methods` (`finalize_def_index`): cross-file method
         // suppression is for the project's OWN accessors/aliases — NOT plain

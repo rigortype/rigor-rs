@@ -2265,7 +2265,7 @@ impl<'i> Typer<'i> {
             // `class_known_to_scope?`: RBS / project `sig/` OR an in-source
             // class — `class`/`module` (`knows_class`) or a meta-new write
             // (`Foo = Struct.new`, the rest of `discovered_classes`).
-            if self.source.knows_class(name) || self.source.knows_meta_new_class(name) {
+            if self.source.knows_class(name) || self.source.knows_discovered_class(name) {
                 return Some((name.to_string(), false));
             }
             if self.constant_names_a_known_class(name) {

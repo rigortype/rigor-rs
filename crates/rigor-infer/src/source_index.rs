@@ -435,12 +435,13 @@ pub struct Harvest {
     rbs_constant_names: Vec<String>,
     /// C5a, in walk order — one entry per distinct qualified name.
     constant_writes: Vec<HarvestedConstWrite>,
-    /// `record_class_new_constant_decl` (scope_indexer.rb:13196): qualified
-    /// name of every constant write whose rvalue is a meta-new factory
-    /// (`Foo = Struct.new` ⇒ `"Foo"`) — covers every position (`def`s,
-    /// blocks, modifiers) and the `Foo ||= …`/path-write shapes the lowering
-    /// drops (rigor-rs#672).
-    meta_new_names: Vec<String>,
+    /// `collect_class_decls` (scope_indexer.rb:12850): qualified name of
+    /// every nameable class/module declaration and every constant write
+    /// whose rvalue is a meta-new factory (`Foo = Struct.new` ⇒ `"Foo"`),
+    /// at ANY position — `def`s, blocks, modifiers — including the
+    /// `Foo ||= …`/path/`self::` write shapes the lowering drops
+    /// (rigor-rs#672).
+    discovered_names: Vec<String>,
     /// Pass 4a, in walk order.
     fold_defs: Vec<HarvestedFoldDef>,
 }
@@ -577,16 +578,16 @@ pub struct SourceIndex {
     /// globals, and a project that names one anywhere is reason enough to
     /// decline. Backs [`Self::project_writes_constant`].
     project_constant_write_names: HashSet<String>,
-    /// rigor-rs#672: qualified names the project assigns a meta-new class to
-    /// (`Foo = Struct.new` ⇒ `"Foo"`, `module M; Point = Data.define` ⇒
-    /// `"M::Point"`) — the `discovered_classes` half of the reference's
-    /// `class_known_to_scope?` that is not `class`/`module` declarations.
-    /// `is_a?(::Foo)` inside `module M` may NOT match `"M::Point"`: the
-    /// rooted operand names the top level only. Covers every write POSITION
-    /// (inside `def`s, blocks, modifiers) and the or-write/path-write shapes
-    /// the lowering cannot model, matching `collect_class_decls`'s
-    /// every-child descent.
-    meta_new_classes: HashSet<String>,
+    /// rigor-rs#672: the reference's `discovered_classes` —
+    /// `collect_class_decls`'s accumulator: every nameable `class`/`module`
+    /// declaration (`class A; class M` ⇒ `"A::M"`) AND every meta-new
+    /// constant write (`Foo = Struct.new` ⇒ `"Foo"`), keyed qualified, at
+    /// ANY position (the reference descends `def`s, blocks, modifiers) and
+    /// covering the `||=`/path/`self::` write shapes the lowering cannot
+    /// model. `class_known_to_scope?` consults it for `is_a?(::Foo)`-family
+    /// operands — which may NOT match a nested decl (`"M::Foo"`) for a
+    /// top-level `::Foo` operand.
+    discovered_classes: HashSet<String>,
     /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
     /// containing-namespace segment vectors keyed by the constant's last segment
     /// (`module Gitlab; module Database; module Partitioning; module Time` keys
