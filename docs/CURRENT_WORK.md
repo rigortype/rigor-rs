@@ -60,10 +60,10 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-20 #345 CLOSED** (PR #720): a `pre_eval:` glob matching a directory earns the reference's `pre-eval.file-not-found` row; expanded-stream `.uniq`/order ported, 0 FP; glob-dialect edge FPs (bare `**`, `[^…]`, `**/`+symlink, `\`) + `config_display_path`/NFD drift filed →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
-- **2026-11-20 #652 CLOSED** (PR #719): brace globs `::{*}`/`::{a, *}` flag like `::*`; child globs stay leaf-silent; test-only, 0 FP; `self::*`+`::{{*}}` limits filed →#654. [note](notes/20261120-issue-652-brace-glob-audit.md)
+- **2026-11-20 #345 CLOSED** (PR #720): pre_eval glob→dir earns not-found row; `.uniq`/order ported; 0 FP; dialect FPs + display-path/NFD →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
+- **2026-11-20 #652 CLOSED** (PR #719): brace globs `::{*}`/`::{a,*}` flag like `::*`; child globs leaf-silent; test-only, 0 FP; `self::*`/`::{{*}}` limits →#654. [note](notes/20261120-issue-652-brace-glob-audit.md)
 
-- **2026-11-20 #714 CLOSED** (PR #716): rooted bundled-class guard: RBS mint outranks the in-source census (round-6 veto killed); dependabot 215→212 (3 `revision` rows), 0 FP; fx 175 r35–r37. →#709/#717/#718. [note](notes/20261120-issue-714-rooted-bundled-guard.md)
+- **2026-11-20 #714 CLOSED** (PR #716): rooted bundled-class guard: RBS mint outranks the in-source census; dependabot 215→212, 0 FP; fx 175 r35–r37. →#709/#717/#718. [note](notes/20261120-issue-714-rooted-bundled-guard.md)
 
 - **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror; 5 review rounds, 0 FP every head, unmodelled arms decline. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
 
