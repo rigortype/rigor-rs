@@ -1365,14 +1365,14 @@ impl<'i> Typer<'i> {
             else {
                 continue;
             };
-            if !matches!(kind, rigor_parse::LoopKind::For)
-                || !(body_span.0 <= span.0 && span.1 <= body_span.1)
-                || inside_nested(*span)
+            if matches!(kind, rigor_parse::LoopKind::For)
+                && body_span.0 <= span.0
+                && span.1 <= body_span.1
+                && !inside_nested(*span)
             {
-                continue;
+                for_writes.extend(index.iter().map(|(nm, _)| nm.clone()));
+                for_writes.extend(index_writes.iter().map(|(nm, _, _)| nm.clone()));
             }
-            for_writes.extend(index.iter().map(|(nm, _)| nm.clone()));
-            for_writes.extend(index_writes.iter().map(|(nm, _, _)| nm.clone()));
         }
         let nil = interner.nil();
         // rigor-rs#683 — a plain self-write compounds when a self-read feeds
