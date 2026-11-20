@@ -1672,6 +1672,7 @@ fn collect_declared_names_at(
 pub(crate) fn collect_meta_new_writes(
     ast: &LoweredAst,
     declared: &DeclaredNames,
+    decls: &mut Vec<String>,
     out: &mut Vec<String>,
 ) {
     // `UnmodeledWrite` markers are arena siblings — the tree they describe is
@@ -1698,6 +1699,7 @@ pub(crate) fn collect_meta_new_writes(
         &markers,
         &mut resolved,
         &mut walked,
+        decls,
         out,
     );
 }
@@ -1711,6 +1713,7 @@ fn meta_new_walk(
     markers: &HashMap<rigor_parse::Span, Vec<String>>,
     resolved: &mut HashSet<rigor_parse::Span>,
     walked: &mut HashSet<NodeId>,
+    decls: &mut Vec<String>,
     out: &mut Vec<String>,
 ) {
     // A node reaches the walk once — the marker arm's `meta_self` descent
@@ -1747,7 +1750,7 @@ fn meta_new_walk(
                         meta_new_block_walk(
                             ast, declared, call_id, cx,
                             meta_new_write_qname(cx, written).unwrap_or_default(),
-                            markers, resolved, walked, out,
+                            markers, resolved, walked, decls, out,
                         );
                     }
                 }
@@ -1771,7 +1774,7 @@ fn meta_new_walk(
         } => {
             if name.is_empty() {
                 for &child in body {
-                    meta_new_walk(ast, declared, child, cx, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, child, cx, markers, resolved, walked, decls, out);
                 }
                 return;
             }
@@ -1784,10 +1787,10 @@ fn meta_new_walk(
             // in `discovered_classes` when nameable (`singleton_cref` IS
             // `child_cref`, and `lexical` is `[]` under it).
             if !inner.singleton_cref && !inner.lexical.is_empty() {
-                out.push(inner.lexical.join("::"));
+                decls.push(inner.lexical.join("::"));
             }
             for &child in body {
-                meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, out);
+                meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
             }
         }
         Node::Definition {
@@ -1800,7 +1803,7 @@ fn meta_new_walk(
             // the body's `self_prefix` is EMPTY_PREFIX and `singleton_cref`
             // becomes true.
             if let Some(op) = singleton_operand {
-                meta_new_walk(ast, declared, *op, cx, markers, resolved, walked, out);
+                meta_new_walk(ast, declared, *op, cx, markers, resolved, walked, decls, out);
             }
             let inner = DefCx {
                 lexical: cx.lexical.clone(),
@@ -1810,7 +1813,7 @@ fn meta_new_walk(
                 defs_side: cx.defs_side,
             };
             for &child in body {
-                meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, out);
+                meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
             }
         }
         Node::Call {
@@ -1826,10 +1829,10 @@ fn meta_new_walk(
             // the body's self rebinds to `eval_receiver_prefix`.
             if block_span.is_some() && RECEIVER_EVAL_METHODS.contains(&method.as_str()) {
                 if let Some(r) = receiver {
-                    meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, decls, out);
                 }
                 for &arg in args {
-                    meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, decls, out);
                 }
                 let self_prefix = cx.self_prefix();
                 let unnameable = cx.in_singleton
@@ -1854,14 +1857,14 @@ fn meta_new_walk(
                     defs_side: cx.defs_side,
                 };
                 for &child in block_body {
-                    meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
                 }
                 return;
             }
             let mut children = Vec::new();
             def_walk_children(n, &mut children);
             for child in children {
-                meta_new_walk(ast, declared, child, cx, markers, resolved, walked, out);
+                meta_new_walk(ast, declared, child, cx, markers, resolved, walked, decls, out);
             }
         }
         Node::ConstantWrite { name, value, .. } => {
@@ -1885,10 +1888,10 @@ fn meta_new_walk(
                     unreachable!("meta_new_rvalue only returns calls");
                 };
                 if let Some(r) = receiver {
-                    meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, decls, out);
                 }
                 for &arg in args {
-                    meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, decls, out);
                 }
                 let meta_self = if cx.singleton_cref {
                     Vec::new()
@@ -1903,17 +1906,17 @@ fn meta_new_walk(
                     defs_side: cx.defs_side,
                 };
                 for &child in block_body {
-                    meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, out);
+                    meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
                 }
             } else {
-                meta_new_walk(ast, declared, *value, cx, markers, resolved, walked, out);
+                meta_new_walk(ast, declared, *value, cx, markers, resolved, walked, decls, out);
             }
         }
         node => {
             let mut children = Vec::new();
             def_walk_children(node, &mut children);
             for child in children {
-                meta_new_walk(ast, declared, child, cx, markers, resolved, walked, out);
+                meta_new_walk(ast, declared, child, cx, markers, resolved, walked, decls, out);
             }
         }
     }
@@ -1933,6 +1936,7 @@ fn meta_new_block_walk(
     markers: &HashMap<rigor_parse::Span, Vec<String>>,
     resolved: &mut HashSet<rigor_parse::Span>,
     walked: &mut HashSet<NodeId>,
+    decls: &mut Vec<String>,
     out: &mut Vec<String>,
 ) {
     let Node::Call {
@@ -1945,10 +1949,10 @@ fn meta_new_block_walk(
         unreachable!("meta_new_rvalue only returns calls");
     };
     if let Some(r) = receiver {
-        meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, out);
+        meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, decls, out);
     }
     for &arg in args {
-        meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, out);
+        meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, decls, out);
     }
     let inner = DefCx {
         lexical: cx.lexical.clone(),
@@ -1962,7 +1966,7 @@ fn meta_new_block_walk(
         defs_side: cx.defs_side,
     };
     for &child in block_body {
-        meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, out);
+        meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
     }
 }
 

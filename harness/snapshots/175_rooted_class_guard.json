@@ -84,6 +84,20 @@
       "column": 5,
       "severity": "error",
       "message": "undefined method `frobnicate_r22' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 173,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r24' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 182,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r26' for [1]"
     }
   ]
 }

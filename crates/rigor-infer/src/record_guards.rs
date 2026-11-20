@@ -302,7 +302,6 @@ impl<'i> Typer<'i> {
                 // (`knows_class`) or a meta-new write (`Foo = Struct.new`,
                 // `discovered_classes`' other half).
                 self.constant_names_a_known_class(name)
-                    || self.source.knows_class(name)
                     || self.source.knows_discovered_class(name)
             }
         }

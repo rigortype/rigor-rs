@@ -156,3 +156,30 @@ def rooted_block_self
   x = [1]
   x.frobnicate_r22 unless x.is_a?(::BlkR::InB)
 end
+
+# Review (PR #708, round 6): a rooted `when`/`is_a?` operand whose leaf
+# exists only NESTED (`class A; class M` — never `::M`) must take the
+# same path as an undeclared one — `knows_class`'s leaf key made `::M`
+# hit `A::M`'s registration.
+class W1A
+  class W1M
+  end
+end
+
+def rooted_when_nested_leaf
+  x = [1]
+  case x
+  when ::W1M then x.frobnicate_r23
+  else x.frobnicate_r24
+  end
+end
+
+class W1B
+  def rooted_when_nested_leaf_in_class
+    x = [1]
+    case x
+    when ::W1M then x.frobnicate_r25
+    else x.frobnicate_r26
+    end
+  end
+end
