@@ -435,6 +435,21 @@ pub struct Harvest {
     rbs_constant_names: Vec<String>,
     /// C5a, in walk order — one entry per distinct qualified name.
     constant_writes: Vec<HarvestedConstWrite>,
+    /// `collect_class_decls` (scope_indexer.rb:12850): qualified name of
+    /// every nameable class/module declaration and every constant write
+    /// whose rvalue is a meta-new factory (`Foo = Struct.new` ⇒ `"Foo"`),
+    /// at ANY position — `def`s, blocks, modifiers — including the
+    /// `Foo ||= …`/path/`self::` write shapes the lowering drops
+    /// (rigor-rs#672).
+    discovered_names: Vec<String>,
+    /// The `class`/`module` DECLARATION half of [`Self::discovered_names`]
+    /// — NO meta-new writes and no `synthesize_namespace_prefixes`
+    /// expansion. `resolved_static_constant`'s rooted arm declines a `::C`
+    /// operand only when the project literally DECLARES `C` (a
+    /// `Foo = Struct.new` write is not a shadow, and `class A::M` must not
+    /// shadow a bare `::M`); `knows_class`'s leaf key was both over- and
+    /// under-inclusive there (rigor-rs#672 round 6).
+    discovered_decls: Vec<String>,
     /// Pass 4a, in walk order.
     fold_defs: Vec<HarvestedFoldDef>,
 }
@@ -571,6 +586,21 @@ pub struct SourceIndex {
     /// globals, and a project that names one anywhere is reason enough to
     /// decline. Backs [`Self::project_writes_constant`].
     project_constant_write_names: HashSet<String>,
+    /// rigor-rs#672: the reference's `discovered_classes` —
+    /// `collect_class_decls`'s accumulator: every nameable `class`/`module`
+    /// declaration (`class A; class M` ⇒ `"A::M"`) AND every meta-new
+    /// constant write (`Foo = Struct.new` ⇒ `"Foo"`), keyed qualified, at
+    /// ANY position (the reference descends `def`s, blocks, modifiers) and
+    /// covering the `||=`/path/`self::` write shapes the lowering cannot
+    /// model. `class_known_to_scope?` consults it for `is_a?(::Foo)`-family
+    /// operands — which may NOT match a nested decl (`"M::Foo"`) for a
+    /// top-level `::Foo` operand.
+    discovered_classes: HashSet<String>,
+    /// The `class`/`module` DECLARATION names [`Self::discovered_classes`]
+    /// also contains — WITHOUT meta-new writes or prefix synthesis. Backs
+    /// `resolved_static_constant`'s rooted shadow-decline
+    /// (rigor-rs#672 round 6).
+    discovered_decls: HashSet<String>,
     /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
     /// containing-namespace segment vectors keyed by the constant's last segment
     /// (`module Gitlab; module Database; module Partitioning; module Time` keys

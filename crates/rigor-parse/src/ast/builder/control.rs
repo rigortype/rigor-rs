@@ -281,6 +281,8 @@ impl<'src> Builder<'src> {
                 // censuses grade the clause like any other write
                 // (rigor-rs#352 review).
                 names: pattern_bound_locals(&in_node.pattern()),
+                // An `in` pattern writes LOCALS, never a meta-new constant.
+                meta_new_const: None,
             });
             // The pattern is matched in `in_arm_position` — typed, never
             // evaluated (rigor-rs#343); it is the dead half of the operand

@@ -1977,7 +1977,15 @@ impl CoreData {
         if lhs == rhs {
             return ClassOrdering::Equal;
         }
-        if !self.classes.contains_key(lhs) || !self.classes.contains_key(rhs) {
+        // A name is orderable only as the class it LITERALLY names. `classes`
+        // additionally keys every NESTED decl by its leaf (`File::Stat`
+        // registers `"Stat"`), so `contains` orders a bare `Stat` as
+        // `File::Stat` where the reference's unresolved nominal `Stat` is
+        // unorderable (rigor-rs#672: `x = [1]; case x when ::Stat; …; x.foo`
+        // fired `for [1]` through a false `Disjoint`). `toplevel_classes`
+        // holds exactly the genuine top-level declarations; a `::`-qualified
+        // name is never in it, which preserves the old `classes` miss.
+        if !self.toplevel_classes.contains(lhs) || !self.toplevel_classes.contains(rhs) {
             return ClassOrdering::Unknown;
         }
         let (lhs_anc, lhs_complete) = self.ancestors(lhs);

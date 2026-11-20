@@ -50,6 +50,20 @@ use rigor_types::Interner;
 use crate::flow_writes::{indexed_narrowing_key, IndexedFlow};
 use crate::{TypeEnv, Typer};
 
+/// Which reference function resolves a rooted `::C` class operand
+/// (rigor-rs#672):
+/// - `Predicate` — `rooted_class_predicate_name` (`is_a?` / `kind_of?` /
+///   `instance_of?`): a rooted operand answers `C` only when the top-level
+///   class is known, and the guard DECLINES otherwise.
+/// - `CaseEq` — `lexical_class_name` (`===` / `case` / `in`): the de-rooted
+///   spelling is kept unconditionally, so a rooted static spelling is always
+///   a class operand.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum RootedOperand {
+    Predicate,
+    CaseEq,
+}
+
 /// One local a guard rebinds, with the extent its record drop covers.
 pub(crate) struct RecordGuard {
     /// The construct's own arms a site reads the guard's edge in, wherever
@@ -129,7 +143,9 @@ impl<'i> Typer<'i> {
                                 // `in C => x`) lowers to the constant.
                                 Node::BeginRescue { body, .. } => body
                                     .first()
-                                    .filter(|&&p| self.static_guard_class(ast, p))
+                                    .filter(|&&p| {
+                                        self.static_guard_class(ast, p, RootedOperand::CaseEq)
+                                    })
                                     .map(|&p| ast.get(p).span().1),
                                 _ => None,
                             });
@@ -245,14 +261,14 @@ impl<'i> Typer<'i> {
                 ("!", []) => self.guarded_locals_into(ast, *r, out),
                 ("is_a?" | "kind_of?" | "instance_of?", [c]) => {
                     if let Some(name) = local(*r) {
-                        if self.static_guard_class(ast, *c) {
+                        if self.static_guard_class(ast, *c, RootedOperand::Predicate) {
                             out.push(name);
                         }
                     }
                 }
                 ("===", [a]) => {
                     if let Some(name) = local(*a) {
-                        let receiver_guards = self.static_guard_class(ast, *r)
+                        let receiver_guards = self.static_guard_class(ast, *r, RootedOperand::CaseEq)
                             || matches!(ast.get(*r), Node::RegexpLit { .. } | Node::Range { .. });
                         if receiver_guards {
                             out.push(name);
@@ -266,20 +282,29 @@ impl<'i> Typer<'i> {
     }
 
     /// Whether `id` is a class operand the reference's class guard narrows
-    /// through: a static constant spelling (`static_class_name`), and for a
-    /// rooted `::C` one whose `C` is known (`rooted_class_predicate_name`).
-    fn static_guard_class(&self, ast: &LoweredAst, id: NodeId) -> bool {
+    /// through: a static constant spelling (`static_class_name`), judged by
+    /// `kind`'s rooted rule (rigor-rs#672).
+    fn static_guard_class(&self, ast: &LoweredAst, id: NodeId, kind: RootedOperand) -> bool {
         let Node::ConstantRead { name, dynamic_base, self_anchored, rooted, .. } = ast.get(id) else {
             return false;
         };
         if name.is_empty() || *dynamic_base || *self_anchored {
             return false;
         }
-        let bare = name.strip_prefix("::").unwrap_or(name);
-        if *rooted || name.starts_with("::") {
-            return self.constant_names_a_known_class(bare) || self.source.knows_class(bare);
+        if !*rooted {
+            return true;
         }
-        true
+        match kind {
+            RootedOperand::CaseEq => true,
+            RootedOperand::Predicate => {
+                // `class_known_to_scope?`: the RBS registry / project `sig/`
+                // or an in-source top-level class — `class`/`module`
+                // (`knows_class`) or a meta-new write (`Foo = Struct.new`,
+                // `discovered_classes`' other half).
+                self.constant_names_a_known_class(name)
+                    || self.source.knows_discovered_class(name)
+            }
+        }
     }
 
     /// [`RecordGuard`]s applied to the env a site reads: every record a

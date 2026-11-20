@@ -1,0 +1,131 @@
+{
+  "fixture": "harness/corpus/175_rooted_class_guard.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r4' for File::Stat"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r5' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 48,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r6' for \"s\" | 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 67,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r9' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 9,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r12' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 103,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r16' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 112,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r17' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 119,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r18' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 126,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r19' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 139,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r20' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 148,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r21' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 157,
+      "column": 5,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r22' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 173,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r24' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 182,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r26' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 210,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r28' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 219,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r30' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 228,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r32' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 236,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `frobnicate_r34' for [1]"
+    }
+  ]
+}

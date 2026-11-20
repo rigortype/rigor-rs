@@ -227,7 +227,9 @@ pub(crate) fn collect_literal_constants(
         Node::ConstantWrite { name, value, .. } => {
             let qualified = qualify(prefix, name);
             match seen.get(&qualified) {
-                Some(&at) => out[at].writes += 1,
+                Some(&at) => {
+                    out[at].writes += 1;
+                }
                 None => {
                     // Issue #540: a constant this file MUTATES is harvested
                     // Dynamic-wrapped, so a read no longer folds through the

@@ -19,7 +19,8 @@ use super::{
     rescue_reference_index_writes,
     case_arm_exits, has_targeted_break, has_targeted_next, has_targeted_retry,
     literal_truthiness, unconditional_exit,
-    param_shape_of, plain_positional_params, rooted_constant_path, self_anchored_constant_path,
+    meta_new_write_name, param_shape_of, plain_positional_params, rooted_constant_path,
+    self_anchored_constant_path,
     span_of, strict_constant_path_string, Compound, ConstName, ConstPathChain, JumpKind, Node,
     NodeId, ParamShape, Recovered, RescueClause, ScopeMarks, Span, StatementsKind,
 };

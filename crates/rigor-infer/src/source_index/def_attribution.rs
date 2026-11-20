@@ -956,7 +956,7 @@ fn collapse_object_owner(prefix: Vec<String>) -> Vec<String> {
 /// the bare constant receiver — a dynamic (`expr::Class`) or `self::`-rooted
 /// base does not name the factory, matching the reference's constant-receiver
 /// requirement.
-fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
+pub(crate) fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
     let Some(recv) = receiver else {
         return false;
     };
@@ -980,9 +980,43 @@ fn is_meta_new_call(ast: &LoweredAst, receiver: Option<NodeId>, method: &str) ->
 /// `.freeze` tail (`K = Class.new { }.freeze.freeze`). Returns the factory
 /// CALL's id so the arm can split receiver/args (enclosing context) from the
 /// block (the written owner).
-fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Option<NodeId> {
-    // `K = K || <factory>` — an `||` whose left operand reads the written
-    // constant.
+fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, value: NodeId) -> Option<NodeId> {
+    let value = meta_new_unwrap(ast, write_name, value);
+    let Node::Call {
+        receiver,
+        method,
+        block_span,
+        ..
+    } = ast.get(value)
+    else {
+        return None;
+    };
+    if block_span.is_some() && is_meta_new_call(ast, *receiver, method) {
+        Some(value)
+    } else {
+        None
+    }
+}
+
+/// `meta_new_constant_rvalue?` — whether `K = <rvalue>` binds a class at all
+/// (rigor-rs#672): the four factory forms behind the same `K = K || …` and
+/// `.freeze` unwraps [`meta_new_rvalue`] applies, WITHOUT its block
+/// requirement — the reference registers the constant in `discovered_classes`
+/// for a block-less `K = Struct.new(:x)` too
+/// (`record_class_new_constant_decl`, `scope_indexer.rb:13196`), and
+/// `class_known_to_scope?` consults that table for `is_a?(::K)` operands.
+pub(crate) fn meta_new_class_rvalue(ast: &LoweredAst, write_name: &str, value: NodeId) -> bool {
+    match ast.get(meta_new_unwrap(ast, write_name, value)) {
+        Node::Call {
+            receiver, method, ..
+        } => is_meta_new_call(ast, *receiver, method),
+        _ => false,
+    }
+}
+
+/// The `K = K || <factory>` and repeated receiverful `.freeze` tail unwraps
+/// both meta-new recognisers share.
+fn meta_new_unwrap(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> NodeId {
     if let Node::Logical {
         left,
         right,
@@ -1002,8 +1036,6 @@ fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Opt
             }
         }
     }
-    // A `.freeze` tail, repeated — only a receiverful, argument-less,
-    // block-less call unwraps.
     loop {
         match ast.get(value) {
             Node::Call {
@@ -1018,20 +1050,7 @@ fn meta_new_rvalue(ast: &LoweredAst, write_name: &str, mut value: NodeId) -> Opt
             _ => break,
         }
     }
-    let Node::Call {
-        receiver,
-        method,
-        block_span,
-        ..
-    } = ast.get(value)
-    else {
-        return None;
-    };
-    if block_span.is_some() && is_meta_new_call(ast, *receiver, method) {
-        Some(value)
-    } else {
-        None
-    }
+    value
 }
 
 /// `qualify` for an already-segmented write target: `K =` inside `Outer`
@@ -1635,4 +1654,366 @@ fn collect_declared_names_at(
             }
         }
     }
+}
+
+/// `collect_class_decls`'s constant-write arm (`record_class_new_constant_decl`,
+/// scope_indexer.rb:13196) as a whole-AST census — the `discovered_classes`
+/// table `class_known_to_scope?` consults for `is_a?(::Foo)`-family operands
+/// (rigor-rs#672). Records the qualified name of every constant write whose
+/// rvalue is a meta-new factory — `Foo = Struct.new`, `Foo ||= …`,
+/// `::Foo = …`, `M::Foo = …`, `self::Foo = …` — at ANY position (the
+/// reference descends `def`s, blocks, modifiers and `case` arms alike).
+///
+/// The walk carries `collect_class_decls`'s dual context on the [`DefCx`]
+/// chassis: `lexical` is `qualified_prefix`, `owner` is `self_prefix` —
+/// the rebound self a `C.class_eval { … }` or `K = Class.new { … }` block
+/// sets, `Some([])` under `class <<` — and `singleton_cref` marks `class <<`
+/// bodies and unnameable-cref decls.
+pub(crate) fn collect_meta_new_writes(
+    ast: &LoweredAst,
+    declared: &DeclaredNames,
+    decls: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    // `UnmodeledWrite` markers are arena siblings — the tree they describe is
+    // the `Statements{Recovered}` carrier at the SAME span — so the walk
+    // resolves each against the context it finds that span under.
+    let mut markers: HashMap<rigor_parse::Span, Vec<String>> = HashMap::new();
+    for (_, n) in ast.iter() {
+        if let Node::UnmodeledWrite {
+            meta_new_const: Some(written),
+            span,
+            ..
+        } = n
+        {
+            markers.entry(*span).or_default().push(written.clone());
+        }
+    }
+    let mut resolved = HashSet::new();
+    let mut walked = HashSet::new();
+    meta_new_walk(
+        ast,
+        declared,
+        ast.root(),
+        &def_root_cx(),
+        &markers,
+        &mut resolved,
+        &mut walked,
+        decls,
+        out,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn meta_new_walk(
+    ast: &LoweredAst,
+    declared: &DeclaredNames,
+    node: NodeId,
+    cx: &DefCx,
+    markers: &HashMap<rigor_parse::Span, Vec<String>>,
+    resolved: &mut HashSet<rigor_parse::Span>,
+    walked: &mut HashSet<NodeId>,
+    decls: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    // A node reaches the walk once — the marker arm's `meta_self` descent
+    // files its factory child here so the generic arm does not also walk
+    // the block under the LEXICAL context.
+    if !walked.insert(node) {
+        return;
+    }
+    let n = ast.get(node);
+    if let Some(writes) = markers.get(&n.span()) {
+        // First visited wins — a node sharing the marker's span is inside the
+        // same context region as the write itself.
+        if resolved.insert(n.span()) {
+            for written in writes {
+                if let Some(q) = meta_new_write_qname(cx, written) {
+                    out.push(q);
+                }
+                // `collect_meta_new_constant_decls?` for the OR/PATH write
+                // forms `meta_new_block_call` also covers: `Foo ||= X`,
+                // `M::Foo = X`, `::Foo = X`, `self::Foo = X` blocks rebind
+                // self to the write's own qualified name (`[]` under an
+                // unnameable cref). The factory call lives inside this
+                // node's `Statements{Recovered}` children.
+                let mut children = Vec::new();
+                def_walk_children(n, &mut children);
+                for child in children {
+                    if let Some(call_id) =
+                        meta_new_rvalue(ast, written.trim_start_matches("::"), child)
+                    {
+                        // The carrier's generic descent reaches this call
+                        // next — skip it there or the block body would ALSO
+                        // walk under the lexical context.
+                        walked.insert(call_id);
+                        meta_new_block_walk(
+                            ast, declared, call_id, cx,
+                            meta_new_write_qname(cx, written).unwrap_or_default(),
+                            markers, resolved, walked, decls, out,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    match n {
+        Node::ClassDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        }
+        | Node::ModuleDef {
+            name,
+            rooted,
+            self_anchored,
+            body,
+            ..
+        } => {
+            if name.is_empty() {
+                for &child in body {
+                    meta_new_walk(ast, declared, child, cx, markers, resolved, walked, decls, out);
+                }
+                return;
+            }
+            // `collect_decl_body?` — the body walks under the header's
+            // `declaration_prefix` (`[]` under an unnameable cref), the
+            // `self_prefix` resets to nil, `singleton_cref` becomes
+            // `child_cref` — exactly `decl_body_cx`'s answer.
+            let inner = decl_body_cx(cx, name, *rooted, *self_anchored);
+            // `collect_decl_body?` — the header registers ITS qualified name
+            // in `discovered_classes` when nameable (`singleton_cref` IS
+            // `child_cref`, and `lexical` is `[]` under it).
+            if !inner.singleton_cref && !inner.lexical.is_empty() {
+                decls.push(inner.lexical.join("::"));
+            }
+            for &child in body {
+                meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
+            }
+        }
+        Node::Definition {
+            is_singleton_class: true,
+            singleton_operand,
+            body,
+            ..
+        } => {
+            // `class << <expr>` — the operand evaluates in the ENCLOSING cref;
+            // the body's `self_prefix` is EMPTY_PREFIX and `singleton_cref`
+            // becomes true.
+            if let Some(op) = singleton_operand {
+                meta_new_walk(ast, declared, *op, cx, markers, resolved, walked, decls, out);
+            }
+            let inner = DefCx {
+                lexical: cx.lexical.clone(),
+                owner: Some(Vec::new()),
+                in_singleton: true,
+                singleton_cref: true,
+                defs_side: cx.defs_side,
+            };
+            for &child in body {
+                meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
+            }
+        }
+        Node::Call {
+            receiver,
+            method,
+            args,
+            block_body,
+            block_span,
+            ..
+        } => {
+            // `collect_eval_class_decls?` — a `RECEIVER_EVAL_CALLS` literal
+            // block: receiver and args evaluate in the enclosing context;
+            // the body's self rebinds to `eval_receiver_prefix`.
+            if block_span.is_some() && RECEIVER_EVAL_METHODS.contains(&method.as_str()) {
+                if let Some(r) = receiver {
+                    meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, decls, out);
+                }
+                for &arg in args {
+                    meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, decls, out);
+                }
+                let self_prefix = cx.self_prefix();
+                let unnameable = cx.in_singleton
+                    || cx.owner.as_ref().is_some_and(|o| o.is_empty())
+                    || (cx.singleton_cref && self_prefix.is_empty());
+                let eval_prefix = eval_receiver_prefix(
+                    ast,
+                    *receiver,
+                    &self_prefix,
+                    &cx.lexical,
+                    unnameable,
+                    declared,
+                )
+                .unwrap_or_default();
+                let named =
+                    receiver.is_some_and(|r| !matches!(ast.get(r), Node::SelfExpr { .. }));
+                let inner = DefCx {
+                    lexical: cx.lexical.clone(),
+                    owner: Some(eval_prefix),
+                    in_singleton: cx.in_singleton && !named,
+                    singleton_cref: cx.singleton_cref,
+                    defs_side: cx.defs_side,
+                };
+                for &child in block_body {
+                    meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
+                }
+                return;
+            }
+            let mut children = Vec::new();
+            def_walk_children(n, &mut children);
+            for child in children {
+                meta_new_walk(ast, declared, child, cx, markers, resolved, walked, decls, out);
+            }
+        }
+        Node::ConstantWrite { name, value, .. } => {
+            // `record_class_new_constant_decl` — a plain `K =` write is
+            // never a PATH target, so under an unnameable cref
+            // `meta_new_path_target_nameable?` declines it outright.
+            if !cx.singleton_cref && meta_new_class_rvalue(ast, name, *value) {
+                out.push(qualify_vec(&cx.lexical, name).join("::"));
+            }
+            // `collect_meta_new_constant_decls?` — a `K = <factory> do …`
+            // block's self is the class the write names (`[]` under an
+            // unnameable cref); the cref stays lexical.
+            if let Some(call_id) = meta_new_rvalue(ast, name, *value) {
+                let Node::Call {
+                    receiver,
+                    args,
+                    block_body,
+                    ..
+                } = ast.get(call_id)
+                else {
+                    unreachable!("meta_new_rvalue only returns calls");
+                };
+                if let Some(r) = receiver {
+                    meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, decls, out);
+                }
+                for &arg in args {
+                    meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, decls, out);
+                }
+                let meta_self = if cx.singleton_cref {
+                    Vec::new()
+                } else {
+                    qualify_vec(&cx.lexical, name)
+                };
+                let inner = DefCx {
+                    lexical: cx.lexical.clone(),
+                    owner: Some(meta_self),
+                    in_singleton: false,
+                    singleton_cref: cx.singleton_cref,
+                    defs_side: cx.defs_side,
+                };
+                for &child in block_body {
+                    meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
+                }
+            } else {
+                meta_new_walk(ast, declared, *value, cx, markers, resolved, walked, decls, out);
+            }
+        }
+        node => {
+            let mut children = Vec::new();
+            def_walk_children(node, &mut children);
+            for child in children {
+                meta_new_walk(ast, declared, child, cx, markers, resolved, walked, decls, out);
+            }
+        }
+    }
+}
+
+/// The block-body descent of [`meta_new_walk`] for a meta-new write whose
+/// qualified name is `meta_self` — the `K = Class.new do …` rebind. `call_id`
+/// is the factory call `meta_new_rvalue` returned; its receiver/args walk in
+/// the enclosing context, the block body under `self_prefix = meta_self`.
+#[allow(clippy::too_many_arguments)]
+fn meta_new_block_walk(
+    ast: &LoweredAst,
+    declared: &DeclaredNames,
+    call_id: NodeId,
+    cx: &DefCx,
+    meta_self: String,
+    markers: &HashMap<rigor_parse::Span, Vec<String>>,
+    resolved: &mut HashSet<rigor_parse::Span>,
+    walked: &mut HashSet<NodeId>,
+    decls: &mut Vec<String>,
+    out: &mut Vec<String>,
+) {
+    let Node::Call {
+        receiver,
+        args,
+        block_body,
+        ..
+    } = ast.get(call_id)
+    else {
+        unreachable!("meta_new_rvalue only returns calls");
+    };
+    if let Some(r) = receiver {
+        meta_new_walk(ast, declared, *r, cx, markers, resolved, walked, decls, out);
+    }
+    for &arg in args {
+        meta_new_walk(ast, declared, arg, cx, markers, resolved, walked, decls, out);
+    }
+    let inner = DefCx {
+        lexical: cx.lexical.clone(),
+        owner: Some(if meta_self.is_empty() {
+            Vec::new()
+        } else {
+            meta_self.split("::").map(str::to_string).collect()
+        }),
+        in_singleton: false,
+        singleton_cref: cx.singleton_cref,
+        defs_side: cx.defs_side,
+    };
+    for &child in block_body {
+        meta_new_walk(ast, declared, child, &inner, markers, resolved, walked, decls, out);
+    }
+}
+
+/// `meta_new_child_prefix` for a write the lowering cannot model — `written`
+/// is the AS-WRITTEN path the builder marked: `"Foo"` (or-write), `"M::Foo"`,
+/// `"::Foo"` (rooted) or `"self::Foo"` (self-anchored). Applies
+/// `record_class_new_constant_decl`'s `singleton_cref`/`nameable` gate, so a
+/// bare `K ||=` inside `class <<` declines while `A::K`/`::K` still name.
+fn meta_new_write_qname(cx: &DefCx, written: &str) -> Option<String> {
+    if let Some(tail) = written.strip_prefix("self::") {
+        // `meta_new_path_target_nameable?` — `self_base.any?` decides under an
+        // unnameable cref; a `self::` target renders nothing lexically.
+        if cx.singleton_cref && cx.owner.as_ref().is_none_or(|b| b.is_empty()) {
+            return None;
+        }
+        return match &cx.owner {
+            // `self_anchored_decl_prefix` — `self_base + tail`.
+            Some(base) => {
+                if base.is_empty() {
+                    None // `child_prefix.empty?` — unnameable.
+                } else {
+                    Some(format!("{}::{tail}", base.join("::")))
+                }
+            }
+            // `self_base.nil? && declaration_prefix(qualified_prefix, target)`
+            // — `self` IS the lexical enclosure.
+            None => {
+                if cx.singleton_cref {
+                    None
+                } else {
+                    let mut q = cx.lexical.clone();
+                    q.extend(tail.split("::").map(str::to_string));
+                    Some(q.join("::"))
+                }
+            }
+        };
+    }
+    // `singleton_cref && !meta_new_path_target_nameable?`: a bare `K ||=`
+    // (no `::`) never names anything under an unnameable cref; a
+    // strict-renderable `::K`/`A::K` path still does.
+    if cx.singleton_cref && !written.contains("::") {
+        return None;
+    }
+    if let Some(bare) = written.strip_prefix("::") {
+        return Some(bare.to_string());
+    }
+    let mut q = cx.lexical.clone();
+    q.extend(written.split("::").map(str::to_string));
+    Some(q.join("::"))
 }

@@ -228,7 +228,7 @@ impl DefLocalMarks {
                         all_writes.push((span.0, name));
                     }
                 }
-                Node::UnmodeledWrite { span, names } => {
+                Node::UnmodeledWrite { span, names, .. } => {
                     for name in names {
                         all_writes.push((span.0, name.clone()));
                     }

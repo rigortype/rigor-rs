@@ -494,8 +494,17 @@ impl<'i> Typer<'i> {
                         // edges (`if LIM.is_a?(k); LIM.inside; end` fires
                         // `for 1` inside AND after, rigor-rs#454); a local
                         // still declines (widens).
+                        //
+                        // A ROOTED operand `::C` nothing owns declines too
+                        // (`rooted_class_predicate_name` answers nil → the
+                        // reference builds NO scopes, so the local keeps its
+                        // carrier on BOTH edges — rigor-rs#672).
                         if self.guard_constant(ast, *c, span).is_none()
-                            && matches!(subject, Subject::Const(..))
+                            && (matches!(subject, Subject::Const(..))
+                                || matches!(
+                                    ast.get(*c),
+                                    Node::ConstantRead { rooted: true, .. }
+                                ))
                         {
                             (Edge::Keep, Edge::Keep)
                         } else {
@@ -522,7 +531,17 @@ impl<'i> Typer<'i> {
                         }
                     }
                     ("===", [arg]) if subject.is_read(ast, *arg) && !self.reads_subject(ast, r, subject) => {
+                        // A ROOTED `===` operand is NOT declined the way
+                        // `is_a?`'s is — `lexical_class_name` keeps the
+                        // de-rooted spelling unconditionally, so `::Stat`
+                        // still narrows to the (unknown) `Stat` nominal:
+                        // `class_edge` resolves it through the rooted
+                        // fallback below (rigor-rs#672).
                         if self.guard_constant(ast, r, span).is_none()
+                            && !matches!(
+                                ast.get(r),
+                                Node::ConstantRead { rooted: true, .. }
+                            )
                             && matches!(subject, Subject::Const(..))
                         {
                             (Edge::Keep, Edge::Keep)
@@ -636,8 +655,28 @@ impl<'i> Typer<'i> {
             }
             _ => None,
         };
-        let Some((class, mintable)) = self.guard_constant(ast, class_node, use_span) else {
-            return Edge::Other;
+        let (class, mintable) = match self.guard_constant(ast, class_node, use_span) {
+            Some(x) => x,
+            // `guard_constant` declines a rooted `::C` nothing owns only for
+            // `is_a?`'s `rooted_class_predicate_name` — and that caller
+            // early-returns `Keep` above. Whoever reaches here (`===` /
+            // `case`) follows `lexical_class_name`, which keeps the
+            // de-rooted spelling unconditionally (rigor-rs#672).
+            None => match ast.get(class_node) {
+                Node::ConstantRead { name, dynamic_base: false, rooted: true, .. }
+                    if !name.is_empty() =>
+                {
+                    // Unorderable: a rooted `===`/`when` spelling that
+                    // `guard_constant` declined is not a known top-level
+                    // class. Minting it (`mintable: true`) lets
+                    // `class_ordering` treat the leaf as a nested RBS class
+                    // (`Stat` → `File::Stat`) and prove a false Disjoint,
+                    // so `x = [1]; case x; when ::Stat; …; end; x.foo`
+                    // fired after the guard (rigor-rs#672).
+                    (name.to_string(), false)
+                }
+                _ => return Edge::Other,
+            },
         };
         if !mintable {
             // A guard constant the walk cannot mint a class for

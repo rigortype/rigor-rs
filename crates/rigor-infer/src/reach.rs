@@ -530,8 +530,8 @@ impl<'i> Typer<'i> {
             UntypedRoot::Ivar(name) => self.ivar_reach(ast, name, use_span, seen),
             UntypedRoot::Cvar(name) => self.cvar_reach(ast, name, use_span, seen),
             UntypedRoot::Gvar(name) => self.gvar_reach(ast, name, seen),
-            UntypedRoot::Const(name) => {
-                if self.const_is_reference_untyped(name, use_span) {
+            UntypedRoot::Const(name, rooted) => {
+                if self.const_is_reference_untyped(name, *rooted, use_span) {
                     Reach::UNTYPED
                 } else {
                     Reach::OPAQUE
@@ -1187,7 +1187,12 @@ impl<'i> Typer<'i> {
     ///   therefore never even reach this predicate).
     ///
     /// [`CoreIndex::object_constant_class`]: rigor_index::CoreIndex::object_constant_class
-    fn const_is_reference_untyped(&self, root: &str, use_span: rigor_parse::Span) -> bool {
+    fn const_is_reference_untyped(
+        &self,
+        root: &str,
+        rooted: bool,
+        use_span: rigor_parse::Span,
+    ) -> bool {
         if root.is_empty() || root.contains("::") {
             return false;
         }
@@ -1199,7 +1204,7 @@ impl<'i> Typer<'i> {
             return false;
         }
         let prefix = self.enclosing_prefix(use_span);
-        !self.constant_names_a_known_class(&self.resolve_constant_as_written(root, prefix))
+        !self.constant_names_a_known_class(&self.resolve_constant_as_written(root, prefix, rooted))
     }
 }
 
@@ -1773,8 +1778,11 @@ enum UntypedRoot {
     Cvar(String),
     /// A global variable, name with the `$` (`"$config"`).
     Gvar(String),
-    /// A constant read, as written (`"CONFIG"`, `"Foo::BAR"`).
-    Const(String),
+    /// A constant read, as written (`"CONFIG"`, `"Foo::BAR"`); the flag is
+    /// `Node::ConstantRead::rooted` — a `::C` spelling anchors at the top
+    /// level and never resolves through the enclosing lexical prefix
+    /// (rigor-rs#672).
+    Const(String, bool),
 }
 
 impl UntypedRoot {
@@ -1787,7 +1795,7 @@ impl UntypedRoot {
             | UntypedRoot::Ivar(n)
             | UntypedRoot::Cvar(n)
             | UntypedRoot::Gvar(n)
-            | UntypedRoot::Const(n) => n,
+            | UntypedRoot::Const(n, _) => n,
         }
     }
 }
@@ -1808,7 +1816,9 @@ fn untyped_expr_root(ast: &LoweredAst, id: NodeId, depth: u32) -> Option<Untyped
     }
     match ast.get(id) {
         Node::LocalVariableRead { name, .. } => Some(UntypedRoot::Local(name.clone())),
-        Node::ConstantRead { name, .. } => Some(UntypedRoot::Const(name.to_string())),
+        Node::ConstantRead { name, rooted, .. } => {
+            Some(UntypedRoot::Const(name.to_string(), *rooted))
+        }
         Node::VariableRead { name, .. } => {
             if let Some(rest) = name.strip_prefix("@@") {
                 (!rest.is_empty()).then(|| UntypedRoot::Cvar(name.clone()))

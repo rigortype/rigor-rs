@@ -2050,3 +2050,81 @@ fn singleton_mixin_chain_limit_counts_the_root_entry() {
     let (_b, idx) = build_one(src.as_bytes(), &core);
     assert!(idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
 }
+
+#[test]
+fn meta_new_write_census_covers_or_path_nested_positions() {
+    // rigor-rs#672 review: `discovered_classes` (`collect_class_decls`)
+    // descends the whole tree and covers the or-write/path-write shapes the
+    // lowering drops — `is_a?(::Foo)`-family operands consult it.
+    let core = CoreIndex::new();
+    let src = b"Foo ||= Struct.new(:a)\n\
+                Bar ||= Class.new\n\
+                module M; ::Baz = Struct.new(:a); end\n\
+                module N; K::Qux = Data.define(:x); end\n\
+                [1].each { Blocked = Class.new }\n\
+                Mod = Struct.new(:a) if true\n\
+                Ctrl = 1\n\
+                Anded &&= Struct.new(:a)\n\
+                k = [M].first\n\
+                k::Dyn = Struct.new(:a)\n\
+                module P; Orm = Module.new; end\n";
+    let (_a, idx) = build_one(src, &core);
+    for name in ["Foo", "Bar", "Baz", "Blocked", "Mod"] {
+        assert!(idx.knows_discovered_class(name), "{name}");
+    }
+    assert!(idx.knows_discovered_class("N::K::Qux"));
+    assert!(idx.knows_discovered_class("P::Orm"));
+    // `&&=` is not a `collect_class_decls` arm; `Ctrl = 1` binds no class;
+    // `k::Dyn`'s dynamic base is unnameable; `Baz` is rooted — never `M::Baz`.
+    for name in ["Anded", "Ctrl", "Dyn", "M::Baz", "Qux"] {
+        assert!(!idx.knows_discovered_class(name), "{name}");
+    }
+}
+
+#[test]
+fn meta_new_self_anchored_writes_resolve_rebound_self() {
+    let core = CoreIndex::new();
+    let src = b"module M; self::Foo = Struct.new(:a); end\n\
+                module M2; self::Bar ||= Class.new; end\n\
+                self::Top = Struct.new(:a)\n\
+                module M3; self::N::Deep = Data.define(:x); end\n";
+    let (_a, idx) = build_one(src, &core);
+    for name in ["M::Foo", "M2::Bar", "Top", "M3::N::Deep"] {
+        assert!(idx.knows_discovered_class(name), "{name}");
+    }
+    let src = b"class C; class << self; self::InS = Struct.new(:a); end; end\n\
+                class C2; class << self; Bare = Struct.new(:a); end; end\n\
+                class C3; class << self; A::Path = Struct.new(:a); end; end\n";
+    let (_a, idx) = build_one(src, &core);
+    assert!(!idx.knows_discovered_class("InS"));
+    assert!(!idx.knows_discovered_class("Bare"));
+    assert!(!idx.knows_discovered_class("C2::Bare"));
+    assert!(idx.knows_discovered_class("C3::A::Path"));
+}
+
+#[test]
+fn discovered_classes_records_nested_decls_and_block_self() {
+    let core = CoreIndex::new();
+    // `class A; class M` keys `A::M`, never bare `M` (rigor-rs#672 round 4).
+    let (_a, idx) = build_one(b"class A; class M; end; end\nmodule B; module C; end; end\nclass D::E; end\n", &core);
+    for name in ["A::M", "B::C", "D::E", "A", "B", "D"] {
+        assert!(idx.knows_discovered_class(name), "{name}");
+    }
+    // `synthesize_namespace_prefixes`: `class D::E` synthesises `D`; the
+    // LEAF name is never re-keyed bare (`M`/`C`/`E` stay absent).
+    for name in ["M", "C", "E"] {
+        assert!(!idx.knows_discovered_class(name), "{name}");
+    }
+    // A `Foo ||= <factory>`/`::Foo = <factory>` block's self is the write's
+    // own name (`collect_meta_new_constant_decls?` covers all four write
+    // shapes, not just `K =`).
+    let (_a, idx) = build_one(
+        b"Foo ||= Class.new do self::X = Struct.new(:a); end\n\
+          M::Bar = Class.new do self::Y = Struct.new(:a); end\n\
+          self::Zed = Class.new do self::Z = Struct.new(:a); end\n",
+        &core,
+    );
+    for name in ["Foo::X", "M::Bar::Y", "Zed::Z"] {
+        assert!(idx.knows_discovered_class(name), "{name}");
+    }
+}

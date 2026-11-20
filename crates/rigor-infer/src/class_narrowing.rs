@@ -2207,7 +2207,7 @@ impl<'i> Typer<'i> {
         id: NodeId,
         use_span: rigor_parse::Span,
     ) -> Option<String> {
-        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(id) else {
+        let Node::ConstantRead { name, dynamic_base, rooted, .. } = ast.get(id) else {
             return None;
         };
         // A dynamic base (`k::String`, `self::String`, `self.class::String`)
@@ -2216,11 +2216,25 @@ impl<'i> Typer<'i> {
         if name.is_empty() || *dynamic_base {
             return None;
         }
+        if *rooted {
+            // `lexical_class_name`'s rooted arm keeps the de-rooted spelling
+            // UN-WALKED — `when ::Stat` inside `class File` names top-level
+            // `Stat`, never `File::Stat` (rigor-rs#672). Only a ONE-SEGMENT
+            // top-level project class shadows it: `knows_class`'s leaf key
+            // used to shadow `::M` for a nested `class A; class M`, and
+            // `discovered_decls`'s qualified keys would shadow
+            // `::Outer::Inner` — both are names the rooted operand narrows
+            // to on the oracle (rigor-rs#672 rounds 6–7).
+            if !name.contains("::") && self.source.knows_discovered_decl(name) {
+                return None;
+            }
+            return Some(name.to_string());
+        }
         let prefix = self.enclosing_prefix(use_span);
         if self.source.constant_shadowed(name, prefix) {
             return None;
         }
-        Some(self.resolve_constant_as_written(name, prefix))
+        Some(self.resolve_constant_as_written(name, prefix, false))
     }
 
     /// [`Typer::resolved_static_constant`] for the `is_a?`/`instance_of?` arm,
@@ -2235,15 +2249,36 @@ impl<'i> Typer<'i> {
         id: NodeId,
         use_span: rigor_parse::Span,
     ) -> Option<(String, bool)> {
-        let Node::ConstantRead { name, dynamic_base, .. } = ast.get(id) else {
+        let Node::ConstantRead { name, dynamic_base, rooted, .. } = ast.get(id) else {
             return None;
         };
         if name.is_empty() || *dynamic_base {
             return None;
         }
+        if *rooted {
+            // `rooted_class_predicate_name` (upstream #614, rigor-rs#672): a
+            // `::C` operand names the TOP level only — `is_a?(::Stat)` inside
+            // `class File` never narrows to `File::Stat`. It answers `C` when
+            // `class_known_to_scope?` holds — the RBS registry / project
+            // `sig/` (`constant_names_a_known_class`) or an in-source
+            // top-level class (`knows_class`, the `discovered_classes`
+            // analogue) — and DECLINES outright (nil → no fact) when nothing
+            // owns it. A project class takes the same assert-only
+            // `mintable: false` the unrooted arm gives lexical shadows.
+            // `class_known_to_scope?`: RBS / project `sig/` OR an in-source
+            // class — `class`/`module` (`knows_class`) or a meta-new write
+            // (`Foo = Struct.new`, the rest of `discovered_classes`).
+            if self.source.knows_discovered_class(name) {
+                return Some((name.to_string(), false));
+            }
+            if self.constant_names_a_known_class(name) {
+                return Some((name.to_string(), true));
+            }
+            return None;
+        }
         let prefix = self.enclosing_prefix(use_span);
         let shadowed = self.source.constant_shadowed(name, prefix);
-        Some((self.resolve_constant_as_written(name, prefix), !shadowed))
+        Some((self.resolve_constant_as_written(name, prefix, false), !shadowed))
     }
 
     /// Resolve a guard constant's SOURCE SPELLING to the qualified key it names,
@@ -2258,20 +2293,24 @@ impl<'i> Typer<'i> {
     /// witness gate declines it anyway (probes p2/p2b are reference-silent), and
     /// leaving it verbatim keeps `guard_meet_precise` seeing exactly what it saw
     /// before this slice.
-    pub(crate) fn resolve_constant_as_written(&self, name: &str, prefix: &[String]) -> String {
-        let (bare, absolute) = match name.strip_prefix("::") {
-            Some(rest) => (rest, true),
-            None => (name, false),
-        };
-        if !absolute {
+    pub(crate) fn resolve_constant_as_written(
+        &self,
+        name: &str,
+        prefix: &[String],
+        rooted: bool,
+    ) -> String {
+        // `rooted` is `Node::ConstantRead`'s flag — the lowering renders `::C`
+        // UNROOTED, so the `starts_with` sniff the old code relied on was dead
+        // and a rooted operand walked the lexical ladder (rigor-rs#672).
+        if !rooted {
             for depth in (1..=prefix.len()).rev() {
-                let cand = format!("{}::{bare}", prefix[..depth].join("::"));
+                let cand = format!("{}::{name}", prefix[..depth].join("::"));
                 if self.constant_names_a_known_class(&cand) {
                     return cand;
                 }
             }
         }
-        bare.to_string()
+        name.to_string()
     }
 
     /// Whether `qname` names a class/module some AUTHORITATIVE surface knows —

@@ -176,6 +176,23 @@ impl SourceIndex {
         self.classes.contains_key(name)
     }
 
+    /// Whether `name` is in `discovered_classes` — `collect_class_decls`'s
+    /// accumulator: nameable `class`/`module` declarations AND meta-new
+    /// constant writes, keyed qualified (rigor-rs#672). This is the
+    /// `discovered_classes.key?` half of `class_known_to_scope?`.
+    pub(crate) fn knows_discovered_class(&self, name: &str) -> bool {
+        self.discovered_classes.contains(name)
+    }
+
+    /// Whether the project DECLARES `name` as a `class`/`module` — the
+    /// declaration half of `discovered_classes` (no meta-new writes, no
+    /// prefix synthesis). `resolved_static_constant`'s rooted shadow-decline
+    /// consults it: `class A::M` must not shadow a bare `::M`, and a
+    /// `Foo = Struct.new` write is not a shadow (rigor-rs#672 round 6).
+    pub(crate) fn knows_discovered_decl(&self, name: &str) -> bool {
+        self.discovered_decls.contains(name)
+    }
+
     /// The DISCOVERED written superclass (last path component) of a source class,
     /// or `None` when the name is unknown OR is a source class/module WITHOUT a
     /// `class Foo < Bar` superclass (a bare `class Foo`/`module Foo` — the two are
