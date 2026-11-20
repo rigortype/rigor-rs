@@ -250,7 +250,11 @@ impl<T> ExprEntry<T> {
 /// record handed to the enclosing computation.
 type ExprHit<T> = (T, Rc<[u32]>, Rc<[TruthyKey]>);
 
-/// `type_of` memo payload: the carrier plus whether it embeds no interner ids.
+/// `type_of` memo payload: the carrier plus whether it embeds no interner
+/// ids. The FLAT memo (`type_of_memo`) stores only when the flag is `true`
+/// — its entries re-intern under whichever interner the hit arrives with.
+/// The env memo (`type_of_env_memo`) is uid-scoped, so its callers pass
+/// `true` and every carrier stores.
 type TypeOfOut = (Type, bool);
 
 /// One stored `type_of` answer for an env-SENSITIVE `Node::Call` — the
@@ -468,6 +472,15 @@ impl ReachMemo {
     /// Whether the entries belong to `ast` and `dead`.
     pub(crate) fn valid_for(&self, ast: (usize, usize), dead: &Option<Rc<DeadPositions>>) -> bool {
         self.ast == ast && same_dead(&self.dead, dead)
+    }
+
+    /// Entries stored for [`Typer::type_of_env_memo`] at `node` — the
+    /// rigor-rs#427 pin that a block chain's interner-bound `Tuple`
+    /// answers STORE (a `0` would mean every driver visit re-types the
+    /// whole receiver suffix).
+    #[cfg(test)]
+    pub(crate) fn env_type_entry_count(&self, node: NodeId) -> usize {
+        self.type_env_ofs.get(&(node.0, 0)).map_or(0, Vec::len)
     }
 
     /// Start over for `ast` and `dead` unless the entries already belong to
@@ -983,9 +996,7 @@ impl<'i> Typer<'i> {
     /// carries the env it was computed under — fingerprint + verbatim
     /// snapshot — plus `def_scope` and the interner identity, which
     /// [`EnvExprEntry::matches`] checks exactly before the stack
-    /// dependency answer is trusted. `compute` has the same contract as
-    /// `type_of_memo`'s: the `Type` the call interned and whether it
-    /// embeds no interner ids.
+    /// dependency answer is trusted.
     ///
     /// `type_of` routes a call here only when its subtree reads env and
     /// `env` is small (the snapshot+compare is O(env), so a bound keeps a
@@ -994,6 +1005,25 @@ impl<'i> Typer<'i> {
     /// `interner_id` is [`rigor_types::Interner::uid`] — the caller passes
     /// it rather than a borrow so the `compute` closure keeps its `&mut`
     /// (the env snapshot's `TypeId`s are only meaningful under it).
+    ///
+    /// Known key gap (rigor-rs#699's family): `Typer::loop_pass` — the
+    /// fixpoint replay that changes how `if` decisions re-type — is NOT
+    /// part of the entry key, like it is not part of the flat memo's. No
+    /// probe has reached a divergence through it (the loop-pass shapes all
+    /// decline before `type_of` matters; the 9k-file memo audit is clean),
+    /// but storing interner-bound answers widens the set an entry may
+    /// answer, so a future loop-pass reachability change must either fold
+    /// the flag into this key or invalidate the window when it flips.
+    ///
+    /// Unlike the flat memo, ANY carrier may be stored, including one that
+    /// embeds `TypeId`s: a hit requires the very interner that produced the
+    /// ids (uid match), so they are re-interned — a dedup hit — under the
+    /// same arena rather than translated across interners (rigor-rs#427:
+    /// without this a block chain whose every answer is a deep `Tuple`
+    /// (`[1].map { |y| [[…[y]…]] }.map { … }`) never stores — and with a
+    /// block call typing its receiver twice, every driver visit then
+    /// DOUBLED the remaining suffix's work: exponential in the chain,
+    /// 2^k − 1 `type_block_call` events for the k-th link).
     pub(crate) fn type_of_env_memo(
         &self,
         ast: &LoweredAst,
@@ -1057,7 +1087,7 @@ impl<'i> Typer<'i> {
             frames.record(stack, &tested, &folding);
             (tested, folding)
         };
-        if out.1 && same_dead(&dead, &self.current_dead(ast)) {
+        if same_dead(&dead, &self.current_dead(ast)) {
             let mut memo = self.reach_memo.borrow_mut();
             if memo.valid_for(ast_id, &dead) {
                 tested.sort_unstable();
