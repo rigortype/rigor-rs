@@ -5245,26 +5245,14 @@ mod severity_config_tests {
                 "x: !ruby/object:BigDecimal 5\n",
                 "unspecified class: BigDecimal",
             ),
-            // A `!str`-family mapping's children record BEFORE its
-            // `init_with` runs (round 3: the arm visits every child, then
-            // freezes only when a non-`str` member exists and the `str`
-            // value is missing or frozen) — these benign shapes keep
-            // firing the sibling/child death upstream too.
-            (
-                "x: !str {str: foo, a: 2}\ny: 2024-01-01\n",
-                "unspecified class: Date",
-            ),
-            (
-                "x: !str {str: 1, str: foo}\ny: 2024-01-01\n",
-                "unspecified class: Date",
-            ),
+            // A `!str`-family mapping's children record BEFORE `init_with`
+            // runs, and a mapping with NO non-`str` member never calls
+            // `instance_variable_set` — these complete on both engines, so
+            // the child/sibling death still fires (round 4's coarse rule
+            // declines every members-exist shape instead).
             ("x: !str {str: 1}\ny: 2024-01-01\n", "unspecified class: Date"),
             ("x: !str: {}\ny: *a\n", "Psych::AliasesNotEnabled"),
             ("x: !str: {a: 2024-01-01}\n", "unspecified class: Date"),
-            (
-                "x: !str {str: {a: 1}, b: 2}\ny: 2024-01-01\n",
-                "unspecified class: Date",
-            ),
             ("x: !float 1.5\ny: 2024-01-01\n", "unspecified class: Date"),
             ("x: !float 5\ny: *a\n", "Psych::AliasesNotEnabled"),
         ] {
@@ -5317,10 +5305,12 @@ mod severity_config_tests {
         // review — three more arm shapes that raise outside the model:
         // `Float()`'s `ArgumentError` (`!float` on a non-numeric value,
         // and the untagged FLOAT arm's no-digit rewrite `.e+1`), and a
-        // `!str`-family MAPPING whose `init_with` freezes (non-`str`
-        // members with the `str` value missing or frozen — its children
-        // still record; the SIBLING after the mapping is what the stop
-        // protects). NOT an empty `!str:` — that arm keeps visiting (probe:
+        // `!str`-family MAPPING with any NON-`str` member (round 4's
+        // coarse rule: `init_with` then runs `instance_variable_set` —
+        // `FrozenError` on a missing/frozen/tagged `str` value, `NameError`
+        // on invalid member names — so the scan declines the superset; its
+        // children still record first, and the member-less shapes still
+        // complete). NOT an empty `!str:` — that arm keeps visiting (probe:
         // `x: !str: {a: 2024-01-01}` dies `Date` on both engines), and a
         // `[a, 1]` pair element loads on both. These load here; upstream's
         // own fate varies (`NoMethodError`, `FrozenError`, `ArgumentError`,
@@ -5338,6 +5328,17 @@ mod severity_config_tests {
             "x: !str {a: 1}\ny: 2024-01-01\n",
             "x: !!str {a: 1}\ny: 2024-01-01\n",
             "x: !str {str: 1, a: 2}\ny: 2024-01-01\n",
+            // … and any NON-`str` member at all (round 4's coarse rule):
+            // `init_with`'s `instance_variable_set` also raises `NameError`
+            // on invalid names and `FrozenError` on tagged/nil `str`
+            // values, so the benign members-exist shapes decline too.
+            "x: !str {str: foo, a: 2}\ny: 2024-01-01\n",
+            "x: !str {str: 1, str: foo}\ny: 2024-01-01\n",
+            "x: !str {str: {a: 1}, b: 2}\ny: 2024-01-01\n",
+            "x: !str {str: foo, 1: 2}\ny: 2024-01-01\n",
+            "x: !str {str: foo, \"a b\": 2}\ny: 2024-01-01\n",
+            "x: !str {str: !str {}, a: 1}\ny: 2024-01-01\n",
+            "x: !str {str: !float 1e5, a: 1}\ny: 2024-01-01\n",
             "x: !float abc\ny: 2024-01-01\n",
             "x: !float abc\n",
             "x: .e+1\ny: 2024-01-01\n",

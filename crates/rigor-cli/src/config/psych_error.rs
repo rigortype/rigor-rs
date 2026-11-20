@@ -124,10 +124,11 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
         // the document still outranks a death recorded before the tag.
         let mut scan = true;
         // `!str`-family MAPPINGs need post-order tracking (see
-        // [`StrMapTracker`]): the arm visits every child, then crashes in
-        // `init_with` when a non-`str` member exists and the `str` value
-        // is missing or frozen — siblings after the mapping's END are
-        // never visited upstream.
+        // [`StrMapTracker`]): the arm visits every child, then
+        // `init_with` runs `instance_variable_set` for every non-`str`
+        // member onto the `str` value — a crash for all but the
+        // plain-String/valid-name shapes — so the scan stops recording at
+        // the mapping's END whenever a non-`str` member exists.
         let mut str_maps: Vec<StrMapTracker> = Vec::new();
         let mut collection_depth: u32 = 0;
         loop {
@@ -154,7 +155,7 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
                     };
                     let tag = c_string(scalar.tag.cast());
                     if let Some(tracker) = str_maps.last_mut() {
-                        tracker.scalar_slot(collection_depth, &value, scalar.quoted_implicit);
+                        tracker.scalar_slot(collection_depth, &value);
                     }
                     match scalar_rejection(tag.as_deref(), &value, scalar.quoted_implicit) {
                         ScalarOutcome::Permitted => {}
@@ -203,9 +204,11 @@ pub(super) fn safe_load_rejection(text: &str) -> Option<SafeLoadRejection> {
                         .is_some_and(|tracker| tracker.depth == collection_depth)
                     {
                         // `init_with` runs after every child has visited:
-                        // non-`str` members plus a missing-or-frozen `str`
-                        // value raise the unmodelled `FrozenError` there,
-                        // so a sibling after this mapping is never visited.
+                        // any NON-`str` member makes it run
+                        // `instance_variable_set` onto the `str` value — a
+                        // crash for all but the plain-String/valid-name
+                        // shapes, so the scan declines on the superset (see
+                        // [`StrMapTracker`]).
                         if str_maps
                             .last()
                             .is_some_and(|tracker| tracker.freezes_at_init_with())
@@ -392,13 +395,20 @@ fn is_str_mapping(tag: Option<&str>) -> bool {
 /// `visit_Psych_Nodes_Mapping`, the `/^!(?:str|ruby\/string)/` case)
 /// visits every child pair — child deaths fire BEFORE `init_with`, which
 /// is why they keep recording — then `init_with` runs
-/// `instance_variable_set` for every NON-`str` member onto the `str`
-/// value: `FrozenError` when such a member exists and the value is
-/// missing (`nil`) or frozen (every tokenize result but a String —
-/// probe: `!str {a: 1}` and `!str {str: 1, a: 2}` crash, `!str {}` and
-/// `!str {str: foo, a: 2}` complete). A sibling AFTER the mapping is
-/// never visited upstream when it crashes, so the scan stops recording
-/// at its END.
+/// `instance_variable_set(:"@#{k}", v)` for every NON-`str` member onto
+/// the `str` value. That raises unless the value is a plain unfrozen
+/// String and every member key a valid instance-variable name:
+/// `FrozenError` on a missing-or-frozen value (probe: `!str {a: 1}`,
+/// `!str {str: 1, a: 2}`, `!str {str: !str {}, a: 1}`,
+/// `!str {str: !float 1e5, a: 1}`) and `NameError` on invalid names
+/// (probe: `!str {str: foo, 1: 2}`'s `'@1'`, `"a b": 2`'s `'@a b'`).
+/// Rather than model which benign shapes complete, the scan declines
+/// whenever any non-`str` member EXISTS — every crash shape is inside
+/// that superset, and the probed completes-shapes have no members to
+/// lose (`!str {}`, `!str {str: V}` give the later sibling's death on
+/// both engines). The members-exist benign shapes (`!str {str: foo,
+/// a: 2}` and kin) load here against a reference Date — the declining
+/// side.
 struct StrMapTracker {
     /// The collection depth of this mapping's own member events.
     depth: u32,
@@ -410,9 +420,6 @@ struct StrMapTracker {
     str_key: bool,
     /// Some key was `str` (the last such pair decides the value).
     str_present: bool,
-    /// The last `str` value was unfrozen: a String, or a nested
-    /// collection (`Hash`/`Array` take instance variables fine).
-    str_ok: bool,
 }
 
 impl StrMapTracker {
@@ -423,11 +430,10 @@ impl StrMapTracker {
             pairs: 0,
             str_key: false,
             str_present: false,
-            str_ok: false,
         }
     }
 
-    fn scalar_slot(&mut self, depth: u32, value: &str, quoted: bool) {
+    fn scalar_slot(&mut self, depth: u32, value: &str) {
         if depth != self.depth {
             return;
         }
@@ -437,7 +443,6 @@ impl StrMapTracker {
             self.str_key = value == "str";
         } else if self.str_key {
             self.str_present = true;
-            self.str_ok = quoted || !tokenize_freezes(value);
             self.str_key = false;
         }
         self.slot += 1;
@@ -452,19 +457,18 @@ impl StrMapTracker {
             // A collection key is not the scalar `str`.
             self.str_key = false;
         } else if self.str_key {
-            // A collection value is an unfrozen `Hash`/`Array`.
             self.str_present = true;
-            self.str_ok = true;
             self.str_key = false;
         }
         self.slot += 1;
     }
 
-    /// `init_with`'s `FrozenError` predicate: members beyond the `str`
-    /// pair exist, and the `str` value is missing or frozen.
+    /// `init_with`'s crash predicate: any NON-`str` member makes it run
+    /// `instance_variable_set` — see the struct's doc for why the scan
+    /// declines on the superset rather than guess at which benign shapes
+    /// complete.
     fn freezes_at_init_with(&self) -> bool {
-        let members = self.pairs - u32::from(self.str_present);
-        members > 0 && !(self.str_present && self.str_ok)
+        self.pairs - u32::from(self.str_present) > 0
     }
 }
 
@@ -582,84 +586,6 @@ fn float_grammar_match(s: &str) -> bool {
     GRAMMAR
         .get_or_init(|| {
             Regex::new(r"^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][-+]?[0-9]+)?$").unwrap()
-        })
-        .is_match(s)
-}
-
-/// Does the tokenizer yield a FROZEN value for the plain scalar `s`?
-/// `init_with`'s `instance_variable_set` raises `FrozenError` on frozen
-/// results, so a `!str` mapping's `str` value freezes exactly when
-/// `tokenize` answers nil/bool/Integer/Float: the ALPHA branch's
-/// `~`/`null`/`yes|true|on`/`no|false|off` spellings (its other results
-/// are Strings — `/^[^ytonf~]/i` takes anything else, including every
-/// multi-byte spelling), the `.inf`/`.nan` floats, and the sexagesimal,
-/// FLOAT and INTEGER arms. The Time/Date/Symbol arms die at the
-/// restricted loader before any value exists — reported `true`, which
-/// only ever declines.
-fn tokenize_freezes(s: &str) -> bool {
-    if alpha_match(s) || s.contains('\n') {
-        if s.chars().count() > 5 {
-            return false;
-        }
-        // `/^[^ytonf~]/i` — a first char outside the ytonf spellings
-        // returns the String unfrozen.
-        if s.chars().next().is_some_and(|c| !"yYtToOnNfF~".contains(c)) {
-            return false;
-        }
-        s == "~"
-            || s.eq_ignore_ascii_case("null")
-            || matches!(
-                s.to_ascii_lowercase().as_str(),
-                "yes" | "true" | "on" | "no" | "false" | "off"
-            )
-    } else if (s.starts_with(':') && s.len() > 1) || time_match(s) || date_match(s) {
-        // A restricted-loader death upstream — the walk ends before
-        // `init_with`, so `true` only ever declines.
-        true
-    } else if inf_nan_match(s) || sexagesimal_match(s) || integer_match(s) {
-        // `Float::INFINITY`/`NaN`, sexagesimal and INTEGER results —
-        // all frozen.
-        true
-    } else if psych_float_match(s) {
-        // The FLOAT arm's bare-dot escape returns the (unfrozen) String;
-        // every other FLOAT result is a frozen Float — or the walk died
-        // at `Float()` before `init_with`, where `true` only declines.
-        !bare_dot_match(s)
-    } else {
-        // The `else` arm returns the (unfrozen) String.
-        false
-    }
-}
-
-/// `.inf`/`-.inf`/`.nan` — `tokenize` returns `Float::INFINITY`/`NAN`,
-/// both frozen.
-fn inf_nan_match(s: &str) -> bool {
-    static INF_NAN: OnceLock<Regex> = OnceLock::new();
-    INF_NAN
-        .get_or_init(|| Regex::new(r"(?i)^[+-]?\.inf$|^\.nan$").unwrap())
-        .is_match(s)
-}
-
-/// The sexagesimal arms — Integer/Float results, both frozen.
-fn sexagesimal_match(s: &str) -> bool {
-    static SEXA: OnceLock<Regex> = OnceLock::new();
-    SEXA
-        .get_or_init(|| {
-            Regex::new(r"^[-+]?[0-9][0-9_]*(?::[0-5]?[0-9]){1,2}(?:\.[0-9_]*)?$").unwrap()
-        })
-        .is_match(s)
-}
-
-/// `tokenize`'s INTEGER arm (`INTEGER_LEGACY`, the default
-/// `strict_integer: false`) — Integer results, frozen.
-fn integer_match(s: &str) -> bool {
-    static INTEGER: OnceLock<Regex> = OnceLock::new();
-    INTEGER
-        .get_or_init(|| {
-            Regex::new(
-                r"^[+-]?(?:0b[_,]*[0-1][0-1_,]*|0[_,]*[0-7][0-7_,]*|(?:0|[1-9](?:[0-9]|,[0-9]|_[0-9])*)|0x[_,]*[0-9a-fA-F][0-9a-fA-F_,]*)$",
-            )
-            .unwrap()
         })
         .is_match(s)
 }
