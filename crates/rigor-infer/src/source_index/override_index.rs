@@ -550,7 +550,6 @@ fn alias_adopted_methods(
 /// [`super::refine_walk::scan_refinements`], which also walks the
 /// `def`-context placements this old direct-statement scan could not see
 /// (rigor-rs#446).
-
 fn collect_body_extends(ast: &LoweredAst, body: &[NodeId]) -> Vec<String> {
     let mut out = Vec::new();
     for &child in body {

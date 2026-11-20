@@ -131,7 +131,7 @@ impl SourceIndex {
                         target == class
                             || self
                                 .level_names(core, class)
-                                .map(|levels| levels.iter().any(|l| *l == target))
+                                .map(|levels| levels.contains(&target))
                                 .unwrap_or(false)
                     }
                 };
@@ -186,7 +186,7 @@ impl SourceIndex {
                         let name = self
                             .resolve_override_ancestor(&from, &raw)
                             .unwrap_or_else(|| raw.clone());
-                        if !names.iter().any(|n| *n == name) {
+                        if !names.contains(&name) {
                             names.push(name.clone());
                         }
                         // An external's own ancestors come with it —
@@ -304,7 +304,7 @@ impl SourceIndex {
                 return false;
             }
             match core.ancestor_names(target) {
-                Some(ancestors) if ancestors.iter().any(|a| *a == class) => {
+                Some(ancestors) if ancestors.contains(&class) => {
                     return false;
                 }
                 None if !core.knows_class(target) && !core.knows_qualified_class(target) => {
@@ -430,9 +430,8 @@ fn split_qualified_owner(module: &str) -> Vec<String> {
 /// An unreadable spelling may be a module (`extend` may put it ahead), so
 /// it counts — the decline direction.
 fn target_is_moduleish(idx: &SourceIndex, core: &CoreIndex, target: &str) -> bool {
-    match idx.project_declares_module(target) {
-        Some(v) => return v,
-        None => {}
+    if let Some(v) = idx.project_declares_module(target) {
+        return v;
     }
     if core.is_module(target) || core.is_qualified_module(target) {
         return true;
