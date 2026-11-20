@@ -2107,11 +2107,12 @@ fn discovered_classes_records_nested_decls_and_block_self() {
     let core = CoreIndex::new();
     // `class A; class M` keys `A::M`, never bare `M` (rigor-rs#672 round 4).
     let (_a, idx) = build_one(b"class A; class M; end; end\nmodule B; module C; end; end\nclass D::E; end\n", &core);
-    for name in ["A::M", "B::C", "D::E", "A", "B"] {
+    for name in ["A::M", "B::C", "D::E", "A", "B", "D"] {
         assert!(idx.knows_discovered_class(name), "{name}");
     }
-    // A compact `class D::E` declares `D::E` alone — `D` is not invented.
-    for name in ["M", "C", "E", "D"] {
+    // `synthesize_namespace_prefixes`: `class D::E` synthesises `D`; the
+    // LEAF name is never re-keyed bare (`M`/`C`/`E` stay absent).
+    for name in ["M", "C", "E"] {
         assert!(!idx.knows_discovered_class(name), "{name}");
     }
     // A `Foo ||= <factory>`/`::Foo = <factory>` block's self is the write's

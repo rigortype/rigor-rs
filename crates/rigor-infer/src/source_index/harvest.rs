@@ -478,7 +478,19 @@ impl SourceIndex {
                     .extend(indices.iter().copied());
             }
             idx.project_constant_write_names.extend(h.constant_write_bare_names.iter().cloned());
-            idx.discovered_classes.extend(h.discovered_names.iter().cloned());
+            for name in &h.discovered_names {
+                // `synthesize_namespace_prefixes` (scope_indexer.rb:13287):
+                // every PROPER `::` prefix of a discovered name also names a
+                // namespace — `class A::B::C` discovers `A` and `A::B`, and
+                // `M::Foo = Class.new` discovers `M`.
+                let mut segs: Vec<&str> = name.split("::").collect();
+                while segs.pop().is_some() {
+                    if !segs.is_empty() {
+                        idx.discovered_classes.insert(segs.join("::"));
+                    }
+                }
+                idx.discovered_classes.insert(name.clone());
+            }
         }
         // `subtract_def_methods` (`finalize_def_index`): cross-file method
         // suppression is for the project's OWN accessors/aliases — NOT plain
