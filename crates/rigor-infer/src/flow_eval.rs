@@ -1354,6 +1354,26 @@ impl<'i> Typer<'i> {
                 .min()
                 .unwrap_or(usize::MAX)
         };
+        // `for`-index writes never land a `Site` (`Node::Loop.index` /
+        // `index_writes`), and they bind the name for the WHOLE body
+        // window — a `for k` after the leaf still rebinds `k` on the same
+        // pass — so any `for` write of a leaf-read name makes its value
+        // unprovable here (the element type is not computed either way).
+        let mut for_writes: HashSet<String> = HashSet::new();
+        for (_, m) in ast.iter() {
+            let Node::Loop { index, index_writes, span, kind, .. } = m
+            else {
+                continue;
+            };
+            if !matches!(kind, rigor_parse::LoopKind::For)
+                || !(body_span.0 <= span.0 && span.1 <= body_span.1)
+                || inside_nested(*span)
+            {
+                continue;
+            }
+            for_writes.extend(index.iter().map(|(nm, _)| nm.clone()));
+            for_writes.extend(index_writes.iter().map(|(nm, _, _)| nm.clone()));
+        }
         let nil = interner.nil();
         // rigor-rs#683 — a plain self-write compounds when a self-read feeds
         // its result unboundedly. `x = x || v` only unions with the entry
@@ -1494,20 +1514,7 @@ impl<'i> Typer<'i> {
                             let mut r_ty = None;
                             let mut entry_survives = false;
                             let mut unprovable = false;
-                            // A `for` index is a write that never lands a
-                            // site (`Node::Loop.index`), so `live` misses
-                            // it — the bound element type is not provable
-                            // here either way.
-                            if ast.iter().any(|(_, m)| {
-                                matches!(m, Node::Loop { index, index_writes, span, kind, .. }
-                                    if matches!(kind, rigor_parse::LoopKind::For)
-                                        && body_span.0 <= span.0
-                                        && span.1 <= pos
-                                        && (index.iter().any(|(nm, _)| nm == r)
-                                            || index_writes
-                                                .iter()
-                                                .any(|(nm, _, _)| nm == r)))
-                            }) {
+                            if for_writes.contains(r) {
                                 leaf_unprovable = true;
                                 continue;
                             }
