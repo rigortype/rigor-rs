@@ -60,7 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror — `AliasesNotEnabled`/`DisallowedClass` exit 1, parse-beats-visit, unmodelled arms decline; 5 review rounds, 0 FP every head. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
+- **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror; 5 review rounds, 0 FP every head, unmodelled arms decline. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
 
 - **2026-11-20 #672 CLOSED** (PR #708): rooted guard operands top-level; 0 FP, +3 dependabot rows →#714; →#709/#710. [note](notes/20261120-issue-672-rooted-class-guard.md)
 - **2026-11-20 #673 CLOSED** (PR #711): dynamic-base rescue designator (`k::X`) opaque — `dynamic_base` gates all five consumers. 0 FP. →#712. [note](notes/20261120-issue-673-rescue-dynamic-base.md)
@@ -149,5 +149,5 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-07-18/19 era, folded** — LSP §12 S1–S4b + coverage/MCP/audit (PRs #33–#43); ADR-0042 gate slices ([deliverables](notes/20260719-adr0042-gate-deliverables.md)); compat + `--bleeding-edge` ([findings](notes/20260718-phase0-m1-m2-findings.md)); RC bump ([note](notes/20260718-upstream-rc-bump-47ec8625-7a69f142.md)).
 - **2026-07-17 era (folded)**: docs economy (baton + [PORT_BACKLOG.md](PORT_BACKLOG.md), `docs_check.py`, #21); Tier B/C CLOSED ([note](notes/20260717-tier-bc-track-closed.md)); ATM arc + constant-shadow gate + C3a String-tail, gitlab UM 356→179 ([spec](notes/20260717-atm-substrate-arc-plan.md)).
 - **2026-07-16 two MERGED inference slices** — `def.ivar-write-mismatch` (gitlab ivar gaps 2→0) + literal-tail return folding (gitlab always-truthy 28→16). 0 FP both. [ivar](notes/20260716-ivar-write-mismatch-spec.md) / [fold](notes/20260716-literal-tail-fold-spec.md).
-- **2026-07-16 v0.3.0-RC arc: pin `47ec8625` + 7 slices, ALL MERGED** — syntactic rules, MutationWidening, implicit-self dispatch, HashShape keys, Kernel `format`/casts, `raise-non-exception`, `shadowed-rescue-clause`, rbs.rs nesting. **v0.3.0 rules fully ported.** [specs](notes/20260716-v030-upstream-gap-survey.md).
+- **2026-07-16 v0.3.0-RC arc: pin `47ec8625` + 7 slices, ALL MERGED — rules fully ported.** [specs](notes/20260716-v030-upstream-gap-survey.md).
 - **2026-07-11 sig-gen arc CLOSED + periphery** — erase → `--print` → union → singletons → write/diff/merge/overwrite → Data/Struct; `--write` sound. `--params=observed` SUBSTRATE-BLOCKED ([note](notes/20260711-siggen-params-observed-substrate-blocked.md)); frontier exhausted ([note](notes/20260711-coverage-frontier-remeasured.md)).
