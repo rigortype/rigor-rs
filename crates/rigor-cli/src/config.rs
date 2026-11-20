@@ -1919,6 +1919,25 @@ fn read_yaml(absolute: &Path) -> Result<serde_yaml::Value, LoadFailure> {
     // libyaml sees the text; serde_yaml forces UTF-8 on libyaml, which then
     // reads U+FEFF as content (a column, and `\u{feff}...` a scalar).
     let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+    // `YAML.safe_load_file(absolute, aliases: false)`'s VISITOR deaths (issue
+    // #347): `Psych.parse` completes the first document before `NoAliasRuby`
+    // and the restricted `ScalarScanner` walk it, so a syntax error still
+    // takes the `Psych::SyntaxError` surface below while an alias (`*a`) or a
+    // plain scalar Psych types as a non-permitted class (a `Date`/`Time`
+    // timestamp or a `:symbol`) is an UNCAUGHT `Psych::AliasesNotEnabled` /
+    // `Psych::DisallowedClass` — exit 1, named class and its message, the
+    // backtrace un-mirrored as with every other exit-1 crash here.
+    if let Some(death) = psych_error::safe_load_rejection(text) {
+        return Err(match death {
+            psych_error::SafeLoadRejection::Alias => crash_failure(
+                "Psych::AliasesNotEnabled: Alias parsing was not enabled. To enable it, \
+                 pass `aliases: true` to `Psych::load` or `Psych::safe_load`.".to_string(),
+            ),
+            psych_error::SafeLoadRejection::DisallowedClass(name) => crash_failure(format!(
+                "Psych::DisallowedClass: Tried to load unspecified class: {name}"
+            )),
+        });
+    }
     let value = parse_yaml(text).map_err(|e| {
         // Re-render as upstream's `#{absolute}:#{e.line}:#{e.column}: not
         // valid YAML: #{[e.problem, e.context].compact.join(" ")}` (exit 64).
@@ -5149,6 +5168,118 @@ mod severity_config_tests {
         match Config::read(&dir.join("r.yml")) {
             ConfigRead::Fatal(f) => assert_eq!(f.code, 64),
             _ => panic!("!ruby/object must stay fatal"),
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Issue #347 — `YAML.safe_load_file(absolute, aliases: false)`'s
+    /// VISITOR deaths: an alias USE (`*a`, resolved or not) is
+    /// `Psych::AliasesNotEnabled`, and a scalar `ScalarScanner#tokenize` /
+    /// `ToRuby#deserialize` resolves through the restricted `ClassLoader`
+    /// (empty `permitted_classes`) is `Psych::DisallowedClass` — both
+    /// UNCAUGHT upstream (exit 1), so they are `Fatal(code 1)` here, not
+    /// serde_yaml's own resolutions. A bare `&a` anchor is legal YAML, a
+    /// QUOTED scalar never tokenizes, and a `Psych::SyntaxError` anywhere in
+    /// the first document still outranks every visitor death (upstream
+    /// parses, then walks).
+    #[test]
+    fn safe_load_visitor_deaths_match_the_reference() {
+        let dir = cfg_dir("safe");
+        for (yaml, want) in [
+            // Alias use — anchored, dangling, in a `<<` merge, or inside a
+            // collection — is `Psych::AliasesNotEnabled`.
+            ("x: &a 5\ny: *a\n", "Psych::AliasesNotEnabled"),
+            ("x: *nope\n", "Psych::AliasesNotEnabled"),
+            ("x: &a {k: 1}\ny:\n  <<: *a\n", "Psych::AliasesNotEnabled"),
+            ("x: &a 1\ny: [*a]\n", "Psych::AliasesNotEnabled"),
+            // Plain scalars `tokenize` types as a non-permitted class: the
+            // date regex (`\d{4}-\d{1,2}-\d{1,2}` — validity unchecked, so
+            // 2024-02-31 dies), the TIME regex, and `:symbol`s — in value,
+            // key, sequence and anchored positions alike.
+            ("baseline: 2024-01-01\n", "unspecified class: Date"),
+            ("x: 2024-02-31\n", "unspecified class: Date"),
+            ("x: 2024-1-5\n", "unspecified class: Date"),
+            ("x: 2024-01-01 10:00:00\n", "unspecified class: Time"),
+            ("x: 2024-01-01T10:00:00+09:00\n", "unspecified class: Time"),
+            ("x: :foo\n", "unspecified class: Symbol"),
+            ("x: :5\n", "unspecified class: Symbol"),
+            ("x: ::foo\n", "unspecified class: Symbol"),
+            ("2024-01-01: v\n", "unspecified class: Date"),
+            ("paths:\n  - :b\n", "unspecified class: Symbol"),
+            ("x: &a 2024-01-01\n", "unspecified class: Date"),
+            // Non-`!ruby` tags still reach `tokenize` through
+            // `deserialize`'s `else` arm (so does `!float`, inside
+            // `Float(tokenize)`).
+            ("x: !foo 2024-01-01\n", "unspecified class: Date"),
+            (
+                "x: !!timestamp 2024-01-01T00:00:00Z\n",
+                "unspecified class: Time",
+            ),
+            ("x: !float 2024-01-01\n", "unspecified class: Date"),
+            // Document order picks the FIRST death …
+            ("x: 2024-01-01\ny: *a\n", "unspecified class: Date"),
+            ("y: *a\nx: 2024-01-01\n", "Psych::AliasesNotEnabled"),
+            // … and `!ruby/*` tag arms land on the same restricted loader.
+            ("x: !ruby/sym foo\n", "unspecified class: Symbol"),
+            ("x: !ruby/class Foo\n", "unspecified class: Foo"),
+            (
+                "x: !ruby/object:BigDecimal 5\n",
+                "unspecified class: BigDecimal",
+            ),
+        ] {
+            std::fs::write(dir.join("s.yml"), yaml).unwrap();
+            match Config::read(&dir.join("s.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 1, "{yaml:?}");
+                    assert!(f.message.contains(want), "{yaml:?} → {:?}", f.message);
+                }
+                _ => panic!("{yaml:?} must be fatal"),
+            }
+        }
+        // Everything that stays legal: a bare anchor, any quoted or
+        // block-styled scalar (Psych's `quoted` covers every non-plain
+        // style), `!!str`/`!binary` tags, a date-shaped non-match, a
+        // `-`-led string, a Float/Integer tokenize result, and anything in
+        // a SECOND document `Psych.parse` never visits.
+        for yaml in [
+            "x: &a 5\n",
+            "x: \"2024-01-01\"\n",
+            "x: '2024-01-01'\n",
+            "x: |\n  2024-01-01\n",
+            "x: >\n  2024-01-01\n",
+            "x: !!str 2024-01-01\n",
+            "x: !binary abc\n",
+            "x: 2024-13-45\n",
+            "x: -2024-01-01\n",
+            "x: 1:20\n",
+            "x: .inf\n",
+            "x: ~\n",
+            "x: 5\n---\ny: *a\n",
+        ] {
+            std::fs::write(dir.join("ok.yml"), yaml).unwrap();
+            assert!(
+                matches!(Config::read(&dir.join("ok.yml")), ConfigRead::Parsed(_)),
+                "{yaml:?} must load",
+            );
+        }
+        // A `Psych::SyntaxError` outranks every visitor death upstream (the
+        // document parses whole, then the visitor walks it) — these stay
+        // the `not valid YAML` exit-64 surface; `!ruby/object:<other>` is a
+        // `tokenize` `else` upstream but serde_yaml rejects the tag itself,
+        // a `!ruby/*` divergence left as-is (issue #347 scope).
+        for yaml in [
+            "x: *a\ny: [unclosed\n",
+            "x: 2024-01-01\nz: [unclosed\n",
+            "x: !ruby/object:Foo bar\n",
+        ] {
+            std::fs::write(dir.join("bad.yml"), yaml).unwrap();
+            match Config::read(&dir.join("bad.yml")) {
+                ConfigRead::Fatal(f) => {
+                    assert_eq!(f.code, 64, "{yaml:?}");
+                    assert!(f.message.contains("not valid YAML"), "{yaml:?} → {:?}", f.message);
+                }
+                _ => panic!("{yaml:?} must be fatal"),
+            }
         }
         std::fs::remove_dir_all(&dir).ok();
     }
