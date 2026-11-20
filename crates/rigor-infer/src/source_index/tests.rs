@@ -2052,6 +2052,63 @@ fn singleton_mixin_chain_limit_counts_the_root_entry() {
 }
 
 #[test]
+fn singleton_self_extend_counts_the_instance_side_entry() {
+    // `compute_singleton` roots the chain at the singleton entry, and a
+    // self-extend inserts `instance_lin(q)` — whose head is a SECOND,
+    // instance-side entry of `q` (entries intern per side, so both count in
+    // `cut_position`). Budget 2 + N: 98 modules still answer nothing, 99
+    // truncate (rigor-rs#667). A self-extend with no include closure stays
+    // under the budget.
+    let core = CoreIndex::new();
+    let src = String::from("module Comparable; extend Comparable; end\n");
+    let (_bare, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
+    let mut src = module_chain(98);
+    src.push_str("module Comparable; include W0; extend Comparable; end\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
+    let mut src = module_chain(99);
+    src.push_str("module Comparable; include W0; extend Comparable; end\n");
+    let (_b, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.core_singleton_mixin_may_answer(&core, "Comparable", "yy"));
+}
+
+#[test]
+fn singleton_self_extend_on_a_core_receiver_truncates_at_the_same_budget() {
+    // The receiver-form spelling has no project declaration of `Integer`, so
+    // the constant read is not shadowed and `check` reaches this consult on
+    // the file: `Integer.extend(Integer)` walks `Integer`'s include closure
+    // through the instance-side head, 2 + N against `cut_position`. 99
+    // modules truncate; 98 still fires (the master FP was every N >= 99).
+    let core = CoreIndex::new();
+    let mut src = module_chain(98);
+    src.push_str("Integer.include(W0)\nInteger.extend(Integer)\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.core_singleton_mixin_may_answer(&core, "Integer", "yy"));
+    let mut src = module_chain(99);
+    src.push_str("Integer.include(W0)\nInteger.extend(Integer)\n");
+    let (_b, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.core_singleton_mixin_may_answer(&core, "Integer", "yy"));
+}
+
+#[test]
+fn singleton_chain_limit_control_float_extend_head_module() {
+    // Control (rigor-rs#667 acceptance): `Float.extend(E)` where `E` itself
+    // includes the chain head stays a NON-self-extend row — one root entry
+    // plus `E` plus the chain — so it truncates one module EARLIER than the
+    // bare `extend W0` row and the fix must not move it.
+    let core = CoreIndex::new();
+    let mut src = module_chain(98);
+    src.push_str("module E; include W0; end\nFloat.extend(E)\n");
+    let (_a, idx) = build_one(src.as_bytes(), &core);
+    assert!(!idx.core_singleton_mixin_may_answer(&core, "Float", "yy"));
+    let mut src = module_chain(99);
+    src.push_str("module E; include W0; end\nFloat.extend(E)\n");
+    let (_b, idx) = build_one(src.as_bytes(), &core);
+    assert!(idx.core_singleton_mixin_may_answer(&core, "Float", "yy"));
+}
+
+#[test]
 fn meta_new_write_census_covers_or_path_nested_positions() {
     // rigor-rs#672 review: `discovered_classes` (`collect_class_decls`)
     // descends the whole tree and covers the or-write/path-write shapes the

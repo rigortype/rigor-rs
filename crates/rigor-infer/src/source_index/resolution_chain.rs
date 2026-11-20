@@ -1100,7 +1100,7 @@ impl SourceIndex {
 
     /// `chain.truncated?` of `q`'s singleton chain: its extended modules and
     /// their include closures hold more than [`CHAIN_LIMIT`] project modules.
-    fn singleton_truncated(&self, q: &str) -> bool {
+    fn singleton_truncated(&self, core: &CoreIndex, q: &str) -> bool {
         let mut queue: Vec<(String, String)> = self
             .singleton_raws(q)
             .into_iter()
@@ -1108,21 +1108,44 @@ impl SourceIndex {
             .map(|r| (q.to_string(), r))
             .collect();
         // `q`'s singleton chain counts its root entry — the singleton class
-        // object — toward [`CHAIN_LIMIT`] (rigor-rs#637).
-        let mut seen: HashSet<String> = [q.to_string()].into_iter().collect();
+        // object — toward [`CHAIN_LIMIT`] (rigor-rs#637). The root is NOT
+        // pre-seeded into `seen`: entries intern PER SIDE, so a self-extend
+        // (`extend Comparable`, `Integer.extend(Integer)`) inserts
+        // `instance_lin(q)`'s head — a SECOND, instance-side entry of `q` —
+        // and the walk must descend `q`'s instance closure from it. Seeding
+        // by name made the self-extend edge hit the dedup and the walk could
+        // never truncate at all (rigor-rs#667). The `+ 1` below is the
+        // root's own entry; every reached name counts once, `q` included.
+        let mut seen: HashSet<String> = HashSet::new();
         while let Some((from, raw)) = queue.pop() {
             if mixin_marker(&raw) {
                 continue;
             }
-            if let Some(m) = self.resolve_override_ancestor(&from, &raw) {
-                if !seen.insert(m.clone()) {
-                    continue;
+            // The reference's resolver answers an RBS-known constant too
+            // (`each_mixin_chain` yields `instance_lin(name)`): a mixin the
+            // project never declares still contributes its own entry plus
+            // its receiver-form includes — `Integer.extend(Integer)`'s
+            // self-edge resolves to Integer itself.
+            let m = match self.resolve_override_ancestor(&from, &raw) {
+                Some(m) => m,
+                None => {
+                    let name = raw.strip_prefix("::").unwrap_or(&raw);
+                    let rbs_known = core.knows_qualified_class(name)
+                        || (!name.contains("::") && core.knows_toplevel_class(name));
+                    if rbs_known {
+                        name.to_string()
+                    } else {
+                        continue;
+                    }
                 }
-                if seen.len() > CHAIN_LIMIT {
-                    return true;
-                }
-                queue.extend(self.instance_mixin_edges(&m));
+            };
+            if !seen.insert(m.clone()) {
+                continue;
             }
+            if seen.len() + 1 > CHAIN_LIMIT {
+                return true;
+            }
+            queue.extend(self.instance_mixin_edges(&m));
         }
         false
     }
@@ -1141,7 +1164,7 @@ impl SourceIndex {
     /// extends a module whose surface is open (hook-capable, or one neither
     /// RBS nor the project declares), or its singleton chain was cut.
     fn open_extend(&self, core: &CoreIndex, owner: &str) -> bool {
-        self.singleton_truncated(owner)
+        self.singleton_truncated(core, owner)
             || self
                 .singleton_raws(owner)
                 .iter()
@@ -1176,7 +1199,9 @@ impl SourceIndex {
             .any(|n| {
                 let open = !OBJECT_ROOTS.contains(&n.as_str());
                 let raws = self.singleton_raws(n);
-                if self.singleton_truncated(n) || (open && raws.iter().any(|r| mixin_marker(r))) {
+                if self.singleton_truncated(core, n)
+                    || (open && raws.iter().any(|r| mixin_marker(r)))
+                {
                     return true;
                 }
                 raws.iter().filter(|r| !mixin_marker(r)).any(|raw| {
