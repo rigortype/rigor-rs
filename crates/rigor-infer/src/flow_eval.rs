@@ -1383,32 +1383,35 @@ impl<'i> Typer<'i> {
             };
             let n = site.target.as_str();
             let entry = env.get(n).copied().unwrap_or(nil);
+            // A write's new binding replaces the pass-entry binding only
+            // when the write always runs — a top-level body statement.
+            // `x = 0` dominates; `x = 0 if d`, `c2 && (x = 1)`, a
+            // `begin`/`rescue` or block write, and `x <op>=` (an implicit
+            // self-read) do not — the entry binding survives the untaken
+            // arm or joins the op's result.
+            let dominates = |s: &Site| {
+                !s.op
+                    && body.iter().any(|b| {
+                        let bn = ast.get(*b);
+                        matches!(
+                            bn,
+                            Node::LocalVariableWrite { .. }
+                                | Node::InstanceVariableWrite { .. }
+                                | Node::MultiWrite { .. }
+                                | Node::UnmodeledWrite { .. }
+                        ) && bn.span() == s.span
+                    })
+            };
             // A read at `p` sees the pass-entry binding iff no earlier
-            // write of the name produced a DOMINATING x-free binding before
-            // it. Dominating = the write is itself a body statement
-            // (`x = 0` cuts; `x = 0 if d` does not — the assumption
-            // survives the untaken arm). A write that itself reads the
-            // name (`x = x`, `x = x || 0`, `x += v`) yields an
-            // assumption-DERIVED binding and does not cut either; an
-            // op-write's self-read is implicit and never cuts.
+            // write of the name produced a DOMINATING x-free binding
+            // before it. A write that itself reads the name (`x = x`,
+            // `x = x || 0`, `x = [x]`) is assumption-derived and does not
+            // cut either.
             let assumption_read = |p: usize| {
                 live.iter()
                     .filter(|s| s.target == n && s.span.1 <= p)
                     .all(|s| {
-                        if s.op {
-                            return true;
-                        }
-                        let dominates = body.iter().any(|b| {
-                            let bn = ast.get(*b);
-                            matches!(
-                                bn,
-                                Node::LocalVariableWrite { .. }
-                                    | Node::InstanceVariableWrite { .. }
-                                    | Node::MultiWrite { .. }
-                                    | Node::UnmodeledWrite { .. }
-                            ) && bn.span() == s.span
-                        });
-                        if !dominates {
+                        if !dominates(s) {
                             return true;
                         }
                         match s.value {
@@ -1479,26 +1482,39 @@ impl<'i> Typer<'i> {
                             if r == n {
                                 continue;
                             }
+                            // A DOMINATING write replaces the entry
+                            // binding; anything else (`k = 0 if d`,
+                            // `c2 && (k = 0)`, a block or op write) joins
+                            // the entry binding back in — the conditional
+                            // arm still leaves `k` at its seed.
                             let mut r_ty = None;
+                            let mut entry_survives = false;
                             for s in live
                                 .iter()
                                 .filter(|s| s.target == r && s.span.1 <= pos)
                             {
-                                match s.value_node {
-                                    Some(sv) if s.plain => {
-                                        let wv = self.type_of(ast, sv, env, interner);
-                                        r_ty = Some(match r_ty {
-                                            None => wv,
-                                            Some(prev) => {
-                                                rigor_types::Algebra::join(interner, prev, wv)
-                                            }
-                                        });
-                                    }
-                                    _ => {
-                                        r_ty = None;
-                                        break;
-                                    }
+                                let dominant = s.plain && dominates(s);
+                                if !dominant {
+                                    entry_survives = true;
                                 }
+                                if let Some(sv) = s.value_node {
+                                    let wv = self.type_of(ast, sv, env, interner);
+                                    r_ty = Some(match r_ty {
+                                        None => wv,
+                                        Some(prev) => {
+                                            rigor_types::Algebra::join(interner, prev, wv)
+                                        }
+                                    });
+                                }
+                            }
+                            if entry_survives {
+                                let e = env.get(r).copied().unwrap_or(nil);
+                                r_ty = Some(match r_ty {
+                                    None => e,
+                                    Some(prev) => {
+                                        rigor_types::Algebra::join(interner, prev, e)
+                                    }
+                                });
                             }
                             if let Some(wv) = r_ty {
                                 leaf_env.insert(Rc::from(r), wv);
