@@ -282,6 +282,21 @@ pub(crate) fn check_call(
         if typer.source().core_singleton_mixin_may_answer(index, name, method) {
             return None;
         }
+        // rigor-rs#666 — `source_declared_method?` /
+        // `ancestry_declares_method?` for the singleton kind: a project `def`
+        // on the class (`def self.x`, `def C.x`, `class << …`), an `extend`ed
+        // module's instance def, or the written superclass chain may answer
+        // it. Needed once a project reopening no longer shadows the RBS
+        // singleton mint (`class Integer` still resolves `::Integer`).
+        if typer.source().singleton_def_may_be_declared(name, method) {
+            return None;
+        }
+        // rigor-rs#666 — `unknown_mixin_includer?`'s singleton half: an
+        // `include`/`prepend` on the reopened class naming a module no side
+        // declares opens the class object's surface too.
+        if typer.source().singleton_unknown_mixin(index, name) {
+            return None;
+        }
         // ADR-17 — a `pre_eval:` patch on the class object's walk.
         if pre_eval_answers(ast, receiver, message_span, typer, index, name, method, true) {
             return None;

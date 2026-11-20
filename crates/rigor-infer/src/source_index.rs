@@ -424,6 +424,11 @@ pub struct Harvest {
     /// overlay (defs AND macros) plus its `Object`-owner slice — replays
     /// index-aligned into [`SourceIndex::file_defs`].
     file_defs: FileDefs,
+    /// Pass 1d, SINGLETON-kind existence table: `def self.x`, `def C.x`,
+    /// `class <<` / `instance_eval` defs, and the singleton-side
+    /// call-introduced names ⇒ [`SourceIndex::singleton_methods`]
+    /// (rigor-rs#666).
+    singleton_methods: HashMap<String, HashSet<String>>,
     /// Pass 1d: EVERY method name this file defines in any `def` form —
     /// instance, `def self.x`, and receiver-bearing `def obj.x` — flattened
     /// with no owner. ⇒ `defined_method_names`.
@@ -658,8 +663,19 @@ pub struct SourceIndex {
     /// [`Self::project_declares_method`] consults for the analyzed file.
     /// Singleton-kind names (`def self.x`, `class <<`, `instance_eval` defs)
     /// are filed NEITHER place (the reference stamps them `:singleton`; the
-    /// port's consumers only ever ask `:instance`).
+    /// port's consumers only ever ask `:instance`) — they live in
+    /// [`Self::singleton_methods`] instead.
     discovered_methods: HashMap<String, HashSet<String>>,
+    /// The `:singleton`-kind existence table the instance tables deliberately
+    /// keep out (the reference's `record_def_method` stamps these names and
+    /// `discovered_method?(kind: :singleton)` reads them): `def self.x`, a
+    /// `def` inside `class <<`/`instance_eval`, a `def C.x` receiver form,
+    /// and the singleton-side call-introduced names (`define_method`,
+    /// `attr_*`, `alias_method`, `define_singleton_method`). Merged
+    /// CROSS-FILE — a `def self.q` in a sibling file still answers `Foo.q`
+    /// on the oracle. Read by
+    /// [`Self::singleton_def_may_be_declared`] (rigor-rs#666).
+    pub(crate) singleton_methods: HashMap<String, HashSet<String>>,
     /// The per-file def-attribution overlay, index-aligned with the `files`
     /// order [`Self::merge`] receives (and `asts` order for
     /// [`Self::build_project`]). The rules pass the analyzed file's position

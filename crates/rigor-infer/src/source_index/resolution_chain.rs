@@ -40,7 +40,7 @@ fn mixin_marker(n: &str) -> bool {
     n == MIXIN_WILDCARD || n == MIXIN_UNNAMED
 }
 
-use super::{DefKind, SourceIndex};
+use super::{DefKind, SourceIndex, OVERRIDE_ANCESTOR_WALK_LIMIT};
 
 /// `ResolutionChain::LIMIT` — the project entries a chain may hold.
 const CHAIN_LIMIT: usize = 100;
@@ -1280,6 +1280,93 @@ impl SourceIndex {
         rbs_ancestors(core, class_name).iter().any(|a| {
             self.instance_records(a, MISSING_HOOK)
                 || self.mixin_closure_may_answer(core, a, method, !OBJECT_ROOTS.contains(&a.as_str()), false)
+        })
+    }
+
+    /// `source_declared_method?` + `ancestry_declares_method?` for the
+    /// `:singleton` kind (`discovered_method_through_ancestors?` on the
+    /// singleton ResolutionChain, external entries skipped): whether a
+    /// project `def` may declare `method` on `class_name`'s class object —
+    /// its own `def self.x` / `def C.x` / `class << …` leaves, the INSTANCE
+    /// defs of the modules its singleton side `extend`s (`kind_for`), then
+    /// the written superclass's singleton, recursively. Walk exhaustion
+    /// answers `true`, `chain.truncated?`'s suppression: "not declared" is
+    /// unproven, so the may-answer side wins. (rigor-rs#666)
+    ///
+    /// The own-entry read is SINGLETON-kind-precise: an INSTANCE `def` on
+    /// the class (`class Integer; def q`) must NOT silence `Integer.q` — the
+    /// reference fires `for singleton(Integer)` there. `singleton_methods`
+    /// (the `record_def_method` existence table) covers every def-bearing
+    /// position, `definers` the fold-side `def self.x` / `class <<` sites.
+    pub fn singleton_def_may_be_declared(&self, class_name: &str, method: &str) -> bool {
+        let mut current = class_name.to_string();
+        let mut seen: HashSet<String> = HashSet::new();
+        while seen.insert(current.clone()) {
+            if seen.len() > OVERRIDE_ANCESTOR_WALK_LIMIT {
+                return true;
+            }
+            if self
+                .singleton_methods
+                .get(&current)
+                .is_some_and(|m| m.contains(method))
+                || self.owner_defines(&current, method, DefKind::Singleton)
+            {
+                return true;
+            }
+            // A module on the singleton chain answers with its INSTANCE defs
+            // (the reference's `kind_for(:singleton) == :instance`), read with
+            // `core_singleton_mixin_may_answer`'s `instance_records` surface
+            // so an `attr_*` / `define_method` / `possible` def counts too.
+            let mixin_defines = self
+                .singleton_raws(&current)
+                .iter()
+                .filter(|r| !mixin_marker(r))
+                .filter_map(|raw| self.resolve_override_ancestor(&current, raw))
+                .any(|q| q != current && self.instance_records(&q, method));
+            if mixin_defines {
+                return true;
+            }
+            match self.project_superclass(&current) {
+                Some(sup) => current = sup,
+                None => return false,
+            }
+        }
+        false
+    }
+
+    /// `unknown_mixin_includer?`'s singleton half (`includes_of` consulted
+    /// before the `kind == :singleton` early-return): whether a project
+    /// `include`/`prepend` on `class_name`'s reopened body names a module NO
+    /// side declares — an unenumerable instance edge opens the class
+    /// object's surface too (`class Integer; include NonexistentMod` keeps
+    /// `Integer.zzz` silent). (rigor-rs#666)
+    pub fn singleton_unknown_mixin(&self, core: &CoreIndex, class_name: &str) -> bool {
+        self.override_classes.get(class_name).is_some_and(|e| {
+            e.includes
+                .iter()
+                .any(|raw| !self.known_mixin(core, class_name, raw))
+        })
+    }
+
+    /// `known_mixin?`: the constant `raw` written on `from`'s instance edge
+    /// resolves to a project class or module (lexically, `discovered_classes`
+    /// included) or to an RBS class — the reference's
+    /// `ancestor_name_candidates` walk answered the same way.
+    fn known_mixin(&self, core: &CoreIndex, from: &str, raw: &str) -> bool {
+        if self.resolve_override_ancestor(from, raw).is_some() {
+            return true;
+        }
+        let raw = raw.strip_prefix("::").unwrap_or(raw);
+        let segments: Vec<&str> = from.split("::").collect();
+        (0..segments.len()).rev().any(|i| {
+            let cand = if i == 0 {
+                raw.to_string()
+            } else {
+                format!("{}::{}", segments[..i].join("::"), raw)
+            };
+            self.discovered_classes.contains(&cand)
+                || core.knows_qualified_class(&cand)
+                || (!cand.contains("::") && core.knows_toplevel_class(&cand))
         })
     }
 

@@ -155,6 +155,36 @@ impl SourceIndex {
         }
     }
 
+    /// [`Self::constant_shadowed`] with one reopen carve-out (rigor-rs#666):
+    /// a TOPLEVEL `class`/`module` declaration of `name` IS `::name` — the
+    /// same object the bundled RBS describes — so it does not shadow the RBS
+    /// constant; `class Integer; extend W` keeps `Integer` the RBS class
+    /// object and `Integer.zzz` still witnesses `for singleton(Integer)`.
+    /// A NESTED declaration (`module M; class Integer; end`) still shadows a
+    /// lexically-visible read, and a project class the qualified walk did not
+    /// place (def-nested / walk gap) keeps the blanket suppression.
+    ///
+    /// Used ONLY by the `ConstantRead` → `Type::Singleton` mint: a reopened
+    /// name reaches the same `singleton(X)` surface check the reference's
+    /// `resolve_constant_name` + `rbs_class_known?` perform, so typing it
+    /// `Dynamic[top]` was the coverage loss the issue files. The other
+    /// shadow-gate callers keep [`Self::constant_shadowed`]'s stricter
+    /// answer — their slices mint or narrow on their own evidence.
+    pub fn constant_shadowed_except_toplevel_reopen(&self, name: &str, use_prefix: &[String]) -> bool {
+        match self.nested_constant_namespaces.get(name) {
+            Some(namespaces) => namespaces.iter().any(|ns| {
+                ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
+            }),
+            // A toplevel `class`/`module` decl is `::name` itself (a reopen,
+            // never a shadow), so it is subtracted from the fallback: a
+            // `class Integer` keeps `Integer` resolvable while a project
+            // class the qualified walk missed still suppresses.
+            None => {
+                self.classes.contains_key(name) && !self.toplevel_constants.contains(name)
+            }
+        }
+    }
+
     /// Whether the project defines a constant named `name` ANYWHERE (toplevel,
     /// nested, or as a discovered class/module) — the scope-INDEPENDENT
     /// companion to [`Self::constant_shadowed`]. Used by `type_dot_new`'s
