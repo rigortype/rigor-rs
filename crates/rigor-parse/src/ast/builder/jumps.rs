@@ -13,9 +13,9 @@
 use crate::ruby_prism::Node as PrismNode;
 
 use super::{
-    collect_defined_operand_children, collect_recoverable_children, is_unmodeled_write,
-    meta_new_write_name, pattern_bound_locals, Builder, JumpKind, Node, NodeId, ScopeMarks, Span,
-    StatementsKind, UNMATCHED,
+    collect_defined_operand_children, collect_recoverable_children, constant_string,
+    is_unmodeled_write, meta_new_write_name, pattern_bound_locals, Builder, JumpKind, Node,
+    NodeId, ScopeMarks, Span, StatementsKind, UNMATCHED,
 };
 
 impl<'src> Builder<'src> {
@@ -279,10 +279,46 @@ impl<'src> Builder<'src> {
             // oracle — `class_known_to_scope?` consults the census for
             // `is_a?(::Foo)`-family operands.
             let meta_new_const = meta_new_write_name(node);
+            // rigor-rs#639 — an ivar op/and/or write (`@x += v`, `@x ||= v`,
+            // `@x &&= v`) binds a NAME the loop-cap criterion tracks
+            // (`loop_body_ivar_writes`), even though `names` stays
+            // locals-only.
+            let ivar_write = node
+                .as_instance_variable_operator_write_node()
+                .map(|n| crate::IvarWrite {
+                    name: constant_string(n.name().as_slice()),
+                    op: crate::OpWriteKind::Operator(constant_string(
+                        n.binary_operator().as_slice(),
+                    )),
+                    rereads: false,
+                })
+                .or_else(|| {
+                    node.as_instance_variable_and_write_node()
+                        .map(|n| {
+                            let name = constant_string(n.name().as_slice());
+                            crate::IvarWrite {
+                                rereads: ivar_self_read(&n.value(), &name),
+                                name,
+                                op: crate::OpWriteKind::And,
+                            }
+                        })
+                })
+                .or_else(|| {
+                    node.as_instance_variable_or_write_node()
+                        .map(|n| {
+                            let name = constant_string(n.name().as_slice());
+                            crate::IvarWrite {
+                                rereads: ivar_self_read(&n.value(), &name),
+                                name,
+                                op: crate::OpWriteKind::Or,
+                            }
+                        })
+                });
             self.push(Node::UnmodeledWrite {
                 span,
                 names,
                 meta_new_const,
+                ivar_write,
             });
             let recovered = collect_recoverable_children(node, self.recovery_marks());
             if recovered.is_empty() {
@@ -298,4 +334,28 @@ impl<'src> Builder<'src> {
 
         UNMATCHED
     }
+}
+
+/// Whether `node`'s subtree reads back the ivar `name` — the `@x ||= [@x]`
+/// self-read the `||=` / `&&=` compound gate needs while the write's RHS is
+/// never lowered (rigor-rs#639).
+fn ivar_self_read(node: &PrismNode<'_>, name: &str) -> bool {
+    struct SelfRead<'a> {
+        name: &'a str,
+        hit: bool,
+    }
+    impl<'pr> crate::ruby_prism::Visit<'pr> for SelfRead<'_> {
+        fn visit_instance_variable_read_node(
+            &mut self,
+            node: &crate::ruby_prism::InstanceVariableReadNode<'pr>,
+        ) {
+            if constant_string(node.name().as_slice()) == self.name {
+                self.hit = true;
+            }
+        }
+    }
+    use crate::ruby_prism::Visit as _;
+    let mut found = SelfRead { name, hit: false };
+    found.visit(node);
+    found.hit
 }

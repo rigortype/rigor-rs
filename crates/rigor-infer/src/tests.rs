@@ -2739,6 +2739,111 @@ fn loop_cap_widen_preserves_body_writes_to_non_suspect_names() {
         i.get(ty)
     );
 }
+
+/// The `if t` snapshot helper shared by the rigor-rs#639 rows: `None` when
+/// the predicate keeps a `Constant` pin (the diagnostic stays armed),
+/// `Some(ty)` of the shed pin otherwise.
+fn last_if_snapshot(src: &[u8]) -> (Interner, Option<TypeId>) {
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let snaps = typer.always_truthy_snapshots(&ast, &mut i);
+    let last_if = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::If { .. }).then_some(id))
+        .last()
+        .expect("at least one if node");
+    (i, snaps.get(&last_if).copied())
+}
+
+/// rigor-rs#639: a `break`/`next`/`redo`/`retry` or `begin…end while`
+/// body cannot be replayed, so the JOIN keeps declining — but the
+/// structural cap check is a static scan and still applies: a
+/// non-convergent body's locals shed every tracked pin exactly as the
+/// reference's cap pass widens them.
+#[test]
+fn loop_cap_still_fires_through_jump_and_once_bodies() {
+    for (src, converged) in [
+        // `next` keeps the cap: `y = [y]` never converges → `t` sheds.
+        (b"def f(c, k)\n  t = 1; y = nil\n  while c\n    next if k\n    if false; t = nil; end\n    y = [y]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // `break` the same.
+        (b"def f(c, k)\n  t = 1; y = nil\n  while c\n    if false; t = nil; end\n    y = [y]\n    break if k\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // `redo` the same.
+        (b"def f(c, k)\n  t = 1; y = nil\n  while c\n    if false; t = nil; end\n    y = [y]\n    redo if k\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // A `begin…end while` body runs at least once — the same gate.
+        (b"def f(c)\n  t = 1; y = nil\n  begin\n    if false; t = nil; end\n    y = [y]\n  end while c\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // The convergent control: `y = 2` still settles, so `t` keeps its
+        // pin through a `next` body (both engines fire).
+        (b"def f(c, k)\n  t = 1; y = nil\n  while c\n    next if k\n    if false; t = nil; end\n    y = 2\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+    ] {
+        let (i, ty) = last_if_snapshot(src);
+        let ty = ty.expect("predicate snapshot recorded");
+        assert_eq!(
+            !matches!(i.get(ty), Type::Constant(_)),
+            !converged,
+            "converged={converged} expected, got {:?} for {:?}",
+            i.get(ty),
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// rigor-rs#639: `loop_body_ivar_writes` counts an ivar the scope binds off
+/// a WRITE (`rebindable_ivar?`) — `@x += v` (an `UnmodeledWrite`), a plain
+/// `@x = …`, `@x ||= v` self-reads, and a literal-name
+/// `instance_variable_set` — so a body that keeps an ivar moving caps its
+/// tracked siblings too. The controls: an ivar bound only BY the loop
+/// (`@y = [@y]` with no prior write) is not rebindable and leaves the cap
+/// alone; a non-literal `instance_variable_set` names no ivar.
+#[test]
+fn loop_cap_tracks_rebindable_ivar_writes() {
+    for (src, converged) in [
+        // `@pos += 1` keeps moving — the write the replay cannot model
+        // forces the structural cap.
+        (b"def f(c)\n  t = 1; @pos = 0\n  while c\n    if false; t = nil; end\n    @pos += 1\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // A plain `@pos = @pos + 1` moves every pass.
+        (b"def f(c)\n  t = 1; @pos = 0\n  while c\n    if false; t = nil; end\n    @pos = @pos + 1\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // `@pos = [@pos]` grows.
+        (b"def f(c)\n  t = 1; @pos = 0\n  while c\n    if false; t = nil; end\n    @pos = [@pos]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // `instance_variable_set(:@pos, [@pos])` on `self` is a literal
+        // ivar write (`ReflectiveIvarWrite`).
+        (b"def f(c)\n  t = 1; @pos = 0\n  while c\n    if false; t = nil; end\n    instance_variable_set(:@pos, [@pos])\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), false),
+        // An ivar bound only BY the loop is not rebindable — no cap, `t`
+        // keeps its pin (the oracle fires `always-truthy-condition`).
+        (b"def f(c)\n  t = 1; y = nil\n  while c\n    if false; t = nil; end\n    @y = [@y]\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+        // `instance_variable_set(:@pos, 1)` on an UNBOUND ivar names no
+        // rebindable write — the oracle keeps firing.
+        (b"def f(c)\n  t = 1\n  while c\n    if false; t = nil; end\n    instance_variable_set(:@pos, 1)\n  end\n  if t\n    y = 3\n  end\nend\n".as_slice(), true),
+    ] {
+        let (i, ty) = last_if_snapshot(src);
+        let ty = ty.expect("predicate snapshot recorded");
+        assert_eq!(
+            !matches!(i.get(ty), Type::Constant(_)),
+            !converged,
+            "converged={converged} expected, got {:?} for {:?}",
+            i.get(ty),
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// rigor-rs#639: `moved` reads the body's OWN writes, not the entry env —
+/// `k = y` types at the write's position where `y = [k]` already landed,
+/// so `k` is a pass-1 mover and the cap sheds `t`'s pin (the entry-env
+/// verdict saw `k`'s unbound seed and called it converged).
+#[test]
+fn loop_cap_moved_reads_the_body_binding() {
+    let src = b"def f(c)\n  t = 1; y = nil; k = nil\n  while c\n    if false; t = nil; end\n    y = [k]\n    k = y\n  end\n  if t\n    y = 3\n  end\nend\n";
+    let (i, ty) = last_if_snapshot(src);
+    let ty = ty.expect("predicate snapshot recorded");
+    assert!(
+        !matches!(i.get(ty), Type::Constant(_)),
+        "k = y must read the body's own y, got {:?}",
+        i.get(ty)
+    );
+}
+
 #[test]
 fn nested_alternating_logical_guard_is_linear() {
     // rigor-rs#453: `subject_edge` re-evaluated a Logical's left operand on
