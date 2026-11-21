@@ -4111,7 +4111,7 @@ impl CoreData {
         } else {
             self.ancestors(a)
         };
-        if chain.iter().any(|&c| c == p) {
+        if chain.contains(&p) {
             return ClassOrdering::Subclass;
         }
         if complete && host_resolvable_class(a) {
