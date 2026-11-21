@@ -33,7 +33,7 @@ include!(concat!(env!("OUT_DIR"), "/embedded_rbs.rs"));
 
 // Issue #382: the reference host's resolvable-constant table (generated).
 mod host_resolvable;
-use host_resolvable::host_resolvable_class;
+use host_resolvable::{host_class, host_resolvable_class};
 
 // `%a{rigor:v1:conforms-to _Interface}` (issue #129, ADR-0044).
 mod conformance;
@@ -4079,15 +4079,29 @@ impl CoreData {
     ///   qualified decl);
     /// * `arg`'s ancestor chain containing the param name ⇒ `Subclass`
     ///   (`actual <= target`, or `subtype_result_via_ancestors`'s `yes`);
-    /// * `arg` host-resolvable with a COMPLETE chain that lacks the name ⇒
-    ///   `Disjoint` — the proven `no` (the caller's `!host_resolvable_class`
-    ///   gate restates the same premise); an incomplete chain or an
-    ///   unresolvable arg ⇒ `Unknown` (`maybe` → admit).
+    /// * `arg` host-resolvable ⇒ the verdict moves OFF the RBS chains onto
+    ///   the host mirror (rigor-rs#809): `resolve_class` answers on the live
+    ///   process, so host aliases the RBS models as distinct classes
+    ///   (`Errno::EWOULDBLOCK` IS `Errno::EAGAIN`, `Mutex` IS `Thread::Mutex`)
+    ///   and host ancestry the RBS writes differently (`Gem::MissingSpecError`
+    ///   < `Gem::LoadError`, `Random` includes `Random::Base`/`Formatter`)
+    ///   both bend to the generated `HOST_CLASSES` table — canonical identity
+    ///   or `<=` when both resolve, the actual's ancestor-name list when only
+    ///   it resolves (`subtype_result_via_ancestors`); an incomplete chain or
+    ///   an unresolvable arg ⇒ `Unknown` (`maybe` → admit).
     fn param_accepts_ordering(&self, arg_class: &str, param_name: &str) -> ClassOrdering {
         let a = arg_class.strip_prefix("::").unwrap_or(arg_class);
         let p = param_name.strip_prefix("::").unwrap_or(param_name);
         if a == p {
             return ClassOrdering::Equal;
+        }
+        // rigor-rs#809: when the ARGUMENT name resolves in the oracle's host
+        // process, `class_subtype_result` never consults RBS — it answers
+        // `actual <= target` on the LIVE hierarchy. The mirror decides every
+        // param shape — top-level and qualified alike — so it runs ahead of
+        // the `toplevel_classes` deferral.
+        if let Some(ordering) = Self::host_ordering(a, p) {
+            return ordering;
         }
         if self.toplevel_classes.contains(p) {
             return self.class_ordering(arg_class, param_name);
@@ -4100,13 +4114,24 @@ impl CoreData {
         if a == p {
             return ClassOrdering::Equal;
         }
+        // A leaf that normalised onto a host-visible qualified name still
+        // answers from the live hierarchy before the RBS chains.
+        if let Some(ordering) = Self::host_ordering(a, p) {
+            return ordering;
+        }
         // A param head the qualified registry does not hold is `maybe` — the
         // stub gate declines it upstream, so reaching here only via a direct
         // call must stay conservative (the pre-#383 `Unknown`).
         if !self.qualified.contains_key(p) {
             return ClassOrdering::Unknown;
         }
-        let (chain, complete) = if self.qualified.contains_key(a) {
+        // Reaching here means `a` does NOT host-resolve under either spelling
+        // (the host mirror above returns for every resolvable arg), so a
+        // `Disjoint` here could never fire — the caller's
+        // `!host_resolvable_class` gate declines it — and the only answers
+        // left are the accept-side `Subclass` witness and the conservative
+        // `maybe`.
+        let (chain, _) = if self.qualified.contains_key(a) {
             self.qualified_ancestors(a)
         } else {
             self.ancestors(a)
@@ -4114,11 +4139,32 @@ impl CoreData {
         if chain.contains(&p) {
             return ClassOrdering::Subclass;
         }
-        if complete && host_resolvable_class(a) {
-            ClassOrdering::Disjoint
-        } else {
-            ClassOrdering::Unknown
-        }
+        ClassOrdering::Unknown
+    }
+
+    /// The `class_subtype_result` verdict for one (arg, param) pair answered
+    /// entirely from the generated `HOST_CLASSES` mirror (rigor-rs#809).
+    /// `None` ⇒ the argument does not host-resolve, the reference's `maybe`,
+    /// and the caller falls back to the RBS-chain path — a proven `no` needs
+    /// the argument's own `resolve_class`. When the argument resolves, the
+    /// reference never returns to RBS: both-resolved answers `actual <=
+    /// target` on canonical names (`Module#name`, so aliases collapse), and
+    /// actual-only runs `subtype_result_via_ancestors` — the spelled target
+    /// name against the actual's canonical ancestor names, `no` when absent.
+    fn host_ordering(a: &str, p: &str) -> Option<ClassOrdering> {
+        let a_host = host_class(a)?;
+        Some(match host_class(p) {
+            Some(p_host) if a_host.canonical == p_host.canonical => ClassOrdering::Equal,
+            Some(p_host) if a_host.ancestors.contains(&p_host.canonical) => {
+                ClassOrdering::Subclass
+            }
+            Some(p_host) if p_host.ancestors.contains(&a_host.canonical) => {
+                ClassOrdering::Superclass
+            }
+            Some(_) => ClassOrdering::Disjoint,
+            None if a_host.ancestors.contains(&p) => ClassOrdering::Subclass,
+            None => ClassOrdering::Disjoint,
+        })
     }
 
     /// An interface parameter accepts `arg_class` iff that class implements every
