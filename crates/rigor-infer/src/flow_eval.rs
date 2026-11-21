@@ -737,21 +737,36 @@ impl<'i> Typer<'i> {
                         Type::Constant(r) => r.clone(),
                         _ => return untyped,
                     };
-                    let Some(sc) = crate::folding::fold(&r, opname, std::slice::from_ref(&v_scalar))
-                    else {
-                        return untyped;
-                    };
-                    if !folded.contains(&sc) {
-                        if folded.len() >= UNION_FOLD_OUTPUT_LIMIT {
-                            return untyped;
+                    match crate::folding::fold_outcome(&r, opname, std::slice::from_ref(&v_scalar)) {
+                        crate::folding::FoldOutcome::Value(sc) => {
+                            if !folded.contains(&sc) {
+                                if folded.len() >= UNION_FOLD_OUTPUT_LIMIT {
+                                    return untyped;
+                                }
+                                folded.push(sc.clone());
+                            }
+                            let f = interner.intern(Type::Constant(sc));
+                            acc = Some(match acc {
+                                None => f,
+                                Some(a) => rigor_types::Algebra::join(interner, a, f),
+                            });
                         }
-                        folded.push(sc.clone());
+                        // `build_constant_type`'s `WidenedResult` partition:
+                        // a member fold past `INTEGER_FOLD_BIT_LIMIT` joins
+                        // its `Nominal[cls]` into the union, it does not
+                        // count toward the output cap and it does not
+                        // decline the whole write (rigor-rs#694) —
+                        // `x = c ? 1 : 2; x <<= 13605` answers
+                        // `<literal> | Integer` on the oracle.
+                        crate::folding::FoldOutcome::Widened(class) => {
+                            let n = self.nominal_or_untyped(class, interner);
+                            acc = Some(match acc {
+                                None => n,
+                                Some(a) => rigor_types::Algebra::join(interner, a, n),
+                            });
+                        }
+                        crate::folding::FoldOutcome::Declined => return untyped,
                     }
-                    let f = interner.intern(Type::Constant(sc));
-                    acc = Some(match acc {
-                        None => f,
-                        Some(a) => rigor_types::Algebra::join(interner, a, f),
-                    });
                 }
                 acc.unwrap_or(untyped)
             }
@@ -4402,13 +4417,32 @@ impl<'i> Typer<'i> {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
                             },
                         );
+                        // Replay the live arm on the ENTRY env first: an
+                        // op-write's fold (`x += 3` ⇒ `4`, rigor-rs#694) and
+                        // a self-reading write (`x = x + 1` ⇒ `2`) need the
+                        // pre-widen binding `widen_flow_writes` destroys.
+                        // Names whose only write sits in a position
+                        // `bind_statement` cannot see (a nested conditional,
+                        // an index target) keep the widened decline — their
+                        // replay binding equals the entry's, so they never
+                        // reach the overlay.
+                        let before = env.clone();
+                        let mut replay = env.clone();
+                        for s in &live {
+                            self.bind_statement(ast, *s, &mut replay, interner);
+                        }
                         widen_flow_writes(live_rebinds.iter(), span, env, interner);
                         self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                         self.widen_mutated_locals(
                             ast, live_mutations, indexed, id, span, env, interner,
                         );
-                        for s in live {
-                            self.bind_statement(ast, s, env, interner);
+                        for s in &live {
+                            self.bind_statement(ast, *s, env, interner);
+                        }
+                        for (name, ty) in replay.iter() {
+                            if before.get(&**name) != Some(ty) {
+                                env.insert(name.clone(), *ty);
+                            }
                         }
                     }
                     None => {
@@ -4607,6 +4641,42 @@ impl<'i> Typer<'i> {
                         self.apply_loop_cap_widen(env, &tracked, &suspect, interner);
                     }
                     None => {}
+                }
+            }
+            // `x <op>= v` binds the fold of its entry binding and `v` — the
+            // same memberwise answer `replay_one`'s arm gives the per-def
+            // env: `x += 3` on `x = 1` is `4`, `x ||= 5` on `x = nil` is `5`,
+            // and a fold past `INTEGER_FOLD_BIT_LIMIT` mints the widened
+            // `Nominal[Integer]` (rigor-rs#694). Anything the fold cannot
+            // decide (`untyped` entry, non-constant operand, a fold the port
+            // lacks) lands on `untyped` — the widen `other =>` used to give
+            // every op-write.
+            Node::LocalVariableOpWrite { name, value, op, .. } => {
+                // The `replay_one` guards: a write inside a position whose
+                // post-scope is discarded, or to a name a closure within
+                // binds, binds nothing — the entry binding stands.
+                if !ast.in_blocked_carrier(ast.get(id).span()) && !ast.closure_bound_names(id).contains(name)
+                {
+                let (name, value, op) = (name.clone(), *value, op.clone());
+                let vspan = ast.get(value).span();
+                widen_flow_writes(effects.rebinds_within(vspan), vspan, env, interner);
+                self.drop_indexed_rebinds(effects.rebinds_within(vspan), vspan, indexed, env);
+                self.widen_mutated_locals(
+                    ast,
+                    effects.mutations_within(vspan),
+                    indexed,
+                    id,
+                    vspan,
+                    env,
+                    interner,
+                );
+                let v_ty = self.type_of(ast, value, env, interner);
+                let new_ty = match env.get(name.as_str()).copied() {
+                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    None => interner.untyped(),
+                };
+                drop_indexed_narrowings(env, &name);
+                env.insert(Rc::from(name.as_str()), new_ty);
                 }
             }
             other => {
@@ -5406,13 +5476,20 @@ impl<'i> Typer<'i> {
                     widen_flow_writes(writes.iter(), tspan, env, interner);
                 }
             }
-            Node::LocalVariableOpWrite { name, .. } => {
-                // `x += 1` / `x ||= 5` reads-then-writes; the result is not a
-                // tracked constant in this slice — widen.
-                let name = name.clone();
-                let u = interner.untyped();
+            Node::LocalVariableOpWrite { name, value, op, .. } => {
+                // `x += 1` / `x ||= 5` reads-then-writes: bind the fold of
+                // the entry and `v` (`x += 3` on `x = 1` ⇒ `4`, the oracle's
+                // own answer — rigor-rs#694), declining to `untyped` where
+                // the fold cannot decide — the widen this arm used to give
+                // every op-write.
+                let (name, value, op) = (name.clone(), *value, op.clone());
+                let v_ty = self.type_of(ast, value, env, interner);
+                let new_ty = match env.get(name.as_str()).copied() {
+                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    None => interner.untyped(),
+                };
                 drop_indexed_narrowings(env, &name);
-                env.insert(Rc::from(name.as_str()), u);
+                env.insert(Rc::from(name.as_str()), new_ty);
             }
             Node::If { predicate, then_body, else_body, is_unless, .. } => {
                 let (predicate, then_body, else_body, is_unless) =
@@ -5875,6 +5952,25 @@ impl<'i> Typer<'i> {
                 for s in body.clone() {
                     self.bind_statement(ast, s, env, interner);
                 }
+            }
+            // `x <op>= v` — binds the fold of its entry binding and `v`, the
+            // same memberwise answer `replay_one`'s arm gives (`x += 3` on
+            // `x = 1` is `4`; `x <<= 20000` is the widened `Nominal[Integer]`,
+            // rigor-rs#694). Reached from `bind_check_statement`'s live-arm
+            // replay — a folded `if true; x += 3; end` writes `4` on the
+            // oracle, not the pre-change unconditional widen.
+            Node::LocalVariableOpWrite { name, value, op, .. } => {
+                if ast.closure_bound_names(id).contains(name) {
+                    return;
+                }
+                let (name, value, op) = (name.clone(), *value, op.clone());
+                let v_ty = self.type_of(ast, value, env, interner);
+                let new_ty = match env.get(name.as_str()).copied() {
+                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    None => interner.untyped(),
+                };
+                drop_indexed_narrowings(env, &name);
+                env.insert(Rc::from(name.as_str()), new_ty);
             }
             // `h[k] op= v` — a compound index write binds no LOCAL name, but a
             // write nested in its operands (`h[:a] ||= (y = 5)`) binds as it

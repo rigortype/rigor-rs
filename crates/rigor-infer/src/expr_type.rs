@@ -6,7 +6,7 @@
 use rigor_parse::{Compound, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
-use crate::{folding, kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
+use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
 
 /// The value-pinned scalar key a hash-literal key NODE carries, or `None` when
 /// the key is dynamic (a computed expression, an interpolated string, a
@@ -688,44 +688,47 @@ impl<'i> Typer<'i> {
         if !self.fully_tracked_type(*pre, interner) {
             return None;
         }
-        // rigor-rs#499 — the `current` read inside `s[k] op= v` evaluates
-        // BEFORE that statement's own mutation lands, so its mark does not
-        // invalidate `pre`'s pin (`stale_local_except`). Fold the pinned
-        // string directly: `s = "abc"; s[9] ||= nil` reads `"abc"[9]` → `nil`
-        // on the oracle, while the flat `type_call` sees the stale mark and
-        // declines to untyped. Only the `nil` fold is kept: an in-bounds
-        // key would record a `Constant | nil` union (`"a" | nil`) whose
-        // diagnostics the flat `String | nil` answer already produces —
-        // the oracle emits `possible-nil` there, and the possible-nil
-        // channel decodes the nominal union, not a literal-member one.
-        let current = match interner.get(*pre).clone() {
-            Type::Constant(rigor_types::Scalar::Str(ref s))
-                if !self.stale_local_except(ast, &w.name, w.span) =>
-            {
-                let folded = self
-                    .pin_arg_scalars(ast, &[w.key_node], env, interner)
-                    .and_then(|keys| folding::fold(&rigor_types::Scalar::Str(s.clone()), "[]", &keys));
-                match folded {
-                    Some(f @ rigor_types::Scalar::Nil) => {
-                        interner.intern(Type::Constant(f))
-                    }
-                    _ => {
-                        // In-bounds: the oracle records `"a" | nil`, whose
-                        // diagnostics a flat `String` current reproduces
-                        // exactly (`String | nil` → `possible-nil`). The
-                        // `type_call` path cannot answer — it sees the
-                        // write's own stale mark and declines.
-                        self.nominal_or_untyped("String", interner)
-                    }
-                }
-            }
-            _ => self.type_call_for_write_value(
-                ast, w.receiver, "[]", &[w.key_node], env, interner,
-            ),
-        };
+        // `recordable_slot_address` admits only `verbatim_slot?` carriers
+        // (`Hash`/`Array`, indexed_narrowing.rb): a `String`'s `[]=` splices
+        // (`s[0] = "xy"` leaves `s[0] == "x"`), so `s[0] ||= "x"` records
+        // nothing and its read answers the unmodeled `Dynamic`. A record
+        // here once minted `String | "x"` — `s[0].w` fired
+        // `for "x" | String` where the oracle stays silent (rigor-rs#694,
+        // superseding the rigor-rs#499 workaround). A negative Integer key
+        // on an `Array` aliases a non-negative slot — `Hash`-only too.
+        let negative_key = matches!(
+            self.pin_arg_scalars(ast, &[w.key_node], env, interner)
+                .as_deref(),
+            Some([rigor_types::Scalar::Int(k)]) if *k < 0
+        );
+        if !self.verbatim_slot(*pre, negative_key, interner) {
+            return None;
+        }
+        let current = self.type_call_for_write_value(
+            ast, w.receiver, "[]", &[w.key_node], env, interner,
+        );
         let rhs = self.type_of(ast, w.value, env, interner);
         let truthy = self.narrow_truthy(current, interner);
         Some(rigor_types::Algebra::join(interner, truthy, rhs))
+    }
+
+    /// `IndexedNarrowing.verbatim_slot?` (indexed_narrowing.rb): only a
+    /// `Hash`/`Array` carrier — every member of a union — leaves the stored
+    /// value verbatim at the literal slot, and a negative Integer key
+    /// aliases a non-negative one unless the receiver is a `Hash`
+    /// (`aliasing_index?`).
+    #[allow(clippy::only_used_in_recursion)]
+    fn verbatim_slot(&self, ty: TypeId, negative_key: bool, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Union(members) => members
+                .iter()
+                .all(|&m| self.verbatim_slot(m, negative_key, interner)),
+            _ => match self.index.class_name_of(interner, ty) {
+                Some("Hash") => true,
+                Some("Array") => !negative_key,
+                _ => false,
+            },
+        }
     }
 
     /// `IndexedNarrowing.fully_tracked_receiver_type?`

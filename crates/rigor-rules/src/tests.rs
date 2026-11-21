@@ -578,7 +578,8 @@ fn index_compound_writes_widen_the_receiver_binding() {
     // `h[:a]` read ahead of the widened carrier — so the reference FIRES
     // `for 1` here (probed at `e59b7b89`). The `||= 2` row stores `1 | 2`,
     // and the same-class scalar-constant union collapses to `Integer` for
-    // the scalar verdict (rigor-rs#681) — the reference fires `for 1 | 2`.
+    // the scalar verdict (rigor-rs#681, upstream #1699) — the reference
+    // fires `for 1 | 2`.
     let diags = run(b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n");
     assert_eq!(
         diags.len(),
@@ -1193,27 +1194,41 @@ fn string_index_or_write_slot_narrowing() {
     }
 }
 
-/// rigor-rs#499 — a String compound write's internal `current` read types
-/// like the oracle's. Every expectation below was probed against the reference
-/// (`harness/probe.py`, tuple for tuple): `s[9] ||= nil` records `nil` (the
-/// out-of-range fold), so a later read is `for nil` — not `possible-nil` and
-/// not the flat `for String`; `s.index &&= 1` keeps `Integer | nil`, silent
-/// downstream; the in-range lookup control still fires on its pinned char.
+/// rigor-rs#499 — a String compound write's `current` read types like the
+/// oracle's. rigor-rs#694 re-probed the rows: a `String` carrier fails the
+/// reference's `verbatim_slot?` (`[]=` splices), so `s[k] op= v` records
+/// NO slot and a later `x = s[k]` binds the unmodeled nilable element read
+/// — `String | nil` on the oracle — which `x.upcase` reports as
+/// `possible-nil`, not `for nil` and not the flat `for String`.
+/// `s.index &&= 1` keeps `Integer | nil`, silent downstream; the in-range
+/// lookup control still fires on its pinned char.
 #[test]
 fn string_compound_write_current_read_edges() {
-    // Item 1: the slot record is exactly `nil`.
+    // Item 1: no slot record — the read is the nilable `String | nil`.
     let src = b"s = \"abc\"; s[9] ||= nil; x = s[9]; x.upcase\n";
     let diags = run(src);
-    assert_eq!(diags.len(), 1, "expected one `for nil` diag, got {diags:?}");
-    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
-    assert_eq!(diags[0].message, "undefined method `upcase' for nil");
-    assert_eq!(diags[0].start_offset, 37, "reference @1:38");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one `possible-nil` diag, got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_POSSIBLE_NIL_RECEIVER);
+    assert_eq!(
+        diags[0].message,
+        "possible nil receiver: `upcase' is undefined on NilClass"
+    );
+    assert_eq!(diags[0].start_offset, 37, "reference @4:3");
 
-    // A chained read: the first link (`strip`) is the one that misses on nil.
+    // A chained read through the same nilable element: `strip` answers on
+    // both arms, `frobnicate` on the resulting `String`.
     let diags = run(b"s = \"abc\"; s[9] ||= nil; s[9].strip.frobnicate\n");
-    assert_eq!(diags.len(), 1, "expected one `strip for nil` diag, got {diags:?}");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one `frobnicate for String` diag, got {diags:?}"
+    );
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
-    assert_eq!(diags[0].message, "undefined method `strip' for nil");
+    assert_eq!(diags[0].message, "undefined method `frobnicate' for String");
 
     // Item 2: `&&=` on a nilable zero-arg lookup types `Integer | nil`, so the
     // result (`nil | 1`) is silent downstream.

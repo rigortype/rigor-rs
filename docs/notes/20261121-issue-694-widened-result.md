@@ -36,6 +36,8 @@ and `call.undefined-method` fires.
 | `x = 1; x += "s"; x.zz` | `for Integer` | silent (fold decline → RBS-tier fallback — residual, out of slice) |
 | `x = 2.0 ** 20000; x.zz` | `for Infinity` | silent (Float `**` unmodeled — residual) |
 | `x = 2 ** -3; x.zz` | silent | silent (Rational fold unmodeled on BOTH) |
+| `x = 3 ** -10000; x.zz` | `for Rational` | silent (`fold_result`'s `oversized_number?` gates a Rational result's DENOMINATOR — `1/3**10000` is ~15850 bits) |
+| `x = 1; if true; x += 3; end; x.zz` | `for 4` | silent (folded-if arm widens rebinds before binding — the op-write needs the pre-widen entry) |
 
 ## Required surface (all oracle-verified above)
 
@@ -61,6 +63,18 @@ and `call.undefined-method` fires.
    (upstream #1699) — `Union[Constant|plain Nominal]*` with ONE distinct
    member class collapses to `Nominal[class]` for the check while the message
    renders the union (`for 1 | 4`, `for <literal> | Integer`).
+7. `flow_eval.rs` folded-`if` arm (`bind_check_statement_effects`): replay the
+   live arm on the ENTRY env and overlay the changed bindings — `x += 3` /
+   `x = x + 1` inside a certainty-folded `if` read the pre-widen entry
+   (`if true; x += 3; end` writes `4` on the oracle).
+8. `expr_type.rs` `slot_stored_type`: the reference's `verbatim_slot?` gate —
+   only `Hash`/`Array` carriers (every union member) record a `||=`/`&&=`
+   slot, and a negative Integer key on a non-`Hash` aliases — was MISSING:
+   `s[0] ||= "x"` recorded `String | "x"`, which the new union collapse
+   fired as `for "x" | String` where the oracle stays silent (its `s[k]`
+   read is the unmodeled `Dynamic`). Removes the rigor-rs#499 Constant(Str)
+   workaround; the `nil` record it minted was itself an FP (`s[9] ||= nil;
+   s[9].w` — silent on the oracle).
 
 ## Residuals (deliberately out of slice)
 
@@ -71,3 +85,19 @@ and `call.undefined-method` fires.
   (`n.to_i; x += 3` → `Integer` nominal on the reference — needs call-tier
   typing on the entry binding).
 - `(±1) ** negative` Integer results the reference folds (`(-1) ** -3` → `-1`).
+- Port `s[k]` element reads after an index write are `Dynamic` where the
+  oracle answers `String | nil` (`x = s[0]; x.upcase` — `possible-nil`
+  coverage gap, pre-existing, unchanged by this slice).
+
+## Outcome (branch, oracle-verified)
+
+- Every probe row above matches the reference modulo the pre-existing
+  diagnostic-ordering family (rigor-rs#328 — `unresolved-toplevel` vs
+  `undefined-method` emit order), plus: `s1`, `neg4`–`neg6`, `e1`–`e12`,
+  `ix1`–`ix14`, `t_1`–`t_14`, `s9a`–`s9h`.
+- `cargo test` (rigor-infer, rigor-rules) green; `harness/gate.sh` pass;
+  `fp_audit.py --gaps --sweep`: 0 FP on all 8 corpora, identical gap totals
+  vs the `origin/master` build (the fold paths are corpus-rare — the gain is
+  the diagnostic surface on these shapes).
+- Two test expectations flipped to oracle-verified `for 1 | 2` /
+  `possible-nil` answers (stale declines pinned pre-collapse).

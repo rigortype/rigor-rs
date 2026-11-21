@@ -128,6 +128,65 @@ fn exact_literal_receiver(interner: &Interner, ty: rigor_types::TypeId) -> bool 
     }
 }
 
+/// Upstream #1699 (`single_class_literal_union`, `check_rules.rb`): a union
+/// of one class's literals, alone or beside that class's plain nominal
+/// (`0 | Integer`, `"a" | "b"`, `1 | 2`), holds nothing but instances of
+/// that class, so it answers a method-existence question exactly as the
+/// class does. The union rule declines it through its distinct-class guard
+/// (which exists for SHAPE joins) and the scalar rule declines it for
+/// having no single concrete class, so neither judges it — this collapses
+/// it to `Nominal[class]` for the check; the caller keeps the original for
+/// the message. Literal-and-plain-nominal arms only: a generic, shape or
+/// refinement arm keeps the union declined, and so does a union spanning
+/// two classes.
+fn single_class_literal_union(
+    interner: &mut Interner,
+    index: &CoreIndex,
+    typer: &Typer,
+    ty: rigor_types::TypeId,
+) -> rigor_types::TypeId {
+    let Type::Union(members) = interner.get(ty) else {
+        return ty;
+    };
+    let members = members.clone();
+    if !members
+        .iter()
+        .any(|&m| matches!(interner.get(m), Type::Constant(_)))
+    {
+        return ty;
+    }
+    if !members.iter().all(|&m| match interner.get(m) {
+        Type::Constant(_) => true,
+        Type::Nominal { args, .. } => args.is_empty(),
+        _ => false,
+    }) {
+        return ty;
+    }
+    let mut class_names: Vec<&str> = Vec::with_capacity(members.len());
+    for m in &members {
+        match index
+            .class_name_of(interner, *m)
+            .or_else(|| typer.source().class_name_for_id_of(interner, *m))
+        {
+            Some(name) => class_names.push(name),
+            None => return ty,
+        }
+    }
+    class_names.sort_unstable();
+    class_names.dedup();
+    let [class_name] = class_names[..] else {
+        return ty;
+    };
+    if class_name == "NilClass" {
+        return ty;
+    }
+    match index.class_id(class_name) {
+        Some(class) => interner.intern(Type::Nominal { class, args: vec![] }),
+        // A registry-only name cannot mint a core `Nominal` — keep the union.
+        None => ty,
+    }
+}
+
 /// `LITERAL_RECEIVER_NODES`: a receiver WRITTEN as a String / xstring /
 /// Array / Hash / Regexp literal. A parenthesised one is a `ParenthesesNode`
 /// on the reference, so an unwrapped receiver is not a literal here.
@@ -243,6 +302,13 @@ pub(crate) fn check_call(
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
     let recv_ty = typer.type_of(ast, receiver, env, interner);
+
+    // Issue #1699 (`single_class_literal_union`): a union of one class's
+    // literals — alone or beside that class's plain nominal — is judged as
+    // its one class; the message still names the union (`for 1 | 4`,
+    // `for <literal> | Integer` on the widened op-write union, rigor-rs#694).
+    let rendered_ty = recv_ty;
+    let recv_ty = single_class_literal_union(interner, index, typer, recv_ty);
 
     // Singleton (class-object) receiver: a bare constant `C` typed to
     // `Type::Singleton(class)` (see the typer's `ConstantRead` arm + its zero-FP
@@ -527,7 +593,7 @@ receiver_classes: Some(vec![name.to_string()]),
         index,
         class_name,
         method,
-        exact_literal_receiver(interner, recv_ty) || literal_receiver_node(ast, receiver),
+        exact_literal_receiver(interner, rendered_ty) || literal_receiver_node(ast, receiver),
     ) {
         return None;
     }
@@ -538,8 +604,9 @@ receiver_classes: Some(vec![name.to_string()]),
 
     // We have witnessed absence over a core/RBS class. Render the receiver in the
     // reference's spelling (value-pinned for a Constant/Tuple, else the class
-    // name) via the shared display layer.
-    let receiver_render = render_receiver(interner, index, typer.source(), recv_ty);
+    // name) via the shared display layer. `rendered_ty` names a single-class
+    // literal union it collapsed for the check (`for 1 | 4`).
+    let receiver_render = render_receiver(interner, index, typer.source(), rendered_ty);
     let message = format!("undefined method `{method}' for {receiver_render}");
 
     let severity = catalog(CALL_UNDEFINED_METHOD)
