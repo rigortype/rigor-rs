@@ -1161,12 +1161,16 @@ impl<'i> Typer<'i> {
             // write (`x = y` under `while y.is_a?(Integer)`) otherwise
             // leaks its un-narrowed binding into the fixpoint. Subjects
             // `predicate_edge_locals` does not recognise keep the entry
-            // binding — the decline side.
+            // binding — the decline side. The ORDERED variant keeps every
+            // conjunct's op per name and each narrows the previous
+            // narrowing in turn (`y.is_a?(Integer) && y.is_a?(Unresolved)`
+            // ends `untyped`, not `Integer` — the reference chains the
+            // conjunct scopes left-to-right).
             if let Some(p) = predicate {
                 let truthy_entry =
                     matches!(kind, rigor_parse::LoopKind::While { .. });
                 let mut subjects = Vec::new();
-                Self::predicate_edge_locals(ast, p, truthy_entry, &mut subjects);
+                Self::predicate_edge_locals_ordered(ast, p, truthy_entry, &mut subjects);
                 for (name, op) in subjects {
                     let Some(&cur) = pass_env.get(name.as_str()) else { continue };
                     let narrowed = self.dead_subject_type(ast, cur, &op, interner);
@@ -3198,14 +3202,23 @@ impl<'i> Typer<'i> {
                 // `narrow_class`'s ordering is environment-only
                 // (narrowing.rb:3670 — `environment.class_ordering`): an
                 // asked class the INDEX cannot resolve — undeclared, or
-                // project-only like `class Bar` — makes every member's
+                // project-only like `class Bar`, or a leaf name that only
+                // a nested decl keys (`Stat`) — makes every member's
                 // ordering `:unknown`, where the positive edge answers
                 // `untyped`, never `Bot` (`declines_bot?`,
                 // narrowing.rb:3651), and the negative edge keeps every
                 // member (`subclass_of?` folds `:unknown` to false).
-                // `instance_of?` is exempt: the exact-class test answers
-                // `Bot` on its own semantics (rigor-rs#681 review).
-                if !exact && self.index.class_id(class).is_none() {
+                // The resolution test is the codebase's established pair:
+                // `toplevel_classes` for genuine top-level decls plus the
+                // qualified registry — which also holds MODULES at their
+                // bare/qualified key (`Comparable`, `Digest::Instance`),
+                // so a module guard still narrows (`rigor-rs#681` review
+                // round 2). `instance_of?` is exempt: the exact-class
+                // test answers `Bot` on its own semantics.
+                if !exact
+                    && !self.index.knows_toplevel_class(class)
+                    && !self.index.knows_qualified_class(class)
+                {
                     return if holds { interner.untyped() } else { ty };
                 }
                 self.narrow_type_members(

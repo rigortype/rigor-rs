@@ -5530,3 +5530,75 @@ fn issue_681_loop_entry_narrowing_keeps_firing() {
         );
     }
 }
+
+/// rigor-rs#681, review round 2 — the loop-entry edge applies EVERY
+/// conjunct's op per subject in order (`predicate_edge_locals_ordered`),
+/// matching the reference's left-to-right scope chaining: a second `is_a?`
+/// on the same local narrows the FIRST narrowing's result, so
+/// `is_a?(Integer) && is_a?(Unresolved)` ends `untyped`, not `Integer`.
+/// Every silent row verified on both engines.
+#[test]
+fn issue_681_loop_entry_conjuncts_chain_silently_on_unknown_class() {
+    for src in [
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Unresolved); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Unresolved); x = y; end\nx.zz\n"[..],
+        &b"class Bar; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Bar); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && Foo === y; x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == 1 && y.is_a?(Unresolved); x = y; end\nx.upcase\n"[..],
+        // Reversed order is silent the same way (`untyped` keeps the
+        // decline side under a known-class `is_a?`).
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Unresolved) && y.is_a?(Integer); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Unresolved) && y.is_a?(Integer); x = y; end\nx.zz\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence for {:?}, got {diags:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// rigor-rs#681, review round 2 — the ordered chain's controls: a second
+/// RESOLVABLE conjunct still narrows (`Comparable` is a module — the
+/// `untyped` guard resolves through the qualified registry, not
+/// `class_id`), and disjoint known-class conjuncts still reach `Bot`.
+#[test]
+fn issue_681_loop_entry_conjuncts_keep_firing() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for (src, expect) in [
+        // `1` survives `is_a?(Comparable)` — Integer includes it.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Comparable); x = y; end\nx.upcase\n"[..],
+            "undefined method `upcase' for 0 | 1",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Comparable); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0 | 1",
+        ),
+        // Disjoint known classes chain to `Bot`.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(String) && y.is_a?(Integer); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0",
+        ),
+        // A module asked directly still narrows.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nuntil y.is_a?(Comparable); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0",
+        ),
+    ] {
+        let diags = undefined(src);
+        assert_eq!(
+            diags,
+            vec![expect.to_string()],
+            "row {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
