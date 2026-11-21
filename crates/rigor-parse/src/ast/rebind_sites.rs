@@ -26,6 +26,7 @@ use std::collections::{HashMap, HashSet};
 use crate::ruby_prism::{self, Node as PrismNode, Visit};
 
 use super::constant_string;
+use super::definitions::{literal_symbol_or_string_name, visibility_call_parts};
 
 /// The receiver of a block call as the rule needs it to ask whether the
 /// callee resolves on it (the reference's `Dispatch.resolves_on_receiver?`).
@@ -84,10 +85,18 @@ pub struct RebindFacts {
     /// Upstream v0.4.6 (#2237 / issue #2013) — every instance-side
     /// `define_method(:x)` / `alias_method :x, …` / `alias x y` that replaces
     /// a method of a class body: `(owner's last constant segment, x,
-    /// settled)`. `settled` holds only for a direct body statement that a
-    /// later direct `private :x` / `protected :x` / `public :x` of the same
-    /// body writes again (the reference's walk clears the contest there).
+    /// settled)`. `settled` holds when a LATER certain visibility write for
+    /// the name in the same FILE clears the contest (the reference's
+    /// `wrote` — a direct `private :x` / `protected :x` / `public :x` /
+    /// `module_function :x`, a `private def`-family argument, an `attr_*`
+    /// member, or a reinstating `def`).
     pub replacers: Vec<(String, String, bool)>,
+    /// Issue #492 (upstream #2013, `supersede_def_nodes`) — the
+    /// instance-side `(owner, name)` pairs whose DEF-NODE slot a non-`def`
+    /// definer superseded after an earlier `def` of the name in the same
+    /// file: `attr_*`, `define_method`, `alias_method`, `alias`, a
+    /// Forwardable delegator. A later `def` of the name clears the mark.
+    pub superseded: Vec<(String, String)>,
 }
 
 impl RebindFacts {
@@ -288,6 +297,10 @@ struct Frame {
     module_function: bool,
     /// The class whose instance side a `define_method` / alias here replaces.
     vis_owner: Option<String>,
+    /// The body's running visibility is not provable — a `private` /
+    /// `protected` / `public` / `module_function` toggle that was itself
+    /// uncertain (the reference's `VisibilityTable#uncertain`).
+    uncertain: bool,
 }
 
 struct Walk {
@@ -310,8 +323,24 @@ struct Walk {
     /// The direct statements (program statements and statements of direct
     /// class bodies) and the def arguments of a direct visibility modifier.
     direct: HashSet<Key>,
-    /// Replacer statements a later direct visibility call settles.
-    settled: HashSet<Key>,
+    /// `def` spans that are the argument of a direct `private` /
+    /// `protected` / `public` / `module_function` — the modifier itself
+    /// writes the def's visibility, so the def's own write is certain
+    /// regardless of the body's running default.
+    modifier_arg_defs: HashSet<Key>,
+    /// Source position for ordering replacer events against settle events.
+    pos: u32,
+    /// `(pos, owner, name)` per replacer — `settled` is resolved in
+    /// `collect` once every settle event is recorded.
+    replacer_events: Vec<(u32, String, String)>,
+    /// `(pos, owner, name)` per certain visibility write that clears a
+    /// replacer's contest.
+    settler_events: Vec<(u32, String, String)>,
+    /// `(owner, name)` pairs an instance `def` recorded earlier in this
+    /// file — the `slot.key?(name)` precondition of `supersede_def_nodes`.
+    def_seen: HashSet<(String, String)>,
+    /// Def-node slots a non-`def` definer superseded (`contested_def_nodes`).
+    superseded: HashSet<(String, String)>,
 }
 
 impl Walk {
@@ -326,11 +355,26 @@ impl Walk {
                 self.direct.insert(span_of_node(&s));
                 // `private def x` / `public def x` written as a direct statement.
                 if let Some(c) = s.as_call_node() {
-                    if c.receiver().is_none() && VISIBILITY_MODIFIERS.contains(&name_of(&c).as_str()) {
+                    let cn = name_of(&c);
+                    if c.receiver().is_none() && VISIBILITY_MODIFIERS.contains(&cn.as_str()) {
                         if let Some(args) = c.arguments() {
                             for a in args.arguments().iter() {
                                 if a.as_def_node().is_some() {
                                     self.direct.insert(span_of_node(&a));
+                                }
+                            }
+                        }
+                    }
+                    // `private def x` / `module_function def x` — the
+                    // modifier itself writes the def's visibility, so the
+                    // def's own write is certain.
+                    if c.receiver().is_none()
+                        && (cn == "module_function" || VISIBILITY_MODIFIERS.contains(&cn.as_str()))
+                    {
+                        if let Some(args) = c.arguments() {
+                            for a in args.arguments().iter() {
+                                if a.as_def_node().is_some() {
+                                    self.modifier_arg_defs.insert(span_of_node(&a));
                                 }
                             }
                         }
@@ -345,23 +389,35 @@ impl Walk {
         if direct && owner.is_some() {
             self.mark_direct_body(body.as_ref());
         }
-        if !singleton && direct {
-            if let Some(stmts) = body.as_ref().and_then(|b| b.as_statements_node()) {
-                let list: Vec<PrismNode<'_>> = stmts.body().iter().collect();
-                for (i, stmt) in list.iter().enumerate() {
-                    let Some(x) = replaced_name(stmt) else { continue };
-                    if list[i + 1..].iter().any(|later| visibility_names(later).is_some_and(|ns| ns.contains(&x))) {
-                        self.settled.insert(span_of_node(stmt));
-                    }
-                }
-            }
-        }
         let vis_owner = if singleton { None } else { owner.clone() };
-        self.frames.push(Frame { owner, singleton, module_function: false, vis_owner });
+        self.frames.push(Frame { owner, singleton, module_function: false, vis_owner, uncertain: false });
         if let Some(b) = &body {
             self.visit(b);
         }
         self.frames.pop();
+    }
+
+    /// One certain visibility write — the events a replacer's `settled`
+    /// resolves against in `collect`.
+    fn push_settle(&mut self, owner: String, name: String) {
+        self.pos += 1;
+        self.settler_events.push((self.pos, owner, name));
+    }
+
+    /// A non-`def` definer superseded the def's own node (`supersede_def_nodes`):
+    /// mark the def-node slot contested when the name's `def` was already
+    /// seen in this file.
+    fn record_supersede(&mut self, n: &PrismNode<'_>) {
+        let Some(frame) = self.frames.last() else { return };
+        if frame.singleton {
+            return;
+        }
+        let Some(owner) = frame.vis_owner.clone() else { return };
+        for x in superseded_names(n) {
+            if self.def_seen.contains(&(owner.clone(), x.clone())) {
+                self.superseded.insert((owner.clone(), x));
+            }
+        }
     }
 
     fn note_value(&mut self, literal: Key, body: (usize, usize)) {
@@ -412,8 +468,8 @@ impl Walk {
     fn record_replacer(&mut self, n: &PrismNode<'_>) {
         let Some(x) = replaced_name(n) else { return };
         let Some(owner) = self.frames.last().and_then(|f| f.vis_owner.clone()) else { return };
-        let settled = self.settled.contains(&span_of_node(n));
-        self.out.replacers.push((owner, x, settled));
+        self.pos += 1;
+        self.replacer_events.push((self.pos, owner, x));
     }
 
     fn def_slot(&self, n: &PrismNode<'_>, def: &ruby_prism::DefNode<'_>) -> Option<(String, bool)> {
@@ -493,11 +549,39 @@ impl<'pr> Visit<'pr> for Walk {
             }
         };
         self.out.defs.push(RebindDef { name, slot, escapes });
+        // Instance-side `def` — the def-node slot bookkeeping
+        // (`supersede_def_nodes`' `slot.key?` + a later `def`'s clear) and
+        // the certain-write event that settles a replacer's contest. The
+        // reference only reads the name itself, not the position.
+        if node.receiver().is_none() {
+            if let Some(owner) = self.frames.last().and_then(|f| f.vis_owner.clone()) {
+                let dname = constant_string(node.name().as_slice());
+                let key = span_of_node(&n);
+                if self.direct.contains(&key) {
+                    self.superseded.remove(&(owner.clone(), dname.clone()));
+                } else {
+                    self.superseded.insert((owner.clone(), dname.clone()));
+                }
+                self.def_seen.insert((owner.clone(), dname.clone()));
+                let settled_def = self.modifier_arg_defs.contains(&key)
+                    || (self.direct.contains(&key)
+                        && !self.frames.last().is_some_and(|f| f.uncertain));
+                if settled_def {
+                    self.push_settle(owner, dname);
+                }
+            }
+        }
         // A `def` opens a new local-variable scope, and nothing in its body
-        // is a direct statement.
+        // is a direct statement. The `uncertain` flag inherits — the
+        // reference's `VisibilityTable` keeps it through a `def` body (only
+        // `body` — a class, module or eval frame — resets it).
         let saved = std::mem::replace(&mut self.scope, n.location().start_offset());
-        let vis_owner = self.frames.last().and_then(|f| f.vis_owner.clone());
-        self.frames.push(Frame { owner: None, singleton: false, module_function: false, vis_owner });
+        let (vis_owner, uncertain) = self
+            .frames
+            .last()
+            .map(|f| (f.vis_owner.clone(), f.uncertain))
+            .unwrap_or((None, false));
+        self.frames.push(Frame { owner: None, singleton: false, module_function: false, vis_owner, uncertain });
         ruby_prism::visit_def_node(self, node);
         self.frames.pop();
         self.scope = saved;
@@ -517,6 +601,51 @@ impl<'pr> Visit<'pr> for Walk {
         }
         self.record_bodiless(node);
         self.record_replacer(&node.as_node());
+        // Visibility toggles set the body's `uncertain` (the reference's
+        // `VisibilityTable#uncertain` — a `private` under `if` makes the
+        // running default unprovable); a splat leaves it uncertain.
+        if let Some((_, vargs)) = visibility_call_parts(node) {
+            let direct = self.direct.contains(&span_of_node(&node.as_node()));
+            if vargs.is_empty() {
+                if let Some(f) = self.frames.last_mut() {
+                    f.uncertain = !direct;
+                }
+            } else if vargs.iter().any(|a| a.as_splat_node().is_some()) {
+                if let Some(f) = self.frames.last_mut() {
+                    f.uncertain = true;
+                }
+            } else if direct {
+                // A certain named visibility write settles a replacer's
+                // contest for the name (`VisibilityTable#wrote`) — and a
+                // `private attr_reader :x` writes its members certain too
+                // (`record_attr_visibility` on the argument).
+                if let Some(owner) = self.frames.last().and_then(|f| f.vis_owner.clone()) {
+                    for a in &vargs {
+                        if let Some(x) = literal_symbol_or_string_name(a) {
+                            self.push_settle(owner.clone(), x);
+                        } else if let Some(members) =
+                            a.as_call_node().and_then(|c| attr_macro_names(&c))
+                        {
+                            for m in members {
+                                self.push_settle(owner.clone(), m);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // A direct `attr_*` writes each member the running visibility — a
+        // certain write that settles a replacer's contest.
+        if self.direct.contains(&span_of_node(&node.as_node())) {
+            if let Some(members) = attr_macro_names(node) {
+                if let Some(owner) = self.frames.last().and_then(|f| f.vis_owner.clone()) {
+                    for m in members {
+                        self.push_settle(owner.clone(), m);
+                    }
+                }
+            }
+        }
+        self.record_supersede(&node.as_node());
         // `note_call`.
         let block = node.block();
         let body = match &block {
@@ -573,7 +702,7 @@ impl<'pr> Visit<'pr> for Walk {
             None
         };
         if let Some(owner) = eval_owner {
-            self.frames.push(Frame { owner: None, singleton: false, module_function: false, vis_owner: Some(owner) });
+            self.frames.push(Frame { owner: None, singleton: false, module_function: false, vis_owner: Some(owner), uncertain: false });
             ruby_prism::visit_call_node(self, node);
             self.frames.pop();
         } else {
@@ -639,6 +768,7 @@ impl<'pr> Visit<'pr> for Walk {
             self.out.bodiless.push(name);
         }
         self.record_replacer(&node.as_node());
+        self.record_supersede(&node.as_node());
         ruby_prism::visit_alias_method_node(self, node);
     }
 
@@ -704,15 +834,107 @@ fn replaced_name(n: &PrismNode<'_>) -> Option<String> {
     }
 }
 
-/// The literal names a receiverless `private :x, :y` (or `protected` /
-/// `public`) writes; `None` for any other statement or a computed argument.
-fn visibility_names(n: &PrismNode<'_>) -> Option<Vec<String>> {
-    let call = n.as_call_node()?;
-    if call.receiver().is_some() || !VISIBILITY_MODIFIERS.contains(&name_of(&call).as_str()) {
+/// The member names an `attr_*` call declares (the reference's
+/// `attr_macro` + `each_attr_macro_name`): receiverless or `self.` only,
+/// named directly or as the literal first argument of `send` /
+/// `__send__` / `public_send`.
+fn attr_macro_names(call: &ruby_prism::CallNode<'_>) -> Option<Vec<String>> {
+    if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
         return None;
     }
-    let args: Vec<PrismNode<'_>> = call.arguments()?.arguments().iter().collect();
-    args.iter().map(|a| literal_name(Some(a))).collect()
+    let mut macro_name = name_of(call);
+    let mut args: Vec<PrismNode<'_>> =
+        call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    if !["attr_reader", "attr_writer", "attr_accessor"].contains(&macro_name.as_str()) {
+        if !SEND_CALLS.contains(&macro_name.as_str()) {
+            return None;
+        }
+        macro_name = args.first().and_then(|a| literal_symbol_or_string_name(a))?;
+        args.remove(0);
+        if !["attr_reader", "attr_writer", "attr_accessor"].contains(&macro_name.as_str()) {
+            return None;
+        }
+    }
+    let mut members = Vec::new();
+    for arg in &args {
+        let Some(base) = literal_symbol_or_string_name(arg) else { continue };
+        if macro_name != "attr_writer" {
+            members.push(base.clone());
+        }
+        if macro_name != "attr_reader" {
+            members.push(format!("{base}="));
+        }
+    }
+    Some(members)
+}
+
+/// The method names a Forwardable delegator call defines (`def_delegator`,
+/// `def_delegators`, `delegate`, the `def_instance_*` / `instance_delegate`
+/// forms). The ambiguous-side macros are read as instance — the port has
+/// no `extend` census, and a `SingleForwardable` body wrongly declining is
+/// safe.
+fn forwardable_names(call: &ruby_prism::CallNode<'_>) -> Vec<String> {
+    if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
+        return Vec::new();
+    }
+    let name = name_of(call);
+    let args: Vec<PrismNode<'_>> =
+        call.arguments().map(|a| a.arguments().iter().collect()).unwrap_or_default();
+    match name.as_str() {
+        "def_delegator" | "def_instance_delegator" => {
+            // `(accessor, method, alias = method)` — the alias is the name.
+            if (2..=3).contains(&args.len()) {
+                args.last().and_then(|a| literal_symbol_or_string_name(a)).into_iter().collect()
+            } else {
+                Vec::new()
+            }
+        }
+        "def_delegators" | "def_instance_delegators" => {
+            // `(accessor, *methods)`.
+            if args.is_empty() {
+                Vec::new()
+            } else {
+                args.iter().skip(1).filter_map(|a| literal_symbol_or_string_name(a)).collect()
+            }
+        }
+        "delegate" | "instance_delegate" => {
+            // `(method => accessor, …)` — the hash's literal keys.
+            if args.len() != 1 {
+                return Vec::new();
+            }
+            let elements = args[0]
+                .as_hash_node()
+                .map(|h| h.elements())
+                .or_else(|| args[0].as_keyword_hash_node().map(|h| h.elements()));
+            let Some(elements) = elements else { return Vec::new() };
+            elements
+                .iter()
+                .filter_map(|e| e.as_assoc_node())
+                .filter_map(|a| literal_symbol_or_string_name(&a.key()))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// The instance-side names a node supersedes a `def` with (the reference's
+/// `call_superseded_names` / the `alias` arm): `attr_*` members,
+/// `define_method` / `alias_method` names (the port's widened
+/// `replaced_name` surface), Forwardable delegator names.
+fn superseded_names(n: &PrismNode<'_>) -> Vec<String> {
+    if let Some(call) = n.as_call_node() {
+        if let Some(members) = attr_macro_names(&call) {
+            return members;
+        }
+        if let Some(x) = replaced_name(n) {
+            return vec![x];
+        }
+        return forwardable_names(&call);
+    }
+    if n.as_alias_method_node().is_some() {
+        return replaced_name(n).into_iter().collect();
+    }
+    Vec::new()
 }
 
 fn last_segment(path: &PrismNode<'_>) -> Option<String> {
@@ -828,11 +1050,31 @@ pub(crate) fn collect(root: &PrismNode<'_>) -> RebindFacts {
             singleton: false,
             module_function: false,
             vis_owner: None,
+            uncertain: false,
         }],
         direct: HashSet::new(),
-        settled: HashSet::new(),
+        modifier_arg_defs: HashSet::new(),
+        pos: 0,
+        replacer_events: Vec::new(),
+        settler_events: Vec::new(),
+        def_seen: HashSet::new(),
+        superseded: HashSet::new(),
     };
     w.visit(root);
+    // A replacer's `settled`: the last certain visibility write for the
+    // name in the FILE that follows it clears the contest (`wrote`).
+    let mut last_settle: HashMap<(String, String), u32> = HashMap::new();
+    for (pos, owner, name) in &w.settler_events {
+        last_settle.insert((owner.clone(), name.clone()), *pos);
+    }
+    for (pos, owner, name) in &w.replacer_events {
+        let settled = last_settle
+            .get(&(owner.clone(), name.clone()))
+            .is_some_and(|p| *p > *pos);
+        w.out.replacers.push((owner.clone(), name.clone(), settled));
+    }
+    w.out.superseded = w.superseded.iter().cloned().collect();
+
     // `value_targets`: a proc value assigned to a local reaches the calls
     // that receive it as `&local` when every other read only calls or tests
     // it; anything else is UNKNOWN.

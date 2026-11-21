@@ -5277,3 +5277,85 @@ fn atm_describe_label_flattens_nested_optionals_and_keeps_inner_separators() {
         ]
     );
 }
+
+/// rigor-rs#492 (upstream #2013) — a `define_method` / `alias` / `attr_*`
+/// after the parent's `def` gives the name a visibility the walk cannot
+/// read, so the override's inherited visibility is not provable and the
+/// reference stays silent. Probed identical on the oracle for each row.
+#[test]
+fn issue_492_override_silent_when_parent_def_replaced() {
+    let silent = [
+        // `attr_reader` in a reopening supersedes the def-node slot.
+        b"class B\n  private def foo = 1\nend\n\nclass B\n  attr_reader :foo\nend\n\nclass S < B\n  protected\n  def foo = 3\nend\n" as &[u8],
+        // …and in the same body.
+        b"class B\n  private def foo = 1\n  attr_reader :foo\nend\n\nclass S < B\n  protected\n  def foo = 3\nend\n",
+        // `define_method` in a reopening contests the visibility slot.
+        b"class B\n  def foo = 1\nend\n\nclass B\n  define_method(:foo) { 2 }\nend\n\nclass S < B\n  protected\n  def foo = 3\nend\n",
+        // …under a condition too (the upstream #2013 spec row).
+        b"class P\n  def x = 1\nend\n\nclass K < P\n  private def x = 2\n  define_method(:x) { 3 } if ENV[\"X\"]\nend\n",
+        // `alias` in a reopening (already silent on master).
+        b"class B\n  def bar = 1\n  private def foo = 1\nend\n\nclass B\n  alias foo bar\nend\n\nclass S < B\n  protected\n  def foo = 3\nend\n",
+    ];
+    for src in silent {
+        let diags = override_vis(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+}
+
+/// Upstream #2013's control rows — a `private :x` after the replacer SETTLES
+/// the slot, so the reduction still reports; and a bare `private def` with
+/// no replacer fires as before.
+#[test]
+fn issue_492_override_fires_when_later_visibility_settles() {
+    let src = b"class P\n  def x = 1\nend\n\nclass K < P\n  private def x = 2\nend\n\nclass L < P\n  private def x = 2\n  define_method(:x) { 3 }\n  private :x\nend\n";
+    let diags = override_vis(src);
+    assert_eq!(diags.len(), 2, "expected K and L to report, got {diags:?}");
+    assert!(diags.iter().all(|d| d.message.contains("public to private")));
+}
+
+/// rigor-rs#492 (upstream #2013) — a `define_method` or `alias` in a SIBLING
+/// file contests the slot either file order (the replaced mark survives the
+/// project fold); the override lint declines. Already matched on master —
+/// kept as a must-stay-silent control.
+#[test]
+fn issue_492_override_silent_cross_file_replacer() {
+    let p = b"class P\n  def x = 1\nend\n" as &[u8];
+    let private_def = b"class K < P\n  private def x = 2\nend\n" as &[u8];
+    let define = b"class K < P\n  define_method(:x) { 3 }\nend\n" as &[u8];
+    assert!(override_vis_project(&[p, private_def, define], 1).is_empty());
+    assert!(override_vis_project(&[p, define, private_def], 2).is_empty());
+}
+
+/// rigor-rs#492 — a block (or any interpolation) inside a HEREDOC reads the
+/// env at the closure, not the end-of-file env: the heredoc body lies
+/// outside its statement's span, so `check_env_at` used to hand the site
+/// the flat env and leak a later write in. Probed on the oracle.
+#[test]
+fn issue_492_heredoc_interpolation_reads_env_at_closure() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    // The issue's row — a block inside the interpolation.
+    assert!(undefined(b"y = \"s\"\nx = <<~EOS\n  #{[1].map { y.upcase }}\nEOS\ny = 1\n").is_empty());
+    // The same with a bare interpolated call.
+    assert!(undefined(b"y = \"s\"\nx = <<~EOS\n  #{y.upcase}\nEOS\ny = 1\n").is_empty());
+    // The reverse leak: the env AT the interpolation holds `1`, and a later
+    // write must not reach back (the oracle fires `for 1` here).
+    assert_eq!(
+        undefined(b"y = 1\nx = <<~EOS\n  #{y.upcase}\nEOS\ny = \"s\"\n"),
+        vec!["undefined method `upcase' for 1".to_string()]
+    );
+    // Controls: a real use after the rebind still fires …
+    assert_eq!(
+        undefined(b"y = \"s\"\nx = <<~EOS\n  #{[1].map { y.upcase }}\nEOS\ny = 1\ny.upcase\n"),
+        vec!["undefined method `upcase' for 1".to_string()]
+    );
+    // …and the parenthesised-group form stays silent (already matched).
+    assert!(
+        undefined(b"y = \"s\"\nx = (y = \"s\"; <<~EOS\n  #{y.upcase}\nEOS\n)\ny = 1\n").is_empty()
+    );
+}

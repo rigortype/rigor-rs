@@ -438,6 +438,9 @@ impl SourceIndex {
                         .or_default()
                         .push((i, *settled));
                 }
+                for (owner, name) in &facts.superseded {
+                    idx.superseded_def_nodes.insert((owner.clone(), name.clone()));
+                }
                 for d in &facts.defs {
                     match &d.slot {
                         Some((owner, side)) if !d.escapes => {

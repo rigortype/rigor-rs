@@ -20,7 +20,8 @@ use crate::{
 use crate::dead::DeadOp;
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
-    is_content_mutator, literal_send_target, IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
+    is_content_mutator, literal_send_target, node_child_ids, IndexedFlow, MUTATOR_METHODS,
+    STRING_MUTATORS,
 };
 
 /// What a `while`/`until` loop's tracked locals converge to —
@@ -2115,6 +2116,7 @@ impl<'i> Typer<'i> {
                     boundary_stride: 1,
                     effects: FlowEffects::new(Vec::new(), Vec::new()),
                     closure_mutations: Vec::new(),
+                    escaped: Vec::new(),
                     indexed: IndexedFlow::default(),
                     dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
                     loops: Vec::new(),
@@ -2191,6 +2193,20 @@ impl<'i> Typer<'i> {
             }
             self.bind_check_statement(ast, stmt, &mut env, &effects, &indexed, &dead, interner);
         }
+        // rigor-rs#492 — a heredoc interpolation body lies outside its
+        // statement's span, so `check_env_at`'s containment lookup cannot
+        // find its statement. Chain every node that escapes its own
+        // parent's span back to its boundary statement, so the site can
+        // replay to the statement's entry env and descend the recorded
+        // links (a Barrier link takes the closure's entry env, exactly as
+        // `entry_children` does).
+        let mut escaped = Vec::new();
+        if record {
+            for (i, &(stmt, span)) in boundary_stmts.iter().enumerate() {
+                let mut chain = vec![stmt];
+                collect_escaped(ast, stmt, span, i, &mut chain, &mut escaped);
+            }
+        }
         let record_guards = self.collect_record_guards(ast, &indexed);
         CheckFlow {
             env,
@@ -2199,6 +2215,7 @@ impl<'i> Typer<'i> {
             boundary_stride: stride,
             effects,
             closure_mutations: closure_muts,
+            escaped,
             indexed,
             dead,
             loops: self.collect_loop_edges(ast),
@@ -2472,15 +2489,27 @@ impl<'i> Typer<'i> {
             let k = flow
                 .boundary_stmts
                 .partition_point(|(_, s)| s.0 <= site.0);
-            let Some(&(stmt, stmt_span)) = k
+            let (stmt_idx, mut chain) = match k
                 .checked_sub(1)
                 .and_then(|i| flow.boundary_stmts.get(i))
-            else {
-                break 'env Cow::Borrowed(&flow.env);
+            {
+                Some(&(_, stmt_span)) if stmt_span.0 <= site.0 && site.1 <= stmt_span.1 => {
+                    (k - 1, None)
+                }
+                // rigor-rs#492 — the site may sit in a heredoc interpolation
+                // body, which lies outside its statement's span entirely:
+                // `escaped` chains it back to its statement.
+                _ => match flow
+                    .escaped
+                    .iter()
+                    .filter(|e| e.span.0 <= site.0 && site.1 <= e.span.1)
+                    .min_by_key(|e| e.span.1 - e.span.0)
+                {
+                    Some(e) => (e.stmt_idx, Some(e.chain.as_slice())),
+                    None => break 'env Cow::Borrowed(&flow.env),
+                },
             };
-            if !(stmt_span.0 <= site.0 && site.1 <= stmt_span.1) {
-                break 'env Cow::Borrowed(&flow.env);
-            }
+            let (stmt, stmt_span) = flow.boundary_stmts[stmt_idx];
             // rigor-rs#368 — a site inside a `rescue` clause also needs the
             // replay even when no write postdates its statement: the clause's
             // own bindings (`rescue => e`) reach only through it.
@@ -2501,16 +2530,21 @@ impl<'i> Typer<'i> {
             // replaced (rigor-rs#424).
             let ci = flow
                 .boundaries
-                .partition_point(|&(i, _)| i < k)
+                .partition_point(|&(i, _)| i <= stmt_idx)
                 .saturating_sub(1);
             let (cp_idx, ref cp_env) = flow.boundaries[ci];
             let mut env = cp_env.clone();
-            for &(s, _) in &flow.boundary_stmts[cp_idx..k - 1] {
+            for &(s, _) in &flow.boundary_stmts[cp_idx..stmt_idx] {
                 self.bind_check_statement(
                     ast, s, &mut env, &flow.effects, &flow.indexed, &flow.dead, interner,
                 );
             }
-            self.entry_descend(ast, stmt, site, true, false, &mut env, flow, interner);
+            match chain.take() {
+                Some(chain) => self.entry_descend_chain(ast, chain, site, &mut env, flow, interner),
+                None => {
+                    self.entry_descend(ast, stmt, site, true, false, &mut env, flow, interner)
+                }
+            }
             Cow::Owned(env)
         };
         // rigor-rs#368 — a site inside a folded-dead `if`/`unless` arm reads
@@ -2539,6 +2573,80 @@ impl<'i> Typer<'i> {
             return Cow::Owned(env);
         }
         base
+    }
+
+    /// [`check_env_at`] for a site inside a span-escaped node
+    /// (rigor-rs#492): the recorded containment chain from its boundary
+    /// statement to the escaped node, replayed in evaluation order. Each
+    /// link descends through the same `flow_children` edges
+    /// [`Self::entry_descend`] walks — earlier children still bind — and a
+    /// `Barrier` link takes the closure's entry env. The containers the
+    /// reference arm keeps flat (`If`, `Loop`, `Case`, `When`,
+    /// `BeginRescue`, a non-sequence `Statements`) apply their subtree
+    /// effects conservatively; `Definition`/`ClassDef`/`ModuleDef` take the
+    /// flat env, exactly as `entry_descend` does.
+    fn entry_descend_chain(
+        &self,
+        ast: &LoweredAst,
+        chain: &[NodeId],
+        site: rigor_parse::Span,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        let mut uncond = true;
+        let mut preserve_env = false;
+        for (i, &id) in chain.iter().enumerate() {
+            match ast.get(id) {
+                Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                    *env = flow.env.clone();
+                    return;
+                }
+                Node::Statements { kind, .. } if !matches!(kind, StatementsKind::Sequence) => {
+                    self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                    return;
+                }
+                Node::If { .. }
+                | Node::Loop { .. }
+                | Node::Case { .. }
+                | Node::When { .. }
+                | Node::BeginRescue { .. } => {
+                    self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                    if matches!(ast.get(id), Node::Loop { .. } | Node::Case { .. }) {
+                        preserve_env = true;
+                    }
+                    if i + 1 < chain.len() {
+                        continue;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            let Some(&next) = chain.get(i + 1) else {
+                self.entry_descend(ast, id, site, uncond, preserve_env, env, flow, interner);
+                return;
+            };
+            for (child, edge) in self.flow_children(ast.get(id)) {
+                if child == next {
+                    if edge == FlowEdge::Barrier {
+                        if !preserve_env {
+                            self.closure_entry(ast, id, site, env, flow, interner);
+                        }
+                        if matches!(ast.get(id), Node::Call { .. }) {
+                            self.closure_descend(ast, id, site, env, flow, id);
+                        }
+                        return;
+                    }
+                    uncond = uncond && edge == FlowEdge::Uncond;
+                    break;
+                }
+                if edge != FlowEdge::Barrier && ast.get(child).span().1 <= site.0 {
+                    self.bind_check_statement(
+                        ast, child, env, &flow.effects, &flow.indexed, &flow.dead, interner,
+                    );
+                }
+            }
+        }
     }
 
     /// Replay `id`'s contained effects into `env` in evaluation order until
@@ -5972,6 +6080,11 @@ pub struct CheckFlow {
     /// body's own scope evaluates — `(body owner node, write span, receiver
     /// name)` — replayed only for a site inside that body (rigor-rs#366).
     closure_mutations: Vec<(NodeId, rigor_parse::Span, String)>,
+    /// rigor-rs#492 — every node that escapes its own parent's span below a
+    /// boundary statement (a heredoc interpolation body: the `#{…}` parts
+    /// sit under the `<<~EOS` opener line's end), with its statement index
+    /// and the containment chain back to it. See [`EscapedBody`].
+    escaped: Vec<EscapedBody>,
     /// [`collect_indexed_flow`]: the indexed-narrowing side table
     /// (rigor-rs#325) — `operand` `h[k] ||= v` records, their spans, and
     /// element-mutator calls.
@@ -5992,6 +6105,40 @@ pub struct CheckFlow {
     /// rigor-rs#405 — every class guard whose local holds an indexed
     /// record, for [`Typer::record_guard_overlay`].
     record_guards: Vec<crate::record_guards::RecordGuard>,
+}
+
+/// One span-escaped node for [`Typer::check_env_at`] (rigor-rs#492).
+struct EscapedBody {
+    /// The escaped node's span — a site inside it takes this entry's chain.
+    span: rigor_parse::Span,
+    /// The [`CheckFlow::boundary_stmts`] index the chain hangs from.
+    stmt_idx: usize,
+    /// `[boundary statement, …, the escaped node]` — the containment chain
+    /// [`Typer::entry_descend`] would have walked had the spans nested.
+    chain: Vec<NodeId>,
+}
+
+/// [`CheckFlow::escaped`]: the `(span, chain)` of every child that lies
+/// outside its parent's span below a boundary statement.
+fn collect_escaped(
+    ast: &LoweredAst,
+    id: NodeId,
+    parent_span: rigor_parse::Span,
+    stmt_idx: usize,
+    chain: &mut Vec<NodeId>,
+    out: &mut Vec<EscapedBody>,
+) {
+    let mut children = Vec::new();
+    node_child_ids(ast.get(id), &mut children);
+    for child in children {
+        let span = ast.get(child).span();
+        chain.push(child);
+        if span.0 < parent_span.0 || parent_span.1 < span.1 {
+            out.push(EscapedBody { span, stmt_idx, chain: chain.clone() });
+        }
+        collect_escaped(ast, child, span, stmt_idx, chain, out);
+        chain.pop();
+    }
 }
 
 /// One `while`/`until` loop for [`Typer::loop_edge_overlay`].

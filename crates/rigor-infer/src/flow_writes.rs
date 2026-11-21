@@ -1106,7 +1106,7 @@ fn descendants_of(ast: &LoweredAst, roots: &[NodeId]) -> HashSet<NodeId> {
 /// into the arena. Used only by [`descendants_of`]; missing a variant can only
 /// under-mark a body descendant, which keeps the write a rebind and declines
 /// (the zero-FP-safe direction).
-fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
+pub(crate) fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
     match n {
         Node::Program { body, .. }
         | Node::Statements { body, .. }
