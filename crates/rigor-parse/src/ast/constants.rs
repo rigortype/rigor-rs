@@ -98,7 +98,7 @@ impl<'pr> ConstPathChain<'pr> {
     /// so this is `nodes` reversed). Each entry is `(segment-name, named)`:
     /// `named` is `false` for a segment `name()` cannot answer (the strict
     /// render declines the whole path on one).
-    fn segments(&self) -> impl Iterator<Item = (String, bool)> + '_ {
+    pub(crate) fn segments(&self) -> impl Iterator<Item = (String, bool)> + '_ {
         self.nodes.iter().rev().map(|cp| {
             (
                 cp.name()

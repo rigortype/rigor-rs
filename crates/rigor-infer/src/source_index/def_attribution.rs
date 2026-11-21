@@ -165,6 +165,14 @@ pub(crate) fn def_root_cx() -> DefCx {
 ///   resolved AFTER the whole walk: `apply_alias_def_nodes` consults the
 ///   file's COMPLETE def-node table, so an alias may precede its target
 ///   `def`.
+/// * `singleton_methods` — the SINGLETON-kind existence table
+///   (`record_def_method`'s `:singleton` kind): `def self.x`, a `def` inside
+///   a `class <<`/`instance_eval` body, `def C.x` receiver forms, and the
+///   singleton-side call-introduced names (`define_method`, `attr_*`,
+///   `alias_method`, `define_singleton_method` under `class <<`/
+///   `instance_eval`). The instance tables deliberately file these NOWHERE,
+///   but `call.undefined-method`'s singleton arm consults them
+///   (`discovered_method?`'s kind-precise half, rigor-rs#666).
 #[derive(Default)]
 pub(crate) struct DefTables {
     pub(crate) toplevel: HashSet<String>,
@@ -172,6 +180,7 @@ pub(crate) struct DefTables {
     pub(crate) def_names: HashMap<String, HashSet<String>>,
     pub(crate) file_methods: HashMap<String, HashSet<String>>,
     pub(crate) file_toplevel: HashSet<String>,
+    pub(crate) singleton_methods: HashMap<String, HashSet<String>>,
     pub(crate) pending_aliases: Vec<(String, String, String)>,
 }
 
@@ -528,7 +537,6 @@ fn file_def(
     def_receiver_path: Option<&str>,
     tables: &mut DefTables,
 ) {
-    let _ = singleton_name; // always `:singleton` kind — see the filing below.
     if cx.defs_side == DefsSide::Unnameable {
         return;
     }
@@ -550,6 +558,13 @@ fn file_def(
     if owner.is_empty() {
         for nm in [name, receiver_def_name].into_iter().flatten() {
             tables.toplevel.insert(nm.to_string());
+        }
+        // A toplevel `def Foo.x` still binds `Foo.x` — the lexical prefix
+        // owns nothing, but the receiver names its singleton
+        // (`discovered_singleton_def_nodes[Foo]`, rigor-rs#666).
+        if let (Some(nm), Some(path)) = (receiver_def_name, def_receiver_path) {
+            let owner_key = path.strip_prefix("::").unwrap_or(path).to_string();
+            tables.singleton_methods.entry(owner_key).or_default().insert(nm.to_string());
         }
         return;
     }
@@ -578,13 +593,46 @@ fn file_def(
     // the instance side and for a receiver-bearing def that does not name the
     // enclosing class; `:singleton` for `def self.x`, for anything under a
     // singleton-side body (`class <<`, `instance_eval`), and for the
-    // self-targeting receiver form. The port's existence table answers
-    // `:instance` queries only (the singleton branch of `check_call` never
-    // consults it), so singleton-kind names file NOWHERE — the Blocking-3
-    // fix: `class String; def self.m` / `Float.instance_eval { def m }` must
-    // not suppress `"x".m` / `1.5.m` (reference + master both fire).
-    if cx.defs_side != DefsSide::Instance {
+    // self-targeting receiver form. The INSTANCE-kind existence tables still
+    // file singleton names nowhere — the Blocking-3 fix (`class String; def
+    // self.m` / `Float.instance_eval { def m }` must not suppress `"x".m` /
+    // `1.5.m`, reference + master both fire) — while the new
+    // `singleton_methods` table holds them for `call.undefined-method`'s
+    // singleton arm (`discovered_method?`'s `:singleton` half, rigor-rs#666).
+    if cx.defs_side == DefsSide::Singleton {
+        // Issue #490 — inside a `class <<` / `instance_eval` body EVERY def
+        // binds on the body's owner, whatever its receiver spells
+        // (`walk_singleton_fold_defs`'s `method` pick is the same triple).
+        for nm in [name, receiver_def_name, singleton_name].into_iter().flatten() {
+            tables
+                .singleton_methods
+                .entry(key.clone())
+                .or_default()
+                .insert(nm.to_string());
+        }
         return;
+    }
+    if let Some(nm) = singleton_name {
+        tables
+            .singleton_methods
+            .entry(key.clone())
+            .or_default()
+            .insert(nm.to_string());
+    }
+    if let Some(nm) = receiver_def_name {
+        if targets_self {
+            tables
+                .singleton_methods
+                .entry(key.clone())
+                .or_default()
+                .insert(nm.to_string());
+        } else if let Some(path) = def_receiver_path {
+            // `def Foo.x` binds `Foo.x` wherever it is written — the
+            // reference's `discovered_singleton_def_nodes[Foo]` — keyed by
+            // the rendered path, `::`-rooted spelling stripped.
+            let owner_key = path.strip_prefix("::").unwrap_or(path).to_string();
+            tables.singleton_methods.entry(owner_key).or_default().insert(nm.to_string());
+        }
     }
     let mut file_instance = |nm: &str| {
         // `def_names` — the name has a project `def` node, so it is per-file
@@ -647,7 +695,18 @@ fn file_alias(
         return;
     }
     // `in_singleton_class || defs_singleton` ⇒ `:singleton` kind — the port's
-    // instance-side table files it nowhere, exactly like [`file_def`].
+    // instance-side table files it nowhere; the singleton-kind existence
+    // table holds it instead (`call.undefined-method`'s arm, rigor-rs#666).
+    if cx.defs_side == DefsSide::Singleton {
+        if let Some(new) = literal_method_name(ast, new_name) {
+            tables
+                .singleton_methods
+                .entry(owner.join("::"))
+                .or_default()
+                .insert(new);
+        }
+        return;
+    }
     if cx.defs_side != DefsSide::Instance {
         return;
     }
@@ -706,6 +765,43 @@ fn file_call_methods(
     args: &[NodeId],
     tables: &mut DefTables,
 ) {
+    // `X.define_singleton_method(:x)` binds `X.x` — a SINGLETON-kind name the
+    // RECEIVER, not the lexical prefix, owns — so it files before the
+    // owner-empty early return below (a toplevel `Foo.define_singleton_method`
+    // still names `Foo`). A receiverless or `self.` spelling binds the
+    // position's self: inside a class body `self` is the class object, so
+    // the name lands on the owner's singleton the same way (`discovered_`
+    // `singleton_def_nodes[Foo]`, rigor-rs#666). A dynamic receiver names
+    // nothing the tables can hold.
+    if method == "define_singleton_method" {
+        let position_owner: &[String] = match &cx.owner {
+            Some(o) => o,
+            None => &cx.lexical,
+        };
+        let position_key: Option<String> = if position_owner.is_empty()
+            || (position_owner.len() == 1 && position_owner[0] == ANONYMOUS_META_OWNER)
+        {
+            None
+        } else {
+            Some(position_owner.join("::"))
+        };
+        let owner_key: Option<String> = match receiver {
+            Some(r) => match ast.get(r) {
+                Node::ConstantRead { name, dynamic_base: false, .. } if !name.is_empty() => {
+                    Some(name.strip_prefix("::").unwrap_or(name).to_string())
+                }
+                Node::SelfExpr { .. } => position_key.clone(),
+                _ => None,
+            },
+            None => position_key,
+        };
+        if let Some(key) = owner_key {
+            if let Some(nm) = args.first().and_then(|a| literal_method_name(ast, *a)) {
+                tables.singleton_methods.entry(key).or_default().insert(nm);
+            }
+        }
+        return;
+    }
     let owner: &[String] = match &cx.owner {
         Some(o) if o.is_empty() => return,
         Some(o) => o,
@@ -722,16 +818,25 @@ fn file_call_methods(
     // `def`, an accessor survives `subtract_def_methods` unless a project
     // `def` shares its name — and under an `Object` owner they stay
     // bare-callable through `file_toplevel` (the per-file half; the merge
-    // adds the cross-file half).
+    // adds the cross-file half). Singleton-kind names join
+    // `singleton_methods` — the instance tables file them nowhere, but
+    // `call.undefined-method`'s singleton arm reads them (rigor-rs#666).
     let singleton_side = cx.in_singleton;
     let mut file = |name: String, both_kinds: bool| {
-        if singleton_side && !both_kinds {
-            return;
+        if singleton_side {
+            tables
+                .singleton_methods
+                .entry(key.clone())
+                .or_default()
+                .insert(name.clone());
+            if !both_kinds {
+                return;
+            }
         }
         tables.macro_methods.entry(key.clone()).or_default().insert(name.clone());
         tables.file_methods.entry(key.clone()).or_default().insert(name.clone());
         if key == "Object" {
-            tables.file_toplevel.insert(name);
+            tables.file_toplevel.insert(name.clone());
         }
     };
 
@@ -742,6 +847,64 @@ fn file_call_methods(
             file(name, false);
         }
         return;
+    }
+    // Forwardable's delegator macros inside a SINGLETON-side body define the
+    // delegated names on the class object — `class << self;
+    // extend Forwardable; def_delegators :x, :q` makes `Integer.q` — so a
+    // literal name there joins the singleton-kind table (the reference reads
+    // the extend's module as a naming macro the class << body runs; the
+    // `extend Forwardable` itself is not required, the call position is).
+    // The INSTANCE side stays untouched: `extend Forwardable;
+    // def_delegator :@x, :q` in the class body defines an instance delegate
+    // and the reference keeps firing `Integer.q` for it.
+    if cx.in_singleton {
+        // `def_delegator(accessor, method, ali = method)`: the defined name
+        // is the ALIAS when one is given, else the method.
+        if matches!(method, "def_delegator" | "def_instance_delegator") {
+            let name = args
+                .get(2)
+                .and_then(|&a| literal_method_name(ast, a))
+                .or_else(|| args.get(1).and_then(|&a| literal_method_name(ast, a)));
+            if let Some(name) = name {
+                file(name, false);
+            }
+            return;
+        }
+        if matches!(method, "def_delegators" | "def_instance_delegators") {
+            for &arg in args.iter().skip(1) {
+                if let Some(name) = literal_method_name(ast, arg) {
+                    file(name, false);
+                }
+            }
+            return;
+        }
+        // Forwardable's `delegate m => a` / `delegate [:m1, :m2] => a` (and
+        // the `instance_delegate` twin): the assoc KEYS are the defined
+        // names — the argument is the keyword-hash the bare-assoc call
+        // argument lowers to (`Node::HashLit`'s paired elements).
+        if matches!(method, "delegate" | "instance_delegate") {
+            for &arg in args {
+                if let Node::HashLit { elements, .. } = ast.get(arg) {
+                    for (i, &el) in elements.iter().enumerate() {
+                        if i % 2 != 0 {
+                            continue; // values, not keys
+                        }
+                        match ast.get(el) {
+                            Node::SymbolLit { value, .. } => file(value.clone(), false),
+                            Node::ArrayLit { elements, .. } => {
+                                for &m in elements {
+                                    if let Node::SymbolLit { value, .. } = ast.get(m) {
+                                        file(value.clone(), false);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return;
+        }
     }
     // Upstream v0.4.5 (#2120, `attr_macro`): an `attr_*` call on the body's
     // self — implicit or `self.` — naming the macro directly or as the literal
@@ -805,7 +968,9 @@ fn file_call_methods(
     if method == "alias_method" {
         let mut names = args.iter().filter_map(|a| literal_method_name(ast, *a));
         if let (Some(new), Some(old)) = (names.next(), names.next()) {
-            if !singleton_side {
+            if singleton_side {
+                tables.singleton_methods.entry(key.clone()).or_default().insert(new);
+            } else {
                 tables.macro_methods.entry(key.clone()).or_default().insert(new.clone());
                 tables.file_methods.entry(key.clone()).or_default().insert(new.clone());
                 if key == "Object" {
