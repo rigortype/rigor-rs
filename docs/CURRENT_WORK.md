@@ -60,6 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-21 #639 CLOSED** (PR #756): loop-cap for jump/once bodies + rebindable ivars (`IvarWrite`) + write-position `moved`; 8 master FPs closed, 22/22 match; 0 FP / 103 = master; gate memo 2.34x→2.10x. →#757–#759. [note](notes/20261121-issue-639-loop-cap-jump-ivar.md)
 - **2026-11-21 #439 CLOSED** (PR #753): reach-memo audit in CI; 0 FP. →#754. [note](notes/20261121-issue-439-reach-memo-audit-gate.md)
 - **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand — x-polarity gate, dominating-write cut, body-env leaf typing, `Integer#[]` fold; `x = [1,2][x] || 0` caps; 0 FP / sweep; 5 Opus rounds. →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
 - **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts the self-extend's instance-side entry (2+N, cut N≥99) + RBS-known fallback; live FP gone; 0 FP / 437 = master. →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
@@ -158,7 +159,5 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-08-07 upstream survey + feedback batch 2, folded** — self-diff moved 2 superseded diagnostics; retired GEM_HOME rbs selection ([note](notes/20260807-upstream-survey-v031-to-master.md)); batch 2 filed 3 reference defects.
 - **2026-07-31 era, folded** — sig-gen `Data.define`/`Struct.new`; `BigMath` CLOSED; survey FP 24→0; sweep set CODIFIED ([CORPUS.md](../harness/CORPUS.md)).
 - **2026-07-31 pin `v0.3.0→v0.3.1` + rbs `4.0.3→4.1.0`** — 0 FP / 9153, gaps −2: bounded type params resolve; `-> instance` via `SELF_RETURN`. [note](notes/20260731-upstream-pin-v031-rbs41.md)/[survey](notes/20260731-v031-preflight-survey.md).
-- **2026-07-25 era, folded** — MultiWrite substrate (PRs #46/#47, [spec](notes/20260725-multiwrite-substrate-spec.md)); LSP `exclude:` parity (PR #45, 24→144); stage-3 tail (PR #44).
-- **2026-07-18/19 era, folded** — LSP §12 S1–S4b + coverage/MCP/audit (PRs #33–#43); ADR-0042 gate slices; compat + `--bleeding-edge`; RC bump ([deliverables](notes/20260719-adr0042-gate-deliverables.md)).
-- **2026-07-17 era (folded)**: docs economy (`docs_check.py`, #21); Tier B/C CLOSED ([note](notes/20260717-tier-bc-track-closed.md)); ATM arc + constant-shadow gate, gitlab UM 356→179 ([spec](notes/20260717-atm-substrate-arc-plan.md)).
+- **2026-07-17–25 era, folded** — LSP §12 + coverage/MCP/audit (PRs #33–#45), ADR-0042 gate slices, MultiWrite substrate (#44/#46/#47); docs economy (#21); ATM arc + constant-shadow gate, gitlab UM 356→179. [LSP](notes/20260719-adr0042-gate-deliverables.md)/[ATM](notes/20260717-atm-substrate-arc-plan.md).
 - **2026-07-16 v0.3.0-RC arc: pin `47ec8625` + 7 slices, ALL MERGED — rules fully ported.** [specs](notes/20260716-v030-upstream-gap-survey.md).
