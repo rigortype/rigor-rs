@@ -1150,6 +1150,38 @@ impl SourceIndex {
         false
     }
 
+    /// The reference's `unnamed_instance_mixin?` (resolution_chain.rb's
+    /// `:include_hook` mark, issue #2994): whether a module no table names
+    /// may sit on `q`'s instance side and so run its `included` /
+    /// `prepended` hook with `q` as `base`, extending the class object with
+    /// anything. Two arms: `q`'s own instance side lists the UNNAMED marker
+    /// (an include argument that names no module — `include(*MODS)`,
+    /// `include helper`, `include nil`; a WILDCARD alone is order-only and
+    /// opens nothing), or a module `q` includes (resolved) does — "a hook's
+    /// `base.include(*MODS)`; that module's own `include(*MODS)` is read so
+    /// too". `discovered_includes`' names are the port's
+    /// [`SourceIndex::instance_mixin_edges`] minus the markers. (rigor-rs#666)
+    fn unnamed_instance_mixin(&self, q: &str) -> bool {
+        if self
+            .ancestry
+            .include_listed
+            .get(q)
+            .is_some_and(|l| l.iter().any(|r| *r == MIXIN_UNNAMED))
+        {
+            return true;
+        }
+        self.instance_mixin_edges(q)
+            .into_iter()
+            .filter(|(_, raw)| !mixin_marker(raw))
+            .filter_map(|(from, raw)| self.resolve_override_ancestor(&from, &raw))
+            .any(|m| {
+                self.ancestry
+                    .include_listed
+                    .get(&m)
+                    .is_some_and(|l| l.iter().any(|r| *r == MIXIN_UNNAMED))
+            })
+    }
+
     /// `SingletonHookDecline.entry_hook_capable?` for an entry written `raw`
     /// from `from`: a declared project module by [`Self::hook_capable`], an
     /// undeclared one when no candidate is a class RBS knows.
@@ -1199,8 +1231,18 @@ impl SourceIndex {
             .any(|n| {
                 let open = !OBJECT_ROOTS.contains(&n.as_str());
                 let raws = self.singleton_raws(n);
+                // The reference's `:include_hook` mark (`singleton_mixins` →
+                // `unnamed_instance_mixin?`, #2994): a mixin no name spells on
+                // the class's own instance side (`include(*MODS)`,
+                // `include helper`, `include nil`) — or on an included module's
+                // — may run its `included` hook on the class and extend the
+                // class object with anything, so the singleton surface opens.
+                // The mark carries UNNAMED_LIST, so `wildcard_mixin?` answers
+                // on it under the same `open_mixins` gate.
                 if self.singleton_truncated(core, n)
-                    || (open && raws.iter().any(|r| mixin_marker(r)))
+                    || (open
+                        && (raws.iter().any(|r| mixin_marker(r))
+                            || self.unnamed_instance_mixin(n)))
                 {
                     return true;
                 }
@@ -1282,12 +1324,18 @@ impl SourceIndex {
             // (the reference's `kind_for(:singleton) == :instance`), read with
             // `core_singleton_mixin_may_answer`'s `instance_records` surface
             // so an `attr_*` / `define_method` / `possible` def counts too.
+            // The SELF-edge counts (`Math.extend(Math)`, `extend self`): the
+            // reference's `discovered_method_through_ancestors?` chain holds
+            // the extended module as an entry even when it is the receiver
+            // itself, and that entry answers with its instance defs — no
+            // `entry.name != name` exclusion exists on the declared side
+            // (that guard is `extends_answer?`'s, the MAY-ANSWER arm).
             let mixin_defines = self
                 .singleton_raws(&current)
                 .iter()
                 .filter(|r| !mixin_marker(r))
                 .filter_map(|raw| self.resolve_override_ancestor(&current, raw))
-                .any(|q| q != current && self.instance_records(&q, method));
+                .any(|q| self.instance_records(&q, method));
             if mixin_defines {
                 return true;
             }
@@ -1299,18 +1347,23 @@ impl SourceIndex {
         false
     }
 
-    /// `unknown_mixin_includer?`'s singleton half (`includes_of` consulted
-    /// before the `kind == :singleton` early-return): whether a project
-    /// `include`/`prepend` on `class_name`'s reopened body names a module NO
-    /// side declares — an unenumerable instance edge opens the class
-    /// object's surface too (`class Integer; include NonexistentMod` keeps
-    /// `Integer.zzz` silent). (rigor-rs#666)
+    /// `unknown_mixin_includer?`'s singleton half (the `includes.any?` line,
+    /// read BEFORE the `kind == :singleton` early-return): an
+    /// `include`/`prepend` operand on `class_name`'s instance side — every
+    /// spelling the census holds, direct body statements, conditional ones,
+    /// receiver-form ones — that names a module NO side declares opens the
+    /// class object's surface too (`class Integer; include NonexistentMod`
+    /// and a conditional `if x; include Foo; end` keep `Integer.zzz`
+    /// silent). The markers are excluded: the reference reads
+    /// `discovered_includes`, which no taint enters, and the UNNAMED taint
+    /// reaches the singleton side through
+    /// [`SourceIndex::core_singleton_mixin_may_answer`]'s
+    /// [`SourceIndex::unnamed_instance_mixin`] arm instead. (rigor-rs#666)
     pub fn singleton_unknown_mixin(&self, core: &CoreIndex, class_name: &str) -> bool {
-        self.override_classes.get(class_name).is_some_and(|e| {
-            e.includes
-                .iter()
-                .any(|raw| !self.known_mixin(core, class_name, raw))
-        })
+        self.instance_mixin_edges(class_name)
+            .into_iter()
+            .filter(|(_, raw)| !mixin_marker(raw))
+            .any(|(from, raw)| !self.known_mixin(core, &from, &raw))
     }
 
     /// `known_mixin?`: the constant `raw` written on `from`'s instance edge
