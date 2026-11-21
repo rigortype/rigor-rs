@@ -1725,7 +1725,7 @@ impl<'i> Typer<'i> {
     /// refinement / difference over one. Port `Type::IntegerRange` is a
     /// scalar-number refinement, not a Range object, and declines exactly as
     /// the reference's own `IntegerRange` does.
-    fn coll_range_index(&self, interner: &Interner, ty: TypeId) -> bool {
+    pub(crate) fn coll_range_index(&self, interner: &Interner, ty: TypeId) -> bool {
         match interner.get(ty) {
             Type::Nominal { class, .. } => self.index.class_name_for_id(*class) == Some("Range"),
             Type::Refined { base, .. } | Type::Difference { base, .. } => {
@@ -1743,7 +1743,7 @@ impl<'i> Typer<'i> {
     /// scalar just as well), and an unresolvable chain answers `maybe`, which
     /// declines here — the `Either` reading belongs to
     /// [`Self::coll_could_be_range`].
-    fn coll_definite_range(&self, interner: &Interner, ty: TypeId) -> bool {
+    pub(crate) fn coll_definite_range(&self, interner: &Interner, ty: TypeId) -> bool {
         if self.coll_range_index(interner, ty) {
             return true;
         }
@@ -1771,7 +1771,7 @@ impl<'i> Typer<'i> {
     /// scalar (the port's `Scalar` holds no Range), `Tuple`, `HashShape`, an
     /// `IntegerRange`, a `Singleton`, a nominal whose chain reaches `Object`
     /// without passing through `Range` — is an element store.
-    fn coll_could_be_range(&self, interner: &Interner, ty: TypeId) -> bool {
+    pub(crate) fn coll_could_be_range(&self, interner: &Interner, ty: TypeId) -> bool {
         if self.coll_range_index(interner, ty) {
             return true;
         }
@@ -1859,7 +1859,7 @@ impl<'i> Typer<'i> {
     /// `class` names a definite Array subclass (`accepts` => `yes` in the
     /// reference's terms): resolvable, not `Array` itself, and `Array` appears
     /// among its ancestors. An unresolvable chain is `maybe`, not `yes`.
-    fn is_array_subclass(&self, class: ClassId) -> bool {
+    pub(crate) fn is_array_subclass(&self, class: ClassId) -> bool {
         self.index.class_name_for_id(class).is_some_and(|n| {
             n != "Array"
                 && self

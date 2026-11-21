@@ -12,7 +12,7 @@ use super::{
     collect_override_classes, def_root_cx, DefKind,
     file_orphan_defs, infer_method_returns, invert_definers, mutated_constant_names, walk_defs,
     walk_fold_defs, ConstLit, DefTables, FileDefs, FoldDefs, FoldSite, Harvest, HarvestedClass,
-    HarvestedFoldDef, SourceIndex,
+    HarvestedFoldDef, SourceIndex, WrittenChain,
 };
 
 impl SourceIndex {
@@ -301,7 +301,7 @@ impl SourceIndex {
         // Database` keys `Gitlab::Database` — matching a
         // `Gitlab::Database.read_only?` receiver). FILE-RELATIVE: the merge
         // stamps the slice position on to build each `FoldSite`.
-        walk_fold_defs(ast, ast.root(), &[], &[], &mut h.fold_defs);
+        walk_fold_defs(ast, ast.root(), "", &WrittenChain::default(), &mut h.fold_defs);
         super::literal_fold::decline_superseded_singletons(ast, &mut h.fold_defs);
         // A def-backed `alias`/`alias_method` folds the TARGET's tail (the
         // reference hands the new name the same DefNode): clone `old`'s
@@ -438,6 +438,9 @@ impl SourceIndex {
                         .or_default()
                         .push((i, *settled));
                 }
+                for (owner, name) in &facts.superseded {
+                    idx.superseded_def_nodes.insert((owner.clone(), name.clone()));
+                }
                 for d in &facts.defs {
                     match &d.slot {
                         Some((owner, side)) if !d.escapes => {
@@ -472,6 +475,12 @@ impl SourceIndex {
         // `subtract_def_methods` barrier, so the union collects both tables
         // first and subtracts once (order-free either way).
         let mut union_def_names: HashMap<String, HashSet<String>> = HashMap::new();
+        // rigor-rs#424 — the `synthesize_namespace_prefixes` replay's trie:
+        // `(parent prefix id, segment) → prefix id`, node 0 the empty
+        // prefix. Built across ALL files first (below), materialized once
+        // after the loop — see the walk's comment.
+        let mut prefix_nodes: Vec<(u32, String)> = vec![(0, String::new())];
+        let mut prefix_children: Vec<HashMap<String, u32>> = vec![HashMap::new()];
         for (i, (h, ast)) in files.iter().enumerate() {
             let h = h.borrow();
             idx.file_index.insert(ast.file_key().clone(), i);
@@ -501,18 +510,46 @@ impl SourceIndex {
                 // `synthesize_namespace_prefixes` (scope_indexer.rb:13287):
                 // every PROPER `::` prefix of a discovered name also names a
                 // namespace — `class A::B::C` discovers `A` and `A::B`, and
-                // `M::Foo = Class.new` discovers `M`.
-                let mut segs: Vec<&str> = name.split("::").collect();
-                while segs.pop().is_some() {
-                    if !segs.is_empty() {
-                        idx.discovered_classes.insert(segs.join("::"));
-                    }
+                // `M::Foo = Class.new` discovers `M`. rigor-rs#424: a deep
+                // `class` nest's discovered names are themselves long (a
+                // D-deep nest's innermost name has D segments), so rejoining
+                // every prefix of every name copies and hashes O(D³) bytes
+                // of string. The trie names each DISTINCT prefix once — in
+                // a nest a prefix of a declared name is almost always a
+                // declared name itself — and only the materialization below
+                // builds and hashes a string, once per prefix in the union.
+                let mut parent = 0u32;
+                for seg in name.split("::") {
+                    parent = match prefix_children[parent as usize].get(seg) {
+                        Some(&id) => id,
+                        None => {
+                            let id = prefix_nodes.len() as u32;
+                            prefix_nodes.push((parent, seg.to_string()));
+                            prefix_children.push(HashMap::new());
+                            prefix_children[parent as usize].insert(seg.to_string(), id);
+                            id
+                        }
+                    };
                 }
-                idx.discovered_classes.insert(name.clone());
             }
             // The DECL-only half — no prefix synthesis: `class A::M` must
             // not shadow a bare `::M` operand.
             idx.discovered_decls.extend(h.discovered_decls.iter().cloned());
+        }
+        // Materialize the trie into `discovered_classes`: node i's string is
+        // its parent's + `::` + its segment — the segment alone under the
+        // root, exactly the `segs.join("::")` the per-name loop built —
+        // inserted once per DISTINCT prefix. Node 0 (the empty prefix)
+        // never materializes: a synthesized namespace has a segment.
+        let mut prefix_strings = vec![String::new()];
+        for (parent, seg) in prefix_nodes.iter().skip(1) {
+            let joined = if *parent == 0 {
+                seg.clone()
+            } else {
+                format!("{}::{}", prefix_strings[*parent as usize], seg)
+            };
+            idx.discovered_classes.insert(joined.clone());
+            prefix_strings.push(joined);
         }
         // `subtract_def_methods` (`finalize_def_index`): cross-file method
         // suppression is for the project's OWN accessors/aliases — NOT plain

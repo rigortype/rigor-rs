@@ -3,14 +3,12 @@
 
 use rigor_index::CoreIndex;
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 
-use rigor_parse::{LoweredAst, Node, NodeId};
+use rigor_parse::{LoweredAst, Node, NodeId, Span};
 use rigor_types::Scalar;
 
-use super::{
-    qualify, split_qualified, DefKind, FoldDefs, HarvestedFoldDef, SourceIndex,
-    OVERRIDE_ANCESTOR_WALK_LIMIT,
-};
+use super::{DefKind, FoldDefs, HarvestedFoldDef, SourceIndex, OVERRIDE_ANCESTOR_WALK_LIMIT};
 
 /// Interprocedural literal-tail fold: the syntactic depth cap the tail capture
 /// applies ([`capture_fold_tail`]; bodies calling bodies — `read_write? =
@@ -385,7 +383,7 @@ impl SourceIndex {
         // Upstream v0.4.1 (#1594, ADR-119 C2-b1): the typing read answers only
         // where `DefinerResolution` is `Known` on the Ruby-order chain, and
         // names the same definer the breadth-first walk found.
-        let settled = self.settled_definer(core, qual, method, false, |n| {
+        let settled = self.settled_definer(core, qual, method, false, false, |n| {
             self.owner_defines(n, method, DefKind::Instance)
         })?;
         (settled == owner).then_some(owner)
@@ -589,11 +587,59 @@ fn fold_arity(shape: &rigor_parse::ParamShape) -> (usize, usize) {
     (min, max)
 }
 
+/// The WRITTEN-name chain of enclosing `class`/`module` declarations as a
+/// persistent list (`module A::V` pushes ONE link `"A::V"`; see
+/// `walk_fold_defs`'s comment on the reference's `qualified_prefix`). Pushing
+/// and cloning are O(1), so a D-deep nest costs O(D) total — the `Vec<String>`
+/// chain's `to_vec` per level cost O(D²) clones and ~1.5 GB at 4,000 nested
+/// `class` (rigor-rs#424).
+#[derive(Clone, Default)]
+pub(crate) struct WrittenChain(Option<Rc<WrittenLink>>);
+
+struct WrittenLink {
+    name: String,
+    parent: WrittenChain,
+}
+
+impl WrittenChain {
+    fn push(&self, name: String) -> Self {
+        WrittenChain(Some(Rc::new(WrittenLink {
+            name,
+            parent: self.clone(),
+        })))
+    }
+
+    /// `self[len - segs.len()..] == segs` on the old `Vec<String>` — compare
+    /// the LAST `segs.len()` written names (innermost last), false when the
+    /// chain is shorter than `segs`.
+    fn tail_is(&self, segs: &[&str]) -> bool {
+        let mut cur = &self.0;
+        for seg in segs.iter().rev() {
+            match cur {
+                Some(link) if link.name == *seg => cur = &link.parent.0,
+                _ => return false,
+            }
+        }
+        true
+    }
+}
+
+/// `qualify` on an already-joined parent name — `prefix.join("::")` IS the
+/// parent qualified name, so passing it down avoids re-splitting and
+/// re-cloning the whole segment vector per level (rigor-rs#424).
+fn qualify_str(parent_qual: &str, name: &str) -> String {
+    if parent_qual.is_empty() {
+        name.to_string()
+    } else {
+        format!("{parent_qual}::{name}")
+    }
+}
+
 pub(crate) fn walk_fold_defs(
     ast: &LoweredAst,
     node: NodeId,
-    prefix: &[String],
-    written: &[String],
+    parent_qual: &str,
+    written: &WrittenChain,
     out: &mut Vec<HarvestedFoldDef>,
 ) {
     match ast.get(node) {
@@ -649,28 +695,32 @@ pub(crate) fn walk_fold_defs(
                         });
                     }
                 } else {
-                    walk_fold_defs(ast, child, prefix, written, out);
+                    walk_fold_defs(ast, child, parent_qual, written, out);
                 }
             }
         }
         Node::Statements { body, .. } => {
             for &child in body {
-                walk_fold_defs(ast, child, prefix, written, out);
+                walk_fold_defs(ast, child, parent_qual, written, out);
             }
         }
         Node::ClassDef { name, body, rooted, .. } | Node::ModuleDef { name, body, rooted, .. } => {
             if name.is_empty() {
                 return;
             }
-            let qualified = qualify(prefix, name);
+            let qualified = qualify_str(parent_qual, name);
             // The reference's `qualified_prefix` holds each declaration's
             // WRITTEN name as one element (`module A::V` pushes `"A::V"`,
             // where `module A; module V` pushes two) — `def_receiver_targets_
             // lexical_self?` reads it, so a `def V.x` directly in the body
             // files the singleton only under the former's `"V"`. A `::`-rooted
             // header resets the chain (`declaration_prefix`).
-            let mut child_written = if *rooted { Vec::new() } else { written.to_vec() };
-            child_written.push(name.clone());
+            let child_written = if *rooted {
+                WrittenChain::default()
+            } else {
+                written.clone()
+            };
+            let child_written = child_written.push(name.clone());
             for &child in body {
                 match ast.get(child) {
                     // `class << <operand>` — its `def`s file on the
@@ -742,9 +792,8 @@ pub(crate) fn walk_fold_defs(
                     _ => {}
                 }
             }
-            let child_prefix = split_qualified(&qualified);
             for &child in body {
-                walk_fold_defs(ast, child, &child_prefix, &child_written, out);
+                walk_fold_defs(ast, child, &qualified, &child_written, out);
             }
         }
         _ => {}
@@ -782,14 +831,15 @@ pub(crate) fn walk_fold_defs(
 /// file, and match an owner by the receiver path's last segment, a superset
 /// of the lexical resolutions.
 pub(crate) fn decline_superseded_singletons(ast: &LoweredAst, out: &mut [HarvestedFoldDef]) {
-    let mut owners: Vec<(NodeId, String, Vec<String>)> = Vec::new();
-    qualified_bodies(ast, ast.root(), &[], &[], &mut owners);
+    let mut owners: Vec<(NodeId, String, WrittenChain)> = Vec::new();
+    qualified_bodies(ast, ast.root(), "", &WrittenChain::default(), &mut owners);
+    let idx = supersede_index(ast, &owners);
     let mut events: HashMap<String, Vec<SingletonEvent>> = HashMap::new();
-    for (id, owner, written) in owners {
+    for (id, owner, written) in &owners {
         events
             .entry(owner.clone())
             .or_default()
-            .extend(singleton_events(ast, id, &owner, &written));
+            .extend(singleton_events(ast, *id, owner, written, &idx));
     }
     let foreign = foreign_singleton_events(ast);
     for (owner, evs) in &mut events {
@@ -828,10 +878,10 @@ fn receiver_path_is_owner(path: &str, owner: &str) -> bool {
 /// name is `"A::V"`, #490 review). A receiver of more segments than the
 /// chain is long can only defensively match `A::V`-style spellings Ruby
 /// cannot actually parse.
-fn receiver_path_targets_written(path: &str, written: &[String]) -> bool {
+fn receiver_path_targets_written(path: &str, written: &WrittenChain) -> bool {
     let path = path.strip_prefix("::").unwrap_or(path);
     let segs: Vec<&str> = path.split("::").collect();
-    segs.len() <= written.len() && written[written.len() - segs.len()..] == segs[..]
+    written.tail_is(&segs)
 }
 
 fn superseded(events: &[SingletonEvent], name: &str) -> bool {
@@ -853,30 +903,266 @@ fn superseded(events: &[SingletonEvent], name: &str) -> bool {
 fn qualified_bodies(
     ast: &LoweredAst,
     node: NodeId,
-    prefix: &[String],
-    written: &[String],
-    out: &mut Vec<(NodeId, String, Vec<String>)>,
+    parent_qual: &str,
+    written: &WrittenChain,
+    out: &mut Vec<(NodeId, String, WrittenChain)>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                qualified_bodies(ast, child, prefix, written, out);
+                qualified_bodies(ast, child, parent_qual, written, out);
             }
         }
         Node::ClassDef { name, body, rooted, .. } | Node::ModuleDef { name, body, rooted, .. } => {
             if name.is_empty() {
                 return;
             }
-            let qualified = qualify(prefix, name);
-            let mut child_written = if *rooted { Vec::new() } else { written.to_vec() };
-            child_written.push(name.clone());
+            let qualified = qualify_str(parent_qual, name);
+            let child_written = if *rooted {
+                WrittenChain::default()
+            } else {
+                written.clone()
+            };
+            let child_written = child_written.push(name.clone());
             out.push((node, qualified.clone(), child_written.clone()));
-            let child_prefix = split_qualified(&qualified);
             for &child in body {
-                qualified_bodies(ast, child, &child_prefix, &child_written, out);
+                qualified_bodies(ast, child, &qualified, &child_written, out);
             }
         }
         _ => {}
+    }
+}
+
+/// One node kind the old `nested` scope list carried: every `Definition`,
+/// `ClassDef` and `ModuleDef` inside an owner's span, flagged by whether it
+/// is a `class << self` (`own` in the old tuple).
+#[derive(Clone, Copy)]
+enum ScopeKind {
+    /// `ClassDef` / `ModuleDef`, named or not — an unnamed one is never an
+    /// owner but still blocks attribution to outer owners, as `nested` did.
+    ClassModule,
+    /// A plain `def` (non-singleton-class `Definition`).
+    MethodDef,
+    /// `class << self` (`nested`'s `own: true`).
+    SclassSelf,
+    /// `class << <non-self>` (`nested`'s `own: false`).
+    SclassOther,
+}
+
+/// One `*_eval` / `*_exec` call with a literal block — the union of the old
+/// `self_eval_blocks` / `foreign_eval_blocks` domains. Whether a receiver is
+/// "self" is owner-dependent, so the receiver is kept unclassified.
+struct EvalSite {
+    /// The whole CALL's span — the `within(n.span(), class_span)` side of the
+    /// old scan (an eval is a candidate only for owners containing the call).
+    call: Span,
+    /// The literal block's span — the `within(span, *b)` side.
+    block: Span,
+    /// `instance_eval` / `instance_exec` vs the `class_eval` family.
+    instance: bool,
+    recv: EvalRecv,
+}
+
+enum EvalRecv {
+    /// No receiver or a `self` receiver — self for every owner.
+    Bare,
+    /// A `ConstantRead` receiver (raw `name`, `::`-prefix stripped at check)
+    /// — self iff the path tail-matches the owner.
+    Const(String),
+    /// Any other receiver — foreign to every owner.
+    Other,
+}
+
+/// rigor-rs#424 — the per-file indexes `singleton_events` needs, computed
+/// ONCE instead of the per-owner `ast.iter()` scans (three per owner plus an
+/// O(scopes) `nested` search per node — cubic on a deep `class` nest).
+///
+/// The owner a node reports to is decided by its innermost enclosing scope
+/// alone: for an owner `O`, `nested` held every scope inside `O`, so the
+/// innermost one containing the node is simply the node's own innermost
+/// scope `s1` (every scope inside `O` and containing the node is inside
+/// `s1`'s chain... `s1` is by definition the innermost ANYWHERE). A node
+/// therefore reports to `s1` when `s1` is a class/module, to EVERY enclosing
+/// class/module when `s1` is a `class << self` (`nested`'s `own` arm — the
+/// transparency the old code had, where an outer owner's innermost was also
+/// `s1`), and to no one otherwise.
+struct SupersedeIndex {
+    /// Per arena node (indexed by `NodeId`), `scopes` index +1 of its
+    /// innermost enclosing scope — 0 for top-level nodes.
+    inner_scope: Vec<u32>,
+    /// Scope `(id, span, kind)` in arena order (the `nested` list's domain).
+    scopes: Vec<(NodeId, Span, ScopeKind)>,
+    /// Per scope, its parent scope's `scopes` index +1.
+    scope_parent: Vec<u32>,
+    /// Per arena node, `evals` index +1 of the innermost eval BLOCK
+    /// containing it.
+    inner_eval: Vec<u32>,
+    evals: Vec<EvalSite>,
+    /// Per eval, the `evals` index +1 of the eval block containing ITS
+    /// block — walking `inner_eval` then `eval_parent` enumerates a node's
+    /// enclosing eval blocks innermost-first.
+    eval_parent: Vec<u32>,
+    /// Owner `NodeId` → its reporting nodes, in arena order.
+    attributed: HashMap<NodeId, Vec<NodeId>>,
+}
+
+/// One merged containment sweep: `containers` (scope spans, eval BLOCK
+/// spans) and `queries` (every node's span) sorted by (start, end desc); a
+/// container still open when an item passes is its innermost enclosing one —
+/// the same `within` semantics the per-node `min_by_key` searches applied,
+/// at O(sort) instead of O(containers × queries). Returns each query's
+/// innermost container +1 and each container's parent container +1.
+/// Shared with `method_returns::superseded_defs` (rigor-rs#424).
+pub(crate) fn containment_links(containers: &[Span], queries: &[Span]) -> (Vec<u32>, Vec<u32>) {
+    use std::cmp::Reverse;
+    let mut items: Vec<(usize, Reverse<usize>, bool, u32)> =
+        Vec::with_capacity(containers.len() + queries.len());
+    for (i, s) in containers.iter().enumerate() {
+        items.push((s.0, Reverse(s.1), false, i as u32));
+    }
+    for (i, s) in queries.iter().enumerate() {
+        items.push((s.0, Reverse(s.1), true, i as u32));
+    }
+    items.sort_unstable();
+    let mut inner = vec![0u32; queries.len()];
+    let mut parent = vec![0u32; containers.len()];
+    let mut stack: Vec<u32> = Vec::new();
+    for (_, _, is_query, i) in items {
+        let end = if is_query {
+            queries[i as usize].1
+        } else {
+            containers[i as usize].1
+        };
+        while stack.last().is_some_and(|&t| containers[t as usize].1 < end) {
+            stack.pop();
+        }
+        if is_query {
+            inner[i as usize] = stack.last().map_or(0, |&t| t + 1);
+        } else {
+            parent[i as usize] = stack.last().map_or(0, |&t| t + 1);
+            stack.push(i);
+        }
+    }
+    (inner, parent)
+}
+
+fn supersede_index(
+    ast: &LoweredAst,
+    owners: &[(NodeId, String, WrittenChain)],
+) -> SupersedeIndex {
+    let owner_pos: HashMap<NodeId, usize> = owners
+        .iter()
+        .enumerate()
+        .map(|(i, (id, _, _))| (*id, i))
+        .collect();
+    let mut scopes: Vec<(NodeId, Span, ScopeKind)> = Vec::new();
+    let mut scope_spans: Vec<Span> = Vec::new();
+    let mut evals: Vec<EvalSite> = Vec::new();
+    let mut eval_spans: Vec<Span> = Vec::new();
+    // Queries are EVERY node's span, indexed by `NodeId` (`iter()` walks the
+    // arena in id order).
+    let mut queries: Vec<Span> = Vec::new();
+    for (id, n) in ast.iter() {
+        queries.push(n.span());
+        match n {
+            Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                scopes.push((id, n.span(), ScopeKind::ClassModule));
+                scope_spans.push(n.span());
+            }
+            Node::Definition {
+                is_singleton_class,
+                singleton_operand,
+                ..
+            } => {
+                let kind = if *is_singleton_class {
+                    if singleton_operand
+                        .is_some_and(|op| matches!(ast.get(op), Node::SelfExpr { .. }))
+                    {
+                        ScopeKind::SclassSelf
+                    } else {
+                        ScopeKind::SclassOther
+                    }
+                } else {
+                    ScopeKind::MethodDef
+                };
+                scopes.push((id, n.span(), kind));
+                scope_spans.push(n.span());
+            }
+            _ => {}
+        }
+        if let Node::Call {
+            receiver,
+            method,
+            block_span: Some(block),
+            ..
+        } = n
+        {
+            let instance = INSTANCE_EVALS.contains(&method.as_str());
+            if instance || CLASS_EVALS.contains(&method.as_str()) {
+                let recv = match receiver.map(|r| ast.get(r)) {
+                    None | Some(Node::SelfExpr { .. }) => EvalRecv::Bare,
+                    Some(Node::ConstantRead { name, .. }) => EvalRecv::Const(name.to_string()),
+                    Some(_) => EvalRecv::Other,
+                };
+                evals.push(EvalSite {
+                    call: n.span(),
+                    block: *block,
+                    instance,
+                    recv,
+                });
+                eval_spans.push(*block);
+            }
+        }
+    }
+    let (inner_scope, scope_parent) = containment_links(&scope_spans, &queries);
+    let (inner_eval, eval_parent) = containment_links(&eval_spans, &queries);
+    // Attribute each node to the owners it reports to (arena order, so each
+    // owner's list comes out id-sorted exactly like the old `ast.iter()`
+    // loop). `class << self` interiors fan out to EVERY enclosing
+    // class/module — the transparency the old `nested` searches had.
+    let mut attributed: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for (id, _) in ast.iter() {
+        // A scope node's own span contains its query, so its innermost
+        // container is ITSELF — step out to the innermost OTHER scope first,
+        // exactly the old searches' `*sid != id` exclusion (without this a
+        // direct-body `def` would see itself as its scope and file nowhere).
+        let si = match inner_scope[id.0 as usize] {
+            si if si > 0 && scopes[(si - 1) as usize].0 == id => {
+                scope_parent[(si - 1) as usize]
+            }
+            si => si,
+        };
+        if si == 0 {
+            continue;
+        }
+        let (sid, _, kind) = scopes[(si - 1) as usize];
+        match kind {
+            ScopeKind::ClassModule => {
+                if owner_pos.contains_key(&sid) {
+                    attributed.entry(sid).or_default().push(id);
+                }
+            }
+            ScopeKind::SclassSelf => {
+                let mut a = scope_parent[(si - 1) as usize];
+                while a > 0 {
+                    let (aid, _, akind) = scopes[(a - 1) as usize];
+                    if matches!(akind, ScopeKind::ClassModule) && owner_pos.contains_key(&aid) {
+                        attributed.entry(aid).or_default().push(id);
+                    }
+                    a = scope_parent[(a - 1) as usize];
+                }
+            }
+            _ => {}
+        }
+    }
+    SupersedeIndex {
+        inner_scope,
+        scopes,
+        scope_parent,
+        inner_eval,
+        evals,
+        eval_parent,
+        attributed,
     }
 }
 
@@ -929,7 +1215,7 @@ fn certain_singleton_defs(
     ast: &LoweredAst,
     body: &[NodeId],
     in_sc: bool,
-    written: &[String],
+    written: &WrittenChain,
     out: &mut HashSet<NodeId>,
 ) {
     for &child in body {
@@ -964,8 +1250,13 @@ fn certain_singleton_defs(
     }
 }
 
-fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[String]) -> Vec<SingletonEvent> {
-    use rigor_parse::Span;
+fn singleton_events(
+    ast: &LoweredAst,
+    class_id: NodeId,
+    owner: &str,
+    written: &WrittenChain,
+    idx: &SupersedeIndex,
+) -> Vec<SingletonEvent> {
     let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
     let class_node = ast.get(class_id);
     let class_span = class_node.span();
@@ -975,92 +1266,85 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
     }
     let self_or_none =
         |r: &Option<NodeId>| r.is_none_or(|r| matches!(ast.get(r), Node::SelfExpr { .. }));
-    // The scopes nested in this body: (id, span, `class << self`?).
-    let nested: Vec<(NodeId, Span, bool)> = ast
-        .iter()
-        .filter(|(id, n)| *id != class_id && within(n.span(), class_span))
-        .filter_map(|(id, n)| match n {
-            Node::ClassDef { .. } | Node::ModuleDef { .. } => Some((id, n.span(), false)),
-            Node::Definition { is_singleton_class: true, singleton_operand, .. } => {
-                let own = singleton_operand
-                    .is_some_and(|op| matches!(ast.get(op), Node::SelfExpr { .. }));
-                Some((id, n.span(), own))
-            }
-            Node::Definition { .. } => Some((id, n.span(), false)),
-            _ => None,
-        })
-        .collect();
-    // The `*_eval` / `*_exec` blocks inside this body, split by whose self
-    // their interior runs under (`eval_named_receiver?`): a bare or `self`
-    // receiver and a constant receiver tail-matching this class keep THIS
-    // class's self; any other receiver moves the body's self to the receiver
-    // (`W.instance_eval { def x }` inside `module V` binds `W.x`, and an
-    // unnameable receiver's interior names nothing — both are
+    // Whether one of the index's eval sites keeps THIS class's self
+    // (`eval_named_receiver?`): a bare or `self` receiver, or a constant
+    // receiver tail-matching this class. The index kept the receiver
+    // unclassified because the answer is owner-dependent; any other
+    // receiver moves the block's self to the receiver (`W.instance_eval
+    // { def x }` inside `module V` binds `W.x`, and an unnameable
+    // receiver's interior names nothing — both are
     // [`foreign_singleton_events`]' domain, not this class's).
-    let mut self_eval_blocks: Vec<(Span, bool)> = Vec::new();
-    let mut foreign_eval_blocks: Vec<Span> = Vec::new();
-    for (_, n) in ast.iter() {
-        let Node::Call { receiver, method, block_span: Some(b), .. } = n else {
-            continue;
-        };
-        if !within(n.span(), class_span) {
-            continue;
+    let eval_is_self = |e: &EvalSite| match &e.recv {
+        EvalRecv::Bare => true,
+        EvalRecv::Const(name) => {
+            receiver_path_is_owner(name.strip_prefix("::").unwrap_or(name), owner)
         }
-        let is_instance = INSTANCE_EVALS.contains(&method.as_str());
-        if !is_instance && !CLASS_EVALS.contains(&method.as_str()) {
-            continue;
-        }
-        let foreign = match receiver.map(|r| ast.get(r)) {
-            None | Some(Node::SelfExpr { .. }) => false,
-            Some(Node::ConstantRead { name, .. }) => {
-                !receiver_path_is_owner(name.strip_prefix("::").unwrap_or(name), owner)
-            }
-            Some(_) => true,
-        };
-        if foreign {
-            foreign_eval_blocks.push(*b);
-        } else {
-            self_eval_blocks.push((*b, is_instance));
-        }
-    }
+        EvalRecv::Other => false,
+    };
     let mut events: Vec<SingletonEvent> = Vec::new();
     // Bare `module_function` toggles of this body, and the receiverless
     // instance `def`s of this body (each a copy candidate).
     let mut mf_toggles: Vec<usize> = Vec::new();
     let mut instance_defs: Vec<(usize, String)> = Vec::new();
-    for (id, n) in ast.iter() {
+    // The old scan's domain in index terms: every node the body holds whose
+    // innermost OTHER scope is this class itself (the direct body, `in_sc`
+    // false) or a `class << self` somewhere inside it (`in_sc` true), and
+    // which no foreign eval block encloses. `supersede_index` attributed
+    // exactly those nodes per owner, in arena order.
+    for &id in idx.attributed.get(&class_id).into_iter().flatten() {
+        let n = ast.get(id);
         let span = n.span();
-        if id == class_id || !within(span, class_span) {
-            continue;
+        // The innermost scope holding `n`, not `n` itself — a scope node's
+        // own span contains its query, so step out to the parent first (the
+        // old search's `*sid != id`). Attribution guarantees the result is
+        // this class or a `class << self` inside it; anything else files
+        // under another owner.
+        let mut si = idx.inner_scope[id.0 as usize];
+        if si > 0 && idx.scopes[(si - 1) as usize].0 == id {
+            si = idx.scope_parent[(si - 1) as usize];
         }
-        // An eval-block interior whose block runs under another self files
-        // its writes on THAT owner, not this class.
-        if foreign_eval_blocks.iter().any(|b| within(span, *b)) {
-            continue;
-        }
-        // The innermost nested scope holding `n` (not `n` itself).
-        let scope = nested
-            .iter()
-            .filter(|(sid, s, _)| *sid != id && within(span, *s))
-            .min_by_key(|(_, s, _)| s.1 - s.0);
-        let in_sc = match scope {
-            None => false,
-            Some((_, _, true)) => true,
-            Some(_) => continue,
+        let (in_sc, sclass_span) = match si.checked_sub(1).map(|i| idx.scopes[i as usize]) {
+            Some((sid, _, ScopeKind::ClassModule)) if sid == class_id => (false, None),
+            Some((_, ss, ScopeKind::SclassSelf)) => (true, Some(ss)),
+            _ => continue,
         };
+        // The node's enclosing eval blocks, innermost first. An eval counts
+        // for this owner only when its CALL sits inside the body (the old
+        // collection scan's `within(n.span(), class_span)` — an eval
+        // ENCLOSING the class is another owner's business, and its blocks
+        // hold no node the body could report).
+        let mut foreign = false;
+        let mut self_ei = 0u32;
+        let mut ei = idx.inner_eval[id.0 as usize];
+        while ei > 0 {
+            let e = &idx.evals[(ei - 1) as usize];
+            if within(e.call, class_span) {
+                if eval_is_self(e) {
+                    if self_ei == 0 {
+                        self_ei = ei;
+                    }
+                } else {
+                    // An eval-block interior whose block runs under another
+                    // self files its writes on THAT owner, not this class.
+                    foreign = true;
+                    break;
+                }
+            }
+            ei = idx.eval_parent[(ei - 1) as usize];
+        }
+        if foreign {
+            continue;
+        }
         // The innermost self-eval block holding `n` — eval blocks nest
         // between `Definition` scopes, so which context governs a def or a
         // call depends on the INNERMOST of the two: a `class <<` inside a
         // self-eval is `in_singleton_class` territory (it outranks the
         // eval's `call_singleton`), while an eval nested INSIDE a
-        // `class <<` rebinds the defs its body reaches.
-        let inner_self_eval = self_eval_blocks
-            .iter()
-            .filter(|(b, _)| within(span, *b))
-            .min_by_key(|(b, _)| b.1 - b.0);
-        let sclass_innermost = match scope {
-            Some((_, ss, true)) => inner_self_eval.is_none_or(|(eb, _)| within(*ss, *eb)),
-            _ => false,
+        // `class <<` rebinds the defs its body reaches. `self_ei` is that
+        // block's index from the chain walk above (0 = none).
+        let sclass_innermost = match sclass_span {
+            Some(ss) => self_ei == 0 || within(ss, idx.evals[(self_ei - 1) as usize].block),
+            None => false,
         };
         // A certain site wins the slot back; any other write of the name
         // contests it.
@@ -1076,15 +1360,25 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
         // singleton's own singleton (`defs_singleton == :unnameable`), which
         // nothing names, so the reference skips the write entirely. An eval
         // OUTSIDE the `class <<` (`instance_eval { class << self; def x }`)
-        // does not match: the def still contests this class's slot.
-        let in_singleton_self_eval = |span: Span| {
-            matches!(scope, Some((_, ss, true)) if
-                self_eval_blocks
-                    .iter()
-                    .any(|(b, i)| *i && within(*b, *ss) && within(span, *b)))
-        };
+        // does not match: the def still contests this class's slot. Eval
+        // blocks nest, so the chain walk can stop at the first block past
+        // the `class <<`.
+        let in_singleton_self_eval = sclass_span.is_some_and(|ss| {
+            let mut ei = idx.inner_eval[id.0 as usize];
+            while ei > 0 {
+                let e = &idx.evals[(ei - 1) as usize];
+                if !within(e.block, ss) {
+                    break;
+                }
+                if e.instance && eval_is_self(e) {
+                    return true;
+                }
+                ei = idx.eval_parent[(ei - 1) as usize];
+            }
+            false
+        });
         match n {
-            Node::Definition { singleton_name: Some(m), .. } if !(in_sc && in_singleton_self_eval(span)) => {
+            Node::Definition { singleton_name: Some(m), .. } if !(in_sc && in_singleton_self_eval) => {
                 events.push(write(m))
             }
             // `def <recv>.x` — the eval context outranks the `class <<`
@@ -1106,13 +1400,14 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
                     // the owner's slot (`in_singleton_class` is
                     // unconditional — `def W.x`, `def obj.x`).
                     events.push(write(m));
-                } else if let Some((_, instance)) = inner_self_eval {
-                    if *instance {
+                } else if self_ei > 0 {
+                    let self_eval = &idx.evals[(self_ei - 1) as usize];
+                    if self_eval.instance {
                         // `instance_*` eval — `defs_singleton` binds every
                         // def, except under a `class <<` interior where
                         // it binds the singleton's own singleton
                         // (`:unnameable`, skipped).
-                        if !in_singleton_self_eval(span) {
+                        if !in_singleton_self_eval {
                             events.push((span.0, Err(Some(vec![m.clone()]))));
                         }
                     } else if def_receiver_path
@@ -1140,11 +1435,11 @@ fn singleton_events(ast: &LoweredAst, class_id: NodeId, owner: &str, written: &[
                 // def of the eval's owner — no singleton write at all.
                 if sclass_innermost {
                     events.push(write(m));
-                } else if let Some((_, true)) = inner_self_eval {
-                    if !in_singleton_self_eval(span) {
+                } else if self_ei > 0 && idx.evals[(self_ei - 1) as usize].instance {
+                    if !in_singleton_self_eval {
                         events.push((span.0, Err(Some(vec![m.clone()]))));
                     }
-                } else if inner_self_eval.is_none() {
+                } else if self_ei == 0 {
                     instance_defs.push((span.0, m.clone()));
                 }
                 // `class_eval` interior — instance-side, no event.

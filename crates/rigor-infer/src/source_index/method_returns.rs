@@ -201,21 +201,45 @@ const RECEIVER_EVAL_CALLS: [&str; 6] =
     ["class_eval", "module_eval", "class_exec", "module_exec", "instance_eval", "instance_exec"];
 
 fn superseded_defs(ast: &LoweredAst) -> HashSet<(String, String)> {
-    use rigor_parse::Span;
+    use rigor_parse::{NodeId, Span};
     let within = |a: Span, b: Span| b.0 <= a.0 && a.1 <= b.1;
-    let literal = |id: rigor_parse::NodeId| match ast.get(id) {
+    let literal = |id: NodeId| match ast.get(id) {
         Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => Some(value.clone()),
         _ => None,
     };
     // (class name, offset, method, is_def)
     let mut events: Vec<(String, usize, String, bool)> = Vec::new();
-    let scopes: Vec<(rigor_parse::NodeId, Span)> = ast
-        .iter()
-        .filter(|(_, n)| {
-            matches!(n, Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Definition { .. })
-        })
-        .map(|(id, n)| (id, n.span()))
-        .collect();
+    // rigor-rs#424 — the region scans below used to walk EVERY node per
+    // region with an O(scopes) innermost-scope search per node (the old
+    // `nested` list per region): cubic on a deep `class` nest. The shared
+    // `containment_links` sweep (literal_fold's supersede index uses the
+    // same one) names each node's innermost scope ONCE — then a class
+    // region's direct statements are exactly the nodes whose innermost
+    // OTHER scope is the region itself, and an eval-block region's the
+    // nodes whose innermost other scope is absent or outside the block.
+    let mut scopes: Vec<(NodeId, Span)> = Vec::new();
+    let mut scope_spans: Vec<Span> = Vec::new();
+    // Queries are every node's span, indexed by `NodeId` (`iter()` walks
+    // the arena in id order).
+    let mut queries: Vec<Span> = Vec::new();
+    for (id, n) in ast.iter() {
+        queries.push(n.span());
+        if matches!(n, Node::ClassDef { .. } | Node::ModuleDef { .. } | Node::Definition { .. }) {
+            scopes.push((id, n.span()));
+            scope_spans.push(n.span());
+        }
+    }
+    let (inner_scope, scope_parent) = super::containment_links(&scope_spans, &queries);
+    // The innermost scope holding `n`, not `n` itself (a scope node's own
+    // span contains its query — step out to the parent first, the old
+    // searches' `*sid != id`): `scopes` index + 1, 0 = none.
+    let innermost_other = |id: NodeId| -> u32 {
+        let mut si = inner_scope[id.0 as usize];
+        if si > 0 && scopes[(si - 1) as usize].0 == id {
+            si = scope_parent[(si - 1) as usize];
+        }
+        si
+    };
     // A region whose direct statements define on `owners`: a class or module
     // body, or (#2225 review, `collect_alias_map_block_call?`) the block of a
     // `K.class_eval { … }`-family call, re-anchored on its constant receiver
@@ -251,22 +275,40 @@ fn superseded_defs(ast: &LoweredAst) -> HashSet<(String, String)> {
             _ => {}
         }
     }
+    // Per class/module region node: its direct statements, in arena order —
+    // exactly the nodes whose innermost other scope is the region itself
+    // (the region node is never its own statement).
+    let mut attributed: HashMap<NodeId, Vec<NodeId>> = HashMap::new();
+    for (id, _) in ast.iter() {
+        let si = innermost_other(id);
+        if si > 0 {
+            let (sid, _) = scopes[(si - 1) as usize];
+            attributed.entry(sid).or_default().push(id);
+        }
+    }
     for (owners, region_id, class_span) in regions {
-        // The scopes nested in this body: a node inside one is not this
-        // body's statement (a named `def` itself still is).
-        let nested: Vec<(rigor_parse::NodeId, Span)> = scopes
-            .iter()
-            .filter(|(id, s)| Some(*id) != region_id && within(*s, class_span))
-            .copied()
-            .collect();
-        for (id, n) in ast.iter() {
+        // The region's direct statements: the pre-attributed list for a
+        // class/module region; for an eval-block region every node the
+        // block holds whose innermost other scope is absent or OUTSIDE it
+        // (a scope between the statement and the block files under that
+        // scope's owner, not the block's).
+        let direct: Box<dyn Iterator<Item = (NodeId, &Node)> + '_> = match region_id {
+            Some(rid) => Box::new(
+                attributed
+                    .get(&rid)
+                    .into_iter()
+                    .flatten()
+                    .map(|&id| (id, ast.get(id))),
+            ),
+            None => Box::new(ast.iter().filter(|(id, n)| {
+                within(n.span(), class_span) && {
+                    let si = innermost_other(*id);
+                    si == 0 || !within(scopes[(si - 1) as usize].1, class_span)
+                }
+            })),
+        };
+        for (_, n) in direct {
             let nspan = n.span();
-            if Some(id) == region_id || !within(nspan, class_span) {
-                continue;
-            }
-            if nested.iter().any(|(sid, s)| *sid != id && within(nspan, *s)) {
-                continue;
-            }
             let mut push = |m: String, is_def: bool| {
                 for name in &owners {
                     events.push((name.clone(), nspan.0, m.clone(), is_def));

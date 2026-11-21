@@ -12,7 +12,7 @@ use crate::{
     check_override_visibility, check_unreachable_branch, check_wrong_arity, dead_assignments_in_def,
     duplicate_hash_key_diagnostics, ivar_write_mismatch_diagnostics, qualified_class_names,
     raise_non_exception_diagnostics, return_in_ensure_diagnostics, unresolved_toplevel_diagnostics,
-    Diagnostic, ScopedEnv,
+    Diagnostic, KeyedDiagnostic, ScopedEnv,
 };
 
 // ---------------------------------------------------------------------------
@@ -103,6 +103,25 @@ pub fn analyze_with_source_and_folder(
     // dispatches on. `check_collection_call` fires `call.undefined-method` from
     // it — and ONLY that rule, same envelope as the class-narrowing map.
     let coll_snaps = typer.collection_shape_snapshots(ast, interner);
+
+    // rigor-rs#328 — the reference emits each file's diagnostics grouped by
+    // RULE STAGE, not positionally: the converged walk's per-node rows first
+    // (in pre-order VISIT order — a parent node's diagnostics precede every
+    // descendant's — with each node's rules in its fixed emission-array
+    // order), then each collector's results in
+    // `COLLECTOR_DIAGNOSTIC_BUILDERS` order (`value-use-void` →
+    // `always-truthy` → `unreachable-clause` → `shadowed-rescue` →
+    // `ivar-write` → `dead-assignment` → `duplicate-hash-key` →
+    // `return-in-ensure`), then the `suppression.*` marker rows (appended by
+    // the caller before `filter_suppressed`). Every pass below queues its
+    // rows keyed by the OWNING node's span and the rule's slot in the
+    // reference's per-node emission array; `drain_ordered` stable-sorts a
+    // stage into `out`.
+    let mut main_rows: Vec<KeyedDiagnostic> = Vec::new();
+    let mut truthy_rows: Vec<KeyedDiagnostic> = Vec::new();
+    let mut dead_rows: Vec<KeyedDiagnostic> = Vec::new();
+    let mut dup_key_rows: Vec<KeyedDiagnostic> = Vec::new();
+    let mut ensure_rows: Vec<KeyedDiagnostic> = Vec::new();
     let mut out = Vec::new();
 
     // Visit nodes in id order, which is source-discovery order, so diagnostics
@@ -248,8 +267,9 @@ pub fn analyze_with_source_and_folder(
                     index,
                 )
             });
+        let call_span = ast.get(call_id).span();
         if let Some(diag) = diag {
-            out.push(diag);
+            main_rows.push((call_span, call_rule_slot(diag.rule_id), diag));
         }
 
         // `call.argument-type-mismatch` is an INDEPENDENT axis (argument types),
@@ -257,7 +277,9 @@ pub fn analyze_with_source_and_folder(
         // emits it ALONGSIDE `call.wrong-arity` at the same call site (a bad-arity
         // AND wrong-typed-first-arg call yields both). Its own gate keeps it off
         // sites the undefined-method rule owns (it requires the method to be
-        // RBS-known on the receiver).
+        // RBS-known on the receiver). In the reference's per-node array it sits
+        // AFTER wrong-arity but BEFORE nil-receiver / always-raises — its slot
+        // (3) orders the pair where a late-slot winner fires alongside it.
         if let Some(diag) = check_argument_type_mismatch(
             ast,
             recv,
@@ -270,7 +292,7 @@ pub fn analyze_with_source_and_folder(
             interner,
             index,
         ) {
-            out.push(diag);
+            main_rows.push((call_span, 3, diag));
         }
     }
 
@@ -296,7 +318,7 @@ pub fn analyze_with_source_and_folder(
             ..
         } = node
         {
-            dead_assignments_in_def(ast, def_id, def_name, body, *span, *param_span, &mut out);
+            dead_assignments_in_def(ast, def_id, def_name, body, *span, *param_span, &mut dead_rows);
         }
     }
 
@@ -382,7 +404,7 @@ pub fn analyze_with_source_and_folder(
             // alias of the name (later, conditional, or in a sibling file)
             // contests the slot, which proves no reduction.
             let owner_segment = qualified.rsplit("::").next().unwrap_or(qualified);
-            if source.visibility_replaced(owner_segment, method, ast.file_key()) {
+            if source.visibility_replaced(owner_segment, method) {
                 continue;
             }
             // Upstream #1569 (`module_function_def?`): a module function's
@@ -410,10 +432,13 @@ pub fn analyze_with_source_and_folder(
             if module_function_def {
                 continue;
             }
+            // The reference fires this on the `DefNode` VISIT — the queue key
+            // is the def's own span, and slot 1 is its place in the def-node
+            // emission array (after `return-type-mismatch`, which is unported).
             if let Some(diag) =
                 check_override_visibility(source, index, qualified, method, override_vis, *name_span)
             {
-                out.push(diag);
+                main_rows.push((ast.get(child_id).span(), 1, diag));
             }
         }
     }
@@ -435,10 +460,13 @@ pub fn analyze_with_source_and_folder(
             ..
         } = node
         {
+            // The reference fires this on the `IfNode`/`UnlessNode` VISIT, so
+            // the row precedes every diagnostic the dead arm's own nodes emit
+            // even though it anchors inside the arm — keyed by the if's span.
             if let Some(diag) =
                 check_unreachable_branch(ast, *predicate, then_body, else_body, *is_unless)
             {
-                out.push(diag);
+                main_rows.push((node.span(), 0, diag));
             }
         }
     }
@@ -470,10 +498,12 @@ pub fn analyze_with_source_and_folder(
             {
                 continue;
             }
+            // `AlwaysTruthyConditionCollector` results come out in `IfNode`
+            // visit order — keyed by the if's span.
             if let Some(diag) =
                 check_always_truthy(ast, id, *predicate, &truthy_snapshots, interner)
             {
-                out.push(diag);
+                truthy_rows.push((node.span(), 0, diag));
             }
         }
     }
@@ -484,7 +514,7 @@ pub fn analyze_with_source_and_folder(
     // = the call's span is not contained in any `def`/`class`/`module` span
     // (span-containment, orphan-proof; ADR-24 leniency keeps in-body implicit-self
     // calls silent). See `check_unresolved_toplevel` for the gate.
-    unresolved_toplevel_diagnostics(ast, index, source, &mut out);
+    unresolved_toplevel_diagnostics(ast, index, source, &mut main_rows);
 
     // Seventh pass — `call.raise-non-exception` (v0.3.0). Its OWN walk over
     // receiver-None `raise`/`fail` calls (the main call walk is receiver-Some
@@ -492,15 +522,15 @@ pub fn analyze_with_source_and_folder(
     // operand is typed through the shared typer; the verdict + FP gates
     // (project-class bail, module bail, duck `#exception`, redefinition, unknown
     // decline) mirror the reference exactly.
-    raise_non_exception_diagnostics(ast, index, source, &typer, &env, interner, &mut out);
+    raise_non_exception_diagnostics(ast, index, source, &typer, &env, interner, &mut main_rows);
 
     // Eighth pass — `flow.duplicate-hash-key` (v0.3.0). Purely syntactic: walk
     // every Hash literal's precomputed value-pinned key list and fire on a repeat.
-    duplicate_hash_key_diagnostics(ast, &mut out);
+    duplicate_hash_key_diagnostics(ast, &mut dup_key_rows);
 
     // Ninth pass — `flow.return-in-ensure` (v0.3.0). Purely syntactic with a
     // frame-aware envelope: walk every `begin/ensure`'s ensure body for `return`s.
-    return_in_ensure_diagnostics(ast, &mut out);
+    return_in_ensure_diagnostics(ast, &mut ensure_rows);
 
     // Tenth pass — `def.ivar-write-mismatch` (since 0.1.2). Groups each class's
     // instance-method `@x = value` writes by (qualified class, ivar) and fires
@@ -508,8 +538,22 @@ pub fn analyze_with_source_and_folder(
     // each rvalue through the shared typer (empty local env) plus the rescue-bound
     // exception resolution (increment a); the `Integer()`/`Float()`/`String()`
     // NOMINAL fold (increment b) lives in the typer, so it flows through
-    // `type_of` transparently here.
-    ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut out);
+    // `type_of` transparently here. Its rows are already in the reference's
+    // group order, so they append as a plain stage.
+    let mut ivar_rows = Vec::new();
+    ivar_write_mismatch_diagnostics(ast, interner, index, source, &typer, &mut ivar_rows);
+
+    // Assemble the reference's stage order (rigor-rs#328): the converged walk's
+    // rows first, then each collector stage — `value-use-void` and
+    // `shadowed-rescue` are produced by the CALLER and slot in via
+    // `emission_stage`, so what leaves here is [main walk, always-truthy,
+    // ivar-write, dead-assignment, duplicate-hash-key, return-in-ensure].
+    drain_ordered(&mut main_rows, &mut out);
+    drain_ordered(&mut truthy_rows, &mut out);
+    out.append(&mut ivar_rows);
+    drain_ordered(&mut dead_rows, &mut out);
+    drain_ordered(&mut dup_key_rows, &mut out);
+    drain_ordered(&mut ensure_rows, &mut out);
 
     // The refinement declines (ADR-121 WD7, rigor-rs#446). One pass now
     // carries all four activation shapes the reference walks
@@ -594,6 +638,35 @@ pub fn analyze_with_source_and_folder(
     }
 
     out
+}
+
+/// Stable-order a stage's queued rows by the reference's emission key — the
+/// owning node's span start (its pre-order visit position: a parent's span
+/// starts before every descendant's, and at an equal start the parent sorts
+/// first by its larger end — `foo.bar.baz`'s outer call precedes `foo.bar`)
+/// — then the rule's slot in the per-node emission array. Drain into `out`.
+fn drain_ordered(rows: &mut Vec<KeyedDiagnostic>, out: &mut Vec<Diagnostic>) {
+    rows.sort_by(|a, b| {
+        (a.0 .0, std::cmp::Reverse(a.0 .1), a.1).cmp(&(b.0 .0, std::cmp::Reverse(b.0 .1), b.1))
+    });
+    out.extend(rows.drain(..).map(|row| row.2));
+}
+
+/// The slot a `call.*` rule holds in the reference's per-`CallNode` emission
+/// array (`call_node_diagnostics`): undefined-method 0, unresolved-toplevel 1,
+/// wrong-arity 2, argument-type-mismatch 3, possible-nil-receiver 4,
+/// (dump/assert-type 5–6, unported), always-raises 7, raise-non-exception 8,
+/// (visibility-mismatch 9, unported).
+fn call_rule_slot(rule_id: &str) -> u8 {
+    match rule_id {
+        crate::CALL_UNRESOLVED_TOPLEVEL => 1,
+        crate::CALL_WRONG_ARITY => 2,
+        crate::CALL_ARGUMENT_TYPE_MISMATCH => 3,
+        crate::CALL_POSSIBLE_NIL_RECEIVER => 4,
+        crate::FLOW_ALWAYS_RAISES => 7,
+        crate::CALL_RAISE_NON_EXCEPTION => 8,
+        _ => 0,
+    }
 }
 
 /// The `Integer` methods the vendored prime signatures (`integer-extension.rbs`)

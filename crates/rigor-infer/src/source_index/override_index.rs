@@ -138,7 +138,10 @@ impl SourceIndex {
         class: &str,
         method: &str,
     ) -> Option<(String, Option<Visibility>)> {
-        let owner = self.settled_definer(core, class, method, true, |n| {
+        // The override answer reads the def-node / visibility slots
+        // (`reads_visibility`), so supersede and replaced-mark contests
+        // decline too (rigor-rs#492 / upstream #2013 `possible?`).
+        let owner = self.settled_definer(core, class, method, true, true, |n| {
             self.override_classes.get(n).is_some_and(|e| {
                 e.methods.contains(method) || e.method_visibilities.contains_key(method)
             })

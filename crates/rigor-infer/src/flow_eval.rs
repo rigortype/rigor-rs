@@ -15,12 +15,13 @@ use crate::{
     closure_mutations, collect_flow_writes, indexed_flow_writes, join_flow_envs,
     multi_target_binder, qualify_self, toplevel_argument_floor, toplevel_mutations, toplevel_rebinds,
     widen_clause_entry, widen_flow_writes,
-    DefKind, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
+    DefKind, TypeEnv, Typer,
 };
 use crate::dead::DeadOp;
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
-    is_content_mutator, IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
+    is_content_mutator, literal_send_target, node_child_ids, IndexedFlow, MUTATOR_METHODS,
+    STRING_MUTATORS,
 };
 
 /// What a `while`/`until` loop's tracked locals converge to —
@@ -967,7 +968,7 @@ impl<'i> Typer<'i> {
     /// `Integer`, a `Refined` to its (recursively widened) base, a union
     /// memberwise. `Constant[nil]` keeps its pin, exactly as the reference's
     /// `type.value.nil? ? type : …` arm does.
-    fn widen_value_pinned(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+    pub(crate) fn widen_value_pinned(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) => ty,
             Type::Constant(s) => {
@@ -981,15 +982,15 @@ impl<'i> Typer<'i> {
             }
             Type::Union(members) => {
                 let members = members.clone();
-                let mut acc: Option<TypeId> = None;
-                for &m in &members {
-                    let w = self.widen_value_pinned(m, interner);
-                    acc = Some(match acc {
-                        None => w,
-                        Some(a) => rigor_types::Algebra::join(interner, a, w),
-                    });
-                }
-                acc.unwrap_or(ty)
+                // `Combinator.union` over the memberwise widened list —
+                // verbatim members, NOT `join`'s Dynamic-facet merge:
+                // `Dynamic[top] | Symbol` stays two members the way the
+                // oracle prints it (rigor-rs#771).
+                let widened: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.widen_value_pinned(m, interner))
+                    .collect();
+                rigor_types::Algebra::union(interner, &widened)
             }
             _ => ty,
         }
@@ -2130,6 +2131,7 @@ impl<'i> Typer<'i> {
                     boundary_stride: 1,
                     effects: FlowEffects::new(Vec::new(), Vec::new()),
                     closure_mutations: Vec::new(),
+                    escaped: Vec::new(),
                     indexed: IndexedFlow::default(),
                     dead: std::rc::Rc::new(crate::dead::DeadPositions::default()),
                     loops: Vec::new(),
@@ -2206,6 +2208,20 @@ impl<'i> Typer<'i> {
             }
             self.bind_check_statement(ast, stmt, &mut env, &effects, &indexed, &dead, interner);
         }
+        // rigor-rs#492 — a heredoc interpolation body lies outside its
+        // statement's span, so `check_env_at`'s containment lookup cannot
+        // find its statement. Chain every node that escapes its own
+        // parent's span back to its boundary statement, so the site can
+        // replay to the statement's entry env and descend the recorded
+        // links (a Barrier link takes the closure's entry env, exactly as
+        // `entry_children` does).
+        let mut escaped = Vec::new();
+        if record {
+            for (i, &(stmt, span)) in boundary_stmts.iter().enumerate() {
+                let mut chain = vec![stmt];
+                collect_escaped(ast, stmt, span, i, &mut chain, &mut escaped);
+            }
+        }
         let record_guards = self.collect_record_guards(ast, &indexed);
         CheckFlow {
             env,
@@ -2214,6 +2230,7 @@ impl<'i> Typer<'i> {
             boundary_stride: stride,
             effects,
             closure_mutations: closure_muts,
+            escaped,
             indexed,
             dead,
             loops: self.collect_loop_edges(ast),
@@ -2487,15 +2504,27 @@ impl<'i> Typer<'i> {
             let k = flow
                 .boundary_stmts
                 .partition_point(|(_, s)| s.0 <= site.0);
-            let Some(&(stmt, stmt_span)) = k
+            let (stmt_idx, mut chain) = match k
                 .checked_sub(1)
                 .and_then(|i| flow.boundary_stmts.get(i))
-            else {
-                break 'env Cow::Borrowed(&flow.env);
+            {
+                Some(&(_, stmt_span)) if stmt_span.0 <= site.0 && site.1 <= stmt_span.1 => {
+                    (k - 1, None)
+                }
+                // rigor-rs#492 — the site may sit in a heredoc interpolation
+                // body, which lies outside its statement's span entirely:
+                // `escaped` chains it back to its statement.
+                _ => match flow
+                    .escaped
+                    .iter()
+                    .filter(|e| e.span.0 <= site.0 && site.1 <= e.span.1)
+                    .min_by_key(|e| e.span.1 - e.span.0)
+                {
+                    Some(e) => (e.stmt_idx, Some(e.chain.as_slice())),
+                    None => break 'env Cow::Borrowed(&flow.env),
+                },
             };
-            if !(stmt_span.0 <= site.0 && site.1 <= stmt_span.1) {
-                break 'env Cow::Borrowed(&flow.env);
-            }
+            let (stmt, stmt_span) = flow.boundary_stmts[stmt_idx];
             // rigor-rs#368 — a site inside a `rescue` clause also needs the
             // replay even when no write postdates its statement: the clause's
             // own bindings (`rescue => e`) reach only through it.
@@ -2516,16 +2545,21 @@ impl<'i> Typer<'i> {
             // replaced (rigor-rs#424).
             let ci = flow
                 .boundaries
-                .partition_point(|&(i, _)| i < k)
+                .partition_point(|&(i, _)| i <= stmt_idx)
                 .saturating_sub(1);
             let (cp_idx, ref cp_env) = flow.boundaries[ci];
             let mut env = cp_env.clone();
-            for &(s, _) in &flow.boundary_stmts[cp_idx..k - 1] {
+            for &(s, _) in &flow.boundary_stmts[cp_idx..stmt_idx] {
                 self.bind_check_statement(
                     ast, s, &mut env, &flow.effects, &flow.indexed, &flow.dead, interner,
                 );
             }
-            self.entry_descend(ast, stmt, site, true, false, &mut env, flow, interner);
+            match chain.take() {
+                Some(chain) => self.entry_descend_chain(ast, chain, site, &mut env, flow, interner),
+                None => {
+                    self.entry_descend(ast, stmt, site, true, false, &mut env, flow, interner)
+                }
+            }
             Cow::Owned(env)
         };
         // rigor-rs#368 — a site inside a folded-dead `if`/`unless` arm reads
@@ -2554,6 +2588,80 @@ impl<'i> Typer<'i> {
             return Cow::Owned(env);
         }
         base
+    }
+
+    /// [`check_env_at`] for a site inside a span-escaped node
+    /// (rigor-rs#492): the recorded containment chain from its boundary
+    /// statement to the escaped node, replayed in evaluation order. Each
+    /// link descends through the same `flow_children` edges
+    /// [`Self::entry_descend`] walks — earlier children still bind — and a
+    /// `Barrier` link takes the closure's entry env. The containers the
+    /// reference arm keeps flat (`If`, `Loop`, `Case`, `When`,
+    /// `BeginRescue`, a non-sequence `Statements`) apply their subtree
+    /// effects conservatively; `Definition`/`ClassDef`/`ModuleDef` take the
+    /// flat env, exactly as `entry_descend` does.
+    fn entry_descend_chain(
+        &self,
+        ast: &LoweredAst,
+        chain: &[NodeId],
+        site: rigor_parse::Span,
+        env: &mut TypeEnv,
+        flow: &CheckFlow,
+        interner: &mut Interner,
+    ) {
+        let mut uncond = true;
+        let mut preserve_env = false;
+        for (i, &id) in chain.iter().enumerate() {
+            match ast.get(id) {
+                Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                    *env = flow.env.clone();
+                    return;
+                }
+                Node::Statements { kind, .. } if !matches!(kind, StatementsKind::Sequence) => {
+                    self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                    return;
+                }
+                Node::If { .. }
+                | Node::Loop { .. }
+                | Node::Case { .. }
+                | Node::When { .. }
+                | Node::BeginRescue { .. } => {
+                    self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                    if matches!(ast.get(id), Node::Loop { .. } | Node::Case { .. }) {
+                        preserve_env = true;
+                    }
+                    if i + 1 < chain.len() {
+                        continue;
+                    }
+                    return;
+                }
+                _ => {}
+            }
+            let Some(&next) = chain.get(i + 1) else {
+                self.entry_descend(ast, id, site, uncond, preserve_env, env, flow, interner);
+                return;
+            };
+            for (child, edge) in self.flow_children(ast.get(id)) {
+                if child == next {
+                    if edge == FlowEdge::Barrier {
+                        if !preserve_env {
+                            self.closure_entry(ast, id, site, env, flow, interner);
+                        }
+                        if matches!(ast.get(id), Node::Call { .. }) {
+                            self.closure_descend(ast, id, site, env, flow, id);
+                        }
+                        return;
+                    }
+                    uncond = uncond && edge == FlowEdge::Uncond;
+                    break;
+                }
+                if edge != FlowEdge::Barrier && ast.get(child).span().1 <= site.0 {
+                    self.bind_check_statement(
+                        ast, child, env, &flow.effects, &flow.indexed, &flow.dead, interner,
+                    );
+                }
+            }
+        }
     }
 
     /// Replay `id`'s contained effects into `env` in evaluation order until
@@ -3458,7 +3566,15 @@ impl<'i> Typer<'i> {
         {
             if let Some(&pre) = env.get(name) {
                 if evaluated {
-                    if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
+                    // `mutator_arg_types` (statement_evaluator.rb:2152):
+                    // the call's argument types, read off `env` — the
+                    // pre-widening scope, the same point `index_write_arg_types`'
+                    // `type_scope` types them.
+                    let arg_types =
+                        self.mutation_arg_types(ast, indexed, wspan, method, env, interner);
+                    if let Some(widened) =
+                        self.widen_mutated_binding(pre, method, &arg_types, interner)
+                    {
                         env.insert(Rc::from(name), widened);
                     }
                 } else {
@@ -3533,14 +3649,31 @@ impl<'i> Typer<'i> {
                 queue.push(other.to_string());
             }
         }
+        // `UnknownStoreWidening.unknown_store` — the site's own name and
+        // ARITY, every argument unknown (one unknown store).
+        let arg_types = self.unknown_store_arg_types(ast, indexed, wspan, method, interner);
         for other in queue.iter().skip(1) {
             if let Some(&pre) = env.get(other.as_str()) {
                 if part_only && !self.mutable_parts(pre, interner) {
                     continue;
                 }
-                if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
-                    if widened != pre {
-                        env.insert(Rc::from(other.as_str()), widened);
+                if let Some(widened) = self.widen_mutated_binding(pre, method, &arg_types, interner)
+                {
+                    // `widen_store` (unknown_store_widening.rb:97): a
+                    // value-preserving mutator on a NON-literal carrier
+                    // keeps the widening's answer; everything else takes
+                    // `gradual_content` — the gradual arm on every site
+                    // that can store.
+                    let floored = if crate::mutation_content::VALUE_PRESERVING_MUTATORS
+                        .contains(&method)
+                        && !Self::literal_carrier(interner, pre)
+                    {
+                        widened
+                    } else {
+                        self.gradual_content(interner, widened)
+                    };
+                    if floored != pre {
+                        env.insert(Rc::from(other.as_str()), floored);
                     }
                 }
             }
@@ -3628,7 +3761,7 @@ impl<'i> Typer<'i> {
             return;
         }
         let widened = self
-            .widen_mutated_binding(recorded, &m.method, interner)
+            .widen_mutated_binding(recorded, &m.method, &[], interner)
             .or_else(|| self.string_slot_floor(recorded, &m.method, interner));
         match widened {
             Some(ty) => {
@@ -4803,6 +4936,132 @@ impl<'i> Typer<'i> {
         out
     }
 
+    /// The `arg_types` [`Self::widen_mutated_binding`]'s content joins
+    /// read — `mutator_arg_types` (`statement_evaluator.rb:2152`) for a
+    /// `Call` mutator and `index_write_arg_types`
+    /// (`statement_evaluator.rb:1952`) for a compound index write, typed
+    /// on the pre-widening `env` exactly as the reference types them on
+    /// the entry scope. `Option` members carry `index_store_form`'s splat
+    /// `nil` mark; the empty vec is `NO_ARG_TYPES`, which reproduces the
+    /// pre-join widening.
+    ///
+    /// A `[]=` mark with no call/index-write site — a multi-assign, `for`
+    /// or `rescue` index target, whose stored key and decomposed value
+    /// this slice cannot read — still takes the unknown-pair join: the
+    /// reference's `widen_index_target` types them there, and the untyped
+    /// pair lands the same `Dynamic[top]` floor.
+    fn mutation_arg_types(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        wspan: rigor_parse::Span,
+        method: &str,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<Option<TypeId>> {
+        let Some(&site) = indexed.arg_sites.get(&wspan) else {
+            return if method == "[]=" {
+                let u = interner.untyped();
+                vec![Some(u), Some(u)]
+            } else {
+                Vec::new()
+            };
+        };
+        match ast.get(site) {
+            Node::Call {
+                args,
+                args_plain_positional,
+                ..
+            } => {
+                // `AliasMutationFloor.literal_send_target` — a literal
+                // `send` is the call it makes, with the method symbol
+                // dropped from the argument list.
+                let offset = usize::from(literal_send_target(ast, ast.get(site)).is_some());
+                let plain = *args_plain_positional;
+                args.iter()
+                    .skip(offset)
+                    .enumerate()
+                    .map(|(i, &a)| {
+                        // `content_arg_types`' splat `nil` mark
+                        // (statement_evaluator.rb:8793) — a splat in a
+                        // `[]=` index position leaves the store's arity
+                        // open. The lowered AST keeps no per-argument
+                        // plainness, so a call ANY argument of which is
+                        // non-plain marks every index position —
+                        // `index_store_form`'s `Either` is the safe
+                        // superset either way.
+                        if method == "[]=" && !plain && i + 1 < args.len() - offset {
+                            None
+                        } else {
+                            Some(self.type_of(ast, a, env, interner))
+                        }
+                    })
+                    .collect()
+            }
+            Node::IndexWrite {
+                receiver: Some(r),
+                indices,
+                value,
+                compound,
+                ..
+            } => {
+                let (r, indices, value, compound) =
+                    (*r, indices.clone(), *value, compound.clone());
+                let mut out: Vec<Option<TypeId>> = indices
+                    .iter()
+                    .map(|&i| Some(self.type_of(ast, i, env, interner)))
+                    .collect();
+                // `[index_type..., stored_value_type]` — the stored type
+                // is `index_write_stored_type`'s compound result
+                // (`index_write_arg_types`, statement_evaluator.rb:1952).
+                out.push(Some(self.index_write_value_type(
+                    ast, r, &indices, value, &compound, env, interner,
+                )));
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `UnknownStoreWidening.unknown_store` — the arg_types one unknown
+    /// store contributes through the alias floor: the site's own ARITY,
+    /// every argument `Dynamic[top]` (with the `[]=` splat nil-mark for
+    /// a non-plain call), since nothing at the call says what was stored.
+    fn unknown_store_arg_types(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        wspan: rigor_parse::Span,
+        method: &str,
+        interner: &mut Interner,
+    ) -> Vec<Option<TypeId>> {
+        let u = interner.untyped();
+        let Some(&site) = indexed.arg_sites.get(&wspan) else {
+            return vec![Some(u), Some(u)];
+        };
+        match ast.get(site) {
+            Node::Call {
+                args,
+                args_plain_positional,
+                ..
+            } => {
+                let offset = usize::from(literal_send_target(ast, ast.get(site)).is_some());
+                let plain = *args_plain_positional;
+                let n = args.len().saturating_sub(offset);
+                (0..n)
+                    .map(|i| {
+                        if method == "[]=" && !plain && i + 1 < n {
+                            None
+                        } else {
+                            Some(u)
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![Some(u), Some(u)],
+        }
+    }
+
     /// `IndexedNarrowing.invalidate_after_call` for ONE mutation entry —
     /// the record-drop half `apply_mutation_effects` also runs.
     pub(crate) fn drop_indexed_mutation(
@@ -4825,26 +5084,36 @@ impl<'i> Typer<'i> {
     /// port of the reference's `MutationWidening.widen_for_mutator`: a
     /// literal-shape carrier loses its shape but keeps its class (`Tuple` →
     /// `Nominal[Array]`, `HashShape` → `Nominal[Hash]`), a union widens
-    /// memberwise (`widen_union`), and
-    /// every other binding is untouched (`None` — a precise `Nominal` has no
-    /// shape to lose and a `Dynamic` gains nothing). The flat env tracks no
-    /// element evidence, so the nominal's args stay empty — the message reads
-    /// `for Array` where the reference says `for Array[Dynamic[top] | …]`; a
-    /// message drift only, since the harness keys on `(rule, line, col)`.
+    /// memberwise (`widen_union`), an already-widened nominal re-joins
+    /// (`MutationRejoin.widen_nominal` — rigor-rs#771), and every other
+    /// binding is untouched (`None` — a precise `Nominal` has no shape to
+    /// lose and a `Dynamic` gains nothing).
     ///
-    /// The union arm's per-member mint is the exception: `widen_union` grows
-    /// each arm memberwise and `Combinator.union` dedups on STRUCTURAL
-    /// equality, so a literal arm keeps its own element evidence —
-    /// `widen_tuple` writes `Array[1 | …]`, not bare `Array`. Two DISTINCT
-    /// literal arms (`c ? [1] : [2]` then `a.push(3)`) must therefore mint
-    /// two distinct carriers or the union collapses to `Nominal[Array]` and
-    /// `a.frobnicate` fires where the oracle stays silent (adversarial review
-    /// of rigor-rs#309). Member evidence comes from the same
-    /// [`Typer::coll_value_members`] the collection-shape pass uses.
+    /// The widened nominal carries the seed's CONTENT args exactly as
+    /// `widen_tuple` / `widen_hash_shape` mint them — `Array[1]`,
+    /// `Hash[Symbol, 1]` — grown by the content-adder joins
+    /// (`join_added_elements` / `join_added_pairs`, in
+    /// `mutation_content.rs`) with the call's typed `arg_types` and the
+    /// `gradual_floor` `Dynamic[top]` arm. `arg_types` mirrors the
+    /// reference's keyword of the same name: `Option` members carry
+    /// `index_store_form`'s splat `nil` mark and an EMPTY slice is
+    /// `NO_ARG_TYPES` — the joins then reproduce the pre-join widening,
+    /// which is what paths that cannot type the call's arguments
+    /// (`widen_mutated_slot`, the nilable replay) pass.
+    ///
+    /// The union arm's per-member mint is load-bearing for silence, not
+    /// just spelling: `widen_union` grows each arm memberwise and
+    /// `Combinator.union` dedups on STRUCTURAL equality, so two DISTINCT
+    /// literal arms (`c ? [1] : [2]` then `a.push(3)`) must mint two
+    /// distinct carriers — `Array[1 | Dynamic[top] | Integer]` vs
+    /// `Array[2 | …]` — or the union collapses to one nominal and
+    /// `a.frobnicate` fires where the oracle stays silent (adversarial
+    /// review of rigor-rs#309).
     pub(crate) fn widen_mutated_binding(
         &self,
         ty: TypeId,
         method: &str,
+        arg_types: &[Option<TypeId>],
         interner: &mut Interner,
     ) -> Option<TypeId> {
         let mint = |name: &str, interner: &mut Interner| {
@@ -4853,8 +5122,18 @@ impl<'i> Typer<'i> {
                 .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
         };
         match interner.get(ty) {
-            Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => mint("Array", interner),
-            Type::HashShape(_) if HASH_MUTATORS.contains(&method) => mint("Hash", interner),
+            // `widen_tuple` / `widen_hash_shape` plus the content-adder
+            // joins (`mutation_content.rs`): the seed's own evidence
+            // (`Array[1]`, `Hash[Symbol, 1]`, floored open once a store
+            // lands) instead of the bare `Nominal` this arm used to mint —
+            // the rigor-rs#771 message drift.
+            Type::Tuple(_) | Type::HashShape(_) => {
+                let widened = self.widened_shape_nominal(interner, ty, method)?;
+                Some(self.join_mutation_content(interner, ty, widened, method, arg_types))
+            }
+            // `MutationRejoin.widen_nominal` — a carrier this seam already
+            // widened once re-opens for the SECOND and later stores.
+            Type::Nominal { .. } => self.rejoin_nominal(interner, ty, method, arg_types),
             // `StringMutation.widen_constant` (string_mutation.rb): a
             // String-valued `Constant` under a String mutator loses its value
             // pin to the bare `String` nominal — `s = "abc"; s[0] = 5` makes
@@ -4909,18 +5188,7 @@ impl<'i> Typer<'i> {
                 let mut out = Vec::with_capacity(members.len());
                 let mut changed = false;
                 for m in members {
-                    let shape_cls = match interner.get(m) {
-                        Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => Some("Array"),
-                        Type::HashShape(_) if HASH_MUTATORS.contains(&method) => Some("Hash"),
-                        _ => None,
-                    };
-                    let widened = match shape_cls {
-                        Some(cls) => {
-                            let members = self.coll_value_members(interner, m);
-                            self.coll_nominal_with(interner, cls, &members)
-                        }
-                        None => self.widen_mutated_binding(m, method, interner),
-                    };
+                    let widened = self.widen_mutated_binding(m, method, arg_types, interner);
                     match widened {
                         Some(w) => {
                             changed = true;
@@ -5934,6 +6202,11 @@ pub struct CheckFlow {
     /// body's own scope evaluates — `(body owner node, write span, receiver
     /// name)` — replayed only for a site inside that body (rigor-rs#366).
     closure_mutations: Vec<(NodeId, rigor_parse::Span, String)>,
+    /// rigor-rs#492 — every node that escapes its own parent's span below a
+    /// boundary statement (a heredoc interpolation body: the `#{…}` parts
+    /// sit under the `<<~EOS` opener line's end), with its statement index
+    /// and the containment chain back to it. See [`EscapedBody`].
+    escaped: Vec<EscapedBody>,
     /// [`collect_indexed_flow`]: the indexed-narrowing side table
     /// (rigor-rs#325) — `operand` `h[k] ||= v` records, their spans, and
     /// element-mutator calls.
@@ -5954,6 +6227,40 @@ pub struct CheckFlow {
     /// rigor-rs#405 — every class guard whose local holds an indexed
     /// record, for [`Typer::record_guard_overlay`].
     record_guards: Vec<crate::record_guards::RecordGuard>,
+}
+
+/// One span-escaped node for [`Typer::check_env_at`] (rigor-rs#492).
+struct EscapedBody {
+    /// The escaped node's span — a site inside it takes this entry's chain.
+    span: rigor_parse::Span,
+    /// The [`CheckFlow::boundary_stmts`] index the chain hangs from.
+    stmt_idx: usize,
+    /// `[boundary statement, …, the escaped node]` — the containment chain
+    /// [`Typer::entry_descend`] would have walked had the spans nested.
+    chain: Vec<NodeId>,
+}
+
+/// [`CheckFlow::escaped`]: the `(span, chain)` of every child that lies
+/// outside its parent's span below a boundary statement.
+fn collect_escaped(
+    ast: &LoweredAst,
+    id: NodeId,
+    parent_span: rigor_parse::Span,
+    stmt_idx: usize,
+    chain: &mut Vec<NodeId>,
+    out: &mut Vec<EscapedBody>,
+) {
+    let mut children = Vec::new();
+    node_child_ids(ast.get(id), &mut children);
+    for child in children {
+        let span = ast.get(child).span();
+        chain.push(child);
+        if span.0 < parent_span.0 || parent_span.1 < span.1 {
+            out.push(EscapedBody { span, stmt_idx, chain: chain.clone() });
+        }
+        collect_escaped(ast, child, span, stmt_idx, chain, out);
+        chain.pop();
+    }
 }
 
 /// One `while`/`until` loop for [`Typer::loop_edge_overlay`].

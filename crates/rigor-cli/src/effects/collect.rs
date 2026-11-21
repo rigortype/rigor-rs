@@ -17,12 +17,26 @@
 //!
 //! Upstream's `catalog_target` (`unit_scan.rb:553`) has three arms: implicit
 //! self, a constant-path receiver, and **the class the typer projected the
-//! receiver to**. This collector implements the first two and declines the
-//! third, so its handled-target set is a strict SUBSET of upstream's — every
-//! answer it gives is upstream's own answer off the same syntax and the same
-//! vendored bytes, and the excluded arm can only cost UNDER. That is what makes
-//! ADR-0043 § 1 ("collection is observational") a dependency fact here: nothing
-//! below reads inference state, and nothing in `rigor-infer` is asked anything.
+//! receiver to**. This collector implements the first two and the third's
+//! SYNTAX-SETTLED subset (`UnitScan::settled_class`): a literal, a
+//! constructor on a written class constant, an implicit `new` whose `self`
+//! is the unit's owner class, and a local whose every assignment allocates
+//! and names the one class. Each of those projects to the same class the
+//! typer would name, so the answer stays upstream's own off the same syntax
+//! and the same vendored bytes; every other shape (a `dup`, a call, an ivar
+//! another unit types, a mixed pair of assignments) is declined, so the
+//! handled-target set remains a strict SUBSET of upstream's and the excluded
+//! shapes can only cost UNDER. That is what makes ADR-0043 § 1 ("collection
+//! is observational") a dependency fact here: nothing below reads inference
+//! state, and nothing in `rigor-infer` is asked anything.
+//!
+//! The subset is what re-opens the ownership judgment for the universally
+//! mutating selectors (#629): `[]=` reached `classify_mutation` only where
+//! the syntax settles the projection (or proves no row can claim it), and
+//! the shapes in between — a parameter a signature may type to the row's
+//! class, an ivar, a `dup` — stay declined in
+//! `UnitScan::universal_row_declined`, because upstream's row CLAIMS there
+//! and a proven `mutate` label would be the OVER.
 //!
 //! # No POSTURE tier either — and the typer-free argument does NOT save it
 //!
@@ -152,7 +166,9 @@ use rigor_effects::catalog::Resolution;
 use rigor_parse::ruby_prism::{self, CallNode, DefNode, Node, ParametersNode, Visit};
 
 use super::narrowing;
-use super::ownership::{name_of, owned_locals, MutationClassifier};
+use super::ownership::{
+    name_of, ownership_facts, Assign, AssignClass, MutationClassifier, COPYING_SELECTORS,
+};
 
 /// Mirrors `Inference::ScopeIndexer::TOP_LEVEL_DEF_KEY` — a `def` outside any
 /// class body (`scanner.rb:43`).
@@ -224,18 +240,19 @@ pub(super) const UNKNOWN_OWNERSHIP: &str = "unknown-ownership";
 pub(super) type Cause = (String, Option<String>);
 
 /// Selectors that mutate EVERY receiver (`[]=`, an attribute writer) but which
-/// some catalogued ROW answers as a NON-mutation — the one place declining the
-/// typer arm could over-claim rather than under-claim, so it is the one place
-/// the collector suppresses rather than mirrors.
+/// some catalogued ROW answers as a NON-mutation — the selectors whose claim
+/// path can make upstream's answer NARROWER than the uncatalogued one, and so
+/// the one place the collector declines rather than mirrors.
 ///
 /// Upstream reaches `ENV#[]=` / `Thread#[]=` through the typer for a receiver
-/// this collector cannot name (`thread[:k] = v` on a local), and those rows say
-/// `global.write` and *not* a receiver mutation. Falling to the uncatalogued
-/// path there would answer `mutate.instance` / `mutate.local` where the oracle
-/// proves neither — an OVER, and the subset argument does not cover it, because
-/// the catalogued path is where upstream's answer gets NARROWER than the
-/// uncatalogued one. Derived from the shipped catalogue rather than listed, so a
-/// row upstream adds is covered without an edit.
+/// this collector cannot name (`thread[:k] = v` on a parameter), and those rows
+/// say `global.write` and *not* a receiver mutation — an OVER if the
+/// uncatalogued judgment classified there. So the judgment runs for these
+/// selectors only where the projection SETTLED (the row then claims through
+/// `catalog_target` before it) or cannot be a row's class at all; the shapes in
+/// between are [`UnitScan::universal_row_declined`]'s (#629). Derived from the
+/// shipped catalogue rather than listed, so a row upstream adds is covered
+/// without an edit.
 static NON_MUTATING_ROWED_SELECTORS: LazyLock<BTreeSet<String>> = LazyLock::new(|| {
     let catalog = rigor_effects::catalog();
     let mut suppressed = BTreeSet::new();
@@ -644,13 +661,16 @@ impl Scanner {
         let key =
             format!("{class_name}{}{method_name}", if ctx.singleton() { "." } else { "#" });
         let names = parameter_names(parameters);
+        let facts = ownership_facts(body, &names, ctx.singleton(), Some(class_name));
         let mut scan = UnitScan::new(
             ctx,
             shared_slot,
             method_name,
             names.clone(),
             block_parameter_name(parameters),
-            owned_locals(body, &names, ctx.singleton()),
+            facts.owned,
+            class_name,
+            facts.assignments,
         );
         if let Some(body) = body {
             scan.visit(body);
@@ -812,12 +832,20 @@ struct UnitScan<'pr> {
     /// callable (`unit_scan.rb:490`, `:528`); slice 2 dropped it because nothing
     /// but taints read it.
     block_parameter: Option<String>,
+    /// The unit's owner CLASS name — the projection an implicit or `self.`
+    /// `new` settles to where `self` is the class object (`settled_class`).
+    class_name: String,
+    /// Every local's assignment records — the claim question's syntax half
+    /// (`ownership_facts`). Read by `settled_class` and
+    /// `universal_row_declined`.
+    assignments: BTreeMap<String, Vec<Assign>>,
     mutation: MutationClassifier,
     summary: Summary,
     nested: Vec<NestedUnit<'pr>>,
 }
 
 impl<'pr> UnitScan<'pr> {
+    #[allow(clippy::too_many_arguments)]
     fn new(
         ctx: BodyCtx,
         shared_slot: bool,
@@ -825,6 +853,8 @@ impl<'pr> UnitScan<'pr> {
         parameters: BTreeSet<String>,
         block_parameter: Option<String>,
         owned: BTreeSet<String>,
+        class_name: &str,
+        assignments: BTreeMap<String, Vec<Assign>>,
     ) -> Self {
         let singleton = ctx.singleton();
         Self {
@@ -833,6 +863,8 @@ impl<'pr> UnitScan<'pr> {
             shared_slot,
             method_name: method_name.to_string(),
             block_parameter,
+            class_name: class_name.to_string(),
+            assignments,
             mutation: MutationClassifier::new(singleton, parameters, owned),
             summary: Summary::default(),
             nested: Vec::new(),
@@ -958,7 +990,7 @@ impl<'pr> UnitScan<'pr> {
     /// claim suppresses the uncatalogued reading, which is what an explicit ∅
     /// row is for (`unit_scan.rb:381`).
     fn claimed_by_catalogue(&mut self, node: &CallNode<'pr>) -> bool {
-        let Some((owner, singleton, implicit)) = catalog_target(node) else { return false };
+        let Some((owner, singleton, implicit)) = self.catalog_target(node) else { return false };
         let selector = name_of(node.name().as_slice());
         let catalog = rigor_effects::catalog();
         // `posture: false` — ALWAYS, for every receiver shape. The tier is gated
@@ -1032,13 +1064,21 @@ impl<'pr> UnitScan<'pr> {
         if opaque_eval(node, &selector) {
             return self.taint(OPAQUE_CALLABLE, None);
         }
-        // No typer, so no receiver class: only the universally-mutating
-        // selectors survive here, which is upstream's own answer whenever it
-        // has no receiver class either. `NON_MUTATING_ROWED_SELECTORS` suppresses
-        // the LABEL only — it is a port-side device against one over-claim, not
-        // an upstream arm, so it may not swallow the taints below.
-        if !NON_MUTATING_ROWED_SELECTORS.contains(&selector)
-            && MutationClassifier::mutating(&selector, None)
+        // No typer, so the receiver class is whatever the SYNTAX settles
+        // (`settled_class`) — upstream's own answer whenever it projected no
+        // class either, and a strict subset of its projections elsewhere.
+        // `NON_MUTATING_ROWED_SELECTORS` names the universally-mutating
+        // selectors a catalogued ROW answers as a NON-mutation: for those
+        // alone the judgment is declined on the shapes whose projection could
+        // still be the row's class (`universal_row_declined`), because
+        // upstream CLAIMS the row there and a proven label would over-claim
+        // (#629). The taints below are not the judgment's to gate: an
+        // unprovably-owned receiver records `unknown-ownership` through
+        // `classify_mutation`, exactly as upstream's does.
+        let settled =
+            node.receiver().as_ref().and_then(|receiver| self.settled_class(receiver));
+        if MutationClassifier::mutating(&selector, settled.as_deref())
+            && !self.universal_row_declined(node, &selector)
         {
             self.classify_mutation(node.receiver().as_ref());
         }
@@ -1056,7 +1096,15 @@ impl<'pr> UnitScan<'pr> {
         // dispatcher declined; the port can prove NEITHER negative, so it taints
         // at every such site. Both are strict over-taints — the safe direction
         // (ADR-0043 § 2) — and they are what the residual UNDER column measures.
+        // The one exception is a SETTLED projection: upstream's record then
+        // names the class and is not `Dynamic`, so the site keeps only its
+        // edge — and the port's selector-keyed edge resolves against every
+        // unit of that name where upstream's resolves against the one class,
+        // so an exhaustive claim here is still upstream's own or narrower.
         if let Some(receiver) = node.receiver() {
+            if settled.is_some() {
+                return self.push_edge(&selector);
+            }
             // The detail is upstream's `record.cause` — the dynamic-origin of
             // the receiver's type. Without a typer the port can only name the
             // archetypal one: a bare local read is Dynamic by
@@ -1114,12 +1162,184 @@ impl<'pr> UnitScan<'pr> {
     /// `unknown-ownership` TAINT and never a proven bare `mutate`
     /// (`unit_scan.rb:533`). `MutationClassifier::label_for` is pure syntax on
     /// both sides, so this producer is EXACT wherever the caller is — the six
-    /// compound-write node types, and the claimed `mutates: receiver` path.
+    /// compound-write node types, the claimed `mutates: receiver` path, and
+    /// the uncatalogued judgment below wherever it is not declined.
     fn classify_mutation(&mut self, receiver: Option<&Node<'pr>>) {
         match self.mutation.label_for(receiver) {
             Some(ownership) => self.summary.add(RECEIVER_MUTATION, [ownership.label()]),
             None => self.taint(UNKNOWN_OWNERSHIP, None),
         }
+    }
+
+    /// The class the catalogue would look this call up under, as
+    /// `(owner, singleton, implicit_self)` — spelled from the SYNTAX, or None.
+    ///
+    /// Upstream's third arm is the class the TYPER projected the receiver to;
+    /// this port answers only its syntax-settled subset
+    /// ([`settled_class`](Self::settled_class)), which keeps the
+    /// handled-target set a strict subset of upstream's — see the module docs.
+    fn catalog_target(&self, node: &CallNode<'_>) -> Option<(String, bool, bool)> {
+        let Some(receiver) = node.receiver() else {
+            return Some(("Kernel".to_string(), false, true));
+        };
+        if receiver.as_self_node().is_some() {
+            return Some(("Kernel".to_string(), false, true));
+        }
+        if let Some(constant) = qualified_name(&receiver) {
+            // `kind: object` constants (`ENV ARGF STDIN STDOUT STDERR`) flip
+            // the singleton bit, so `ENV["HOME"]` keys as the INSTANCE row
+            // `ENV#[]` while `File.read` keys as the singleton `File.read`
+            // (`unit_scan.rb:558`).
+            let singleton = !rigor_effects::catalog().object_constant(&constant);
+            return Some((constant, singleton, false));
+        }
+        self.settled_class(&receiver).map(|owner| (owner, false, false))
+    }
+
+    /// The class the receiver of a call projects to, where the SYNTAX settles
+    /// it — upstream's third `catalog_target` arm (`record.receiver_class`,
+    /// `unit_scan.rb:558`) restricted to the shapes whose projection the
+    /// typer cannot disagree with: a literal, a constructor on a written
+    /// class constant, an implicit `new` whose `self` is the unit's owner
+    /// class, or a local whose every assignment allocates and names the one
+    /// class. Everything else answers None — a local with a `dup`, a call,
+    /// an ivar the file's other units may type — keeping the handled-target
+    /// set a strict subset of upstream's.
+    ///
+    /// Measured rows behind each arm (#629): `{}[k] = v` / `[][0] = v` →
+    /// `mutate.local` (a literal settles, and no row claims it);
+    /// `Thread.new[k] = v` → `global.write` (the row claims through the
+    /// settled `Thread`); `Time.new[k] = v` → `mutate.local` (settled, but
+    /// no row); `ENV.new[k] = v` → `mutate.local` (new on an OBJECT
+    /// constant cannot resolve, so the claim never fires); implicit `new` on
+    /// a singleton body → `mutate.local`; a `dup` receiver → declined in
+    /// [`universal_row_declined`].
+    fn settled_class(&self, receiver: &Node<'pr>) -> Option<String> {
+        // The TYPER sees through parentheses; ownership does not (upstream's
+        // `allocation?` case matches the node itself, so `(+"x")` taints
+        // `unknown-ownership` while its RECORD projects `String`). Only this
+        // half unwraps.
+        let mut unwrapped: Option<Node<'pr>> = None;
+        loop {
+            let current: &Node<'pr> = unwrapped.as_ref().unwrap_or(receiver);
+            let Some(paren) = current.as_parentheses_node() else { break };
+            let Some(statements) =
+                paren.body().and_then(|body| body.as_statements_node())
+            else {
+                break;
+            };
+            match statements.body().iter().last() {
+                Some(last) => unwrapped = Some(last),
+                None => break,
+            }
+        }
+        let receiver = unwrapped.as_ref().unwrap_or(receiver);
+        if receiver.as_hash_node().is_some() {
+            return Some("Hash".to_string());
+        }
+        if receiver.as_array_node().is_some() {
+            return Some("Array".to_string());
+        }
+        if receiver.as_string_node().is_some() || receiver.as_interpolated_string_node().is_some()
+        {
+            return Some("String".to_string());
+        }
+        if receiver.as_lambda_node().is_some() {
+            return Some("Proc".to_string());
+        }
+        if let Some(local) = receiver.as_local_variable_read_node() {
+            return self.local_settled_class(&name_of(local.name().as_slice()));
+        }
+        let call = receiver.as_call_node()?;
+        if super::ownership::unary_plus_string(&call) {
+            return Some("String".to_string());
+        }
+        if call.name().as_slice() != b"new" {
+            return None;
+        }
+        if let Some(constant) =
+            call.receiver().as_ref().and_then(|receiver| qualified_name(receiver))
+        {
+            // An OBJECT constant's `new` cannot resolve — the typer answers
+            // `Dynamic` there, so no row ever claims it.
+            return (!rigor_effects::catalog().object_constant(&constant)).then_some(constant);
+        }
+        // Implicit or `self.` `new` where `self` is the class object: an
+        // instance of the unit's owner. `x.class.new` answers None — `Class`
+        // is not a projection a row of this catalogue answers.
+        let implicit_or_self = call.receiver().is_none()
+            || call.receiver().is_some_and(|receiver| receiver.as_self_node().is_some());
+        (implicit_or_self && self.singleton).then(|| self.class_name.clone())
+    }
+
+    /// The single class every assignment of local `name` settles to, where
+    /// each one allocates and names one. Upstream's union rule keeps a MIXED
+    /// pair claimless (`union_descriptor`, `collector.rb:214`), so two
+    /// disagreeing classes answer None; a `dup`/`clone` or a non-allocation
+    /// anywhere in the list is not a class the syntax can name either.
+    /// [`AssignClass::Claimless`] answers None the same way — a claimless
+    /// local can never be CLAIMED, so the uncatalogued judgment is the
+    /// reading (measured: `x = ENV.new; x[k] = v` → `mutate.local`).
+    fn local_settled_class(&self, name: &str) -> Option<String> {
+        let assigns = self.assignments.get(name)?;
+        let mut single: Option<&String> = None;
+        for assign in assigns {
+            let AssignClass::Class(class) = &assign.class else { return None };
+            match single {
+                None => single = Some(class),
+                Some(existing) if existing != class => return None,
+                Some(_) => {}
+            }
+        }
+        single.cloned()
+    }
+
+    /// The one place the port must stay QUIET where upstream answers a row
+    /// (#629). For a universally-mutating selector that a catalogued row
+    /// answers as a NON-mutation (`ENV#[]=`, `Thread#[]=`, `Warning.[]=`,
+    /// `Encoding.default_*_=`), upstream's claim path runs BEFORE the
+    /// ownership judgment whenever the receiver's TYPE projects to the row's
+    /// class — and the port cannot see a type in exactly these shapes:
+    ///
+    /// - a parameter, which a signature may type to the row's class;
+    /// - a frame-owned local with a `dup`/`clone` assignment — the projection
+    ///   is the inner receiver's class (measured:
+    ///   `t = Thread.current; t.dup[k] = v` answers `Thread#[]=`'s row);
+    /// - an ivar or a cvar, which another unit of the class types (measured:
+    ///   `@t = Thread.new` in one unit claims the row in every other);
+    /// - the `dup`/`clone` call itself, for the same inner-receiver reason.
+    ///
+    /// Everything else either settles — `claimed_by_catalogue` then answers
+    /// the row before this judgment runs — or answers a taint through
+    /// `classify_mutation`, never a label. The decline therefore costs only
+    /// labels the port could not prove, the safe side (ADR-0043 § 2).
+    fn universal_row_declined(&self, node: &CallNode<'pr>, selector: &str) -> bool {
+        if !NON_MUTATING_ROWED_SELECTORS.contains(selector) {
+            return false;
+        }
+        let Some(receiver) = node.receiver() else { return false };
+        if receiver.as_instance_variable_read_node().is_some()
+            || receiver.as_class_variable_read_node().is_some()
+        {
+            return true;
+        }
+        if let Some(local) = receiver.as_local_variable_read_node() {
+            let name = name_of(local.name().as_slice());
+            if self.mutation.is_parameter(&name) {
+                return true;
+            }
+            // `label_for` answers `mutate.local` here (every assignment
+            // allocates and the name never escapes), and the projection is
+            // unknown exactly where one of those assignments is a
+            // `dup`/`clone`.
+            return self.mutation.is_owned(&name)
+                && self.assignments.get(&name).is_some_and(|assigns| {
+                    assigns.iter().any(|assign| assign.class == AssignClass::Unsettled)
+                });
+        }
+        receiver
+            .as_call_node()
+            .is_some_and(|call| COPYING_SELECTORS.contains(&call.name().as_slice()))
     }
 }
 
@@ -1203,26 +1423,6 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
             }
         }
     }
-}
-
-/// The class the catalogue would look this call up under, as
-/// `(owner, singleton, implicit_self)` — spelled from the SYNTAX, or None.
-///
-/// Upstream's third arm (`record.receiver_class`) is deliberately absent; see
-/// the module docs.
-fn catalog_target(node: &CallNode<'_>) -> Option<(String, bool, bool)> {
-    let Some(receiver) = node.receiver() else {
-        return Some(("Kernel".to_string(), false, true));
-    };
-    if receiver.as_self_node().is_some() {
-        return Some(("Kernel".to_string(), false, true));
-    }
-    let constant = qualified_name(&receiver)?;
-    // `kind: object` constants (`ENV ARGF STDIN STDOUT STDERR`) flip the
-    // singleton bit, so `ENV["HOME"]` keys as the INSTANCE row `ENV#[]` while
-    // `File.read` keys as the singleton `File.read` (`unit_scan.rb:558`).
-    let singleton = !rigor_effects::catalog().object_constant(&constant);
-    Some((constant, singleton, false))
 }
 
 /// An `eval`-family call carrying code rather than a block, or a bare
@@ -1342,8 +1542,9 @@ fn parameter_name(node: &Node<'_>) -> Option<String> {
 /// Upstream's `Source::ConstantPath.qualified_name` — LENIENT: a constant path
 /// rooted in a dynamic base (`expr::Bar`) drops the dynamic segment and renders
 /// the trailing constant names. A node that is neither a `ConstantReadNode` nor
-/// a `ConstantPathNode` answers None.
-fn qualified_name(node: &Node<'_>) -> Option<String> {
+/// a `ConstantPathNode` answers None. `pub(super)` because `ownership`'s
+/// claim-class half reads a constructor's constant receiver through it.
+pub(super) fn qualified_name(node: &Node<'_>) -> Option<String> {
     if let Some(read) = node.as_constant_read_node() {
         return Some(name_of(read.name().as_slice()));
     }
@@ -1845,33 +2046,101 @@ mod tests {
     }
 
     #[test]
-    fn a_typed_mutator_needs_a_constant_receiver_and_is_otherwise_silent() {
-        // `n << 2` is a bit shift and `io << "x"` is output, so `<<` on an
-        // untyped receiver claims nothing — the corpus's `mutates_its_argument`.
+    fn a_mutator_needs_a_settled_receiver_and_is_otherwise_silent() {
+        // MEASURED against the oracle (#629's probe set): a receiver whose
+        // projection the SYNTAX settles feeds the per-class mutator sets
+        // exactly as the typer's projection does upstream — `b = []; b << 1`
+        // proves `mutate.local` there. A parameter or an untyped local
+        // claims nothing: `n << 2` is a bit shift and `io << "x"` is output,
+        // so `<<` where no class settles claims nothing either.
+        assert_eq!(one("  b = []\n  b << 1\n  nil"), ["mutate.local"]);
+        assert_eq!(one("  [] << 1"), ["mutate.local"]);
+        assert_eq!(one("  {}.merge!(k: 1)"), ["mutate.local"]);
+        assert_eq!(one("  s = \"x\"\n  s.upcase!\n  nil"), ["mutate.local"]);
+        assert_eq!(one("  Array.new.push(1)"), ["mutate.local"]);
+        // An `Integer`-settled receiver is in none of the per-class sets.
+        assert!(one("  n = 5\n  n << 1\n  nil").is_empty());
+        // The untyped shapes stay silent.
         assert!(one("  list << 1").is_empty());
-        assert!(one("  b = []\n  b << 1\n  nil").is_empty());
+        assert!(one("  other << 1").is_empty());
+        assert!(one("  @x << 1").is_empty());
     }
 
     #[test]
-    fn a_plain_index_write_is_suppressed_because_two_rows_answer_it_as_a_non_mutation() {
-        // MEASURED against the oracle (impl note § composition probes):
-        // `t[:k] = 1` on a `Thread` proves `global.write` and NOT
-        // `mutate.instance`, because `Thread#[]=` is a ROW and rows are
-        // authoritative. With no typer this collector cannot tell a `Thread`
-        // local from any other, so it declines `[]=` on the UNCATALOGUED path
-        // entirely — an UNDER on every ordinary index write, and the only
-        // alternative was an OVER on this one.
+    fn a_plain_index_write_classifies_where_the_projection_settles() {
+        // MEASURED against the oracle (issue #629's rows, both engines):
+        // `[]=` reaches `classify_mutation` wherever the projection settles
+        // (or proves no row can claim it), so the ownership judgment answers
+        // what the blanket suppression used to swallow.
+        assert_eq!(one("  Thing.new[1] = 2"), ["mutate.local"]);
+        assert_eq!(one("  {}[:k] = 1"), ["mutate.local"]);
+        assert_eq!(one("  [][0] = 1"), ["mutate.local"]);
+        assert_eq!(one("  b = []\n  b[0] = 1\n  nil"), ["mutate.local"]);
+        assert_eq!(one("  h = {}\n  h[:k] = 1\n  nil"), ["mutate.local"]);
+        assert_eq!(one("  x = Time.new\n  x[1] = 2\n  nil"), [
+            "mutate.local",
+            "nondet.time",
+        ]);
+        // Bare `new` on a singleton body is `Class#new` on the owner.
+        let found = summaries("class C\n def self.s\n  new[1] = 2\n end\nend");
+        assert_eq!(found["C.s"], ["mutate.local"]);
+        // An OBJECT constant's `new` cannot resolve, so no row claims it. The
+        // reference also proves `global` there — ENV's POSTURE on a named
+        // constant — which the posture-off design declines (issue #106).
+        assert_eq!(one("  ENV.new[1] = 2"), ["mutate.local"]);
+        // An unprovably-owned receiver is the taint, never a label.
+        let (_, causes) = taint("  foo[1] = 2");
+        assert!(causes.contains(&cause(UNKNOWN_OWNERSHIP, None)), "{causes:?}");
+        // Implicit `new` on an instance body allocates nothing.
+        let (_, causes) = bits("class C\n def m\n  new[1] = 2\n end\nend").remove("C#m").unwrap();
+        assert!(causes.contains(&cause(UNKNOWN_OWNERSHIP, None)), "{causes:?}");
+    }
+
+    #[test]
+    fn a_row_settled_projection_claims_the_row_instead_of_classifying() {
+        // MEASURED: where the projection settles to the row's own class, the
+        // catalogued path answers the row and never classifies — `Thread.new`
+        // settles `Thread`, and `Thread#[]=` is a non-mutating row.
+        assert_eq!(one("  Thread.new[1] = 2"), ["global.write"]);
+        assert_eq!(one("  t = Thread.new\n  t[:k] = 1\n  nil"), ["global.write"]);
+        // `Array#[]=` has no row, so the settled `Array` classifies.
+        assert_eq!(one("  Array.new[0] = 1"), ["mutate.local"]);
+        // `Time` settles but no `[]=` row answers, so it classifies beside
+        // the `nondet.time` of the constructor's own row.
+        assert_eq!(one("  Time.new[1] = 2"), ["mutate.local", "nondet.time"]);
+        // `Encoding`'s writers are SINGLETON rows; an instance settles to the
+        // rowless instance side, so the judgment runs (measured).
+        assert_eq!(one("  Encoding.new.default_internal = \"x\""), ["mutate.local"]);
+        // A MIXED pair of settled classes claims no row either way
+        // (`union_descriptor` keeps disagreeing arms claimless).
+        assert_eq!(one("  x = Thread.new\n  x = Time.new\n  x[1] = 2\n  nil"), [
+            "mutate.local",
+            "nondet.time",
+        ]);
+    }
+
+    #[test]
+    fn a_plain_index_write_stays_declined_where_a_row_could_claim() {
+        // The other half of #629's measurement, and the shape the old blanket
+        // suppression existed for: these receivers' projections could be the
+        // row's class at run time, and upstream CLAIMS the row there — so a
+        // proven label here would be the OVER.
+        assert!(one("  list[0] = 1").is_empty(), "a parameter, which a signature may type");
+        assert!(one("  @x[0] = 1").is_empty(), "an ivar, which another unit types");
+        // …the cvar READ is still its own `global.read` origin; the decline
+        // drops only the `mutate.static` the judgment would have added.
+        assert_eq!(one("  @@x[0] = 1"), ["global.read"]);
+        assert!(one("  other.dup[0] = 1").is_empty(), "the dup's inner receiver types");
+        assert!(one("  y = other.dup\n  y[0] = 1\n  nil").is_empty());
+        // …but a CONSTANT receiver reads the row itself, both its label and
+        // its deliberate non-mutation.
+        assert_eq!(one(r#"  ENV["k"] = "v""#), ["global.write"]);
+        // And the decline set itself is DERIVED from the catalogue; a new row
+        // changes it.
         assert_eq!(
             NON_MUTATING_ROWED_SELECTORS.iter().map(String::as_str).collect::<Vec<_>>(),
-            ["[]=", "default_external=", "default_internal="],
-            "the suppression is DERIVED from the catalogue; a new row changes it"
+            ["[]=", "default_external=", "default_internal="]
         );
-        assert!(one("  list[0] = 1").is_empty());
-        assert!(one("  @x[0] = 1").is_empty());
-        assert!(one("  b = []\n  b[0] = 1\n  nil").is_empty());
-        // …but a CONSTANT receiver reads the row itself, both its label and its
-        // deliberate non-mutation.
-        assert_eq!(one(r#"  ENV["k"] = "v""#), ["global.write"]);
     }
 
     // -----------------------------------------------------------------------
@@ -1981,15 +2250,16 @@ mod tests {
         assert_eq!(taint("  payload.call"), (false, vec![cause(OPAQUE_CALLABLE, None)]));
         // The two exemptions still fall through to the ordinary explicit-receiver
         // reading rather than to `opaque-callable`: a lambda literal's body is
-        // already counted by containment, and `&blk` is forwarding. (Upstream
-        // reaches `exhaustive: true` for both because it can see the receiver is
-        // a Proc; the port cannot, so it keeps the weaker `dynamic-receiver` —
-        // an over-taint, the safe direction.)
+        // already counted by containment, and `&blk` is forwarding. A lambda
+        // literal SETTLES to `Proc` (`settled_class`), so its `.call` records
+        // the edge and reaches `exhaustive: true` exactly as upstream does;
+        // `&blk` has no assignment the syntax could settle, so it keeps the
+        // weaker `dynamic-receiver` — an over-taint, the safe direction.
         assert_eq!(
             taint("  blk.call"),
             (false, vec![cause(DYNAMIC_RECEIVER, Some("inferred_return_untyped"))])
         );
-        assert_eq!(taint("  ->(x) { x }.call(1)"), (false, vec![cause(DYNAMIC_RECEIVER, None)]));
+        assert_eq!(taint("  ->(x) { x }.call(1)"), (true, vec![]));
     }
 
     #[test]

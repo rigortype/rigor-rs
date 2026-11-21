@@ -10,7 +10,7 @@ use rigor_parse::{HashKeyTag, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type};
 
 use crate::{
-    catalog, span_within, Diagnostic, Severity, FLOW_ALWAYS_RAISES, FLOW_ALWAYS_TRUTHY_CONDITION,
+    catalog, span_within, Diagnostic, KeyedDiagnostic, Severity, FLOW_ALWAYS_RAISES, FLOW_ALWAYS_TRUTHY_CONDITION,
     FLOW_DEAD_ASSIGNMENT, FLOW_DUPLICATE_HASH_KEY, FLOW_RETURN_IN_ENSURE, FLOW_UNREACHABLE_BRANCH,
 };
 
@@ -359,7 +359,10 @@ pub(crate) fn dead_assignments_in_def(
     body: &[rigor_parse::NodeId],
     def_span: rigor_parse::Span,
     param_span: Option<rigor_parse::Span>,
-    out: &mut Vec<Diagnostic>,
+    // Queued keyed by the DEF's span — the reference's collector pushes a def's
+    // dead writes when the `DefNode` is VISITED (pre-order), so an outer def's
+    // rows precede a nested def's wherever the writes anchor (rigor-rs#328).
+    out: &mut Vec<KeyedDiagnostic>,
 ) {
     // Spans of nested definition units WITHIN this def (the write barrier). A
     // nested def/class/module is one whose span is strictly inside `def_span`
@@ -442,7 +445,7 @@ pub(crate) fn dead_assignments_in_def(
         if reads.contains(name) {
             continue;
         }
-        out.push(Diagnostic {
+        out.push((def_span, 0, Diagnostic {
             rule_id: FLOW_DEAD_ASSIGNMENT,
             start_offset: name_span.0,
             end_offset: name_span.1,
@@ -453,7 +456,7 @@ pub(crate) fn dead_assignments_in_def(
             receiver_classes: None,
 
             method_name: None,
-        });
+        }));
     }
 }
 
@@ -507,7 +510,13 @@ fn descend_trailing(ast: &LoweredAst, id: rigor_parse::NodeId) -> Option<rigor_p
 /// updated on a hit, so with N≥2 duplicates every later occurrence references the
 /// SAME original first occurrence (reference semantics). Each literal is its own
 /// scope — nested literals never cross-compare (they are distinct arena nodes).
-pub(crate) fn duplicate_hash_key_diagnostics(ast: &LoweredAst, out: &mut Vec<Diagnostic>) {
+/// Rows are queued keyed by the HASH LITERAL's span — the collector records
+/// a literal's repeats when the literal is VISITED, so an outer literal's rows
+/// precede a nested literal's wherever the keys anchor (rigor-rs#328).
+pub(crate) fn duplicate_hash_key_diagnostics(
+    ast: &LoweredAst,
+    out: &mut Vec<KeyedDiagnostic>,
+) {
     for (_id, node) in ast.iter() {
         let Node::HashLit { dup_keys, .. } = node else {
             continue;
@@ -518,7 +527,7 @@ pub(crate) fn duplicate_hash_key_diagnostics(ast: &LoweredAst, out: &mut Vec<Dia
         let mut seen: HashMap<&HashKeyTag, u32> = HashMap::new();
         for key in dup_keys {
             match seen.get(&key.tag) {
-                Some(&first_line) => out.push(Diagnostic {
+                Some(&first_line) => out.push((node.span(), 0, Diagnostic {
                     rule_id: FLOW_DUPLICATE_HASH_KEY,
                     start_offset: key.anchor.0,
                     end_offset: key.anchor.1,
@@ -533,7 +542,7 @@ pub(crate) fn duplicate_hash_key_diagnostics(ast: &LoweredAst, out: &mut Vec<Dia
                     receiver_classes: None,
 
                     method_name: None,
-                }),
+                })),
                 None => {
                     seen.insert(&key.tag, key.line);
                 }
@@ -556,23 +565,35 @@ const FRAME_BARRIER_CALL_NAMES: &[&str] = &["lambda", "define_method"];
 /// Emit `flow.return-in-ensure` for every explicit `return` lexically inside an
 /// `ensure` clause body. Dispatches on every `BeginRescue` carrying a non-empty
 /// `ensure_body` and gathers returns from it with a frame-aware envelope.
-pub(crate) fn return_in_ensure_diagnostics(ast: &LoweredAst, out: &mut Vec<Diagnostic>) {
+/// Rows are queued keyed by the `BeginRescue`'s span — the collector scans an
+/// ensure body when the `begin` is VISITED, so an outer ensure's rows precede
+/// a nested begin's wherever the returns anchor (rigor-rs#328).
+pub(crate) fn return_in_ensure_diagnostics(
+    ast: &LoweredAst,
+    out: &mut Vec<KeyedDiagnostic>,
+) {
     for (_id, node) in ast.iter() {
         let Node::BeginRescue { ensure_body, .. } = node else {
             continue;
         };
+        let key_span = node.span();
         for &stmt in ensure_body {
-            gather_returns_in_ensure(ast, stmt, out);
+            gather_returns_in_ensure(ast, stmt, key_span, out);
         }
     }
 }
 
 /// Recursively collect offending `return`s under `id`, stopping at frame
 /// barriers. Port of the reference `gather_returns` + `gather_returns_around_barrier_block`.
-fn gather_returns_in_ensure(ast: &LoweredAst, id: NodeId, out: &mut Vec<Diagnostic>) {
+fn gather_returns_in_ensure(
+    ast: &LoweredAst,
+    id: NodeId,
+    key_span: rigor_parse::Span,
+    out: &mut Vec<KeyedDiagnostic>,
+) {
     match ast.get(id) {
         Node::Return { values, span } => {
-            out.push(Diagnostic {
+            out.push((key_span, 0, Diagnostic {
                 rule_id: FLOW_RETURN_IN_ENSURE,
                 start_offset: span.0,
                 end_offset: span.1,
@@ -585,10 +606,10 @@ fn gather_returns_in_ensure(ast: &LoweredAst, id: NodeId, out: &mut Vec<Diagnost
                 receiver_classes: None,
 
                 method_name: None,
-            });
+            }));
             // The reference falls through to descend the return's children.
             for &v in values {
-                gather_returns_in_ensure(ast, v, out);
+                gather_returns_in_ensure(ast, v, key_span, out);
             }
         }
         // A nested `def` / lambda opens a new return frame — a `return` below it
@@ -601,7 +622,7 @@ fn gather_returns_in_ensure(ast: &LoweredAst, id: NodeId, out: &mut Vec<Diagnost
         Node::BeginRescue { body, ensure_body, .. } => {
             for &child in body {
                 if !ensure_body.contains(&child) {
-                    gather_returns_in_ensure(ast, child, out);
+                    gather_returns_in_ensure(ast, child, key_span, out);
                 }
             }
         }
@@ -614,20 +635,20 @@ fn gather_returns_in_ensure(ast: &LoweredAst, id: NodeId, out: &mut Vec<Diagnost
                 && FRAME_BARRIER_CALL_NAMES.contains(&method.as_str())
                 && !block_body.is_empty();
             if let Some(r) = receiver {
-                gather_returns_in_ensure(ast, *r, out);
+                gather_returns_in_ensure(ast, *r, key_span, out);
             }
             for &a in args {
-                gather_returns_in_ensure(ast, a, out);
+                gather_returns_in_ensure(ast, a, key_span, out);
             }
             if !is_barrier {
                 for &b in block_body {
-                    gather_returns_in_ensure(ast, b, out);
+                    gather_returns_in_ensure(ast, b, key_span, out);
                 }
             }
         }
         other => {
             for child in node_children(other) {
-                gather_returns_in_ensure(ast, child, out);
+                gather_returns_in_ensure(ast, child, key_span, out);
             }
         }
     }
