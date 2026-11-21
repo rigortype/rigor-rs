@@ -4027,7 +4027,7 @@ impl CoreData {
     ) -> bool {
         match t {
             RetainedParamType::ClassInstance(name, _) => {
-                match self.class_ordering(arg_class, name) {
+                match self.param_accepts_ordering(arg_class, name) {
                     // A proven `no` in the reference's `class_subtype_result`
                     // (acceptance.rb) requires the ARGUMENT's class to resolve
                     // against the host process (`resolve_class` → `const_get`,
@@ -4060,6 +4060,64 @@ impl CoreData {
             | RetainedParamType::Variable(_)
             | RetainedParamType::Tuple(_)
             | RetainedParamType::Other(_) => true,
+        }
+    }
+
+    /// The `arg <=> param` ordering `param_accepts_arg_class` consults — the
+    /// reference `class_subtype_result` (`acceptance.rb`), which resolves BOTH
+    /// names against the HOST process (`resolve_class`: `const_get`, no
+    /// autoload) and answers `actual <= target` on the live ancestry. A
+    /// genuinely TOP-LEVEL param defers to [`Self::class_ordering`]
+    /// (rigor-rs#672's leaf-collision rule); a nested / qualified param name —
+    /// `Outer::Inner`, `Thread::Backtrace::Location` — is answered here from
+    /// `HOST_RESOLVABLE_CLASSES` (the generated host mirror) plus the RBS
+    /// ancestor chains (rigor-rs#383):
+    ///
+    /// * equal spellings ⇒ `Equal` — after `::`-stripping AND leaf→unambiguous-
+    ///   qualified normalisation, because `Mutex` and `Thread::Mutex` name ONE
+    ///   host class (and a written-bare param the oracle's env resolves to the
+    ///   qualified decl);
+    /// * `arg`'s ancestor chain containing the param name ⇒ `Subclass`
+    ///   (`actual <= target`, or `subtype_result_via_ancestors`'s `yes`);
+    /// * `arg` host-resolvable with a COMPLETE chain that lacks the name ⇒
+    ///   `Disjoint` — the proven `no` (the caller's `!host_resolvable_class`
+    ///   gate restates the same premise); an incomplete chain or an
+    ///   unresolvable arg ⇒ `Unknown` (`maybe` → admit).
+    fn param_accepts_ordering(&self, arg_class: &str, param_name: &str) -> ClassOrdering {
+        let a = arg_class.strip_prefix("::").unwrap_or(arg_class);
+        let p = param_name.strip_prefix("::").unwrap_or(param_name);
+        if a == p {
+            return ClassOrdering::Equal;
+        }
+        if self.toplevel_classes.contains(p) {
+            return self.class_ordering(arg_class, param_name);
+        }
+        // Normalise leaf spellings through the unambiguous short→qualified
+        // map: `Mutex` and `Thread::Mutex` name ONE host class, and the
+        // oracle's env resolves a written `Mutex` to the qualified decl.
+        let a = self.resolve_short_unambiguous(a).map_or(a, |q| q);
+        let p = self.resolve_short_unambiguous(p).map_or(p, |q| q);
+        if a == p {
+            return ClassOrdering::Equal;
+        }
+        // A param head the qualified registry does not hold is `maybe` — the
+        // stub gate declines it upstream, so reaching here only via a direct
+        // call must stay conservative (the pre-#383 `Unknown`).
+        if !self.qualified.contains_key(p) {
+            return ClassOrdering::Unknown;
+        }
+        let (chain, complete) = if self.qualified.contains_key(a) {
+            self.qualified_ancestors(a)
+        } else {
+            self.ancestors(a)
+        };
+        if chain.contains(&p) {
+            return ClassOrdering::Subclass;
+        }
+        if complete && host_resolvable_class(a) {
+            ClassOrdering::Disjoint
+        } else {
+            ClassOrdering::Unknown
         }
     }
 
