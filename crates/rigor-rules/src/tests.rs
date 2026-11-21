@@ -735,7 +735,9 @@ fn class_guard_record_drop_keeps_its_controls() {
 
 /// The widening's controls: the read WITHOUT the write keeps firing on the
 /// pinned literal (the stale shape is real there), and the carrier itself
-/// still witnesses a method Hash lacks — `for Hash`, the widened nominal.
+/// still witnesses a method Hash lacks — `for Hash[Dynamic[top] | Symbol,
+/// Dynamic[top] | Integer]`, the widened nominal with the seed's and the
+/// store's content joined (rigor-rs#771; the reference's own text).
 #[test]
 fn index_compound_write_widening_keeps_its_controls() {
     let diags = run(b"h = {a: 1}\nh[:a].upcase\n");
@@ -745,7 +747,10 @@ fn index_compound_write_widening_keeps_its_controls() {
     let diags = run(b"h = {a: 1}\nh[:a] += 1\nh.frobnicate_zzz\n");
     assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
-    assert_eq!(diags[0].message, "undefined method `frobnicate_zzz' for Hash");
+    assert_eq!(
+        diags[0].message,
+        "undefined method `frobnicate_zzz' for Hash[Dynamic[top] | Symbol, Dynamic[top] | Integer]"
+    );
 }
 
 /// The suppression is per-CALL-NODE, keyed on the guarded local being the
