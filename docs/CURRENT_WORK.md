@@ -60,12 +60,12 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-21 #685 CLOSED** (PR #761): `Algebra::union` member-set builder (`top`/`bot` verbatim) + `flatten_union_members`; 4 raw `Union` mints routed. 0 FP. [note](notes/20261121-issue-685-union-canonicalization.md)
+- **2026-11-21 #685 CLOSED** (PR #761): `Algebra::union`/`flatten_union_members` member-set builders (`top`/`bot` verbatim); 4 raw mints routed. 0 FP. [note](notes/20261121-issue-685-union-canonicalization.md)
 - **2026-11-21 #639 CLOSED** (PR #756): loop-cap jump/once bodies + rebindable ivars (`IvarWrite`) + write-position `moved`; 8 master FPs closed, 22/22 match; 0 FP; →#757–#759. [note](notes/20261121-issue-639-loop-cap-jump-ivar.md)
 - **2026-11-21 #439 CLOSED** (PR #753): reach-memo audit in CI; 0 FP. →#754. [note](notes/20261121-issue-439-reach-memo-audit-gate.md)
 - **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand (x-polarity gate, dominating-write cut); `x = [1,2][x] || 0` caps; 0 FP; 5 Opus rounds; →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
 - **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts the self-extend's instance-side entry (2+N, cut N≥99) + RBS fallback; live FP gone; 0 FP; →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
-- **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census, `using`/`.refined` regions, `own_method_answers` walk; 0 FP; review edges →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
+- **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census, `using`/`.refined` regions, `own_method_answers` walk; 0 FP; →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
 - **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + `stack.yml`; ADR-0045 x86_64 rungs (`alloc`, never 2 MiB overflow); Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
 - **2026-11-20 #724 CLOSED** (PR #739): pool-audit `use` alias/glob of `configure_global_pool`/`ThreadPoolBuilder` in `fn main` flags (the #676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
 - **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch String carriers (`decimal-int-string`/`non-empty-string`); drift 47→46, 0 FP. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
