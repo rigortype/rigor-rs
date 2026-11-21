@@ -447,6 +447,18 @@ impl SourceIndex {
                     &[],
                 );
             }
+            // SingleForwardable extended in a body: its delegator calls
+            // define SINGLETON names (round 2's class-body row); the
+            // WILDCARD alone opens the surface.
+            for (owner, names) in &facts.single_forwardable {
+                let entry = idx
+                    .singleton_methods
+                    .entry(owner.clone())
+                    .or_default();
+                for n in names {
+                    entry.insert(n.clone());
+                }
+            }
         }
 
         // Upstream v0.4.6 (#1817 / #2183): the rebinding-callee census,

@@ -5755,3 +5755,74 @@ fn forwardable_delegators_in_singleton_body_silent() {
         assert_eq!(diags[0].message, msg);
     }
 }
+
+/// Review round 2's blocking shapes — the extends walk's reach and the
+/// adjacent spellings of the round-1 families (rigor-rs#666 round 2).
+#[test]
+fn reopened_rbs_singleton_round2_edges_silent() {
+    for src in [
+        // `ModuleFunctionState`'s extends walk reaches a bare
+        // `module_function` inside a `def` body and inside a block that
+        // provably runs once with the body's `self`.
+        &b"module Comparable\n  def self.x\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  def self.x = module_function\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  def r\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  [1].each do\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  [1].each { |i| module_function }\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  [1, 2].map do\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  3.times do\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+        &b"module Comparable\n  {a: 1}.each do\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+        // A concern's `Owner::ClassMethods` const_get edge exists for ANY
+        // concern body, however ClassMethods is defined; a hook's
+        // `b.send(:extend, W1)` and `b.singleton_class.include(W1)` are the
+        // OPEN mark.
+        &b"module W0\n  extend ActiveSupport::Concern\n  module ClassMethods\n    def q; end\n  end\nend\n\
+           class Integer; include W0; end\nInteger.q\n"[..],
+        &b"module W1; def q; end; end\nmodule W0\n  def self.included(b)\n    b.send(:extend, W1)\n  end\nend\n\
+           class Integer; include W0; end\nInteger.q\n"[..],
+        &b"module W1; def q; end; end\nmodule W0\n  def self.included(b)\n    b.singleton_class.include(W1)\n  end\nend\n\
+           class Integer; include W0; end\nInteger.q\n"[..],
+        // Multi-target and `self::`-anchored constant writes.
+        &b"class Integer; end\nmodule Foo\n  Integer, X = \"s\", 1\n  Integer.upcase\nend\n"[..],
+        &b"class Integer; end\nmodule Foo\n  self::Integer = \"s\"\n  Integer.upcase\nend\n"[..],
+        // Forwardable's `delegate` hash spelling and SingleForwardable at
+        // class-body level define SINGLETON names.
+        &b"class Integer\n  class << self\n    extend Forwardable\n    delegate [:q] => :x\n  end\nend\nInteger.q\n"[..],
+        &b"class Integer\n  class << self\n    extend Forwardable\n    instance_delegate [:q] => :x\n  end\nend\nInteger.q\n"[..],
+        &b"require \"forwardable\"\nclass Integer\n  extend SingleForwardable\n  def_delegators :x, :q\nend\nInteger.q\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+    for (src, msg) in [
+        // The walk does NOT reach an ordinary block, a lambda or a
+        // receiverless `tap`.
+        (
+            &b"module Comparable\n  some_dsl do\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+            "undefined method `q' for singleton(Comparable)",
+        ),
+        (
+            &b"module Comparable\n  x = lambda { module_function }\n  def q; end\nend\nComparable.q\n"[..],
+            "undefined method `q' for singleton(Comparable)",
+        ),
+        (
+            &b"module Comparable\n  tap do\n    module_function\n  end\n  def q; end\nend\nComparable.q\n"[..],
+            "undefined method `q' for singleton(Comparable)",
+        ),
+        // SingleForwardable's delegated names are enumerable.
+        (
+            &b"require \"forwardable\"\nclass Integer\n  extend SingleForwardable\n  def_delegators :x, :q\nend\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        // The delegator alias form with a non-literal METHOD still defines
+        // the literal ALIAS, and only it.
+        (
+            &b"require \"forwardable\"\nclass Integer\n  class << self\n    extend Forwardable\n    def_delegator :x, \"q#{1}\", :r\n  end\nend\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].message, msg);
+    }
+}

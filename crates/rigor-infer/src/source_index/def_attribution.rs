@@ -878,6 +878,33 @@ fn file_call_methods(
             }
             return;
         }
+        // Forwardable's `delegate m => a` / `delegate [:m1, :m2] => a` (and
+        // the `instance_delegate` twin): the assoc KEYS are the defined
+        // names — the argument is the keyword-hash the bare-assoc call
+        // argument lowers to (`Node::HashLit`'s paired elements).
+        if matches!(method, "delegate" | "instance_delegate") {
+            for &arg in args {
+                if let Node::HashLit { elements, .. } = ast.get(arg) {
+                    for (i, &el) in elements.iter().enumerate() {
+                        if i % 2 != 0 {
+                            continue; // values, not keys
+                        }
+                        match ast.get(el) {
+                            Node::SymbolLit { value, .. } => file(value.clone(), false),
+                            Node::ArrayLit { elements, .. } => {
+                                for &m in elements {
+                                    if let Node::SymbolLit { value, .. } = ast.get(m) {
+                                        file(value.clone(), false);
+                                    }
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            return;
+        }
     }
     // Upstream v0.4.5 (#2120, `attr_macro`): an `attr_*` call on the body's
     // self — implicit or `self.` — naming the macro directly or as the literal
