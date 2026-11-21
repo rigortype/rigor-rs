@@ -689,8 +689,13 @@ fn atm_param_accepts_arg_class_instance() {
         &RetainedParamType::ClassInstance("Integer", vec![]),
         "Numeric"
     ));
-    // Unknown: an unloaded param class cannot be refuted.
-    assert!(idx.param_accepts_arg_class(
+    // A param class nothing knows still gets the host mirror's `no`
+    // (rigor-rs#809): `subtype_result_via_ancestors` answers from the actual's
+    // ancestor names alone, and `String`'s live chain cannot contain
+    // `NoSuchClassZzz`. Unreachable end-to-end — the stub gate declines a
+    // never-declared param name upstream — but the isolated verdict is the
+    // reference's.
+    assert!(!idx.param_accepts_arg_class(
         &RetainedParamType::ClassInstance("NoSuchClassZzz", vec![]),
         "String"
     ));
@@ -708,11 +713,12 @@ fn atm_param_accepts_arg_class_instance() {
     ));
 }
 
-/// `ClassInstance` acceptance for a NON-toplevel param head (rigor-rs#383):
-/// `class_ordering` answers `Unknown` for namespaced names (both names must
-/// be genuine top-level decls), so `param_accepts_ordering` mirrors the
-/// reference's `class_subtype_result` — host-resolvability (the generated
-/// `HOST_RESOLVABLE_CLASSES` table) plus the RBS ancestor chains.
+/// `ClassInstance` acceptance for a NON-toplevel param head (rigor-rs#383,
+/// rigor-rs#809): `class_ordering` answers `Unknown` for namespaced names
+/// (both names must be genuine top-level decls), so `param_accepts_ordering`
+/// mirrors the reference's `class_subtype_result` — the generated `HOST_CLASSES`
+/// live-hierarchy mirror for a host-resolvable arg, the RBS ancestor chains
+/// only past it.
 #[test]
 fn atm_param_accepts_arg_qualified_class_instance() {
     let idx = CoreData::load();
@@ -771,9 +777,11 @@ fn atm_param_accepts_arg_qualified_class_instance() {
         &RetainedParamType::ClassInstance("ERB::Util", vec![]),
         "BigDecimal"
     ));
-    // And a param name the registry does not hold at all stays `maybe` — the
-    // stub gate declines it upstream of this predicate.
-    assert!(idx.param_accepts_arg_class(
+    // And a param name the registry does not hold at all still gets the
+    // mirror's `no` on a host-resolvable arg (same
+    // `subtype_result_via_ancestors` arm as `ERB::Util` above): unreachable
+    // end-to-end — the stub gate declines it upstream of this predicate.
+    assert!(!idx.param_accepts_arg_class(
         &RetainedParamType::ClassInstance("Foo::SigOnlyBarZzz", vec![]),
         "Integer"
     ));
