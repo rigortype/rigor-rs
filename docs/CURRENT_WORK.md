@@ -60,6 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-21 #492 CLOSED** (PR #789): override-parent replacer/supersede decline (upstream #2013 `contest_replaced` → rebind census `superseded/settled/uncertain`) + heredoc closure env (`CheckFlow.escaped`/`Barrier`); 13/13 rows `=`; 0 FP/437=master; →#793 (diff-caused nested-def supersede)/#794–#798. [note](notes/20261121-issue-492-override-heredoc-env.md)
 - **2026-11-21 #328 CLOSED** (PR #790): per-file diagnostics in the reference's stage order (span key + emission-array slot, `emission_stage` at the callers); all brief rows `=`; 0 FP/437=master; found #791/#792. [note](notes/20261121-issue-328-diagnostic-stage-order.md)
 - **2026-11-21 #629 CLOSED** (PR #786): effects `catalog_target` settles the typer arm's syntax subset; rows claim where upstream claims, judgment runs rowless; effects MATCH 5693→5812, 0 OVER; →#787/#788. [note](notes/20261121-issue-629-index-write-ownership.md)
 - **2026-11-21 #771 file-scope half CLOSED** (PR #776): content args on widened carriers; 23 rows byte-identical; 0 FP/437=master; →#777–#785 (def-body #781). [note](notes/20261121-issue-771-mutation-content-args.md)
