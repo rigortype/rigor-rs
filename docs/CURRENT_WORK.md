@@ -22,9 +22,9 @@ repin's filed residuals #600, #605.
   exception tables EMPTY; new entries are real findings (`UPSTREAM.md`
   hazards + overlay/`sig/shims` trap).
 
-State (2026-11-05, `v0.4.7`): harness **170 fixtures / 0
-unregistered / 0 divergent**; standing sweep **0 FP / 9,441 files / 623
-gaps**, 8 corpora; effects gate 0 OVER. `--sweep` ~3 min.
+State (2026-11-21, `v0.4.8`): harness **174 fixtures / 0
+unregistered**; standing sweep **0 FP / 437 gaps** (master = branch, #764
+fold); effects gate 0 OVER. `--sweep` ~3 min.
 Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
@@ -53,30 +53,30 @@ Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DI
 
 The gate tiers and their commands: `AGENTS.md` → Gates.
 
-Reference oracle: pinned git submodule `reference/rigor` (see `UPSTREAM.md`);
-run from a clean temp cwd. Sweep membership: `harness/sweep-corpora.yml`. RBS is vendored + embedded at
+Reference oracle: pinned submodule `reference/rigor` (`UPSTREAM.md`; clean
+temp cwd). Sweep membership: `harness/sweep-corpora.yml`. RBS is vendored + embedded at
 build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 `harness/vendor_rbs.py` regenerates the tree.
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-21 #424 CLOSED** (PR #764): nested-class time — 4 rescans → containment index/trie; 4k 100s→3.7s; 0 FP, gaps=master; →#772. [note](notes/20261121-issue-424-nested-class-time.md)
 - **2026-11-21 #685 CLOSED** (PR #761): `Algebra::union`/`flatten_union_members` member-set builders (`top`/`bot` verbatim); 4 raw mints routed. 0 FP. [note](notes/20261121-issue-685-union-canonicalization.md)
-- **2026-11-21 #639 CLOSED** (PR #756): loop-cap jump/once bodies + rebindable ivars (`IvarWrite`) + write-position `moved`; 8 master FPs closed, 22/22 match; 0 FP; →#757–#759. [note](notes/20261121-issue-639-loop-cap-jump-ivar.md)
+- **2026-11-21 #639 CLOSED** (PR #756): loop-cap jump/once bodies + rebindable ivars + write-position moved; 8 master FPs closed; 0 FP; →#757–#759. [note](notes/20261121-issue-639-loop-cap-jump-ivar.md)
 - **2026-11-21 #439 CLOSED** (PR #753): reach-memo audit in CI; 0 FP. →#754. [note](notes/20261121-issue-439-reach-memo-audit-gate.md)
-- **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand (x-polarity gate, dominating-write cut); `x = [1,2][x] || 0` caps; 0 FP; 5 Opus rounds; →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
+- **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand (x-polarity gate, dominating-write cut); 0 FP; →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
 - **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts the self-extend's instance-side entry (2+N, cut N≥99) + RBS fallback; live FP gone; 0 FP; →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
 - **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census, `using`/`.refined` regions, `own_method_answers` walk; 0 FP; →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
-- **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + `stack.yml`; ADR-0045 x86_64 rungs (`alloc`, never 2 MiB overflow); Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
-- **2026-11-20 #724 CLOSED** (PR #739): pool-audit `use` alias/glob of `configure_global_pool`/`ThreadPoolBuilder` in `fn main` flags (the #676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
+- **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + stack.yml; ADR-0045 x86_64 rungs (alloc, never 2 MiB overflow); Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
+- **2026-11-20 #724 CLOSED** (PR #739): pool-audit `use` alias/glob of configure_global_pool/ThreadPoolBuilder in `fn main` flags (#676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
 - **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch String carriers (`decimal-int-string`/`non-empty-string`); drift 47→46, 0 FP. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
 - **2026-11-20 #427 CLOSED** (PR #726): env memo stores uid-scoped interner-bound answers; `.map` repro doubled per link → never finishes; check 68 s; byte-identical on 9,036 files, 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
-- **2026-11-20 #643 CLOSED** (PR #725): named `Finding` struct + conformance `start_offset`; refactor, 0 FP / 437 gaps = master; →#727/#728. [note](notes/20261120-issue-643-findings-tuple.md)
-- **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — `main_never_builds_the_pool_itself` planted inversion: the threads unit test passes, the audit fails at the line. Aliased-use hole →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
+- **2026-11-20 #643 CLOSED** (PR #725): named Finding struct + conformance start_offset; refactor, 0 FP / 437 gaps = master; →#727/#728. [note](notes/20261120-issue-643-findings-tuple.md)
+- **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — `main_never_builds_the_pool_itself` planted inversion (threads test passes, audit fails at the line); →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
 - **2026-11-20 #345 CLOSED** (PR #720): pre_eval glob→dir earns not-found row; `.uniq`/order ported; 0 FP; dialect FPs + display-path/NFD →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
 - **2026-11-20 #652 CLOSED** (PR #719): brace globs `::{*}`/`::{a,*}` flag like `::*`; child globs leaf-silent; test-only, 0 FP. →#654. [note](notes/20261120-issue-652-brace-glob-audit.md)
-- **2026-11-20 #714 CLOSED** (PR #716): rooted bundled-class guard: RBS mint outranks the in-source census; dependabot 215→212, 0 FP. →#709/#717/#718. [note](notes/20261120-issue-714-rooted-bundled-guard.md)
-- **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror; 5 review rounds, 0 FP every head, unmodelled arms decline. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
-
+- **2026-11-20 #714 CLOSED** (PR #716): rooted bundled-class guard: RBS mint outranks the census; dependabot 215→212, 0 FP. →#709/#717/#718. [note](notes/20261120-issue-714-rooted-bundled-guard.md)
+- **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror; 0 FP every head, unmodelled arms decline. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
 - **2026-11-20 #672 CLOSED** (PR #708): rooted guard operands top-level; 0 FP, +3 dependabot rows. →#709/#710/#714. [note](notes/20261120-issue-672-rooted-class-guard.md)
 - **2026-11-20 #673 CLOSED** (PR #711): dynamic-base rescue designator (`k::X`) opaque — `dynamic_base` gates all five consumers. 0 FP. →#712. [note](notes/20261120-issue-673-rescue-dynamic-base.md)
 - **2026-11-20 #677 CLOSED** (PR #703): fallback warning: one line per new worst stack; `RLIMIT_STACK` rank, refusal quoted. →#676/#705. [note](notes/20261120-issue-677-stack-fallback-warn.md)
@@ -84,14 +84,14 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 - **2026-11-20 #678 CLOSED** (PR #702): pool-build failure exits 70; `help`/`version`/`upgrade` skip+poison. →#676/#677. [note](notes/20261120-issue-678-pool-exit-code.md)
 - **2026-11-20 #424 seq-modif** (PR #697): kill-scan folds + env checkpoints + delta joins; 8k 35.8→2.1s (oracle 5.5). →#701. [note](notes/20261120-issue-424-seq-modif-rows.md)
 - **2026-11-19 #682 CLOSED** (PR #693): integer-fold overflow promotes to `Scalar::BigInt`; decimal `**`/shifts + `fold_bigint`. 0 FP; →#694–#696. [note](notes/20261119-issue-682-folding-bigint.md)
-- **2026-11-19 #437 MERGED** (PR #687): contextual fold memo + `loop_pass` if-arms; o6/o9/o10 fire; snapshot 952→959; 0 FP. →#688-91. [note](notes/20261119-issue-437-fold-memo.md)
+- **2026-11-19 #437 MERGED** (PR #687): contextual fold memo + `loop_pass` if-arms; snapshot 952→959; 0 FP. →#688-91. [note](notes/20261119-issue-437-fold-memo.md)
 - **2026-11-19 #653 CLOSED** (PR #689): `#[cfg(test)]` span — `pub` looks past its visibility group; `item_end` stops at unopened closers. 0 FP. →#692. [note](notes/20261119-issue-653-pub-field-cfg-span.md)
-- **2026-11-19 #679 CLOSED** (PR #686): last stack fallback is explicit `stack_size(2 << 20)`. ADR-0045 amended. [note](notes/20261119-issue-679-explicit-2mib-fallback.md)
+- **2026-11-19 #679 CLOSED** (PR #686): last stack fallback explicit `stack_size(2 << 20)`; ADR-0045 amended. [note](notes/20261119-issue-679-explicit-2mib-fallback.md)
 - **2026-11-19 #427 walkers** (PR #680): stackless `Interner::cmp` + iterative `literal_seed`/sig-gen predicates; 0 FP. →#685. [note](notes/20261119-issue-427-iterative-walkers.md)
 - **2026-11-19 #638 MERGED** (PR #674): exact-gated loop fixpoint replay; structural fallback on declines. 0 FP. →#681-84. [note](notes/20261119-issue-638-loop-fixpoint.md)
 - **2026-11-19 #431 CLOSED** (PR #675): command stack reserved before the rayon pool. ADR-0045 amended; →#676–#679. [note](notes/20261119-issue-431-stack-fallback-order.md)
 - **2026-11-19 #424 modifier-if** (PR #669): subsequent-first exit + compact_children; 10k `if true` 2.16s→0.52s; 0 FP. [note](notes/20261119-issue-424-modifier-if.md)
-- **2026-11-19 #670 CLOSED** (PR #671): class-guard `dynamic_base` — 13 master FPs gone, 0 FP. → #672/#673. [note](notes/20261119-issue-670-dynamic-base-class-guard.md)
+- **2026-11-19 #670 CLOSED** (PR #671): class-guard `dynamic_base` — 13 master FPs gone, 0 FP. →#672/#673. [note](notes/20261119-issue-670-dynamic-base-class-guard.md)
 - **2026-11-19 #655+#661 CLOSED** (PR #668): dynamic-base `ConstantRead` skips C5/C1; 0 FP. [note](notes/20261119-issue-655-dynamic-base-const.md)
 - **2026-11-19 #637 CLOSED** (PR #664): CHAIN_LIMIT counts the root; 100-module include silent; 0 FP. [note](notes/20261119-issue-637-chain-limit.md)
 - **2026-11-19 #657 CLOSED** (PR #660): ConstName prefix-share + bounded `knows_*`; 20k 0.74s/749MB→0.26s/44MB; 0 FP. [note](notes/20261119-issue-657-const-read-name-storage.md)
