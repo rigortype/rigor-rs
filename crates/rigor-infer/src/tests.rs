@@ -1876,6 +1876,40 @@ fn bound_type(idx: &CoreIndex, src: &[u8], name: &str) -> (Interner, TypeId) {
     (i, ty)
 }
 
+/// rigor-rs#685: `coll_value_members` pushes Tuple elements and HashShape
+/// values UNFLATTENED, so a member that is itself a union (`[c ? 1 : "a"]`
+/// types `1 | "a" | Dynamic[top]` inside the tuple) reached
+/// `coll_nominal_with`'s raw `intern(Type::Union(..))` and minted a `Union`
+/// inside a `Union` — the same logical member set then interned under two
+/// different `TypeId`s. The arg must hold the canonical flat union.
+#[test]
+fn coll_nominal_with_flattens_union_members() {
+    let idx = CoreIndex::new();
+    let Some(array) = idx.class_id("Array") else {
+        return;
+    };
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let one = i.int(1);
+    let s = i.intern(Type::Constant(Scalar::Str("a".into())));
+    let inner = i.intern(Type::Union(vec![one, s]));
+    let ty = typer
+        .coll_nominal_with(&mut i, "Array", &[inner, one])
+        .expect("Array resolves");
+    let Type::Nominal { class, args } = i.get(ty) else {
+        panic!("coll_nominal_with must mint a Nominal, got {:?}", i.get(ty));
+    };
+    assert_eq!(*class, array);
+    let Type::Union(ms) = i.get(args[0]) else {
+        panic!("the member arg must be a union, got {:?}", i.get(args[0]));
+    };
+    assert!(
+        ms.iter().all(|&m| !matches!(i.get(m), Type::Union(_))),
+        "union members must be flat, got {ms:?}"
+    );
+    assert!(ms.contains(&one) && ms.contains(&s));
+}
+
 #[test]
 fn tap_break_value_is_the_call_type() {
     let idx = CoreIndex::new();

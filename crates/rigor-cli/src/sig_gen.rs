@@ -3473,6 +3473,18 @@ fn literal_tail_nominal(
                     }
                 }
             }
+            // A bound union's member is pushed VERBATIM above — including a
+            // `Union` when `type_of` minted one unflattened. Expand those
+            // before the describe sort: order-preserving flatten, NOT
+            // `Algebra::union`, since the member order is the contract.
+            let mut flat_members: Vec<TypeId> = Vec::with_capacity(arg_members.len());
+            rigor_types::Algebra::flatten_union_members(interner, &arg_members, &mut flat_members);
+            arg_members.clear();
+            for m in flat_members {
+                if !arg_members.contains(&m) {
+                    arg_members.push(m);
+                }
+            }
             // The erased arg lists its members in the reference's
             // describe-sorted union order (`Float | Integer` for `1...2.5`,
             // `Integer | [1]` for `[1]..2`).

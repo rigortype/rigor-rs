@@ -3050,11 +3050,12 @@ impl<'i> Typer<'i> {
                     .into_iter()
                     .filter(|m| keep(interner.get(*m)))
                     .collect();
-                match kept.as_slice() {
-                    [] => interner.bottom(),
-                    [only] => *only,
-                    _ => interner.intern(Type::Union(kept)),
-                }
+                // `Algebra::union`, not a raw intern: a kept member can be a
+                // `Union` itself whenever the INPUT union was minted
+                // unflattened, and the result must hold the canonical
+                // member set (rigor-rs#685). `[]` → bottom, `[only]` → the
+                // member, same as the match it replaces.
+                rigor_types::Algebra::union(interner, &kept)
             }
             t => {
                 if keep(t) {
@@ -4835,13 +4836,10 @@ impl<'i> Typer<'i> {
                 if !changed {
                     return None;
                 }
-                out.sort_unstable();
-                out.dedup();
-                Some(if out.len() == 1 {
-                    out[0]
-                } else {
-                    interner.intern(Type::Union(out))
-                })
+                // A widened member can itself be a `Union` (the recursive
+                // `widen_mutated_binding` on a union member hits this same
+                // arm): mint the canonical flattened set (rigor-rs#685).
+                Some(rigor_types::Algebra::union(interner, &out))
             }
             _ => None,
         }
