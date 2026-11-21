@@ -984,10 +984,10 @@ impl Typer<'_> {
     /// `UnknownStoreWidening.literal_carrier?`
     /// (`unknown_store_widening.rb:236`): a carrier that still records its
     /// slots or keys — a `Tuple`/`HashShape`, alone or in a `Union`.
-    pub(crate) fn literal_carrier(&self, interner: &Interner, ty: TypeId) -> bool {
+    pub(crate) fn literal_carrier(interner: &Interner, ty: TypeId) -> bool {
         match interner.get(ty) {
             Type::Tuple(_) | Type::HashShape(_) => true,
-            Type::Union(members) => members.iter().any(|&m| self.literal_carrier(interner, m)),
+            Type::Union(members) => members.iter().any(|&m| Self::literal_carrier(interner, m)),
             _ => false,
         }
     }

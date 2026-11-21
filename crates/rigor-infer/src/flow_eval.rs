@@ -3543,7 +3543,7 @@ impl<'i> Typer<'i> {
                     // that can store.
                     let floored = if crate::mutation_content::VALUE_PRESERVING_MUTATORS
                         .contains(&method)
-                        && !self.literal_carrier(interner, pre)
+                        && !Self::literal_carrier(interner, pre)
                     {
                         widened
                     } else {
