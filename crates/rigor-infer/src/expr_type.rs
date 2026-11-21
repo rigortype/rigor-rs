@@ -718,7 +718,7 @@ impl<'i> Typer<'i> {
     /// aliases a non-negative one unless the receiver is a `Hash`
     /// (`aliasing_index?`).
     #[allow(clippy::only_used_in_recursion)]
-    fn verbatim_slot(&self, ty: TypeId, negative_key: bool, interner: &Interner) -> bool {
+    pub(crate) fn verbatim_slot(&self, ty: TypeId, negative_key: bool, interner: &Interner) -> bool {
         match interner.get(ty) {
             Type::Union(members) => members
                 .iter()

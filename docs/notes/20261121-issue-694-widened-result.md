@@ -67,14 +67,21 @@ and `call.undefined-method` fires.
    live arm on the ENTRY env and overlay the changed bindings — `x += 3` /
    `x = x + 1` inside a certainty-folded `if` read the pre-widen entry
    (`if true; x += 3; end` writes `4` on the oracle).
-8. `expr_type.rs` `slot_stored_type`: the reference's `verbatim_slot?` gate —
-   only `Hash`/`Array` carriers (every union member) record a `||=`/`&&=`
-   slot, and a negative Integer key on a non-`Hash` aliases — was MISSING:
-   `s[0] ||= "x"` recorded `String | "x"`, which the new union collapse
-   fired as `for "x" | String` where the oracle stays silent (its `s[k]`
-   read is the unmodeled `Dynamic`). Removes the rigor-rs#499 Constant(Str)
-   workaround; the `nil` record it minted was itself an FP (`s[9] ||= nil;
-   s[9].w` — silent on the oracle).
+8. `expr_type.rs` `slot_stored_type` + `nilable.rs`'s IndexWrite arm: the
+   reference's `verbatim_slot?` gate — only `Hash`/`Array` carriers (every
+   union member) record a `||=`/`&&=` slot, and a negative Integer key on a
+   non-`Hash` aliases — was MISSING at both record mints: `s[0] ||= "x"`
+   recorded `String | "x"`, which the new union collapse fired as
+   `for "x" | String` where the oracle stays silent (its `s[k]` read is the
+   unmodeled nilable element). Without the record the nilable env answers
+   `String | nil` — `x = s[0]; x.upcase` fires `possible-nil` on BOTH
+   engines. Removes the rigor-rs#499 Constant(Str) workaround; the `nil`
+   record it minted was itself an FP (`s[9] ||= nil; s[9].w` — silent on
+   the oracle).
+9. `bind_check_statement_effects`'s op-write arm reads the entry binding
+   BEFORE the rvalue's widen (the reference's `compound_eval` order:
+   `current_type` first, rvalue effects second) — `x += (x = 2)` is
+   `for 3` on the oracle (review Q1).
 
 ## Residuals (deliberately out of slice)
 
@@ -85,9 +92,15 @@ and `call.undefined-method` fires.
   (`n.to_i; x += 3` → `Integer` nominal on the reference — needs call-tier
   typing on the entry binding).
 - `(±1) ** negative` Integer results the reference folds (`(-1) ** -3` → `-1`).
-- Port `s[k]` element reads after an index write are `Dynamic` where the
-  oracle answers `String | nil` (`x = s[0]; x.upcase` — `possible-nil`
-  coverage gap, pre-existing, unchanged by this slice).
+- Port `s[k]` element reads in the TYPE env after an index write are
+  `Dynamic` where the oracle answers `String | nil` (`x = s[0]; x.zz` — a
+  coverage gap, pre-existing; the nilable env DOES answer `String | nil`,
+  so the `possible-nil` row matches).
+- Nested conditionals inside a certainty-folded `if` keep the widened
+  decline — the reference's `live_branch_for_if` evaluates the live arm
+  with the full evaluator so `if true; if c; x = "s"; end; end` reads
+  `"s" | 1` where the port stays silent (review Q4 — a recursive
+  `bind_check_statement` replay is the fix; filed as follow-up).
 
 ## Outcome (branch, oracle-verified)
 
