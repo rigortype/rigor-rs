@@ -4412,11 +4412,13 @@ impl<'i> Typer<'i> {
                             .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
                             .cloned()
                             .collect();
-                        let live_mutations = effects.mutations_within(span).filter(
-                            |(w, _, m, _)| {
+                        let live_mutations: Vec<_> = effects
+                            .mutations_within(span)
+                            .filter(|(w, _, m, _)| {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                            },
-                        );
+                            })
+                            .cloned()
+                            .collect();
                         // Replay the live arm on the ENTRY env first: an
                         // op-write's fold (`x += 3` ⇒ `4`, rigor-rs#694) and
                         // a self-reading write (`x = x + 1` ⇒ `2`) need the
@@ -4426,15 +4428,33 @@ impl<'i> Typer<'i> {
                         // an index target) keep the widened decline — their
                         // replay binding equals the entry's, so they never
                         // reach the overlay.
+                        //
+                        // Each statement's own mutations land on `replay`
+                        // FIRST, positionally — a pin the arm mutates
+                        // (`s << "d"; s += "e"`) must not fold a stale
+                        // literal into a `Constant` the runtime never
+                        // produces (`"abce"` for `"abcde"` minted `for 1`
+                        // downstream where the oracle stays silent —
+                        // rigor-rs#694 review).
                         let before = env.clone();
                         let mut replay = env.clone();
                         for s in &live {
+                            let sspan = ast.get(*s).span();
+                            self.widen_mutated_locals(
+                                ast,
+                                live_mutations.iter(),
+                                indexed,
+                                id,
+                                sspan,
+                                &mut replay,
+                                interner,
+                            );
                             self.bind_statement(ast, *s, &mut replay, interner);
                         }
                         widen_flow_writes(live_rebinds.iter(), span, env, interner);
                         self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                         self.widen_mutated_locals(
-                            ast, live_mutations, indexed, id, span, env, interner,
+                            ast, live_mutations.iter(), indexed, id, span, env, interner,
                         );
                         for s in &live {
                             self.bind_statement(ast, *s, env, interner);
