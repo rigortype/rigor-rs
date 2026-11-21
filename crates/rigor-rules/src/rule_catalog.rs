@@ -384,3 +384,40 @@ pub const CALL_RAISE_NON_EXCEPTION: &str = "call.raise-non-exception";
 /// a later clause naming a superclass of an earlier one (narrow→wide) stays
 /// silent; comparisons never cross a nested `begin`.
 pub const FLOW_SHADOWED_RESCUE_CLAUSE: &str = "flow.shadowed-rescue-clause";
+
+/// The reference's per-file emission stage (rigor-rs#328).
+/// `CheckRules.diagnose` emits the converged walk's per-node rows FIRST (in
+/// pre-order visit order), then `self_undefined_method_diagnostics`, then each
+/// collector's results in `COLLECTOR_DIAGNOSTIC_BUILDERS` order, then the
+/// `RubyDeprecations` stream, and finally the `suppression.*` marker rows —
+/// grouped by stage, NOT sorted by position. `check`/`lsp`/`mcp` stable-sort
+/// each file's diagnostics by this rank so rows land where the reference emits
+/// them; within a stage the producer's own order is kept.
+pub fn emission_stage(rule_id: &str) -> u8 {
+    match rule_id {
+        // The converged walk (`main_pass`) — the call rules,
+        // `call.unresolved-toplevel`, `call.raise-non-exception`, the def rules
+        // (`override-visibility` is the only one ported), `unreachable-branch`
+        // and the (unported) special-global-write rows interleave by node visit.
+        CALL_UNDEFINED_METHOD | CALL_UNRESOLVED_TOPLEVEL | CALL_WRONG_ARITY
+        | CALL_ARGUMENT_TYPE_MISMATCH | CALL_POSSIBLE_NIL_RECEIVER | FLOW_ALWAYS_RAISES
+        | CALL_RAISE_NON_EXCEPTION | DEF_OVERRIDE_VISIBILITY_REDUCED
+        | FLOW_UNREACHABLE_BRANCH => 0,
+        // `self_undefined_method_diagnostics` — appended before the collectors.
+        "call.self-undefined-method" => 1,
+        // `COLLECTOR_DIAGNOSTIC_BUILDERS` order.
+        STATIC_VALUE_USE_VOID => 2,
+        FLOW_ALWAYS_TRUTHY_CONDITION => 3,
+        "flow.unreachable-clause" => 4,
+        FLOW_SHADOWED_RESCUE_CLAUSE => 5,
+        DEF_IVAR_WRITE_MISMATCH => 6,
+        FLOW_DEAD_ASSIGNMENT => 7,
+        FLOW_DUPLICATE_HASH_KEY => 8,
+        FLOW_RETURN_IN_ENSURE => 9,
+        // (10 would be the `RubyDeprecations` stream — unported.)
+        SUPPRESSION_UNKNOWN_RULE | SUPPRESSION_EMPTY | SUPPRESSION_UNKNOWN_MARKER => 11,
+        // Ruleless rows (parse/path/internal errors) position elsewhere — the
+        // main-pass rank keeps any straggler at the head, the safe side.
+        _ => 0,
+    }
+}

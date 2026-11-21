@@ -52,6 +52,14 @@ impl Severity {
 /// coverage gap and an unregistered extra.
 pub const NO_RULE: &str = "";
 
+/// A diagnostic queued for the reference's per-file emission order
+/// (rigor-rs#328): the OWNING node's span — its pre-order visit key, since a
+/// parent's span starts before every descendant's and at an equal start the
+/// parent's end is the larger — and the slot the rule holds in the
+/// reference's per-node emission array (`main_pass_node_diagnostics`). Sort
+/// by `(span.0, Reverse(span.1), slot)`.
+pub(crate) type KeyedDiagnostic = (rigor_parse::Span, u8, Diagnostic);
+
 /// A diagnostic finding, identified by `rule_id` + location (ADR-0002 parity
 /// is defined over this pair).
 ///

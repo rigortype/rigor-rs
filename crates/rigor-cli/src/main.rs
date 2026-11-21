@@ -2350,6 +2350,14 @@ fn analyze_files(
                         &project_source,
                     ));
                 }
+                // rigor-rs#328 — the reference emits each file's diagnostics
+                // grouped by RULE STAGE (the converged walk's rows, then each
+                // collector's in `COLLECTOR_DIAGNOSTIC_BUILDERS` order), not
+                // positionally. `analyze_*` returns its stages in that order;
+                // a stable sort by `emission_stage` slots the caller-side rows
+                // (`static.value-use.void`, `flow.shadowed-rescue-clause`)
+                // into theirs.
+                diags.sort_by_key(|d| rigor_rules::emission_stage(d.rule_id));
                 // ADR-47 WD5 (upstream #627) — the dead arm of a decidable
                 // version guard reports nothing: it cannot run on the Ruby being
                 // checked with, so a diagnostic there is a false positive.
