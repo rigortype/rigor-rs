@@ -5370,3 +5370,202 @@ fn reopened_rbs_class_singleton_unnamed_edges_silent() {
         assert!(diags.is_empty(), "expected silent, got {diags:?}");
     }
 }
+
+/// A bare `module_function` in a reopened RBS module makes the module
+/// extend itself (`ModuleFunctionState.extends_self?`, #526), so its
+/// instance defs answer class-object calls; a NAMED call's singleton copy
+/// is unmodelled and keeps firing (rigor-rs#666 review round 1).
+#[test]
+fn reopened_rbs_module_function_bare_extends_self() {
+    for src in [
+        &b"module Comparable; module_function; def q; end; end\nComparable.q\n"[..],
+        &b"module Kernel; module_function; def q; end; end\nKernel.q\n"[..],
+        &b"module Math; module_function; def q; end; end\nMath.q\n"[..],
+        &b"module Comparable; module_function; define_method(:q) { }; end\nComparable.q\n"[..],
+        // A later bare `public` resets the visibility default, not the
+        // module_function coverage — "whatever a later public says".
+        &b"module Comparable; module_function; def q; end; public; def r; end; end\nComparable.r\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+    // The named and modifier-def spellings keep firing on both engines.
+    for (src, msg) in [
+        (
+            &b"module Comparable; module_function :q; def q; end; end\nComparable.q\n"[..],
+            "undefined method `q' for singleton(Comparable)",
+        ),
+        (
+            &b"module Comparable; module_function def q; end; end\nComparable.q\n"[..],
+            "undefined method `q' for singleton(Comparable)",
+        ),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].message, msg);
+    }
+}
+
+/// The hook edges an included module's `included`/`prepended` body and a
+/// concern's blocks put on the INCLUDER's singleton chain
+/// (`record_hook_extends` / `record_concern_class_methods`, #2975/#1592/
+/// #3005) — review round 1's second blocking family.
+#[test]
+fn reopened_rbs_class_singleton_hook_edges_silent() {
+    for src in [
+        // A hook's direct `base.extend(X)` names a module the includer is
+        // extended with; its instance defs answer the class-object call.
+        &b"module W0; module CM; def q; end; end; def self.included(b); b.extend(CM); end; end\n\
+            class Integer; include W0; end\nInteger.q\n"[..],
+        &b"module W0; module ClassMethods; def q; end; end; def self.included(b); b.extend(ClassMethods); end; end\n\
+            class Integer; include W0; end\nInteger.q\n"[..],
+        &b"module W1; def q; end; end\nmodule W0; def self.included(b); b.extend(W1); end; end\n\
+            class Integer; include W0; end\nInteger.q\n"[..],
+        // An unresolved `base.extend(Foo)` is the opaque external that
+        // opens the surface — any name may come from it.
+        &b"module W0; def self.included(b); b.extend(Foo); end; end\nclass Integer; include W0; end\nInteger.zzz\n"[..],
+        &b"module W0; def self.prepended(b); b.extend(Foo); end; end\nclass Integer; prepend W0; end\nInteger.zzz\n"[..],
+        // A conditional extend is the OPEN mark.
+        &b"module W0; def self.included(b); if $x; b.extend(Foo); end; end; end\n\
+            class Integer; include W0; end\nInteger.zzz\n"[..],
+        // A concern's `class_methods` block is a module_eval of
+        // `Owner::ClassMethods`, drawn by `append_features`' const_get.
+        &b"module W0; extend ActiveSupport::Concern; class_methods do; def q; end; end; end\n\
+            class Integer; include W0; end\nInteger.q\n"[..],
+        // An `included do … end` block runs in the includer's class body:
+        // its `def self.x` defines there.
+        &b"module W0; extend ActiveSupport::Concern; included do; def self.q; end; end; end\n\
+            class String; include W0; end\nString.q\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+    // The controls: an empty hook opens nothing, a
+    // `b.define_singleton_method` through the hook is not read, and a
+    // resolved hook module with a CLOSED surface still fires elsewhere.
+    for (src, msg) in [
+        (
+            &b"module W0; def self.included(b); end; end\nclass Integer; include W0; end\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        (
+            &b"module W0; def self.included(b); b.define_singleton_method(:q); end; end\n\
+               class Integer; include W0; end\nInteger.q\n"[..],
+            "undefined method `q' for singleton(Integer)",
+        ),
+        (
+            &b"module W1; def q; end; end\nmodule W0; def self.included(b); b.extend(W1); end; end\n\
+               class Integer; include W0; end\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].message, msg);
+    }
+}
+
+/// A NESTED non-memo constant write of an RBS name owns the read: the
+/// reference resolves the written value (its `in_source_constants`), so a
+/// literal folds (`Integer = 3` + `Integer.zzz` fires `for 3`), a
+/// non-literal leaves the read `Dynamic` (silent), and neither mints the
+/// RBS class object. A toplevel write keeps the RBS reading, a memo
+/// (`||=`) assigns nothing, and a COMPACT `class Foo::Bar` use site does
+/// not see a constant written in `module Foo` (#682's cref). Review round
+/// 1's third blocking family, plus the `.new` seam it exposed.
+#[test]
+fn nested_constant_write_owns_the_reopen_read() {
+    for src in [
+        // A literal write folds to its value.
+        &b"class Integer; end\nmodule Foo; Integer = \"s\"; Integer.upcase; end\n"[..],
+        &b"class Integer; end\nclass Foo; Integer = \"s\"; def m; Integer.upcase; end; end\n"[..],
+        &b"class Integer; end\nclass Foo; Integer = \"s\"; class << self; def m; Integer.upcase; end; end; end\n"[..],
+        &b"class Integer; end\nFoo::Integer = \"s\"\nmodule Foo; Integer.upcase; end\n"[..],
+        // A non-literal write leaves the read Dynamic.
+        &b"class String; end\nmodule Foo; String = Class.new { def self.q; end }; String.q; end\n"[..],
+        &b"class String; end\nmodule Foo; String = Class.new; end\nmodule Foo; String.q; end\n"[..],
+        &b"class Integer; end\nmodule Foo; class Bar; end; Integer = Bar; Integer.zzz; end\n"[..],
+        &b"class Integer; end\nmodule Foo; Integer = Struct.new(:a); Integer.new(1).a; end\n"[..],
+        // The `.new` seam: the mint there follows the same resolution.
+        &b"class Integer; end\nmodule Foo; Integer = Struct.new(:a); Integer.new(1).nope; end\n"[..],
+        &b"module M; class Integer; end; Integer.new(1).zzz; end\n"[..],
+        // A write beside a same-body declaration keeps the class reading.
+        &b"module A; class B; end; B = 3; B.zzz; end\n"[..],
+        &b"class Foo; end\nFoo = 3\nFoo.zzz\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+    for (src, msg) in [
+        // The literal's VALUE is what fires, not the RBS class object.
+        (
+            &b"class Integer; end\nmodule Foo; Integer = 3; def m; Integer.zzz; end; end\n"[..],
+            "undefined method `zzz' for 3",
+        ),
+        (
+            &b"module Foo; Integer = 3; Integer.zzz; end\n"[..],
+            "undefined method `zzz' for 3",
+        ),
+        // A memo write assigns nothing when the name is defined.
+        (
+            &b"class Integer; end\nmodule Foo; Integer ||= \"s\"; Integer.upcase; end\n"[..],
+            "undefined method `upcase' for singleton(Integer)",
+        ),
+        // A COMPACT use site does not see a constant written in the
+        // enclosing module's own namespace.
+        (
+            &b"class Integer; end\nmodule Foo; Integer = 1; end\nclass Foo::Bar; Integer.zzz; end\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        // A toplevel write of an RBS name keeps the RBS reading.
+        (
+            &b"class Integer; end\nInteger = 3\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].message, msg);
+    }
+}
+
+/// Forwardable's delegator macros inside a SINGLETON-side body define the
+/// delegated names on the class object; the INSTANCE side stays untouched
+/// (review round 1's fourth blocking family).
+#[test]
+fn forwardable_delegators_in_singleton_body_silent() {
+    for src in [
+        &b"require \"forwardable\"\nclass Integer; class << self; extend Forwardable; def_delegators :x, :q; end; end\nInteger.q\n"[..],
+        &b"class Integer; class << self; def_delegators :x, :q, :r; end; end\nInteger.r\n"[..],
+        &b"class Integer; class << self; def_delegator :@x, :q; end; end\nInteger.q\n"[..],
+        // The alias form defines the ALIAS, not the original name.
+        &b"class Integer; class << self; def_delegator :@x, :q, :qq; end; end\nInteger.qq\n"[..],
+        // A name no literal spells opens the surface.
+        &b"class Integer; class << self; def_delegators :x, \"q#{1}\"; end; end\nInteger.zzz\n"[..],
+        &b"class Integer; class << self; def_delegators :x, *names; end; end\nInteger.zzz\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
+    for (src, msg) in [
+        // The instance-side spelling defines an INSTANCE delegate.
+        (
+            &b"require \"forwardable\"\nclass Integer\n  extend Forwardable\n  def_delegator :@x, :q\nend\nInteger.q\n"[..],
+            "undefined method `q' for singleton(Integer)",
+        ),
+        // The delegated names are enumerable: other names still fire.
+        (
+            &b"class Integer; class << self; def_delegators :x, :q; end; end\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        // The alias form defines ONLY the alias.
+        (
+            &b"class Integer; class << self; def_delegator :@x, :q, :qq; end; end\nInteger.q\n"[..],
+            "undefined method `q' for singleton(Integer)",
+        ),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
+        assert_eq!(diags[0].message, msg);
+    }
+}

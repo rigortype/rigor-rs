@@ -848,6 +848,37 @@ fn file_call_methods(
         }
         return;
     }
+    // Forwardable's delegator macros inside a SINGLETON-side body define the
+    // delegated names on the class object — `class << self;
+    // extend Forwardable; def_delegators :x, :q` makes `Integer.q` — so a
+    // literal name there joins the singleton-kind table (the reference reads
+    // the extend's module as a naming macro the class << body runs; the
+    // `extend Forwardable` itself is not required, the call position is).
+    // The INSTANCE side stays untouched: `extend Forwardable;
+    // def_delegator :@x, :q` in the class body defines an instance delegate
+    // and the reference keeps firing `Integer.q` for it.
+    if cx.in_singleton {
+        // `def_delegator(accessor, method, ali = method)`: the defined name
+        // is the ALIAS when one is given, else the method.
+        if matches!(method, "def_delegator" | "def_instance_delegator") {
+            let name = args
+                .get(2)
+                .and_then(|&a| literal_method_name(ast, a))
+                .or_else(|| args.get(1).and_then(|&a| literal_method_name(ast, a)));
+            if let Some(name) = name {
+                file(name, false);
+            }
+            return;
+        }
+        if matches!(method, "def_delegators" | "def_instance_delegators") {
+            for &arg in args.iter().skip(1) {
+                if let Some(name) = literal_method_name(ast, arg) {
+                    file(name, false);
+                }
+            }
+            return;
+        }
+    }
     // Upstream v0.4.5 (#2120, `attr_macro`): an `attr_*` call on the body's
     // self — implicit or `self.` — naming the macro directly or as the literal
     // first argument of `send` / `public_send` / `__send__` declares its
