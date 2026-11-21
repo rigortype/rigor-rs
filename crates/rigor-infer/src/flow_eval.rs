@@ -223,7 +223,7 @@ impl<'i> Typer<'i> {
                         | rigor_parse::LoopKind::Until { begin_modifier: true }
                 );
                 if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    match self.loop_continuation(ast, &entry, predicate, &body, interner)
+                    match self.loop_continuation(ast, &entry, predicate, kind, &body, interner)
                     {
                         Some(LoopContinuation::Fixpoint(bindings)) => {
                             for (n, ty) in bindings {
@@ -1025,6 +1025,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         env: &TypeEnv,
         predicate: Option<NodeId>,
+        kind: rigor_parse::LoopKind,
         body: &[NodeId],
         interner: &mut Interner,
     ) -> Option<LoopContinuation> {
@@ -1153,6 +1154,31 @@ impl<'i> Typer<'i> {
             for n in &overlay {
                 pass_env.insert(Rc::from(n.as_str()), assumption[n]);
             }
+            // rigor-rs#681 — `loop_pass_entry`'s edge narrowing: every pass
+            // enters the body on the predicate's loop-entry edge (truthy
+            // for `while`, falsey for `until`), narrowing its subject
+            // locals. An UNTRACKED subject the body copies into a tracked
+            // write (`x = y` under `while y.is_a?(Integer)`) otherwise
+            // leaks its un-narrowed binding into the fixpoint. Subjects
+            // `predicate_edge_locals` does not recognise keep the entry
+            // binding — the decline side. The ORDERED variant keeps every
+            // conjunct's op per name and each narrows the previous
+            // narrowing in turn (`y.is_a?(Integer) && y.is_a?(Unresolved)`
+            // ends `untyped`, not `Integer` — the reference chains the
+            // conjunct scopes left-to-right).
+            if let Some(p) = predicate {
+                let truthy_entry =
+                    matches!(kind, rigor_parse::LoopKind::While { .. });
+                let mut subjects = Vec::new();
+                Self::predicate_edge_locals_ordered(ast, p, truthy_entry, &mut subjects);
+                for (name, op) in subjects {
+                    let Some(&cur) = pass_env.get(name.as_str()) else { continue };
+                    let narrowed = self.dead_subject_type(ast, cur, &op, interner);
+                    if narrowed != cur {
+                        pass_env.insert(Rc::from(name.as_str()), narrowed);
+                    }
+                }
+            }
             let mut returns = Vec::new();
             self.replay_statements(ast, &mut pass_env, body, interner, &mut returns);
             // A non-exact exit is a decline wearing a "stable" verdict —
@@ -1199,13 +1225,17 @@ impl<'i> Typer<'i> {
 
     /// Whether `ty` carries a decline marker a replay verdict must not
     /// trust — `Dynamic` (a `type_of` miss, a `replay_opaque` widen, an
-    /// op-write decline), `Top`, `Bottom` or `Void` — anywhere in the
-    /// shape. `Constant`, `Nominal`, `Tuple` &co. are value-exact: a
-    /// `Tuple` that keeps growing converges only via the cap pass, which
-    /// is the verdict the fixpoint exists to observe.
+    /// op-write decline), `Top` or `Void` — anywhere in the shape.
+    /// `Constant`, `Nominal`, `Tuple` &co. are value-exact: a `Tuple`
+    /// that keeps growing converges only via the cap pass, which is the
+    /// verdict the fixpoint exists to observe. `Bottom` is exact too: it
+    /// is a REAL edge answer (every entry-edge member excluded — `until
+    /// y` on a `1 | "s"` `y` — writes nothing the reference would keep),
+    /// not a miss, and `join` absorbs it into the running assumption
+    /// exactly as `BodyFixpoint`'s `converge` does (rigor-rs#681).
     fn type_has_decline(interner: &Interner, ty: TypeId) -> bool {
         match interner.get(ty) {
-            Type::Top | Type::Bottom | Type::Void | Type::Dynamic(_) => true,
+            Type::Top | Type::Void | Type::Dynamic(_) => true,
             Type::Union(ms) | Type::Intersection(ms) | Type::Tuple(ms) => {
                 ms.iter().any(|&m| Self::type_has_decline(interner, m))
             }
@@ -3084,15 +3114,71 @@ impl<'i> Typer<'i> {
             // the fold that made the arm dead came from a sibling operand.
             DeadOp::Cmp { peer, eq } => {
                 let eq = *eq;
-                match self.expr_scalar(ast, *peer, &mut Vec::new()) {
-                    Some(lit) => self.narrow_type_members(
-                        ty,
-                        |t| match t {
-                            Type::Constant(s) => (*s == lit) == eq,
-                            _ => true,
-                        },
-                        interner,
-                    ),
+                // The peer must be a literal NODE — `static_literal_type`
+                // (narrowing.rb:2568) reads no other shape: `q == r` with a
+                // pinned-local `r` narrows nothing on the oracle
+                // (`equality_local_literal` declines a non-literal operand).
+                match crate::reach::literal_scalar(ast, *peer) {
+                    // Reference `narrow_equal` / `narrow_not_equal`
+                    // (narrowing.rb:207,222). A singleton literal
+                    // (`nil`/`true`/`false`) narrows memberwise
+                    // (`narrow_singleton_*`); any other TRUSTED literal —
+                    // String/Symbol/Integer, Float EXCLUDED
+                    // (`TRUSTED_EQUALITY_LITERAL_CLASSES`,
+                    // narrowing.rb:51) — narrows only a FINITE
+                    // trusted-literal domain: every member a Constant of
+                    // a trusted class (or `Bot`). Any other member keeps
+                    // the WHOLE domain — `x == 1` on `1 | 2.0` narrows
+                    // nothing, so the Float survives (rigor-rs#681
+                    // review).
+                    Some(lit) => match lit {
+                        Scalar::Float(_) => ty,
+                        Scalar::Nil | Scalar::Bool(_) => self.narrow_type_members(
+                            ty,
+                            |t| match t {
+                                Type::Constant(s) => (*s == lit) == eq,
+                                // `narrow_singleton_equal`/`_not_equal`
+                                // (narrowing.rb:1054,1071): a Nominal
+                                // keeps iff its class is the singleton's;
+                                // `narrow_singleton_equal_other`
+                                // (narrowing.rb:1064) drops shapes and
+                                // class objects on the positive edge.
+                                Type::Nominal { class, .. } => {
+                                    (self.index.class_name_for_id(*class)
+                                        == Some(crate::folding::scalar_class(&lit)))
+                                        == eq
+                                }
+                                Type::Singleton(_) | Type::Tuple(_) | Type::HashShape(_) => !eq,
+                                _ => true,
+                            },
+                            interner,
+                        ),
+                        _ => {
+                            let finite_trusted = match interner.get(ty) {
+                                Type::Union(ms) => ms.iter().all(|&m| {
+                                    match interner.get(m) {
+                                        Type::Constant(s) => !matches!(s, Scalar::Float(_)),
+                                        Type::Bottom => true,
+                                        _ => false,
+                                    }
+                                }),
+                                Type::Constant(s) => !matches!(s, Scalar::Float(_)),
+                                Type::Bottom => true,
+                                _ => false,
+                            };
+                            if !finite_trusted {
+                                return ty;
+                            }
+                            self.narrow_type_members(
+                                ty,
+                                |t| match t {
+                                    Type::Constant(s) => (*s == lit) == eq,
+                                    _ => true,
+                                },
+                                interner,
+                            )
+                        }
+                    },
                     None => ty,
                 }
             }
@@ -3113,6 +3199,28 @@ impl<'i> Typer<'i> {
                 holds,
             } => {
                 let (class, exact, holds) = (class.as_str(), *exact, *holds);
+                // `narrow_class`'s ordering is environment-only
+                // (narrowing.rb:3670 — `environment.class_ordering`): an
+                // asked class the INDEX cannot resolve — undeclared, or
+                // project-only like `class Bar`, or a leaf name that only
+                // a nested decl keys (`Stat`) — makes every member's
+                // ordering `:unknown`, where the positive edge answers
+                // `untyped`, never `Bot` (`declines_bot?`,
+                // narrowing.rb:3651), and the negative edge keeps every
+                // member (`subclass_of?` folds `:unknown` to false).
+                // The resolution test is the codebase's established pair:
+                // `toplevel_classes` for genuine top-level decls plus the
+                // qualified registry — which also holds MODULES at their
+                // bare/qualified key (`Comparable`, `Digest::Instance`),
+                // so a module guard still narrows (`rigor-rs#681` review
+                // round 2). `instance_of?` is exempt: the exact-class
+                // test answers `Bot` on its own semantics.
+                if !exact
+                    && !self.index.knows_toplevel_class(class)
+                    && !self.index.knows_qualified_class(class)
+                {
+                    return if holds { interner.untyped() } else { ty };
+                }
                 self.narrow_type_members(
                     ty,
                     |t| {
@@ -4468,7 +4576,7 @@ impl<'i> Typer<'i> {
                 // survives (rigor-rs#638).
                 let entry = env.clone();
                 let cont = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    self.loop_continuation(ast, &entry, predicate, &body, interner)
+                    self.loop_continuation(ast, &entry, predicate, kind, &body, interner)
                 } else if !matches!(kind, rigor_parse::LoopKind::For) {
                     // rigor-rs#639 — the join stays declined for a
                     // jump/`begin…end while` body, but the structural cap
@@ -5584,7 +5692,7 @@ impl<'i> Typer<'i> {
                 // survives, and a stabilizing self-op does not shed a
                 // sibling pin (rigor-rs#638).
                 let cont = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    self.loop_continuation(ast, env, predicate, &body, interner)
+                    self.loop_continuation(ast, env, predicate, kind, &body, interner)
                 } else if !matches!(kind, rigor_parse::LoopKind::For) {
                     // rigor-rs#639 — the join stays declined for a
                     // jump/`begin…end while` body, but the structural cap
