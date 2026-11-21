@@ -520,10 +520,8 @@ fn strict_report_cleared_bucket() {
     let text = "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r1\n  count: 2\n";
     let b = Baseline::parse(text, "t").unwrap();
     let rows = b.audit(&[]);
-    let drifted: Vec<&baseline::DriftRow> = rows
-        .iter()
-        .filter(|r| r.status != DriftStatus::Within)
-        .collect();
+    let drifted: Vec<&baseline::DriftRow> =
+        rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
     let out = format_strict_drift(&drifted, "bl.yml").unwrap();
     assert_eq!(
         out,

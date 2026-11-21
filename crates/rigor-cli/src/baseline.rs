@@ -137,15 +137,16 @@ impl KeyScalar {
         }
     }
 
-    /// The class name `TypeError: no implicit conversion of X into String`
+    /// The text `TypeError: no implicit conversion of X into String`
     /// reports upstream when `File.fnmatch?`/`to_s`-implicit conversions
-    /// meet a non-String key.
-    pub fn class_name(&self) -> &'static str {
+    /// meet a non-String key — the VALUE for nil/true/false
+    /// (`of true into String`), the class elsewhere.
+    pub fn class_name(&self) -> &str {
         match self {
             KeyScalar::Str(_) => "String",
             KeyScalar::Int(_) => "Integer",
             KeyScalar::Float(_) => "Float",
-            KeyScalar::True => "TrueClass",
+            KeyScalar::True => "true",
             KeyScalar::Symbol(_) => "Symbol",
             KeyScalar::Opaque(_, class) => class,
         }
@@ -262,6 +263,10 @@ pub(crate) fn ruby_scalar_cmp(a: &KeyScalar, b: &KeyScalar) -> Option<std::cmp::
         (Int(_) | Float(_), Int(_) | Float(_)) => {
             f64_of(a).and_then(|x| f64_of(b).and_then(|y| x.partial_cmp(&y)))
         }
+        // `Object#<=>` falls back to `==` — `true <=> true` is 0 upstream,
+        // and one Encoding compares equal to itself.
+        (True, True) => Some(std::cmp::Ordering::Equal),
+        (Opaque(x, _), Opaque(y, _)) if x == y => Some(std::cmp::Ordering::Equal),
         _ => None,
     }
 }
@@ -468,8 +473,21 @@ impl Baseline {
         if !path.exists() {
             return Ok(Baseline::default());
         }
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| LoadError::load(format!("{}: {e}", path.display())))?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            // `YAML.safe_load_file`'s `File.read` raises `Errno::*` (or an
+            // encoding `ArgumentError` on bad UTF-8) — nothing rescues it
+            // upstream, so this is the Fatal surface.
+            let text = match e.kind() {
+                std::io::ErrorKind::PermissionDenied => {
+                    format!("Errno::EACCES: Permission denied - {}", path.display())
+                }
+                std::io::ErrorKind::InvalidData => {
+                    "ArgumentError: invalid byte sequence in UTF-8".to_string()
+                }
+                _ => format!("{}: {e}", path.display()),
+            };
+            LoadError::fatal(text)
+        })?;
         Baseline::parse(&text, &path.display().to_string())
     }
 
@@ -504,7 +522,18 @@ impl Baseline {
         // reject as `unsupported \`version: "1"\``, not parse, while `1.0`
         // and `0x1` pass (both `== 1` upstream).
         let mut version: Option<PsychScalar> = None;
-        let mut buckets: Vec<Bucket> = Vec::new();
+        // `rows = raw["ignored"] || []` — the LOADED value's truthiness
+        // decides (`ignored: false`/`no`/`off` are `[]` upstream, accepted);
+        // the `is_a?(Array)` check runs AFTER `version`, so a truthy
+        // non-array scalar defers to the end (issue #326 review).
+        let mut ignored_scalar: Option<PsychScalar> = None;
+        let mut ignored_empty_array = false;
+        // Rows are collected, not validated, during the scan — upstream
+        // `YAML.safe_load_file` types every scalar in the document before
+        // `parse_loaded` validates anything, so a DisallowedClass/Float()
+        // death ANYWHERE in the file beats every row error, and the version
+        // and ignored-Array checks run before the first row error.
+        let mut rows: Vec<RowAcc> = Vec::new();
 
         // Row accumulator: fields seen for the current `- file:` item.
         let mut cur: Option<RowAcc> = None;
@@ -554,13 +583,25 @@ impl Baseline {
             // Top-level keys (no indentation).
             if !raw_line.starts_with(' ') && !raw_line.starts_with('-') {
                 if !trimmed.contains(':') {
+                    // The doc's root scalar — upstream reports its loaded
+                    // CLASS (`got Integer`/`NilClass`/`TrueClass`), and a
+                    // DisallowedClass death fires here, before the shape
+                    // check.
+                    let (head, kind, tag) = scalar_head(trimmed);
+                    let v = classify_scalar(
+                        tag,
+                        &unyaml_scalar(head),
+                        matches!(kind, ScalarKind::Plain) && tag.is_none(),
+                    )
+                    .map_err(LoadError::fatal)?;
                     return Err(LoadError::load(format!(
-                        "{label}: expected a Hash at top level, got String"
+                        "{label}: expected a Hash at top level, got {}",
+                        v.class_name()
                     )));
                 }
-                // Flush any pending row before leaving the array.
+                // Close any pending row before leaving the array.
                 if let Some(acc) = cur.take() {
-                    buckets.push(acc.into_bucket(label)?);
+                    rows.push(acc);
                 }
                 in_ignored = false;
                 if let Some(rest) = trimmed.strip_prefix("version:") {
@@ -591,27 +632,36 @@ impl Baseline {
                     // `Float()` conversion raises) kills the whole load
                     // upstream — `ignored: 2024-01-01` never reaches
                     // `rows.is_a?(Array)`.
-                    if !matches!(kind, ScalarKind::Plain) || tag.is_some() || !inline.is_empty() {
+                    let loaded = classify_scalar(
+                        tag,
+                        &unyaml_scalar(inline),
+                        matches!(kind, ScalarKind::Plain) && tag.is_none(),
+                    )
+                    .map_err(LoadError::fatal)?;
+                    let is_plain = matches!(kind, ScalarKind::Plain) && tag.is_none();
+                    in_ignored = is_plain && inline.is_empty();
+                    if is_plain && inline == "[]" {
+                        // An explicit empty array — the `is_a?(Array)` check
+                        // passes on its own; nothing to defer.
+                        ignored_empty_array = true;
+                    } else {
+                        // The LOADED value's truthiness (`ignored: false` is
+                        // `false || []` → `[]`, accepted) decides the
+                        // deferred `is_a?(Array)` check after `version`.
+                        ignored_scalar = Some(loaded);
+                    }
+                } else {
+                    // Any other top-level key is ignored upstream — but its
+                    // scalar still typed during `safe_load`, so a
+                    // `generated_at: 2024-01-01` Date dies here.
+                    if let Some((_, value)) = trimmed.split_once(':') {
+                        let (head, kind, tag) = scalar_head(value.trim_start());
                         classify_scalar(
                             tag,
-                            &unyaml_scalar(inline),
+                            &unyaml_scalar(head),
                             matches!(kind, ScalarKind::Plain) && tag.is_none(),
                         )
                         .map_err(LoadError::fatal)?;
-                    }
-                    let is_plain = matches!(kind, ScalarKind::Plain) && tag.is_none();
-                    let is_nil = if is_plain {
-                        inline.is_empty()
-                            || inline == "~"
-                            || inline.eq_ignore_ascii_case("null")
-                    } else {
-                        inline.is_empty() // a bare `!tag` is tagged nil
-                    };
-                    in_ignored = is_plain && inline.is_empty();
-                    if !(is_nil || (is_plain && inline == "[]")) {
-                        return Err(LoadError::load(format!(
-                            "{label}: `ignored:` must be an Array"
-                        )));
                     }
                 }
                 continue;
@@ -627,12 +677,12 @@ impl Baseline {
             // reference's emitter.
             if trimmed.starts_with("- ") && (cur.is_none() || indent <= item_col) {
                 if let Some(acc) = cur.take() {
-                    buckets.push(acc.into_bucket(label)?);
+                    rows.push(acc);
                 }
                 item_col = indent;
                 let rest = &trimmed[2..];
                 member_col = indent + 2 + (rest.len() - rest.trim_start().len());
-                let mut acc = RowAcc { idx: buckets.len(), ..RowAcc::default() };
+                let mut acc = RowAcc { idx: rows.len(), ..RowAcc::default() };
                 acc.apply(rest.trim_start(), label, true)?;
                 cur = Some(acc);
             } else if let Some(acc) = cur.as_mut() {
@@ -646,7 +696,7 @@ impl Baseline {
             }
         }
         if let Some(acc) = cur.take() {
-            buckets.push(acc.into_bucket(label)?);
+            rows.push(acc);
         }
 
         // `unless version == CURRENT_VERSION` upstream — a missing `version:`
@@ -667,6 +717,20 @@ impl Baseline {
             )));
         }
 
+        // `rows = raw["ignored"] || []`, then `rows.is_a?(Array)` — checked
+        // after `version` upstream. `ignored: false`/`~`/`null` are `[]`
+        // (falsy); `ignored: []` is an actual empty array; any truthy other
+        // scalar fails.
+        if ignored_scalar.as_ref().is_some_and(|v| !v.falsy()) && !ignored_empty_array {
+            return Err(LoadError::load(format!(
+                "{label}: `ignored:` must be an Array"
+            )));
+        }
+
+        let mut buckets: Vec<Bucket> = Vec::new();
+        for acc in rows {
+            buckets.push(acc.into_bucket(label)?);
+        }
         Ok(Baseline { buckets })
     }
 
@@ -1113,13 +1177,29 @@ impl RowAcc {
     /// (where it is malformed YAML the reference's Psych parse would have
     /// already rejected; report it as a row error either way).
     fn apply(&mut self, fragment: &str, label: &str, row_head: bool) -> Result<(), LoadError> {
-        let (key, value) = fragment.split_once(':').ok_or_else(|| {
-            if row_head {
-                LoadError::load(format!("{label}: ignored[{}] must be a Hash", self.idx))
-            } else {
-                LoadError::load(format!("{label}: malformed row entry {fragment:?}"))
+        let (key, value) = match fragment.split_once(':') {
+            Some(kv) => kv,
+            None => {
+                // A bare row scalar (`- 2024-01-01`) is a Date upstream —
+                // `safe_load` dies on it before `must be a Hash` could run,
+                // so classify it before erroring. A member line without a
+                // colon is `Psych::SyntaxError` (uncaught) upstream.
+                let (head, kind, tag) = scalar_head(fragment.trim_start());
+                classify_scalar(
+                    tag,
+                    &unyaml_scalar(head),
+                    matches!(kind, ScalarKind::Plain) && tag.is_none(),
+                )
+                .map_err(LoadError::fatal)?;
+                return if row_head {
+                    Err(LoadError::load(format!("{label}: ignored[{}] must be a Hash", self.idx)))
+                } else {
+                    Err(LoadError::fatal(format!(
+                        "Psych::SyntaxError: ({label}): mapping values are not allowed here"
+                    )))
+                };
             }
-        })?;
+        };
         let (head, kind, tag) = scalar_head(value.trim_start());
         let field = match key.trim() {
             "file" => Field::File,
@@ -1130,6 +1210,21 @@ impl RowAcc {
         };
         self.last = Some(field);
         self.pending_breaks = 0;
+        // Eagerly type the scalar in DOCUMENT ORDER — `safe_load` typed it
+        // before `parse_row` ran, so its DisallowedClass/`Float()` death
+        // beats every validation error, including an unknown `meta:` field's
+        // (upstream typed it too). An Ok result is discarded: a multi-line
+        // plain/quoted scalar re-classifies its full text at `typed()`
+        // (a `file: 2024-01-01` head plus a continuation line is the
+        // documented corner where the eager death is one line early).
+        if !head.is_empty() {
+            classify_scalar(
+                tag,
+                &unyaml_scalar(head),
+                matches!(kind, ScalarKind::Plain) && tag.is_none(),
+            )
+            .map_err(LoadError::fatal)?;
+        }
         // `key:` with an empty value is YAML nil upstream — leave the field
         // unset (`file`/`rule` then hit `or raise`; a nil `message` reads as
         // a rule-ID row). A bare TAG (`file: !ruby/regexp`) resolves on nil
@@ -1227,10 +1322,17 @@ impl RowAcc {
 
     fn into_bucket(self, label: &str) -> Result<Bucket, LoadError> {
         let idx = self.idx;
+        // Type all four fields before validating any — `safe_load` typed
+        // the whole document before `parse_row`, so a `message: 2024-01-01`
+        // death beats the `count: 0` error beside it (issue #326 review).
+        let file_v = self.typed(Field::File)?;
+        let rule_v = self.typed(Field::Rule)?;
+        let count_v = self.typed(Field::Count)?;
+        let message_v = self.typed(Field::Message)?;
         // `file = row["file"] or raise`, `rule = row["rule"] or raise` — the
         // TYPED value's truthiness decides (nil/false are missing; `file: 5`
         // and `file: true` are truthy non-String keys — an inert bucket).
-        let file = match self.typed(Field::File)? {
+        let file = match file_v {
             v if v.falsy() => {
                 return Err(LoadError::load(format!(
                     "{label}: ignored[{idx}] missing `file:`"
@@ -1238,7 +1340,7 @@ impl RowAcc {
             }
             v => v.into_key(),
         };
-        let rule = match self.typed(Field::Rule)? {
+        let rule = match rule_v {
             v if v.falsy() => {
                 return Err(LoadError::load(format!(
                     "{label}: ignored[{idx}] missing `rule:`"
@@ -1251,7 +1353,6 @@ impl RowAcc {
         // `got :x`, `got nil`), an Integer its canonical decimal (`got -16`
         // for `-0x10`). A huge Integer counts as `usize::MAX` — the
         // reference's `expect`-free threshold semantics need no bignum.
-        let count_v = self.typed(Field::Count)?;
         let count = match count_v {
             PsychScalar::Int(i) if i.value > 0 => usize::try_from(i.value).unwrap_or(usize::MAX),
             v => {
@@ -1261,7 +1362,7 @@ impl RowAcc {
                 )))
             }
         };
-        Ok(match self.typed(Field::Message)? {
+        Ok(match message_v {
             // `if (message = row["message"])` — a falsy typed value (nil,
             // `false`/`no`/`off`) is the rule-ID row, not a `/false/` bucket.
             v if v.falsy() => Bucket::rule_row_typed(file, rule, count),
@@ -1357,6 +1458,14 @@ fn scalar_head(value: &str) -> (&str, ScalarKind, Option<&str>) {
             }
         }
     }
+    // `!<URI>` is the verbatim tag spelling — Psych reports the tag as the
+    // bare URI (`!<!str>` → `!str`, `!<tag:yaml.org,2002:str>` →
+    // `tag:yaml.org,2002:str`), so unwrap it before `deserialize` routes.
+    let tag = tag.map(|t| {
+        t.strip_prefix("!<")
+            .and_then(|inner| inner.strip_suffix('>'))
+            .unwrap_or(t)
+    });
     let kind = match v.chars().next() {
         Some('"') => ScalarKind::DoubleQuoted,
         Some('\'') => ScalarKind::SingleQuoted,
@@ -1486,6 +1595,21 @@ impl PsychScalar {
         matches!(self, PsychScalar::Nil | PsychScalar::Bool(false))
     }
 
+    /// `raw.class` text — the `expected a Hash at top level, got …` class
+    /// name and the `can't convert X into Float` subject.
+    fn class_name(&self) -> &str {
+        match self {
+            PsychScalar::Nil => "NilClass",
+            PsychScalar::Bool(true) => "TrueClass",
+            PsychScalar::Bool(false) => "FalseClass",
+            PsychScalar::Int(_) => "Integer",
+            PsychScalar::Float(_) => "Float",
+            PsychScalar::Symbol(_) => "Symbol",
+            PsychScalar::Str(_) => "String",
+            PsychScalar::Opaque { class, .. } => class,
+        }
+    }
+
     /// Ruby `to_s` — the `message:` Regexp source for non-String values
     /// (`0x10` → `16`, `true` → `true`, `:x` → `x`).
     fn to_s(&self) -> String {
@@ -1568,10 +1692,17 @@ fn classify_tagged(tag: &str, text: &str) -> Result<PsychScalar, String> {
             Ok(PsychScalar::Str(text.to_string()))
         }
         _ if tag.starts_with("!str:") || tag.starts_with("!ruby/string:") => {
-            let name = tag.rsplit(':').next().unwrap_or_default();
-            // `resolve_class($1)`: `Symbol` is the one permitted class —
-            // `Symbol.allocate` then dies `allocator undefined` upstream.
-            if name == "Symbol" {
+            // `(?::(.*))?` — `$1` is the WHOLE tail, `!str:Foo::Bar` names
+            // `Foo::Bar`. `resolve_class($1)`: `Symbol` is the one
+            // permitted class — `Symbol.allocate` then dies
+            // `allocator undefined` upstream; an empty name is `nil`.
+            let name = tag
+                .strip_prefix("!str:")
+                .or_else(|| tag.strip_prefix("!ruby/string:"))
+                .unwrap_or_default();
+            if name.is_empty() {
+                Ok(PsychScalar::Str(text.to_string()))
+            } else if name == "Symbol" {
                 Err("TypeError: allocator undefined for Symbol".to_string())
             } else {
                 disallowed(name)
@@ -1586,10 +1717,14 @@ fn classify_tagged(tag: &str, text: &str) -> Result<PsychScalar, String> {
         "!ruby/object:DateTime" => disallowed("DateTime"),
         "!ruby/object:Complex" => disallowed("Complex"),
         "!ruby/object:Rational" => disallowed("Rational"),
-        // `resolve_class o.value` — `Symbol` alone is permitted (and keys an
-        // inert Symbol-class bucket); anything else is DisallowedClass.
+        // `resolve_class o.value` — an empty name resolves to nil (a
+        // `file: !ruby/class` row hits `missing \`file:\`` upstream);
+        // `Symbol` alone is permitted (and keys an inert Symbol-class
+        // bucket); anything else is DisallowedClass.
         "!ruby/class" | "!ruby/module" => {
-            if text == "Symbol" {
+            if text.is_empty() {
+                Ok(PsychScalar::Nil)
+            } else if text == "Symbol" {
                 Ok(PsychScalar::Opaque {
                     to_s: "Symbol".to_string(),
                     class: "Class",
@@ -1600,13 +1735,38 @@ fn classify_tagged(tag: &str, text: &str) -> Result<PsychScalar, String> {
         }
         // `/^!ruby\/sym(bol)?:?(.*)?$/` — `.*` swallows any tail.
         _ if tag.starts_with("!ruby/sym") => Ok(PsychScalar::Symbol(text.to_string())),
-        // `Encoding.find` — loads for real names (`Opaque` → inert key),
-        // `ArgumentError` on unknown ones; the port keeps the loading side
-        // for every name (an Encoding key is inert either way).
-        "!ruby/encoding" => Ok(PsychScalar::Opaque {
-            to_s: format!("#<Encoding:{}>", text.to_uppercase()),
-            class: "Encoding",
-        }),
+        // `Encoding.find` — case-insensitive over `name_list` + `aliases`,
+        // loading to the CANONICAL name (`ascii` → `US-ASCII`, whose `to_s`
+        // is the name, not `#<Encoding:…>`); unknown names die
+        // `ArgumentError: unknown encoding name - foo`.
+        "!ruby/encoding" => {
+            let upper = text.to_uppercase();
+            // `Encoding.find`'s pseudo-names: `internal` → the nil internal
+            // encoding (a `missing \`file:\`` upstream — probed), the env
+            // defaults `external`/`locale`/`filesystem` → UTF-8 here.
+            if upper == "INTERNAL" {
+                return Ok(PsychScalar::Nil);
+            }
+            if matches!(upper.as_str(), "EXTERNAL" | "LOCALE" | "FILESYSTEM") {
+                return Ok(PsychScalar::Opaque {
+                    to_s: "UTF-8".to_string(),
+                    class: "Encoding",
+                });
+            }
+            match ENCODING_TABLE
+                .iter()
+                .find(|(name, _)| *name == upper)
+                .map(|(_, canonical)| *canonical)
+            {
+                Some(canonical) => Ok(PsychScalar::Opaque {
+                    to_s: canonical.to_string(),
+                    class: "Encoding",
+                }),
+                None => Err(format!(
+                    "ArgumentError: unknown encoding name - {text}"
+                )),
+            }
+        }
         // `!foo`, `!!int`/`!!bool`/`!!null`, `!omap`, `!map:K`,
         // `!ruby/object:K`, `!ruby/exception:K`… — every tag with no
         // scalar arm tokenizes the text (`file: !foo '5'` → Integer 5,
@@ -1627,9 +1787,10 @@ fn tokenize_scalar(s: &str) -> Result<PsychScalar, String> {
     }
     // The ALPHA arm — word-only scalars ≤5 chars resolve `~`/`null`/the
     // YAML 1.1 bool words; everything else in the arm is a String, as is
-    // any `\n`-containing scalar (a folded/tagged block's text).
+    // any `\n`-containing scalar (a folded/tagged block's text). Ruby's
+    // `string.length` counts chars, not bytes.
     if pe::alpha_match(s) || s.contains('\n') {
-        if s.len() > 5 {
+        if s.chars().count() > 5 {
             return Ok(PsychScalar::Str(s.to_string()));
         }
         let first = s.chars().next().unwrap_or('\0').to_ascii_lowercase();
@@ -1661,14 +1822,16 @@ fn tokenize_scalar(s: &str) -> Result<PsychScalar, String> {
     if s.eq_ignore_ascii_case(".nan") {
         return Ok(PsychScalar::Float(f64::NAN));
     }
-    // `/^:./` — `:'x'`/`:"x"` quote their name, `:x` keeps the rest.
+    // `/^:(['"])(.*)\1/` is NOT end-anchored — `(.*)\1` backtracks to the
+    // LAST matching quote (`:'x'y` → `:x`); a `:'x` with no closing quote
+    // falls through to the plain `/^:(.*)/` arm, name `'x`.
     if s.len() > 1 && s.starts_with(':') {
         let rest = &s[1..];
-        let name = match rest.as_bytes() {
-            [q @ (b'\'' | b'"'), inner @ .., last] if *last == *q => {
-                let inner = std::str::from_utf8(inner).unwrap_or("");
-                inner.strip_prefix(':').unwrap_or(inner)
-            }
+        let name = match rest.chars().next() {
+            Some(q @ ('\'' | '"')) => match rest[1..].rfind(q) {
+                Some(i) => rest[1..][..i].strip_prefix(':').unwrap_or(&rest[1..][..i]),
+                None => rest.strip_prefix(':').unwrap_or(rest),
+            },
             _ => rest.strip_prefix(':').unwrap_or(rest),
         };
         return Ok(PsychScalar::Symbol(name.to_string()));
@@ -1814,14 +1977,15 @@ fn sexa_segments(s: &str) -> Option<Vec<&str>> {
     Some(parts)
 }
 
-/// Ruby `String#to_i` — optional sign, then leading digits (`"1_0"` → 1,
-/// `""` → 0), saturated.
+/// Ruby `String#to_i` — optional sign, then leading digits with `_`
+/// separators BETWEEN digits (`"1_0"` → 10, `"1__0"` → 1 — to_i stops at
+/// the doubled `_`), saturated.
 fn str_to_i(s: &str) -> i128 {
     let (neg, b) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
-    let digits: String = b.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let digits = digit_run(b);
     let v = digits.parse::<i128>().unwrap_or(0).min(i128::MAX / 3601);
     if neg {
         -v
@@ -1830,28 +1994,67 @@ fn str_to_i(s: &str) -> i128 {
     }
 }
 
-/// Ruby `String#to_f` — optional sign, then the longest float prefix
-/// (`"1_0"` → 1.0, `""` → 0.0).
+/// The `to_i`/`to_f` digit run at the head of `s`: digits, with `_` kept
+/// only when a digit follows (`1_0` → `10`, `1__0`/`1_` stop).
+fn digit_run(b: &str) -> String {
+    let chars: Vec<char> = b.chars().collect();
+    let mut out = String::new();
+    let mut i = 0;
+    while i < chars.len() {
+        match chars[i] {
+            c if c.is_ascii_digit() => {
+                out.push(c);
+                i += 1;
+            }
+            '_' if i + 1 < chars.len() && chars[i + 1].is_ascii_digit() => i += 1,
+            _ => break,
+        }
+    }
+    out
+}
+
+/// Ruby `String#to_f` — optional sign, then the longest float prefix:
+/// int digits with `_` separators, `.` + frac digits with `_` (`30.5_5` →
+/// 30.55; a `.` with no frac digits ends the run before it — `"1."` → 1.0).
 fn str_to_f(s: &str) -> f64 {
     let (neg, b) = match s.strip_prefix('-') {
         Some(r) => (true, r),
         None => (false, s.strip_prefix('+').unwrap_or(s)),
     };
-    // Longest `[0-9]*(.[0-9]*)?` prefix — `to_f` stops at the first char
-    // that can't continue the number.
-    let mut end = 0;
-    let mut seen_dot = false;
-    for (i, c) in b.char_indices() {
-        if c.is_ascii_digit() {
-            end = i + 1;
-        } else if c == '.' && !seen_dot {
-            seen_dot = true;
-            end = i + 1;
-        } else {
-            break;
+    let chars: Vec<char> = b.chars().collect();
+    let mut pos = 0;
+    while pos < chars.len() {
+        match chars[pos] {
+            c if c.is_ascii_digit() => pos += 1,
+            '_' if pos > 0
+                && chars[pos - 1].is_ascii_digit()
+                && pos + 1 < chars.len()
+                && chars[pos + 1].is_ascii_digit() =>
+            {
+                pos += 1
+            }
+            _ => break,
         }
     }
-    let v: f64 = b[..end].parse().unwrap_or(0.0);
+    if pos < chars.len() && chars[pos] == '.' {
+        let mut p = pos + 1;
+        let mut any = false;
+        while p < chars.len() {
+            match chars[p] {
+                c if c.is_ascii_digit() => {
+                    any = true;
+                    p += 1;
+                }
+                '_' if any && p + 1 < chars.len() && chars[p + 1].is_ascii_digit() => p += 1,
+                _ => break,
+            }
+        }
+        if any {
+            pos = p;
+        }
+    }
+    let end = b.char_indices().nth(pos).map_or(b.len(), |(i, _)| i);
+    let v: f64 = b[..end].replace('_', "").parse().unwrap_or(0.0);
     if neg {
         -v
     } else {
@@ -1860,7 +2063,7 @@ fn str_to_f(s: &str) -> f64 {
 }
 
 /// `^[-+]?[0-9][0-9_]*(:[0-5]?[0-9]){1,2}$` — base-60 sexagesimal Integer,
-/// summed upstream as `n.to_i * 60**(e-2).abs` per segment (`1:30` → 90,
+/// summed upstream as `n.to_i * 60**(e-2).abs` per segment (`1:30` → 5400,
 /// `1:0` → 3600 — the sign rides the FIRST segment only).
 fn sexagesimal_int(s: &str) -> Option<PsychInt> {
     // Reject a `.` anywhere — that's the Float arm's shape.
@@ -1914,32 +2117,61 @@ fn ruby_float_of(v: PsychScalar) -> Result<PsychScalar, String> {
     }
 }
 
-/// `Kernel#Float(s)` — accepts `,`/`_`-separated decimals, `0x` hex, and
-/// the `Infinity`/`NaN` words; anything else dies `ArgumentError` (the
-/// `!float abc` probe).
+/// `Kernel#Float(s)` — the strict grammar upstream applies to `!float`
+/// text: `[+-]?\d+(_\d+)*(\.\d+(_\d+)*)?([eE][+-]?\d+(_\d+)*)?` inside
+/// optional whitespace, or `0x` hex. NO comma separators, no
+/// `Infinity`/`NaN` words, no bare `1.`/`.5` — each dies `ArgumentError`
+/// (probed).
 fn ruby_float(s: &str) -> Result<f64, String> {
-    let cleaned: String = s.chars().filter(|c| !matches!(c, '_' | ',')).collect();
-    let (neg, body) = match cleaned.strip_prefix('-') {
+    let t = s.trim();
+    let (neg, body) = match t.strip_prefix('-') {
         Some(r) => (true, r),
-        None => (false, cleaned.strip_prefix('+').unwrap_or(&cleaned)),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
     };
-    if body.eq_ignore_ascii_case("infinity") {
-        return Ok(if neg {
-            f64::NEG_INFINITY
-        } else {
-            f64::INFINITY
-        });
-    }
-    if body.eq_ignore_ascii_case("nan") {
-        return Ok(f64::NAN);
-    }
     if let Some(hex) = body.strip_prefix("0x") {
-        let v = i128::from_str_radix(hex, 16)
-            .map_err(|_| format!("ArgumentError: invalid value for Float(): \"{s}\""))?;
-        return Ok(if neg { -(v as f64) } else { v as f64 });
+        if !hex.is_empty() && hex.chars().all(|c| c.is_ascii_hexdigit()) {
+            let v = i128::from_str_radix(hex, 16).unwrap_or(i128::MAX);
+            return Ok(if neg { -(v as f64) } else { v as f64 });
+        }
     }
-    cleaned
+    // Strict grammar check before parsing: `_` only between digits.
+    let valid = {
+        let chars: Vec<char> = body.chars().collect();
+        let mut i = 0;
+        let num_run = |i: &mut usize| {
+            let start = *i;
+            while *i < chars.len() {
+                match chars[*i] {
+                    c if c.is_ascii_digit() => *i += 1,
+                    '_' if *i + 1 < chars.len() && chars[*i + 1].is_ascii_digit() => *i += 1,
+                    _ => break,
+                }
+            }
+            *i > start
+        };
+        let mut ok = num_run(&mut i);
+        if ok && i < chars.len() && chars[i] == '.' {
+            i += 1;
+            ok = num_run(&mut i);
+        }
+        if ok
+            && i < chars.len()
+            && (chars[i] == 'e' || chars[i] == 'E')
+        {
+            i += 1;
+            if i < chars.len() && (chars[i] == '+' || chars[i] == '-') {
+                i += 1;
+            }
+            ok = num_run(&mut i);
+        }
+        ok && i == chars.len()
+    };
+    if !valid {
+        return Err(format!("ArgumentError: invalid value for Float(): \"{s}\""));
+    }
+    body.replace('_', "")
         .parse::<f64>()
+        .map(|v| if neg { -v } else { v })
         .map_err(|_| format!("ArgumentError: invalid value for Float(): \"{s}\""))
 }
 
@@ -1998,60 +2230,222 @@ fn symbol_inspect(name: &str) -> String {
 /// i128 get the correct decimal digits via a widening multiply-add; the
 /// saturated `value` still orders `== 1`/`positive?` right.
 fn digits_to_decimal(digits: &str, base: u32) -> (i128, String) {
+    // First pass — the i128 value, detecting overflow.
     let mut acc: i128 = 0;
     let mut overflow = false;
-    // Decimal digit accumulator for the bignum tail.
+    for c in digits.chars() {
+        let d = c.to_digit(base).unwrap_or(0) as i128;
+        match acc
+            .checked_mul(base as i128)
+            .and_then(|a| a.checked_add(d))
+        {
+            Some(v) if !overflow => acc = v,
+            _ => overflow = true,
+        }
+    }
+    if !overflow {
+        return (acc, acc.to_string());
+    }
+    // Second pass (rare): the canonical decimal text via widening
+    // multiply-add — upstream's Integer is unbounded.
     let mut dec: Vec<u8> = Vec::new();
     for c in digits.chars() {
-        let d = c.to_digit(base).unwrap_or(0) as u128;
-        if !overflow {
-            match acc
-                .checked_mul(base as i128)
-                .and_then(|a| a.checked_add(d as i128))
-            {
-                Some(v) => acc = v,
-                None => overflow = true,
-            }
+        let mut carry = c.to_digit(base).unwrap_or(0) as u128;
+        for slot in dec.iter_mut() {
+            let v = *slot as u128 * base as u128 + carry;
+            *slot = (v % 10) as u8;
+            carry = v / 10;
         }
-        if overflow {
-            // dec = dec * base + d
-            let mut carry = d;
-            for slot in dec.iter_mut() {
-                let v = *slot as u128 * base as u128 + carry;
-                *slot = (v % 10) as u8;
-                carry = v / 10;
-            }
-            while carry > 0 {
-                dec.insert(0, (carry % 10) as u8);
-                carry /= 10;
-            }
+        while carry > 0 {
+            dec.insert(0, (carry % 10) as u8);
+            carry /= 10;
         }
     }
-    if overflow {
-        // Fold the i128 prefix in: acc holds digits up to the overflow —
-        // recompute fully into dec for correctness (simple and rare).
-        let mut dec: Vec<u8> = Vec::new();
-        for c in digits.chars() {
-            let d = c.to_digit(base).unwrap_or(0) as u128;
-            let mut carry = d;
-            for slot in dec.iter_mut() {
-                let v = *slot as u128 * base as u128 + carry;
-                *slot = (v % 10) as u8;
-                carry = v / 10;
-            }
-            while carry > 0 {
-                dec.insert(0, (carry % 10) as u8);
-                carry /= 10;
-            }
-        }
-        (
-            i128::MAX,
-            dec.into_iter().map(|d| (b'0' + d) as char).collect(),
-        )
-    } else {
-        (acc, acc.to_string())
-    }
+    (
+        i128::MAX,
+        dec.into_iter().map(|d| (b'0' + d) as char).collect(),
+    )
 }
+
+/// `Encoding.find` name→canonical table, generated from the pinned Ruby 4.0.5
+/// (`Encoding.name_list` minus the internal encoding, + `Encoding.aliases`;
+/// `find` is case-insensitive, so keys are uppercased).
+const ENCODING_TABLE: &[(&str, &str)] = &[
+    ("646", "US-ASCII"),
+    ("ANSI_X3.4-1968", "US-ASCII"),
+    ("ASCII", "US-ASCII"),
+    ("ASCII-8BIT", "ASCII-8BIT"),
+    ("BIG5", "Big5"),
+    ("BIG5-HKSCS", "Big5-HKSCS"),
+    ("BIG5-HKSCS:2008", "Big5-HKSCS"),
+    ("BIG5-UAO", "Big5-UAO"),
+    ("BINARY", "ASCII-8BIT"),
+    ("CESU-8", "CESU-8"),
+    ("CP1250", "Windows-1250"),
+    ("CP1251", "Windows-1251"),
+    ("CP1252", "Windows-1252"),
+    ("CP1253", "Windows-1253"),
+    ("CP1254", "Windows-1254"),
+    ("CP1255", "Windows-1255"),
+    ("CP1256", "Windows-1256"),
+    ("CP1257", "Windows-1257"),
+    ("CP1258", "Windows-1258"),
+    ("CP437", "IBM437"),
+    ("CP50220", "CP50220"),
+    ("CP50221", "CP50221"),
+    ("CP51932", "CP51932"),
+    ("CP65000", "UTF-7"),
+    ("CP65001", "UTF-8"),
+    ("CP720", "IBM720"),
+    ("CP737", "IBM737"),
+    ("CP775", "IBM775"),
+    ("CP850", "CP850"),
+    ("CP852", "CP852"),
+    ("CP855", "CP855"),
+    ("CP857", "IBM857"),
+    ("CP860", "IBM860"),
+    ("CP861", "IBM861"),
+    ("CP862", "IBM862"),
+    ("CP863", "IBM863"),
+    ("CP864", "IBM864"),
+    ("CP865", "IBM865"),
+    ("CP866", "IBM866"),
+    ("CP869", "IBM869"),
+    ("CP874", "Windows-874"),
+    ("CP878", "KOI8-R"),
+    ("CP932", "Windows-31J"),
+    ("CP936", "GBK"),
+    ("CP949", "CP949"),
+    ("CP950", "CP950"),
+    ("CP951", "CP951"),
+    ("CSWINDOWS31J", "Windows-31J"),
+    ("EBCDIC-CP-US", "IBM037"),
+    ("EMACS-MULE", "Emacs-Mule"),
+    ("EUC-CN", "GB2312"),
+    ("EUC-JIS-2004", "EUC-JIS-2004"),
+    ("EUC-JISX0213", "EUC-JIS-2004"),
+    ("EUC-JP", "EUC-JP"),
+    ("EUC-JP-MS", "eucJP-ms"),
+    ("EUC-KR", "EUC-KR"),
+    ("EUC-TW", "EUC-TW"),
+    ("EUCCN", "GB2312"),
+    ("EUCJP", "EUC-JP"),
+    ("EUCJP-MS", "eucJP-ms"),
+    ("EUCKR", "EUC-KR"),
+    ("EUCTW", "EUC-TW"),
+    ("EXTERNAL", "UTF-8"),
+    ("FILESYSTEM", "UTF-8"),
+    ("GB12345", "GB12345"),
+    ("GB18030", "GB18030"),
+    ("GB1988", "GB1988"),
+    ("GB2312", "GB2312"),
+    ("GBK", "GBK"),
+    ("IBM037", "IBM037"),
+    ("IBM437", "IBM437"),
+    ("IBM720", "IBM720"),
+    ("IBM737", "IBM737"),
+    ("IBM775", "IBM775"),
+    ("IBM850", "CP850"),
+    ("IBM852", "IBM852"),
+    ("IBM855", "IBM855"),
+    ("IBM857", "IBM857"),
+    ("IBM860", "IBM860"),
+    ("IBM861", "IBM861"),
+    ("IBM862", "IBM862"),
+    ("IBM863", "IBM863"),
+    ("IBM864", "IBM864"),
+    ("IBM865", "IBM865"),
+    ("IBM866", "IBM866"),
+    ("IBM869", "IBM869"),
+    ("ISO-2022-JP", "ISO-2022-JP"),
+    ("ISO-2022-JP-2", "ISO-2022-JP-2"),
+    ("ISO-2022-JP-KDDI", "ISO-2022-JP-KDDI"),
+    ("ISO-8859-1", "ISO-8859-1"),
+    ("ISO-8859-10", "ISO-8859-10"),
+    ("ISO-8859-11", "ISO-8859-11"),
+    ("ISO-8859-13", "ISO-8859-13"),
+    ("ISO-8859-14", "ISO-8859-14"),
+    ("ISO-8859-15", "ISO-8859-15"),
+    ("ISO-8859-16", "ISO-8859-16"),
+    ("ISO-8859-2", "ISO-8859-2"),
+    ("ISO-8859-3", "ISO-8859-3"),
+    ("ISO-8859-4", "ISO-8859-4"),
+    ("ISO-8859-5", "ISO-8859-5"),
+    ("ISO-8859-6", "ISO-8859-6"),
+    ("ISO-8859-7", "ISO-8859-7"),
+    ("ISO-8859-8", "ISO-8859-8"),
+    ("ISO-8859-9", "ISO-8859-9"),
+    ("ISO2022-JP", "ISO-2022-JP"),
+    ("ISO2022-JP2", "ISO-2022-JP-2"),
+    ("ISO8859-1", "ISO-8859-1"),
+    ("ISO8859-10", "ISO-8859-10"),
+    ("ISO8859-11", "ISO-8859-11"),
+    ("ISO8859-13", "ISO-8859-13"),
+    ("ISO8859-14", "ISO-8859-14"),
+    ("ISO8859-15", "ISO-8859-15"),
+    ("ISO8859-16", "ISO-8859-16"),
+    ("ISO8859-2", "ISO-8859-2"),
+    ("ISO8859-3", "ISO-8859-3"),
+    ("ISO8859-4", "ISO-8859-4"),
+    ("ISO8859-5", "ISO-8859-5"),
+    ("ISO8859-6", "ISO-8859-6"),
+    ("ISO8859-7", "ISO-8859-7"),
+    ("ISO8859-8", "ISO-8859-8"),
+    ("ISO8859-9", "ISO-8859-9"),
+    ("KOI8-R", "KOI8-R"),
+    ("KOI8-U", "KOI8-U"),
+    ("LOCALE", "UTF-8"),
+    ("MACCENTEURO", "macCentEuro"),
+    ("MACCROATIAN", "macCroatian"),
+    ("MACCYRILLIC", "macCyrillic"),
+    ("MACGREEK", "macGreek"),
+    ("MACICELAND", "macIceland"),
+    ("MACJAPAN", "MacJapanese"),
+    ("MACJAPANESE", "MacJapanese"),
+    ("MACROMAN", "macRoman"),
+    ("MACROMANIA", "macRomania"),
+    ("MACTHAI", "macThai"),
+    ("MACTURKISH", "macTurkish"),
+    ("MACUKRAINE", "macUkraine"),
+    ("PCK", "Windows-31J"),
+    ("SHIFT_JIS", "Shift_JIS"),
+    ("SJIS", "Windows-31J"),
+    ("SJIS-DOCOMO", "SJIS-DoCoMo"),
+    ("SJIS-KDDI", "SJIS-KDDI"),
+    ("SJIS-SOFTBANK", "SJIS-SoftBank"),
+    ("STATELESS-ISO-2022-JP", "stateless-ISO-2022-JP"),
+    ("STATELESS-ISO-2022-JP-KDDI", "stateless-ISO-2022-JP-KDDI"),
+    ("TIS-620", "TIS-620"),
+    ("UCS-2BE", "UTF-16BE"),
+    ("UCS-4BE", "UTF-32BE"),
+    ("UCS-4LE", "UTF-32LE"),
+    ("US-ASCII", "US-ASCII"),
+    ("UTF-16", "UTF-16"),
+    ("UTF-16BE", "UTF-16BE"),
+    ("UTF-16LE", "UTF-16LE"),
+    ("UTF-32", "UTF-32"),
+    ("UTF-32BE", "UTF-32BE"),
+    ("UTF-32LE", "UTF-32LE"),
+    ("UTF-7", "UTF-7"),
+    ("UTF-8", "UTF-8"),
+    ("UTF-8-HFS", "UTF8-MAC"),
+    ("UTF-8-MAC", "UTF8-MAC"),
+    ("UTF8-DOCOMO", "UTF8-DoCoMo"),
+    ("UTF8-KDDI", "UTF8-KDDI"),
+    ("UTF8-MAC", "UTF8-MAC"),
+    ("UTF8-SOFTBANK", "UTF8-SoftBank"),
+    ("WINDOWS-1250", "Windows-1250"),
+    ("WINDOWS-1251", "Windows-1251"),
+    ("WINDOWS-1252", "Windows-1252"),
+    ("WINDOWS-1253", "Windows-1253"),
+    ("WINDOWS-1254", "Windows-1254"),
+    ("WINDOWS-1255", "Windows-1255"),
+    ("WINDOWS-1256", "Windows-1256"),
+    ("WINDOWS-1257", "Windows-1257"),
+    ("WINDOWS-1258", "Windows-1258"),
+    ("WINDOWS-31J", "Windows-31J"),
+    ("WINDOWS-874", "Windows-874"),
+];
 
 /// `o.value.unpack('m').first` — a lenient base64 decoder (whitespace and
 /// non-alphabet bytes are skipped, like Ruby's `unpack('m')`).
@@ -3059,7 +3453,7 @@ mod tests {
                 "count: {form}"
             );
         }
-        }
+    }
 
     #[test]
     fn falsy_typed_message_is_a_rule_bucket() {
@@ -3208,6 +3602,49 @@ mod tests {
     }
 
     #[test]
+    fn kernel_float_grammar_is_strict() {
+        // `!float` is `Float(tokenize(value))` upstream — only scalars that
+        // tokenize to a STRING reach `Kernel#Float`, whose grammar rejects
+        // `,` separators, `Infinity`/`NaN` words and `1_` (`0x` hex and
+        // `_`-separated decimals pass). A non-numeric scalar dies ArgumentError
+        // or `can't convert` TypeError — both Fatal.
+        for (form, klass) in [
+            ("!float Infinity", "ArgumentError"),
+            ("!float nan", "ArgumentError"),
+            ("!float abc", "ArgumentError"),
+            ("!float 'abc'", "ArgumentError"),
+            ("!float '1,5e3'", "ArgumentError"),
+            ("!float '1__0'", "ArgumentError"),
+            ("!float '1_'", "ArgumentError"),
+            // `1.e5` is a String upstream — the FLOAT arm wants a SIGNED
+            // exponent (`1.E+5` is a Float) — so `Float("1.e5")` dies.
+            ("!float 1.e5", "ArgumentError"),
+            ("!float :x", "TypeError"),
+            ("!float ~", "TypeError"),
+            ("!float true", "TypeError"),
+        ] {
+            let e = baseline_with_row(&format!("- file: a.rb\n  rule: r\n  count: {form}"))
+                .unwrap_err();
+            assert!(e.is_fatal(), "count: {form}: {e}");
+            assert!(e.to_string().contains(klass), "count: {form}: {e}");
+        }
+        // Scalar forms tokenize resolves itself never reach `Kernel#Float` —
+        // `1.`/`.5` are Float-arm values upstream, `0x10`/`1_0` are
+        // Integers, each `Float(v)` → a Float → `got N.N`.
+        for (form, got) in [
+            ("!float '1.'", "got 1.0"),
+            ("!float '.5'", "got 0.5"),
+            ("!float 0x10", "got 16.0"),
+            ("!float 1_0", "got 10.0"),
+        ] {
+            let e = baseline_with_row(&format!("- file: a.rb\n  rule: r\n  count: {form}"))
+                .unwrap_err();
+            assert!(!e.is_fatal(), "count: {form}: {e}");
+            assert!(e.to_string().contains(got), "count: {form}: {e}");
+        }
+    }
+
+    #[test]
     fn disallowed_class_scalars_are_fatal_not_load_errors() {
         // Date/Time/`!ruby/*` resolver deaths are UNCAUGHT upstream (the run
         // dies, empty stdout, exit 1) — the Fatal surface, not a LoadError.
@@ -3222,6 +3659,7 @@ mod tests {
         ] {
             let e = baseline_with_row(row).unwrap_err();
             assert!(e.is_fatal(), "{row}: {e}");
+        }
         // `version:` and `ignored:` lines die the same death.
         let e = Baseline::parse("---\nversion: 2024-01-01\nignored: []\n", "t").unwrap_err();
         assert!(e.is_fatal());
@@ -3229,6 +3667,96 @@ mod tests {
         let e = Baseline::parse("---\nversion: !float abc\nignored: []\n", "t").unwrap_err();
         assert!(e.is_fatal());
         assert!(e.to_string().contains("invalid value for Float()"));
+    }
+
+    #[test]
+    fn fatal_scalars_anywhere_in_the_document_die_at_load() {
+        // `safe_load_file` types the WHOLE document before `parse_row` — a
+        // Date in an unknown top-level key, an unknown `meta:` row field, or
+        // a bare `- ` row scalar is a Fatal, never an ignored key or a
+        // `must be a Hash` (issue #326 review).
+        let e = Baseline::parse(
+            "---\nversion: 1\ngenerated_at: 2024-01-01\nignored: []\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal());
+        assert!(e.to_string().contains("Date"), "{e}");
+        let e = baseline_with_row("- file: a.rb\n  rule: r\n  meta: 2024-01-01\n  count: 1")
+            .unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        let e = Baseline::parse("---\nversion: 1\nignored:\n- 2024-01-01\n", "t").unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        // …and the Fatal beats row validation errors (`count: 0` beside a
+        // Date'd `message:`), and `version:` beats every row error
+        // (upstream checks version before rows).
+        let e = baseline_with_row("- file: a.rb\n  rule: r\n  count: 0\n  message: 2024-01-01")
+            .unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        let e = Baseline::parse(
+            "---\nversion: 2\nignored:\n- file: a.rb\n  rule: r\n  count: nope\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(!e.is_fatal());
+        assert_eq!(e.to_string(), "t: unsupported `version: 2` (expected 1)");
+    }
+
+    #[test]
+    fn ignored_truthiness_and_top_level_class_names() {
+        // `rows = raw["ignored"] || []` — a FALSY typed scalar is `[]`
+        // upstream and accepted; a truthy non-Array fails the check, run
+        // AFTER the version check.
+        for form in ["false", "no", "off", "~", "null"] {
+            let b = Baseline::parse(&format!("---\nversion: 1\nignored: {form}\n"), "t")
+                .unwrap_or_else(|e| panic!("ignored: {form}: {e}"));
+            assert!(b.is_empty(), "ignored: {form}");
         }
+        for form in ["5", "!!str", "1.5", "true", ":x"] {
+            let e = Baseline::parse(&format!("---\nversion: 1\nignored: {form}\n"), "t")
+                .unwrap_err();
+            assert_eq!(e.to_string(), "t: `ignored:` must be an Array", "ignored: {form}");
+        }
+        // The top-level `expected a Hash` reports the loaded class (a
+        // `:x` doc reads as a `key:`-shaped line here — a shape corner, not
+        // the class report).
+        for (doc, class) in [("5", "Integer"), ("~", "NilClass"), ("true", "TrueClass"), ("1.5", "Float")] {
+            let e = Baseline::parse(&format!("{doc}\n"), "t").unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                format!("t: expected a Hash at top level, got {class}"),
+                "doc: {doc}"
+            );
+        }
+    }
+
+    #[test]
+    fn sexagesimal_underscores_and_symbol_quote_edges() {
+        // `n.to_i` accepts `_` separators: `1_0:30` is 10·3600+30·60.
+        let b = baseline_with_row("- file: a.rb\n  rule: r\n  count: 1_0:30").unwrap();
+        assert_eq!(b.buckets()[0].count, 37800);
+        let b = baseline_with_row("- file: a.rb\n  rule: r\n  count: 1:2:3").unwrap();
+        assert_eq!(b.buckets()[0].count, 3723);
+        // `/^:(['"])(.*)\1/` is not end-anchored — `:'x'y` is `:x`.
+        let b = baseline_with_row("- file: :'x'y\n  rule: r\n  count: 1").unwrap();
+        assert_eq!(b.buckets()[0].file, KeyScalar::Symbol("x".to_string()));
+        // `!ruby/class` on empty resolves nil → `missing \`file:\``.
+        let e = baseline_with_row("- file: !ruby/class\n  rule: r\n  count: 1").unwrap_err();
+        assert_eq!(e.to_string(), "t: ignored[0] missing `file:`");
+        // `!str:Foo::Bar` names the WHOLE tail, not the last `::` segment.
+        let e = baseline_with_row("- file: !str:Foo::Bar x\n  rule: r\n  count: 1").unwrap_err();
+        assert!(e.is_fatal());
+        assert!(e.to_string().contains("Foo::Bar"), "{e}");
+        // `!ruby/encoding` canonicalises (`ascii` → `US-ASCII`, to_s is the
+        // name, inert key); unknown names die ArgumentError.
+        let b = baseline_with_row("- file: !ruby/encoding ascii\n  rule: r\n  count: 1").unwrap();
+        assert_eq!(
+            b.buckets()[0].file,
+            KeyScalar::Opaque("US-ASCII".to_string(), "Encoding")
+        );
+        let e = baseline_with_row("- file: !ruby/encoding no-such-enc\n  rule: r\n  count: 1")
+            .unwrap_err();
+        assert!(e.is_fatal());
+        assert!(e.to_string().contains("unknown encoding name"), "{e}");
     }
 }

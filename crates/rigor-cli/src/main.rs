@@ -3264,6 +3264,19 @@ fn baseline_dump(args: &[String]) -> ExitCode {
         rows.push(b);
     }
     if format == "json" {
+        // `JSON.pretty_generate` refuses non-finite numbers — a
+        // `.nan`/`.inf` typed key dies `JSON::GeneratorError` upstream
+        // (uncaught, exit 1) before any output.
+        for b in &rows {
+            for key in [&b.file, &b.rule] {
+                if let baseline::KeyScalar::Float(t) = key {
+                    if matches!(t.as_str(), "NaN" | "Infinity" | "-Infinity") {
+                        eprintln!("rigor: JSON::GeneratorError: {t} not allowed in JSON");
+                        return ExitCode::from(1);
+                    }
+                }
+            }
+        }
         println!("{}", dump_json(&rows));
     } else {
         return dump_text(&rows);
@@ -3435,9 +3448,10 @@ fn baseline_drift(args: &[String]) -> ExitCode {
         if group.is_empty() {
             continue;
         }
-        // `[bucket.file, bucket.rule]` — typed keys compare Ruby-style; a
-        // mixed-type pair dies upstream's `comparison of Array with Array
-        // failed` (uncaught, exit 1).
+        // The section header prints BEFORE `group.sort_by [file, rule]`
+        // upstream (`report_drift_rows`) — a mixed-typed key set dies the
+        // `comparison of Array with Array failed` crash after it.
+        println!("{}", drift_section_header(status, group.len()));
         let group = match baseline::ruby_sort(group, |a, b| {
             baseline::ruby_pair_cmp(
                 (&a.bucket.file, &a.bucket.rule),
@@ -3450,8 +3464,6 @@ fn baseline_drift(args: &[String]) -> ExitCode {
                 return ExitCode::from(1);
             }
         };
-        let n = group.len();
-        println!("{}", drift_section_header(status, n));
         for row in group {
             let delta_str = match row.delta.cmp(&0) {
                 std::cmp::Ordering::Greater => format!("+{}", row.delta),
