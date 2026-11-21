@@ -550,6 +550,12 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
                 .or_default()
                 .extend(methods);
         }
+        for (owner, methods) in std::mem::take(&mut tables.singleton_methods) {
+            idx.singleton_methods
+                .entry(owner)
+                .or_default()
+                .extend(methods);
+        }
         for (owner, defs) in std::mem::take(&mut tables.def_names) {
             union_def_names
                 .entry(owner)
