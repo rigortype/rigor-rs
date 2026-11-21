@@ -280,8 +280,14 @@ impl<'i> Typer<'i> {
                         tenv.remove(crate::indexed_narrowing_key(&name, &key).as_str());
                     }
                     let pre = tenv.get(name.as_str()).copied();
-                    let widened = pre
-                        .and_then(|pre| self.widen_mutated_binding(pre, "[]=", interner));
+                    let widened = pre.and_then(|pre| {
+                        // `index_write_arg_types` for an index target:
+                        // the stored key/value this slice cannot read
+                        // take the untyped pair the reference's own
+                        // unknown evidence does.
+                        let u = interner.untyped();
+                        self.widen_mutated_binding(pre, "[]=", &[Some(u), Some(u)], interner)
+                    });
                     widen_flow_writes(writes.iter(), tspan, tenv, interner);
                     // The index-target store is a MUTATION, not a rebind:
                     // `widen_mutated_binding` declining (`None` — the binding is
@@ -343,8 +349,16 @@ impl<'i> Typer<'i> {
                         // `widen_flow_writes`' Dynamic.
                         widened.push((
                             name.clone(),
-                            self.widen_mutated_binding(pre, "[]=", interner)
-                                .unwrap_or(pre),
+                            self.widen_mutated_binding(
+                                pre,
+                                "[]=",
+                                &{
+                                    let u = interner.untyped();
+                                    [Some(u), Some(u)]
+                                },
+                                interner,
+                            )
+                            .unwrap_or(pre),
                         ));
                     }
                 }
@@ -381,8 +395,16 @@ impl<'i> Typer<'i> {
                         if let Some(&pre) = tenv.get(name.as_str()) {
                             widened.push((
                                 name.clone(),
-                                self.widen_mutated_binding(pre, "[]=", interner)
-                                    .unwrap_or(pre),
+                                self.widen_mutated_binding(
+                                    pre,
+                                    "[]=",
+                                    &{
+                                        let u = interner.untyped();
+                                        [Some(u), Some(u)]
+                                    },
+                                    interner,
+                                )
+                                .unwrap_or(pre),
                             ));
                         }
                     }
@@ -500,9 +522,18 @@ impl<'i> Typer<'i> {
                                 tenv,
                             );
                             if let Some(&pre) = tenv.get(name.as_str()) {
-                                if let Some(widened) =
-                                    self.widen_mutated_binding(pre, &method, interner)
-                                {
+                                if let Some(widened) = self.widen_mutated_binding(
+                                    pre,
+                                    &method,
+                                    // `mutator_arg_types` — the call's own
+                                    // arguments feed the content join
+                                    // (rigor-rs#771).
+                                    &args
+                                        .iter()
+                                        .map(|&a| Some(self.type_of(ast, a, tenv, interner)))
+                                        .collect::<Vec<Option<TypeId>>>(),
+                                    interner,
+                                ) {
                                     tenv.insert(Rc::from(name.as_str()), widened);
                                 }
                             }
@@ -611,9 +642,15 @@ impl<'i> Typer<'i> {
                             None
                         };
                         if let Some(&pre) = tenv.get(name.as_str()) {
-                            if let Some(widened) =
-                                self.widen_mutated_binding(pre, "[]=", interner)
-                            {
+                            if let Some(widened) = self.widen_mutated_binding(
+                                pre,
+                                "[]=",
+                                &{
+                                    let u = interner.untyped();
+                                    [Some(u), Some(u)]
+                                },
+                                interner,
+                            ) {
                                 tenv.insert(Rc::from(name.as_str()), widened);
                             }
                         }
