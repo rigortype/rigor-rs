@@ -708,6 +708,77 @@ fn atm_param_accepts_arg_class_instance() {
     ));
 }
 
+/// `ClassInstance` acceptance for a NON-toplevel param head (rigor-rs#383):
+/// `class_ordering` answers `Unknown` for namespaced names (both names must
+/// be genuine top-level decls), so `param_accepts_ordering` mirrors the
+/// reference's `class_subtype_result` — host-resolvability (the generated
+/// `HOST_RESOLVABLE_CLASSES` table) plus the RBS ancestor chains.
+#[test]
+fn atm_param_accepts_arg_qualified_class_instance() {
+    let idx = CoreData::load();
+    // Host-resolvable on BOTH sides: `String <= Thread::Backtrace::Location`
+    // is false ⇒ reject (the oracle fires `expected Thread::Backtrace::Location,
+    // got "x"`).
+    assert!(!idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Thread::Backtrace::Location", vec![]),
+        "String"
+    ));
+    // Same-name accept, written either spelling.
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Thread::Backtrace::Location", vec![]),
+        "Thread::Backtrace::Location"
+    ));
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("::Thread::Backtrace::Location", vec![]),
+        "Thread::Backtrace::Location"
+    ));
+    // Host-alias twins: `Mutex` and `Thread::Mutex` are ONE host class — a
+    // bare-leaf spelling normalises through the unambiguous short→qualified
+    // map in BOTH directions.
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Thread::Mutex", vec![]),
+        "Mutex"
+    ));
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Mutex", vec![]),
+        "Mutex"
+    ));
+    // Subclass direction: `Thread::SizedQueue < Thread::Queue` ⇒ the queue
+    // param accepts a sized-queue arg; the SUPER direction rejects (arg
+    // `Thread::Queue` is broader than param `Thread::SizedQueue`).
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Thread::Queue", vec![]),
+        "Thread::SizedQueue"
+    ));
+    assert!(!idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Thread::SizedQueue", vec![]),
+        "Thread::Queue"
+    ));
+    // A vendored-but-unloaded param name (RBS-known, host-unresolvable:
+    // `ERB::Util` is not `require`d in the oracle's check host) still refutes
+    // a host-resolvable arg whose chain cannot contain it — the oracle's
+    // `subtype_result_via_ancestors` `no` (this is the `expected Outer::Inner,
+    // got 1` shape: the param is a sig-only class the host cannot see).
+    assert!(idx.knows_qualified_class("ERB::Util"));
+    assert!(!idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("ERB::Util", vec![]),
+        "Integer"
+    ));
+    // …but a non-host-resolvable ARG can never carry the rejection (`maybe`
+    // ⇒ admit): the arg class might be the param class itself under another
+    // spelling.
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("ERB::Util", vec![]),
+        "BigDecimal"
+    ));
+    // And a param name the registry does not hold at all stays `maybe` — the
+    // stub gate declines it upstream of this predicate.
+    assert!(idx.param_accepts_arg_class(
+        &RetainedParamType::ClassInstance("Foo::SigOnlyBarZzz", vec![]),
+        "Integer"
+    ));
+}
+
 /// The `string` / `int` aliases accept their concrete arm directly and, via
 /// the interface walk, decline to reject a class that implements the
 /// conversion: `int` accepts `Float` because `Float` (over `Numeric`) has

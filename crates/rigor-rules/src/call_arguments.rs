@@ -484,7 +484,19 @@ fn stub_typed_param(index: &CoreIndex, param: &RetainedParamType, depth: usize) 
             }
         }
         RetainedParamType::ClassInstance(name, _) => {
-            index.is_synthesized_stub(name) || !index.knows_class(name)
+            // The oracle resolves the written name to its absolute form and
+            // consults `env.class_decls ∪ env.class_alias_decls`
+            // (`undefined_param_class?` → `rbs_class_known?`). `knows_class` is
+            // leaf-keyed, so a QUALIFIED head (`Outer::Inner`,
+            // `Thread::Backtrace::Location`) must also consult the qualified
+            // registry (rigor-rs#383). No leaf fallback: `Foo::Bar` missing
+            // must decline even when a different `Bar` exists. The alias
+            // table's half stays declined deliberately — the oracle renders a
+            // class alias's TARGET (`class Aliased = Thread::Mutex` ⇒
+            // `expected Thread::Mutex`), which the port cannot yet resolve,
+            // so declining beats a drifted emit.
+            index.is_synthesized_stub(name)
+                || !(index.knows_class(name) || index.knows_qualified_class(name))
         }
         RetainedParamType::Interface(..)
         | RetainedParamType::Variable(_)
@@ -524,7 +536,10 @@ fn single_concrete_arg_class(
         return None;
     }
     let class_name = concrete_class_name(interner, index, source, arg_ty)?;
-    if !index.knows_class(&class_name) {
+    // `rbs_class_known?` (`class_decls ∪ class_alias_decls`) resolves the
+    // written name absolutely — a qualified nominal (`Thread::Mutex`, a
+    // project-sig `Outer::Inner`) counts too (rigor-rs#383).
+    if !(index.knows_class(&class_name) || index.knows_qualified_class(&class_name)) {
         return None;
     }
     Some(class_name)
