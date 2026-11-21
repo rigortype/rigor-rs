@@ -1805,6 +1805,14 @@ impl<'i> Typer<'i> {
             }
         }
         let mut suspect: HashSet<String> = HashSet::new();
+        // The decision gate below is a pure function of `(ast, d)` but its
+        // arena scan is O(nodes) per decision — the fixed point re-runs it
+        // every pass, and a jump body (rigor-rs#639) can now be a whole
+        // 30k-statement generated parser loop. Memoized per call: the pass
+        // walks decision spans in the same order, so the first pass warms
+        // exactly the gates the later passes re-read.
+        let mut gate_of: std::collections::HashMap<rigor_parse::Span, Option<rigor_parse::Span>> =
+            std::collections::HashMap::new();
         loop {
             let mut grew = false;
             for site in &live {
@@ -1859,11 +1867,12 @@ impl<'i> Typer<'i> {
                 if !hot {
                     continue;
                 }
-                let gate = ast
-                    .iter()
-                    .map(|(_, n)| n.span())
-                    .filter(|s| s.0 <= d.0 && d.1 <= s.1 && *s != d)
-                    .min_by_key(|s| s.1 - s.0);
+                let gate = *gate_of.entry(d).or_insert_with(|| {
+                    ast.iter()
+                        .map(|(_, n)| n.span())
+                        .filter(|s| s.0 <= d.0 && d.1 <= s.1 && *s != d)
+                        .min_by_key(|s| s.1 - s.0)
+                });
                 if let Some(gate) = gate {
                     for site in &live {
                         if gate.0 <= site.span.0 && site.span.1 <= gate.1 {
