@@ -1145,7 +1145,10 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // and config `disable:`, per reference WD6). With no resolved baseline this
     // is a no-op, so the no-baseline path stays byte-identical (harness-gated).
     if let Some(path) = resolve_baseline_path(&baseline_arg, &cfg) {
-        findings = apply_baseline(findings, &path);
+        findings = match apply_baseline(findings, &path) {
+            Ok(f) => f,
+            Err(code) => return code,
+        };
     }
 
     // ADR-0040 — inject bad-path diagnostics AFTER the baseline filter (they are
@@ -1219,8 +1222,14 @@ fn cmd_check(args: &[String]) -> ExitCode {
     // final thing emitted, and OR's onto the exit code. It must run and print
     // even when `normal_fail` is already true (informational output + a flat OR;
     // no distinct exit code).
-    let strict_violation =
-        baseline_strict && baseline_strict_violation(&raw_findings, &cfg, &baseline_arg);
+    let strict_violation = if baseline_strict {
+        match baseline_strict_violation(&raw_findings, &cfg, &baseline_arg) {
+            Ok(v) => v,
+            Err(code) => return code,
+        }
+    } else {
+        false
+    };
 
     if normal_fail || strict_violation || fail_on_hit {
         ExitCode::from(1)
@@ -1345,22 +1354,27 @@ fn baseline_strict_violation(
     raw_findings: &[Finding],
     cfg: &Config,
     baseline_arg: &BaselineArg,
-) -> bool {
+) -> Result<bool, ExitCode> {
     let Some(path) = resolve_baseline_path(baseline_arg, cfg) else {
         eprintln!("rigor: --baseline-strict given but no baseline is active; nothing to gate.");
-        return false;
+        return Ok(false);
     };
-
     let baseline = match Baseline::load(Path::new(&path)) {
         Ok(b) => b,
+        // Uncaught upstream (`Psych::DisallowedClass` etc.) — the run dies
+        // with the exception, exit 1, as in `apply_baseline`.
+        Err(e) if e.is_fatal() => {
+            eprintln!("rigor: {e}");
+            return Err(ExitCode::from(1));
+        }
         Err(e) => {
             eprintln!("rigor: baseline load failed: {e} (--baseline-strict gate skipped)");
-            return false;
+            return Ok(false);
         }
     };
     // An absent file loads as empty → nothing to gate, silently.
     if baseline.is_empty() {
-        return false;
+        return Ok(false);
     }
 
     let cwd = std::env::current_dir().ok();
@@ -1373,11 +1387,15 @@ fn baseline_strict_violation(
     let drifted: Vec<&baseline::DriftRow> =
         rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
     if drifted.is_empty() {
-        return false;
+        return Ok(false);
     }
 
-    report_strict_drift(&drifted, &path);
-    true
+    // `report_strict_drift` either prints the whole report or dies mid-way
+    // (the `sort_by` crash on mixed-typed keys) — `Err` is the exit-1 crash.
+    if report_strict_drift(&drifted, &path).is_err() {
+        return Err(ExitCode::from(1));
+    }
+    Ok(true)
 }
 
 /// Print the `--baseline-strict` drift report to stderr (reference
@@ -1386,21 +1404,43 @@ fn baseline_strict_violation(
 /// inside the parens (verified byte-for-byte against the oracle). `delta_str`
 /// is `+N` for positive delta, else Ruby's `Integer#to_s` (`0`, `-N`);
 /// `status` renders as the lowercase status word (`over`/`cleared`/`reducible`).
-fn report_strict_drift(drifted: &[&baseline::DriftRow], path: &str) {
-    eprint!("{}", format_strict_drift(drifted, path));
+/// `Err` is the upstream `sort_by` crash on incomparable keys — the header
+/// has already printed by then.
+fn report_strict_drift(drifted: &[&baseline::DriftRow], path: &str) -> Result<(), ()> {
+    match format_strict_drift(drifted, path) {
+        Ok(text) => {
+            eprint!("{text}");
+            Ok(())
+        }
+        Err(header) => {
+            eprint!("{header}");
+            eprintln!("rigor: ArgumentError: comparison of Array with Array failed");
+            Err(())
+        }
+    }
 }
 
 /// Render the strict-drift report as one trailing-newline-terminated block, so
 /// the exact bytes are unit-testable. `eprint!`ed verbatim by
-/// `report_strict_drift`.
-fn format_strict_drift(drifted: &[&baseline::DriftRow], path: &str) -> String {
+/// `report_strict_drift`. `Err(header)` is the upstream `sort_by` crash —
+/// `Enumerable#sort_by` dies `comparison of Array with Array failed` on a
+/// mixed-type `[file, rule]` set — with the already-printed header.
+fn format_strict_drift(drifted: &[&baseline::DriftRow], path: &str) -> Result<String, String> {
     let mut out = String::new();
     out.push_str(&format!(
         "rigor: --baseline-strict — {} bucket(s) drifted from {path}:\n",
         drifted.len()
     ));
-    let mut rows: Vec<&&baseline::DriftRow> = drifted.iter().collect();
-    rows.sort_by(|a, b| (&a.bucket.file, &a.bucket.rule).cmp(&(&b.bucket.file, &b.bucket.rule)));
+    let rows: Vec<&&baseline::DriftRow> = drifted.iter().collect();
+    let rows = match baseline::ruby_sort(rows, |a, b| {
+        baseline::ruby_pair_cmp(
+            (&a.bucket.file, &a.bucket.rule),
+            (&b.bucket.file, &b.bucket.rule),
+        )
+    }) {
+        Ok(r) => r,
+        Err(()) => return Err(out),
+    };
     for row in rows {
         out.push_str(&format!(
             "  {}  [{}]  {} → {}  (Δ{}, {})\n",
@@ -1413,7 +1453,7 @@ fn format_strict_drift(drifted: &[&baseline::DriftRow], path: &str) -> String {
         ));
     }
     out.push_str("rigor: run `rigor baseline regenerate` to refresh the baseline.\n");
-    out
+    Ok(out)
 }
 
 /// Ruby's `delta.positive? ? "+#{delta}" : delta.to_s` — `+N` for positive,
@@ -2951,8 +2991,15 @@ fn load_baseline_strict(path: &str) -> Result<Baseline, ExitCode> {
         return Err(ExitCode::from(64));
     }
     Baseline::load(Path::new(path)).map_err(|e| {
-        eprintln!("rigor: baseline load failed: {e}");
-        ExitCode::from(64)
+        if e.is_fatal() {
+            // An uncaught `Psych::DisallowedClass`/`ArgumentError` upstream —
+            // exit 1, not the rescued-LoadError exit 64.
+            eprintln!("rigor: {e}");
+            ExitCode::from(1)
+        } else {
+            eprintln!("rigor: baseline load failed: {e}");
+            ExitCode::from(64)
+        }
     })
 }
 
@@ -3191,28 +3238,35 @@ fn baseline_dump(args: &[String]) -> ExitCode {
         Ok(b) => b,
         Err(code) => return code,
     };
-    // `filter_dump_rows`: exact rule match, `File.fnmatch?`-no-flags file glob.
-    let rows: Vec<&Bucket> = baseline
-        .buckets()
-        .iter()
-        .filter(|b| {
-            if let Some(r) = &rule {
-                if &b.rule != r {
-                    return false;
-                }
+    // `filter_dump_rows`: exact rule match, `File.fnmatch?`-no-flags file
+    // glob — a non-String `file` under `--file` dies `TypeError` upstream
+    // (`File.fnmatch?(g, 5)`), an uncaught exit-1 crash.
+    let mut rows: Vec<&Bucket> = Vec::new();
+    for b in baseline.buckets() {
+        if let Some(r) = &rule {
+            if b.rule.as_str() != Some(r.as_str()) {
+                continue;
             }
-            if let Some(g) = &file_glob {
-                if !conformance_gate::fnmatch(g, &b.file) {
-                    return false;
+        }
+        if let Some(g) = &file_glob {
+            match b.file.as_str() {
+                None => {
+                    eprintln!(
+                        "rigor: TypeError: no implicit conversion of {} into String",
+                        b.file.class_name()
+                    );
+                    return ExitCode::from(1);
                 }
+                Some(f) if !conformance_gate::fnmatch(g, f) => continue,
+                Some(_) => {}
             }
-            true
-        })
-        .collect();
+        }
+        rows.push(b);
+    }
     if format == "json" {
         println!("{}", dump_json(&rows));
     } else {
-        dump_text(&rows);
+        return dump_text(&rows);
     }
     ExitCode::SUCCESS
 }
@@ -3221,17 +3275,17 @@ fn baseline_dump(args: &[String]) -> ExitCode {
 /// else group by rule (first-seen order, most buckets first — `group_by` +
 /// `sort_by -group.size`, stable), buckets by `[-count, file]`, a blank line
 /// between groups, then the `Total:` line over the FILTERED rows.
-fn dump_text(rows: &[&Bucket]) {
+fn dump_text(rows: &[&Bucket]) -> ExitCode {
     if rows.is_empty() {
         println!("(no baseline rows matching the supplied filters)");
-        return;
+        return ExitCode::SUCCESS;
     }
-    let mut groups: Vec<(&str, Vec<&Bucket>)> = Vec::new();
+    let mut groups: Vec<(&baseline::KeyScalar, Vec<&Bucket>)> = Vec::new();
     for b in rows {
-        if let Some(g) = groups.iter_mut().find(|(r, _)| *r == b.rule) {
+        if let Some(g) = groups.iter_mut().find(|(r, _)| **r == b.rule) {
             g.1.push(b);
         } else {
-            groups.push((b.rule.as_str(), vec![b]));
+            groups.push((&b.rule, vec![b]));
         }
     }
     groups.sort_by_key(|g| std::cmp::Reverse(g.1.len()));
@@ -3240,8 +3294,20 @@ fn dump_text(rows: &[&Bucket]) {
         let total: usize = group.iter().map(|b| b.count).sum();
         occurrences += total;
         println!("{rule}  ({} bucket(s), {total} occurrence(s))", group.len());
-        let mut sorted = group.clone();
-        sorted.sort_by(|a, b| b.count.cmp(&a.count).then_with(|| a.file.cmp(&b.file)));
+        // `sort_by [-count, file]` — the `file` element is a typed key; a
+        // mixed-type comparison dies `comparison of Array with Array
+        // failed` upstream (uncaught, exit 1 — earlier groups have already
+        // printed, matching this loop's progress).
+        let sorted = match baseline::ruby_sort(group.clone(), |a, b| match b.count.cmp(&a.count) {
+            std::cmp::Ordering::Equal => baseline::ruby_scalar_cmp(&a.file, &b.file),
+            ord => Some(ord),
+        }) {
+            Ok(s) => s,
+            Err(()) => {
+                eprintln!("rigor: ArgumentError: comparison of Array with Array failed");
+                return ExitCode::from(1);
+            }
+        };
         for bucket in sorted {
             match &bucket.message {
                 Some(m) => println!("  {}: {}  ~/{m}/", bucket.file, bucket.count),
@@ -3251,6 +3317,7 @@ fn dump_text(rows: &[&Bucket]) {
         println!();
     }
     println!("Total: {} bucket(s), {occurrences} occurrence(s)", rows.len());
+    ExitCode::SUCCESS
 }
 
 /// `dump_to_json` + `JSON.pretty_generate` — the `{"version":…,"ignored":[…]}`
@@ -3267,8 +3334,8 @@ fn dump_json(rows: &[&Bucket]) -> String {
     out.push_str("[\n");
     for (i, b) in rows.iter().enumerate() {
         out.push_str("    {\n");
-        out.push_str(&format!("      \"file\": {},\n", json_string(&b.file)));
-        out.push_str(&format!("      \"rule\": {},\n", json_string(&b.rule)));
+        out.push_str(&format!("      \"file\": {},\n", b.file.json()));
+        out.push_str(&format!("      \"rule\": {},\n", b.rule.json()));
         out.push_str(&format!("      \"count\": {}", b.count));
         if let Some(m) = &b.message {
             out.push_str(&format!(",\n      \"message\": {}", json_string(m)));
@@ -3363,12 +3430,26 @@ fn baseline_drift(args: &[String]) -> ExitCode {
     println!("Drift report against {path}:");
     println!();
     for status in [DriftStatus::Over, DriftStatus::Cleared, DriftStatus::Reducible, DriftStatus::Within] {
-        let mut group: Vec<&&baseline::DriftRow> =
+        let group: Vec<&&baseline::DriftRow> =
             shown.iter().filter(|r| r.status == status).collect();
         if group.is_empty() {
             continue;
         }
-        group.sort_by(|a, b| (&a.bucket.file, &a.bucket.rule).cmp(&(&b.bucket.file, &b.bucket.rule)));
+        // `[bucket.file, bucket.rule]` — typed keys compare Ruby-style; a
+        // mixed-type pair dies upstream's `comparison of Array with Array
+        // failed` (uncaught, exit 1).
+        let group = match baseline::ruby_sort(group, |a, b| {
+            baseline::ruby_pair_cmp(
+                (&a.bucket.file, &a.bucket.rule),
+                (&b.bucket.file, &b.bucket.rule),
+            )
+        }) {
+            Ok(g) => g,
+            Err(()) => {
+                eprintln!("rigor: ArgumentError: comparison of Array with Array failed");
+                return ExitCode::from(1);
+            }
+        };
         let n = group.len();
         println!("{}", drift_section_header(status, n));
         for row in group {
@@ -3458,15 +3539,30 @@ fn baseline_prune(args: &[String]) -> ExitCode {
     let entries = baseline_entries(&findings);
     let rows = baseline.audit(&entries);
 
-    let mut cleared: Vec<&baseline::DriftRow> =
-        rows.iter().filter(|r| r.status == DriftStatus::Cleared).collect();
+    let cleared: Vec<&baseline::DriftRow> = rows
+        .iter()
+        .filter(|r| r.status == DriftStatus::Cleared)
+        .collect();
     if cleared.is_empty() {
         println!("No cleared buckets to prune.");
         return ExitCode::SUCCESS;
     }
-    cleared.sort_by(|a, b| (&a.bucket.file, &a.bucket.rule).cmp(&(&b.bucket.file, &b.bucket.rule)));
-
+    // The header prints before `cleared.sort_by [file, rule]` upstream
+    // (`announce_prune`) — a mixed-typed key set dies the `comparison of
+    // Array with Array failed` crash after it.
     println!("{} bucket(s) to prune from {path}:", cleared.len());
+    let cleared = match baseline::ruby_sort(cleared, |a, b| {
+        baseline::ruby_pair_cmp(
+            (&a.bucket.file, &a.bucket.rule),
+            (&b.bucket.file, &b.bucket.rule),
+        )
+    }) {
+        Ok(c) => c,
+        Err(()) => {
+            eprintln!("rigor: ArgumentError: comparison of Array with Array failed");
+            return ExitCode::from(1);
+        }
+    };
     for row in &cleared {
         println!("  - {}  [{}]  (was: {})", row.bucket.file, row.bucket.rule, row.bucket.count);
     }
@@ -3516,19 +3612,24 @@ fn resolve_baseline_path(arg: &BaselineArg, cfg: &Config) -> Option<String> {
 /// degradation, matching the reference's "continuing without baseline"). The
 /// matcher keys each diagnostic on its project-root-relative path, exactly as
 /// the reference normalizes `diag.path` against `Dir.pwd`.
-fn apply_baseline(
-    findings: Findings,
-    path: &str,
-) -> Findings {
+fn apply_baseline(findings: Findings, path: &str) -> Result<Findings, ExitCode> {
     let baseline = match Baseline::load(Path::new(path)) {
         Ok(b) => b,
+        // A `Baseline::LoadError` warns and runs unfiltered; an uncaught
+        // exception upstream (`Psych::DisallowedClass` on a Date/`!ruby/*`
+        // scalar, `Float()`'s `ArgumentError` — issue #326) kills the run
+        // like the reference: `rigor: <Class>: <message>`, exit 1.
+        Err(e) if e.is_fatal() => {
+            eprintln!("rigor: {e}");
+            return Err(ExitCode::from(1));
+        }
         Err(e) => {
             eprintln!("rigor: baseline load failed: {e} (continuing without baseline)");
-            return findings;
+            return Ok(findings);
         }
     };
     if baseline.is_empty() {
-        return findings;
+        return Ok(findings);
     }
 
     // Pair each finding with its relative path; internal-error diagnostics
@@ -3549,10 +3650,10 @@ fn apply_baseline(
     // regroups output by (file, rule) bin under a non-empty baseline
     // (`Baseline#filter` returns the regrouped diagnostics themselves).
     let mut slots: Vec<Option<Finding>> = findings.into_iter().map(Some).collect();
-    surfaced_idx
+    Ok(surfaced_idx
         .into_iter()
         .map(|i| slots[i].take().expect("baseline filter returns each index at most once"))
-        .collect()
+        .collect())
 }
 
 /// Normalize a path to project-root-relative (against cwd), matching the

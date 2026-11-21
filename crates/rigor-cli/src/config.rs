@@ -39,7 +39,7 @@ use rigor_rules::SuppressSet;
 use serde::Deserialize;
 
 mod psych_booleans;
-mod psych_error;
+pub(crate) mod psych_error;
 
 /// The parsed `.rigor.yml`. Unknown keys are ignored (no `deny_unknown_fields`),
 /// and every field defaults so a partial or empty file is valid.
@@ -3126,9 +3126,12 @@ fn coerce_effects_value(merged: &serde_yaml::Mapping) -> Result<(), LoadFailure>
             // `name?` is `/\A[a-z0-9][a-z0-9_-]*\z/`.
             let glob = e.bytes().any(|b| matches!(b, b'*' | b'?' | b'[' | b']' | b'/' | b'.'));
             let name = !e.is_empty()
-                && e.bytes().next().is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
                 && e.bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+                    .next()
+                    .is_some_and(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                && e.bytes().all(|b| {
+                    b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-'
+                });
             if !glob && !name {
                 return Err(usage_failure(format!(
                     "effects.snapshot.reach entry is neither a file glob nor a well-formed \
@@ -4638,9 +4641,14 @@ mod bleeding_edge_selector_tests {
         );
         assert_eq!(
             sel("bleeding_edge:\n  all: true\n  except:\n    - use-of-void-value\n"),
-            BleedingEdgeSelector::All { except: vec!["use-of-void-value".into()] }
+            BleedingEdgeSelector::All {
+                except: vec!["use-of-void-value".into()]
+            }
         );
-        assert_eq!(sel("bleeding_edge:\n  all: false\n"), BleedingEdgeSelector::None);
+        assert_eq!(
+            sel("bleeding_edge:\n  all: false\n"),
+            BleedingEdgeSelector::None
+        );
         assert_eq!(sel("bleeding_edge: 42\n"), BleedingEdgeSelector::None);
     }
 
