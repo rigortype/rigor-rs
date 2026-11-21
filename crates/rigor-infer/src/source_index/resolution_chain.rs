@@ -537,10 +537,21 @@ impl SourceIndex {
     }
 
     /// Whether `owner`'s `method` rests on a fact the port cannot vouch for:
-    /// a `possible` def or a contested visibility slot.
-    fn uncertain_definer(&self, owner: &str, method: &str) -> bool {
+    /// a `possible` def, a contested visibility slot, or — when the reader
+    /// consults visibility — a def-node slot a non-`def` definer superseded
+    /// (`supersede_def_nodes`) or a name a `define_method` / `alias` left
+    /// replaced without a later certain visibility write
+    /// (`replaced_visibility_mark`, upstream #2013).
+    fn uncertain_definer(&self, owner: &str, method: &str, reads_visibility: bool) -> bool {
         let key = (owner.to_string(), method.to_string());
-        self.ancestry.possible.contains(&key) || self.contested_slot(owner, method)
+        if self.ancestry.possible.contains(&key) || self.contested_slot(owner, method) {
+            return true;
+        }
+        let seg = owner.rsplit("::").next().unwrap_or(owner);
+        if self.def_node_superseded(seg, method) {
+            return true;
+        }
+        reads_visibility && self.visibility_replaced(seg, method)
     }
 
     /// Whether `owner`'s `method` slot is contested, by name or by the
@@ -566,7 +577,7 @@ impl SourceIndex {
             .filter(|k| *k == name || k.ends_with(&suffix))
             .filter(|k| self.owner_defines(k, method, DefKind::Instance))
             .all(|k| {
-                self.settled_definer(core, k, method, false, |n| {
+                self.settled_definer(core, k, method, false, false, |n| {
                     self.owner_defines(n, method, DefKind::Instance)
                 })
                 .is_some_and(|d| d == *k)
@@ -579,23 +590,45 @@ impl SourceIndex {
     /// entry after the class (the override lints' `from:`); otherwise from
     /// the chain's head (the typing read). `defines` is the reader's own
     /// definer predicate.
+    /// `reads_visibility` (rigor-rs#492): the reader's answer comes from the
+    /// reference's def-node / visibility slot, so the supersede and
+    /// replaced-mark declines join the `possible?` ones.
     pub(crate) fn settled_definer(
         &self,
         core: &CoreIndex,
         class: &str,
         method: &str,
         skip_self: bool,
+        reads_visibility: bool,
         defines: impl Fn(&str) -> bool,
     ) -> Option<String> {
         let chain = self.instance_chain(class)?;
         if !chain.marks.iter().all(|m| self.discharged(core, m, method)) {
             return None;
         }
-        let answer = first_definer(self, core, &chain.entries, class, method, skip_self, &defines)?;
+        let answer = first_definer(
+            self,
+            core,
+            &chain.entries,
+            class,
+            method,
+            skip_self,
+            reads_visibility,
+            &defines,
+        )?;
         match &chain.retro {
             None => Some(answer),
             Some(retro) => {
-                let other = first_definer(self, core, retro, class, method, skip_self, &defines)?;
+                let other = first_definer(
+                    self,
+                    core,
+                    retro,
+                    class,
+                    method,
+                    skip_self,
+                    reads_visibility,
+                    &defines,
+                )?;
                 (other == answer).then_some(answer)
             }
         }
@@ -612,6 +645,7 @@ fn first_definer(
     class: &str,
     method: &str,
     skip_self: bool,
+    reads_visibility: bool,
     defines: &impl Fn(&str) -> bool,
 ) -> Option<String> {
     let start = if skip_self {
@@ -630,7 +664,7 @@ fn first_definer(
                 }
             }
             ChainEntry::Project(n) => {
-                if idx.uncertain_definer(n, method) {
+                if idx.uncertain_definer(n, method, reads_visibility) {
                     return None;
                 }
                 if defines(n) {

@@ -127,15 +127,26 @@ impl SourceIndex {
 
     /// Upstream v0.4.6 (#2237 / issue #2013) — whether a `define_method` /
     /// `alias_method` / `alias` of `method` in a body of the class whose last
-    /// constant segment is `owner` may give the name another visibility than
-    /// the `def` in `file` records: any replacer in another file, or one in
-    /// this file no later direct `private :x` settles. Coarse by owner
-    /// segment, so it only declines more.
-    pub fn visibility_replaced(&self, owner: &str, method: &str, file: &FileKey) -> bool {
-        let here = self.file_index.get(file).copied();
+    /// constant segment is `owner` left the name's visibility slot
+    /// contested: the reference's `replaced_visibility_mark` survives the
+    /// project fold as a sit-once contest, which a certain visibility write
+    /// later in the same file (`settled`) clears. Asked of the overriding
+    /// class's name — and, inside `uncertain_definer`, of the ancestor the
+    /// override read hits. Coarse by owner segment, so it only declines
+    /// more.
+    pub fn visibility_replaced(&self, owner: &str, method: &str) -> bool {
         self.visibility_replacers
             .get(&(owner.to_string(), method.to_string()))
-            .is_some_and(|rows| rows.iter().any(|&(i, settled)| !settled || Some(i) != here))
+            .is_some_and(|rows| rows.iter().any(|&(_, settled)| !settled))
+    }
+
+    /// rigor-rs#492 (upstream #2013, `supersede_def_nodes`) — whether a
+    /// non-`def` definer (`attr_*`, `define_method`, `alias_method`,
+    /// `alias`, a Forwardable delegator) replaced the name's `def` in the
+    /// same file, so the def-node slot the reference's override read
+    /// consults sits contested.
+    pub fn def_node_superseded(&self, owner: &str, method: &str) -> bool {
+        self.superseded_def_nodes.contains(&(owner.to_string(), method.to_string()))
     }
 
     /// Record whether the project config lists `pre_eval:` files.

@@ -714,6 +714,14 @@ pub struct SourceIndex {
     /// (`define_method` / `alias_method` / `alias`) of that instance method.
     /// See [`Self::visibility_replaced`].
     visibility_replacers: HashMap<(String, String), Vec<(usize, bool)>>,
+    /// rigor-rs#492 (upstream #2013, `supersede_def_nodes` /
+    /// `contested_def_nodes`) — `(owner's last constant segment, method)`
+    /// whose def-node slot a non-`def` definer superseded after an earlier
+    /// `def` of the name in the same file (`attr_*`, `define_method`,
+    /// `alias_method`, `alias`, a Forwardable delegator). Read only to
+    /// DECLINE — the reference gives the name an override-parent answer
+    /// its def-node walk cannot produce.
+    superseded_def_nodes: HashSet<(String, String)>,
     /// Upstream v0.4.7 (ADR-127, #2515 and follow-ups) — every method name
     /// the project gives a body in any form: a `def` of any kind, a literal
     /// `define_method` / `alias_method` / `alias` / `attr_*` / delegation

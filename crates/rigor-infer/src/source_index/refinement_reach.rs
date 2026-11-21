@@ -254,7 +254,7 @@ impl SourceIndex {
         // def clamp}` + `1.clamp` declines; `refine(String){def center}`
         // + `"x".center` declines at the definer itself).
         let definer = self
-            .settled_definer(core, class, method, false, |n| {
+            .settled_definer(core, class, method, false, false, |n| {
                 self.override_classes.get(n).is_some_and(|e| {
                     e.methods.contains(method) || e.method_visibilities.contains_key(method)
                 })
