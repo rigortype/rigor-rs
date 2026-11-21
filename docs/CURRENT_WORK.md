@@ -60,6 +60,7 @@ build time (ADR-0007); `RIGOR_RBS_CORE_DIR` is the override seam and
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-21 #685 CLOSED** (PR #761): `Algebra::union` member-set builder (flatten + `Interner::cmp`, `top`/`bot` verbatim) + order-preserving `flatten_union_members`; 4 raw `Union` mints routed, 2 flat-only audited. 0 FP, census = master. [note](notes/20261121-issue-685-union-canonicalization.md)
 - **2026-11-21 #639 CLOSED** (PR #756): loop-cap for jump/once bodies + rebindable ivars (`IvarWrite`) + write-position `moved`; 8 master FPs closed, 22/22 match; 0 FP / 103 = master; gate memo 2.34x→2.10x. →#757–#759. [note](notes/20261121-issue-639-loop-cap-jump-ivar.md)
 - **2026-11-21 #439 CLOSED** (PR #753): reach-memo audit in CI; 0 FP. →#754. [note](notes/20261121-issue-439-reach-memo-audit-gate.md)
 - **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand — x-polarity gate, dominating-write cut, body-env leaf typing, `Integer#[]` fold; `x = [1,2][x] || 0` caps; 0 FP / sweep; 5 Opus rounds. →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
