@@ -7,7 +7,7 @@ script regenerates it against a release `rigor` binary (default
 
 Default is the `**` row the first PR of #424 lands (800 and 1600 links).
 `--all` adds the call / `+` / constant-path rows, the local-read residuals,
-and the modifier-`if` row.
+the modifier-`if` row, and the nested-`class` row.
 
 Usage:
   python3 harness/time_nesting.py
@@ -28,6 +28,10 @@ ROOT = Path(__file__).resolve().parent.parent
 
 # (kind, sizes). Default is `**` only; `--all` uses the rest too.
 POW = ("pow", [800, 1600])
+# The nested-`class` row (#424's "4,999 nested class/module" shape). The
+# lowering refuses nesting past 5,000 (a deterministic depth refusal, exit
+# 1), so 2,000 is the largest size every build must complete.
+NESTCLASS = ("nestclass", [1_000, 2_000])
 OTHERS = [
     ("call", [10_000, 20_000]),
     ("plus", [10_000, 20_000]),
@@ -36,6 +40,7 @@ OTHERS = [
     ("vplus", [10_000, 20_000]),
     ("xcall", [10_000, 20_000]),
     ("modif", [5_000, 10_000]),
+    NESTCLASS,
 ]
 
 
@@ -56,6 +61,11 @@ def generate(kind: str, n: int) -> str:
         return "x = foo\n" + "x" + ".a" * n + "\n"
     if kind == "modif":
         return "1" + " if x" * n + "\n"
+    if kind == "nestclass":
+        # #424's "4,999 nested class/module" row: `class C0; class C1; …`
+        # D deep. Qualified names grow with depth, so a build that rejoins
+        # per-class prefixes shows up super-linearly here.
+        return "".join(f"class C{i}\n" for i in range(n)) + "end\n" * n
     raise SystemExit(f"unknown kind {kind!r}")
 
 
@@ -88,7 +98,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument(
         "--all",
         action="store_true",
-        help="also time call / + / const / local-read / modifier-if rows",
+        help="also time call / + / const / local-read / modifier-if / nested-class rows",
     )
     args = ap.parse_args(argv[1:])
     rigor = Path(args.bin)
