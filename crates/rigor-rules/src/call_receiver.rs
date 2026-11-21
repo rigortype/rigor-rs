@@ -326,7 +326,29 @@ receiver_classes: Some(vec![receiver_render]),
     // witnessing it against the unrelated stdlib surface is an FP (caught by
     // fp_audit on gitlab app/models the first time this gate was
     // `knows_class`-wide).
-    if index.class_name_of(interner, recv_ty).is_none() {
+    // The receiver's concrete class for the scalar verdict. A union of
+    // scalar CONSTANTS sharing one class collapses to that class — the
+    // reference fires `for 0 | 1` where `check_union_call`'s "fewer than two
+    // distinct arm classes" decline already defers the answer here. A
+    // mixed-class union, or one holding a non-Constant arm (Tuple/HashShape
+    // are reference-SILENT this way — `[1] | [2]` / `{a: 1} | {b: 2}`),
+    // resolves to `None` and keeps the memberwise union verdict.
+    let resolved_class = index.class_name_of(interner, recv_ty).or_else(|| {
+        let Type::Union(ms) = interner.get(recv_ty) else { return None };
+        let mut name: Option<&'static str> = None;
+        for &m in ms.iter() {
+            if !matches!(interner.get(m), Type::Constant(_)) {
+                return None;
+            }
+            let n = index.class_name_of(interner, m)?;
+            match name {
+                Some(prev) if prev != n => return None,
+                _ => name = Some(n),
+            }
+        }
+        name
+    });
+    if resolved_class.is_none() {
         // UNION receiver — the reference's `union_undefined_method_diagnostic`
         // (`check_rules.rb:1921`), reached exactly where the scalar path finds
         // no single concrete class (`class_name.nil?`). Fire only when EVERY
@@ -464,7 +486,7 @@ receiver_classes: Some(vec![name.to_string()]),
     // round-trips by id. A receiver that resolves only through the in-source /
     // registry surface (a project class, or a non-core `X.new` like Pathname)
     // returns `None` here ⇒ silent (reference leniency, see the rustdoc above).
-    let class_name = index.class_name_of(interner, recv_ty)?;
+    let class_name = resolved_class?;
     // Upstream #739/#742 — the core-id twin of the decline above. `class_name_of`
     // answers only with a `CORE_CLASSES` name today, none of which is a module or a
     // metaclass, so this is defence in depth: it keeps the two instance paths

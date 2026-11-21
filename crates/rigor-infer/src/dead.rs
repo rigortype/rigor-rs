@@ -1232,14 +1232,42 @@ impl<'i> Typer<'i> {
     /// class. `respond_to?` and every other call narrow nothing — the
     /// oracle keeps the carrier (`q = "x"; …; if q.respond_to?(:upcase) ||
     /// r; else; q.w` fires `w for "x"`).
+    ///
+    /// First-op-wins: a name collects only its FIRST `DeadOp` (the
+    /// dead-arm callers' contract — `a && b` narrows `a` once).
     pub(crate) fn predicate_edge_locals(
         ast: &LoweredAst,
         pred: NodeId,
         polarity: bool,
         out: &mut Vec<(String, DeadOp)>,
     ) {
+        Self::predicate_edge_locals_impl(ast, pred, polarity, out, true)
+    }
+
+    /// The every-op variant for the loop-entry edge (rigor-rs#681,
+    /// review round 2): the reference's `predicate_scopes` narrows each
+    /// subject LEFT-TO-RIGHT through every conjunct — a second `is_a?`
+    /// on the same local narrows the FIRST narrowing's result, so
+    /// `y.is_a?(Integer) && y.is_a?(Unresolved)` ends `untyped`, not
+    /// `Integer`. The caller folds the ops over the binding in order.
+    pub(crate) fn predicate_edge_locals_ordered(
+        ast: &LoweredAst,
+        pred: NodeId,
+        polarity: bool,
+        out: &mut Vec<(String, DeadOp)>,
+    ) {
+        Self::predicate_edge_locals_impl(ast, pred, polarity, out, false)
+    }
+
+    fn predicate_edge_locals_impl(
+        ast: &LoweredAst,
+        pred: NodeId,
+        polarity: bool,
+        out: &mut Vec<(String, DeadOp)>,
+        dedup: bool,
+    ) {
         let push = |out: &mut Vec<(String, DeadOp)>, name: &str, op: DeadOp| {
-            if !out.iter().any(|(n, _)| n == name) {
+            if !dedup || !out.iter().any(|(n, _)| n == name) {
                 out.push((name.to_string(), op));
             }
         };
@@ -1251,8 +1279,8 @@ impl<'i> Typer<'i> {
             // edge either may have failed, so neither narrows. `a || b`
             // mirrors — both narrow on the falsey edge only.
             Node::Logical { left, right, is_and, .. } if *is_and == polarity => {
-                Self::predicate_edge_locals(ast, *left, polarity, out);
-                Self::predicate_edge_locals(ast, *right, polarity, out);
+                Self::predicate_edge_locals_impl(ast, *left, polarity, out, dedup);
+                Self::predicate_edge_locals_impl(ast, *right, polarity, out, dedup);
             }
             Node::Call {
                 receiver,
@@ -1264,18 +1292,56 @@ impl<'i> Typer<'i> {
             } if block_body.is_empty() && !*safe_nav => match method.as_str() {
                 "!" if args.is_empty() => {
                     if let Some(r) = receiver {
-                        Self::predicate_edge_locals(ast, *r, !polarity, out);
+                        Self::predicate_edge_locals_impl(ast, *r, !polarity, out, dedup);
                     }
                 }
-                "==" | "!=" | "eql?" | "equal?" | "===" if args.len() == 1 => {
+                "==" | "!=" | "===" if args.len() == 1 => {
                     // `q == p` holds on the `polarity` edge: the local keeps
                     // iff `local == peer` matches the expected equality.
+                    // `eql?`/`equal?` are NOT in the reference's predicate
+                    // catalogue (`simple_dispatch_name?`,
+                    // narrowing.rb:1469) — they narrow no subject on either
+                    // edge, so minting `Cmp` for them dropped members the
+                    // oracle keeps (rigor-rs#681 review: `while y.eql?(1)`).
                     let eq = if method == "!=" { !polarity } else { polarity };
-                    if let Some(r) = receiver {
-                        Self::predicate_cmp_local(ast, *r, args[0], eq, out);
+                    // `C === local` is a class check ON the local —
+                    // `Integer === y` narrows `y` exactly like
+                    // `y.is_a?(Integer)` (rigor-rs#681). The reference's
+                    // `analyse_case_equality_receiver` resolves the constant
+                    // NAME lexically (`lexical_class_name` falls back to the
+                    // bare spelling) and hands it to `narrow_class`, so the
+                    // `Isa` is minted for ANY static constant receiver — an
+                    // undeclared or project-only class answers `untyped` on
+                    // the positive edge, not Bot (`declines_bot?`), which
+                    // `dead_subject_type` owns. `local === C` keeps the
+                    // `Cmp` operand — `1 === Integer` is `==` equality, not
+                    // a class test.
+                    if method == "===" {
+                        if let Some(r) = receiver {
+                            if let Node::ConstantRead {
+                                name: class,
+                                dynamic_base: false,
+                                ..
+                            } = ast.get(*r)
+                            {
+                                if let Node::LocalVariableRead { name, .. }
+                                | Node::LocalVariableWrite { name, .. } = ast.get(args[0])
+                                {
+                                    push(out, name, DeadOp::Isa {
+                                        class: class.to_string(),
+                                        exact: false,
+                                        holds: eq,
+                                    });
+                                    return;
+                                }
+                            }
+                        }
                     }
                     if let Some(r) = receiver {
-                        Self::predicate_cmp_local(ast, args[0], *r, eq, out);
+                        Self::predicate_cmp_local(ast, *r, args[0], eq, out, dedup);
+                    }
+                    if let Some(r) = receiver {
+                        Self::predicate_cmp_local(ast, args[0], *r, eq, out, dedup);
                     }
                 }
                 "nil?" if args.is_empty() => {
@@ -1326,11 +1392,12 @@ impl<'i> Typer<'i> {
         peer: NodeId,
         eq: bool,
         out: &mut Vec<(String, DeadOp)>,
+        dedup: bool,
     ) {
         if let Node::LocalVariableRead { name, .. } | Node::LocalVariableWrite { name, .. } =
             ast.get(id)
         {
-            if !out.iter().any(|(n, _)| n == name) {
+            if !dedup || !out.iter().any(|(n, _)| n == name) {
                 out.push((name.clone(), DeadOp::Cmp { peer, eq }));
             }
         }

@@ -553,7 +553,6 @@ fn index_compound_writes_widen_the_receiver_binding() {
     for src in [
         // Straight-line, all three compound forms, Array and Hash seeds.
         &b"h = {a: 1}\nh[:a] += 1\nh[:a].upcase\n"[..],
-        &b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nh[:a] &&= 2\nh[:a].upcase\n"[..],
         &b"a = [1]\na[0] += 1\na.first.upcase\n"[..],
         &b"a = [1]\na[0] ||= 2\na.first.upcase\n"[..],
@@ -577,8 +576,9 @@ fn index_compound_writes_widen_the_receiver_binding() {
     // `Scope#with_indexed_narrowing`, rigor-rs#325): `h[:a] ||= 1` stores
     // `narrow_truthy(1) | 1` = `1`, and the narrowing intercepts the later
     // `h[:a]` read ahead of the widened carrier — so the reference FIRES
-    // `for 1` here (probed at `e59b7b89`), unlike the `||= 2` row above
-    // where the stored `1 | 2` union keeps `upcase` silent.
+    // `for 1` here (probed at `e59b7b89`). The `||= 2` row stores `1 | 2`,
+    // and the same-class scalar-constant union collapses to `Integer` for
+    // the scalar verdict (rigor-rs#681) — the reference fires `for 1 | 2`.
     let diags = run(b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n");
     assert_eq!(
         diags.len(),
@@ -587,6 +587,14 @@ fn index_compound_writes_widen_the_receiver_binding() {
     );
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
     assert_eq!(diags[0].message, "undefined method `upcase' for 1");
+    let diags = run(b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1 | 2`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1 | 2");
 }
 
 /// rigor-rs#325: `h[k] ||= v` in an operand-transparent recovery position —
@@ -603,8 +611,6 @@ fn index_or_write_records_the_stored_slot_through_transparent_positions() {
         // The primary reproducer: the stored `"s"` answers `h[:a]`, not the
         // literal's `1` — silent both engines.
         &b"h = {a: 1}\nputs(*[h[:a] ||= \"s\"])\nh[:a].upcase\n"[..],
-        // `narrow_truthy(1) | 2` = `1 | 2` — a union keeps `upcase` silent.
-        &b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nputs(*[h[:a] ||= nil])\nh[:a].upcase\n"[..],
         // `&&=` records no narrowing — the `[]=` widening alone silences.
         &b"h = {a: 1}\nputs(*[h[:a] &&= \"s\"])\nh[:a].upcase\n"[..],
@@ -628,6 +634,18 @@ fn index_or_write_records_the_stored_slot_through_transparent_positions() {
             String::from_utf8_lossy(src)
         );
     }
+
+    // `narrow_truthy(1) | 2` = `1 | 2` — the same-class scalar-constant
+    // union collapses to `Integer` for the scalar verdict (rigor-rs#681),
+    // and the reference fires `for 1 | 2`.
+    let diags = run(b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1 | 2`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1 | 2");
 }
 
 /// The narrowing's controls (rigor-rs#325): a `||=` storing a truthy
@@ -5382,4 +5400,205 @@ fn issue_492_heredoc_interpolation_reads_env_at_closure() {
     assert!(
         undefined(b"y = \"s\"\nx = (y = \"s\"; <<~EOS\n  #{y.upcase}\nEOS\n)\ny = 1\n").is_empty()
     );
+}
+
+/// rigor-rs#681, review round 1 — the loop-pass entry edge narrows predicate
+/// subjects through `predicate_edge_locals` + `dead_subject_type`, and every
+/// shape the reference CANNOT narrow must keep the subject's binding: an
+/// unresolved or project-only class (`narrow_class` answers `untyped`, never
+/// `Bot`, on an `:unknown` ordering — `declines_bot?`, narrowing.rb:3651),
+/// `eql?`/`equal?` (absent from `simple_dispatch_name?`), a `==` peer that is
+/// not a literal NODE (`static_literal_type` reads no local), and a `==`
+/// literal whose domain is not all trusted literals
+/// (`finite_trusted_literal_domain?` — a Float member keeps the whole
+/// union). Every row silent on BOTH engines; each was a false positive on
+/// the first cut.
+#[test]
+fn issue_681_loop_entry_narrowing_stays_silent_on_unnarrowable_predicates() {
+    for src in [
+        // Class the index cannot resolve → `untyped`, not `Bot`.
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Unresolved); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Unresolved); x = y; end\nx.zz\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nuntil y.is_a?(Unresolved); x = y; end\nx.upcase\n"[..],
+        // A project class is unknown to the RBS ordering the same way.
+        &b"class Bar; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Bar); x = y; end\nx.upcase\n"[..],
+        &b"class Bar; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Bar); x = y; end\nx.zz\n"[..],
+        // `C === local` mints `Isa` for ANY static constant receiver; an
+        // undeclared, project-only or namespaced name answers `untyped`.
+        &b"class Bar; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile Bar === y; x = y; end\nx.upcase\n"[..],
+        &b"class Bar; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile Bar === y; x = y; end\nx.zz\n"[..],
+        &b"module Mo; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile Mo === y; x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile Foo === y; x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile Foo === y; x = y; end\nx.zz\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile Foo::Bar === y; x = y; end\nx.upcase\n"[..],
+        &b"FOO = 5\ny = gets ? 1 : \"s\"\nx = 0\nwhile FOO === y; x = y; end\nx.upcase\n"[..],
+        // `eql?`/`equal?` narrow nothing on either edge.
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.eql?(1); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.equal?(1); x = y; end\nx.upcase\n"[..],
+        // `==` declines when the peer is a pinned LOCAL (not a literal
+        // node) …
+        &b"y = gets ? 1 : \"s\"\nz = 1\nx = 0\nwhile y == z; x = y; end\nx.upcase\n"[..],
+        // … or a Float literal …
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == 2.0; x = y; end\nx.upcase\n"[..],
+        // … or the domain holds an untrusted member (`1 | 2.0` under
+        // `== 1`: `1.0 == 1` can be true, so `2.0` survives).
+        &b"y = gets ? 1 : 2.0\nx = 0\nwhile y == 1; x = y; end\nx.nan?\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence for {:?}, got {diags:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// rigor-rs#681 — the must-still-fire controls beside the silent rows: the
+/// entry edge narrows where the reference narrows (`is_a?`/`kind_of?` /
+/// `instance_of?` on a resolvable class, `C === local`, `==`/`!=` against a
+/// trusted literal on a finite domain, `nil?`, `!`), and nowhere wider.
+/// Messages probed on the oracle at the pin.
+#[test]
+fn issue_681_loop_entry_narrowing_keeps_firing() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for (src, expect) in [
+        // The issue's rows.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0 | 1",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == 1; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0 | 1",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile Integer === y; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0 | 1",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nuntil Integer === y; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for \"s\" | 0",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y != 1; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for \"s\" | 0",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == \"s\"; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for \"s\" | 0",
+        ),
+        // `eql?` narrows nothing — the whole union survives and still fires.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.eql?(1); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for \"s\" | 0 | 1",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == z; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for \"s\" | 0 | 1",
+        ),
+        // A Float member keeps the whole domain (untrusted literal domain).
+        (
+            &b"y = gets ? 1 : 2.0\nx = 0\nwhile y == 1; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0 | 1 | 2.0",
+        ),
+        // `instance_of?` is exempt from `declines_bot?`: the exact-class
+        // test narrows to `Bot` even for an unresolvable class — the
+        // reference fires `for 0` on this row.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.instance_of?(Unresolved); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0",
+        ),
+        // `nil` is a singleton literal — `== nil` on `1 | "s"` leaves `Bot`,
+        // so `x` converges to `0`.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == nil; x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0",
+        ),
+    ] {
+        let diags = undefined(src);
+        assert_eq!(
+            diags,
+            vec![expect.to_string()],
+            "row {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// rigor-rs#681, review round 2 — the loop-entry edge applies EVERY
+/// conjunct's op per subject in order (`predicate_edge_locals_ordered`),
+/// matching the reference's left-to-right scope chaining: a second `is_a?`
+/// on the same local narrows the FIRST narrowing's result, so
+/// `is_a?(Integer) && is_a?(Unresolved)` ends `untyped`, not `Integer`.
+/// Every silent row verified on both engines.
+#[test]
+fn issue_681_loop_entry_conjuncts_chain_silently_on_unknown_class() {
+    for src in [
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Unresolved); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Unresolved); x = y; end\nx.zz\n"[..],
+        &b"class Bar; end\ny = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Bar); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && Foo === y; x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y == 1 && y.is_a?(Unresolved); x = y; end\nx.upcase\n"[..],
+        // Reversed order is silent the same way (`untyped` keeps the
+        // decline side under a known-class `is_a?`).
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Unresolved) && y.is_a?(Integer); x = y; end\nx.upcase\n"[..],
+        &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Unresolved) && y.is_a?(Integer); x = y; end\nx.zz\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(
+            diags.is_empty(),
+            "expected silence for {:?}, got {diags:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
+}
+
+/// rigor-rs#681, review round 2 — the ordered chain's controls: a second
+/// RESOLVABLE conjunct still narrows (`Comparable` is a module — the
+/// `untyped` guard resolves through the qualified registry, not
+/// `class_id`), and disjoint known-class conjuncts still reach `Bot`.
+#[test]
+fn issue_681_loop_entry_conjuncts_keep_firing() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for (src, expect) in [
+        // `1` survives `is_a?(Comparable)` — Integer includes it.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Comparable); x = y; end\nx.upcase\n"[..],
+            "undefined method `upcase' for 0 | 1",
+        ),
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(Integer) && y.is_a?(Comparable); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0 | 1",
+        ),
+        // Disjoint known classes chain to `Bot`.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nwhile y.is_a?(String) && y.is_a?(Integer); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0",
+        ),
+        // A module asked directly still narrows.
+        (
+            &b"y = gets ? 1 : \"s\"\nx = 0\nuntil y.is_a?(Comparable); x = y; end\nx.zz\n"[..],
+            "undefined method `zz' for 0",
+        ),
+    ] {
+        let diags = undefined(src);
+        assert_eq!(
+            diags,
+            vec![expect.to_string()],
+            "row {:?}",
+            String::from_utf8_lossy(src)
+        );
+    }
 }
