@@ -5490,6 +5490,21 @@ fn reopened_rbs_class_singleton_still_fires() {
             &b"module M\n  class Integer; end\n  ::Integer.zzz\nend\n"[..],
             "undefined method `zzz' for singleton(Integer)",
         ),
+        // An order-only taint (the include/prepend clash records both
+        // modules) opens nothing: the class object's surface is enumerable.
+        (
+            &b"module W0; end\nclass Integer; include W0; prepend W0; end\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        // A receiver-form include of a module either side declares.
+        (
+            &b"module W0; def d; end; end\nInteger.include(W0)\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
+        (
+            &b"Integer.include(Comparable)\nInteger.zzz\n"[..],
+            "undefined method `zzz' for singleton(Integer)",
+        ),
     ] {
         let diags = run(src);
         assert_eq!(diags.len(), 1, "expected one diagnostic on {diags:?}");
@@ -5499,4 +5514,45 @@ fn reopened_rbs_class_singleton_still_fires() {
     // A NESTED `class Integer` still shadows the un-rooted read inside it.
     let diags = run(b"module M\n  class Integer; end\n  Integer.zzz\nend\n");
     assert!(diags.is_empty(), "expected silent, got {diags:?}");
+}
+
+/// The edges a toplevel reopen exposes that no strict-constant table holds
+/// (rigor-rs#666's FP family, found re-probing the mint fix): a self-extend's
+/// contributed INSTANCE defs silence the declared walk (the reference's
+/// `discovered_method_through_ancestors?` chain holds the extended module as
+/// an entry even when it is the receiver itself), and an include/prepend
+/// operand that names no module (`include(*MODS)`, `include helper`,
+/// `include nil`, a conditional or receiver-form `include Foo`) opens the
+/// class object's surface — the reference's `:include_hook` mark
+/// (`unnamed_instance_mixin?`) and `unknown_mixin_includer?`'s
+/// pre-early-return includes line.
+#[test]
+fn reopened_rbs_class_singleton_unnamed_edges_silent() {
+    for src in [
+        // A self-extend (either spelling) contributes the receiver's own
+        // INSTANCE defs to the singleton surface.
+        &b"module Math; def q; end; end\nMath.extend(Math)\nMath.q\n"[..],
+        &b"module Math; extend self; def q; end; end\nMath.q\n"[..],
+        &b"class Integer; def q; end; end\nInteger.extend(Integer)\nInteger.q\n"[..],
+        // An include/prepend argument that names no module: the class's
+        // `included` hook may extend the class object with anything.
+        &b"class Integer; include(*MODS); end\nInteger.zzz\n"[..],
+        &b"class Integer; include(*[]); end\nInteger.zzz\n"[..],
+        &b"class Integer; include(nil); end\nInteger.zzz\n"[..],
+        &b"class Integer; include helper; end\nInteger.zzz\n"[..],
+        &b"class Integer; prepend(*MODS); end\nInteger.zzz\n"[..],
+        // The receiver-form splat, no project reopen needed.
+        &b"Integer.include(*MODS)\nInteger.zzz\n"[..],
+        // A name beside one the census cannot spell taints the whole edge.
+        &b"module W0; def d; end; end\nclass Integer; include W0, h; end\nInteger.zzz\n"[..],
+        // A module the class includes whose own include side is unnamed.
+        &b"module Inc; include(*MODS); end\nclass Integer; include Inc; end\nInteger.zzz\n"[..],
+        // A conditional include still reaches the includes listing.
+        &b"class Integer; if $x; include Foo; end; end\nInteger.zzz\n"[..],
+        // A receiver-form include of a module no side declares.
+        &b"Integer.include(Foo)\nInteger.zzz\n"[..],
+    ] {
+        let diags = run(src);
+        assert!(diags.is_empty(), "expected silent, got {diags:?}");
+    }
 }
