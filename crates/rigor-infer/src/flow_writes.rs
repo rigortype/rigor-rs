@@ -2243,7 +2243,7 @@ const SEND_SELECTORS: &[&str] = &["send", "public_send", "__send__"];
 /// literal IS the named call (`a.send(:push, x)` is `a.push(x)`); anything
 /// else (a computed selector, a block, a splat the lowering leaves in
 /// `args`) names no method.
-fn literal_send_target(ast: &LoweredAst, node: &Node) -> Option<String> {
+pub(crate) fn literal_send_target(ast: &LoweredAst, node: &Node) -> Option<String> {
     let Node::Call {
         method,
         args,
@@ -2680,6 +2680,12 @@ pub(crate) struct IndexedFlow {
     /// Only `Node::Call` mutations get an entry; every other mark reads
     /// its own span start.
     pub mutation_offsets: std::collections::HashMap<rigor_parse::Span, usize>,
+    /// `(mutation span -> node)` for every candidate mutator `Call` and
+    /// every `IndexWrite` — the site a mutation's `arg_types`
+    /// (`mutator_arg_types` / `index_write_arg_types`, rigor-rs#771) read
+    /// its call arguments / index arguments + rvalue from. Keyed by the
+    /// whole-node span the `mutations` table carries.
+    pub arg_sites: std::collections::HashMap<rigor_parse::Span, NodeId>,
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
@@ -2716,6 +2722,7 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 // Every `IndexWrite` is a compound (`||=`/`&&=`/`op=`) —
                 // upstream's alias floor does not trigger on it.
                 flow.non_floorable.insert(*span);
+                flow.arg_sites.insert(*span, id);
                 if !*operand {
                     continue;
                 }
@@ -2760,6 +2767,7 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                 if write_dropped(*span) {
                     continue;
                 }
+                flow.arg_sites.insert(*span, id);
                 // A literal-target `send` (`f[0].send(:<<, 2)`) mutates
                 // under the call it makes, as `literal_send_target`
                 // normalises it upstream.

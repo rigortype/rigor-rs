@@ -15,12 +15,12 @@ use crate::{
     closure_mutations, collect_flow_writes, indexed_flow_writes, join_flow_envs,
     multi_target_binder, qualify_self, toplevel_argument_floor, toplevel_mutations, toplevel_rebinds,
     widen_clause_entry, widen_flow_writes,
-    DefKind, TypeEnv, Typer, ARRAY_MUTATORS, HASH_MUTATORS,
+    DefKind, TypeEnv, Typer,
 };
 use crate::dead::DeadOp;
 use crate::flow_writes::{
     collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
-    is_content_mutator, IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
+    is_content_mutator, literal_send_target, IndexedFlow, MUTATOR_METHODS, STRING_MUTATORS,
 };
 
 /// What a `while`/`until` loop's tracked locals converge to —
@@ -952,7 +952,7 @@ impl<'i> Typer<'i> {
     /// `Integer`, a `Refined` to its (recursively widened) base, a union
     /// memberwise. `Constant[nil]` keeps its pin, exactly as the reference's
     /// `type.value.nil? ? type : …` arm does.
-    fn widen_value_pinned(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+    pub(crate) fn widen_value_pinned(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
         match interner.get(ty) {
             Type::Constant(Scalar::Nil) => ty,
             Type::Constant(s) => {
@@ -966,15 +966,15 @@ impl<'i> Typer<'i> {
             }
             Type::Union(members) => {
                 let members = members.clone();
-                let mut acc: Option<TypeId> = None;
-                for &m in &members {
-                    let w = self.widen_value_pinned(m, interner);
-                    acc = Some(match acc {
-                        None => w,
-                        Some(a) => rigor_types::Algebra::join(interner, a, w),
-                    });
-                }
-                acc.unwrap_or(ty)
+                // `Combinator.union` over the memberwise widened list —
+                // verbatim members, NOT `join`'s Dynamic-facet merge:
+                // `Dynamic[top] | Symbol` stays two members the way the
+                // oracle prints it (rigor-rs#771).
+                let widened: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.widen_value_pinned(m, interner))
+                    .collect();
+                rigor_types::Algebra::union(interner, &widened)
             }
             _ => ty,
         }
@@ -3443,7 +3443,15 @@ impl<'i> Typer<'i> {
         {
             if let Some(&pre) = env.get(name) {
                 if evaluated {
-                    if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
+                    // `mutator_arg_types` (statement_evaluator.rb:2152):
+                    // the call's argument types, read off `env` — the
+                    // pre-widening scope, the same point `index_write_arg_types`'
+                    // `type_scope` types them.
+                    let arg_types =
+                        self.mutation_arg_types(ast, indexed, wspan, method, env, interner);
+                    if let Some(widened) =
+                        self.widen_mutated_binding(pre, method, &arg_types, interner)
+                    {
                         env.insert(Rc::from(name), widened);
                     }
                 } else {
@@ -3518,14 +3526,31 @@ impl<'i> Typer<'i> {
                 queue.push(other.to_string());
             }
         }
+        // `UnknownStoreWidening.unknown_store` — the site's own name and
+        // ARITY, every argument unknown (one unknown store).
+        let arg_types = self.unknown_store_arg_types(ast, indexed, wspan, method, interner);
         for other in queue.iter().skip(1) {
             if let Some(&pre) = env.get(other.as_str()) {
                 if part_only && !self.mutable_parts(pre, interner) {
                     continue;
                 }
-                if let Some(widened) = self.widen_mutated_binding(pre, method, interner) {
-                    if widened != pre {
-                        env.insert(Rc::from(other.as_str()), widened);
+                if let Some(widened) = self.widen_mutated_binding(pre, method, &arg_types, interner)
+                {
+                    // `widen_store` (unknown_store_widening.rb:97): a
+                    // value-preserving mutator on a NON-literal carrier
+                    // keeps the widening's answer; everything else takes
+                    // `gradual_content` — the gradual arm on every site
+                    // that can store.
+                    let floored = if crate::mutation_content::VALUE_PRESERVING_MUTATORS
+                        .contains(&method)
+                        && !self.literal_carrier(interner, pre)
+                    {
+                        widened
+                    } else {
+                        self.gradual_content(interner, widened)
+                    };
+                    if floored != pre {
+                        env.insert(Rc::from(other.as_str()), floored);
                     }
                 }
             }
@@ -3613,7 +3638,7 @@ impl<'i> Typer<'i> {
             return;
         }
         let widened = self
-            .widen_mutated_binding(recorded, &m.method, interner)
+            .widen_mutated_binding(recorded, &m.method, &[], interner)
             .or_else(|| self.string_slot_floor(recorded, &m.method, interner));
         match widened {
             Some(ty) => {
@@ -4707,6 +4732,132 @@ impl<'i> Typer<'i> {
         out
     }
 
+    /// The `arg_types` [`Self::widen_mutated_binding`]'s content joins
+    /// read — `mutator_arg_types` (`statement_evaluator.rb:2152`) for a
+    /// `Call` mutator and `index_write_arg_types`
+    /// (`statement_evaluator.rb:1952`) for a compound index write, typed
+    /// on the pre-widening `env` exactly as the reference types them on
+    /// the entry scope. `Option` members carry `index_store_form`'s splat
+    /// `nil` mark; the empty vec is `NO_ARG_TYPES`, which reproduces the
+    /// pre-join widening.
+    ///
+    /// A `[]=` mark with no call/index-write site — a multi-assign, `for`
+    /// or `rescue` index target, whose stored key and decomposed value
+    /// this slice cannot read — still takes the unknown-pair join: the
+    /// reference's `widen_index_target` types them there, and the untyped
+    /// pair lands the same `Dynamic[top]` floor.
+    fn mutation_arg_types(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        wspan: rigor_parse::Span,
+        method: &str,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<Option<TypeId>> {
+        let Some(&site) = indexed.arg_sites.get(&wspan) else {
+            return if method == "[]=" {
+                let u = interner.untyped();
+                vec![Some(u), Some(u)]
+            } else {
+                Vec::new()
+            };
+        };
+        match ast.get(site) {
+            Node::Call {
+                args,
+                args_plain_positional,
+                ..
+            } => {
+                // `AliasMutationFloor.literal_send_target` — a literal
+                // `send` is the call it makes, with the method symbol
+                // dropped from the argument list.
+                let offset = usize::from(literal_send_target(ast, ast.get(site)).is_some());
+                let plain = *args_plain_positional;
+                args.iter()
+                    .skip(offset)
+                    .enumerate()
+                    .map(|(i, &a)| {
+                        // `content_arg_types`' splat `nil` mark
+                        // (statement_evaluator.rb:8793) — a splat in a
+                        // `[]=` index position leaves the store's arity
+                        // open. The lowered AST keeps no per-argument
+                        // plainness, so a call ANY argument of which is
+                        // non-plain marks every index position —
+                        // `index_store_form`'s `Either` is the safe
+                        // superset either way.
+                        if method == "[]=" && !plain && i + 1 < args.len() - offset {
+                            None
+                        } else {
+                            Some(self.type_of(ast, a, env, interner))
+                        }
+                    })
+                    .collect()
+            }
+            Node::IndexWrite {
+                receiver: Some(r),
+                indices,
+                value,
+                compound,
+                ..
+            } => {
+                let (r, indices, value, compound) =
+                    (*r, indices.clone(), *value, compound.clone());
+                let mut out: Vec<Option<TypeId>> = indices
+                    .iter()
+                    .map(|&i| Some(self.type_of(ast, i, env, interner)))
+                    .collect();
+                // `[index_type..., stored_value_type]` — the stored type
+                // is `index_write_stored_type`'s compound result
+                // (`index_write_arg_types`, statement_evaluator.rb:1952).
+                out.push(Some(self.index_write_value_type(
+                    ast, r, &indices, value, &compound, env, interner,
+                )));
+                out
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// `UnknownStoreWidening.unknown_store` — the arg_types one unknown
+    /// store contributes through the alias floor: the site's own ARITY,
+    /// every argument `Dynamic[top]` (with the `[]=` splat nil-mark for
+    /// a non-plain call), since nothing at the call says what was stored.
+    fn unknown_store_arg_types(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        wspan: rigor_parse::Span,
+        method: &str,
+        interner: &mut Interner,
+    ) -> Vec<Option<TypeId>> {
+        let u = interner.untyped();
+        let Some(&site) = indexed.arg_sites.get(&wspan) else {
+            return vec![Some(u), Some(u)];
+        };
+        match ast.get(site) {
+            Node::Call {
+                args,
+                args_plain_positional,
+                ..
+            } => {
+                let offset = usize::from(literal_send_target(ast, ast.get(site)).is_some());
+                let plain = *args_plain_positional;
+                let n = args.len().saturating_sub(offset);
+                (0..n)
+                    .map(|i| {
+                        if method == "[]=" && !plain && i + 1 < n {
+                            None
+                        } else {
+                            Some(u)
+                        }
+                    })
+                    .collect()
+            }
+            _ => vec![Some(u), Some(u)],
+        }
+    }
+
     /// `IndexedNarrowing.invalidate_after_call` for ONE mutation entry —
     /// the record-drop half `apply_mutation_effects` also runs.
     pub(crate) fn drop_indexed_mutation(
@@ -4729,26 +4880,36 @@ impl<'i> Typer<'i> {
     /// port of the reference's `MutationWidening.widen_for_mutator`: a
     /// literal-shape carrier loses its shape but keeps its class (`Tuple` →
     /// `Nominal[Array]`, `HashShape` → `Nominal[Hash]`), a union widens
-    /// memberwise (`widen_union`), and
-    /// every other binding is untouched (`None` — a precise `Nominal` has no
-    /// shape to lose and a `Dynamic` gains nothing). The flat env tracks no
-    /// element evidence, so the nominal's args stay empty — the message reads
-    /// `for Array` where the reference says `for Array[Dynamic[top] | …]`; a
-    /// message drift only, since the harness keys on `(rule, line, col)`.
+    /// memberwise (`widen_union`), an already-widened nominal re-joins
+    /// (`MutationRejoin.widen_nominal` — rigor-rs#771), and every other
+    /// binding is untouched (`None` — a precise `Nominal` has no shape to
+    /// lose and a `Dynamic` gains nothing).
     ///
-    /// The union arm's per-member mint is the exception: `widen_union` grows
-    /// each arm memberwise and `Combinator.union` dedups on STRUCTURAL
-    /// equality, so a literal arm keeps its own element evidence —
-    /// `widen_tuple` writes `Array[1 | …]`, not bare `Array`. Two DISTINCT
-    /// literal arms (`c ? [1] : [2]` then `a.push(3)`) must therefore mint
-    /// two distinct carriers or the union collapses to `Nominal[Array]` and
-    /// `a.frobnicate` fires where the oracle stays silent (adversarial review
-    /// of rigor-rs#309). Member evidence comes from the same
-    /// [`Typer::coll_value_members`] the collection-shape pass uses.
+    /// The widened nominal carries the seed's CONTENT args exactly as
+    /// `widen_tuple` / `widen_hash_shape` mint them — `Array[1]`,
+    /// `Hash[Symbol, 1]` — grown by the content-adder joins
+    /// (`join_added_elements` / `join_added_pairs`, in
+    /// `mutation_content.rs`) with the call's typed `arg_types` and the
+    /// `gradual_floor` `Dynamic[top]` arm. `arg_types` mirrors the
+    /// reference's keyword of the same name: `Option` members carry
+    /// `index_store_form`'s splat `nil` mark and an EMPTY slice is
+    /// `NO_ARG_TYPES` — the joins then reproduce the pre-join widening,
+    /// which is what paths that cannot type the call's arguments
+    /// (`widen_mutated_slot`, the nilable replay) pass.
+    ///
+    /// The union arm's per-member mint is load-bearing for silence, not
+    /// just spelling: `widen_union` grows each arm memberwise and
+    /// `Combinator.union` dedups on STRUCTURAL equality, so two DISTINCT
+    /// literal arms (`c ? [1] : [2]` then `a.push(3)`) must mint two
+    /// distinct carriers — `Array[1 | Dynamic[top] | Integer]` vs
+    /// `Array[2 | …]` — or the union collapses to one nominal and
+    /// `a.frobnicate` fires where the oracle stays silent (adversarial
+    /// review of rigor-rs#309).
     pub(crate) fn widen_mutated_binding(
         &self,
         ty: TypeId,
         method: &str,
+        arg_types: &[Option<TypeId>],
         interner: &mut Interner,
     ) -> Option<TypeId> {
         let mint = |name: &str, interner: &mut Interner| {
@@ -4757,8 +4918,18 @@ impl<'i> Typer<'i> {
                 .map(|class| interner.intern(Type::Nominal { class, args: vec![] }))
         };
         match interner.get(ty) {
-            Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => mint("Array", interner),
-            Type::HashShape(_) if HASH_MUTATORS.contains(&method) => mint("Hash", interner),
+            // `widen_tuple` / `widen_hash_shape` plus the content-adder
+            // joins (`mutation_content.rs`): the seed's own evidence
+            // (`Array[1]`, `Hash[Symbol, 1]`, floored open once a store
+            // lands) instead of the bare `Nominal` this arm used to mint —
+            // the rigor-rs#771 message drift.
+            Type::Tuple(_) | Type::HashShape(_) => {
+                let widened = self.widened_shape_nominal(interner, ty, method)?;
+                Some(self.join_mutation_content(interner, ty, widened, method, arg_types))
+            }
+            // `MutationRejoin.widen_nominal` — a carrier this seam already
+            // widened once re-opens for the SECOND and later stores.
+            Type::Nominal { .. } => self.rejoin_nominal(interner, ty, method, arg_types),
             // `StringMutation.widen_constant` (string_mutation.rb): a
             // String-valued `Constant` under a String mutator loses its value
             // pin to the bare `String` nominal — `s = "abc"; s[0] = 5` makes
@@ -4813,18 +4984,7 @@ impl<'i> Typer<'i> {
                 let mut out = Vec::with_capacity(members.len());
                 let mut changed = false;
                 for m in members {
-                    let shape_cls = match interner.get(m) {
-                        Type::Tuple(_) if ARRAY_MUTATORS.contains(&method) => Some("Array"),
-                        Type::HashShape(_) if HASH_MUTATORS.contains(&method) => Some("Hash"),
-                        _ => None,
-                    };
-                    let widened = match shape_cls {
-                        Some(cls) => {
-                            let members = self.coll_value_members(interner, m);
-                            self.coll_nominal_with(interner, cls, &members)
-                        }
-                        None => self.widen_mutated_binding(m, method, interner),
-                    };
+                    let widened = self.widen_mutated_binding(m, method, arg_types, interner);
                     match widened {
                         Some(w) => {
                             changed = true;
