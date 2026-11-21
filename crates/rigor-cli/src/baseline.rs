@@ -1942,6 +1942,33 @@ fn block_value(lines: &[String], folded: bool, chomp: Chomp) -> String {
 /// only; the caller matches it or rejects quoted/flow heads.
 fn key_split(fragment: &str) -> Option<(&str, &str)> {
     let bytes = fragment.as_bytes();
+    // A `'`/`"`-led fragment is a quoted key — its member colon sits after
+    // the CLOSING quote (`'a: b': c` keys on `a: b`; `''` escapes in sq,
+    // a `\` in dq). No close → the fragment is a scalar, not a member.
+    if matches!(bytes.first(), Some(b'\'' | b'"')) {
+        let q = bytes[0];
+        let mut i = 1;
+        let close = loop {
+            let p = bytes[i..].iter().position(|&b| b == q)?;
+            let idx = i + p;
+            if q == b'\'' && bytes.get(idx + 1) == Some(&b'\'') {
+                i = idx + 2;
+            } else if q == b'"'
+                && bytes[..idx].iter().rev().take_while(|&&b| b == b'\\').count() % 2
+                    == 1
+            {
+                i = idx + 1;
+            } else {
+                break idx;
+            }
+        };
+        let rest = fragment[close + 1..].trim_start();
+        let rest = rest.strip_prefix(':')?;
+        if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
+            return None;
+        }
+        return Some((&fragment[..close + 1], rest));
+    }
     let i = (0..bytes.len()).find(|&j| {
         bytes[j] == b':' && matches!(bytes.get(j + 1), None | Some(b' ' | b'\t'))
     })?;
@@ -1968,6 +1995,53 @@ fn member_key(key: &str) -> Option<String> {
     Some(key.to_string())
 }
 
+/// Split a flow collection's inner text on top-level commas — a comma
+/// inside a quoted scalar or a nested `[…]`/`{…}` does not split
+/// (`['x, y']` is one element upstream; `\` escapes in dq, `''` in sq).
+fn flow_items(inner: &str) -> Vec<&str> {
+    let bytes = inner.as_bytes();
+    let mut items = Vec::new();
+    let mut start = 0;
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'[' | b'{' => depth += 1,
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        if bytes.get(i + 1) == Some(&b'\'') { i += 1; } else { break; }
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        i += 2;
+                        continue;
+                    }
+                    if bytes[i] == b'"' {
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b',' if depth == 0 => {
+                items.push(&inner[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    items.push(&inner[start..]);
+    items
+}
+
 /// The `inspect`-joined `[…]` a flow sequence loads — each element
 /// types (a `2024-01-01` inside still dies DisallowedClass). Elements
 /// that are themselves `k: v` pairs load as one-pair maps (`[a: 1]` →
@@ -1978,25 +2052,41 @@ fn classify_flow_seq(inner: &str) -> Result<PsychScalar, String> {
         return Ok(PsychScalar::Opaque { to_s: "[]".to_string(), class: "Array" });
     }
     let mut parts = Vec::new();
-    for item in inner.split(',') {
+    for item in flow_items(inner) {
         let item = item.trim();
         if item.is_empty() {
             continue;
         }
-        let v = if let Some((k, v)) = key_split(item) {
+        let v = if (item.starts_with('[') && item.ends_with(']'))
+            || (item.starts_with('{') && item.ends_with('}'))
+        {
+            classify_scalar(None, item, true)?
+        } else if let Some((k, v)) = key_split(item) {
             // A `k: v` element — a one-pair map upstream.
             let key_inspect = format!("{k:?}");
-            let val = classify_scalar(None, v.trim(), true)?;
+            let val = flow_scalar(v.trim())?;
             PsychScalar::Opaque {
                 to_s: format!("{{{key_inspect} => {}}}", val.inspect()),
                 class: "Hash",
             }
         } else {
-            classify_scalar(None, item, true)?
+            flow_scalar(item)?
         };
         parts.push(v.inspect());
     }
     Ok(PsychScalar::Opaque { to_s: format!("[{}]", parts.join(", ")), class: "Array" })
+}
+
+/// Classify one flow element — the same `scalar_head` + `unyaml` + kind
+/// the block parser applies, so a quoted element decodes its quotes
+/// (`'a, b'` → the String `a, b`, whose inspect is `"a, b"`).
+fn flow_scalar(item: &str) -> Result<PsychScalar, String> {
+    let (head, kind, tag) = scalar_head(item);
+    classify_scalar(
+        tag,
+        &unyaml_scalar(head),
+        matches!(kind, ScalarKind::Plain) && tag.is_none(),
+    )
 }
 
 /// The `inspect`-joined `{…}` a flow mapping loads — keys and values
@@ -2007,18 +2097,18 @@ fn classify_flow_map(inner: &str) -> Result<PsychScalar, String> {
         return Ok(PsychScalar::Opaque { to_s: "{}".to_string(), class: "Hash" });
     }
     let mut parts = Vec::new();
-    for item in inner.split(',') {
+    for item in flow_items(inner) {
         let item = item.trim();
         if item.is_empty() {
             continue;
         }
         if let Some((k, v)) = key_split(item) {
             classify_scalar(None, k.trim(), true)?;
-            let val = classify_scalar(None, v.trim(), true)?;
+            let val = flow_scalar(v.trim())?;
             parts.push(format!("{:?} => {}", k.trim(), val.inspect()));
         } else {
             // A bare flow-map entry (`{a}`) — types as a scalar.
-            let v = classify_scalar(None, item, true)?;
+            let v = flow_scalar(item)?;
             parts.push(format!("{} => nil", v.inspect()));
         }
     }
@@ -2103,10 +2193,16 @@ fn scalar_head(value: &str) -> (&str, ScalarKind, Option<&str>) {
     };
     let v = match kind {
         ScalarKind::Plain => {
-            // ` #` opens a comment in a plain scalar.
-            match v.find(" #") {
-                Some(i) => v[..i].trim_end(),
-                None => v.trim_end(),
+            // ` #` opens a comment in a plain scalar — and a `#`-first
+            // remainder left by a stripped tag/anchor is comment-only
+            // (`!foo # c` → the value stays PENDING, probed).
+            if v.starts_with('#') {
+                ""
+            } else {
+                match v.find(" #") {
+                    Some(i) => v[..i].trim_end(),
+                    None => v.trim_end(),
+                }
             }
         }
         ScalarKind::Block { .. } => v,
@@ -4594,6 +4690,54 @@ mod tests {
         // A deeper-indented member still belongs to a bare-`-` row.
         let b = Baseline::parse(
             "---\nversion: 1\nignored:\n-\n    file: a.rb\n    rule: r\n    count: 1\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 1);
+    }
+
+    #[test]
+    fn review5_flow_items_and_quoted_key_colons() {
+        // R1 — flow commas inside quotes/nested brackets do not split.
+        for meta in ["['x,2024-01-01,y']", "[\"x,2024-01-01,y\"]"] {
+            let b = baseline_with_row(&format!(
+                "- file: a.rb\n  rule: r\n  count: 1\n  meta: {meta}"
+            ))
+            .unwrap_or_else(|e| panic!("meta: {meta}: {e}"));
+            assert_eq!(b.size(), 1, "meta: {meta}");
+        }
+        // …and the quoted element's inspect decodes its quotes.
+        let e = Baseline::parse("---\nversion: ['a, b']\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: unsupported `version: [\"a, b\"]` (expected 1)");
+        let e = Baseline::parse("---\nversion: {a: 'x,y'}\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: unsupported `version: {\"a\" => \"x,y\"}` (expected 1)");
+        let e = Baseline::parse("---\nversion: [[1, 2], [3]]\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: unsupported `version: [[1, 2], [3]]` (expected 1)");
+        // A `{…}`-shaped seq element types recursively, not as `k: v`.
+        let e = baseline_with_row(
+            "- file: a.rb\n  rule: r\n  count: 1\n  meta: [x, {a: [1, 2024-01-01]}]",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("Date"), "{e}");
+        // Control: a top-level comma still separates, a date inside dies.
+        let e = baseline_with_row(
+            "- file: a.rb\n  rule: r\n  count: 1\n  meta: [\"x\", 2024-01-01]",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("Date"), "{e}");
+        // R2 — a quoted key's member colon sits after the closing quote.
+        let b = baseline_with_row("- file: a.rb\n  rule: r\n  count: 1\n  'a: b': c").unwrap();
+        assert_eq!(b.size(), 1);
+        let b = baseline_with_row("- file: a.rb\n  rule: r\n  count: 1\n  \"a: b\": c").unwrap();
+        assert_eq!(b.size(), 1);
+        let e = Baseline::parse("---\nversion: 1\nignored:\n- 'a: b': 1\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: ignored[0] missing `file:`");
+        let e = Baseline::parse("---\nversion: 1\nignored:\n- 'x: y': 1\n  file: a.rb\n  rule: r\n", "t")
+            .unwrap_err();
+        assert_eq!(e.to_string(), "t: ignored[0] `count:` must be a positive Integer (got nil)");
+        // `ignored: !tag # comment` stays pending for the block sequence.
+        let b = Baseline::parse(
+            "---\nversion: 1\nignored: !!seq # c\n- file: a.rb\n  rule: r\n  count: 1\n",
             "t",
         )
         .unwrap();
