@@ -529,7 +529,6 @@ fn index_compound_writes_widen_the_receiver_binding() {
     for src in [
         // Straight-line, all three compound forms, Array and Hash seeds.
         &b"h = {a: 1}\nh[:a] += 1\nh[:a].upcase\n"[..],
-        &b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nh[:a] &&= 2\nh[:a].upcase\n"[..],
         &b"a = [1]\na[0] += 1\na.first.upcase\n"[..],
         &b"a = [1]\na[0] ||= 2\na.first.upcase\n"[..],
@@ -553,8 +552,10 @@ fn index_compound_writes_widen_the_receiver_binding() {
     // `Scope#with_indexed_narrowing`, rigor-rs#325): `h[:a] ||= 1` stores
     // `narrow_truthy(1) | 1` = `1`, and the narrowing intercepts the later
     // `h[:a]` read ahead of the widened carrier — so the reference FIRES
-    // `for 1` here (probed at `e59b7b89`), unlike the `||= 2` row above
-    // where the stored `1 | 2` union keeps `upcase` silent.
+    // `for 1` here (probed at `e59b7b89`). The `||= 2` row fires too:
+    // `narrow_truthy(1) | 2` = `1 | 2` is a single-class literal union, which
+    // upstream #1699 judges as `Integer` — `for 1 | 2`, rigor-rs#694
+    // (probed, both rows).
     let diags = run(b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n");
     assert_eq!(
         diags.len(),
@@ -563,6 +564,14 @@ fn index_compound_writes_widen_the_receiver_binding() {
     );
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
     assert_eq!(diags[0].message, "undefined method `upcase' for 1");
+    let diags = run(b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1 | 2`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1 | 2");
 }
 
 /// rigor-rs#325: `h[k] ||= v` in an operand-transparent recovery position —
@@ -579,8 +588,6 @@ fn index_or_write_records_the_stored_slot_through_transparent_positions() {
         // The primary reproducer: the stored `"s"` answers `h[:a]`, not the
         // literal's `1` — silent both engines.
         &b"h = {a: 1}\nputs(*[h[:a] ||= \"s\"])\nh[:a].upcase\n"[..],
-        // `narrow_truthy(1) | 2` = `1 | 2` — a union keeps `upcase` silent.
-        &b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nputs(*[h[:a] ||= nil])\nh[:a].upcase\n"[..],
         // `&&=` records no narrowing — the `[]=` widening alone silences.
         &b"h = {a: 1}\nputs(*[h[:a] &&= \"s\"])\nh[:a].upcase\n"[..],
@@ -604,6 +611,14 @@ fn index_or_write_records_the_stored_slot_through_transparent_positions() {
             String::from_utf8_lossy(src)
         );
     }
+
+    // `narrow_truthy(1) | 2` = `1 | 2` — a single-class literal union,
+    // judged as `Integer` by upstream #1699's `single_class_literal_union`
+    // — fires `for 1 | 2` on the oracle (rigor-rs#694, probed).
+    let diags = run(b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n");
+    assert_eq!(diags.len(), 1, "expected `for 1 | 2`, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1 | 2");
 }
 
 /// The narrowing's controls (rigor-rs#325): a `||=` storing a truthy
@@ -1115,17 +1130,20 @@ fn string_index_target_rebind_declined_gaps() {
     }
 }
 
-/// `s[k] ||= v` records the stored-slot narrowing
-/// `s[k] -> narrow_truthy(s[k]) | v`: a non-nil `v` keeps the slot non-nil,
-/// so `x = s[0]` is NOT a nilable source and `x.upcase` stays silent — but a
-/// `nil` default keeps the slot nilable, and a later `[]=`/masgn store or a
-/// rebind of `s` invalidates the record (each probed against the reference).
+/// `s[k] ||= v` on a `String` carrier records NOTHING — the reference's
+/// `verbatim_slot?` admits only `Hash`/`Array` (a String's `[]=` splices;
+/// rigor-rs#694) — so `x = s[0]` binds the nilable `String | nil` element
+/// read and `x.upcase` fires `possible-nil`. A later `[]=`/masgn store or a
+/// rebind of `s` reads the same nilable element (each probed against the
+/// reference).
 #[test]
 fn string_index_or_write_slot_narrowing() {
-    // `||= "x"` narrows the slot non-nil ⇒ silent.
-    assert!(
-        nil_diags(b"s = \"abc\"; s[0] ||= \"x\"; x = s[0]; x.upcase\n").is_empty(),
-        "recorded non-nil slot must not mint a nilable fact"
+    // No record: the nilable element read fires `possible-nil`.
+    let diags = nil_diags(b"s = \"abc\"; s[0] ||= \"x\"; x = s[0]; x.upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "nilable element read must fire possible-nil, got {diags:?}"
     );
     // Rebind of `s` drops the slot record ⇒ still silent: the fresh literal
     // folds `s[0]` to a concrete char (keystone declines a Constant receiver).
@@ -1151,27 +1169,41 @@ fn string_index_or_write_slot_narrowing() {
     }
 }
 
-/// rigor-rs#499 — a String compound write's internal `current` read types
-/// like the oracle's. Every expectation below was probed against the reference
-/// (`harness/probe.py`, tuple for tuple): `s[9] ||= nil` records `nil` (the
-/// out-of-range fold), so a later read is `for nil` — not `possible-nil` and
-/// not the flat `for String`; `s.index &&= 1` keeps `Integer | nil`, silent
-/// downstream; the in-range lookup control still fires on its pinned char.
+/// rigor-rs#499 — a String compound write's `current` read types like the
+/// oracle's. rigor-rs#694 re-probed the rows: a `String` carrier fails the
+/// reference's `verbatim_slot?` (`[]=` splices), so `s[k] op= v` records
+/// NO slot and a later `x = s[k]` binds the unmodeled nilable element read
+/// — `String | nil` on the oracle — which `x.upcase` reports as
+/// `possible-nil`, not `for nil` and not the flat `for String`.
+/// `s.index &&= 1` keeps `Integer | nil`, silent downstream; the in-range
+/// lookup control still fires on its pinned char.
 #[test]
 fn string_compound_write_current_read_edges() {
-    // Item 1: the slot record is exactly `nil`.
+    // Item 1: no slot record — the read is the nilable `String | nil`.
     let src = b"s = \"abc\"; s[9] ||= nil; x = s[9]; x.upcase\n";
     let diags = run(src);
-    assert_eq!(diags.len(), 1, "expected one `for nil` diag, got {diags:?}");
-    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
-    assert_eq!(diags[0].message, "undefined method `upcase' for nil");
-    assert_eq!(diags[0].start_offset, 37, "reference @1:38");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one `possible-nil` diag, got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_POSSIBLE_NIL_RECEIVER);
+    assert_eq!(
+        diags[0].message,
+        "possible nil receiver: `upcase' is undefined on NilClass"
+    );
+    assert_eq!(diags[0].start_offset, 37, "reference @4:3");
 
-    // A chained read: the first link (`strip`) is the one that misses on nil.
+    // A chained read through the same nilable element: `strip` answers on
+    // both arms, `frobnicate` on the resulting `String`.
     let diags = run(b"s = \"abc\"; s[9] ||= nil; s[9].strip.frobnicate\n");
-    assert_eq!(diags.len(), 1, "expected one `strip for nil` diag, got {diags:?}");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one `frobnicate for String` diag, got {diags:?}"
+    );
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
-    assert_eq!(diags[0].message, "undefined method `strip' for nil");
+    assert_eq!(diags[0].message, "undefined method `frobnicate' for String");
 
     // Item 2: `&&=` on a nilable zero-arg lookup types `Integer | nil`, so the
     // result (`nil | 1`) is silent downstream.
