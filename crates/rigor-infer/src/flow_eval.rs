@@ -4659,6 +4659,12 @@ impl<'i> Typer<'i> {
                 {
                 let (name, value, op) = (name.clone(), *value, op.clone());
                 let vspan = ast.get(value).span();
+                // `compound_eval` reads `current_type` from the ENTRY scope
+                // BEFORE the rvalue's effects land: `x += (x = 2)` is
+                // `1 + 2` → `for 3` on the oracle, not the widened carrier
+                // an early `widen_flow_writes` would leave (rigor-rs#694
+                // review, Q1).
+                let entry_ty = env.get(name.as_str()).copied();
                 widen_flow_writes(effects.rebinds_within(vspan), vspan, env, interner);
                 self.drop_indexed_rebinds(effects.rebinds_within(vspan), vspan, indexed, env);
                 self.widen_mutated_locals(
@@ -4671,7 +4677,7 @@ impl<'i> Typer<'i> {
                     interner,
                 );
                 let v_ty = self.type_of(ast, value, env, interner);
-                let new_ty = match env.get(name.as_str()).copied() {
+                let new_ty = match entry_ty {
                     Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
                     None => interner.untyped(),
                 };

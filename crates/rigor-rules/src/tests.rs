@@ -1158,17 +1158,20 @@ fn string_index_target_rebind_declined_gaps() {
     }
 }
 
-/// `s[k] ||= v` records the stored-slot narrowing
-/// `s[k] -> narrow_truthy(s[k]) | v`: a non-nil `v` keeps the slot non-nil,
-/// so `x = s[0]` is NOT a nilable source and `x.upcase` stays silent — but a
-/// `nil` default keeps the slot nilable, and a later `[]=`/masgn store or a
-/// rebind of `s` invalidates the record (each probed against the reference).
+/// `s[k] ||= v` on a `String` carrier records NOTHING — the reference's
+/// `verbatim_slot?` admits only `Hash`/`Array` (a String's `[]=` splices;
+/// rigor-rs#694) — so `x = s[0]` binds the nilable `String | nil` element
+/// read and `x.upcase` fires `possible-nil`. A later `[]=`/masgn store or a
+/// rebind of `s` reads the same nilable element (each probed against the
+/// reference).
 #[test]
 fn string_index_or_write_slot_narrowing() {
-    // `||= "x"` narrows the slot non-nil ⇒ silent.
-    assert!(
-        nil_diags(b"s = \"abc\"; s[0] ||= \"x\"; x = s[0]; x.upcase\n").is_empty(),
-        "recorded non-nil slot must not mint a nilable fact"
+    // No record: the nilable element read fires `possible-nil`.
+    let diags = nil_diags(b"s = \"abc\"; s[0] ||= \"x\"; x = s[0]; x.upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "nilable element read must fire possible-nil, got {diags:?}"
     );
     // Rebind of `s` drops the slot record ⇒ still silent: the fresh literal
     // folds `s[0]` to a concrete char (keystone declines a Constant receiver).
