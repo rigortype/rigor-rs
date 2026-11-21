@@ -38,6 +38,7 @@ use std::path::Path;
 use rigor_rules::SuppressSet;
 use serde::Deserialize;
 
+mod psych_booleans;
 mod psych_error;
 
 /// The parsed `.rigor.yml`. Unknown keys are ignored (no `deny_unknown_fields`),
@@ -860,21 +861,23 @@ impl Config {
     /// YAML TRAP (reference divergence, verified empirically against this
     /// crate's actual parser): the reference's Ruby YAML loader (Psych,
     /// YAML 1.1 core schema) folds a BARE `off` scalar to the boolean
-    /// `false` (also `no`/`n`/`on`/`yes`), so the reference raises with a
-    /// "quote it" hint unless the author writes `call: "off"`. `serde_yaml`
-    /// 0.9 (the crate this loader actually uses, backed by `unsafe-libyaml`)
-    /// implements YAML 1.2's Core Schema instead: ONLY `true`/`false`
-    /// (case-insensitive) fold to booleans — `off`/`on`/`yes`/`no` parse as
-    /// plain strings. So here `severity_overrides: { call: off }` parses
-    /// `off` as the string `"off"` and resolves correctly WITHOUT quoting;
-    /// quoting it also still works (a string either way). What DOES fold to
-    /// [`serde_yaml::Value::Bool`] here — and is dropped like any other
-    /// invalid entry, since `"true"`/`"false"` are not
+    /// `false` (also `on`/`no`/`yes`, case-insensitively), so the reference
+    /// raises with a "quote it" hint unless the author writes `call: "off"`.
+    /// `serde_yaml` 0.9 (the crate this loader actually uses, backed by
+    /// `unsafe-libyaml`) implements YAML 1.2's Core Schema instead: ONLY
+    /// `true`/`false` (case-insensitive) fold to booleans — `off`/`on`/
+    /// `yes`/`no` parse as plain strings. The LOAD path closes that gap
+    /// (issue #253): [`Self::read`]'s per-file pass flips a bare boolean
+    /// severity to `Value::Bool`, so `Config::read`/`Config::load` die with
+    /// the reference's `a YAML boolean` error exactly. This direct-parse
+    /// getter still sees the un-flipped serde read, so for a
+    /// `serde_yaml::from_str`/`parse_or_warn` construction (the tests) a bare
+    /// `off` resolves correctly WITHOUT quoting; quoting it also still works
+    /// (a string either way). What DOES fold to
+    /// [`serde_yaml::Value::Bool`] on either path — and is dropped like any
+    /// other invalid entry, since `"true"`/`"false"` are not
     /// [`crate::severity::ResolvedSeverity`] spellings — is the literal word
-    /// `true` or `false` as a value (e.g. a stray `call: false`). The
-    /// reference's "quote it" hint has no analogue to port here since the
-    /// trap it guards against doesn't reproduce; a future config-audit hint
-    /// for a bare `true`/`false` value is out of scope for this port.
+    /// `true` or `false` as a value (e.g. a stray `call: false`).
     ///
     /// Order: this preserves the source `.rigor.yml` mapping's iteration
     /// order (`serde_yaml::Mapping` is insertion-ordered), so an exact-id
@@ -2765,6 +2768,42 @@ fn stringify_top_level_keys(map: serde_yaml::Mapping) -> serde_yaml::Mapping {
     out
 }
 
+/// Issue #253 — Psych 1.1 vs serde_yaml 1.2 scalar resolution for the
+/// `severity:` keys, applied per file before the include merge. A PLAIN,
+/// untagged `off`/`on`/`no`/`yes` (case-insensitively) is `false`/`true` to
+/// the reference — [`psych_booleans`] reads the written spellings off the
+/// libyaml event stream, and this flips the matching serde Strings in `raw`:
+/// the value then hits `validate_severity_overrides`'s `a YAML boolean`
+/// error, and `severity_profile` takes the uncaught `to_sym` crash path.
+/// Every other shape keeps serde's read: quoted and `!!`-tagged spellings are
+/// Strings on both parsers, and a decline (a config the reference rejects that
+/// the port accepts) is the safe side for a load gate.
+fn flip_psych_boolean_severities(raw: &mut serde_yaml::Mapping, text: &str) {
+    let psych = psych_booleans::scan(text);
+    if let Some(v) = raw.get_mut("severity_profile") {
+        if let serde_yaml::Value::String(s) = v {
+            if let Some(b) = psych
+                .severity_profile
+                .filter(|&b| psych_booleans::bare_boolean_word(s) == Some(b))
+            {
+                *v = serde_yaml::Value::Bool(b);
+            }
+        }
+    }
+    let Some(serde_yaml::Value::Mapping(map)) = raw.get_mut("severity_overrides") else {
+        return;
+    };
+    for (k, v) in map.iter_mut() {
+        // The scan names slots by their written key text, so a non-String key
+        // matches through its `to_s` (`5: off` is `severity_overrides[5]`).
+        let serde_yaml::Value::String(s) = v else { continue };
+        let Some(b) = psych_booleans::bare_boolean_word(s) else { continue };
+        if psych.severity_overrides.get(&ruby_to_s(k)) == Some(&Some(b)) {
+            *v = serde_yaml::Value::Bool(b);
+        }
+    }
+}
+
 /// `Configuration#coerce_severity_overrides` (configuration.rb:1037): the
 /// merged `severity_overrides:` value must be a Hash, every VALUE must be a
 /// String/Symbol (`a YAML boolean` message — bare `off` is already `false`
@@ -3628,6 +3667,14 @@ fn load_with_includes(
     // `read_yaml` read it as UTF-8 already.
     if let Ok(text) = std::fs::read_to_string(absolute) {
         key_texts.extend(severity_override_key_texts(&text));
+        // Issue #253 — Psych 1.1 resolves bare `off`/`on`/`no`/`yes` to
+        // `false`/`true` where serde_yaml's 1.2 parse keeps the String, so a
+        // `severity_overrides:` value or a `severity_profile:` scalar the
+        // reference dies on loads fine here. Flip this file's severity values
+        // to the Psych resolution BEFORE the include merge — exactly where
+        // the reference's parser resolves them — so the merged values reach
+        // the coercions' existing boolean error paths.
+        flip_psych_boolean_severities(&mut raw, &text);
     }
     let base_dir = absolute.parent().unwrap_or_else(|| Path::new("/"));
     let includes = match raw.remove("includes") {
@@ -4692,8 +4739,153 @@ mod severity_config_tests {
         // Contrast case for the divergence note: the reference's Ruby Psych
         // loader (YAML 1.1) folds bare `off` to boolean `false`; this crate's
         // parser (YAML 1.2 Core Schema) does not, so it resolves normally.
+        // The LOAD path closes the divergence (issue #253) — see the
+        // `bare_psych_severity_booleans_die_like_the_reference` tests below —
+        // but this direct `parse_or_warn` construction bypasses it.
         let overrides = cfg("severity_overrides:\n  call: off\n").severity_overrides();
         assert_eq!(overrides, vec![("call".to_string(), ResolvedSeverity::Off)]);
+    }
+
+    // ------------------------------------------------------------------
+    // Issue #253 — the LOAD path (`Config::read`, which runs
+    // `flip_psych_boolean_severities` per file before the include merge):
+    // a bare `off`/`on`/`no`/`yes` severity is a Psych 1.1 boolean, so the
+    // load must die with the reference's exact `a YAML boolean` error —
+    // quoted, tagged and plain non-boolean spellings stay accepted.
+    // ------------------------------------------------------------------
+
+    fn read_config(dir: &Path, yaml: &str) -> ConfigRead {
+        let path = dir.join("issue253.yml");
+        std::fs::write(&path, yaml).unwrap();
+        Config::read(&path)
+    }
+
+    fn fatal(dir: &Path, yaml: &str) -> LoadFailure {
+        match read_config(dir, yaml) {
+            ConfigRead::Fatal(f) => f,
+            ConfigRead::Parsed(_) => panic!("this config must die like the reference: {yaml}"),
+            ConfigRead::Absent(m) => panic!("config absent: {m}"),
+        }
+    }
+
+    const BOOLEAN_OFF: &str = "severity_overrides[\"call\"] is false, a YAML boolean \
+                              — did you mean the string \"off\"? Bare off/on/no/yes/true/false \
+                              are parsed as booleans; quote the severity (e.g. \"off\").";
+
+    /// The brief's rows: family, rule id and plugin-id key forms all reach the
+    /// same value check, with the reference's exact message and exit 64.
+    #[test]
+    fn bare_psych_severity_booleans_die_like_the_reference() {
+        let dir = cfg_dir("sevbool");
+        let off = fatal(&dir, "severity_overrides:\n  call: off\n");
+        assert_eq!(off.message, BOOLEAN_OFF, "family key form");
+        assert_eq!(off.code, 64);
+
+        let rule = fatal(&dir, "severity_overrides:\n  call.undefined-method: no\n");
+        assert_eq!(
+            rule.message,
+            BOOLEAN_OFF.replace("\"call\"", "\"call.undefined-method\""),
+            "rule-id key form (a bare `no` is false, hint included)"
+        );
+
+        let plugin = fatal(&dir, "severity_overrides:\n  plugin.rails-routes: off\n");
+        assert_eq!(
+            plugin.message,
+            BOOLEAN_OFF.replace("\"call\"", "\"plugin.rails-routes\""),
+            "plugin-id key form"
+        );
+
+        // Case-insensitive, like Psych's ScalarScanner.
+        let caseful = fatal(&dir, "severity_overrides:\n  call: OFF\n");
+        assert_eq!(caseful.message, BOOLEAN_OFF, "case-insensitive `OFF`");
+
+        // Flow style, and a bare `on`/`yes` — `true`, so no hint.
+        let flow = fatal(&dir, "severity_overrides: {call: on}\n");
+        assert_eq!(
+            flow.message,
+            "severity_overrides[\"call\"] is true, a YAML boolean Bare off/on/no/yes/true/false \
+             are parsed as booleans; quote the severity (e.g. \"off\")."
+        );
+        let yes = fatal(&dir, "severity_overrides:\n  call: YES\n");
+        assert_eq!(yes.message, flow.message, "case-insensitive `YES`");
+
+        // A merge-key source resolves its scalars too.
+        let merged = fatal(&dir, "severity_overrides:\n  <<: {call: off}\n");
+        assert_eq!(merged.message, BOOLEAN_OFF, "`<<` merge source");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Duplicate keys: the LAST occurrence decides, on both parsers.
+    #[test]
+    fn duplicate_severity_spellings_last_wins() {
+        let dir = cfg_dir("sevdup");
+        // A quoted spelling AFTER a bare one wins and the config loads —
+        // Psych keeps the last duplicate's String.
+        match read_config(&dir, "severity_overrides:\n  call: off\n  call: \"off\"\n") {
+            ConfigRead::Parsed(cfg) => {
+                assert_eq!(
+                    cfg.severity_overrides(),
+                    vec![("call".to_string(), ResolvedSeverity::Off)]
+                );
+            }
+            _ => panic!("the later QUOTED occurrence wins on both engines — this must load"),
+        }
+        // A bare boolean AFTER a quoted spelling wins and dies.
+        let bare_last = read_config(&dir, "severity_overrides:\n  call: \"off\"\n  call: off\n");
+        assert!(
+            matches!(bare_last, ConfigRead::Fatal(f) if f.message == BOOLEAN_OFF),
+            "the later bare occurrence wins"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// `severity_profile: off` is a Psych boolean and dies UNCAUGHT upstream
+    /// (`false.to_sym` NoMethodError, exit 1) — it does not share the
+    /// overrides' exit-64 boolean check. The backtrace is un-mirrored, as for
+    /// every uncaught shape.
+    #[test]
+    fn bare_profile_boolean_takes_the_uncaught_path() {
+        let dir = cfg_dir("sevprof");
+        let f = fatal(&dir, "severity_profile: off\n");
+        assert_eq!(f.message, "undefined method 'to_sym' for false");
+        assert_eq!(f.code, 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// Must-still-load controls: quoting, an explicit tag, and a plain
+    /// non-boolean severity name all stay Strings on both parsers.
+    #[test]
+    fn quoted_tagged_and_plain_severities_still_load() {
+        let dir = cfg_dir("sevok");
+        for (tag, yaml, expect) in [
+            ("quoted", "severity_overrides:\n  call: \"off\"\n", vec![("call", ResolvedSeverity::Off)]),
+            ("tagged", "severity_overrides:\n  call: !!str off\n", vec![("call", ResolvedSeverity::Off)]),
+            ("plain word", "severity_overrides:\n  call: warning\n", vec![("call", ResolvedSeverity::Warning)]),
+        ] {
+            match read_config(&dir, yaml) {
+                ConfigRead::Parsed(cfg) => {
+                    let want: Vec<(String, ResolvedSeverity)> = expect
+                        .into_iter()
+                        .map(|(k, s)| (k.to_string(), s))
+                        .collect();
+                    assert_eq!(cfg.severity_overrides(), want, "control `{tag}` must still load");
+                }
+                _ => panic!("control `{tag}` must load: {yaml}"),
+            }
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The flip runs per FILE, before the include merge — an included file's
+    /// bare boolean dies exactly like the main file's own.
+    #[test]
+    fn an_included_files_bare_boolean_also_dies() {
+        let dir = cfg_dir("sevinc");
+        std::fs::write(dir.join("inc.yml"), "severity_overrides:\n  call: off\n").unwrap();
+        let f = fatal(&dir, "includes: [inc.yml]\n");
+        assert_eq!(f.message, BOOLEAN_OFF);
+        assert_eq!(f.code, 64);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ------------------------------------------------------------------
