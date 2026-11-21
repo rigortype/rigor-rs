@@ -404,7 +404,7 @@ pub fn analyze_with_source_and_folder(
             // alias of the name (later, conditional, or in a sibling file)
             // contests the slot, which proves no reduction.
             let owner_segment = qualified.rsplit("::").next().unwrap_or(qualified);
-            if source.visibility_replaced(owner_segment, method, ast.file_key()) {
+            if source.visibility_replaced(owner_segment, method) {
                 continue;
             }
             // Upstream #1569 (`module_function_def?`): a module function's

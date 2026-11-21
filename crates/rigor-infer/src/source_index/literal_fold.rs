@@ -383,7 +383,7 @@ impl SourceIndex {
         // Upstream v0.4.1 (#1594, ADR-119 C2-b1): the typing read answers only
         // where `DefinerResolution` is `Known` on the Ruby-order chain, and
         // names the same definer the breadth-first walk found.
-        let settled = self.settled_definer(core, qual, method, false, |n| {
+        let settled = self.settled_definer(core, qual, method, false, false, |n| {
             self.owner_defines(n, method, DefKind::Instance)
         })?;
         (settled == owner).then_some(owner)
