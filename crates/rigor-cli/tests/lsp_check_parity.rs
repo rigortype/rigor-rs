@@ -307,10 +307,12 @@ fn lsp_drops_an_off_rule_exactly_as_check_does() {
     assert_eq!(control_check[0].3, "def.override-visibility-reduced");
     assert_eq!(lsp_findings(dir.path(), "lib/sub.rb", SUB_RB), control_check);
 
-    // …now turn that exact rule off.
+    // …now turn that exact rule off. The severity is QUOTED: Psych reads a
+    // bare `off` as boolean `false`, so the reference dies on it (issue #253
+    // — the port's load now matches); only the quoted spelling is a severity.
     fs::write(
         dir.path().join(".rigor.yml"),
-        "severity_overrides:\n  def.override-visibility-reduced: off\n",
+        "severity_overrides:\n  def.override-visibility-reduced: \"off\"\n",
     )
     .unwrap();
 
