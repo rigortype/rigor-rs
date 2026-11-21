@@ -23,7 +23,7 @@
 //!    and a proven parent label on a fresh-but-unproven receiver would put
 //!    findings on correct code.
 //!
-//! [`owned_locals`] is deliberately **flow-insensitive and whole-body**: a local
+//! [`ownership_facts`] is deliberately **flow-insensitive and whole-body**: a local
 //! that escapes anywhere disqualifies, even if the escape happens after the
 //! mutation. That is strictly more conservative than the "escaped before the
 //! mutating call" reading, and the conservative direction is the safe one here.
@@ -35,8 +35,9 @@ use rigor_parse::ruby_prism::{CallNode, Node, Visit};
 /// Assignment right-hand sides that witness a fresh allocation on ANY
 /// receiver (`local_ownership.rb:29`, `COPYING_SELECTORS`). `.new` is NOT
 /// here — only a class object's `new` is `Class#new`, which is
-/// [`constructor`]'s question.
-const COPYING_SELECTORS: &[&[u8]] = &[b"dup", b"clone"];
+/// [`constructor`]'s question. `pub(super)` because the claim path reads it
+/// as the `dup`/`clone` shape whose projection the syntax cannot settle.
+pub(super) const COPYING_SELECTORS: &[&[u8]] = &[b"dup", b"clone"];
 
 /// The `mutate.*` label an ownership answer earns.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -139,41 +140,107 @@ impl MutationClassifier {
     fn self_or_static(&self) -> Ownership {
         if self.singleton { Ownership::Static } else { Ownership::SelfState }
     }
+
+    /// Whether `name` is one of the unit's parameters — the claim path's
+    /// first question about a local receiver (`local_ownership`'s
+    /// `@parameters.include?`).
+    pub(super) fn is_parameter(&self, name: &str) -> bool {
+        self.parameters.contains(name)
+    }
+
+    /// Whether `name` is frame-owned — i.e. whether `label_for` would answer
+    /// a LABEL for a read of it rather than the `unknown-ownership` taint.
+    pub(super) fn is_owned(&self, name: &str) -> bool {
+        self.owned_locals.contains(name)
+    }
 }
 
-/// The set of frame-owned local names in `body`, given the method's parameter
-/// names (a parameter is never frame-owned — the caller holds the same object,
-/// so mutating it is `mutate.instance`) and whether `self` is a class there
-/// ([`constructor`] reads it, `local_ownership.rb:36`).
-pub(super) fn owned_locals(
+/// The class one assignment's value settles to for the CLAIM question — the
+/// syntax half of the typer's projection (`descriptor_for`,
+/// `collector.rb:198`), which is all a typer-free collector may consult.
+/// Ownership itself reads only `Assign::allocated`; the claim path
+/// (`collect::catalog_target`) reads the class.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum AssignClass {
+    /// An allocation whose projection NO catalogue row can answer: a
+    /// constructor on an OBJECT constant (`ENV.new` cannot resolve at all)
+    /// or a class-call constructor (`x.class.new`, whose result is an
+    /// instance of `Class`). Upstream answers `Dynamic` here, so it never
+    /// claims and the ownership judgment is the whole reading — measured
+    /// `ENV.new`/`Warning.new`/`self.class.new` rows all classify.
+    Claimless,
+    /// The class the allocation names: a literal's class, or the constant
+    /// path a constructor is called on. A row on `(class, selector)` is
+    /// then reachable exactly as the typer's own projection reaches it.
+    Class(String),
+    /// A `dup` / `clone`: the projection is the INNER receiver's class, which
+    /// the syntax cannot see and a catalogue row may answer — measured
+    /// `t = Thread.current; t.dup[k] = v` claims `Thread#[]=`.
+    Unsettled,
+}
+
+/// One recorded assignment of a local: whether the value allocates (the
+/// ownership question) and what class the value settles to (the claim
+/// question). A non-allocating value carries [`AssignClass::Unsettled`]; the
+/// claim path never reads a class off it, because a local with any
+/// non-allocating assignment is never frame-owned.
+#[derive(Debug, Clone)]
+pub(super) struct Assign {
+    pub(super) allocated: bool,
+    pub(super) class: AssignClass,
+}
+
+/// What one body's ownership scan answers: the frame-owned names and every
+/// local's assignment list.
+pub(super) struct OwnershipFacts {
+    pub(super) owned: BTreeSet<String>,
+    pub(super) assignments: BTreeMap<String, Vec<Assign>>,
+}
+
+/// The whole ownership scan for one body: the frame-owned names (the set
+/// `LocalOwnership.owned` answers, `local_ownership.rb:24`) plus every
+/// local's assignment records — the claim question's syntax half. `owner` is
+/// the unit's owner CLASS name — what an implicit or `self.` `new` in a
+/// singleton-method body projects to.
+pub(super) fn ownership_facts(
     body: Option<&Node<'_>>,
     parameters: &BTreeSet<String>,
     singleton: bool,
-) -> BTreeSet<String> {
-    let Some(body) = body else { return BTreeSet::new() };
-    let mut scan = OwnershipScan { singleton, ..Default::default() };
+    owner: Option<&str>,
+) -> OwnershipFacts {
+    let Some(body) = body else {
+        return OwnershipFacts { owned: BTreeSet::new(), assignments: BTreeMap::new() };
+    };
+    let mut scan = OwnershipScan {
+        singleton,
+        owner: owner.unwrap_or_default().to_string(),
+        ..Default::default()
+    };
     scan.visit(body);
     let OwnershipScan { assignments, mut escaped, .. } = scan;
     escaped.extend(trailing_read(body));
-    assignments
-        .into_iter()
-        .filter(|(name, allocations)| {
-            !escaped.contains(name)
-                && !parameters.contains(name)
-                && allocations.iter().all(|allocated| *allocated)
+    let owned = assignments
+        .iter()
+        .filter(|(name, assigns)| {
+            !escaped.contains(*name)
+                && !parameters.contains(*name)
+                && assigns.iter().all(|assign| assign.allocated)
         })
-        .map(|(name, _)| name)
-        .collect()
+        .map(|(name, _)| name.clone())
+        .collect();
+    OwnershipFacts { owned, assignments }
 }
 
-/// `name -> [was each assignment an allocation?]`, plus the names that escaped.
+/// `name -> [assignment records]`, plus the names that escaped.
 #[derive(Default)]
 struct OwnershipScan {
-    assignments: BTreeMap<String, Vec<bool>>,
+    assignments: BTreeMap<String, Vec<Assign>>,
     escaped: BTreeSet<String>,
     /// Whether the enclosing unit's `self` is a class — [`constructor`]'s
     /// `singleton` (`scanner.rb:254`).
     singleton: bool,
+    /// The unit's owner class name, for the singleton-`new` projection.
+    owner: String,
 }
 
 impl OwnershipScan {
@@ -186,10 +253,11 @@ impl OwnershipScan {
         if let Some(write) = node.as_local_variable_write_node() {
             let value = write.value();
             let name = name_of(write.name().as_slice());
-            self.assignments
-                .entry(name)
-                .or_default()
-                .push(allocation(&value, self.singleton));
+            let assign = Assign {
+                allocated: allocation(&value, self.singleton),
+                class: assign_class(&value, self.singleton, &self.owner),
+            };
+            self.assignments.entry(name).or_default().push(assign);
             // `y = x` hands the same object to a second name; neither can be
             // proven frame-private cheaply.
             self.note_read(Some(&value));
@@ -209,7 +277,10 @@ impl OwnershipScan {
         } else {
             return;
         };
-        self.assignments.entry(name).or_default().push(false);
+        self.assignments.entry(name).or_default().push(Assign {
+            allocated: false,
+            class: AssignClass::Unsettled,
+        });
     }
 
     /// An escape is any position from which a caller could later reach the
@@ -331,9 +402,66 @@ fn class_call(call: &CallNode<'_>) -> bool {
 }
 
 /// `+""` — the frozen-string-literal era's spelling of "a fresh mutable String".
-fn unary_plus_string(call: &CallNode<'_>) -> bool {
+/// `pub(super)` because the claim path reads it as a String-projection shape.
+pub(super) fn unary_plus_string(call: &CallNode<'_>) -> bool {
     call.name().as_slice() == b"+@"
         && call.receiver().is_some_and(|receiver| receiver.as_string_node().is_some())
+}
+
+/// The class one assignment's VALUE settles to for the claim path — the
+/// syntax half of the typer's projection (`descriptor_for`,
+/// `collector.rb:198`). Only allocations are asked: a value that does not
+/// allocate never reaches the claim question (its local is never
+/// frame-owned), so every other shape answers [`AssignClass::Unsettled`].
+fn assign_class(node: &Node<'_>, singleton: bool, owner: &str) -> AssignClass {
+    if node.as_hash_node().is_some() {
+        return AssignClass::Class("Hash".to_string());
+    }
+    if node.as_array_node().is_some() {
+        return AssignClass::Class("Array".to_string());
+    }
+    if node.as_string_node().is_some() || node.as_interpolated_string_node().is_some() {
+        return AssignClass::Class("String".to_string());
+    }
+    if node.as_lambda_node().is_some() {
+        return AssignClass::Class("Proc".to_string());
+    }
+    let Some(call) = node.as_call_node() else {
+        return AssignClass::Unsettled;
+    };
+    if COPYING_SELECTORS.contains(&call.name().as_slice()) {
+        return AssignClass::Unsettled;
+    }
+    if unary_plus_string(&call) {
+        return AssignClass::Class("String".to_string());
+    }
+    if call.name().as_slice() != b"new" {
+        return AssignClass::Unsettled;
+    }
+    // A constructor the author wrote on a class: the projection is an
+    // instance of that constant (`Thread.new` → `Thread`).
+    if let Some(constant) = call.receiver().as_ref().and_then(super::collect::qualified_name) {
+        // …unless the constant names an OBJECT, where `new` cannot resolve at
+        // all (`ENV.new`) and the typer answers `Dynamic` — measured: the
+        // ownership judgment, not a row, is then the whole reading.
+        return if rigor_effects::catalog().object_constant(&constant) {
+            AssignClass::Claimless
+        } else {
+            AssignClass::Class(constant)
+        };
+    }
+    // Implicit or `self.` `new` where `self` is the class object: an instance
+    // of the unit's owner class.
+    let implicit_or_self = call.receiver().is_none()
+        || call.receiver().is_some_and(|receiver| receiver.as_self_node().is_some());
+    if implicit_or_self && singleton {
+        return AssignClass::Class(owner.to_string());
+    }
+    // `x.class.new` / `self.class.new` — an instance of `Class` at best; no
+    // row answers that projection (measured: the ownership judgment is the
+    // reading), and on an instance body implicit `new` does not allocate at
+    // all, so its class is never read.
+    AssignClass::Claimless
 }
 
 /// A body whose value is a bare local read hands that local to the caller. Only
@@ -366,7 +494,8 @@ mod tests {
         // parse result's root is the enclosing `ProgramNode`, and `trailing_read`
         // reads the statements' tail.
         let program = result.node().as_program_node().expect("a program").statements();
-        owned_locals(Some(&program.as_node()), &params, singleton)
+        ownership_facts(Some(&program.as_node()), &params, singleton, None)
+            .owned
             .into_iter()
             .collect()
     }
