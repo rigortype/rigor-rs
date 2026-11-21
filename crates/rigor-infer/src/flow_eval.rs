@@ -223,7 +223,7 @@ impl<'i> Typer<'i> {
                         | rigor_parse::LoopKind::Until { begin_modifier: true }
                 );
                 if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    match self.loop_continuation(ast, &entry, predicate, &body, interner)
+                    match self.loop_continuation(ast, &entry, predicate, kind, &body, interner)
                     {
                         Some(LoopContinuation::Fixpoint(bindings)) => {
                             for (n, ty) in bindings {
@@ -1025,6 +1025,7 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         env: &TypeEnv,
         predicate: Option<NodeId>,
+        kind: rigor_parse::LoopKind,
         body: &[NodeId],
         interner: &mut Interner,
     ) -> Option<LoopContinuation> {
@@ -1153,6 +1154,27 @@ impl<'i> Typer<'i> {
             for n in &overlay {
                 pass_env.insert(Rc::from(n.as_str()), assumption[n]);
             }
+            // rigor-rs#681 — `loop_pass_entry`'s edge narrowing: every pass
+            // enters the body on the predicate's loop-entry edge (truthy
+            // for `while`, falsey for `until`), narrowing its subject
+            // locals. An UNTRACKED subject the body copies into a tracked
+            // write (`x = y` under `while y.is_a?(Integer)`) otherwise
+            // leaks its un-narrowed binding into the fixpoint. Subjects
+            // `predicate_edge_locals` does not recognise keep the entry
+            // binding — the decline side.
+            if let Some(p) = predicate {
+                let truthy_entry =
+                    matches!(kind, rigor_parse::LoopKind::While { .. });
+                let mut subjects = Vec::new();
+                self.predicate_edge_locals(ast, p, truthy_entry, &mut subjects);
+                for (name, op) in subjects {
+                    let Some(&cur) = pass_env.get(name.as_str()) else { continue };
+                    let narrowed = self.dead_subject_type(ast, cur, &op, interner);
+                    if narrowed != cur {
+                        pass_env.insert(Rc::from(name.as_str()), narrowed);
+                    }
+                }
+            }
             let mut returns = Vec::new();
             self.replay_statements(ast, &mut pass_env, body, interner, &mut returns);
             // A non-exact exit is a decline wearing a "stable" verdict —
@@ -1199,13 +1221,17 @@ impl<'i> Typer<'i> {
 
     /// Whether `ty` carries a decline marker a replay verdict must not
     /// trust — `Dynamic` (a `type_of` miss, a `replay_opaque` widen, an
-    /// op-write decline), `Top`, `Bottom` or `Void` — anywhere in the
-    /// shape. `Constant`, `Nominal`, `Tuple` &co. are value-exact: a
-    /// `Tuple` that keeps growing converges only via the cap pass, which
-    /// is the verdict the fixpoint exists to observe.
+    /// op-write decline), `Top` or `Void` — anywhere in the shape.
+    /// `Constant`, `Nominal`, `Tuple` &co. are value-exact: a `Tuple`
+    /// that keeps growing converges only via the cap pass, which is the
+    /// verdict the fixpoint exists to observe. `Bottom` is exact too: it
+    /// is a REAL edge answer (every entry-edge member excluded — `until
+    /// y` on a `1 | "s"` `y` — writes nothing the reference would keep),
+    /// not a miss, and `join` absorbs it into the running assumption
+    /// exactly as `BodyFixpoint`'s `converge` does (rigor-rs#681).
     fn type_has_decline(interner: &Interner, ty: TypeId) -> bool {
         match interner.get(ty) {
-            Type::Top | Type::Bottom | Type::Void | Type::Dynamic(_) => true,
+            Type::Top | Type::Void | Type::Dynamic(_) => true,
             Type::Union(ms) | Type::Intersection(ms) | Type::Tuple(ms) => {
                 ms.iter().any(|&m| Self::type_has_decline(interner, m))
             }
@@ -4468,7 +4494,7 @@ impl<'i> Typer<'i> {
                 // survives (rigor-rs#638).
                 let entry = env.clone();
                 let cont = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    self.loop_continuation(ast, &entry, predicate, &body, interner)
+                    self.loop_continuation(ast, &entry, predicate, kind, &body, interner)
                 } else if !matches!(kind, rigor_parse::LoopKind::For) {
                     // rigor-rs#639 — the join stays declined for a
                     // jump/`begin…end while` body, but the structural cap
@@ -5344,7 +5370,7 @@ impl<'i> Typer<'i> {
                         // `"x"`, `&&`'s truthy edge keeping `a`).
                         let mut dead_env = env.clone();
                         let mut subjects = Vec::new();
-                        Self::predicate_edge_locals(ast, predicate, !truthy, &mut subjects);
+                        self.predicate_edge_locals(ast, predicate, !truthy, &mut subjects);
                         for (name, op) in subjects {
                             let cur = dead_env
                                 .get(name.as_str())
@@ -5584,7 +5610,7 @@ impl<'i> Typer<'i> {
                 // survives, and a stabilizing self-op does not shed a
                 // sibling pin (rigor-rs#638).
                 let cont = if !(jumps || once || matches!(kind, rigor_parse::LoopKind::For)) {
-                    self.loop_continuation(ast, env, predicate, &body, interner)
+                    self.loop_continuation(ast, env, predicate, kind, &body, interner)
                 } else if !matches!(kind, rigor_parse::LoopKind::For) {
                     // rigor-rs#639 — the join stays declined for a
                     // jump/`begin…end while` body, but the structural cap

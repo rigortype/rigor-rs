@@ -553,7 +553,6 @@ fn index_compound_writes_widen_the_receiver_binding() {
     for src in [
         // Straight-line, all three compound forms, Array and Hash seeds.
         &b"h = {a: 1}\nh[:a] += 1\nh[:a].upcase\n"[..],
-        &b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nh[:a] &&= 2\nh[:a].upcase\n"[..],
         &b"a = [1]\na[0] += 1\na.first.upcase\n"[..],
         &b"a = [1]\na[0] ||= 2\na.first.upcase\n"[..],
@@ -577,8 +576,9 @@ fn index_compound_writes_widen_the_receiver_binding() {
     // `Scope#with_indexed_narrowing`, rigor-rs#325): `h[:a] ||= 1` stores
     // `narrow_truthy(1) | 1` = `1`, and the narrowing intercepts the later
     // `h[:a]` read ahead of the widened carrier — so the reference FIRES
-    // `for 1` here (probed at `e59b7b89`), unlike the `||= 2` row above
-    // where the stored `1 | 2` union keeps `upcase` silent.
+    // `for 1` here (probed at `e59b7b89`). The `||= 2` row stores `1 | 2`,
+    // and the same-class scalar-constant union collapses to `Integer` for
+    // the scalar verdict (rigor-rs#681) — the reference fires `for 1 | 2`.
     let diags = run(b"h = {a: 1}\nx = (h[:a] ||= 1)\nh[:a].upcase\n");
     assert_eq!(
         diags.len(),
@@ -587,6 +587,14 @@ fn index_compound_writes_widen_the_receiver_binding() {
     );
     assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
     assert_eq!(diags[0].message, "undefined method `upcase' for 1");
+    let diags = run(b"h = {a: 1}\nh[:a] ||= 2\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1 | 2`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1 | 2");
 }
 
 /// rigor-rs#325: `h[k] ||= v` in an operand-transparent recovery position —
@@ -603,8 +611,6 @@ fn index_or_write_records_the_stored_slot_through_transparent_positions() {
         // The primary reproducer: the stored `"s"` answers `h[:a]`, not the
         // literal's `1` — silent both engines.
         &b"h = {a: 1}\nputs(*[h[:a] ||= \"s\"])\nh[:a].upcase\n"[..],
-        // `narrow_truthy(1) | 2` = `1 | 2` — a union keeps `upcase` silent.
-        &b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n"[..],
         &b"h = {a: 1}\nputs(*[h[:a] ||= nil])\nh[:a].upcase\n"[..],
         // `&&=` records no narrowing — the `[]=` widening alone silences.
         &b"h = {a: 1}\nputs(*[h[:a] &&= \"s\"])\nh[:a].upcase\n"[..],
@@ -628,6 +634,18 @@ fn index_or_write_records_the_stored_slot_through_transparent_positions() {
             String::from_utf8_lossy(src)
         );
     }
+
+    // `narrow_truthy(1) | 2` = `1 | 2` — the same-class scalar-constant
+    // union collapses to `Integer` for the scalar verdict (rigor-rs#681),
+    // and the reference fires `for 1 | 2`.
+    let diags = run(b"h = {a: 1}\nputs(*[h[:a] ||= 2])\nh[:a].upcase\n");
+    assert_eq!(
+        diags.len(),
+        1,
+        "expected one undefined-method (`for 1 | 2`), got {diags:?}"
+    );
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `upcase' for 1 | 2");
 }
 
 /// The narrowing's controls (rigor-rs#325): a `||=` storing a truthy
