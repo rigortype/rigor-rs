@@ -7881,13 +7881,32 @@ fn retained_param_type(
             }
         }
         Node::ClassInstanceType(ci) => match retained_name(ctx, &ci.name()) {
-            Some(name) => RetainedParamType::ClassInstance(
-                name,
-                ci.args()
-                    .iter()
-                    .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
-                    .collect(),
-            ),
+            Some(name) => {
+                // rigor-rs#809 (review): a RELATIVE class-instance name
+                // resolves lexically at build time, the way the reference's
+                // `resolve_type_names` leaves it before the definition build
+                // — `(Class c)` inside `module Digest` is `Digest::Class`,
+                // `(Queue q)` inside `class Thread` is `Thread::Queue`.
+                // Without it the written leaf is read as the ROOT class by
+                // the host mirror and ordering alike, and the `expected:`
+                // label keeps the leaf where the oracle renders the resolved
+                // name. `::`-rooted (and `use`-anchored) spellings skip the
+                // walk — they are already absolute.
+                let name = if written_ref_ctx(ctx, &ci.name())
+                    .is_some_and(|w| w.starts_with("::"))
+                {
+                    name
+                } else {
+                    resolve_lexical_name(name, enclosing, known).unwrap_or(name)
+                };
+                RetainedParamType::ClassInstance(
+                    name,
+                    ci.args()
+                        .iter()
+                        .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
+                        .collect(),
+                )
+            }
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::AliasType(a) => match retained_name(ctx, &a.name()) {
@@ -7956,6 +7975,51 @@ fn retained_param_type(
 /// compare registry spellings, which carry no root marker).
 fn retained_name(ctx: Option<&FileSigCtx>, tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
     member_name(ctx, tn).map(|n| n.strip_prefix("::").unwrap_or(n))
+}
+
+/// A [`RBS::Resolver::TypeNameResolver#resolve_namespace0`]-shaped lexical
+/// resolution for one RELATIVE written class-instance name (`::`-stripped,
+/// `use`-mapped already): the HEAD is tried innermost-scope outward through
+/// `enclosing`, then the root spelling; a hit COMMITS to that scope — every
+/// tail segment must resolve beneath it or the name resolves NOTHING (the
+/// resolver never backtracks to an outer scope once the head landed, and the
+/// builder then keeps the written name). `known` is the build's
+/// `known_type_names` — classes, modules, interfaces, type- and
+/// class/module-aliases — the resolver's `all_names ∪ aliased_name?`.
+/// `None` ⇒ stays written.
+fn resolve_lexical_name(
+    written: &str,
+    enclosing: &[&'static str],
+    known: &HashSet<&'static str>,
+) -> Option<&'static str> {
+    let (head, tail) = match written.split_once("::") {
+        Some((h, t)) => (h, Some(t)),
+        None => (written, None),
+    };
+    for scope in enclosing.iter().rev().copied().chain([""]) {
+        let mut ns = if scope.is_empty() {
+            head.to_string()
+        } else {
+            format!("{scope}::{head}")
+        };
+        if !known.contains(ns.as_str()) {
+            continue;
+        }
+        let mut resolved = true;
+        if let Some(tail) = tail {
+            for seg in tail.split("::") {
+                let next = format!("{ns}::{seg}");
+                if known.contains(next.as_str()) {
+                    ns = next;
+                } else {
+                    resolved = false;
+                    break;
+                }
+            }
+        }
+        return resolved.then(|| intern(&ns));
+    }
+    None
 }
 
 /// The verbatim written form of a type node, sliced from the RBS source `code`
