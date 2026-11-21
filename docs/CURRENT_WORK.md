@@ -58,6 +58,7 @@ seam, `harness/vendor_rbs.py` regenerates).
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #326 CLOSED** (PR #807): baseline scalars resolve through Psych's ScalarScanner — `!ruby/` tags, quoted folds, doc-order fatals, `ruby_sort`; six review rounds, Approved `dcc1980c`; ~160 probe rows `=`; 0 FP. [note](notes/20261122-issue-326-baseline-psych-scalars.md)
 - **2026-11-21 #616 CLOSED** (PR #804): `record_declaration` gate into macro arms; cite refresh; `define_method_unit` triple. 0 FP; →#805. [note](notes/20261121-issue-616-fidelity.md)
 - **2026-11-21 #640 CLOSED** (PR #800): env dead-arm judge; `for 1`→`for Integer`; 0 FP. [note](notes/20261121-issue-640-dead-arm-env.md)
 - **2026-11-21 #253 CLOSED** (PR #799): `# rigor:disable` class-bounded capture + Psych severity booleans; 19/19 `=`; 0 FP/437=master; →#801–#803. [note](notes/20261121-issue-253-suppression-psych-booleans.md)
@@ -162,7 +163,4 @@ seam, `harness/vendor_rbs.py` regenerates).
 - **2026-08-01/08 instruments + adjudication, folded** — 0-FP gate could pass VACUOUSLY ([note](notes/20260807-fp-audit-port-side-blind-spots.md)); gap CENSUS by MECHANISM ([note](notes/20260807-gap-census.md)); LSP keeps LAST GOOD ([lsp](notes/20260801-lsp-config-reload.md)).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup** (PR #64) — namespaced receivers route via the qualified registry; 14 closures (→1179), 0 FP / 9204; fx 82 pins Tier-3. [spec](notes/20260807-adr0042-s5-return-lookup-spec.md).
 - **2026-08-07 upstream survey + feedback batch 2, folded** — self-diff moved 2 superseded diagnostics; retired GEM_HOME rbs selection ([note](notes/20260807-upstream-survey-v031-to-master.md)).
-- **2026-07-31 era, folded** — sig-gen `Data.define`/`Struct.new`; `BigMath` CLOSED; survey FP 24→0; sweep set CODIFIED ([CORPUS.md](../harness/CORPUS.md)).
-- **2026-07-31 pin `v0.3.0→v0.3.1` + rbs `4.0.3→4.1.0`** — 0 FP / 9153, gaps −2: bounded type params resolve; `-> instance` via `SELF_RETURN`. [note](notes/20260731-upstream-pin-v031-rbs41.md)/[survey](notes/20260731-v031-preflight-survey.md).
-- **2026-07-17–25 era, folded** — LSP §12 + coverage/MCP/audit (#33–#45), ADR-0042 gates, MultiWrite; ATM/shadow-gate, gitlab UM 356→179. [LSP](notes/20260719-adr0042-gate-deliverables.md)/[ATM](notes/20260717-atm-substrate-arc-plan.md).
-- **2026-07-16 v0.3.0-RC arc: pin `47ec8625` + 7 slices, ALL MERGED — rules fully ported.** [specs](notes/20260716-v030-upstream-gap-survey.md).
+- **2026-07-16–31 v0.3.0-RC→v0.3.1 era, folded** — rules fully ported (pin `47ec8625`, 7 slices); re-pin v0.3.1+rbs 4.1.0 (0 FP/9153); LSP §12 + audit/MCP arcs #33–#45; sig-gen Data/Struct, BigMath CLOSED; sweep codified. [specs](notes/20260716-v030-upstream-gap-survey.md)/[pin](notes/20260731-upstream-pin-v031-rbs41.md)/[lsp](notes/20260719-adr0042-gate-deliverables.md).
