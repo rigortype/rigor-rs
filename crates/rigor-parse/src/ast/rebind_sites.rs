@@ -834,9 +834,10 @@ fn replaced_name(n: &PrismNode<'_>) -> Option<String> {
     }
 }
 
-/// The member names an `attr_*` call declares (the reference's `attr_macro`
-/// + `each_attr_macro_name`): receiverless or `self.` only, named directly
-/// or as the literal first argument of `send` / `__send__` / `public_send`.
+/// The member names an `attr_*` call declares (the reference's
+/// `attr_macro` + `each_attr_macro_name`): receiverless or `self.` only,
+/// named directly or as the literal first argument of `send` /
+/// `__send__` / `public_send`.
 fn attr_macro_names(call: &ruby_prism::CallNode<'_>) -> Option<Vec<String>> {
     if call.receiver().is_some_and(|r| r.as_self_node().is_none()) {
         return None;

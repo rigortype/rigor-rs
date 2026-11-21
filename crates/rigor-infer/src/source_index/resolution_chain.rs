@@ -638,6 +638,7 @@ impl SourceIndex {
 /// The first definer of `method` on one world of a chain, read from the
 /// class's own entry (`skip_self`: the entry after it), or `None` where a
 /// definer Ruby may not reach could answer first.
+#[allow(clippy::too_many_arguments)] // the env context is one logical read
 fn first_definer(
     idx: &SourceIndex,
     core: &CoreIndex,
