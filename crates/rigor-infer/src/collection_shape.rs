@@ -873,6 +873,8 @@ impl<'i> Typer<'i> {
         if members.len() == 1 {
             members[0]
         } else {
+            // Raw intern is safe here: every member is a `Nominal` minted
+            // above (or `untyped`) — never a `Union` (rigor-rs#685 audit).
             interner.intern(Type::Union(members))
         }
     }
@@ -1148,7 +1150,13 @@ impl<'i> Typer<'i> {
         let args = match members.len() {
             0 => vec![],
             1 => vec![members[0]],
-            _ => vec![interner.intern(Type::Union(members.to_vec()))],
+            // `members` comes from `coll_value_members`, which pushes Tuple
+            // elements and HashShape values UNFLATTENED — a member that is
+            // itself a union (`[c ? 1 : "a"]` types `1 | "a" | Dynamic[top]`
+            // inside the tuple) would otherwise intern a `Union` inside a
+            // `Union`, splitting the canonical TypeId two edges must agree
+            // on (rigor-rs#685).
+            _ => vec![rigor_types::Algebra::union(interner, members)],
         };
         Some(interner.intern(Type::Nominal { class, args }))
     }
@@ -1207,6 +1215,9 @@ impl<'i> Typer<'i> {
                 match minted.as_slice() {
                     [] => None,
                     [only] => Some(*only),
+                    // Raw intern is safe: `minted` holds only
+                    // `coll_nominal_with` results — `Nominal`s, never a
+                    // `Union` (rigor-rs#685 audit).
                     _ => Some(interner.intern(Type::Union(minted))),
                 }
             }
@@ -1546,29 +1557,10 @@ impl<'i> Typer<'i> {
         if ca != cb {
             return None;
         }
-        let mut members: Vec<TypeId> = Vec::new();
-        for side in [a, b] {
-            match interner.get(side) {
-                Type::Union(ms) => {
-                    for &m in ms {
-                        if !members.contains(&m) {
-                            members.push(m);
-                        }
-                    }
-                }
-                _ => {
-                    if !members.contains(&side) {
-                        members.push(side);
-                    }
-                }
-            }
-        }
-        members.sort_unstable();
-        match members.len() {
-            0 => None,
-            1 => Some(members[0]),
-            _ => Some(interner.intern(Type::Union(members))),
-        }
+        // `Algebra::union` does what this site's hand-rolled loop did —
+        // flatten each side's union arms, dedup, sort, collapse — plus the
+        // transitive flatten the loop lacked (rigor-rs#685).
+        Some(rigor_types::Algebra::union(interner, &[a, b]))
     }
 
     /// The single collection class a carrier — or a union of carriers — stands

@@ -69,6 +69,47 @@ impl Algebra {
         Self::make_union(i, members)
     }
 
+    /// Build a canonical union from an arbitrary member list: flatten nested
+    /// `Union`s, sort + dedup into the interner's canonical order, collapse
+    /// the empty/singleton cases — `join`'s union arm lifted to N members,
+    /// WITHOUT `join`'s algebra. Two differences, both load-bearing:
+    ///
+    /// - no pairwise Dynamic facet merge (`Dynamic[A] | Dynamic[B]` stays
+    ///   two members; `join` mints `Dynamic[A | B]`), and
+    /// - `top`/`bot` are kept VERBATIM, not absorbed/dropped. These callers
+    ///   hold a member SET compared by `TypeId` equality — the coll pass's
+    ///   member sets carry `top` as the gradual-floor marker, and absorbing
+    ///   it collapsed `Array[1 | top | …]` and `Array[2 | top | …]` onto one
+    ///   `TypeId`, unioning distinct literal arms the reference keeps apart
+    ///   and firing where the oracle is silent (rigor-rs#685).
+    ///
+    /// Use it where the caller already holds the member set (a filtered,
+    /// grown or minted list) rather than two carriers to join.
+    pub fn union(i: &mut Interner, members: &[TypeId]) -> TypeId {
+        let mut flat = Vec::with_capacity(members.len());
+        for &m in members {
+            Self::expand_union_members(i, m, &mut flat);
+        }
+        flat.sort_by(|&x, &y| i.cmp(x, y));
+        flat.dedup();
+        match flat.len() {
+            0 => i.bottom(),
+            1 => flat[0],
+            _ => i.intern(Type::Union(flat)),
+        }
+    }
+
+    /// Order-PRESERVING flatten: expand any nested `Union` members of
+    /// `members` into `out`, with no sort and no dedup and `top`/`bot` kept
+    /// verbatim like [`Self::union`]. For the sites whose member ORDER is
+    /// itself a contract — sig-gen's describe-sorted erased unions — where
+    /// [`Self::union`]'s canonical sort would mint the wrong signature.
+    pub fn flatten_union_members(i: &Interner, members: &[TypeId], out: &mut Vec<TypeId>) {
+        for &m in members {
+            Self::expand_union_members(i, m, out);
+        }
+    }
+
     /// Meet (`A & B`): the greatest carrier contained in both. Threads the
     /// Dynamic algebra.
     pub fn meet(i: &mut Interner, a: TypeId, b: TypeId) -> TypeId {
@@ -198,6 +239,22 @@ impl Algebra {
         match i.get(id) {
             Type::Dynamic(f) => Some(*f),
             _ => None,
+        }
+    }
+
+    /// Push `id` — or the members of `id`, recursively, when it is a `Union`
+    /// — into `out`. Unlike `collect_union_members` every member is kept
+    /// VERBATIM, `bot` and `top` included: [`Self::union`] serves member-SET
+    /// semantics, not the lattice (see its doc).
+    fn expand_union_members(i: &Interner, id: TypeId, out: &mut Vec<TypeId>) {
+        match i.get(id) {
+            Type::Union(ms) => {
+                let ms = ms.clone();
+                for m in ms {
+                    Self::expand_union_members(i, m, out);
+                }
+            }
+            _ => out.push(id),
         }
     }
 
@@ -433,5 +490,66 @@ mod tests {
             Type::Union(ms) => assert_eq!(ms.len(), 3, "nested union must flatten"),
             other => panic!("expected flattened 3-member union, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn union_flattens_and_canonicalizes_members() {
+        let mut i = Interner::new();
+        let a = nominal(&mut i, 1);
+        let b = nominal(&mut i, 2);
+        let c = nominal(&mut i, 3);
+        // A member list carrying a nested union flattens — and lands on the
+        // SAME TypeId `join` gives the flat set, the canonicalization
+        // invariant rigor-rs#685 restores.
+        let inner = i.intern(Type::Union(vec![b, c]));
+        let via_union = Algebra::union(&mut i, &[a, inner]);
+        let ab = Algebra::join(&mut i, a, b);
+        let via_join = Algebra::join(&mut i, ab, c);
+        assert_eq!(via_union, via_join);
+        // `[]` → bot, `[t]` → t.
+        let bot = i.bottom();
+        assert_eq!(Algebra::union(&mut i, &[]), bot);
+        assert_eq!(Algebra::union(&mut i, &[a]), a);
+        // …but `top`/`bot` MEMBERS are kept verbatim — member-set
+        // semantics, not the lattice (the coll pass's `top` gradual floor
+        // must survive as a marker, rigor-rs#685).
+        let top = i.top();
+        let with_top = Algebra::union(&mut i, &[a, top]);
+        match i.get(with_top) {
+            Type::Union(ms) => assert_eq!(ms.len(), 2),
+            other => panic!("`top` member must be kept verbatim, got {other:?}"),
+        }
+        let with_bot = Algebra::union(&mut i, &[a, bot]);
+        match i.get(with_bot) {
+            Type::Union(ms) => assert_eq!(ms.len(), 2),
+            other => panic!("`bot` member must be kept verbatim, got {other:?}"),
+        }
+        // No Dynamic facet merge: `join` mints `Dynamic[A | B]`, `union`
+        // keeps the two facets as members (the member-set callers'
+        // semantics).
+        let da = i.intern(Type::Dynamic(a));
+        let db = i.intern(Type::Dynamic(b));
+        let u = Algebra::union(&mut i, &[da, db]);
+        match i.get(u) {
+            Type::Union(ms) => assert_eq!(ms.len(), 2),
+            other => panic!("union must not facet-merge dynamics, got {other:?}"),
+        }
+        let facet_ab = Algebra::join(&mut i, a, b);
+        let merged = Algebra::join(&mut i, da, db);
+        assert_eq!(i.get(merged), &Type::Dynamic(facet_ab));
+    }
+
+    #[test]
+    fn flatten_union_members_preserves_order() {
+        let mut i = Interner::new();
+        let a = nominal(&mut i, 1);
+        let b = nominal(&mut i, 2);
+        let c = nominal(&mut i, 3);
+        let inner = i.intern(Type::Union(vec![b, c]));
+        // `b, c` stay in LIST order — a canonical sort would reorder them,
+        // which the describe-sorted sig-gen call site cannot take.
+        let mut out = Vec::new();
+        Algebra::flatten_union_members(&i, &[a, inner, c], &mut out);
+        assert_eq!(out, vec![a, b, c, c]);
     }
 }
