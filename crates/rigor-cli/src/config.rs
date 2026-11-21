@@ -38,6 +38,7 @@ use std::path::Path;
 use rigor_rules::SuppressSet;
 use serde::Deserialize;
 
+mod psych_booleans;
 mod psych_error;
 
 /// The parsed `.rigor.yml`. Unknown keys are ignored (no `deny_unknown_fields`),
@@ -2765,6 +2766,42 @@ fn stringify_top_level_keys(map: serde_yaml::Mapping) -> serde_yaml::Mapping {
     out
 }
 
+/// Issue #253 — Psych 1.1 vs serde_yaml 1.2 scalar resolution for the
+/// `severity:` keys, applied per file before the include merge. A PLAIN,
+/// untagged `off`/`on`/`no`/`yes` (case-insensitively) is `false`/`true` to
+/// the reference — [`psych_booleans`] reads the written spellings off the
+/// libyaml event stream, and this flips the matching serde Strings in `raw`:
+/// the value then hits `validate_severity_overrides`'s `a YAML boolean`
+/// error, and `severity_profile` takes the uncaught `to_sym` crash path.
+/// Every other shape keeps serde's read: quoted and `!!`-tagged spellings are
+/// Strings on both parsers, and a decline (a config the reference rejects that
+/// the port accepts) is the safe side for a load gate.
+fn flip_psych_boolean_severities(raw: &mut serde_yaml::Mapping, text: &str) {
+    let psych = psych_booleans::scan(text);
+    if let Some(v) = raw.get_mut("severity_profile") {
+        if let serde_yaml::Value::String(s) = v {
+            if let Some(b) = psych
+                .severity_profile
+                .filter(|&b| psych_booleans::bare_boolean_word(s) == Some(b))
+            {
+                *v = serde_yaml::Value::Bool(b);
+            }
+        }
+    }
+    let Some(serde_yaml::Value::Mapping(map)) = raw.get_mut("severity_overrides") else {
+        return;
+    };
+    for (k, v) in map.iter_mut() {
+        // The scan names slots by their written key text, so a non-String key
+        // matches through its `to_s` (`5: off` is `severity_overrides[5]`).
+        let serde_yaml::Value::String(s) = v else { continue };
+        let Some(b) = psych_booleans::bare_boolean_word(s) else { continue };
+        if psych.severity_overrides.get(&ruby_to_s(k)) == Some(&Some(b)) {
+            *v = serde_yaml::Value::Bool(b);
+        }
+    }
+}
+
 /// `Configuration#coerce_severity_overrides` (configuration.rb:1037): the
 /// merged `severity_overrides:` value must be a Hash, every VALUE must be a
 /// String/Symbol (`a YAML boolean` message — bare `off` is already `false`
@@ -3628,6 +3665,14 @@ fn load_with_includes(
     // `read_yaml` read it as UTF-8 already.
     if let Ok(text) = std::fs::read_to_string(absolute) {
         key_texts.extend(severity_override_key_texts(&text));
+        // Issue #253 — Psych 1.1 resolves bare `off`/`on`/`no`/`yes` to
+        // `false`/`true` where serde_yaml's 1.2 parse keeps the String, so a
+        // `severity_overrides:` value or a `severity_profile:` scalar the
+        // reference dies on loads fine here. Flip this file's severity values
+        // to the Psych resolution BEFORE the include merge — exactly where
+        // the reference's parser resolves them — so the merged values reach
+        // the coercions' existing boolean error paths.
+        flip_psych_boolean_severities(&mut raw, &text);
     }
     let base_dir = absolute.parent().unwrap_or_else(|| Path::new("/"));
     let includes = match raw.remove("includes") {

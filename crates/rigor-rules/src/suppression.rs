@@ -400,37 +400,78 @@ pub(crate) fn parse_suppression_comments(
     (line_suppressions, file_suppressions)
 }
 
-/// Find `#` `<ws>*` `<keyword>` `<ws>+` in `text` and return the rule-token tail
-/// (everything after the keyword's trailing whitespace). Hand-rolled equivalent
-/// of the reference's `/#\s*<keyword>\s+(?<rules>[\w.,\s-]+)/` (the `regex` crate
-/// is a cached dep, but the patterns are simple enough to scan directly and avoid
-/// pulling it into this crate). Returns `None` when the directive is absent or
-/// has no whitespace-separated tail.
+/// Ruby's `\s` in a regexp: the six ASCII whitespace characters, no more.
+const RUBY_WS: [char; 6] = [' ', '\t', '\r', '\n', '\u{0b}', '\u{0c}'];
+
+/// `[\s,]` — the reference's `raw.split(/[\s,]+/)` delimiter class, shared by
+/// the filter-side absorb and the marker-side token split.
+pub(crate) const RULE_SPLIT: [char; 7] = [' ', '\t', '\r', '\n', '\u{0b}', '\u{0c}', ','];
+
+/// A byte of the reference's `[\w.,\s-]` rule-token class: Ruby's `\w` is
+/// ASCII alnum + `_`, and `\s` the six whitespace characters of [`RUBY_WS`].
+fn is_rule_class_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(b, b'_' | b'.' | b',' | b'-')
+        || matches!(b, b' ' | b'\t' | b'\r' | b'\n' | 0x0b | 0x0c)
+}
+
+/// Find `#` `<ws>*` `<keyword>` `<ws>+` in `text` and return the captured
+/// rule-token tail. Hand-rolled equivalent of the reference's
+/// `/\A#\s*<keyword>\s+(?<rules>[\w.,\s-]+)/` (the `regex` crate is a cached
+/// dep, but the patterns are simple enough to scan directly and avoid pulling
+/// it into this crate). Returns `None` when the directive is absent or has
+/// no whitespace-separated tail.
+///
+/// The capture `(?<rules>[\w.,\s-]+)` STOPS at the first character outside the
+/// class, so `call.*` yields the token `call.` and `call.undefined-method
+/// (note)` yields `call.undefined-method` — the tail past the class run is not
+/// part of the directive at all (issue #253: the port used to return it
+/// verbatim, which minted unknown-rule rows the reference never sees and let
+/// `# rigor:disable call.undefined-method*` suppress nothing).
+///
+/// The greedy `\s+` BACKTRACKS into its own run, because `\s` is also in the
+/// capture's class: a tail that starts outside the class can still let the
+/// capture begin on the whitespace run's last character when two or more
+/// whitespace characters follow the keyword — the capture is then that ONE
+/// whitespace character, which `split(/[\s,]+/)` reduces to no tokens, so
+/// `# rigor:disable  *foo` fires `suppression.empty`, not unknown-rule `*foo`.
+/// With exactly one whitespace there is no room to backtrack and the pattern
+/// fails entirely: `# rigor:disable *foo` is no directive at all (the bare /
+/// unknown-marker pass reads it, and diagnoses nothing).
 ///
 /// For the `rigor:disable` keyword the caller has already tried `disable-file`
 /// first, which is how the reference's `(?!-file)` lookahead is honored: a
 /// `disable-file` comment matches the `-file` branch and never reaches here.
 pub(crate) fn match_directive<'a>(text: &'a str, keyword: &str) -> Option<&'a str> {
     let hash = text.find('#')?;
-    let mut rest = &text[hash + 1..];
+    let rest = &text[hash + 1..];
     // `#\s*`
-    rest = rest.trim_start_matches([' ', '\t']);
+    let rest = rest.trim_start_matches(RUBY_WS);
     let after_kw = rest.strip_prefix(keyword)?;
     // `\s+` — at least one whitespace must follow the keyword.
-    let trimmed = after_kw.trim_start_matches([' ', '\t']);
-    if trimmed.len() == after_kw.len() {
+    let ws = after_kw.len() - after_kw.trim_start_matches(RUBY_WS).len();
+    if ws == 0 {
         return None;
     }
-    Some(trimmed)
+    let tail = &after_kw[ws..];
+    // `(?<rules>[\w.,\s-]+)`, maximal run. The class is pure ASCII, so a
+    // multi-byte lead byte ends the run and the byte slice below is safe.
+    let cap = tail.bytes().take_while(|&b| is_rule_class_byte(b)).count();
+    if cap > 0 {
+        return Some(&tail[..cap]);
+    }
+    // The backtracking arm: the run's last whitespace character, exactly —
+    // `\s+` keeps `ws - 1` chars and the capture takes the one char at
+    // `ws - 1` (the class-external tail head stops the `+` there).
+    (ws >= 2).then(|| &after_kw[ws - 1..ws])
 }
 
 /// Split the rule-token tail on whitespace/commas and absorb each token,
-/// matching the reference's `raw.split(/[\s,]+/)`. The reference's `[\w.,\s-]+`
-/// capture stops at the first character outside that class; tokens here are split
-/// on the same delimiters, and any token is absorbed verbatim, so a trailing
-/// non-rule word is simply an unknown token (a no-op).
+/// matching the reference's `raw.split(/[\s,]+/)`. [`match_directive`] has
+/// already bounded the tail at the class run, and any token is absorbed
+/// verbatim, so a non-rule token is simply an unknown token (a no-op).
 fn absorb_tokens(tail: &str, target: &mut SuppressSet) {
-    for token in tail.split([' ', '\t', ',']) {
+    for token in tail.split(RULE_SPLIT) {
         if !token.is_empty() {
             target.absorb_token(token);
         }

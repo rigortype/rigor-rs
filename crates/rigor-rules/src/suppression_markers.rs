@@ -4,7 +4,7 @@
 
 use crate::{
     known_suppression_token, match_directive, Diagnostic, Severity, SUPPRESSION_EMPTY,
-    SUPPRESSION_UNKNOWN_MARKER, SUPPRESSION_UNKNOWN_RULE,
+    SUPPRESSION_UNKNOWN_MARKER, SUPPRESSION_UNKNOWN_RULE, RULE_SPLIT,
 };
 
 // ---------------------------------------------------------------------------
@@ -37,7 +37,7 @@ pub fn suppression_marker_diagnostics(comments: &[(usize, usize, String)]) -> Ve
 /// `suppression.empty`; each token that is not a known identifier fires
 /// `suppression.unknown-rule` (reference `validate_suppression_tokens`).
 fn validate_suppression_tokens(raw: &str, marker: &str, offset: usize, out: &mut Vec<Diagnostic>) {
-    let tokens: Vec<&str> = raw.split([' ', '\t', ',']).filter(|t| !t.is_empty()).collect();
+    let tokens: Vec<&str> = raw.split(RULE_SPLIT).filter(|t| !t.is_empty()).collect();
     if tokens.is_empty() {
         out.push(empty_suppression_diagnostic(marker, offset));
         return;
