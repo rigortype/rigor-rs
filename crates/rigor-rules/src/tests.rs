@@ -46,6 +46,30 @@ fn narrowed_local_witnesses_undefined_method() {
     assert_eq!(&src[d.start_offset..d.end_offset], b"frobnicate_zzz");
 }
 
+/// rigor-rs#640: a top-level local whose only loop-body write sits in the
+/// DEAD arm of an `if` pinned decided in the pass env (`s = (if d then 2
+/// else w = "x"; 3 end)` on a pinned `d`) converges through the loop
+/// fixpoint, and the cap pass — forced by `y = [y]`'s growth — lifts the
+/// pin to the widened CLASS, exactly the reference's `BodyFixpoint` cap
+/// answer (oracle-probed): `w.zz` fires `for Integer`, and the String-seeded
+/// twin fires `for String`. Pre-fix, the dead-arm write spoiled the pass,
+/// the fixpoint declined to the structural cap, and both rows were silent.
+#[test]
+fn loop_dead_if_arm_write_widens_to_class_at_cap() {
+    let src = b"c = gets\nd = 1\nw = 1\ny = nil\nwhile c\n  s = (if d then 2 else w = \"x\"; 3 end)\n  y = [y]\nend\nw.zz\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    let d = &diags[0];
+    assert_eq!(d.rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(d.message, "undefined method `zz' for Integer");
+    assert_eq!(&src[d.start_offset..d.end_offset], b"zz");
+
+    let src = b"c = gets\nd = 1\nw = \"abc\"\ny = nil\nwhile c\n  s = (if d then 2 else w = 1; 3 end)\n  y = [y]\nend\nw.zz\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].message, "undefined method `zz' for String");
+}
+
 /// CARRIER FIDELITY (docs/notes/20260808-narrowing-carrier-fidelity-fp.md),
 /// END TO END. `narrow_class_other` narrows a `Dynamic`/`Top` carrier only,
 /// so "we narrow only Dynamic" is a subset rule exactly while `Dynamic`
