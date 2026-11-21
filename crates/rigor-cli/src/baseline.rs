@@ -542,13 +542,29 @@ impl Baseline {
         // keys (`file:`), for `- item` vs continuation disambiguation.
         let mut item_col = 0usize;
         let mut member_col = 0usize;
+        // A document that is a bare SEQUENCE (`- x` at column 0 outside
+        // `ignored:`) — its items still type (a `2024-01-01` anywhere is a
+        // DisallowedClass death) and the `expected a Hash …, got Array`
+        // error defers to the end, before `version:` (upstream check order:
+        // `raw.is_a?(Hash)` → `version` → `ignored` → rows).
+        let mut top_level_seq = false;
+        // `---` opens doc 1; a SECOND `---` or an `...` line ends it —
+        // `safe_load` reads only the first document.
+        let mut doc_open = false;
 
         for raw_line in text.lines() {
             let trimmed = raw_line.trim();
+            if trimmed == "..." || (trimmed == "---" && doc_open) {
+                break;
+            }
             // The document marker and comment lines never join a scalar.
             if trimmed == "---" || trimmed.starts_with('#') {
+                doc_open |= trimmed == "---";
                 continue;
             }
+            // Any other line is doc-1 content — a later `---` opens doc 2.
+            doc_open = true;
+
             let indent = raw_line.len() - raw_line.trim_start().len();
             if trimmed.is_empty() {
                 // A blank line inside a row is a pending fold break for the
@@ -570,18 +586,26 @@ impl Baseline {
             }
 
             // A document that is a bare sequence (`- x` at column 0 outside
-            // `ignored:`) loads as an Array upstream, a bare scalar as a
-            // String — both fail `raw.is_a?(Hash)` there. An INDENTED `- x`
-            // belongs to some other key's nested sequence and is ignored like
-            // its key.
+            // `ignored:`) loads as an Array upstream — its items still TYPE
+            // during `safe_load` (`- 2024-01-01` dies DisallowedClass), so
+            // keep scanning for fatal scalars and defer the
+            // `expected a Hash …, got Array` to after the scan (upstream
+            // order: `is_a?(Hash)` before `version`). An INDENTED `- x`
+            // belongs to some other key's nested sequence — its scalars are
+            // untyped here either way (the nested-structure gap).
             if !in_ignored && indent == 0 && (trimmed == "-" || trimmed.starts_with("- ")) {
-                return Err(LoadError::load(format!(
-                    "{label}: expected a Hash at top level, got Array"
-                )));
+                top_level_seq = true;
             }
 
             // Top-level keys (no indentation).
             if !raw_line.starts_with(' ') && !raw_line.starts_with('-') {
+                // A non-`-` line at column 0 inside a sequence document
+                // can't start a mapping — `Psych::SyntaxError` upstream.
+                if top_level_seq {
+                    return Err(LoadError::fatal(format!(
+                        "Psych::SyntaxError: ({label}): did not find expected '-' indicator"
+                    )));
+                }
                 if !trimmed.contains(':') {
                     // The doc's root scalar — upstream reports its loaded
                     // CLASS (`got Integer`/`NilClass`/`TrueClass`), and a
@@ -667,26 +691,36 @@ impl Baseline {
                 continue;
             }
 
-            if !in_ignored {
+            if !in_ignored && !top_level_seq {
                 continue;
             }
 
-            // A new array item begins with `- ` at (or left of) the row's
-            // dash column; deeper `- ` text is a folded continuation. The
-            // first key (`file:`) rides on the same line as the dash in the
-            // reference's emitter.
-            if trimmed.starts_with("- ") && (cur.is_none() || indent <= item_col) {
+            // A new array item begins with `- ` (or bare `-`) at (or left
+            // of) the row's dash column; deeper `- ` text is a folded
+            // continuation. The first key (`file:`) rides on the same line
+            // as the dash in the reference's emitter.
+            if (trimmed == "-" || trimmed.starts_with("- "))
+                && (cur.is_none() || indent <= item_col)
+            {
                 if let Some(acc) = cur.take() {
                     rows.push(acc);
                 }
                 item_col = indent;
-                let rest = &trimmed[2..];
+                let rest = trimmed.get(2..).unwrap_or("");
                 member_col = indent + 2 + (rest.len() - rest.trim_start().len());
                 let mut acc = RowAcc { idx: rows.len(), ..RowAcc::default() };
                 acc.apply(rest.trim_start(), label, true)?;
                 cur = Some(acc);
             } else if let Some(acc) = cur.as_mut() {
-                if indent > member_col {
+                if acc.last_is_pending()
+                    && (trimmed == "-" || trimmed.starts_with("- "))
+                    && indent >= member_col
+                {
+                    // A `- item` of the pending key's nested sequence
+                    // (`meta:` loads `[item]` upstream — the elements type,
+                    // so a `2024-01-01` there still dies DisallowedClass).
+                    acc.seq_item(trimmed[1..].trim_start(), label)?;
+                } else if indent > member_col {
                     // Folded / block-scalar continuation of the last value.
                     acc.continue_scalar(raw_line);
                 } else {
@@ -697,6 +731,14 @@ impl Baseline {
         }
         if let Some(acc) = cur.take() {
             rows.push(acc);
+        }
+
+        // `unless raw.is_a?(Hash)` — a bare-sequence document types every
+        // item first (deaths above), then reports Array, before `version:`.
+        if top_level_seq {
+            return Err(LoadError::load(format!(
+                "{label}: expected a Hash at top level, got Array"
+            )));
         }
 
         // `unless version == CURRENT_VERSION` upstream — a missing `version:`
@@ -1089,6 +1131,10 @@ struct FieldVal {
     /// and can still die on the tag alone (`class_loader.regexp`). The
     /// resolved [`PsychScalar`] is stored here at `apply` time.
     resolved: Option<PsychScalar>,
+    /// Elements of a nested `- item` sequence under a `key:` with no scalar
+    /// (`meta:\n  - x` — upstream loads the Array; each element types, so a
+    /// `2024-01-01` there is still a DisallowedClass death).
+    seq: Vec<PsychScalar>,
     lines: Vec<String>,
     /// A block scalar's content indentation, set by its first content line;
     /// deeper lines keep their extra columns relative to it.
@@ -1120,6 +1166,11 @@ struct RowAcc {
     /// Blank lines since the last value line — consumed as fold breaks by the
     /// next continuation (a run of n blanks folds to n `\n`s), else discarded.
     pending_breaks: usize,
+    /// The row's `- ` head was a bare scalar (`- 5`, `- [1]`) — the row loads
+    /// non-Hash upstream. The `must be a Hash` error is deferred to
+    /// [`RowAcc::into_bucket`] so `version:`/`ignored:` checks and later
+    /// DisallowedClass deaths still win (upstream check order).
+    not_a_hash: bool,
 }
 
 impl RowAcc {
@@ -1160,6 +1211,17 @@ impl RowAcc {
         let Some(fv) = self.field_ref(f) else {
             return Ok(PsychScalar::Nil);
         };
+        if !fv.seq.is_empty() {
+            // `key:\n  - x\n  - y` loads an Array — `Array#to_s`/`#inspect`
+            // are the element inspects joined (`["foo"]`, `[5]`).
+            let joined = fv
+                .seq
+                .iter()
+                .map(PsychScalar::inspect)
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Ok(PsychScalar::Opaque { to_s: format!("[{joined}]"), class: "Array" });
+        }
         if let Some(v) = &fv.resolved {
             return Ok(v.clone());
         }
@@ -1177,13 +1239,29 @@ impl RowAcc {
     /// (where it is malformed YAML the reference's Psych parse would have
     /// already rejected; report it as a row error either way).
     fn apply(&mut self, fragment: &str, label: &str, row_head: bool) -> Result<(), LoadError> {
+        // Any member line under a bare-scalar row (`- 5\n  x: 1`) is
+        // `mapping values are not allowed in this context` upstream — a
+        // scalar element cannot carry a mapping.
+        if self.not_a_hash {
+            return Err(LoadError::fatal(format!(
+                "Psych::SyntaxError: ({label}): mapping values are not allowed in this context"
+            )));
+        }
+        // A `- item` at the member column is a nested sequence element of a
+        // PENDING `key:` (`meta:\n  - x` — upstream loads the Array under
+        // the key and types each element).
+        if !row_head && (fragment == "-" || fragment.starts_with("- ")) {
+            return self.seq_item(fragment[1..].trim_start(), label);
+        }
         let (key, value) = match fragment.split_once(':') {
             Some(kv) => kv,
             None => {
                 // A bare row scalar (`- 2024-01-01`) is a Date upstream —
                 // `safe_load` dies on it before `must be a Hash` could run,
-                // so classify it before erroring. A member line without a
-                // colon is `Psych::SyntaxError` (uncaught) upstream.
+                // so classify it, then DEFER the row-shape error to
+                // `into_bucket` (`version:`/`ignored:` checks run first
+                // upstream). A member line without a colon is
+                // `Psych::SyntaxError` (uncaught) upstream.
                 let (head, kind, tag) = scalar_head(fragment.trim_start());
                 classify_scalar(
                     tag,
@@ -1191,13 +1269,13 @@ impl RowAcc {
                     matches!(kind, ScalarKind::Plain) && tag.is_none(),
                 )
                 .map_err(LoadError::fatal)?;
-                return if row_head {
-                    Err(LoadError::load(format!("{label}: ignored[{}] must be a Hash", self.idx)))
-                } else {
-                    Err(LoadError::fatal(format!(
-                        "Psych::SyntaxError: ({label}): mapping values are not allowed here"
-                    )))
-                };
+                if row_head {
+                    self.not_a_hash = true;
+                    return Ok(());
+                }
+                return Err(LoadError::fatal(format!(
+                    "Psych::SyntaxError: ({label}): could not find expected ':'"
+                )));
             }
         };
         let (head, kind, tag) = scalar_head(value.trim_start());
@@ -1208,6 +1286,12 @@ impl RowAcc {
             "count" => Field::Count,
             _ => Field::Other,
         };
+        if matches!(field, Field::Other) {
+            // `other` is a shared sink — a new unknown `key:` opens a fresh
+            // pending field (`meta2:` after `meta:\n  - x` is a NEW key's
+            // value upstream, not a continuation).
+            self.other = FieldVal::default();
+        }
         self.last = Some(field);
         self.pending_breaks = 0;
         // Eagerly type the scalar in DOCUMENT ORDER — `safe_load` typed it
@@ -1252,6 +1336,54 @@ impl RowAcc {
             tag: tag.map(str::to_string),
             ..FieldVal::default()
         };
+        Ok(())
+    }
+
+    /// Whether the last `key:` left its value PENDING (`meta:` with no
+    /// inline scalar) — a `- item` that follows belongs to that key's
+    /// nested sequence. A valued field or a bare-scalar row cannot take one
+    /// (`did not find expected key` / `mapping values are not allowed`
+    /// upstream).
+    fn last_is_pending(&self) -> bool {
+        let Some(field) = self.last else { return false };
+        let fv = match field {
+            Field::Other => &self.other,
+            // `last` is set by the `key:` line itself — an absent FieldVal
+            // means that line wrote no value: pending.
+            _ => match self.field_ref(field) {
+                Some(fv) => fv,
+                None => return true,
+            },
+        };
+        // `seq` is NOT checked — a field collecting `- item`s stays
+        // pending so the sequence keeps growing.
+        fv.raw.is_empty()
+            && fv.resolved.is_none()
+            && fv.tag.is_none()
+            && matches!(fv.kind, ScalarKind::Plain)
+    }
+
+    /// One `- item` of the nested sequence under a pending `key:`. Each
+    /// element types (a `2024-01-01` there is the same DisallowedClass
+    /// death as an inline scalar); under a valued field or a scalar row the
+    /// line is uncaught `Psych::SyntaxError` upstream.
+    fn seq_item(&mut self, item: &str, label: &str) -> Result<(), LoadError> {
+        if self.not_a_hash || !self.last_is_pending() {
+            return Err(LoadError::fatal(format!(
+                "Psych::SyntaxError: ({label}): did not find expected key \
+                 while parsing a block mapping"
+            )));
+        }
+        let field = self.last.expect("last_is_pending implies last");
+        let (head, kind, tag) = scalar_head(item);
+        let v = classify_scalar(
+            tag,
+            &unyaml_scalar(head),
+            matches!(kind, ScalarKind::Plain) && tag.is_none(),
+        )
+        .map_err(LoadError::fatal)?;
+        self.field_mut(field).seq.push(v);
+        self.pending_breaks = 0;
         Ok(())
     }
 
@@ -1322,6 +1454,12 @@ impl RowAcc {
 
     fn into_bucket(self, label: &str) -> Result<Bucket, LoadError> {
         let idx = self.idx;
+        // `row.is_a?(Hash)` — a bare-scalar row (`- 5`, `- [1]`, `- nil`)
+        // deferred its shape error here so `version:`/`ignored:` checks
+        // and document-order DisallowedClass deaths still precede it.
+        if self.not_a_hash {
+            return Err(LoadError::load(format!("{label}: ignored[{idx}] must be a Hash")));
+        }
         // Type all four fields before validating any — `safe_load` typed
         // the whole document before `parse_row`, so a `message: 2024-01-01`
         // death beats the `count: 0` error beside it (issue #326 review).
@@ -3728,6 +3866,65 @@ mod tests {
                 "doc: {doc}"
             );
         }
+    }
+
+    #[test]
+    fn nested_sequences_and_row_shape_ordering() {
+        // `meta:` (or any `key:`) with `- item` lines loads an Array
+        // upstream — a valid row, no error (round-2 review N1 regression).
+        let b = baseline_with_row("- file: a.rb\n  rule: r\n  count: 1\n  meta:\n  - foo")
+            .unwrap();
+        assert_eq!(b.size(), 1);
+        // …and the elements TYPE: a Date under `meta:` is DisallowedClass.
+        let e = baseline_with_row("- file: a.rb\n  rule: r\n  count: 1\n  meta:\n  - 2024-01-01")
+            .unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        assert!(e.to_string().contains("Date"), "{e}");
+        // `- item` under a VALUED field is `did not find expected key` —
+        // a SyntaxError, i.e. Fatal, not a row error.
+        let e = baseline_with_row("- file: a.rb\n  - foo\n  rule: r\n  count: 1").unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        assert!(e.to_string().contains("SyntaxError"), "{e}");
+        // A nested seq under `count:` loads `[5]` — `got [5]`.
+        let e = baseline_with_row("- file: a.rb\n  rule: r\n  count:\n  - 5").unwrap_err();
+        assert!(!e.is_fatal(), "{e}");
+        assert!(e.to_string().contains("got [5]"), "{e}");
+
+        // `must be a Hash` defers to parse_row: `version:` wins over it,
+        // and a later row's DisallowedClass death beats it (N2).
+        let e = Baseline::parse("---\nversion: 2\nignored:\n- 5\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: unsupported `version: 2` (expected 1)");
+        let e = Baseline::parse(
+            "---\nversion: 1\nignored:\n- 5\n- file: a.rb\n  rule: r\n  meta: 2024-01-01\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        assert!(e.to_string().contains("Date"), "{e}");
+        let e = Baseline::parse("---\nversion: 1\nignored:\n- 5\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: ignored[0] must be a Hash");
+        // Member lines under a bare-scalar row are `mapping values are not
+        // allowed` upstream — SyntaxError.
+        let e = Baseline::parse("---\nversion: 1\nignored:\n- 5\n  rule: r\n", "t").unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        assert!(e.to_string().contains("SyntaxError"), "{e}");
+
+        // A top-level sequence types its items before `got Array` (N3).
+        let e = Baseline::parse("---\n- 2024-01-01\n", "t").unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        assert!(e.to_string().contains("Date"), "{e}");
+        let e = Baseline::parse("---\n- x\n- 2024-01-01\n", "t").unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+        let e = Baseline::parse("---\n- 5\n- abc\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: expected a Hash at top level, got Array");
+        let e = Baseline::parse("---\n- file: 2024-01-01\n", "t").unwrap_err();
+        assert!(e.is_fatal(), "{e}");
+
+        // `...` and a second `---` end doc 1 — upstream reads only it.
+        let b = Baseline::parse("---\nversion: 1\nignored: []\n...\nversion: 2\n", "t").unwrap();
+        assert!(b.is_empty());
+        let b = Baseline::parse("---\nversion: 1\nignored: []\n---\nversion: 2\n", "t").unwrap();
+        assert!(b.is_empty());
     }
 
     #[test]
