@@ -6,7 +6,7 @@ use rigor_infer::Typer;
 use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, Type};
 
-use crate::{catalog, render_receiver, Diagnostic, ScopedEnv, Severity, CALL_RAISE_NON_EXCEPTION};
+use crate::{catalog, render_receiver, Diagnostic, KeyedDiagnostic, ScopedEnv, Severity, CALL_RAISE_NON_EXCEPTION};
 
 // ---------------------------------------------------------------------------
 // call.raise-non-exception (v0.3.0) — reference `raise_non_exception_diagnostic`
@@ -44,7 +44,9 @@ pub(crate) fn raise_non_exception_diagnostics(
     typer: &Typer,
     env: &ScopedEnv,
     interner: &mut Interner,
-    out: &mut Vec<Diagnostic>,
+    // Queued keyed by the CALL's span — the reference emits the rule inside
+    // the converged walk's `CallNode` visit (slot 8 of its per-node array).
+    out: &mut Vec<KeyedDiagnostic>,
 ) {
     // Collect the candidate calls up front (an owned snapshot) so the immutable
     // AST borrow does not clash with the `&mut interner` the operand typing needs.
@@ -92,7 +94,7 @@ pub(crate) fn raise_non_exception_diagnostics(
         let severity = catalog(CALL_RAISE_NON_EXCEPTION)
             .map(|e| e.default_severity)
             .unwrap_or(Severity::Error);
-        out.push(Diagnostic {
+        out.push((ast.get(call_id).span(), 8, Diagnostic {
             rule_id: CALL_RAISE_NON_EXCEPTION,
             start_offset: message_span.0,
             end_offset: message_span.1,
@@ -104,7 +106,7 @@ pub(crate) fn raise_non_exception_diagnostics(
             receiver_classes: None,
 
             method_name: Some(method),
-        });
+        }));
     }
 }
 

@@ -56,7 +56,7 @@ pub use dead_version_guard::{
 pub use diagnostic::{Diagnostic, Severity, NO_RULE};
 pub use driver::{analyze, analyze_with_source, analyze_with_source_and_folder};
 pub use rule_catalog::{
-    catalog, RuleEntry, CALL_ARGUMENT_TYPE_MISMATCH, CALL_POSSIBLE_NIL_RECEIVER,
+    catalog, emission_stage, RuleEntry, CALL_ARGUMENT_TYPE_MISMATCH, CALL_POSSIBLE_NIL_RECEIVER,
     CALL_RAISE_NON_EXCEPTION, CALL_UNDEFINED_METHOD, CALL_UNRESOLVED_TOPLEVEL, CALL_WRONG_ARITY,
     DEF_IVAR_WRITE_MISMATCH, DEF_OVERRIDE_VISIBILITY_REDUCED, FLOW_ALWAYS_RAISES,
     FLOW_ALWAYS_TRUTHY_CONDITION, FLOW_DEAD_ASSIGNMENT, FLOW_DUPLICATE_HASH_KEY,

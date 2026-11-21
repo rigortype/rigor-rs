@@ -3007,6 +3007,11 @@ fn compute_diagnostics(
                 &source,
             ));
         }
+        // rigor-rs#328 — same stage ordering as `check`'s stage 3: the
+        // reference emits grouped by RULE STAGE, so the caller-side
+        // `static.value-use.void` / `flow.shadowed-rescue-clause` rows slot in
+        // by `emission_stage`, not at the tail.
+        diags.sort_by_key(|d| rigor_rules::emission_stage(d.rule_id));
         // ADR-47 WD5 (upstream #627) — the dead arm of a decidable version guard
         // reports nothing. Same position as `check`'s stage 3: after every
         // type/flow rule, before `suppression.*` joins the list.

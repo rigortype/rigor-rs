@@ -5,7 +5,7 @@
 use rigor_index::CoreIndex;
 use rigor_parse::{LoweredAst, Node};
 
-use crate::{catalog, Diagnostic, Severity, CALL_UNRESOLVED_TOPLEVEL};
+use crate::{catalog, Diagnostic, KeyedDiagnostic, Severity, CALL_UNRESOLVED_TOPLEVEL};
 
 /// Toplevel `Kernel` methods that the RUNTIME Ruby injects but the vendored
 /// RBS does not model, so `class_has_method("Object", …)` misses them. The
@@ -38,11 +38,14 @@ fn main_singleton_method(index: &CoreIndex, method: &str) -> bool {
 /// injects toplevel methods that way would see a firing — the reference routes the
 /// same case to `pre_eval:` in the message; on the config-less corpus/harness the
 /// two agree exactly.
+/// Rows are queued keyed by the CALL's span (the reference emits the rule
+/// inside the converged walk's `CallNode` visit — slot 1 of its per-node
+/// emission array), not appended (rigor-rs#328).
 pub(crate) fn unresolved_toplevel_diagnostics(
     ast: &LoweredAst,
     index: &CoreIndex,
     source: &rigor_infer::SourceIndex,
-    out: &mut Vec<Diagnostic>,
+    out: &mut Vec<KeyedDiagnostic>,
 ) {
     // Spans of every CLASS/MODULE body — the NON-toplevel regions. `def` spans are
     // deliberately EXCLUDED: the reference's `scope.toplevel?` means "outside any
@@ -122,7 +125,7 @@ pub(crate) fn unresolved_toplevel_diagnostics(
             let severity = catalog(CALL_UNRESOLVED_TOPLEVEL)
                 .map(|e| e.default_severity)
                 .unwrap_or(Severity::Warning);
-            out.push(Diagnostic {
+            out.push((n.span(), 1, Diagnostic {
                 rule_id: CALL_UNRESOLVED_TOPLEVEL,
                 start_offset: message_span.0,
                 end_offset: message_span.1,
@@ -137,7 +140,7 @@ pub(crate) fn unresolved_toplevel_diagnostics(
                 receiver_classes: None,
 
                 method_name: Some(method.clone()),
-            });
+            }));
         }
     }
 }
