@@ -418,12 +418,35 @@ impl SourceIndex {
         }
         // Upstream v0.4.1: the ancestry facts, a union keyed by qualified
         // owner, plus how many files declare each qualified class.
-        for (h, ast) in files {
+        for (file, (h, ast)) in files.iter().enumerate() {
             let h = h.borrow();
+            let facts = ast.ancestry_facts();
             idx.ancestry.ingest(
-                ast.ancestry_facts(),
+                facts,
                 h.override_classes.iter().map(|oc| oc.qualified.as_str()),
             );
+            // The SYNTHETIC modules a concern's blocks define on
+            // (`class_methods do …` ⇒ `Owner::ClassMethods`, an `included
+            // do; def self.x` block ⇒ `Owner::<hook>`, #2986/#3005): module
+            // entries holding the blocks' instance defs, so an includer's
+            // singleton chain can resolve its hook edge against them
+            // exactly as the reference's `record_class_methods_block` /
+            // `record_hook_block_singleton_defs` file the def nodes. No
+            // visibilities ride, so the `file` index is inert here.
+            for (owner, names) in &facts.concern_blocks {
+                idx.ingest_override_class(
+                    file,
+                    owner,
+                    None,
+                    names,
+                    &[],
+                    &[],
+                    &[],
+                    &[],
+                    true,
+                    &[],
+                );
+            }
         }
 
         // Upstream v0.4.6 (#1817 / #2183): the rebinding-callee census,
@@ -645,8 +668,20 @@ impl SourceIndex {
             let bare = qualified.rsplit("::").next().unwrap_or(&qualified).to_string();
             // A constant is never a class/module: a name collision (the qualified
             // name names an override class, or the bare name a source class)
-            // declines — the singleton / source-class path owns that name.
-            if idx.override_classes.contains_key(&qualified) || idx.classes.contains_key(&bare) {
+            // declines — the singleton / source-class path owns that name — EXCEPT
+            // where the collision is a toplevel REOPEN of an RBS name and the write
+            // is NESTED: the reference resolves the write's value there (`class
+            // Integer; end; module Foo; Integer = 3` folds 3 and fires `for 3`,
+            // the value's read), while a toplevel write keeps the RBS reading
+            // (`Integer = 3` beside a reopen still fires `for
+            // singleton(Integer)`) and a PROJECT-OWN class name keeps the class
+            // reading (`module A; class B; end; B = 3` stays silent on both
+            // engines). rigor-rs#666.
+            let nested_rbs_write =
+                !namespace.is_empty() && core.knows_toplevel_class(&bare);
+            if !nested_rbs_write
+                && (idx.override_classes.contains_key(&qualified) || idx.classes.contains_key(&bare))
+            {
                 continue;
             }
             if let Some(l) = lit {

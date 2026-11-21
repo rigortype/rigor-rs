@@ -108,6 +108,17 @@ pub(crate) struct AncestryIndex {
     /// ([`AncestryFacts::extend_hook_owners`]) — `extend_reshapes_instance?`'s
     /// `defines_any?` half.
     extend_hook_owners: HashSet<String>,
+    /// rigor-rs#666 — per bare name, the namespaces a non-memo constant
+    /// WRITE of it sits in ([`AncestryFacts::shadow_writes`]), deduplicated:
+    /// a nested write makes the read resolve the written value (the
+    /// reference's `in_source_constants` reading), never the RBS class
+    /// object.
+    pub(crate) constant_write_namespaces: HashMap<String, Vec<Vec<String>>>,
+    /// rigor-rs#666 — per module owner, the modules its `included` /
+    /// `prepended` hook extends the INCLUDER with ([`AncestryFacts::
+    /// hook_extends`], the reference's `include_hook_edges`), the
+    /// WILDCARD (an extend the census cannot place) included.
+    pub(crate) hook_extends: HashMap<String, Vec<String>>,
 }
 
 impl AncestryIndex {
@@ -151,6 +162,20 @@ impl AncestryIndex {
         for raw in &facts.toplevel_includes {
             if !self.toplevel_includes.contains(raw) {
                 self.toplevel_includes.push(raw.clone());
+            }
+        }
+        for (ns, bare) in &facts.shadow_writes {
+            let list = self.constant_write_namespaces.entry(bare.clone()).or_default();
+            if !list.contains(ns) {
+                list.push(ns.clone());
+            }
+        }
+        for (owner, targets) in &facts.hook_extends {
+            let list = self.hook_extends.entry(owner.clone()).or_default();
+            for t in targets {
+                if !list.contains(t) {
+                    list.push(t.clone());
+                }
             }
         }
         for (owners, names) in &facts.receiver_mixins {
@@ -1282,35 +1307,98 @@ impl SourceIndex {
                     return true;
                 }
                 raws.iter().filter(|r| !mixin_marker(r)).any(|raw| {
-                    // v0.4.6 review: level 0 of the reference's singleton
-                    // chain holds the extended module's own include/prepend
-                    // closure too (`module Ext; include Inner`), read as the
-                    // instance-side closure is. A union, so a superset.
-                    if let Some(q) = self.resolve_override_ancestor(n, raw) {
-                        if &q != n && self.mixin_closure_may_answer(core, &q, method, open, false) {
-                            return true;
-                        }
-                    }
-                    match self.resolve_override_ancestor(n, raw) {
-                        Some(q) if self.known_user(&q) => {
-                            if &q == n {
-                                return false;
-                            }
-                            let rbs_known = core.knows_qualified_class(&q)
-                                || (!q.contains("::") && core.knows_toplevel_class(&q));
-                            if rbs_known {
-                                self.discovered_methods.get(&q).is_some_and(|m| m.contains(method))
-                                    || core.qualified_class_has_method(&q, method)
-                            } else {
-                                self.instance_records(&q, method)
-                                    || self.macro_named(&q, method)
-                                    || (open && (self.hook_capable(&q) || self.open_extend(core, &q)))
-                            }
-                        }
-                        _ => self.external_may_answer(core, n, raw, method, open),
-                    }
+                    self.singleton_raw_answers(core, n, raw, method, open)
                 })
+                    // The reference's `include_hook_edges` (#2975/#1592/
+                    // #3005): the modules the hooks of `n`'s instance
+                    // mixins extend it with — a hook's `base.extend(X)`,
+                    // a concern's `Owner::ClassMethods`, an
+                    // `included do; def self.x` block's `Owner::<hook>`
+                    // — answer as an extended module does, resolved
+                    // against the MIXIN's nesting; the WILDCARD is the
+                    // open hook (an extend the census could not place),
+                    // which silences every name under the same `open`
+                    // gate.
+                    || self.singleton_hook_targets(n).into_iter().any(|(m, raw)| {
+                        (open && mixin_marker(&raw))
+                            || (!mixin_marker(&raw)
+                                && self.singleton_raw_answers(core, &m, &raw, method, open))
+                    })
             })
+    }
+
+    /// One singleton-side mixin entry (the class's own `extend` raw or a
+    /// hook-extended module): [`Self::core_singleton_mixin_may_answer`]'s
+    /// per-raw arm, extracted so the hook edges reuse it with the MIXIN as
+    /// the resolution base — the level-0 closure read, the `known_user`
+    /// instance-surface read, and the external fallback for a spelling
+    /// that resolves to nothing.
+    fn singleton_raw_answers(
+        &self,
+        core: &CoreIndex,
+        from: &str,
+        raw: &str,
+        method: &str,
+        open: bool,
+    ) -> bool {
+        // v0.4.6 review: level 0 of the reference's singleton
+        // chain holds the extended module's own include/prepend
+        // closure too (`module Ext; include Inner`), read as the
+        // instance-side closure is. A union, so a superset.
+        if let Some(q) = self.resolve_override_ancestor(from, raw) {
+            if q != from && self.mixin_closure_may_answer(core, &q, method, open, false) {
+                return true;
+            }
+        }
+        match self.resolve_override_ancestor(from, raw) {
+            Some(q) if self.known_user(&q) => {
+                if q == from {
+                    return false;
+                }
+                let rbs_known = core.knows_qualified_class(&q)
+                    || (!q.contains("::") && core.knows_toplevel_class(&q));
+                if rbs_known {
+                    self.discovered_methods.get(&q).is_some_and(|m| m.contains(method))
+                        || core.qualified_class_has_method(&q, method)
+                } else {
+                    self.instance_records(&q, method)
+                        || self.macro_named(&q, method)
+                        || (open && (self.hook_capable(&q) || self.open_extend(core, &q)))
+                }
+            }
+            _ => self.external_may_answer(core, from, raw, method, open),
+        }
+    }
+
+    /// The reference's `include_hook_edges` (resolution_chain.rb, #2975):
+    /// `(mixin, target)` for each module the hooks of `class_name`'s
+    /// RESOLVED instance mixins extend it with, as written — an
+    /// `included`/`prepended` hook's `base.extend(X)`, a concern's
+    /// `ClassMethods` (its `append_features` const_get), an
+    /// `included do; def self.x` block's `<included>` segment. A mixin the
+    /// census cannot name never reaches a hook edge (its own unknown-mixin
+    /// silence covers the row).
+    fn singleton_hook_targets(&self, class_name: &str) -> Vec<(String, String)> {
+        self.instance_mixin_edges(class_name)
+            .into_iter()
+            .filter(|(_, raw)| !mixin_marker(raw))
+            .filter_map(|(from, raw)| {
+                self.resolve_override_ancestor(&from, &raw)
+                    .map(|m| (m, raw))
+            })
+            .flat_map(|(m, _)| {
+                self.ancestry
+                    .hook_extends
+                    .get(&m)
+                    .map(|targets| {
+                        targets
+                            .iter()
+                            .map(|t| (m.clone(), t.clone()))
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect()
     }
 
     /// Upstream v0.4.5 (#2086 / issue #1722, `RbsReceiverSurface.ancestor_may_answer?`)
@@ -1372,6 +1460,22 @@ impl SourceIndex {
                 .filter_map(|raw| self.resolve_override_ancestor(&current, raw))
                 .any(|q| self.instance_records(&q, method));
             if mixin_defines {
+                return true;
+            }
+            // The hook-extended modules of `current`'s instance side answer
+            // with their INSTANCE defs too (the reference's singleton chain
+            // holds the hook's modules as entries, `include_hook_edges`,
+            // #2975): a resolved target — a hook's `base.extend(CM)`, a
+            // concern's `ClassMethods`, an `included do` block's `<hook>`
+            // — is a project module like any other; an unresolved one stays
+            // the may-answer side's external.
+            let hook_defines = self
+                .singleton_hook_targets(&current)
+                .into_iter()
+                .filter(|(_, raw)| !mixin_marker(raw))
+                .filter_map(|(m, raw)| self.resolve_override_ancestor(&m, &raw))
+                .any(|q| self.instance_records(&q, method));
+            if hook_defines {
                 return true;
             }
             match self.project_superclass(&current) {

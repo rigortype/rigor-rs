@@ -52,6 +52,7 @@ use std::collections::HashSet;
 use crate::ruby_prism::{self, Node as PrismNode, Visit};
 
 use super::{constant_path_string, constant_string, strict_constant_path_string};
+use super::constants::rooted_constant_path;
 
 /// The name an owner side lists when an edge was written that the port cannot
 /// hold (the reference's `MixinAccumulator::WILDCARD`).
@@ -158,6 +159,36 @@ pub struct AncestryFacts {
     /// decline ([`super::rebind_sites`]). Carried here so the AST keeps one
     /// boxed side table.
     pub rebind: super::rebind_sites::RebindFacts,
+    /// `(namespace segments, bare name)` of every non-memo constant WRITE
+    /// this file makes in a class/module/program body — bare (`X = v`),
+    /// qualified (`Foo::X = v`, the constant's own namespace) and rooted
+    /// (`::Foo::X = v`) spellings alike; `||=` / `&&=` / op-assign writes
+    /// nothing when the name is already defined and counts nowhere. The
+    /// namespace is the WRITE SITE'S header chain flattened (a compact
+    /// `class Foo::Bar` contributes both its segments), matching the
+    /// use-site prefix model [`SourceIndex`]'s shadow gates read. The
+    /// reference resolves such a write as the read's VALUE (its
+    /// `in_source_constants`), so a nested write shadows the RBS constant
+    /// mint for reads its namespace actually covers (rigor-rs#666).
+    pub shadow_writes: Vec<(Vec<String>, String)>,
+    /// Upstream #2975 / #1592 (`record_hook_extends`) — per module owner,
+    /// the modules its `included` / `prepended` hook extends the INCLUDER
+    /// with, as written (`def self.included(b); b.extend(ClassMethods)`),
+    /// plus a concern's `Owner::ClassMethods` (its `append_features`
+    /// const_get, #2986) and an `included do; def self.x` block's
+    /// `Owner::<included>` segment (#3005 — Ruby runs that block in the
+    /// includer's class body). The WILDCARD marks an extend the census
+    /// cannot place (conditional, non-constant, sent, nested), the
+    /// reference's `[ENVELOPE_HOOK_EXTEND_OPEN_KIND]`.
+    pub hook_extends: Vec<(String, Vec<String>)>,
+    /// The SYNTHETIC modules a concern's blocks define the methods of
+    /// (`class_methods do … end` ⇒ `Owner::ClassMethods`, an
+    /// `included`/`prepended` block ⇒ `Owner::<hook>`): `(qualified
+    /// synthetic owner, def names)` — the reference's
+    /// `record_class_methods_block` / `record_hook_block_singleton_defs`,
+    /// read in EVERY body of the module (#2997), drawn by an includer
+    /// only through the hook edge above.
+    pub concern_blocks: Vec<(String, Vec<String>)>,
 }
 
 /// `RequiredFeatures::VENDORED_DIRS`' keys: the features whose vendored gem
@@ -1113,6 +1144,37 @@ struct Census<'pr> {
     /// each registered body, extended one body per question.
     class_body_calls: std::collections::HashMap<(usize, usize), PrismNode<'pr>>,
     class_bodies_read: usize,
+    /// ORDINARY block nesting depth (a call's block that is neither an
+    /// eval-family nor a class-creating block — no frame is pushed for it).
+    /// `ModuleFunctionState.extends_self?` is not reached through one.
+    ordinary_blocks: usize,
+    /// The `included`/`prepended` HOOK bodies currently being walked (one
+    /// per nesting level that is such a def), for the named hook-extend
+    /// census: the module the hook belongs to and the spans of its body's
+    /// DIRECT statements (`placeable_hook_statements` — only a direct
+    /// `base.extend(X)` is an edge the tables can place).
+    hook_frames: Vec<HookCtx>,
+    /// Per declaration: the module-body concern state
+    /// (`record_concern_class_methods`) — `None` for a `class` body, a
+    /// module's `Some(ConcernCtx)` otherwise.
+    concern_stack: Vec<Option<ConcernCtx>>,
+}
+
+/// One `included`/`prepended` hook body being walked.
+struct HookCtx {
+    /// The module whose hook this is (qualified).
+    owner: String,
+    /// The spans of the hook body's DIRECT statements.
+    direct: std::collections::HashSet<(usize, usize)>,
+}
+
+/// `concern_body?` + the pending `class_methods` blocks of one module
+/// body: the `Owner::ClassMethods` const_get edge is recorded only when
+/// the body runs `extend ActiveSupport::Concern` (#2986).
+#[derive(Default)]
+struct ConcernCtx {
+    concern: bool,
+    class_methods: bool,
 }
 
 impl<'pr> Census<'pr> {
@@ -1207,7 +1269,13 @@ impl<'pr> Census<'pr> {
         false
     }
 
-    fn declaration(&mut self, n: &PrismNode<'_>, name: String, body: Option<PrismNode<'pr>>) {
+    fn declaration(
+        &mut self,
+        n: &PrismNode<'_>,
+        name: String,
+        body: Option<PrismNode<'pr>>,
+        module_body: bool,
+    ) {
         let direct = self.is_direct(n);
         if name.is_empty() {
             // An unnameable declaration owns nothing the port can hold.
@@ -1237,8 +1305,12 @@ impl<'pr> Census<'pr> {
         );
         let saved_def = std::mem::replace(&mut self.in_def, 0);
         let saved_hooks = std::mem::take(&mut self.hook_params);
+        // `record_concern_class_methods` reads a MODULE body only; a
+        // `class` body's blocks stay out (`return unless ModuleNode`).
+        let saved_concern = std::mem::take(&mut self.concern_stack);
+        self.concern_stack.push(module_body.then(ConcernCtx::default));
         self.frames.push(Frame {
-            owner: Some(vec![qualified]),
+            owner: Some(vec![qualified.clone()]),
             singleton: false,
             uncertain: false,
             eval_owner: None,
@@ -1249,6 +1321,17 @@ impl<'pr> Census<'pr> {
         self.frames.pop();
         self.hook_params = saved_hooks;
         self.in_def = saved_def;
+        // `concern_body?` decided at the END of the body, order-free: the
+        // body ran `extend ActiveSupport::Concern` (wherever it sits) and
+        // holds a `class_methods` block ⇒ the `Owner::ClassMethods`
+        // const_get edge (#2986's `append_features`).
+        let ctx = self.concern_stack.pop().flatten();
+        if ctx.is_some_and(|c| c.concern && c.class_methods) {
+            self.out
+                .hook_extends
+                .push((qualified, vec!["ClassMethods".to_string()]));
+        }
+        self.concern_stack = saved_concern;
         self.prefix = saved_prefix;
     }
 
@@ -1727,8 +1810,95 @@ impl<'pr> Census<'pr> {
     }
 }
 
-impl<'pr> Visit<'pr> for Census<'pr> {
-    fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
+/// `each_class_methods_def` over a `class_methods do … end` block body
+/// (#2997): every RECEIVERLESS `def` name, descending until the reference's
+/// `CONCERN_BLOCK_STOPS` (a nested `def`, class, module or
+/// `class <<` body — a `def self.x` in the block lands on the synthetic
+/// module's own singleton, which no chain entry answers with, and so files
+/// nowhere here). `None` when the walk meets a shape it does not model.
+fn class_methods_def_names(body: &PrismNode<'_>) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    fn walk(node: &PrismNode<'_>, out: &mut Vec<String>) {
+        if let Some(def) = node.as_def_node() {
+            if def.receiver().is_none() {
+                out.push(constant_string(def.name().as_slice()));
+            }
+            return; // CONCERN_BLOCK_STOPS: a def's own body is not entered.
+        }
+        if node.as_class_node().is_some()
+            || node.as_module_node().is_some()
+            || node.as_singleton_class_node().is_some()
+        {
+            return; // another scope's defs belong to it.
+        }
+        for child in compact_children(node) {
+            walk(&child, out);
+        }
+    }
+    walk(body, &mut out);
+    Some(out)
+}
+
+/// `hook_block_singleton_defs` over an `included do … end` /
+/// `prepended do … end` block body (#3005): the `def self.x` names the
+/// block's statements define on the INCLUDER's singleton, plus a
+/// `class << self` body's RECEIVERLESS defs (`each_hook_block_singleton_
+/// class`); a `class << self` body with a statement-level visibility call
+/// (`private`, `private :x`, …) may make its defs non-public, which the
+/// tables cannot hold, so the whole block answers `None` — the caller
+/// records nothing and the hook stays as the plain extends/taints read it
+/// (the reference files the open hook instead; unported, a disclosed
+/// refinement).
+fn hook_block_def_names(body: &PrismNode<'_>) -> Option<Vec<String>> {
+    let mut out = Vec::new();
+    fn walk(node: &PrismNode<'_>, out: &mut Vec<String>) -> bool {
+        if let Some(def) = node.as_def_node() {
+            if def.receiver().is_some_and(|r| r.as_self_node().is_some()) {
+                out.push(constant_string(def.name().as_slice()));
+            }
+            return true; // CONCERN_BLOCK_STOPS.
+        }
+        if let Some(sc) = node.as_singleton_class_node() {
+            if sc.expression().as_self_node().is_some() {
+                if let Some(stmts) = sc.body().and_then(|b| b.as_statements_node()) {
+                    for s in stmts.body().iter() {
+                        if s.as_call_node().is_some_and(|c| {
+                            c.receiver().is_none()
+                                && matches!(
+                                    constant_string(c.name().as_slice()).as_str(),
+                                    "private" | "protected" | "public"
+                                )
+                        }) {
+                            return false; // the open shape
+                        }
+                        if let Some(def) = s.as_def_node() {
+                            if def.receiver().is_none() {
+                                out.push(constant_string(def.name().as_slice()));
+                            }
+                        }
+                    }
+                }
+            }
+            return true;
+        }
+        if node.as_class_node().is_some() || node.as_module_node().is_some() {
+            return true; // another scope's defs belong to it.
+        }
+        for child in compact_children(node) {
+            if !walk(&child, out) {
+                return false;
+            }
+        }
+        true
+    }
+    if walk(body, &mut out) {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+impl<'pr> Visit<'pr> for Census<'pr> {    fn visit_program_node(&mut self, node: &ruby_prism::ProgramNode<'pr>) {
         for s in node.statements().body().iter() {
             self.direct.insert(span_key(&s));
         }
@@ -1741,12 +1911,12 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             self.visit(&sup);
         }
         let name = constant_path_string(&node.constant_path());
-        self.declaration(&node.as_node(), name, node.body());
+        self.declaration(&node.as_node(), name, node.body(), false);
     }
 
     fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
         let name = constant_path_string(&node.constant_path());
-        self.declaration(&node.as_node(), name, node.body());
+        self.declaration(&node.as_node(), name, node.body(), true);
     }
 
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
@@ -1846,6 +2016,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             }
         }
         let saved_hooks = self.hook_params.len();
+        let saved_hook_frames = self.hook_frames.len();
         if hook {
             if let Some(params) = node.parameters() {
                 for p in params.requireds().iter().chain(params.optionals().iter()) {
@@ -1857,10 +2028,73 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                 }
             }
         }
+        // `record_hook_extends` (#2975): only an `included`/`prepended`
+        // hook the module's own body declares (a SINGLETON-side def at
+        // body level, `def self.included(b)` or one under `class << self`)
+        // runs for an includer, so only its body is scanned for the
+        // `base.extend(X)` edges. The hook's DIRECT statements are the
+        // placeable ones (`placeable_hook_statements`).
+        if self.in_def == 0
+            && matches!(name.as_str(), "included" | "prepended")
+            && singleton_def
+        {
+            if let Some(owner) = self.owner() {
+                let mut direct = std::collections::HashSet::new();
+                if let Some(b) = node.body() {
+                    if let Some(stmts) = b.as_statements_node() {
+                        for s in stmts.body().iter() {
+                            direct.insert(span_key(&s));
+                        }
+                    }
+                }
+                self.hook_frames.push(HookCtx { owner: owner.join("::"), direct });
+            }
+        }
         self.in_def += 1;
         ruby_prism::visit_def_node(self, node);
         self.in_def -= 1;
         self.hook_params.truncate(saved_hooks);
+        self.hook_frames.truncate(saved_hook_frames);
+    }
+
+    fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+        // `shadow_writes` (rigor-rs#666): a bare `X = v` writes the constant of
+        // the enclosing header chain — non-memo, def-nested writes out of scope
+        // exactly as C5's fold-discovery inclusion rule reads them.
+        if self.in_def == 0 {
+            let bare = constant_string(node.name().as_slice());
+            if !bare.is_empty() {
+                self.out.shadow_writes.push((self.prefix.clone(), bare));
+            }
+        }
+        ruby_prism::visit_constant_write_node(self, node);
+    }
+
+    fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+        // A path-write (`Foo::X = v`, `::Foo::X = v`) writes the constant of
+        // its OWN namespace: the written path minus the last segment, rooted
+        // spellings anchored at the top level. A dynamic base or a `self::`
+        // anchor renders nothing strict here and counts nowhere.
+        if self.in_def == 0 {
+            let target = node.target().as_node();
+            if let Some(written) = strict_constant_path_string(&target) {
+                let rooted = rooted_constant_path(&target);
+                let segs: Vec<&str> = written.split("::").collect();
+                if let Some((last, parents)) = segs.split_last() {
+                    if !last.is_empty() && parents.iter().all(|s| !s.is_empty()) {
+                        let ns = if rooted {
+                            parents.iter().map(|s| s.to_string()).collect::<Vec<_>>()
+                        } else {
+                            let mut ns = self.prefix.clone();
+                            ns.extend(parents.iter().map(|s| s.to_string()));
+                            ns
+                        };
+                        self.out.shadow_writes.push((ns, (*last).to_string()));
+                    }
+                }
+            }
+        }
+        ruby_prism::visit_constant_path_write_node(self, node);
     }
 
     fn visit_call_node(&mut self, node: &ruby_prism::CallNode<'pr>) {
@@ -1944,6 +2178,154 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                             self.out.contested_visibilities.push((o.clone(), m.clone()));
                         }
                     }
+                }
+            }
+        }
+        // `record_hook_extends` (#2975/#1592): a DIRECT `base.extend(X)`
+        // statement of an `included`/`prepended` hook body names a module
+        // the hook's INCLUDER is extended with — the port's counterpart of
+        // the `[ENVELOPE_HOOK_EXTEND_KIND]` edge. Only the BARE hook
+        // parameter as the receiver and only constant arguments place; any
+        // other spelling of the extend (chained, sent, conditional,
+        // non-constant, block-nested) is the OPEN mark — some module no
+        // name spells — exactly the reference's
+        // `[ENVELOPE_HOOK_EXTEND_OPEN_KIND]` entry.
+        if name == "extend"
+            && self.in_def == self.hook_frames.len()
+            && self.in_def > 0
+            && recv.as_ref().is_some_and(|r| {
+                r.as_local_variable_read_node().is_some_and(|lv| {
+                    self.hook_params.contains(&constant_string(lv.name().as_slice()))
+                })
+            })
+        {
+            if let Some(f) = self.hook_frames.last() {
+                let consts: Vec<String> =
+                    args.iter().filter_map(strict_constant_path_string).collect();
+                let placeable =
+                    f.direct.contains(&span_key(&n)) && !args.is_empty() && consts.len() == args.len();
+                if placeable {
+                    self.out.hook_extends.push((f.owner.clone(), consts));
+                } else {
+                    self.out
+                        .hook_extends
+                        .push((f.owner.clone(), vec![WILDCARD.to_string()]));
+                }
+            }
+        }
+        // `record_concern_class_methods` (#2986/#3005/#2997): a module
+        // body's concern blocks. `extend ActiveSupport::Concern` marks the
+        // body a concern (read at the body's end, order-free, in
+        // [`Census::declaration`]); a `class_methods do … end` block is a
+        // `module_eval` of `Owner::ClassMethods` (every def of it lands
+        // there, whether or not the body is a concern — an includer draws
+        // it only through the concern's const_get edge); an
+        // `included do … end` / `prepended do … end` block runs in the
+        // INCLUDER's class body, so its `def self.x` defines there — filed
+        // as the instance methods of an unspellable `Owner::<hook>`
+        // module the includer's chain holds.
+        if recv.is_none()
+            && self.in_def == 0
+            && !self.frame().singleton
+            && node.block().is_some()
+            && matches!(name.as_str(), "class_methods" | "included" | "prepended")
+        {
+            let concern_block = node.block().and_then(|b| b.as_block_node());
+            if let Some(owner) = self.owner() {
+                if !owner.is_empty() {
+                    let owner = owner.join("::");
+                    let body = concern_block.as_ref().map(|b| b.as_node());
+                    if name == "class_methods" {
+                        if let Some(names) = body.and_then(|b| class_methods_def_names(&b)) {
+                            if !names.is_empty() {
+                                self.out.concern_blocks.push((
+                                    format!("{owner}::ClassMethods"),
+                                    names,
+                                ));
+                                if let Some(Some(c)) = self.concern_stack.last_mut() {
+                                    c.class_methods = true;
+                                }
+                            }
+                        }
+                    } else if matches!(name.as_str(), "included" | "prepended") {
+                        if let Some(names) = body.and_then(|b| hook_block_def_names(&b)) {
+                            let segment = format!("<{name}>");
+                            if !names.is_empty() {
+                                self.out
+                                    .concern_blocks
+                                    .push((format!("{owner}::{segment}"), names));
+                                self.out.hook_extends.push((owner, vec![segment]));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // The concern-body mark: a receiverless `extend
+        // ActiveSupport::Concern` statement of a module body.
+        if recv.is_none()
+            && self.in_def == 0
+            && name == "extend"
+            && args
+                .first()
+                .and_then(|a| strict_constant_path_string(a))
+                .is_some_and(|raw| raw.trim_start_matches("::") == "ActiveSupport::Concern")
+        {
+            if let Some(Some(c)) = self.concern_stack.last_mut() {
+                c.concern = true;
+            }
+        }
+        // `ModuleFunctionState.extends_self?` — the extends table's reading
+        // (#526): a bare receiverless `module_function` in a class/module
+        // body makes the module extend itself, so every instance def it has
+        // — before and after the call, whatever a later bare `public` says —
+        // also answers on its singleton (`discovered_extends`'s "the module
+        // itself for module_function"). A NAMED call is not a directive
+        // here: its singleton copy is not modelled, and the reference keeps
+        // firing (`module_function :q` + `Comparable.q`). Reached in control
+        // flow and in an eval-family block under that block's frame; not
+        // through an ordinary block, a `class << self` body or a `def` body
+        // (an END body is the one form this walk does not tell apart, noted
+        // here as the reference does not either).
+        if recv.is_none()
+            && name == "module_function"
+            && args.is_empty()
+            && self.in_def == 0
+            && self.ordinary_blocks == 0
+            && !self.frame().singleton
+        {
+            if let Some(owner) = self.self_owner() {
+                self.out.singleton_mixins.push((owner.clone(), owner.to_vec()));
+            }
+        }
+        // Forwardable's delegator macros inside a `class << self` body define
+        // names on the class object; one whose NAME argument no literal spells
+        // (an interpolated string, a splat, a local) opens the surface — the
+        // reference's computed-definer reading — so the singleton side takes
+        // the WILDCARD there (`def_delegators :x, *NAMES` silences any
+        // class-object call). The literal names themselves file in the def
+        // walk (`file_call_methods`); this arm only marks the side.
+        if self.frame().singleton
+            && self.in_def == 0
+            && matches!(
+                name.as_str(),
+                "def_delegator" | "def_delegators" | "def_instance_delegator" | "def_instance_delegators"
+            )
+        {
+            let name_args: Vec<&PrismNode<'pr>> = if name.ends_with('s') {
+                args.iter().skip(1).collect()
+            } else {
+                args.iter().skip(1).take(2).collect()
+            };
+            if name_args.is_empty()
+                || name_args
+                    .iter()
+                    .any(|a| super::definitions::literal_symbol_or_string_name(a).is_none())
+            {
+                if let Some(owner) = self.self_owner() {
+                    self.out
+                        .singleton_mixins
+                        .push((owner, vec![WILDCARD.to_string()]));
                 }
             }
         }
@@ -2039,10 +2421,14 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         let pushed = frame.is_some();
         if let Some(f) = frame {
             self.frames.push(f);
+        } else {
+            self.ordinary_blocks += 1;
         }
         ruby_prism::visit_block_node(self, &b);
         if pushed {
             self.frames.pop();
+        } else {
+            self.ordinary_blocks -= 1;
         }
     }
 }
@@ -2059,6 +2445,9 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
         hook_params: Vec::new(),
         direct_includes: std::collections::HashMap::new(),
         main_self: HashSet::new(),
+        ordinary_blocks: 0,
+        hook_frames: Vec::new(),
+        concern_stack: Vec::new(),
         class_bodies: Vec::new(),
         class_body_calls: std::collections::HashMap::new(),
         class_bodies_read: 0,

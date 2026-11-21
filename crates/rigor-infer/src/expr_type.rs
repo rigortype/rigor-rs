@@ -410,8 +410,10 @@ impl<'i> Typer<'i> {
                 }
                 // Both the C5 literal-fold and the C1 shadow gate resolve against
                 // the use site's lexical prefix (Ruby constant lookup), so compute
-                // it once.
+                // it once. The write-shadow arm additionally matches against the
+                // site's header boundaries (`enclosing_ns_boundaries`).
                 let prefix = self.enclosing_prefix(*span);
+                let ns_boundaries = self.enclosing_ns_boundaries(*span);
                 // C5: a project constant with a single fully-literal assignment,
                 // visible here lexically, types to that literal value
                 // (Range -> Nominal[Range]) — consulted BEFORE the singleton gate
@@ -420,7 +422,9 @@ impl<'i> Typer<'i> {
                 // the SAME FILE as the assignment — the reference rebuilds its
                 // in-source constant-value table per file, so a cross-file fold
                 // is an emission the oracle never makes.
-                if let Some(lit) = self.source.literal_constant(name, prefix, ast.file_key()) {
+                if let Some(lit) =
+                    self.source.literal_constant_bounded(name, prefix, &ns_boundaries, ast.file_key())
+                {
                     return self.intern_const_lit(lit, interner);
                 }
                 // Collection-shape stage 2e: the same C5 value reached by a
@@ -448,9 +452,11 @@ impl<'i> Typer<'i> {
                 if !name.is_empty()
                     && self.index.knows_toplevel_class(name)
                     && (*rooted
-                        || !self
-                            .source
-                            .constant_shadowed_except_toplevel_reopen(name, prefix))
+                        || !self.source.constant_shadowed_except_toplevel_reopen(
+                            name,
+                            prefix,
+                            &ns_boundaries,
+                        ))
                 {
                     if let Some(class) = self.source.class_id(name) {
                         return interner.intern(Type::Singleton(class));
@@ -1181,6 +1187,35 @@ impl<'i> Typer<'i> {
         // `call.undefined-method` on the result where the oracle is silent.
         if *dynamic_base || name.is_empty() || CLASS_RETURNING_NEW.contains(&name.as_str()) {
             return None;
+        }
+        // The receiver's constant resolves as the `ConstantRead` arm does —
+        // the reference types `X.new`'s X through its constant-value and
+        // shadow tables, not the RBS name alone. A visible NESTED write owns
+        // the read: a literal folds to its VALUE (the caller's normal path
+        // types it — `Integer = "s"; Integer.new(1)` fires `new` for "s" and
+        // the result stays silent, the oracle's row), and a non-literal
+        // (`Integer = Struct.new(:a)`) leaves the read `Dynamic` and the
+        // `.new` result with it. A NESTED declaration shadows exactly as the
+        // read gate does (`module M; class Integer; end; Integer.new(1).zzz`
+        // is the oracle's silence; this mint used to ignore both). A
+        // TOPLEVEL reopen keeps the mint (`class Integer; end;
+        // Integer.new(1).zzz` still fires, both engines).
+        if let Node::ConstantRead { span, .. } = ast.get(receiver) {
+            let use_prefix = self.enclosing_prefix(*span);
+            let use_boundaries = self.enclosing_ns_boundaries(*span);
+            if self
+                .source
+                .literal_constant_bounded(name, use_prefix, &use_boundaries, ast.file_key())
+                .is_some()
+            {
+                return None;
+            }
+            if self
+                .source
+                .constant_shadowed_except_toplevel_reopen(name, use_prefix, &use_boundaries)
+            {
+                return None;
+            }
         }
 
         // Reference `meta_new` constant-constructor lifts (faithful decline

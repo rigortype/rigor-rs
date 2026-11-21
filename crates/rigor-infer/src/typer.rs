@@ -303,6 +303,29 @@ impl<'i> Typer<'i> {
         best.map(|b| b.1.as_slice()).unwrap_or(&[])
     }
 
+    /// The NS BOUNDARIES of the use site at `span`: the cumulative segment
+    /// counts of every enclosing declaration header, outermost first —
+    /// `[1]` inside `module Foo; class Bar`, but `[2]` inside a COMPACT
+    /// `class Foo::Bar` (whose one header spans both segments, so a
+    /// constant written in `module Foo` is NOT in its `Module.nesting`
+    /// lookup — the reference's cref, #682's reading). A
+    /// [`SourceIndex`] shadow gate matches a write's namespace against
+    /// these, not against the flattened prefix (rigor-rs#666).
+    pub fn enclosing_ns_boundaries(&self, span: rigor_parse::Span) -> Vec<usize> {
+        let mut chain: Vec<&(rigor_parse::Span, Vec<String>)> = self
+            .lexical_scopes
+            .iter()
+            .filter(|(sc, _)| sc.0 <= span.0 && span.1 <= sc.1)
+            .collect();
+        // Narrow→wide, so the reverse walk is outermost→innermost.
+        chain.sort_by_key(|(sc, _)| sc.1 - sc.0);
+        // The leading 0 is the implicit toplevel boundary: a toplevel
+        // constant is visible at every use site.
+        let mut out = vec![0usize];
+        out.extend(chain.iter().rev().map(|(_, segs)| segs.len()));
+        out
+    }
+
     /// The borrowed source index (for the rules layer's method-resolution gate).
     pub fn source(&self) -> &SourceIndex {
         self.source

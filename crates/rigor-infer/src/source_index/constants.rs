@@ -28,11 +28,34 @@ impl SourceIndex {
         use_prefix: &[String],
         use_file: &FileKey,
     ) -> Option<&ConstLit> {
+        // Every prefix length is a valid nesting boundary under the flat
+        // reading — the historical 3-argument shape the per-file and
+        // probe-suite callers hold.
+        let flat: Vec<usize> = (0..=use_prefix.len()).collect();
+        self.literal_constant_bounded(name, use_prefix, &flat, use_file)
+    }
+
+    /// [`Self::literal_constant`] with the use site's HEADER BOUNDARIES
+    /// ([`Typer::enclosing_ns_boundaries`], 0 leading): an entry applies
+    /// only when its defining namespace ends at a boundary the site's
+    /// `Module.nesting` actually holds — a constant written in `module
+    /// Foo` is visible from `module Foo` and from a nested
+    /// `module Foo; class Bar`, never from a COMPACT `class Foo::Bar`
+    /// whose one header covers both segments (rigor-rs#666, #682's cref
+    /// reading the reference's constant-value table resolves by).
+    pub fn literal_constant_bounded(
+        &self,
+        name: &str,
+        use_prefix: &[String],
+        use_boundaries: &[usize],
+        use_file: &FileKey,
+    ) -> Option<&ConstLit> {
         self.literal_constants
             .get(name)?
             .iter()
             .filter(|(_, file, _)| file == use_file)
             .filter(|(ns, _, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
+            .filter(|(ns, _, _)| use_boundaries.contains(&ns.len()))
             .max_by_key(|(ns, _, _)| ns.len())
             .map(|(_, _, lit)| lit)
     }
@@ -164,14 +187,33 @@ impl SourceIndex {
     /// lexically-visible read, and a project class the qualified walk did not
     /// place (def-nested / walk gap) keeps the blanket suppression.
     ///
+    /// A NESTED constant WRITE (`module Foo; Integer = "s"`) also shadows:
+    /// the reference resolves the read as the written VALUE (its
+    /// `in_source_constants`), so a literal folds in C5 before this gate and
+    /// a non-literal (`Class.new`, `Struct.new`, another class) leaves the
+    /// read `Dynamic[top]` — never the RBS class object. `use_boundaries`
+    /// ([`Typer::enclosing_ns_boundaries`]) keeps the match header-accurate:
+    /// a write in `module Foo` shadows reads in `module Foo` and in a nested
+    /// `module Foo; class Bar`, but NOT in a COMPACT `class Foo::Bar`,
+    /// whose single header covers both segments (`class Foo::Bar;
+    /// Integer.zzz` keeps firing, #682's cref reading). A toplevel write
+    /// shadows nothing: the reference keeps the RBS name there (`Integer =
+    /// 3` beside a reopen still fires `for singleton(Integer)`), and a memo
+    /// write (`||=`) assigns nothing when the name is defined.
+    ///
     /// Used ONLY by the `ConstantRead` → `Type::Singleton` mint: a reopened
     /// name reaches the same `singleton(X)` surface check the reference's
     /// `resolve_constant_name` + `rbs_class_known?` perform, so typing it
     /// `Dynamic[top]` was the coverage loss the issue files. The other
     /// shadow-gate callers keep [`Self::constant_shadowed`]'s stricter
     /// answer — their slices mint or narrow on their own evidence.
-    pub fn constant_shadowed_except_toplevel_reopen(&self, name: &str, use_prefix: &[String]) -> bool {
-        match self.nested_constant_namespaces.get(name) {
+    pub fn constant_shadowed_except_toplevel_reopen(
+        &self,
+        name: &str,
+        use_prefix: &[String],
+        use_boundaries: &[usize],
+    ) -> bool {
+        let declared = match self.nested_constant_namespaces.get(name) {
             Some(namespaces) => namespaces.iter().any(|ns| {
                 ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
             }),
@@ -182,7 +224,16 @@ impl SourceIndex {
             None => {
                 self.classes.contains_key(name) && !self.toplevel_constants.contains(name)
             }
-        }
+        };
+        declared
+            || self.ancestry.constant_write_namespaces.get(name).is_some_and(|nses| {
+                nses.iter().any(|ns| {
+                    !ns.is_empty()
+                        && ns.len() <= use_prefix.len()
+                        && use_prefix[..ns.len()] == ns[..]
+                        && use_boundaries.contains(&ns.len())
+                })
+            })
     }
 
     /// Whether the project defines a constant named `name` ANYWHERE (toplevel,
