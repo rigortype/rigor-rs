@@ -578,7 +578,7 @@ impl<'i> Typer<'i> {
                         // folded truthiness — `if`'s dead `then` is the
                         // truthy edge's scope.
                         let mut subjects = Vec::new();
-                        self.predicate_edge_locals(ast, *predicate, !truthy, &mut subjects);
+                        Self::predicate_edge_locals(ast, *predicate, !truthy, &mut subjects);
                         dead.folded.push((hull, subjects));
                         dirty = true;
                     }
@@ -1233,7 +1233,6 @@ impl<'i> Typer<'i> {
     /// oracle keeps the carrier (`q = "x"; …; if q.respond_to?(:upcase) ||
     /// r; else; q.w` fires `w for "x"`).
     pub(crate) fn predicate_edge_locals(
-        &self,
         ast: &LoweredAst,
         pred: NodeId,
         polarity: bool,
@@ -1252,8 +1251,8 @@ impl<'i> Typer<'i> {
             // edge either may have failed, so neither narrows. `a || b`
             // mirrors — both narrow on the falsey edge only.
             Node::Logical { left, right, is_and, .. } if *is_and == polarity => {
-                self.predicate_edge_locals(ast, *left, polarity, out);
-                self.predicate_edge_locals(ast, *right, polarity, out);
+                Self::predicate_edge_locals(ast, *left, polarity, out);
+                Self::predicate_edge_locals(ast, *right, polarity, out);
             }
             Node::Call {
                 receiver,
@@ -1265,21 +1264,30 @@ impl<'i> Typer<'i> {
             } if block_body.is_empty() && !*safe_nav => match method.as_str() {
                 "!" if args.is_empty() => {
                     if let Some(r) = receiver {
-                        self.predicate_edge_locals(ast, *r, !polarity, out);
+                        Self::predicate_edge_locals(ast, *r, !polarity, out);
                     }
                 }
-                "==" | "!=" | "eql?" | "equal?" | "===" if args.len() == 1 => {
+                "==" | "!=" | "===" if args.len() == 1 => {
                     // `q == p` holds on the `polarity` edge: the local keeps
                     // iff `local == peer` matches the expected equality.
+                    // `eql?`/`equal?` are NOT in the reference's predicate
+                    // catalogue (`simple_dispatch_name?`,
+                    // narrowing.rb:1469) — they narrow no subject on either
+                    // edge, so minting `Cmp` for them dropped members the
+                    // oracle keeps (rigor-rs#681 review: `while y.eql?(1)`).
                     let eq = if method == "!=" { !polarity } else { polarity };
                     // `C === local` is a class check ON the local —
                     // `Integer === y` narrows `y` exactly like
-                    // `y.is_a?(Integer)` (rigor-rs#681). Minted only when
-                    // `C` resolves to a class: a value constant
-                    // (`FOO = 5; FOO === y`) is an equality the `Cmp`
-                    // operand declines. `local === C` keeps the `Cmp`
-                    // operand — `1 === Integer` is `==` equality, not a
-                    // class test.
+                    // `y.is_a?(Integer)` (rigor-rs#681). The reference's
+                    // `analyse_case_equality_receiver` resolves the constant
+                    // NAME lexically (`lexical_class_name` falls back to the
+                    // bare spelling) and hands it to `narrow_class`, so the
+                    // `Isa` is minted for ANY static constant receiver — an
+                    // undeclared or project-only class answers `untyped` on
+                    // the positive edge, not Bot (`declines_bot?`), which
+                    // `dead_subject_type` owns. `local === C` keeps the
+                    // `Cmp` operand — `1 === Integer` is `==` equality, not
+                    // a class test.
                     if method == "===" {
                         if let Some(r) = receiver {
                             if let Node::ConstantRead {
@@ -1288,19 +1296,15 @@ impl<'i> Typer<'i> {
                                 ..
                             } = ast.get(*r)
                             {
-                                let resolves = self.index.class_id(class).is_some()
-                                    || self.source.class_id(class).is_some();
-                                if resolves {
-                                    if let Node::LocalVariableRead { name, .. }
-                                    | Node::LocalVariableWrite { name, .. } = ast.get(args[0])
-                                    {
-                                        push(out, name, DeadOp::Isa {
-                                            class: class.to_string(),
-                                            exact: false,
-                                            holds: eq,
-                                        });
-                                        return;
-                                    }
+                                if let Node::LocalVariableRead { name, .. }
+                                | Node::LocalVariableWrite { name, .. } = ast.get(args[0])
+                                {
+                                    push(out, name, DeadOp::Isa {
+                                        class: class.to_string(),
+                                        exact: false,
+                                        holds: eq,
+                                    });
+                                    return;
                                 }
                             }
                         }

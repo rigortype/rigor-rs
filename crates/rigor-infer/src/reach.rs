@@ -1851,7 +1851,7 @@ fn pin_join(acc: Option<Option<Scalar>>, value: Option<Scalar>) -> Option<Option
 /// or `None` for a non-literal. Used by [`Typer::expr_scalar`] to pin an
 /// all-literal chain (`"x".to_i`) to the `Constant` the reference's own fold
 /// would give it (rigor-rs#332).
-fn literal_scalar(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
+pub(crate) fn literal_scalar(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
     match ast.get(id) {
         Node::IntegerLit { value: Some(v), .. } => Some(Scalar::Int(*v)),
         Node::IntegerLit { digits: Some(d), .. } => Some(Scalar::BigInt(d.clone())),

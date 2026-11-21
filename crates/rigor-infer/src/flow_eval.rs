@@ -1166,7 +1166,7 @@ impl<'i> Typer<'i> {
                 let truthy_entry =
                     matches!(kind, rigor_parse::LoopKind::While { .. });
                 let mut subjects = Vec::new();
-                self.predicate_edge_locals(ast, p, truthy_entry, &mut subjects);
+                Self::predicate_edge_locals(ast, p, truthy_entry, &mut subjects);
                 for (name, op) in subjects {
                     let Some(&cur) = pass_env.get(name.as_str()) else { continue };
                     let narrowed = self.dead_subject_type(ast, cur, &op, interner);
@@ -3110,15 +3110,71 @@ impl<'i> Typer<'i> {
             // the fold that made the arm dead came from a sibling operand.
             DeadOp::Cmp { peer, eq } => {
                 let eq = *eq;
-                match self.expr_scalar(ast, *peer, &mut Vec::new()) {
-                    Some(lit) => self.narrow_type_members(
-                        ty,
-                        |t| match t {
-                            Type::Constant(s) => (*s == lit) == eq,
-                            _ => true,
-                        },
-                        interner,
-                    ),
+                // The peer must be a literal NODE — `static_literal_type`
+                // (narrowing.rb:2568) reads no other shape: `q == r` with a
+                // pinned-local `r` narrows nothing on the oracle
+                // (`equality_local_literal` declines a non-literal operand).
+                match crate::reach::literal_scalar(ast, *peer) {
+                    // Reference `narrow_equal` / `narrow_not_equal`
+                    // (narrowing.rb:207,222). A singleton literal
+                    // (`nil`/`true`/`false`) narrows memberwise
+                    // (`narrow_singleton_*`); any other TRUSTED literal —
+                    // String/Symbol/Integer, Float EXCLUDED
+                    // (`TRUSTED_EQUALITY_LITERAL_CLASSES`,
+                    // narrowing.rb:51) — narrows only a FINITE
+                    // trusted-literal domain: every member a Constant of
+                    // a trusted class (or `Bot`). Any other member keeps
+                    // the WHOLE domain — `x == 1` on `1 | 2.0` narrows
+                    // nothing, so the Float survives (rigor-rs#681
+                    // review).
+                    Some(lit) => match lit {
+                        Scalar::Float(_) => ty,
+                        Scalar::Nil | Scalar::Bool(_) => self.narrow_type_members(
+                            ty,
+                            |t| match t {
+                                Type::Constant(s) => (*s == lit) == eq,
+                                // `narrow_singleton_equal`/`_not_equal`
+                                // (narrowing.rb:1054,1071): a Nominal
+                                // keeps iff its class is the singleton's;
+                                // `narrow_singleton_equal_other`
+                                // (narrowing.rb:1064) drops shapes and
+                                // class objects on the positive edge.
+                                Type::Nominal { class, .. } => {
+                                    (self.index.class_name_for_id(*class)
+                                        == Some(crate::folding::scalar_class(&lit)))
+                                        == eq
+                                }
+                                Type::Singleton(_) | Type::Tuple(_) | Type::HashShape(_) => !eq,
+                                _ => true,
+                            },
+                            interner,
+                        ),
+                        _ => {
+                            let finite_trusted = match interner.get(ty) {
+                                Type::Union(ms) => ms.iter().all(|&m| {
+                                    match interner.get(m) {
+                                        Type::Constant(s) => !matches!(s, Scalar::Float(_)),
+                                        Type::Bottom => true,
+                                        _ => false,
+                                    }
+                                }),
+                                Type::Constant(s) => !matches!(s, Scalar::Float(_)),
+                                Type::Bottom => true,
+                                _ => false,
+                            };
+                            if !finite_trusted {
+                                return ty;
+                            }
+                            self.narrow_type_members(
+                                ty,
+                                |t| match t {
+                                    Type::Constant(s) => (*s == lit) == eq,
+                                    _ => true,
+                                },
+                                interner,
+                            )
+                        }
+                    },
                     None => ty,
                 }
             }
@@ -3139,6 +3195,19 @@ impl<'i> Typer<'i> {
                 holds,
             } => {
                 let (class, exact, holds) = (class.as_str(), *exact, *holds);
+                // `narrow_class`'s ordering is environment-only
+                // (narrowing.rb:3670 — `environment.class_ordering`): an
+                // asked class the INDEX cannot resolve — undeclared, or
+                // project-only like `class Bar` — makes every member's
+                // ordering `:unknown`, where the positive edge answers
+                // `untyped`, never `Bot` (`declines_bot?`,
+                // narrowing.rb:3651), and the negative edge keeps every
+                // member (`subclass_of?` folds `:unknown` to false).
+                // `instance_of?` is exempt: the exact-class test answers
+                // `Bot` on its own semantics (rigor-rs#681 review).
+                if !exact && self.index.class_id(class).is_none() {
+                    return if holds { interner.untyped() } else { ty };
+                }
                 self.narrow_type_members(
                     ty,
                     |t| {
@@ -5370,7 +5439,7 @@ impl<'i> Typer<'i> {
                         // `"x"`, `&&`'s truthy edge keeping `a`).
                         let mut dead_env = env.clone();
                         let mut subjects = Vec::new();
-                        self.predicate_edge_locals(ast, predicate, !truthy, &mut subjects);
+                        Self::predicate_edge_locals(ast, predicate, !truthy, &mut subjects);
                         for (name, op) in subjects {
                             let cur = dead_env
                                 .get(name.as_str())
