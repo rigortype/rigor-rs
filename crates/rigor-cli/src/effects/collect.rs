@@ -410,7 +410,7 @@ impl BodyCtx {
     const UNKNOWN: Self = Self { kind: SelfKind::Unknown, definee: None };
 
     /// `singleton?` — whether `self` here is a class object
-    /// (`definition_context.rb:82`).
+    /// (`definition_context.rb:71`).
     fn singleton(self) -> bool {
         matches!(self.kind, SelfKind::Class | SelfKind::SingletonClass)
     }
@@ -421,7 +421,7 @@ impl BodyCtx {
     }
 
     /// `def_body` — the context the body of `def` node `receiver` runs under,
-    /// or None where no key names the method (`definition_context.rb:96`).
+    /// or None where no key names the method (`definition_context.rb:89`).
     /// The unit's key separator is the answer's `singleton()`.
     fn def_body(self, receiver: Option<&Node<'_>>) -> Option<Self> {
         match receiver {
@@ -443,7 +443,7 @@ impl BodyCtx {
 
     /// `module_call_body` — the context the block of a literal-name
     /// `define_method`, or an `attr_*` macro, defines into; None where no key
-    /// names the method (`definition_context.rb:112`).
+    /// names the method (`definition_context.rb:103`).
     fn module_call(self) -> Option<Self> {
         match self.kind {
             SelfKind::Class => {
@@ -458,7 +458,7 @@ impl BodyCtx {
 
     /// `singleton_class_body` — `class << self` opens the singleton class
     /// only where `self` IS the class; `class << obj`, or `class << self`
-    /// anywhere else, is a position no key names (`definition_context.rb:139`).
+    /// anywhere else, is a position no key names (`definition_context.rb:124`).
     fn singleton_class(self, expression: &Node<'_>) -> Self {
         if self.self_is_class() && expression.as_self_node().is_some() {
             Self::SINGLETON_CLASS_BODY
@@ -468,7 +468,7 @@ impl BodyCtx {
     }
 
     /// `for_child`'s `block(call)` — the context a call's literal block runs
-    /// under (`definition_context.rb:130`). Only the `_eval` families, a
+    /// under (`definition_context.rb:128`). Only the `_eval` families, a
     /// `singleton_class`-call receiver and the anonymous builders rebind;
     /// every other block keeps this context.
     fn block_ctx(self, call: &CallNode<'_>) -> Self {
@@ -506,7 +506,7 @@ impl BodyCtx {
         self
     }
 
-    /// `singleton_class` called on the class (`definition_context.rb:159`).
+    /// `singleton_class` called on the class (`definition_context.rb:161`).
     fn singleton_class_receiver(self, receiver: Option<&Node<'_>>) -> bool {
         let Some(call) = receiver.and_then(|r| r.as_call_node()) else { return false };
         self.kind == SelfKind::Class
@@ -517,12 +517,12 @@ impl BodyCtx {
     }
 }
 
-/// `self_receiver?` (`definition_context.rb:155`).
+/// `self_receiver?` (`definition_context.rb:156`).
 fn self_receiver(receiver: Option<&Node<'_>>) -> bool {
     receiver.is_none() || receiver.is_some_and(|r| r.as_self_node().is_some())
 }
 
-/// `anonymous_builder?` (`definition_context.rb:166`) — `Class.new`,
+/// `anonymous_builder?` (`definition_context.rb:167`) — `Class.new`,
 /// `Module.new`, `Struct.new` and `Data.define` spelled on the core constant.
 fn anonymous_builder(call: &CallNode<'_>) -> bool {
     let Some(receiver) = call.receiver() else { return false };
@@ -689,30 +689,40 @@ impl Scanner {
         }
     }
 
+    /// `record_declaration` (`scanner.rb:278`) — `include` / `prepend` file an
+    /// ancestry record gated on `instance_side_self?`
+    /// (`ancestry_recorder.rb:141`), which admits the top level — they are NOT
+    /// gated on `module_call_body`. Only `define_method` and the `attr_*`
+    /// macros — calls on `self` — declare nothing where `module_call_body` is
+    /// nil: the top level and every unplaceable position (`scanner.rb:289`,
+    /// `:299`).
     fn record_declaration(&mut self, node: &CallNode<'_>, prefix: &[String], ctx: BodyCtx) {
-        // `define_method` and the `attr_*` macros are calls on `self`, so they
-        // declare nothing where `module_call_body` is nil — the top level and
-        // every unplaceable position (`scanner.rb:289`, `:301`).
-        let Some(unit_ctx) = ctx.module_call() else { return };
         let class_name = class_name_for(prefix);
         match name_of(node.name().as_slice()).as_str() {
             // `include` / `prepend` record ancestry, which the transitive lane
-            // (slice 4) reads and the direct one does not.
+            // (slice 4) reads and the direct one does not; upstream files it
+            // through `record_includes`.
             "include" | "prepend" => {}
+            // `declare_define_method` (`scanner.rb:287`) — `return if
+            // name.nil? || body_context.nil?`.
             "define_method" => {
-                if let Some(unit) = define_method_unit(node) {
+                if let (Some((name, body, parameters)), Some(unit_ctx)) =
+                    (define_method_unit(node), ctx.module_call())
+                {
                     self.add_unit(
                         &class_name,
-                        &unit.name,
+                        &name,
                         unit_ctx,
-                        unit.body.as_ref(),
-                        unit.parameters.as_ref(),
-                        unit.shared_slot,
+                        body.as_ref(),
+                        parameters.as_ref(),
+                        true,
                     );
                 }
             }
+            // `synthesize_accessors` takes `module_call_body`'s answer
+            // (`scanner.rb:283`) and files nothing where it is nil.
             macro_name => {
-                self.synthesize_accessors(&class_name, macro_name, node, unit_ctx.singleton())
+                self.synthesize_accessors(&class_name, macro_name, node, ctx.module_call())
             }
         }
     }
@@ -726,8 +736,10 @@ impl Scanner {
         class_name: &str,
         macro_name: &str,
         node: &CallNode<'_>,
-        keyed_singleton: bool,
+        body_ctx: Option<BodyCtx>,
     ) {
+        let Some(body_ctx) = body_ctx else { return };
+        let keyed_singleton = body_ctx.singleton();
         let separator = if keyed_singleton { "." } else { "#" };
         for name in symbol_arguments(node) {
             if macro_name != "attr_writer" {
@@ -760,15 +772,17 @@ struct NestedUnit<'pr> {
     parameters: Option<ParametersNode<'pr>>,
     /// Whether the body runs on the special-variable slot of the body that
     /// defined it rather than on one of its own — true for a `define_method`
-    /// block, false for a nested `def` (`unit_scan.rb:338`, `:348`).
+    /// block, false for a nested `def` (`unit_scan.rb:351`, `:359`).
     shared_slot: bool,
 }
 
 /// `define_method(:literal) { … }` — the block becomes `literal`'s body, so the
 /// call is a unit declaration wherever it appears. A non-literal name has no key
 /// to file the block under, so it stays contained in the enclosing method and
-/// this answers None (`unit_scan.rb:91`).
-fn define_method_unit<'pr>(node: &CallNode<'pr>) -> Option<NestedUnit<'pr>> {
+/// this answers None (`unit_scan.rb:144`).
+fn define_method_unit<'pr>(
+    node: &CallNode<'pr>,
+) -> Option<(String, Option<Node<'pr>>, Option<ParametersNode<'pr>>)> {
     if node.name().as_slice() != b"define_method" || node.receiver().is_some() {
         return None;
     }
@@ -777,17 +791,10 @@ fn define_method_unit<'pr>(node: &CallNode<'pr>) -> Option<NestedUnit<'pr>> {
     let block = node.block()?.as_block_node()?;
     // A block's parameters are a `BlockParametersNode`, not a `ParametersNode`;
     // upstream's `parameter_names` takes only the latter, so a `define_method`
-    // unit has no parameter names on either side.
-    // `ctx` is a placeholder — the two callers that file a unit overwrite it
-    // with `module_call_body`'s answer (the scanner's `record_declaration`,
-    // the unit walk's `visit_call_node`).
-    Some(NestedUnit {
-        name,
-        ctx: BodyCtx::UNKNOWN,
-        body: block.body(),
-        parameters: None,
-        shared_slot: true,
-    })
+    // unit has no parameter names on either side. Upstream's triple reads
+    // `[name, body, parameters]` — the filing context is each caller's
+    // `module_call_body` answer, not this function's to give.
+    Some((name, block.body(), None))
 }
 
 /// The name a global-variable WRITE binds, for every node kind upstream's
@@ -812,7 +819,7 @@ fn gvar_write_name(node: &Node<'_>) -> Option<String> {
 /// One method body, scanned into its direct summary.
 struct UnitScan<'pr> {
     /// `context.singleton?` — this unit's `self` is a class object
-    /// (`definition_context.rb:82`). Upstream's IVAR_WRITE label reads the
+    /// (`definition_context.rb:71`). Upstream's IVAR_WRITE label reads the
     /// unit-level bit, NOT the moving context — so it stays a fixed field
     /// even now that `ctx` moves.
     singleton: bool,
@@ -1368,7 +1375,7 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
     }
 
     /// `class <<` inside a method body — `for_child`'s `singleton_class_body`
-    /// (`definition_context.rb:139`). Only the BODY rebinds; the expression
+    /// (`definition_context.rb:124`). Only the BODY rebinds; the expression
     /// keeps this context.
     fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
         self.visit(&node.expression());
@@ -1383,14 +1390,20 @@ impl<'pr> Visit<'pr> for UnitScan<'pr> {
         // A `define_method` with a literal name is a unit boundary: the block
         // is the new method's body, and the enclosing method gains only the
         // `mutate.static` of having defined it.
-        if let Some(unit) = define_method_unit(node) {
+        if let Some((name, body, parameters)) = define_method_unit(node) {
             // …but only where `self` is a class object: `module_call_body` is
             // nil on an instance body, and the reference files NO unit for
-            // `def m; define_method(:x) { … }` (`unit_scan.rb:348`,
-            // `definition_context.rb:114`). The `mutate.static` lands either
+            // `def m; define_method(:x) { … }` (`unit_scan.rb:359`,
+            // `definition_context.rb:103`). The `mutate.static` lands either
             // way.
             if let Some(ctx) = self.ctx.module_call() {
-                self.nested.push(NestedUnit { ctx, ..unit });
+                self.nested.push(NestedUnit {
+                    name,
+                    ctx,
+                    body,
+                    parameters,
+                    shared_slot: true,
+                });
             }
             self.summary.add(DEFINE_METHOD, ["mutate.static"]);
             return;
@@ -1713,7 +1726,7 @@ mod tests {
         // MEASURED against the oracle: `define_method` is a call on `self`,
         // and an instance method's `self` is no class —
         // `DefinitionContext#module_call_body` is nil there, so the block
-        // belongs to no summary (`unit_scan.rb:348`). The `mutate.static` of
+        // belongs to no summary (`unit_scan.rb:359`). The `mutate.static` of
         // performing the definition still lands on the enclosing unit.
         let found = summaries("class C\n def build\n  define_method(:lit) { @x = 1 }\n end\nend");
         assert_eq!(found.keys().collect::<Vec<_>>(), ["C#build"]);
@@ -1724,7 +1737,7 @@ mod tests {
     fn define_method_inside_a_singleton_method_stays_a_unit() {
         // The same call inside `def self.build` runs with `self` as the class
         // object, so `module_call_body` answers and the unit keys `C#lit`
-        // (`definition_context.rb:112`).
+        // (`definition_context.rb:103`).
         let found = summaries("class C\n def self.build\n  define_method(:lit) { @x = 1 }\n end\nend");
         assert_eq!(found.keys().collect::<Vec<_>>(), ["C#lit", "C.build"]);
         assert_eq!(found["C#lit"], ["mutate.self"]);
