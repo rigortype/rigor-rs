@@ -39,7 +39,7 @@ use rigor_rules::SuppressSet;
 use serde::Deserialize;
 
 mod psych_booleans;
-mod psych_error;
+pub(crate) mod psych_error;
 
 /// The parsed `.rigor.yml`. Unknown keys are ignored (no `deny_unknown_fields`),
 /// and every field defaults so a partial or empty file is valid.

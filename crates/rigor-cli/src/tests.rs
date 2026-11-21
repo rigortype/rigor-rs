@@ -504,7 +504,7 @@ fn strict_report_byte_format_over_and_sorted() {
     let drifted: Vec<&baseline::DriftRow> =
         rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
     assert_eq!(drifted.len(), 2);
-    let out = format_strict_drift(&drifted, ".rigor-baseline.yml");
+    let out = format_strict_drift(&drifted, ".rigor-baseline.yml").unwrap();
     assert_eq!(
         out,
         "rigor: --baseline-strict — 2 bucket(s) drifted from .rigor-baseline.yml:\n\
@@ -522,7 +522,7 @@ fn strict_report_cleared_bucket() {
     let rows = b.audit(&[]);
     let drifted: Vec<&baseline::DriftRow> =
         rows.iter().filter(|r| r.status != DriftStatus::Within).collect();
-    let out = format_strict_drift(&drifted, "bl.yml");
+    let out = format_strict_drift(&drifted, "bl.yml").unwrap();
     assert_eq!(
         out,
         "rigor: --baseline-strict — 1 bucket(s) drifted from bl.yml:\n\
@@ -1033,11 +1033,7 @@ fn analyze_files_class_pattern_no_match_on_dup_argv() {
     )
     .unwrap();
     std::fs::write(root.join("cfg/lib/foo.rb"), b"class Foo\n  def bar = 1\nend\n").unwrap();
-    std::fs::write(
-        root.join("app/a.rb"),
-        b"Foo.new.bar.upcase\n\"s\".nope\n",
-    )
-    .unwrap();
+    std::fs::write(root.join("app/a.rb"), b"Foo.new.bar.upcase\n\"s\".nope\n").unwrap();
 
     let crate::config::ConfigRead::Parsed(cfg) =
         Config::read(&root.join("cfg/.rigor.yml"))

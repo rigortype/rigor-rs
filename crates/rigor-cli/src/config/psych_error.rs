@@ -525,7 +525,7 @@ fn disallowed_class(tag: Option<&str>, value: &str) -> Option<String> {
 /// `[[:alpha:]]` is Unicode; the port's `\p{Alpha}` is ASCII — every
 /// value the two disagree on falls to the tokenizer's `else` String arm
 /// either way, so the disagreement is invisible to every modeled arm.
-fn alpha_match(s: &str) -> bool {
+pub(crate) fn alpha_match(s: &str) -> bool {
     static ALPHA: OnceLock<Regex> = OnceLock::new();
     ALPHA
         .get_or_init(|| {
@@ -536,7 +536,7 @@ fn alpha_match(s: &str) -> bool {
 
 /// `tokenize`'s TIME arm — `class_loader.load 'Time'` dies before the
 /// parse runs.
-fn time_match(s: &str) -> bool {
+pub(crate) fn time_match(s: &str) -> bool {
     static TIME: OnceLock<Regex> = OnceLock::new();
     TIME
         .get_or_init(|| {
@@ -549,7 +549,7 @@ fn time_match(s: &str) -> bool {
 }
 
 /// `tokenize`'s DATE arm — validity unchecked (`2024-02-31` dies).
-fn date_match(s: &str) -> bool {
+pub(crate) fn date_match(s: &str) -> bool {
     static DATE: OnceLock<Regex> = OnceLock::new();
     DATE
         .get_or_init(|| {
@@ -561,7 +561,7 @@ fn date_match(s: &str) -> bool {
 
 /// `ScalarScanner`'s FLOAT shape — a dot is mandatory, digits optional on
 /// both sides of it, the exponent signed.
-fn psych_float_match(s: &str) -> bool {
+pub(crate) fn psych_float_match(s: &str) -> bool {
     static FLOAT: OnceLock<Regex> = OnceLock::new();
     FLOAT
         .get_or_init(|| {
@@ -571,7 +571,7 @@ fn psych_float_match(s: &str) -> bool {
 }
 
 /// The FLOAT arm's bare-dot escape (`\A[-+]?\.\Z` returns the String).
-fn bare_dot_match(s: &str) -> bool {
+pub(crate) fn bare_dot_match(s: &str) -> bool {
     static BARE: OnceLock<Regex> = OnceLock::new();
     BARE
         .get_or_init(|| Regex::new(r"^[-+]?\.$").unwrap())
@@ -581,7 +581,7 @@ fn bare_dot_match(s: &str) -> bool {
 /// What Ruby's `Float()` accepts over a FLOAT-arm candidate: digits around
 /// an optional dot with an optional exponent (probe: `Float("1E5")` and
 /// `Float("1e5")` load, `Float("e+1")` raises).
-fn float_grammar_match(s: &str) -> bool {
+pub(crate) fn float_grammar_match(s: &str) -> bool {
     static GRAMMAR: OnceLock<Regex> = OnceLock::new();
     GRAMMAR
         .get_or_init(|| {
