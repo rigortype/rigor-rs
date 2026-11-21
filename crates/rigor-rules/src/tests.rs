@@ -2652,6 +2652,37 @@ fn disable_file_negative_lookahead_not_read_as_line_disable() {
     assert!(line_set.1.suppresses(CALL_UNDEFINED_METHOD));
 }
 
+/// Issue #253 — the FILTER side consumes the same class-bounded capture as
+/// the surveillance, so a `call.undefined-method*` marker still suppresses
+/// `call.undefined-method` (the reference absorbs `call.undefined-method`
+/// and drops the `*`), while a non-class tail absorbs nothing at all.
+#[test]
+fn bounded_capture_still_absorbs_the_known_token() {
+    let (lines, files) =
+        parse_suppression_comments(&[(2, 0, "# rigor:disable call.undefined-method*".to_string())]);
+    assert!(lines[&2].suppresses(CALL_UNDEFINED_METHOD));
+    assert!(!files.suppresses(CALL_UNDEFINED_METHOD));
+
+    // Prose past the class boundary never reaches the token list either.
+    let (lines, _) = parse_suppression_comments(&[(
+        2,
+        0,
+        "# rigor:disable call.undefined-method (note)".to_string(),
+    )]);
+    assert!(lines[&2].suppresses(CALL_UNDEFINED_METHOD));
+
+    // A backtracking capture (one whitespace char) holds no tokens.
+    let (lines, files) =
+        parse_suppression_comments(&[(2, 0, "# rigor:disable  *foo".to_string())]);
+    assert!(!lines[&2].suppresses(CALL_UNDEFINED_METHOD));
+    assert!(!files.suppresses(CALL_UNDEFINED_METHOD));
+
+    // Control: the unbounded-reading shape is gone — `*foo` alone is not a
+    // token the filter ever absorbs.
+    let (lines, _) = parse_suppression_comments(&[(2, 0, "# rigor:disable *foo".to_string())]);
+    assert!(!lines.get(&2).is_some_and(|s| s.suppresses(CALL_UNDEFINED_METHOD)));
+}
+
 #[test]
 fn internal_error_is_never_suppressed() {
     let diags = vec![(2, diag(INTERNAL_ERROR_RULE))];
@@ -3494,6 +3525,50 @@ fn suppression_known_tokens_stay_silent() {
     assert!(sup("# rigor:disable plugin_trust.foo").is_empty());
     assert!(sup("# rigor:disable source-rbs-annotation-not-honoured").is_empty());
 }
+
+/// Issue #253 — the reference's `(?<rules>[\w.,\s-]+)` capture STOPS at the
+/// first character outside the class, and the greedy `\s+` backtracks into
+/// its own run (`\s` is in the class) when the tail starts outside it. Every
+/// row was oracle-verified against `LINE`/`FILE_SUPPRESSION_PATTERN` before
+/// the porting.
+#[test]
+fn suppression_capture_stops_at_the_class_boundary() {
+    // `call.*` captures `call.` — the token the reference names in its
+    // unknown-rule message (not the verbatim `call.*`).
+    let d = sup("# rigor:disable call.*");
+    assert_eq!(d.len(), 1);
+    assert!(d[0].message.contains("unknown rule `call.` in `# rigor:disable`"), "{}", d[0].message);
+
+    // A KNOWN rule before a non-class char: the capture is the known token,
+    // so the marker suppresses and no surveillance row fires.
+    assert!(sup("# rigor:disable call.undefined-method*").is_empty());
+    // Same through trailing prose — the capture ends at `(`.
+    assert!(sup("# rigor:disable call.undefined-method (note)").is_empty());
+
+    // One whitespace then a non-class tail: `\s+` cannot shrink, the pattern
+    // fails, and the bare/unknown pass diagnoses nothing (the rest is not
+    // `[\s,]*` nor rule-list-shaped).
+    assert!(sup("# rigor:disable *foo").is_empty());
+    // Two whitespace: the capture backtracks onto ONE whitespace character —
+    // no tokens, so the marker is EMPTY, not unknown-rule `*foo`.
+    let d = sup("# rigor:disable  *foo");
+    assert_eq!(d.len(), 1);
+    assert_eq!(d[0].rule_id, SUPPRESSION_EMPTY);
+
+    // The `-file` pattern shares the bound; `flow` is a family, so only the
+    // `call.` token of `call.,flow` is unknown.
+    let d = sup("# rigor:disable-file call.*");
+    assert_eq!(d.len(), 1);
+    assert!(
+        d[0].message.contains("unknown rule `call.` in `# rigor:disable-file`"),
+        "{}",
+        d[0].message
+    );
+    let d = sup("# rigor:disable call.,flow");
+    assert_eq!(d.len(), 1);
+    assert!(d[0].message.contains("unknown rule `call.`"), "{}", d[0].message);
+}
+
 
 #[test]
 fn suppression_prose_is_ignored() {

@@ -259,13 +259,22 @@ unsafe fn resolve_map(
                                 slots.entry(k).or_insert(v);
                             }
                         } else {
-                            // A compound value under a normal key: the entry
-                            // keeps serde's read wholesale, no bare boolean to
-                            // record.
+                            // A compound value under a normal key still SETS
+                            // the slot (DupOk inserts the whole mapping as the
+                            // value), so it must wipe an earlier bare boolean
+                            // even though no boolean of its own is recorded.
+                            slots.insert(key, None);
                             skip_collection(parser);
                         }
                     }
                     Some(Ev::SeqStart) => {
+                        if key != "<<" {
+                            // Same wipe for a sequence value: the entry keeps
+                            // serde's read wholesale.
+                            slots.insert(key, None);
+                            skip_collection(parser);
+                            continue;
+                        }
                         // `<<: [{…}, {…}]` merges each element only when EVERY
                         // element is a mapping (DupOk's `all?` gate); any other
                         // element keeps `<<` as a literal key. Fills stage
@@ -359,3 +368,206 @@ unsafe fn skip_value(parser: *mut unsafe_libyaml::yaml_parser_t) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overrides(text: &str) -> HashMap<String, Option<bool>> {
+        scan(text).severity_overrides
+    }
+
+    #[test]
+    fn bare_boolean_values_are_reported_case_insensitively() {
+        for (word, b) in [
+            ("off", false),
+            ("OFF", false),
+            ("Off", false),
+            ("no", false),
+            ("on", true),
+            ("YES", true),
+        ] {
+            assert_eq!(
+                overrides(&format!("severity_overrides:\n  call: {word}\n")),
+                HashMap::from([("call".to_string(), Some(b))]),
+                "bare `{word}` must resolve to {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn quoted_and_tagged_spellings_decline() {
+        // Quoted: a String on both parsers.
+        assert_eq!(
+            overrides("severity_overrides:\n  call: \"off\"\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        // `!!str`: Psych's ToRuby keeps the String; serde_yaml agrees.
+        assert_eq!(
+            overrides("severity_overrides:\n  call: !!str off\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        // A non-boolean plain word is no Psych boolean either.
+        assert_eq!(
+            overrides("severity_overrides:\n  call: warning\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        // `y`/`n` are Strings in both parsers (Psych's boolean set is
+        // off/on/yes/no/true/false, not YAML 1.1's wider one).
+        assert_eq!(
+            overrides("severity_overrides:\n  call: y\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+    }
+
+    #[test]
+    fn flow_style_and_multiple_keys_report_per_key() {
+        assert_eq!(
+            overrides("severity_overrides: {call: off, call.undefined-method: on}\n"),
+            HashMap::from([
+                ("call".to_string(), Some(false)),
+                ("call.undefined-method".to_string(), Some(true)),
+            ])
+        );
+    }
+
+    #[test]
+    fn duplicate_keys_last_wins_like_psych() {
+        assert_eq!(
+            overrides("severity_overrides:\n  call: off\n  call: \"off\"\n"),
+            HashMap::from([("call".to_string(), None)]),
+            "the later quoted occurrence wins"
+        );
+        assert_eq!(
+            overrides("severity_overrides:\n  call: \"off\"\n  call: off\n"),
+            HashMap::from([("call".to_string(), Some(false))]),
+            "the later bare occurrence wins"
+        );
+    }
+
+    #[test]
+    fn the_last_top_level_severity_overrides_mapping_counts() {
+        // Psych keeps the last duplicate top-level key; an earlier mapping's
+        // spellings must not name the entries that survived (#490 rule).
+        let text = "severity_overrides:\n  call: off\nseverity_overrides:\n  dump.type: on\n";
+        assert_eq!(
+            overrides(text),
+            HashMap::from([("dump.type".to_string(), Some(true))])
+        );
+        // A later NON-mapping occurrence clears the record entirely.
+        assert_eq!(
+            overrides("severity_overrides:\n  call: off\nseverity_overrides: 5\n")
+                .is_empty(),
+            true
+        );
+    }
+
+    #[test]
+    fn merge_keys_fill_only_unfilled_slots_in_order() {
+        // Merge-source entries count.
+        assert_eq!(
+            overrides("severity_overrides:\n  <<: {call: off}\n"),
+            HashMap::from([("call".to_string(), Some(false))])
+        );
+        // A direct key always wins over a merge, before or after it.
+        assert_eq!(
+            overrides("severity_overrides:\n  <<: {call: \"off\"}\n  call: off\n"),
+            HashMap::from([("call".to_string(), Some(false))])
+        );
+        assert_eq!(
+            overrides("severity_overrides:\n  call: off\n  <<: {call: \"off\"}\n"),
+            HashMap::from([("call".to_string(), Some(false))])
+        );
+        // An all-mappings sequence merges each element, earlier wins.
+        assert_eq!(
+            overrides("severity_overrides:\n  <<:\n    - {call: off}\n    - {call: on}\n"),
+            HashMap::from([("call".to_string(), Some(false))])
+        );
+        // A `<<` sequence with a non-mapping element keeps `<<` literal and
+        // discards the staged fills (DupOk's `all?` gate).
+        assert_eq!(
+            overrides("severity_overrides:\n  <<:\n    - {call: off}\n    - 5\n"),
+            HashMap::from([("<<".to_string(), None)])
+        );
+        // A non-mapping `<<` value is a literal entry, not a merge.
+        assert_eq!(
+            overrides("severity_overrides:\n  <<: off\n"),
+            HashMap::from([("<<".to_string(), Some(false))])
+        );
+    }
+
+    #[test]
+    fn compound_values_and_complex_keys_decline() {
+        // A nested mapping under a normal key keeps serde's read wholesale.
+        assert_eq!(
+            overrides("severity_overrides:\n  call:\n    nested: off\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        // ... and it WIPES an earlier bare boolean, being the later direct
+        // occurrence (the slot exists with no boolean of its own).
+        assert_eq!(
+            overrides("severity_overrides:\n  call: off\n  call:\n    nested: x\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        // A sequence value under a normal key likewise — and it must not be
+        // misread as a `<<` merge (no bogus `"<<"` slot).
+        assert_eq!(
+            overrides("severity_overrides:\n  call: [off]\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        assert_eq!(
+            overrides("severity_overrides:\n  call: off\n  call: [x]\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+        // A complex key cannot be named.
+        assert_eq!(overrides("severity_overrides:\n  ? [a]\n  : off\n").is_empty(), true);
+    }
+
+    #[test]
+    fn severity_profile_reports_the_last_scalar() {
+        assert_eq!(scan("severity_profile: off\n").severity_profile, Some(false));
+        assert_eq!(scan("severity_profile: On\n").severity_profile, Some(true));
+        // Psych resolves the scalar; quoting keeps the String.
+        assert_eq!(scan("severity_profile: \"off\"\n").severity_profile, None);
+        assert_eq!(scan("severity_profile: strict\n").severity_profile, None);
+        // Duplicate top-level keys: the last occurrence counts.
+        assert_eq!(
+            scan("severity_profile: off\nseverity_profile: strict\n").severity_profile,
+            None
+        );
+        assert_eq!(
+            scan("severity_profile: strict\nseverity_profile: off\n").severity_profile,
+            Some(false)
+        );
+        // A compound value declines.
+        assert_eq!(
+            scan("severity_profile:\n  - off\n").severity_profile,
+            None
+        );
+    }
+
+    #[test]
+    fn texts_without_severity_keys_short_circuit() {
+        assert!(overrides("paths:\n  - app\n").is_empty());
+        assert_eq!(scan("").severity_profile, None);
+    }
+
+    #[test]
+    fn only_the_first_document_is_read() {
+        // Both parsers load the first document; a boolean in a second one is
+        // never resolved by either.
+        assert_eq!(
+            overrides("---\nseverity_overrides:\n  call: warning\n---\nseverity_overrides:\n  call: off\n"),
+            HashMap::from([("call".to_string(), None)])
+        );
+    }
+
+    #[test]
+    fn a_bom_is_stripped_like_read_yaml_strips_it() {
+        assert_eq!(
+            overrides("\u{feff}severity_overrides:\n  call: off\n"),
+            HashMap::from([("call".to_string(), Some(false))])
+        );
+    }
+}
+
