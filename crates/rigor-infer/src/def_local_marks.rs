@@ -1004,17 +1004,78 @@ impl<'i> Typer<'i> {
             // it is not stale either — the loop pass would otherwise spoil
             // a pin held only under a decided arm (`s = (if d then 2 else
             // w = "x"; 3 end)` on a pinned `d` keeps `w`'s `1`).
+            //
+            // rigor-rs#640: the same holds for the dead arm of an `if` whose
+            // predicate the PASS ENV pins to a decided `Constant`. The pass's
+            // own replay already elides that arm ([`Self::replay_one`]'s If
+            // arm takes the live arm only), but `dead_positions` folds
+            // SYNTAX — reach-pinned predicates, not env-typed carriers — so
+            // the #437 filter alone lets such a write spoil the tracked name
+            // (`Dynamic` in a pass exit), and the exactness gate then
+            // declines the fixpoint: the structural cap widens every tracked
+            // name where the reference's cap pass widens only the
+            // still-moving ones (`w` keeps its pin until the cap pass lifts
+            // it to `Integer`). Only value-pinned `Constant` predicates
+            // judge here, exactly as the elide does — a `Nominal`/`Tuple`
+            // answer could be an optimistic carrier the reference declines
+            // to elide.
             let dead = self.dead_positions(ast, &mut Vec::new());
-            if dead.has_folded() {
+            if !names.is_empty() {
                 let positions = marks.write_positions_outside(span, &bodies, skip);
+                let env_dead = self.env_decided_dead_hulls(ast, span, env, interner);
                 names.retain(|n| {
-                    positions
-                        .iter()
-                        .any(|&(p, w)| w == n && !dead.covers((p, p)))
+                    positions.iter().any(|&(p, w)| {
+                        w == n
+                            && !dead.covers((p, p))
+                            && !env_dead.iter().any(|&h| h.0 <= p && p < h.1)
+                    })
                 });
             }
         }
         Self::widen_names(env, &names, interner);
+    }
+
+    /// The hulls of the DEAD arms of `if`/`unless` nodes inside `span` whose
+    /// predicate the pass env types as a decided `Constant` — the env-polarity
+    /// judge of [`Self::widen_shell`]'s loop-pass filter. The live/dead choice
+    /// mirrors `replay_one`'s If arm (a truthy `if` kills the `else`, an
+    /// `unless` swaps them), including its Constant-only trust base.
+    fn env_decided_dead_hulls(
+        &self,
+        ast: &LoweredAst,
+        span: Span,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<Span> {
+        let mut out = Vec::new();
+        for (_, n) in ast.iter() {
+            let Node::If {
+                predicate,
+                then_body,
+                else_body,
+                is_unless,
+                span: if_span,
+                ..
+            } = n
+            else {
+                continue;
+            };
+            if !(span.0 <= if_span.0 && if_span.1 <= span.1) {
+                continue;
+            }
+            let (predicate, then_body, else_body, is_unless) =
+                (*predicate, then_body, else_body, *is_unless);
+            let pred_ty = self.type_of(ast, predicate, env, interner);
+            if !matches!(interner.get(pred_ty), Type::Constant(_)) {
+                continue;
+            }
+            let Some(folded) = self.predicate_polarity(interner, pred_ty) else {
+                continue;
+            };
+            let dead_body = if folded != is_unless { else_body } else { then_body };
+            out.extend(body_span(ast, dead_body));
+        }
+        out
     }
 
     /// The env a tail node is typed under, or `None` to decline it: a tail

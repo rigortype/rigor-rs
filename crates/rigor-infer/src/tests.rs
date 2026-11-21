@@ -758,6 +758,104 @@ fn toplevel_check_env_widens_nested_rebinds() {
     assert_eq!(get("d", &i), Some(Type::Constant(Scalar::Str("s".into()))));
 }
 
+/// rigor-rs#640: the loop-pass stale-write filter's env-polarity judge. A
+/// tracked local whose only body write sits in the DEAD arm of an `if` the
+/// pass env pins decided (`s = (if d then 2 else w = "x"; 3 end)` on a
+/// pinned `d`) keeps its pin through every fixpoint pass — the pass's own
+/// replay elides the arm, but the reach-based `dead_positions` never folds
+/// an env-pinned carrier inside a loop, so the #437 filter alone let the
+/// write spoil the name and decline the whole fixpoint. The convergence is
+/// the reference's own `BodyFixpoint` cap answer (forced here by `y = [y]`'s
+/// growth): `w` holds `Constant[1]` through the passes and the CAP pass
+/// lifts it to the widened class, while the still-moving `y` floors to
+/// `Dynamic`.
+#[test]
+fn loop_pass_env_dead_arm_write_keeps_pin_to_cap_widen() {
+    let src = b"c = gets\nd = 1\nw = 1\ny = nil\nwhile c\n  s = (if d then 2 else w = \"x\"; 3 end)\n  y = [y]\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    let integer = typer.nominal_or_untyped("Integer", &mut i);
+    assert_eq!(
+        env.get("w"),
+        Some(&integer),
+        "the cap pass widens the stable pin to its class, got {:?}",
+        env.get("w").map(|&t| i.get(t))
+    );
+    let y = env.get("y").copied().expect("y bound");
+    assert!(
+        matches!(i.get(y), Type::Dynamic(_)),
+        "the still-moving name floors at the cap, got {:?}",
+        i.get(y)
+    );
+}
+
+/// rigor-rs#640 boundary (oracle-probed): a LITERAL-decided dead arm keeps
+/// the pin through a convergent body (no cap pass: `y` is body-first and
+/// settles at pass one), so `w` keeps its `Constant[1]` and `w.zz` fires
+/// `for 1` on both engines — the #437 `dead_positions` filter's own row,
+/// unchanged by the env judge.
+#[test]
+fn loop_pass_literal_dead_arm_write_keeps_pin_before_cap() {
+    let src = b"w = 1\nc = gets\nwhile c\n  s = (if true then 2 else w = \"x\"; 3 end)\n  y = [y]\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    assert_eq!(
+        env.get("w"),
+        Some(&i.intern(Type::Constant(Scalar::Int(1)))),
+        "a converged body keeps the pin, got {:?}",
+        env.get("w").map(|&t| i.get(t))
+    );
+}
+
+/// rigor-rs#640 boundary: the env judge only excuses a DEAD arm. A write in
+/// the LIVE arm of the same write-wrapped `if` is still a shell write the
+/// pass's replay does not walk (`s`'s binding replays the VALUE only), so
+/// the tracked name stays declined and the structural cap widens it.
+/// (Oracle: `for Integer` here — the port's silence is the live-arm
+/// write-walk coverage gap, deliberately not this slice's.)
+#[test]
+fn loop_pass_env_dead_arm_write_live_arm_still_declines() {
+    let src = b"c = gets\nd = 1\nw = 1\ny = nil\nwhile c\n  s = (if d then w = 2; 3 else 4 end)\n  y = [y]\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    let w = env.get("w").copied().expect("w bound");
+    assert!(
+        matches!(i.get(w), Type::Dynamic(_)),
+        "a live-arm shell write must keep the decline, got {:?}",
+        i.get(w)
+    );
+}
+
+/// rigor-rs#640 boundary: an UNDECIDED predicate (`c2 = gets`) judges no
+/// arm dead, so the arm write still spoils the pass and the structural cap
+/// widens the tracked name. (Oracle: `for Integer | String` here — the
+/// port's silence is the undecided arm-join coverage gap; the decline is
+/// the FP-safe side, and this guard pins it against an over-eager judge.)
+#[test]
+fn loop_pass_undecided_if_arm_write_still_declines() {
+    let src = b"c = gets\nc2 = gets\nw = 1\ny = nil\nwhile c\n  s = (if c2 then 2 else w = \"x\"; 3 end)\n  y = [y]\nend\n";
+    let ast = lower_src(src);
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    let w = env.get("w").copied().expect("w bound");
+    assert!(
+        matches!(i.get(w), Type::Dynamic(_)),
+        "an undecided arm write must keep the decline, got {:?}",
+        i.get(w)
+    );
+}
+
 /// rigor-rs#151 / #153: a `for` index and a write in a recovery carrier
 /// widen; a write under `defined?`, `END`, `BEGIN` or `super(…)` neither
 /// binds nor widens; a `for` whose index is not a local, and a `for` over
