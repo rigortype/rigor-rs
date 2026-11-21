@@ -455,11 +455,7 @@ mod tests {
             HashMap::from([("dump.type".to_string(), Some(true))])
         );
         // A later NON-mapping occurrence clears the record entirely.
-        assert_eq!(
-            overrides("severity_overrides:\n  call: off\nseverity_overrides: 5\n")
-                .is_empty(),
-            true
-        );
+        assert!(overrides("severity_overrides:\n  call: off\nseverity_overrides: 5\n").is_empty());
     }
 
     #[test]
@@ -520,7 +516,7 @@ mod tests {
             HashMap::from([("call".to_string(), None)])
         );
         // A complex key cannot be named.
-        assert_eq!(overrides("severity_overrides:\n  ? [a]\n  : off\n").is_empty(), true);
+        assert!(overrides("severity_overrides:\n  ? [a]\n  : off\n").is_empty());
     }
 
     #[test]
