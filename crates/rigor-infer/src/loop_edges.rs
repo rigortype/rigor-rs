@@ -421,6 +421,34 @@ impl<'i> Typer<'i> {
                 if block_body.is_empty() =>
             {
                 let (r, span) = (*r, *span);
+                // `(x).m(…)` and `a.m((x))` — `analyse`'s operand gates
+                // read `LocalVariableReadNode`/`ConstantReadNode`/…
+                // classes (`receiver_slot`, `receiver.is_a?`,
+                // `comparison_local_literal`'s `is_a?` checks), so a
+                // `ParenthesesNode` receiver or argument narrows no
+                // subject upstream (`(x).is_a?(C)`, `C === (x)`,
+                // `(x) < 2`, `nil == (x)` all keep on both edges —
+                // rigor-rs#820). Predicate-position parens DO read —
+                // `analyse` unwraps and recurses into them — so `!`'s
+                // operand is excluded. A paren'd RECEIVER declines the
+                // whole call — upstream never reaches the `nil&.m` fold
+                // (`(x)&.nil?` on a nil `x` keeps both edges). A paren'd
+                // ARGUMENT leaves the receiver analysed, so a provably-nil
+                // `&.` carrier still dies on the truthy edge
+                // (`x&.foo((y))` on a nil `x` folds to `nil`).
+                if method != "!" && subject.is_read(ast, r) && ast.paren_unwrapped(r) {
+                    return atom2(Edge::Keep, Edge::Keep);
+                }
+                if method != "!"
+                    && args.iter().any(|a| {
+                        subject.is_read(ast, *a) && ast.paren_unwrapped(*a)
+                    })
+                {
+                    return atom2(
+                        if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                        Edge::Keep,
+                    );
+                }
                 let recv_is_subject = subject.is_read(ast, r);
                 match (method.as_str(), args.as_slice()) {
                     ("!", []) => {
@@ -444,16 +472,81 @@ impl<'i> Typer<'i> {
                     // falsey edge narrows to the non-empty shape — the port
                     // declines that to a widen (`non-empty-array[top]`'s
                     // firing is a coverage loss, never an FP —
-                    // rigor-rs#451).
-                    ("empty?", []) if recv_is_subject => atom2(
-                        if nil_safe_nav { Edge::Empty } else { Edge::Keep },
-                        Edge::Other,
-                    ),
+                    // rigor-rs#451). `analyse_array_emptiness_predicate`
+                    // only narrows a `Nominal[Array]` member: a Tuple, a
+                    // Constant or a non-Array nominal stays opaque, so the
+                    // falsey edge only widens where the reference actually
+                    // narrows (`x = []; if x.empty?; else x.frob` fires
+                    // `for []`, rigor-rs#820). The class name resolves
+                    // through the CORE index — `source.class_name_for_id`
+                    // answers `None` for a core-range `ClassId`.
+                    ("empty?", []) if recv_is_subject => {
+                        let is_array = |ty: TypeId| {
+                            matches!(interner.get(ty), Type::Nominal { class, .. }
+                                if self.index.class_name_for_id(*class) == Some("Array"))
+                        };
+                        let falsy = match interner.get(ty) {
+                            Type::Union(ms) if ms.iter().any(|m| is_array(*m)) => Edge::Other,
+                            _ if is_array(ty) => Edge::Other,
+                            _ => Edge::Keep,
+                        };
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            falsy,
+                        )
+                    }
                     // `v == nil` / `v != nil`: only the nil comparison
                     // collapses (`narrow_nil` / `narrow_non_nil` — `v ==
                     // nil` truthy on `[1, 2]` is unreachable, `!= nil`
                     // keeps). Other scalar `==`s don't narrow — `v == 1`
                     // on `[1, 2]` still fires inside (rigor-rs#451).
+                    //
+                    // `x == (lit)` / `(lit) == x` are UNREAD —
+                    // `equality_local_literal`'s `static_literal_type`
+                    // answers nil for the `ParenthesesNode` itself, so the
+                    // equality keeps the carrier on both edges whatever
+                    // the literal inside (rigor-rs#820). The comparison
+                    // still folds for VALUE (`always-truthy-condition`
+                    // fires upstream) — it just narrows no subject.
+                    ("==" | "!=", [arg])
+                        if (recv_is_subject && ast.paren_unwrapped(*arg))
+                            || (subject.is_read(ast, *arg)
+                                && ast.paren_unwrapped(r)) =>
+                    {
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
+                    }
+                    // `x < (lit)` / `x.between?((1), 5)` —
+                    // `comparison_local_literal` and
+                    // `analyse_between_predicate` read
+                    // `numeric_literal_node?` (IntegerNode/FloatNode
+                    // only): a `ParenthesesNode` operand narrows nothing
+                    // upstream, so the carrier keeps on both edges
+                    // (rigor-rs#820). The comparison still folds for
+                    // VALUE — `always-truthy-condition` fires — it just
+                    // narrows no subject.
+                    ("<" | "<=" | ">" | ">=", [arg])
+                        if (recv_is_subject && ast.paren_unwrapped(*arg))
+                            || (subject.is_read(ast, *arg)
+                                && ast.paren_unwrapped(r)) =>
+                    {
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
+                    }
+                    ("between?", [lo, hi])
+                        if recv_is_subject
+                            && (ast.paren_unwrapped(*lo)
+                                || ast.paren_unwrapped(*hi)) =>
+                    {
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
+                    }
                     ("==" | "!=", [arg]) if recv_is_subject => {
                         let nil_arg = matches!(
                             scalar_literal(ast, *arg),
@@ -517,6 +610,7 @@ impl<'i> Typer<'i> {
                                     ty,
                                     true,
                                     interner,
+                                    nil_safe_nav,
                                 ),
                                 self.class_edge(
                                     ast,
@@ -526,6 +620,7 @@ impl<'i> Typer<'i> {
                                     ty,
                                     false,
                                     interner,
+                                    nil_safe_nav,
                                 ),
                             )
                         }
@@ -547,10 +642,19 @@ impl<'i> Typer<'i> {
                             (Edge::Keep, Edge::Keep)
                         } else {
                             atom2(
-                                self.class_edge(ast, r, span, false, ty, true, interner),
-                                self.class_edge(ast, r, span, false, ty, false, interner),
+                                self.class_edge(ast, r, span, false, ty, true, interner, nil_safe_nav),
+                                self.class_edge(ast, r, span, false, ty, false, interner, nil_safe_nav),
                             )
                         }
+                    }
+                    // `x.respond_to?((:m))` — `static_hash_key` reads the
+                    // `ParenthesesNode` and answers nil for it: the
+                    // predicate narrows nothing upstream (rigor-rs#820).
+                    ("respond_to?", [m]) if recv_is_subject && ast.paren_unwrapped(*m) => {
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
                     }
                     ("respond_to?", [m]) if recv_is_subject => {
                         let name = match ast.get(*m) {
@@ -638,6 +742,7 @@ impl<'i> Typer<'i> {
         ty: TypeId,
         edge: bool,
         interner: &Interner,
+        nil_safe_nav: bool,
     ) -> Edge {
         // The carrier the class test sees: a `Singleton[C]` is the CLASS
         // OBJECT `C`, which answers `is_a?`/`===` as `Class` (`File.is_a?
@@ -662,6 +767,18 @@ impl<'i> Typer<'i> {
             // early-returns `Keep` above. Whoever reaches here (`===` /
             // `case`) follows `lexical_class_name`, which keeps the
             // de-rooted spelling unconditionally (rigor-rs#672).
+            //
+            // A PARENThesised operand declines it too (`when (C)`, `(C)
+            // === x`, `x.is_a?((C))` — `static_class_name` reads the
+            // `ParenthesesNode` and answers nil, rigor-rs#820) — but where
+            // a rooted decline is unorderable, an UNREAD operand guards
+            // nothing at all: the carrier survives on whichever edge this
+            // is, so `Keep`, not `Other` — except a provably-nil `&.`
+            // carrier, whose truthy edge is still dead (`nil&.is_a?` is
+            // `nil`).
+            None if ast.paren_unwrapped(class_node) => {
+                return if nil_safe_nav && edge { Edge::Empty } else { Edge::Keep };
+            }
             None => match ast.get(class_node) {
                 Node::ConstantRead { name, dynamic_base: false, rooted: true, .. }
                     if !name.is_empty() =>

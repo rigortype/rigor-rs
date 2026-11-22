@@ -2233,9 +2233,12 @@ impl<'i> Typer<'i> {
                 // `stable_chain_address` returns nil for it (probes `c7b_ivar`,
                 // `m_two_hop`, `c7e_args_on_hop`, `m_block_on_hop`,
                 // `m_safe_nav_hop`; the last three are reference-silent too,
-                // the first two are recorded coverage gaps).
+                // the first two are recorded coverage gaps). A `(x)`
+                // receiver is a `ParenthesesNode` upstream —
+                // `analyse_class_predicate`/`stable_chain_address` decline
+                // it too (rigor-rs#820).
                 let (target, chain_call) = match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => {
+                    Node::LocalVariableRead { name, .. } if !ast.paren_unwrapped(*r) => {
                         (GuardTarget::Local(name.clone()), None)
                     }
                     _ => {
@@ -2252,7 +2255,13 @@ impl<'i> Typer<'i> {
                 Some((vec![g], Vec::new()))
             }
             ("===", 1) => {
+                // `C === (x)` — the operand `(x)` is a `ParenthesesNode`,
+                // not a `LocalVariableReadNode`: unread upstream
+                // (rigor-rs#820).
                 let Node::LocalVariableRead { name, .. } = ast.get(args[0]) else { return None };
+                if ast.paren_unwrapped(args[0]) {
+                    return None;
+                }
                 let class = self.resolved_static_constant(ast, *r, *span)?;
                 let g = (GuardTarget::Local(name.clone()), GuardFact {
                     classes: vec![class],
@@ -2263,13 +2272,31 @@ impl<'i> Typer<'i> {
                 Some((vec![g], Vec::new()))
             }
             ("nil?", 0) => {
+                // `(x).nil?` — the paren'd receiver is unread upstream
+                // (rigor-rs#820).
                 let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
+                if ast.paren_unwrapped(*r) {
+                    return None;
+                }
                 Some((vec![nil_fact(name)], Vec::new()))
             }
             ("==" | "!=", 1) => {
+                // `x == (nil)` / `(nil) == x` are unread:
+                // `equality_local_literal`'s `static_literal_type` reads the
+                // `ParenthesesNode` itself and answers nil for it
+                // (rigor-rs#820). So is a `(x)` local on either side — the
+                // `is_a?(LocalVariableReadNode)` gate fails on it.
                 let name = match (ast.get(*r), ast.get(args[0])) {
-                    (Node::LocalVariableRead { name, .. }, Node::NilLit { .. }) => name,
-                    (Node::NilLit { .. }, Node::LocalVariableRead { name, .. }) => name,
+                    (Node::LocalVariableRead { name, .. }, Node::NilLit { .. })
+                        if !ast.paren_unwrapped(*r) && !ast.paren_unwrapped(args[0]) =>
+                    {
+                        name
+                    }
+                    (Node::NilLit { .. }, Node::LocalVariableRead { name, .. })
+                        if !ast.paren_unwrapped(*r) && !ast.paren_unwrapped(args[0]) =>
+                    {
+                        name
+                    }
                     _ => return None,
                 };
                 let g = nil_fact(name);
@@ -2440,8 +2467,13 @@ impl<'i> Typer<'i> {
         };
         // A dynamic base (`k::String`, `self::String`, `self.class::String`)
         // is not a static class: the trailing name is a lenient render, and
-        // the reference's `static_class_name` returns nil (rigor-rs#670).
-        if name.is_empty() || *dynamic_base {
+        // the reference's `static_class_name` returns nil (rigor-rs#670). So
+        // does a PARENTHESED operand: `static_class_name` reads the
+        // `ParenthesesNode` itself and answers nil for it (`when (C)` narrows
+        // neither edge upstream — rigor-rs#820), so the id the lowering
+        // unwrapped stays unread in every `lexical_class_name` position this
+        // resolves (`when` condition, `===` receiver).
+        if name.is_empty() || *dynamic_base || ast.paren_unwrapped(id) {
             return None;
         }
         if *rooted {
@@ -2480,7 +2512,11 @@ impl<'i> Typer<'i> {
         let Node::ConstantRead { name, dynamic_base, rooted, .. } = ast.get(id) else {
             return None;
         };
-        if name.is_empty() || *dynamic_base {
+        // `is_a?((C))` is silent upstream: `rooted_class_predicate_name`
+        // walks the same `static_class_name`, which reads the
+        // `ParenthesesNode` — not the constant — and answers nil
+        // (rigor-rs#820).
+        if name.is_empty() || *dynamic_base || ast.paren_unwrapped(id) {
             return None;
         }
         if *rooted {
@@ -2587,7 +2623,14 @@ impl<'i> Typer<'i> {
     ) -> CaseCond {
         match ast.get(id) {
             Node::ConstantRead { name, dynamic_base, rooted, .. } => {
-                if name.is_empty() || *dynamic_base {
+                // `(C)` is UNREAD — `lexical_class_name`'s
+                // `static_class_name` answers nil for the `ParenthesesNode`
+                // itself (rigor-rs#820). The literal arms below stay
+                // paren-transparent by contrast: `when_condition_class`'s
+                // other two sources (`case_equality_target_class`, the
+                // nil/true/false table) and the integer paths all
+                // `unwrap_parens` before they read.
+                if name.is_empty() || *dynamic_base || ast.paren_unwrapped(id) {
                     return CaseCond::Unread;
                 }
                 // `lexical_class_name` — resolved at the use site's prefix

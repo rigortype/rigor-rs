@@ -243,8 +243,13 @@ impl<'i> Typer<'i> {
     }
 
     fn guarded_locals_into(&self, ast: &LoweredAst, pred: NodeId, out: &mut Vec<String>) {
+        // A `(x)` operand is a `ParenthesesNode`, not a
+        // `LocalVariableReadNode` — `analyse`'s gates decline it upstream
+        // (rigor-rs#820), so it mints no record guard.
         let local = |id: NodeId| match ast.get(id) {
-            Node::LocalVariableRead { name, .. } => Some(name.clone()),
+            Node::LocalVariableRead { name, .. } if !ast.paren_unwrapped(id) => {
+                Some(name.clone())
+            }
             _ => None,
         };
         match ast.get(pred) {
@@ -288,7 +293,10 @@ impl<'i> Typer<'i> {
         let Node::ConstantRead { name, dynamic_base, self_anchored, rooted, .. } = ast.get(id) else {
             return false;
         };
-        if name.is_empty() || *dynamic_base || *self_anchored {
+        // A parenthesised operand is not a static spelling either:
+        // `static_class_name` reads the `ParenthesesNode` and answers nil, so
+        // `x.is_a?((C))` / `(C) === x` guard nothing upstream (rigor-rs#820).
+        if name.is_empty() || *dynamic_base || *self_anchored || ast.paren_unwrapped(id) {
             return false;
         }
         if !*rooted {

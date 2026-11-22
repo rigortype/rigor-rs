@@ -1289,7 +1289,14 @@ impl<'i> Typer<'i> {
                 block_body,
                 safe_nav,
                 ..
-            } if block_body.is_empty() && !*safe_nav => match method.as_str() {
+            // `x&.nil?` narrows like `x.nil?` upstream —
+            // `analyse_nil_predicate` has no `safe_navigation?` decline, so
+            // the truthy edge binds `x` to nil and the falsey edge to its
+            // non-nil fragment (a nil carrier Bots the falsey arm —
+            // rigor-rs#820). Every OTHER method on a `&.` call keeps the
+            // historical skip.
+            } if block_body.is_empty()
+                && (!*safe_nav || (method == "nil?" && args.is_empty())) => match method.as_str() {
                 "!" if args.is_empty() => {
                     if let Some(r) = receiver {
                         Self::predicate_edge_locals_impl(ast, *r, !polarity, out, dedup);
@@ -1318,14 +1325,33 @@ impl<'i> Typer<'i> {
                     // a class test.
                     if method == "===" {
                         if let Some(r) = receiver {
+                            // `(C) === local` reads no class either —
+                            // `static_class_name` answers nil for the
+                            // `ParenthesesNode` itself (rigor-rs#820).
                             if let Node::ConstantRead {
                                 name: class,
                                 dynamic_base: false,
                                 ..
                             } = ast.get(*r)
+                                && !ast.paren_unwrapped(*r)
                             {
-                                if let Node::LocalVariableRead { name, .. }
-                                | Node::LocalVariableWrite { name, .. } = ast.get(args[0])
+                                // `(x)` on the operand side is a
+                                // `ParenthesesNode`, not a
+                                // `LocalVariableReadNode` — unread
+                                // upstream (rigor-rs#820); a paren'd
+                                // WRITE still reads (issue #1223).
+                                if let Node::LocalVariableRead { name, .. } =
+                                    ast.get(args[0])
+                                    && !ast.paren_unwrapped(args[0])
+                                {
+                                    push(out, name, DeadOp::Isa {
+                                        class: class.to_string(),
+                                        exact: false,
+                                        holds: eq,
+                                    });
+                                    return;
+                                }
+                                if let Node::LocalVariableWrite { name, .. } = ast.get(args[0])
                                 {
                                     push(out, name, DeadOp::Isa {
                                         class: class.to_string(),
@@ -1346,24 +1372,41 @@ impl<'i> Typer<'i> {
                 }
                 "nil?" if args.is_empty() => {
                     if let Some(r) = receiver {
-                        if let Node::LocalVariableRead { name, .. }
-                        | Node::LocalVariableWrite { name, .. } = ast.get(*r)
-                        {
+                        // A parenthesised receiver is unread upstream —
+                        // `analyse_nil_predicate`'s `receiver_slot` answers
+                        // nil for the `ParenthesesNode` itself — except a
+                        // paren'd WRITE, which `write_receiver_as_read`
+                        // still reads (issue #1223, rigor-rs#820).
+                        let name = match ast.get(*r) {
+                            Node::LocalVariableRead { name, .. }
+                                if !ast.paren_unwrapped(*r) => Some(name),
+                            Node::LocalVariableWrite { name, .. } => Some(name),
+                            _ => None,
+                        };
+                        if let Some(name) = name {
                             push(out, name, DeadOp::NilQ(polarity));
                         }
                     }
                 }
                 "is_a?" | "kind_of?" | "instance_of?" if args.len() == 1 => {
                     if let Some(r) = receiver {
-                        if let Node::LocalVariableRead { name, .. }
-                        | Node::LocalVariableWrite { name, .. } = ast.get(*r)
-                        {
+                        let name = match ast.get(*r) {
+                            Node::LocalVariableRead { name, .. }
+                                if !ast.paren_unwrapped(*r) => Some(name),
+                            Node::LocalVariableWrite { name, .. } => Some(name),
+                            _ => None,
+                        };
+                        if let Some(name) = name {
                             let op = match ast.get(args[0]) {
+                                // `(C)` is not a class operand upstream —
+                                // `static_class_name` reads the
+                                // `ParenthesesNode` and answers nil
+                                // (rigor-rs#820).
                                 Node::ConstantRead {
                                     name: class,
                                     dynamic_base: false,
                                     ..
-                                } => DeadOp::Isa {
+                                } if !ast.paren_unwrapped(args[0]) => DeadOp::Isa {
                                     class: class.to_string(),
                                     exact: method == "instance_of?",
                                     holds: polarity,
@@ -1385,7 +1428,10 @@ impl<'i> Typer<'i> {
     }
 
     /// Collect `id` as a `==`-family comparison operand against `peer`,
-    /// when `id` is a bare local.
+    /// when `id` is a bare local. A parenthesised peer is unread:
+    /// `equality_local_literal`'s `static_literal_type` answers nil for the
+    /// `ParenthesesNode` itself (`x == (nil)` narrows nothing upstream,
+    /// rigor-rs#820).
     fn predicate_cmp_local(
         ast: &LoweredAst,
         id: NodeId,
@@ -1394,12 +1440,19 @@ impl<'i> Typer<'i> {
         out: &mut Vec<(String, DeadOp)>,
         dedup: bool,
     ) {
-        if let Node::LocalVariableRead { name, .. } | Node::LocalVariableWrite { name, .. } =
-            ast.get(id)
-        {
-            if !dedup || !out.iter().any(|(n, _)| n == name) {
-                out.push((name.clone(), DeadOp::Cmp { peer, eq }));
-            }
+        if ast.paren_unwrapped(peer) {
+            return;
+        }
+        // `(x)` is not a `LocalVariableReadNode` — the local position is
+        // unread upstream too (rigor-rs#820); a paren'd WRITE reads
+        // (issue #1223).
+        let name = match ast.get(id) {
+            Node::LocalVariableRead { name, .. } if !ast.paren_unwrapped(id) => name,
+            Node::LocalVariableWrite { name, .. } => name,
+            _ => return,
+        };
+        if !dedup || !out.iter().any(|(n, _)| n == name) {
+            out.push((name.clone(), DeadOp::Cmp { peer, eq }));
         }
     }
 

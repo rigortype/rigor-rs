@@ -343,6 +343,13 @@ impl<'i> Typer<'i> {
                 else {
                     return None;
                 };
+                // `q.is_a?((C))` does not fold — the reference's class
+                // operand test (`static_class_name`) answers nil for the
+                // `ParenthesesNode` itself, so the guard is unread and the
+                // predicate stays undecided (rigor-rs#820).
+                if ast.paren_unwrapped(*arg) {
+                    return None;
+                }
                 let own = folding::scalar_class(&recv_scalar);
                 if own == class.as_str() {
                     Some(Scalar::Bool(true))

@@ -5620,3 +5620,170 @@ fn issue_681_loop_entry_conjuncts_keep_firing() {
         );
     }
 }
+
+/// rigor-rs#820 — parenthesised SUBJECT reads are unread upstream:
+/// `analyse`'s gates (`receiver_slot`, `analyse_nil_predicate`,
+/// `analyse_class_predicate`, `comparison_local_literal`,
+/// `equality_local_literal`) match `LocalVariableReadNode`-class operands,
+/// so a `ParenthesesNode` receiver or operand narrows nothing — the
+/// carrier keeps BOTH edges (`(x).is_a?(C)`, `C === (x)`, `(x).nil?`,
+/// `(x) < 2`, `(x) =~ /re/`, `case (x)` all fire inside and out). A
+/// paren'd `&.` receiver declines the whole call — upstream never reaches
+/// the `nil&.m` fold — while a provably-nil UNparen'd `x&.m` receiver
+/// still dies on the truthy edge. `x&.nil?` narrows like `x.nil?`
+/// upstream (`analyse_nil_predicate` has no `safe_navigation?` decline):
+/// the truthy edge binds `x` to nil, the falsey edge to non-nil — the
+/// `dead.folded` fill must carry that `NilQ` subject or the port emits
+/// inside a folded-dead arm where the reference's edge scope is `Bot`.
+///
+/// Rows oracle-measured at pin `bbea1bac` (fresh-dir probes): each entry
+/// is `(source, expected undefined-method messages in order)`.
+#[test]
+fn issue_820_parenthesised_subject_matrix() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for (src, expect) in [
+        // `(x)` receiver / operand — both edges keep the carrier.
+        (
+            &b"x = \"s\"\nif (x).is_a?(Integer)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for \"s\"",
+                "undefined method `foo_b' for \"s\"",
+            ],
+        ),
+        (
+            &b"x = \"s\"\nif Integer === (x)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for \"s\"",
+                "undefined method `foo_b' for \"s\"",
+            ],
+        ),
+        (
+            &b"x = \"s\"\nif (x).nil?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for \"s\"",
+                "undefined method `foo_b' for \"s\"",
+            ],
+        ),
+        (
+            &b"x = \"s\"\nif ((x)).is_a?(Integer)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for \"s\"",
+                "undefined method `foo_b' for \"s\"",
+            ],
+        ),
+        (
+            &b"x = \"s\"\nif (x) =~ /s/\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for \"s\"",
+                "undefined method `foo_b' for \"s\"",
+            ],
+        ),
+        (
+            &b"x = 1\nif (x) < 2\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for 1",
+                "undefined method `foo_b' for 1",
+            ],
+        ),
+        (
+            &b"x = \"s\"\nif nil == (x)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for \"s\"",
+                "undefined method `foo_b' for \"s\"",
+            ],
+        ),
+        (
+            &b"x = \"s\"\ncase (x)\nwhen Integer\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_b' for \"s\""],
+        ),
+        (
+            &b"x = 1\nwhile (x) < 2\n  break\nend\nx.frob\n"[..],
+            vec!["undefined method `frob' for 1"],
+        ),
+        // `x&.m` — `safe_navigation_call_type`: a provably-nil carrier
+        // still dies on the truthy edge; a paren'd receiver keeps both.
+        (
+            &b"x = nil\nif (x)&.frozen?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for nil",
+                "undefined method `foo_b' for nil",
+            ],
+        ),
+        (
+            &b"x = [nil].first\nif (x)&.is_a?(Integer)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for nil",
+                "undefined method `foo_b' for nil",
+            ],
+        ),
+        (
+            &b"x = [nil].first\nif x&.is_a?((Integer))\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_b' for nil"],
+        ),
+        (
+            &b"x = [nil].first\nif (x)&.empty?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for nil",
+                "undefined method `foo_b' for nil",
+            ],
+        ),
+        // `x&.nil?` narrows like `x.nil?` — truthy binds nil, falsey
+        // non-nil (a nil carrier Bots the falsey arm).
+        (
+            &b"x = nil\nif x&.nil?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_a' for nil"],
+        ),
+        (
+            &b"x = \"s\"\nif x&.nil?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_b' for \"s\""],
+        ),
+        (
+            &b"x = nil\nif (x)&.nil?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec![
+                "undefined method `foo_a' for nil",
+                "undefined method `foo_b' for nil",
+            ],
+        ),
+        // `!(x)` — predicate-position parens DO read (`analyse` recurses
+        // into them): the `nil` carrier dies on the truthy edge.
+        (
+            &b"x = nil\nif !(x)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_a' for nil"],
+        ),
+        // Must-still-narrow controls: the unparen'd spellings decide.
+        (
+            &b"x = \"s\"\nif x.is_a?(Integer)\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_b' for \"s\""],
+        ),
+        (
+            &b"x = \"s\"\nif x.nil?\n  x.foo_a\nelse\n  x.foo_b\nend\n"[..],
+            vec!["undefined method `foo_b' for \"s\""],
+        ),
+        // The `empty?` falsy edge narrows only a `Nominal[Array]` carrier
+        // (`analyse_array_emptiness_predicate`) — resolved through the
+        // CORE index (`source.class_name_for_id` answers `None` for a
+        // core-range `ClassId`; review-blocker row, rigor-rs#820).
+        (
+            &b"x = ENV.keys\nif x.empty? || rand > 0.5\n  x.foo_a\nend\n"[..],
+            vec![],
+        ),
+        (
+            &b"x = Dir.glob(\"*\")\nx.frob if x.empty? || x.size > 3\n"[..],
+            vec![],
+        ),
+        (
+            &b"x = [1, 2].shuffle\nuntil x.empty?\n  break\nend\nx.frob\n"[..],
+            vec![],
+        ),
+    ] {
+        let diags = undefined(src);
+        let expect: Vec<String> = expect.iter().map(|s| s.to_string()).collect();
+        assert_eq!(diags, expect, "row {:?}", String::from_utf8_lossy(src));
+    }
+}
