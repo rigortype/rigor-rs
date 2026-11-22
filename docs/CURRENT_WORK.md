@@ -34,16 +34,16 @@ Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DI
   [tier-bc](notes/20260717-tier-bc-track-closed.md)). **SCOPE: the 85
   `Dynamic`-arm rows, NOT the 93 concrete-arm ones**.
 - **Reference-FP undefined-method clusters, CLOSED** — `pre_eval:` cross-file
-  monkey-patch (closing INVERTS the ADR-0033 provenance gate), receiver-typed-`nil`,
-  rdoc generated-parser `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
+  monkey-patch (closing INVERTS the ADR-0033 provenance gate), `nil` receiver,
+  rdoc parser `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
   Re-adjudicated `v0.3.8` ([799](notes/20260909-gap-adjudication-799.md)):
-  **395 of 799 behind decisions; biggest: nested-scope receiver typing, 71 rows.**
-- **5 consecutive FP-safe flow slices closed 0 gaps** — no slice without a
-  valid-mode `fp_audit --gaps` prediction ([flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
+  **395 of 799 behind decisions.**
+- **5 consecutive FP-safe flow slices closed 0 gaps** — no slice without an
+  `fp_audit --gaps` prediction ([flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
 - **The receiver-typing lever is open**: gap census buckets by MECHANISM
   ([census](notes/20260807-gap-census.md)); four slices closed **47
   rows**. Re-run `gap_census.py --sweep` after each.
-- **Effects TRANSITIVE LABEL lane DECLINED — not portable at parity** (s4): four typer-free rules, best 5 OVER — labels stay UNDER; parity outranks the ~2,000-method prize. [probe](notes/20260826-effects-s4-probe.md).
+- **Effects TRANSITIVE LABEL lane DECLINED — not portable at parity** (s4): four typer-free rules, best 5 OVER — labels stay UNDER; parity outranks the prize. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen closed** — byte surface 0, `--write` sound.
 - **Plugin work:** pure-RBS bundle track closed ([note](notes/20260710-pure-rbs-bundle-track-closed.md));
   sidecar + perf retired ([ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md)).
@@ -58,9 +58,10 @@ seam, `harness/vendor_rbs.py` regenerates).
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #809 CLOSED** (PR #815): ATM ordering: host mirror + lexical param-head resolution; ~50 rows `=`; 0 FP; →#817. [note](notes/20261122-issue-809-host-mirror.md)
 - **2026-11-22 #383 CLOSED** (PR #808): qualified param heads reach the ATM param gates; 30 probe rows `=`; 0 FP; →#809-812. [note](notes/20261122-issue-383-qualified-param-heads.md)
 - **2026-11-22 #681 CLOSED** (PR #806): loop-entry edge narrows untracked predicate subjects (ordered conjuncts, Isa, literal `==`); Approved `a4be2d25`; 150/164 `=`; 0 FP. [note](notes/20261122-issue-681-loop-entry-narrowing.md)
-- **2026-11-22 #326 CLOSED** (PR #807): baseline scalars through Psych's ScalarScanner — `!ruby/` tags, quoted folds, doc-order fatals, `ruby_sort`; six rounds, Approved `dcc1980c`; ~160 rows `=`; 0 FP. [note](notes/20261122-issue-326-baseline-psych-scalars.md)
+- **2026-11-22 #326 CLOSED** (PR #807): baseline scalars through Psych's ScalarScanner — `!ruby/` tags, quoted folds, doc-order fatals, `ruby_sort`; Approved `dcc1980c`; ~160 rows `=`; 0 FP. [note](notes/20261122-issue-326-baseline-psych-scalars.md)
 - **2026-11-21 #616 CLOSED** (PR #804): `record_declaration` gate into macro arms; cite refresh; `define_method_unit` triple. 0 FP; →#805. [note](notes/20261121-issue-616-fidelity.md)
 - **2026-11-21 #640 CLOSED** (PR #800): env dead-arm judge; `for 1`→`for Integer`; 0 FP. [note](notes/20261121-issue-640-dead-arm-env.md)
 - **2026-11-21 #253 CLOSED** (PR #799): `# rigor:disable` class-bounded capture + Psych severity booleans; 19/19 `=`; 0 FP; →#801–#803. [note](notes/20261121-issue-253-suppression-psych-booleans.md)
@@ -78,7 +79,7 @@ seam, `harness/vendor_rbs.py` regenerates).
 - **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + stack.yml; ADR-0045 x86_64 rungs (alloc, never 2 MiB overflow); Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
 - **2026-11-20 #724 CLOSED** (PR #739): pool-audit `use` alias/glob of the pool builders in `fn main` flags (#676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
 - **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch String carriers (`decimal-int-string`/`non-empty-string`); drift 47→46, 0 FP. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
-- **2026-11-20 #427 CLOSED** (PR #726): env memo stores uid-scoped interner-bound answers; `.map` repro doubled per link → never finishes; check 68 s; byte-identical, 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
+- **2026-11-20 #427 CLOSED** (PR #726): env memo stores uid-scoped interner-bound answers; `.map` repro doubled per link → never finishes; check 68 s; 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
 - **2026-11-20 #643 CLOSED** (PR #725): named Finding struct + conformance start_offset; refactor, 0 FP / 437 gaps = master; →#727/#728. [note](notes/20261120-issue-643-findings-tuple.md)
 - **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — planted inversion: threads test passes, audit fails at the line; →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
 - **2026-11-20 #345 CLOSED** (PR #720): pre_eval glob→dir earns not-found row; `.uniq`/order ported; 0 FP; →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
@@ -161,8 +162,8 @@ seam, `harness/vendor_rbs.py` regenerates).
 - **2026-08-09 unresolved-const-receiver carrier REJECTED at 0 rows** (PR #89, closed). [note](notes/20260809-unresolved-const-receiver-carrier.md)
 - **2026-08-09 re-pin `v0.3.1→v0.3.2` (+rbs 4.1.1), folded** — 0 FP/9204, gaps 1125→841; shims→overlay; join-wipe; chain-guard meet. [repin](notes/20260809-repin-v032.md)/[meet](notes/20260809-chain-guard-meet.md)
 - **2026-08-08 era, folded (0 FP / 9204)** — narrowing/shape trio #70–#82; `Object` bucket #85; harvest #83/#84.
-- **2026-08-07/08 class-narrowing arc CLOSED, measured stop** (#63–#79): `narrow_class_other`: 19 closures + 11 master FPs, 0 FP / 9204. [spec](notes/20260807-class-narrowing-slice-spec.md)/[stage3](notes/20260807-narrowing-stage3-spec.md).
+- **2026-08-07/08 class-narrowing arc CLOSED, measured stop** (#63–#79): `narrow_class_other`; 0 FP / 9204. [spec](notes/20260807-class-narrowing-slice-spec.md)/[stage3](notes/20260807-narrowing-stage3-spec.md).
 - **2026-08-01/08 instruments + adjudication, folded** — 0-FP gate VACUITY risk; gap CENSUS by mechanism; LSP keeps LAST GOOD. [fp](notes/20260807-fp-audit-port-side-blind-spots.md)/[census](notes/20260807-gap-census.md)/[lsp](notes/20260801-lsp-config-reload.md).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup** (PR #64) — namespaced receivers route via the qualified registry; 14 closures (→1179), 0 FP / 9204; fx 82 pins Tier-3. [spec](notes/20260807-adr0042-s5-return-lookup-spec.md).
 - **2026-08-07 upstream survey + feedback batch 2, folded** — self-diff moved 2 superseded diagnostics; retired GEM_HOME rbs selection ([note](notes/20260807-upstream-survey-v031-to-master.md)).
-- **2026-07-16–31 v0.3.0-RC→v0.3.1 era, folded** — rules fully ported (pin `47ec8625`); re-pin v0.3.1+rbs 4.1.0 (0 FP/9153); LSP §12 + audit/MCP #33–#45; sig-gen Data/Struct; BigMath CLOSED; sweep codified. [specs](notes/20260716-v030-upstream-gap-survey.md)/[pin](notes/20260731-upstream-pin-v031-rbs41.md)/[lsp](notes/20260719-adr0042-gate-deliverables.md).
+- **2026-07-16–31 v0.3.0-RC→v0.3.1 era, folded** — rules ported (pin `47ec8625`); re-pin v0.3.1+rbs 4.1.0 (0 FP/9153); LSP §12 + MCP #33–#45; sig-gen Data/Struct; BigMath. [specs](notes/20260716-v030-upstream-gap-survey.md)/[pin](notes/20260731-upstream-pin-v031-rbs41.md)/[lsp](notes/20260719-adr0042-gate-deliverables.md).
