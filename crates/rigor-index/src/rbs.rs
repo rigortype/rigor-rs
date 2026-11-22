@@ -5520,13 +5520,16 @@ impl Builder {
         self.object_constants.entry(name).or_insert(class);
     }
 
-    /// rigor-rs#811: record a `class X = Y` / `module X = Y` declaration —
-    /// the NEW name joins `known_type_names` (class/module aliases feed the
-    /// resolver's `all_names ∪ aliased_name?` hit set), and
-    /// `new → (old written, decl ctx)` joins `class_alias_targets`, the
+    /// rigor-rs#811: record a `class X = Y` / `module X = Y` declaration as
+    /// `new → (old written, decl ctx)` in `class_alias_targets`, the
     /// `TypeNameResolver` `aliases` table [`resolve_lexical_name`] chases
     /// (`Mutex` ⇒ `Thread::Mutex`, so an `expected:` label renders the
-    /// resolved target the oracle prints). First write wins.
+    /// resolved target the oracle prints). First write wins. The new name
+    /// deliberately does NOT join `known_type_names`: that set mirrors the
+    /// resolver's `all_names` (class/interface/`type` decls only — an alias
+    /// is NOT a `has_type_name?` hit), and the consumers that mirror
+    /// `env.type_name?` / `UseMap::Table#known_types` (which DO merge
+    /// `class_alias_decls`) union `class_alias_targets` at their call sites.
     fn record_class_alias(
         &mut self,
         new_name: &ruby_rbs::node::TypeNameNode,
@@ -5534,7 +5537,6 @@ impl Builder {
         enclosing: &[&'static str],
     ) {
         let qual = qualified_name(enclosing, new_name);
-        self.known_type_names.insert(qual);
         if let Some(old) = written_ref(old_name) {
             self.class_alias_targets
                 .entry(qual)
@@ -6529,6 +6531,17 @@ impl Builder {
                 entry.superclass = Some(object);
             }
         }
+        // `type_names` is the WIDER set (`has_type_name? || aliased_name?`,
+        // #168): `known_type_names` mirrors the resolver's `all_names` (no
+        // alias names — a tail `has_type_name?` must miss them so the
+        // `aliases.fetch` arm takes the chase, rigor-rs#811), so the
+        // class/module-alias names ride back in at export.
+        let type_names: HashSet<&'static str> = self
+            .known_type_names
+            .iter()
+            .copied()
+            .chain(self.class_alias_targets.keys().copied())
+            .collect();
         (
             self.classes,
             self.toplevel_classes,
@@ -6538,7 +6551,7 @@ impl Builder {
             self.qualified,
             self.short_to_qualified,
             self.object_constants,
-            self.known_type_names,
+            type_names,
             self.synthesized_type_names,
         )
     }
@@ -6552,16 +6565,32 @@ impl Builder {
     /// `all_names` does not discriminate, and the missing-type scan must not
     /// stub a declared interface.
     fn resolve_type_name_rbs(&self, name: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        // `env.type_name?` counts `class_alias_decls` (`module_name?`) — the
+        // alias check rides along every `has_type_name?`-shaped probe.
         if let Some(abs) = name.strip_prefix("::") {
-            return self.known_type_names.get(abs).copied();
+            if let Some(&k) = self.known_type_names.get(abs) {
+                return Some(k);
+            }
+            return self
+                .class_alias_targets
+                .get_key_value(abs)
+                .map(|(k, _)| *k);
         }
         for scope in ctx.iter().rev() {
             let cand = format!("{scope}::{name}");
             if let Some(&k) = self.known_type_names.get(cand.as_str()) {
                 return Some(k);
             }
+            if let Some((k, _)) = self.class_alias_targets.get_key_value(cand.as_str()) {
+                return Some(k);
+            }
         }
-        self.known_type_names.get(name).copied()
+        if let Some(&k) = self.known_type_names.get(name) {
+            return Some(k);
+        }
+        self.class_alias_targets
+            .get_key_value(name)
+            .map(|(k, _)| *k)
     }
 }
 
@@ -6777,7 +6806,13 @@ fn collect_decl_names_inner<'a>(
 /// `use Foo::*` clause expands through.
 fn use_map_children(builder: &Builder) -> HashMap<&'static str, Vec<&'static str>> {
     let mut children: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
-    for &name in &builder.known_type_names {
+    // `Table#known_types` merges `class_alias_decls` too — a `use Lib::*`
+    // maps `Al` ⇒ `Lib::Al` when `Lib::Al` is an alias (rigor-rs#811).
+    for &name in builder
+        .known_type_names
+        .iter()
+        .chain(builder.class_alias_targets.keys())
+    {
         if let Some(pos) = name.rfind("::") {
             children.entry(&name[..pos]).or_default().push(name);
         }
@@ -7000,7 +7035,10 @@ fn synthesize_missing_referenced_types(
                     continue;
                 }
                 let cand = name.strip_prefix("::").unwrap_or(name);
-                if !builder.known_type_names.contains(cand) {
+                // `env.type_name?(::cand)` — `class_alias_decls` count too.
+                if !builder.known_type_names.contains(cand)
+                    && !builder.class_alias_targets.contains_key(cand)
+                {
                     missing.insert(cand.to_string());
                 }
             }
@@ -7018,7 +7056,10 @@ fn synthesize_missing_referenced_types(
                 idx = pos;
             }
         }
-        names.retain(|n| !builder.known_type_names.contains(n.as_str()));
+        names.retain(|n| {
+            !builder.known_type_names.contains(n.as_str())
+                && !builder.class_alias_targets.contains_key(n.as_str())
+        });
         if names.is_empty() {
             break;
         }
@@ -7991,10 +8032,16 @@ fn retained_param_type(
                 // resolution then chases class/module aliases
                 // (`Mutex` ⇒ `Thread::Mutex`). An unresolvable name keeps
                 // the written spelling, which renders identically when the
-                // written form was already qualified.
+                // written form was already qualified. A `resolve-type-names:
+                // false` file skips resolution wholesale — the reference's
+                // `resolve_signature` stands down there, so the name stays
+                // as written (`::`-marker dropped for display).
                 let stripped = written.strip_prefix("::").unwrap_or(written);
-                let name = resolve_lexical_name(written, enclosing, b)
-                    .unwrap_or(stripped);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_name(written, enclosing, b).unwrap_or(stripped)
+                };
                 RetainedParamType::ClassInstance(
                     name,
                     ci.args()
@@ -8011,10 +8058,14 @@ fn retained_param_type(
                 // `TypeNameResolver#resolve`: a bare `selector` inside
                 // `class String` retains `String::selector` (rigor-rs#463),
                 // `Foo::bar` resolves its namespace then needs the leaf
-                // declared beneath.
+                // declared beneath. `resolve-type-names: false` keeps the
+                // written name (`::`-marker dropped) — see ClassInstance.
                 let stripped = written.strip_prefix("::").unwrap_or(written);
-                let name = resolve_lexical_type_name(written, enclosing, b)
-                    .unwrap_or(stripped);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_type_name(written, enclosing, b).unwrap_or(stripped)
+                };
                 RetainedParamType::Alias(
                     name,
                     a.args()
@@ -8028,8 +8079,11 @@ fn retained_param_type(
         Node::InterfaceType(i) => match written_ref_ctx(ctx, &i.name()) {
             Some(written) => {
                 let stripped = written.strip_prefix("::").unwrap_or(written);
-                let name = resolve_lexical_type_name(written, enclosing, b)
-                    .unwrap_or(stripped);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_type_name(written, enclosing, b).unwrap_or(stripped)
+                };
                 RetainedParamType::Interface(
                     name,
                     i.args()
@@ -8133,12 +8187,14 @@ fn resolve_lexical_type_name(
 /// `TypeNameResolver#resolve_namespace0`: split `head, *tail` — the head
 /// binds on `has_type_name? || aliased_name?` (innermost→root, or root only
 /// when `::`-rooted) and COMMITS; a bound alias normalises its `old_name` in
-/// the alias's own decl context (`or return head` on failure — the alias
-/// name itself stays as the namespace); each tail segment must resolve
-/// directly beneath (same rule, but an alias that fails to normalise fails
-/// the WHOLE name — `or return m` with `m` nil). `visited` is the
-/// `normalize_namespace` cycle set: an alias chain back onto an in-progress
-/// name answers `false`, which both `or`-clauses read as failure.
+/// the alias's own decl context (`head = normalize(...) or return head` —
+/// the `or` binds after the assignment, so a failed normalisation makes the
+/// whole name fail to resolve); each tail segment must resolve directly
+/// beneath (`has_type_name?` — real decls only, `known` holds no alias
+/// names — else `aliases.fetch` → `normalize or return m`, a failure that
+/// likewise fails the WHOLE name). `visited` is the `normalize_namespace`
+/// cycle set: an alias chain back onto an in-progress name answers `false`,
+/// which both `or`-clauses read as failure.
 fn resolve_namespace0(
     written: &str,
     ctx: &[&'static str],
@@ -8177,11 +8233,11 @@ fn resolve_namespace0(
         hit?
     };
     // Head alias: `head = normalize_namespace(head, rhs, ctx) or return head`
-    // — a failed normalisation keeps the alias NAME as the namespace.
+    // — `or` binds AFTER the assignment, so a failed normalisation leaves
+    // `head` falsy and the WHOLE name fails to resolve; the caller keeps the
+    // written spelling, which is what the oracle renders.
     if let Some((rhs, actx)) = aliases.get(ns.as_str()) {
-        if let Some(t) = normalize_alias(&ns, rhs, actx, known, aliases, visited) {
-            ns = t;
-        }
+        ns = normalize_alias(&ns, rhs, actx, known, aliases, visited)?;
     }
     // Tail: `namespace::seg` must be declared, or an alias that normalises.
     for seg in tail {

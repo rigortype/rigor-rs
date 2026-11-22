@@ -50,20 +50,32 @@ fn lexical_resolution_chases_class_aliases() {
         crate::rbs::resolve_lexical_name_in("Mutex::B", &["W2"], &known2, &aliases),
         Some("Thread::Mutex::B")
     );
-    // A cycle (`A = B; B = A`) stays on the alias name rather than looping.
+    // A cycle (`A = B; B = A`) fails the whole name — `head = normalize or
+    // return head` makes `head` falsy on a `visited` re-entry — so the use
+    // site keeps the WRITTEN name (the caller's `unwrap_or`), as the
+    // reference's unresolved name does.
     let known3: std::collections::HashSet<&'static str> = ["A", "B"].into_iter().collect();
     let aliases3: std::collections::HashMap<&'static str, (&'static str, Vec<&'static str>)> =
         [("A", ("B", Vec::new())), ("B", ("A", Vec::new()))].into_iter().collect();
     assert_eq!(
         crate::rbs::resolve_lexical_name_in("A", &[], &known3, &aliases3),
-        Some("A")
+        None
     );
-    // An alias whose target resolves nothing keeps the alias NAME
-    // (`or return head`), so the label reads as the oracle's `::A` would.
+    // An alias whose target resolves nothing fails the same way.
     let aliases4: std::collections::HashMap<&'static str, (&'static str, Vec<&'static str>)> =
         [("A", ("Missing::Thing", Vec::new()))].into_iter().collect();
     assert_eq!(
         crate::rbs::resolve_lexical_name_in("A", &[], &known3, &aliases4),
-        Some("A")
+        None
+    );
+    // An alias in the TAIL position chases too (`M::Mutex` ⇒ `Thread::Mutex`)
+    // — `has_type_name?` misses alias-only names, so `aliases.fetch` takes it.
+    let known4: std::collections::HashSet<&'static str> =
+        ["M", "Thread", "Thread::Mutex"].into_iter().collect();
+    let aliases5: std::collections::HashMap<&'static str, (&'static str, Vec<&'static str>)> =
+        [("M::Mutex", ("Thread::Mutex", Vec::new()))].into_iter().collect();
+    assert_eq!(
+        crate::rbs::resolve_lexical_name_in("M::Mutex", &[], &known4, &aliases5),
+        Some("Thread::Mutex")
     );
 }

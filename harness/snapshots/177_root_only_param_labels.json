@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/177_root_only_param_labels.rb",
+  "diagnostics": [
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 6,
+      "column": 9,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `a' on R: expected Mutex, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 7,
+      "column": 9,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `b' on R: expected Mutex?, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 8,
+      "column": 9,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `c' on R: expected Integer | Mutex, got \"s\""
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 9,
+      "column": 9,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `d' on R: expected Array[Mutex], got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 13,
+      "column": 10,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `e' on R2: expected Thread::Mutex, got 1"
+    }
+  ]
+}

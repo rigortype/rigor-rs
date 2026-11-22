@@ -1,0 +1,5 @@
+class R2
+  # Normal-file control: a literally WRITTEN `::Mutex` still resolves through
+  # the bundled alias — `expected Thread::Mutex`.
+  def e: (::Mutex x) -> void
+end

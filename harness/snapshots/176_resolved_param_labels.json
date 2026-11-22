@@ -1,0 +1,47 @@
+{
+  "fixture": "harness/corpus/176_resolved_param_labels.rb",
+  "diagnostics": [
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 6,
+      "column": 14,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `w' of `take' on Top: expected Top::Widget, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 9,
+      "column": 19,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `m' of `take_mutex' on W2: expected Thread::Mutex, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 12,
+      "column": 19,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `a' of `take_alias' on W3: expected Thread::Mutex, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 15,
+      "column": 16,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `b' of `take' on Mixin: expected Outer::Inner, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 18,
+      "column": 10,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `m2' on M: expected Thread::Mutex, got 1"
+    },
+    {
+      "rule": "call.argument-type-mismatch",
+      "line": 22,
+      "column": 13,
+      "severity": "error",
+      "message": "argument type mismatch at parameter `x' of `f' on UseCl: expected Thread::Mutex, got 1"
+    }
+  ]
+}
