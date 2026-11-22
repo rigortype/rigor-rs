@@ -1455,6 +1455,28 @@ mod tests {
         assert_eq!(entries, canonical);
     }
 
+    /// rigor-rs#818 acceptance: every entry's `severity_by_profile` is a
+    /// second copy of the `SeverityProfile::PROFILES` data `crate::severity`
+    /// holds, and the two had drifted nine rows apart. An id absent from a
+    /// profile table resolves to the entry's authored severity, which is what
+    /// the catalogue should then report for all three profiles.
+    #[test]
+    fn severity_by_profile_agrees_with_the_profile_tables() {
+        for e in ENTRIES {
+            let authored = crate::severity::ResolvedSeverity::from_str(e.severity_authored)
+                .expect("catalogue severity_authored must parse");
+            for (profile, expected) in e.severity_by_profile {
+                let p = crate::severity::Profile::from_str(profile).unwrap();
+                assert_eq!(
+                    crate::severity::resolve(e.id, authored, p, &[], &[]).as_str(),
+                    expected,
+                    "{} under {profile}",
+                    e.id
+                );
+            }
+        }
+    }
+
     #[test]
     fn aliases_reverse_maps_the_legacy_table() {
         let e = resolve("def.method-visibility-mismatch");
