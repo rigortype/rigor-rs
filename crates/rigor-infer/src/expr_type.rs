@@ -742,6 +742,70 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// rigor-rs#770 — the `recv[k]` read on a verbatim-carrier UNION
+    /// (`{a:1} | [1]` `h[0]`). Answers the per-member element envelope the
+    /// reference's `dispatch_union` produces: each member erases to
+    /// `Hash[K,V]` / `Array[E]` (`hash_shape_type_args` /
+    /// `tuple_type_args`), `[]` answers the value arm, and the results
+    /// union. `Some` only when EVERY member contributes — a union holding a
+    /// non-verbatim member (`[1] | "s"`, `[1] | 2`) declines whole, as
+    /// `dispatch_union` declines when any member's dispatch does.
+    pub(crate) fn union_index_read(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+        let Type::Union(members) = interner.get(ty) else {
+            return None;
+        };
+        let members = members.clone();
+        let mut parts = Vec::with_capacity(members.len());
+        for &m in &members {
+            parts.push(self.index_read_member_envelope(m, interner)?);
+        }
+        Some(self.union_members(parts, interner))
+    }
+
+    /// One union member's erased `[]` answer for
+    /// [`Self::union_index_read`]: a `Tuple` contributes its element join
+    /// (`tuple_type_args`), a `HashShape` its value join
+    /// (`hash_shape_type_args`), a `Hash`/`Array` nominal its value /
+    /// element type argument — `untyped` when the member carries no
+    /// element type to contribute (empty shape, bare nominal), matching the
+    /// unbound `Elem` the erased `[]` signature returns upstream. A
+    /// refinement or difference resolves through its base, as
+    /// [`Self::verbatim_slot`]'s `class_name_of` erasure does. Every other
+    /// carrier declines.
+    #[allow(clippy::only_used_in_recursion)]
+    fn index_read_member_envelope(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+        match interner.get(ty) {
+            Type::Tuple(elems) => {
+                let elems = elems.clone();
+                Some(if elems.is_empty() {
+                    interner.untyped()
+                } else {
+                    self.union_members(elems, interner)
+                })
+            }
+            Type::HashShape(members) => {
+                let values: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                Some(if values.is_empty() {
+                    interner.untyped()
+                } else {
+                    self.union_members(values, interner)
+                })
+            }
+            Type::Nominal { class, args } => {
+                let idx = match self.index.class_name_for_id(*class) {
+                    Some("Array") => Some(0),
+                    Some("Hash") => Some(1),
+                    _ => None,
+                }?;
+                Some(args.get(idx).copied().unwrap_or_else(|| interner.untyped()))
+            }
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.index_read_member_envelope(*base, interner)
+            }
+            _ => None,
+        }
+    }
+
     /// `IndexedNarrowing.fully_tracked_receiver_type?`
     /// (indexed_narrowing.rb:92): a `Dynamic`/`Top` constituent means the
     /// collection can hold a caller-supplied slot value `||=` keeps.
