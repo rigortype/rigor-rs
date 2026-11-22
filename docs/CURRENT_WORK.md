@@ -18,7 +18,7 @@ byte budget.
 - **CLI** — `--bleeding-edge`/severity/`coverage` done;
   `--protection`/`--mutation`/`type-scan` deferred
   ([scoping](notes/20260719-coverage-command-scoping.md)).
-- **Pin `v0.4.8`** (rbs 4.2.0). Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
+- **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-21, `v0.4.8`): harness **174 fixtures / 0
 unregistered**; standing sweep **0 FP / 437 = master**; effects gate 0
@@ -53,6 +53,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #805 CLOSED** (PR #828): stale `scanner.rb` cite `:201`→`:274`; doc-only. →#830. [note](notes/20261122-issue-805-stale-cite.md)
 - **2026-11-22 #766 CLOSED** (PR #823): FoldOutcome mints → `numeric_blow_up_class` + `fold_result_gate`; `(-4) ** -6803` Rational gain; 0 FP; →#826/#827. [note](notes/20261122-issue-766-fold-blowup-consolidation.md)
 - **2026-11-22 #818 CLOSED** (PR #824): severity PROFILES resynced 28→37 rows verbatim; explain drift guard. 0 FP; →#825. [note](notes/20261122-issue-818-severity-profiles.md)
 - **2026-11-22 #710 case-guard half CLOSED** (PR #819): threaded `when`/`in` falsey edge; `in` arms modelled; brief FP rows `=`; 0 FP. →#820–#822. [note](notes/20261122-issue-710-case-falsey-edge.md)
@@ -60,8 +61,8 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-22 #255 CLOSED** (PR #816): explain + sig.skipped catalogues synced to shared rule tables; all probes `=`; →#818. [note](notes/20261122-issue-255-explain-catalogue.md)
 - **2026-11-22 #809 CLOSED** (PR #815): ATM: host mirror + lexical param heads; ~50 rows `=`; 0 FP; →#817. [note](notes/20261122-issue-809-host-mirror.md)
 - **2026-11-22 #383 CLOSED** (PR #808): qualified param heads reach the ATM gates; 30 rows `=`; 0 FP; →#809–#812. [note](notes/20261122-issue-383-qualified-param-heads.md)
-- **2026-11-22 #681 CLOSED** (PR #806): loop-entry edge narrows untracked predicate subjects (ordered conjuncts, Isa, literal `==`); 150/164 `=`; 0 FP. [note](notes/20261122-issue-681-loop-entry-narrowing.md)
-- **2026-11-22 #326 CLOSED** (PR #807): baseline scalars via Psych's ScalarScanner (`!ruby/` tags, quoted folds, `ruby_sort`); ~160 rows `=`; 0 FP. [note](notes/20261122-issue-326-baseline-psych-scalars.md)
+- **2026-11-22 #681 CLOSED** (PR #806): loop-entry edge narrows untracked predicate subjects (conjuncts, Isa, literal `==`); 150/164 `=`; 0 FP. [note](notes/20261122-issue-681-loop-entry-narrowing.md)
+- **2026-11-22 #326 CLOSED** (PR #807): baseline scalars via Psych's ScalarScanner; ~160 rows `=`; 0 FP. [note](notes/20261122-issue-326-baseline-psych-scalars.md)
 - **2026-11-21 #616 CLOSED** (PR #804): `record_declaration` gate into macro arms; `define_method_unit` triple. 0 FP; →#805. [note](notes/20261121-issue-616-fidelity.md)
 - **2026-11-21 #640 CLOSED** (PR #800): env dead-arm judge; `for 1`→`for Integer`; 0 FP. [note](notes/20261121-issue-640-dead-arm-env.md)
 - **2026-11-21 #253 CLOSED** (PR #799): `rigor:disable` class capture + Psych severity booleans; 19/19 `=`; 0 FP; →#801–#803. [note](notes/20261121-issue-253-suppression-psych-booleans.md)
@@ -79,9 +80,9 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + stack.yml; ADR-0045 x86_64 rungs; Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
 - **2026-11-20 #724 CLOSED** (PR #739): pool-audit flags `use` alias/glob of pool builders in `fn main` (#676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
 - **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch String carriers (`decimal-int-string`/`non-empty-string`); drift 47→46, 0 FP. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
-- **2026-11-20 #427 CLOSED** (PR #726): uid-scoped interner env memo; `.map` repro doubled per link → never finishes; check 68 s; 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
+- **2026-11-20 #427 CLOSED** (PR #726): uid-scoped interner env memo; `.map` repro doubled per link → never finishes; 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
 - **2026-11-20 #643 CLOSED** (PR #725): named Finding struct + conformance start_offset; refactor, 0 FP / 437 gaps = master; →#727/#728. [note](notes/20261120-issue-643-findings-tuple.md)
-- **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — planted inversion: threads test passes, audit fails at the line; →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
+- **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — planted inversion: threads test passes, audit fails at line; →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
 - **2026-11-20 #345 CLOSED** (PR #720): pre_eval glob→dir earns not-found row; `.uniq`/order ported; 0 FP; →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
 - **2026-11-20 #652 CLOSED** (PR #719): brace globs `::{*}`/`::{a,*}` flag like `::*`; child globs leaf-silent; test-only, 0 FP. →#654. [note](notes/20261120-issue-652-brace-glob-audit.md)
 - **2026-11-20 #714 CLOSED** (PR #716): rooted bundled-class guard: RBS mint outranks the census; dependabot 215→212, 0 FP. →#709/#717/#718. [note](notes/20261120-issue-714-rooted-bundled-guard.md)
@@ -106,17 +107,17 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-19 #657 CLOSED** (PR #660): ConstName prefix-share + bounded `knows_*`; 20k 0.74s/749MB→0.26s/44MB; 0 FP. [note](notes/20261119-issue-657-const-read-name-storage.md)
 - **2026-11-19 #658 CLOSED** (PR #659): PathMarks + CoreData + env-fp type_of; 2.5k push 49.5s→1.7s; 0 FP. [note](notes/20261119-issue-658-mutator-chains.md)
 - **2026-11-19 #429 CLOSED** (PR #601): `analysis_stack_audit` — unbounded parses + unsized threads. →#652–#654. [note](notes/20261118-issue-429-analysis-stack-audit.md)
-- **2026-11-19 #424 const** (PR #651): `lower_constant_path`; 20k→0.72s; 0 FP. → #655–#658. [note](notes/20261119-issue-424-const-path.md)
+- **2026-11-19 #424 const** (PR #651): `lower_constant_path`; 20k→0.72s; 0 FP. →#655–#658. [note](notes/20261119-issue-424-const-path.md)
 - **2026-11-19 #427 display stack** (PR #648): `render_postorder`; wrap90 SIGABRT→exit 1; 0 FP. [note](notes/20261119-issue-427-iterative-type-display.md)
 - **2026-11-19 #424 `**` row** (PR #649): env-free call memos — 800 `**` 38s→0.5s; 20k under bar; 0 FP. [note](notes/20261119-issue-424-pow-chain.md)
-- **2026-11-19 #642 CLOSED** (PR #644): shared `LineIndex` on `LoweredAst`; LSP 2.89s→0.36s, MCP 4.26s→0.54s; 0 FP. [note](notes/20261119-issue-642-shared-line-index.md)
-- **2026-11-19 #435 CLOSED** (PR #634): loop-cap widen (ADR-56 slice B); m1/m2/o8 match; 0 FP. → #638–#640. [note](notes/20261119-issue-435-loop-cap-widen.md)
-- **2026-11-19 #453 CLOSED** (PR #645): one-pass Logical `subject_edges` — 34 terms 14s→0.10s; 0 FP. → #646/#647. [note](notes/20261119-issue-453-logical-one-pass.md)
-- **2026-11-19 #636 CLOSED** (PR #641): findings `(line, column)` at production; 60k-diag 169s/49GB → 1.8s/141MB; 0 FP. → #642/#643. [note](notes/20261119-issue-636-findings-line-index.md)
-- **2026-11-19 #464 CLOSED** (PR #635): `object_mixin_may_define` collects the mixin closure once — 4.7s → 0.66s; 0 FP. [note](notes/20261119-issue-464-object-mixin-memo.md)
-- **2026-11-19 #346 CLOSED** (PR #630): config `~` via `Dir.home` NSS; `~name` literal. → #631–#633. [note](notes/20261119-issue-346-tilde-dir-home.md)
+- **2026-11-19 #642 CLOSED** (PR #644): shared `LineIndex` on `LoweredAst`; LSP 2.89s→0.36s; 0 FP. [note](notes/20261119-issue-642-shared-line-index.md)
+- **2026-11-19 #435 CLOSED** (PR #634): loop-cap widen (ADR-56 slice B); m1/m2/o8 match; 0 FP. →#638–#640. [note](notes/20261119-issue-435-loop-cap-widen.md)
+- **2026-11-19 #453 CLOSED** (PR #645): one-pass Logical `subject_edges` — 34 terms 14s→0.10s; 0 FP. →#646/#647. [note](notes/20261119-issue-453-logical-one-pass.md)
+- **2026-11-19 #636 CLOSED** (PR #641): findings `(line, column)` at production; 60k-diag 169s/49GB→1.8s/141MB; 0 FP. →#642/#643. [note](notes/20261119-issue-636-findings-line-index.md)
+- **2026-11-19 #464 CLOSED** (PR #635): `object_mixin_may_define` collects the mixin closure once — 4.7s→0.66s; 0 FP. [note](notes/20261119-issue-464-object-mixin-memo.md)
+- **2026-11-19 #346 CLOSED** (PR #630): config `~` via `Dir.home` NSS; `~name` literal. →#631–#633. [note](notes/20261119-issue-346-tilde-dir-home.md)
 - **2026-11-19 #614 CLOSED** (PR #624): `LocalOwnership` ports `constructor?`/`class_call?`/`singleton`. →#629. [note](notes/20261119-issue-614-local-ownership-allocation.md)
-- **2026-11-19 #603 CLOSED** (PR #623): alias floor `selection_branches` + `ReceiverAlias.candidates` + carrier marks; 4 FP. → #625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
+- **2026-11-19 #603 CLOSED** (PR #623): alias floor `selection_branches` + `ReceiverAlias.candidates` + carrier marks; 4 FP. →#625–#628. [note](notes/20261119-issue-603-alias-floor-links.md)
 - **2026-11-19 #615 CLOSED** (PR #620): `walk_namespace` ports `declaration_prefix`/`rooted?`; 0 OVER. →#621/#622. [note](notes/20261119-issue-615-rooted-class-header.md)
 - **2026-11-18 #604 UNNAMED mixin marker** (PR #612): `"?"` rides `"*"`; computed `include`/`send` opens the class. 0 OVER. →#617/#619. [note](notes/20261118-issue-604-unnamed-mixin-marker.md)
 - **2026-11-18 #448 frame-local specials + DefinitionContext** (PR #613): `UNCOLOURED_READS`; `{$~,$_}` on `!shared_slot`; `BodyCtx`←`definition_context.rb`; 0 OVER; →#614/#616. [note](notes/20261118-issue-448-frame-local-specials.md)
@@ -124,10 +125,10 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-18 #490 singleton-slot writers + severity key naming** (PR #602): `class <<`/eval-block + composition contexts; `psych_key_to_s`←`ToRuby#deserialize`. →#606–#608. [note](notes/20261118-issue-490-singleton-slot-writers.md)
 - **2026-11-18 re-pin `v0.4.7 → v0.4.8`** (PR #599, human-merged) — mixin-call recording + #2677 alias-floor copy-link; 13 rows closed; **0 FP; 959/1063**; →#600/#603–#605. [note](notes/20261115-repin-v048.md)
 - **2026-11-12 #405 class-guard record drop** (PR #591): class guards drop rooted `h[k]` records. 18 FP closed, 0 FP/658; →#595/#596. [note](notes/20261112-issue-405-class-guard-records.md)
-- **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` record `$~` + `$N`. 0 FP/658; → #597/#598. [note](notes/20261112-issue-449-match-globals.md)
+- **2026-11-12 #449 match-global early-exit guard** (PR #589): `=~`/`!~` record `$~` + `$N`. 0 FP/658; →#597/#598. [note](notes/20261112-issue-449-match-globals.md)
 - **2026-11-12 #438 `class_ivar_scope` memo key** (PR #588): reads in one class body share the `IvarScope`; ~pre-#432 RSS; byte-identical. [note](notes/20261112-issue-438-ivar-scope-memo.md)
 - **2026-11-12 #393 retry-edge indexed narrowings** (PR #590): retry-rebound/mutated locals drop rooted h[k] records; ~22 FP closed, 0 FP/658; →#592/#593. [note](notes/20261112-issue-393-retry-index-drop.md)
-- **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver + nil bit; 0 FP/658; → #584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
+- **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver + nil bit; 0 FP/658; →#584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
 - **2026-11-12 #398 Kernel termination** (PR #575): dead code via `kernel_call_terminates`, not block-timing veto; 13+3 FP closed, 0 FP/658; →#581–#583. [note](notes/20261112-issue-398-kernel-termination.md)
 - **2026-11-12 #349 Psych YAML errors** (PR #576): libyaml marks render Psych positions/details; BOM parity. 0 FP; →#579/#580. [note](notes/20261112-issue-349-yaml-fidelity.md)
 - **2026-11-12 #384 ATM describe labels** (PR #573): union/optional/alias members flatten before `union_describe`; `Other` strips root `::`. 12 rows `=`, 0 FP; →#577/#578. [note](notes/20261112-issue-384-render-other-drift.md)
@@ -137,7 +138,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-05 re-pin walk → `v0.4.7` DONE** (#445…#481): 0 FP / 623 gaps; last tag callee floor, `core_root:`, CLI. [notes](notes/20261105-repin-v047.md)
 - **2026-10-30 #436 CLOSED** (PR #440): reaching-write fan-out cap 256 → `UNKNOWN`; lexer-F0/F1 1,600 s → 0.2 s. 0 FP; →#441–#443. [note](notes/20261030-fanout-cap-436.md)
 - **2026-10-30 #422 CLOSED** (stack #434, PRs #432/#433): `ReachIndex` hoist + exact `local_reach` memo; slow files <7 s. 0 FP/9,435; →#435–#439. [note](notes/20261030-reach-memo-422.md)
-- **2026-10-28 #412 CLOSED** (PR #426): 256 MiB stacks + a 25,000-edge nesting bound. 0 FP; → #427–#431. [ADR-0045](adr/0045-stack-totality.md)
+- **2026-10-28 #412 CLOSED** (PR #426): 256 MiB stacks + a 25,000-edge nesting bound. 0 FP; →#427–#431. [ADR-0045](adr/0045-stack-totality.md)
 - **2026-10-27 splits** #204/#234/#258/#260/#279/#416/#418/#420: infer lib 14,084→144, rules 4,497→95; ast 3,756→80; source_index 4,650→668; lower_node→5. [note](notes/20261027-lower-node-family-split.md)
 - **2026-10-08/14 dead-position + reach arc, folded** (#362–#404): dead.rs exclusion, reach leaks, arg-class gate, blocked/discarded. 0 FP. [dead](notes/20261008-i368-dead-positions.md)/[leaks](notes/20261014-i386-dead-position-leaks.md)
 - **2026-09-30/10-01 CLI + config parity, folded** (#155–#360, PRs #335–#375): Psych config, OptionParser; →#345–#349/#376. [config](notes/20260930-issue-158-config.md)/[optparse](notes/20260930-issue-155-optparse.md)
