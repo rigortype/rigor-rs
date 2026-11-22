@@ -8240,8 +8240,8 @@ fn resolve_namespace0(
     let mut segs = body.split("::");
     let head = segs.next()?;
     let tail: Vec<&str> = segs.collect();
-    // `resolve_head_namespace` — the `aliased_name?` half is folded into the
-    // `known`/`aliases` checks (`known_type_names` carries alias new names).
+    // `resolve_head_namespace` — `has_type_name?` via `known` (real decls
+    // only; alias names are NOT in it) `||` `aliased_name?` via `aliases`.
     let mut ns: String = if absolute {
         if known.contains(head) || aliases.contains_key(head) {
             head.to_string()
