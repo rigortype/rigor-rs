@@ -101,5 +101,5 @@ controls).
   empties, in `while`/`until`/`return unless`/`and`/chain shapes (the
   `NilQ` fix covers if/ternary/unless only). Port FPs, base-identical.
 
-Design companion: Fable 5.2 + Grok 4.6 quota-blocked → pi `devin/swe-2`
-substitute (advisory; recorded per `docs/agents/review.md`).
+Design companion unavailable — Fable 5.2, Grok 4.6 and pi `devin/swe-2`
+all quota-blocked at review time; recorded per `docs/agents/review.md`.
