@@ -53,11 +53,12 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 
 ## Ledger (newest first; one line per arc/slice)
 
-- **2026-11-22 #825 CLOSED** (PR #832): severity `row_override` ported — qualified/`plugin.<id>` arms + `FAMILY_FALLBACK_EXEMPT`; run-level plugin rows stamped. 0 FP; →#833–#835. [note](notes/20261122-issue-825-severity-row-override.md)
-- **2026-11-22 #830 CLOSED** (PR #831): collect.rs scanner.rb cites resynced (:43→:50, :48→:55, :283→:343); doc-only. [note](notes/20261122-issue-830-collect-cite-drift.md)
+- **2026-11-22 #769 CLOSED** (PR #836): fold `pow(exp,mod)` chunk powmod, BigInt `**` small results, `**`/`pow` × Float; `Float#pow` no-fold. 0 FP; →#837. [note](notes/20261122-issue-769-fold-pow-variants.md)
+- **2026-11-22 #825 CLOSED** (PR #832): severity `row_override` ported (+`FAMILY_FALLBACK_EXEMPT`). 0 FP; →#833–#835. [note](notes/20261122-issue-825-severity-row-override.md)
+- **2026-11-22 #830 CLOSED** (PR #831): collect.rs scanner.rb cites resynced; doc-only. [note](notes/20261122-issue-830-collect-cite-drift.md)
 - **2026-11-22 #805 CLOSED** (PR #828): stale `scanner.rb` cite `:201`→`:274`; doc-only. →#830. [note](notes/20261122-issue-805-stale-cite.md)
-- **2026-11-22 #766 CLOSED** (PR #823): FoldOutcome mints → `numeric_blow_up_class` + `fold_result_gate`; `(-4) ** -6803` Rational gain; 0 FP; →#826/#827. [note](notes/20261122-issue-766-fold-blowup-consolidation.md)
-- **2026-11-22 #818 CLOSED** (PR #824): severity PROFILES resynced 28→37 rows verbatim; explain drift guard. 0 FP; →#825. [note](notes/20261122-issue-818-severity-profiles.md)
+- **2026-11-22 #766 CLOSED** (PR #823): FoldOutcome mints → `numeric_blow_up_class` + `fold_result_gate`; `(-4) ** -6803` Rational; 0 FP; →#826/#827. [note](notes/20261122-issue-766-fold-blowup-consolidation.md)
+- **2026-11-22 #818 CLOSED** (PR #824): severity PROFILES resynced 28→37 rows; explain drift guard. 0 FP; →#825. [note](notes/20261122-issue-818-severity-profiles.md)
 - **2026-11-22 #710 case-guard half CLOSED** (PR #819): threaded `when`/`in` falsey edge; `in` arms modelled; brief FP rows `=`; 0 FP. →#820–#822. [note](notes/20261122-issue-710-case-falsey-edge.md)
 - **2026-11-22 #694 CLOSED** (PR #763): WidenedResult nominals — oversized `**`/`<<` folds, op-write binds, literal-union collapse; ~30 rows `=`; →#765–#771/#773–#775. [note](notes/20261121-issue-694-widened-result.md)
 - **2026-11-22 #255 CLOSED** (PR #816): explain + sig.skipped catalogues synced to shared rule tables; all probes `=`; →#818. [note](notes/20261122-issue-255-explain-catalogue.md)
@@ -133,7 +134,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-12 #450 project-sig singleton returns** (PR #574): buildable sig beats body fold; lexical receiver + nil bit; 0 FP/658; →#584–#587. [note](notes/20261112-issue-450-sig-singleton-return.md)
 - **2026-11-12 #398 Kernel termination** (PR #575): dead code via `kernel_call_terminates`, not block-timing veto; 13+3 FP closed, 0 FP/658; →#581–#583. [note](notes/20261112-issue-398-kernel-termination.md)
 - **2026-11-12 #349 Psych YAML errors** (PR #576): libyaml marks render Psych positions/details; BOM parity. 0 FP; →#579/#580. [note](notes/20261112-issue-349-yaml-fidelity.md)
-- **2026-11-12 #384 ATM describe labels** (PR #573): union/optional/alias members flatten before `union_describe`; `Other` strips root `::`. 12 rows `=`, 0 FP; →#577/#578. [note](notes/20261112-issue-384-render-other-drift.md)
+- **2026-11-12 #384 ATM describe labels** (PR #573): members flatten before `union_describe`; `Other` strips root `::`. 12 rows `=`, 0 FP; →#577/#578. [note](notes/20261112-issue-384-render-other-drift.md)
 - **2026-08-10 `if`-edge joins** (#451/#443, PRs #571/#572): per-edge narrowing (`Empty` join, live-arm cut, `&.`); post-`if` writes join `entry ∪ arm-write`. [edge](notes/20260810-if-edge-narrowing.md)/[join](notes/20260810-if-write-join.md)
 - **2026-11-06 `run_corpus.rb` REMOVED** (PR #495): first-80-files `--sweep` sample; its unique input measures identically. [CORPUS.md](../harness/CORPUS.md)
 - **2026-11-05 walk follow-ups** (#483–#488): port-only rows fixed, `pre_eval:` declines; 0 FP / 623. [note](notes/20261105-walk-followups.md)
@@ -161,7 +162,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-08-26/28 effects GATE lying ×3** (PRs #112/#115/#117) — deleted-arm, `methods:{}`, `omit?`. [s112](notes/20260826-s112-effects-instrument.md)/[s116](notes/20260826-s116-snapshot-gate.md).
 - **2026-08-26 LSP honours `rootUri`/`workspaceFolders`** (PR #110) — enters the client's root. [note](notes/20260826-s111-lsp-rooturi.md).
 - **2026-08-25/26 effects 0–3 + frozen-index folded** — 35 MATCH/11 UNDER/0 OVER ([s3](notes/20260826-effects-s3-impl.md)); file order NORMATIVE, harvest NO-GO ([s113](notes/20260826-s113-fold-capture-impl.md)).
-- **2026-08-23/25 re-pin `v0.3.2→v0.3.4` + survey (HOLD)** — 0 FP / 9204, gaps 841→820; 50 raw FPs + retractions [note](notes/20260823-repin-v034.md); plugin drift/404s [survey](notes/20260825-upstream-survey-v034-master.md).
+- **2026-08-23/25 re-pin `v0.3.2→v0.3.4` + survey (HOLD)** — 0 FP / 9204, gaps 841→820; 50 raw FPs + retractions. [note](notes/20260823-repin-v034.md)
 - **2026-08-09 unresolved-const-receiver carrier REJECTED at 0 rows** (PR #89, closed). [note](notes/20260809-unresolved-const-receiver-carrier.md)
 - **2026-08-09 re-pin `v0.3.1→v0.3.2` (+rbs 4.1.1), folded** — 0 FP/9204, gaps 1125→841; shims→overlay; join-wipe; chain-guard meet. [repin](notes/20260809-repin-v032.md)/[meet](notes/20260809-chain-guard-meet.md)
 - **2026-08-08 era, folded (0 FP / 9204)** — narrowing/shape trio #70–#82; `Object` bucket #85; harvest #83/#84.
