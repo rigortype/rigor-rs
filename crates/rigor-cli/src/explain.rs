@@ -1468,7 +1468,7 @@ mod tests {
             for (profile, expected) in e.severity_by_profile {
                 let p = crate::severity::Profile::from_str(profile).unwrap();
                 assert_eq!(
-                    crate::severity::resolve(e.id, authored, p, &[], &[]).as_str(),
+                    crate::severity::resolve(e.id, authored, p, &[], &[], e.id, None).as_str(),
                     expected,
                     "{} under {profile}",
                     e.id

@@ -1775,6 +1775,8 @@ fn pre_eval_not_found_rows(
         profile,
         user_overrides,
         bleeding_overrides,
+        "pre-eval.file-not-found",
+        None,
     ) {
         severity::ResolvedSeverity::Off => return Vec::new(),
         severity::ResolvedSeverity::Error => Severity::Error,
@@ -1860,6 +1862,8 @@ fn analyze_files(
         profile,
         &user_overrides,
         &bleeding_overrides,
+        rigor_rules::STATIC_VALUE_USE_VOID,
+        None,
     ) != severity::ResolvedSeverity::Off;
     // ADR-25 — config-gated plugins. With no `plugins:` in `.rigor.yml` this is
     // byte-identical to `CoreIndex::new()` (empty list ⇒ default no-config path),
@@ -2451,6 +2455,8 @@ fn analyze_files(
                                 profile,
                                 &user_overrides,
                                 &bleeding_overrides,
+                                diag.rule_id,
+                                None,
                             ) {
                                 severity::ResolvedSeverity::Off => continue,
                                 severity::ResolvedSeverity::Error => {
@@ -2505,15 +2511,20 @@ fn analyze_files(
     // `plugin_loader.load-error` rows FIRST, then the `pre-eval.*` stream
     // (`pre_eval_not_found_rows`), then (streams the port does not carry)
     // and finally `expansion.errors` — which `prepend_path_errors` splices
-    // in after the leading run-level rows. Load-error rows bypass `disable:`,
-    // `severity_profile:` and `severity_overrides:` entirely upstream
-    // (SeverityStamp is not applied to them — oracle: `plugin_loader: "off"`
-    // leaves the row at error), so they carry their authored severity.
+    // in after the leading run-level rows. `SeverityStamp` DOES cover
+    // load-error rows upstream — a `severity_overrides:` key resolves them by
+    // qualified id (`plugin_loader.load-error`), bare rule (`load-error`) or
+    // family — while `disable:` never reaches them (the `plugin_loader`
+    // family fails `plugin_row_disabled?`'s `plugin.` prefix test). What the
+    // earlier oracle probe actually showed — `plugin_loader: "off"` leaves
+    // the row at :error — is a MISS under those keys, not an exemption
+    // (`plugin_loader` is a source family, not a key the row answers to).
     let mut run_rows: Findings = plugin_resolution
         .load_errors
         .iter()
-        .map(|row| {
-            Finding::run_level(
+        .filter_map(|row| {
+            let stamped = stamp_plugin_row(row, profile, &user_overrides, &bleeding_overrides)?;
+            Some(Finding::run_level(
                 0,
                 ".rigor.yml".to_string(),
                 Diagnostic {
@@ -2521,14 +2532,14 @@ fn analyze_files(
                     start_offset: 0,
                     end_offset: 0,
                     message: row.message.clone(),
-                    severity: row.severity,
+                    severity: stamped,
                     source_family: row.source_family,
                     receiver_type: None,
                     receiver_classes: None,
 
                     method_name: None,
                 },
-            )
+            ))
         })
         .collect();
 
@@ -2546,10 +2557,17 @@ fn analyze_files(
     // `conforms-to` rows): `plugin.<id>.load-error` file-probe disclosures.
     // v0.4.4 (#1953): `SeverityStamp` drops a plugin row whose qualified id
     // or `plugin.<id>` family is in `disable:` — never a bare id or `all`
-    // (`rigor_rules::config_disables_plugin_row`).
+    // (`rigor_rules::config_disables_plugin_row`). The stamp itself reaches
+    // them too (#1985): a `severity_overrides:` key resolves by the qualified
+    // id (`plugin.<id>.<rule>`), then the `plugin.<id>` family — never the
+    // bare rule or a family wildcard (`stamp_plugin_row`).
     for row in plugin_resolution.emitted.iter().filter(|row| {
         !rigor_rules::config_disables_plugin_row(&cfg.disable, row.source_family, row.rule_id)
     }) {
+        let Some(stamped) = stamp_plugin_row(row, profile, &user_overrides, &bleeding_overrides)
+        else {
+            continue;
+        };
         findings.push(Finding::run_level(
             0,
             ".rigor.yml".to_string(),
@@ -2558,7 +2576,7 @@ fn analyze_files(
                 start_offset: 0,
                 end_offset: 0,
                 message: row.message.clone(),
-                severity: row.severity,
+                severity: stamped,
                 source_family: row.source_family,
                 receiver_type: None,
                 receiver_classes: None,
@@ -2702,6 +2720,8 @@ fn conformance_rows(
             profile,
             user_overrides,
             bleeding_overrides,
+            f.rule_id(),
+            None,
         );
         let severity = match resolved {
             severity::ResolvedSeverity::Off => continue,
@@ -3786,6 +3806,53 @@ fn json_document(findings: &[Finding]) -> String {
     }
     buf.push(']');
     buf
+}
+
+/// `SeverityStamp.stamp` for a `plugin_loader.*` / `plugin.<id>.*` run-level
+/// row (rigor-rs#825): resolves the row's severity under the profile +
+/// overrides, `None` when the resolution is `:off` and the row drops out of
+/// the stream. The port's `rule_id` is the QUALIFIED id, so `rule` is the
+/// short id minus the `<source_family>.` prefix (`plugin_loader.load-error`
+/// → `load-error`), `qualified_rule` is `rule_id` itself, and
+/// `plugin_family` is the `plugin.<id>` family — `None` for `plugin_loader`
+/// (a source family, not a `plugin.` one; `SeverityStamp.plugin_family`'s
+/// prefix test). A `plugin.<id>` row then answers only to its qualified id
+/// or `plugin.<id>` — never its bare `load-error` or a family wildcard —
+/// while a `plugin_loader` row answers qualified → bare → family.
+fn stamp_plugin_row(
+    row: &config::PluginLoadRow,
+    profile: severity::Profile,
+    user_overrides: &[(String, severity::ResolvedSeverity)],
+    bleeding_overrides: &[(&str, severity::ResolvedSeverity)],
+) -> Option<rigor_rules::Severity> {
+    let bare = row
+        .rule_id
+        .strip_prefix(row.source_family)
+        .and_then(|rest| rest.strip_prefix('.'))
+        .unwrap_or(row.rule_id);
+    let plugin_family = row
+        .source_family
+        .starts_with("plugin.")
+        .then_some(row.source_family);
+    let authored = match row.severity {
+        rigor_rules::Severity::Error => severity::ResolvedSeverity::Error,
+        rigor_rules::Severity::Warning => severity::ResolvedSeverity::Warning,
+        rigor_rules::Severity::Info => severity::ResolvedSeverity::Info,
+    };
+    match severity::resolve(
+        bare,
+        authored,
+        profile,
+        user_overrides,
+        bleeding_overrides,
+        row.rule_id,
+        plugin_family,
+    ) {
+        severity::ResolvedSeverity::Off => None,
+        severity::ResolvedSeverity::Error => Some(rigor_rules::Severity::Error),
+        severity::ResolvedSeverity::Warning => Some(rigor_rules::Severity::Warning),
+        severity::ResolvedSeverity::Info => Some(rigor_rules::Severity::Info),
+    }
 }
 
 /// The reference's `Diagnostic#rule` is the SHORT rule id — for a

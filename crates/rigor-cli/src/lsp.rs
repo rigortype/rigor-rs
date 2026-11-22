@@ -621,6 +621,8 @@ impl SeverityStamp {
             profile,
             &user_overrides,
             &bleeding_overrides,
+            rigor_rules::STATIC_VALUE_USE_VOID,
+            None,
         ) != severity::ResolvedSeverity::Off;
         Self { profile, user_overrides, bleeding_overrides, void_rule_active }
     }
@@ -648,6 +650,8 @@ impl SeverityStamp {
             self.profile,
             &self.user_overrides,
             &self.bleeding_overrides,
+            diag.rule_id,
+            None,
         ) {
             severity::ResolvedSeverity::Off => return false,
             severity::ResolvedSeverity::Error => diag.severity = Severity::Error,
