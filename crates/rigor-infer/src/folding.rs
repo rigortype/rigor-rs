@@ -654,6 +654,27 @@ enum PowExp {
 /// little-endian base-1e9 chunks with [`decimal_shr_chunks`].
 struct ExpBits(PowExp);
 
+/// `(exp_bits, shift_words)` — the estimated bit count a square-and-multiply
+/// iterates and the per-bit [`decimal_shr_chunks`] pass width a `PowExp`
+/// pays. `Small` reads its bits straight out of the `u64` (shift width 0);
+/// `Big` halves the whole chunk vector per bit — `exp_bits * shift_words`
+/// word-ops the modmul estimate used to leave uncounted (rigor-rs#850).
+fn pow_exp_cost(exp: &PowExp) -> (usize, usize) {
+    match exp {
+        PowExp::Small(e) => (64 - e.leading_zeros() as usize, 0),
+        PowExp::Big(chunks) => (chunks.len() * 30, chunks.len()),
+    }
+}
+
+/// One fold's estimated word-ops: `exp_bits` square-and-multiply steps at
+/// `modmul_words` word-ops each, plus `shift_words` per iterated bit for the
+/// `ExpBits` chunk-halving a `PowExp::Big` exponent pays (rigor-rs#850).
+fn powmod_work(exp: &PowExp, modmul_words: usize) -> u128 {
+    let (exp_bits, shift_words) = pow_exp_cost(exp);
+    (exp_bits as u128)
+        .saturating_mul((modmul_words as u128).saturating_add(shift_words as u128))
+}
+
 impl Iterator for ExpBits {
     type Item = bool;
 
@@ -701,9 +722,29 @@ fn int_pow_mod_result(base: IntReceiver<'_>, e: &Scalar, m: &Scalar) -> FoldOutc
     }
 }
 
+/// The chunk path's budget of [`powmod_work`] units — a `chunks_modmul`
+/// word-op costs ~17ns in release (the per-digit `chunks_mul_small` alloc,
+/// `chunks_cmp` and fixup), so `1 << 24` bounds a fold at ~0.3s and still
+/// passes an RSA-2048 shape (~2k exp bits * ~69² words ≈ 9.9M work). `1 << 28`
+/// once let a single fold run ~4.5s (rigor-rs#837).
+const POWMOD_WORK_LIMIT: u128 = 1 << 24;
+
+/// The u128 path's budget: its modmul is a handful of `u128` ops (~8
+/// word-equivalents) and its `ExpBits` shift word-op is a cheap
+/// `decimal_shr_chunks` pass (~0.3ns — a 360k-digit exponent ran ~48G
+/// word-ops ≈ 13s ungated, rigor-rs#850). `1 << 30` bounds a fold at ~0.3s
+/// and still passes a ~53k-digit exponent.
+const POWMOD_U128_WORK_LIMIT: u128 = 1 << 30;
+
 /// `a.pow(e, m)` with an `i64` modulus — the whole computation stays under
 /// `u128` (`|m| <= 2**63`, so a product of residues is under `2**126`).
 fn int_pow_mod_u128(base: IntReceiver<'_>, exp: PowExp, m: i64) -> FoldOutcome {
+    // The estimate's only large term is the `ExpBits` shift — a `PowExp::Big`
+    // exponent costs `exp_bits * exp_chunks` word-ops before any modmul. A
+    // `Small` exponent iterates at most 64 O(1) bits, so it never gates.
+    if powmod_work(&exp, 8) > POWMOD_U128_WORK_LIMIT {
+        return FoldOutcome::Declined;
+    }
     let mm = (m as i128).unsigned_abs();
     let mut cur = match base {
         IntReceiver::Int(a) => i128::from(a).rem_euclid(mm as i128) as u128,
@@ -744,23 +785,18 @@ fn decimal_mod_u128(d: &str, m: u128) -> u128 {
 /// `a.pow(e, m)` with a `BigInt` modulus — chunk modular exponentiation. The
 /// result is bounded by |m| and exits through [`big_scalar`]'s
 /// [`INTEGER_FOLD_BIT_LIMIT`] gate like every spelled integer result
-/// (rigor-rs#769). The work estimate (`exp_bits * m_words²`) is bounded — a
-/// pathological modulus past it declines, the zero-FP-safe side.
+/// (rigor-rs#769). The [`powmod_work`] estimate is bounded — a pathological
+/// exponent or modulus past it declines, the zero-FP-safe side.
 fn int_pow_mod_chunks(base: IntReceiver<'_>, exp: PowExp, d: &str) -> FoldOutcome {
-    // ~`log2(exp) * m_words` modmul word-ops — decline a computation the
+    // `exp_bits * (m_words² + shift_words)` — decline a computation the
     // reference's native bignum does invisibly but this port cannot afford.
-    // The estimate omits `chunks_mod`'s constant factor (per-digit
-    // `chunks_mul_small` alloc + `chunks_cmp` + fixup): measured, one work
-    // unit costs ~17ns in release, so `1 << 28` let a single fold run ~4.5s
-    // (rigor-rs#837). `1 << 24` bounds a fold at ~0.3s and still passes an
-    // RSA-2048 shape (~2k exp bits * ~69² words ≈ 9.9M work).
-    const WORK_LIMIT: u128 = 1 << 24;
-    let exp_bits = match &exp {
-        PowExp::Small(e) => 64 - e.leading_zeros() as usize,
-        PowExp::Big(chunks) => chunks.len() * 30,
-    };
+    // The `m_words²` term is the `chunks_modmul` estimate; `shift_words` is
+    // the `ExpBits` chunk-halving a `PowExp::Big` exponent pays per iterated
+    // bit, which the estimate once omitted — its worst case under the modmul
+    // term alone (exp_bits = C·30, m_words = 3) was a ~32s fold
+    // (rigor-rs#850).
     let m_mag = decimal_chunks(d.trim_start_matches('-'));
-    if (exp_bits as u128).saturating_mul((m_mag.len() as u128).pow(2)) > WORK_LIMIT {
+    if powmod_work(&exp, m_mag.len().pow(2)) > POWMOD_WORK_LIMIT {
         return FoldOutcome::Declined;
     }
     let cur = match base {
@@ -2366,8 +2402,8 @@ mod tests {
         );
     }
 
-    /// rigor-rs#837 — the chunk-powmod work estimate (`exp_bits * m_words²`)
-    /// is bounded at `1 << 24` (~0.3s/fold measured); an estimate past it
+    /// rigor-rs#837 — the chunk-powmod [`powmod_work`] estimate is bounded
+    /// at [`POWMOD_WORK_LIMIT`] (~0.3s/fold measured); an estimate past it
     /// declines before iterating, so these rows answer instantly.
     #[test]
     fn pow_mod_declines_past_work_limit() {
@@ -2387,6 +2423,32 @@ mod tests {
         let rsa_exp = big(&"9".repeat(617));
         let rsa_mod = big(&format!("9{}7", "9".repeat(616)));
         assert!(fold(&i(2), "pow", &[rsa_exp, rsa_mod]).is_some());
+    }
+
+    /// rigor-rs#850 — the estimate now charges the `ExpBits` chunk-shift pass
+    /// (`exp_bits * shift_words`), and the u128 path gates a `PowExp::Big`
+    /// exponent at [`POWMOD_U128_WORK_LIMIT`]: both ran uncounted before.
+    #[test]
+    fn pow_mod_gates_exp_shift_work() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        // u128 path: a 60k-digit exponent (~6.7k chunks ≈ 1.34G est word-ops)
+        // declines where it once ran ~2s; a 6k-digit one (~13.5M) folds in ms.
+        assert_eq!(fold(&i(2), "pow", &[big(&"9".repeat(60_000)), i(97)]), None);
+        assert!(fold(&i(2), "pow", &[big(&"9".repeat(6_000)), i(97)]).is_some());
+        // Chunk path, a 3-word modulus: the modmul term (~30*2000*9 = 540k)
+        // passed the estimate alone, but the shift term (~30*2000*2000 =
+        // 120M) pushes an 18k-digit exponent past the limit.
+        let narrow_mod = big("9999999999999999999");
+        assert_eq!(
+            fold(&i(2), "pow", &[big(&"9".repeat(18_000)), narrow_mod.clone()]),
+            None
+        );
+        // Control: same modulus, a 1.8k-digit exponent still folds
+        // (~30*200*(9+200) ≈ 1.25M work).
+        assert!(
+            fold(&i(2), "pow", &[big(&"9".repeat(1_800)), narrow_mod]).is_some()
+        );
     }
 
     #[test]
