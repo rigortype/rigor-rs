@@ -1,5 +1,5 @@
 {
-  "fixture": "harness/corpus/177_root_only_param_labels.rb",
+  "fixture": "harness/corpus/178_root_only_param_labels.rb",
   "diagnostics": [
     {
       "rule": "call.argument-type-mismatch",
