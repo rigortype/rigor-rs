@@ -8107,7 +8107,7 @@ fn resolve_lexical_type_name(
     let known = &b.known_type_names;
     let aliases = &b.class_alias_targets;
     let body = written.strip_prefix("::").unwrap_or(written);
-    match body.split_once("::") {
+    match body.rsplit_once("::") {
         None => {
             // `resolve_type_name`: innermost scope outward, then root.
             if !written.starts_with("::") {
