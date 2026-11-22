@@ -305,6 +305,7 @@ impl<'i> Typer<'i> {
                 block_params,
                 explicit_arg_list,
                 safe_nav,
+                args_plain_positional,
                 ..
             } => {
                 let (
@@ -316,6 +317,7 @@ impl<'i> Typer<'i> {
                     block_params,
                     explicit_arg_list,
                     safe_nav,
+                    args_plain_positional,
                 ) = (
                     *r,
                     method.clone(),
@@ -325,6 +327,7 @@ impl<'i> Typer<'i> {
                     block_params.clone(),
                     *explicit_arg_list,
                     *safe_nav,
+                    *args_plain_positional,
                 );
                 if !block_body.is_empty() {
                     // Issue #479: `"a".concat("b") { }` — the reference's
@@ -367,7 +370,15 @@ impl<'i> Typer<'i> {
                     )
                 } else {
                     let args = args.clone();
-                    self.type_call(ast, r, &method, &args, env, interner)
+                    self.type_call(
+                        ast,
+                        r,
+                        &method,
+                        &args,
+                        args_plain_positional,
+                        env,
+                        interner,
+                    )
                 }
             }
             // An IMPLICIT-SELF call (`p x`, `format(...)`, …) never reaches
@@ -607,7 +618,7 @@ impl<'i> Typer<'i> {
                 // `Integer | nil` and stays silent downstream. `||=` keeps the
                 // write-value read (#178): `narrow_truthy` is sound on it.
                 let current = if matches!(compound, Compound::And) {
-                    self.type_call(ast, r, &read_name, &[], env, interner)
+                    self.type_call(ast, r, &read_name, &[], true, env, interner)
                 } else {
                     self.type_call_for_write_value(ast, r, &read_name, &[], env, interner)
                 };

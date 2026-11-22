@@ -24,16 +24,29 @@ impl<'i> Typer<'i> {
     ///
     // TODO(spec): tier-2 shape dispatch, tier-4 in-source bodies, argument
     // contracts, the Ruby sidecar for non-Rust-foldable calls (ADR-0008/0023).
+    // too_many_arguments: the call context (receiver, args and their
+    // plain-positional flag, env, interner) is one logical bundle.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn type_call(
         &self,
         ast: &LoweredAst,
         receiver: NodeId,
         method: &str,
         args: &[NodeId],
+        args_plain_positional: bool,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
-        let ty = self.type_call_declines(ast, receiver, method, args, env, interner, true);
+        let ty = self.type_call_declines(
+            ast,
+            receiver,
+            method,
+            args,
+            args_plain_positional,
+            env,
+            interner,
+            true,
+        );
         self.decline_fold_gap(ast, receiver, env, ty, interner)
     }
 
@@ -111,7 +124,9 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
-        self.type_call_declines(ast, receiver, method, args, env, interner, false)
+        // The synthesized `recv[k]`/`recv.attr` read carries only the index /
+        // plain exprs — plain positional by construction.
+        self.type_call_declines(ast, receiver, method, args, true, env, interner, false)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -121,6 +136,7 @@ impl<'i> Typer<'i> {
         receiver: NodeId,
         method: &str,
         args: &[NodeId],
+        args_plain_positional: bool,
         env: &TypeEnv,
         interner: &mut Interner,
         user_facing: bool,
@@ -690,11 +706,19 @@ impl<'i> Typer<'i> {
             // fallback. `x = 2 ** 20000 / 3` is the headline row: the `**`
             // widened the receiver to `Nominal[Integer]`, the fold had
             // nothing to pin, and the slot had nothing to give.
-            if let Some(overloads) = self.index.method_overloads(class_name, method) {
-                if let Some(ty) = self.proven_overload_return(
-                    overloads, recv_ty, ast, args, env, interner,
-                ) {
-                    return ty;
+            // Only a plain-positional call reaches the selector: a splat, a
+            // bare keyword-hash (`f.round(2, half: :even)` — rigor-rs#775
+            // review) or `...` is counted in `args` but carries no plain
+            // argument's class for its slot, and the reference's
+            // `KeywordArguments` / `keywords_last` engagement is unmodeled —
+            // the call declines rather than mis-select.
+            if args_plain_positional {
+                if let Some(overloads) = self.index.method_overloads(class_name, method) {
+                    if let Some(ty) = self.proven_overload_return(
+                        overloads, recv_ty, ast, args, env, interner,
+                    ) {
+                        return ty;
+                    }
                 }
             }
         }
@@ -1001,9 +1025,19 @@ impl<'i> Typer<'i> {
         }
         let argc = arg_classes.len();
         let mut uncontested = true;
+        // The `no_match_fallback` answers only where the reference reached the
+        // end of EVERY selector pass. An arity-eligible overload that rejected
+        // an argument is a safe fallback base only when its `no` came through
+        // a lone `ClassInstance` param — a class disjointness the gradual pass
+        // proves the same way. An `Alias` / `Interface` / `Variable` / `Other`
+        // param rejects here but can still match in the reference's alias or
+        // gradual pass, so the fallback would answer an overload its selector
+        // never reached (`f.round("x")` — rigor-rs#775 review).
+        let mut fallback_ok = true;
         for ov in overloads {
             // A block-free call site never engages a block-REQUIRED overload,
-            // and a call passing no keywords never satisfies a required one —
+            // and a call carrying no keyword arguments (the caller gates on
+            // `args_plain_positional`) never satisfies a required one —
             // `engages_block_shape?` and `KeywordArguments.accepted_by?`.
             let engages = !ov.block_required && !ov.has_required_keywords;
             // Rest and trailing positionals are presence-only in the retained
@@ -1025,32 +1059,41 @@ impl<'i> Typer<'i> {
                 && argc <= ov.required_positionals.len() + ov.optional_positionals.len();
             if engages && arity_ok {
                 let needed = argc - ov.required_positionals.len();
-                let engaged = ov
+                let engaged: Vec<&RetainedParamType> = ov
                     .required_positionals
                     .iter()
-                    .chain(ov.optional_positionals.iter().take(needed));
+                    .chain(ov.optional_positionals.iter().take(needed))
+                    .collect();
                 if engaged
+                    .iter()
                     .zip(&arg_classes)
                     .all(|(p, a)| self.index.param_accepts_arg_class(p, a))
                 {
                     // The FIRST gradual match — pass 0's pick, contingent on
                     // the proof: uncontested, and every engaged param a lone
                     // class naming its argument's own class.
-                    let named = ov
-                        .required_positionals
+                    let named = engaged
                         .iter()
-                        .chain(ov.optional_positionals.iter().take(needed))
                         .zip(&arg_classes)
                         .all(|(p, a)| Self::names_arg_class(p, a));
                     if !uncontested || !named {
                         return None;
                     }
-                    return self.overload_bare_class_return(&ov.return_form, interner);
+                    return self.overload_bare_class_return(ov, interner);
+                }
+                if engaged
+                    .iter()
+                    .any(|p| !matches!(p, RetainedParamType::ClassInstance(..)))
+                {
+                    fallback_ok = false;
                 }
             }
             if !self.overload_proven_out(ov, &arg_classes) {
                 uncontested = false;
             }
+        }
+        if !fallback_ok {
+            return None;
         }
         // `no_match_fallback`: nothing matched, so the first overload that
         // does not require a block answers (else `method_types.first`) —
@@ -1064,7 +1107,7 @@ impl<'i> Typer<'i> {
             .iter()
             .find(|ov| !ov.block_required)
             .or_else(|| ordered.first())
-            .and_then(|ov| self.overload_bare_class_return(&ov.return_form, interner))
+            .and_then(|ov| self.overload_bare_class_return(ov, interner))
     }
 
     /// The reference `ReceiverAffinity.reorder` (`receiver_affinity.rb`): a
@@ -1181,10 +1224,25 @@ impl<'i> Typer<'i> {
     /// declines back to the cascade's `Dynamic[top]`.
     fn overload_bare_class_return(
         &self,
-        return_form: &str,
+        ov: &OverloadSignature,
         interner: &mut Interner,
     ) -> Option<TypeId> {
+        let return_form = ov.return_form.as_str();
         let name = return_form.strip_prefix("::").unwrap_or(return_form);
+        // A method type parameter's name is a variable, not a class —
+        // `Object#to_yaml`'s `[IO] (IO, …) -> IO` would otherwise resolve
+        // `IO` to the class through `class_id` (rigor-rs#775 review).
+        // `type_param_bounds` records only BOUNDED params, so an unbounded
+        // `[T]` shows up as a `Variable` leaf in the param shapes instead;
+        // check both.
+        if ov.type_param_bounds.iter().any(|(n, _)| *n == name)
+            || ov.required_positionals
+                .iter()
+                .chain(&ov.optional_positionals)
+                .any(|p| Self::param_mentions_variable(p, name))
+        {
+            return None;
+        }
         let bare = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
             && name
                 .chars()
@@ -1200,6 +1258,24 @@ impl<'i> Typer<'i> {
             class: class_id,
             args: vec![],
         }))
+    }
+
+    /// Does `name` occur as a bare type `Variable` anywhere inside a retained
+    /// param shape (a `[T]`/bounded `[I < _ToInt]` method parameter's own
+    /// spellings — used to spot a `return_form` that is really a variable)?
+    fn param_mentions_variable(p: &RetainedParamType, name: &str) -> bool {
+        match p {
+            RetainedParamType::Variable(v) => *v == name,
+            RetainedParamType::ClassInstance(_, args)
+            | RetainedParamType::Alias(_, args)
+            | RetainedParamType::Interface(_, args)
+            | RetainedParamType::Union(args)
+            | RetainedParamType::Tuple(args) => {
+                args.iter().any(|a| Self::param_mentions_variable(a, name))
+            }
+            RetainedParamType::Optional(inner) => Self::param_mentions_variable(inner, name),
+            RetainedParamType::Other(_) => false,
+        }
     }
 
     /// The index half of [`Typer::rbs_dispatch_declines_on_untyped_arg`]:
