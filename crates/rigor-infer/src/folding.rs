@@ -723,8 +723,11 @@ fn int_pow_mod_u128(base: IntReceiver<'_>, exp: PowExp, m: i64) -> FoldOutcome {
     } else {
         r as i128 - mm as i128
     };
-    // |signed| < |m| <= 2**63, so the cast cannot fail.
-    FoldOutcome::Value(Scalar::Int(i64::try_from(signed).unwrap_or(i64::MAX)))
+    // |signed| < |m| <= 2**63, so the cast cannot fail — a violated
+    // invariant is a bug, not a foldable value (rigor-rs#837).
+    FoldOutcome::Value(Scalar::Int(
+        i64::try_from(signed).expect("pow-mod residue is under |m| <= 2**63"),
+    ))
 }
 
 /// `|d| mod mm` by base-1e9 Horner reduction — the canonical (non-negative)
@@ -746,7 +749,12 @@ fn decimal_mod_u128(d: &str, m: u128) -> u128 {
 fn int_pow_mod_chunks(base: IntReceiver<'_>, exp: PowExp, d: &str) -> FoldOutcome {
     // ~`log2(exp) * m_words` modmul word-ops — decline a computation the
     // reference's native bignum does invisibly but this port cannot afford.
-    const WORK_LIMIT: u128 = 1 << 28;
+    // The estimate omits `chunks_mod`'s constant factor (per-digit
+    // `chunks_mul_small` alloc + `chunks_cmp` + fixup): measured, one work
+    // unit costs ~17ns in release, so `1 << 28` let a single fold run ~4.5s
+    // (rigor-rs#837). `1 << 24` bounds a fold at ~0.3s and still passes an
+    // RSA-2048 shape (~2k exp bits * ~69² words ≈ 9.9M work).
+    const WORK_LIMIT: u128 = 1 << 24;
     let exp_bits = match &exp {
         PowExp::Small(e) => 64 - e.leading_zeros() as usize,
         PowExp::Big(chunks) => chunks.len() * 30,
@@ -2356,6 +2364,29 @@ mod tests {
             fold(&big("100000000000000000000"), "**", &[f(0.5)]),
             Some(f(1e20f64.powf(0.5)))
         );
+    }
+
+    /// rigor-rs#837 — the chunk-powmod work estimate (`exp_bits * m_words²`)
+    /// is bounded at `1 << 24` (~0.3s/fold measured); an estimate past it
+    /// declines before iterating, so these rows answer instantly.
+    #[test]
+    fn pow_mod_declines_past_work_limit() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        // The issue's pathological shape: 4000-digit exp (~13.4k est bits) x
+        // 1261-digit mod (141 words) ≈ 265M work — declined.
+        let huge_exp = big(&"9".repeat(4000));
+        let huge_mod = big(&format!("1{}7", "0".repeat(1259)));
+        assert_eq!(fold(&i(3), "pow", &[huge_exp, huge_mod]), None);
+        // A row between the old (`1 << 28`) and new limits: 4000-digit exp
+        // x 361-digit mod (41 words) ≈ 22M work — folded before, declines now.
+        let wide_mod = big(&format!("9{}7", "9".repeat(359)));
+        assert_eq!(fold(&i(3), "pow", &[big(&"9".repeat(4000)), wide_mod]), None);
+        // Control: an RSA-2048-class fold (~2070 est bits x 69 words ≈ 9.9M)
+        // still folds.
+        let rsa_exp = big(&"9".repeat(617));
+        let rsa_mod = big(&format!("9{}7", "9".repeat(616)));
+        assert!(fold(&i(2), "pow", &[rsa_exp, rsa_mod]).is_some());
     }
 
     #[test]
