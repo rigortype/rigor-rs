@@ -655,6 +655,21 @@ impl CoreIndex {
         self.data.param_accepts_arg_class(t, arg_class)
     }
 
+    /// rigor-rs#775 — the reference `ProvenOverload` `disjoint_param?` leaf:
+    /// `param_name` is a declared class proven disjoint from `arg_class`
+    /// under BOTH the host-mirror and the RBS-loader orderings. See
+    /// [`rbs::CoreData::classes_proven_disjoint`].
+    pub fn classes_proven_disjoint(&self, arg_class: &str, param_name: &str) -> bool {
+        self.data.classes_proven_disjoint(arg_class, param_name)
+    }
+
+    /// The `arg <=> param` ordering the acceptance substrate consults — the
+    /// reference `class_subtype_result`. See
+    /// [`rbs::CoreData::param_arg_ordering`].
+    pub fn param_arg_ordering(&self, arg_class: &str, param_name: &str) -> ClassOrdering {
+        self.data.param_arg_ordering(arg_class, param_name)
+    }
+
     /// The right-hand side of a `type` alias, retained one level deep, or
     /// `None` when unknown — for the translated-describe `expected` label
     /// (`call.argument-type-mismatch`, single-overload non-nil channel), which

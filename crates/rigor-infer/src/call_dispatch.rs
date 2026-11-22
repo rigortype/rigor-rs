@@ -3,6 +3,7 @@
 //! and object-constant receivers included), with its untyped-argument and
 //! bare-nominal-join declines and in-source parameter bounds.
 
+use rigor_index::{OverloadSignature, RetainedParamType};
 use rigor_parse::{LoweredAst, Node, NodeId};
 use rigor_types::{Interner, RefinementId, Scalar, Type, TypeId};
 
@@ -680,6 +681,22 @@ impl<'i> Typer<'i> {
                     return nominal;
                 }
             }
+            // rigor-rs#775 — when the flat `method_return` slot collapses on a
+            // divergent overload set (`Integer#/` is `(Integer) -> Integer |
+            // (Float) -> Float | …`, so the slot holds no answer), the
+            // reference's `OverloadSelector` still answers the call from the
+            // argument types — pass 0 (`ProvenOverload`) for a call whose
+            // every argument is a plain value, else the first-overload
+            // fallback. `x = 2 ** 20000 / 3` is the headline row: the `**`
+            // widened the receiver to `Nominal[Integer]`, the fold had
+            // nothing to pin, and the slot had nothing to give.
+            if let Some(overloads) = self.index.method_overloads(class_name, method) {
+                if let Some(ty) = self.proven_overload_return(
+                    overloads, recv_ty, ast, args, env, interner,
+                ) {
+                    return ty;
+                }
+            }
         }
 
         // Tier 4b (ADR-0023): in-source method RETURN inference. A SOURCE-class
@@ -914,6 +931,275 @@ impl<'i> Typer<'i> {
                 .pins_one_constant(),
             _ => false,
         }
+    }
+
+    /// rigor-rs#775 — the reference `OverloadSelector` pass 0
+    /// (`proven_overload.rb`, `overload_selector.rb:find_proven_overload`)
+    /// plus its `no_match_fallback`, consulted only where the flat
+    /// `method_return` slot found nothing. With every argument a plain value
+    /// (a `Constant`, or a `Nominal` with no type arguments —
+    /// `ProvenOverload.applies?`), the FIRST overload in declared order that
+    /// gradually matches answers the call, but only when it is PROVEN: every
+    /// positional parameter it engages is a lone class naming its argument's
+    /// own class (`names_arg_class?`), and every overload declared before it
+    /// is proven out (`contested?` — each of its parameters disjoint from
+    /// every argument's class under both class orderings). When no overload
+    /// matches at all the reference fails soft onto the first overload that
+    /// does not require a block; the same fallback applies here.
+    ///
+    /// The strict / alias / gradual passes and the receiver-affinity reorder
+    /// the reference falls to when pass 0 declines are NOT ported: a gradual
+    /// match that fails the proven tests, and every imprecise-argument call
+    /// (whose `#521` union-of-matches this slice does not model), declines
+    /// back to the cascade's `Dynamic[top]` — silence, never a guessed class.
+    /// Only a BARE class-name `return_form` translates to a `Nominal` (the
+    /// reference's translator answers unions, tuples, `self` and literal
+    /// returns too); anything else declines.
+    fn proven_overload_return(
+        &self,
+        overloads: &[OverloadSignature],
+        recv_ty: TypeId,
+        ast: &LoweredAst,
+        args: &[NodeId],
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        // `applies?`: at least one argument and every argument a `Constant`
+        // or a `Nominal` with no type arguments.
+        if args.is_empty() {
+            return None;
+        }
+        let mut arg_classes: Vec<String> = Vec::with_capacity(args.len());
+        let mut all_constant_args = true;
+        for &a in args {
+            let arg_ty = self.type_of(ast, a, env, interner);
+            let name = match interner.get(arg_ty) {
+                Type::Constant(s) => folding::scalar_class(s).to_string(),
+                Type::Nominal { class, args } if args.is_empty() => {
+                    all_constant_args = false;
+                    self.index
+                        .class_name_for_id(*class)
+                        .map(str::to_string)
+                        .or_else(|| self.source.class_name_for_id(*class).map(str::to_string))?
+                }
+                _ => return None,
+            };
+            arg_classes.push(name);
+        }
+        // The receiver must be a carrier the reference's RbsDispatch actually
+        // reaches. A `Constant` ran ConstantFolding first, so it is admitted
+        // only when an argument the fold cannot pin proves the fold declined
+        // upstream too: an all-`Constant` call may fold there to a literal
+        // (`x = 1; x / 3.0` prints `0.333…`, not `Float`) or a widened
+        // nominal this answer would drift — the port's fold is the narrower
+        // one. A `BigInt` receiver is that same fold gap (rigor-rs#695),
+        // gate or no gate.
+        match interner.get(recv_ty) {
+            Type::Nominal { .. } => {}
+            Type::Constant(s) if !matches!(s, Scalar::BigInt(_)) && !all_constant_args => {}
+            _ => return None,
+        }
+        let argc = arg_classes.len();
+        let mut uncontested = true;
+        for ov in overloads {
+            // A block-free call site never engages a block-REQUIRED overload,
+            // and a call passing no keywords never satisfies a required one —
+            // `engages_block_shape?` and `KeywordArguments.accepted_by?`.
+            let engages = !ov.block_required && !ov.has_required_keywords;
+            // Rest and trailing positionals are presence-only in the retained
+            // shapes. A trailing param is unreadable whenever the overload
+            // could engage; a rest param is unreadable only when the call
+            // actually spills into it (`argc > required + optional` — below
+            // that it contributes no engaged slot, so the overload is still
+            // decidable). An overload that could engage either is neither a
+            // safe pick NOR a safe fallback: it might be the match.
+            if engages
+                && (ov.has_trailing_positionals
+                    || (ov.has_rest_positionals
+                        && argc > ov.required_positionals.len() + ov.optional_positionals.len()))
+                && argc >= ov.required_positionals.len()
+            {
+                return None;
+            }
+            let arity_ok = argc >= ov.required_positionals.len()
+                && argc <= ov.required_positionals.len() + ov.optional_positionals.len();
+            if engages && arity_ok {
+                let needed = argc - ov.required_positionals.len();
+                let engaged = ov
+                    .required_positionals
+                    .iter()
+                    .chain(ov.optional_positionals.iter().take(needed));
+                if engaged
+                    .zip(&arg_classes)
+                    .all(|(p, a)| self.index.param_accepts_arg_class(p, a))
+                {
+                    // The FIRST gradual match — pass 0's pick, contingent on
+                    // the proof: uncontested, and every engaged param a lone
+                    // class naming its argument's own class.
+                    let named = ov
+                        .required_positionals
+                        .iter()
+                        .chain(ov.optional_positionals.iter().take(needed))
+                        .zip(&arg_classes)
+                        .all(|(p, a)| Self::names_arg_class(p, a));
+                    if !uncontested || !named {
+                        return None;
+                    }
+                    return self.overload_bare_class_return(&ov.return_form, interner);
+                }
+            }
+            if !self.overload_proven_out(ov, &arg_classes) {
+                uncontested = false;
+            }
+        }
+        // `no_match_fallback`: nothing matched, so the first overload that
+        // does not require a block answers (else `method_types.first`) —
+        // read in RECEIVER-AFFINITY order, as the reference reads it: an
+        // overlay that prepends a disjoint-sibling arm (`bigdecimal`'s
+        // `Integer#/(BigDecimal) -> BigDecimal`) cannot win by position, so
+        // `x / "a"` answers `Integer`, not `BigDecimal`.
+        let ordered =
+            self.receiver_affinity_order(overloads, self.index.class_name_of(interner, recv_ty)?);
+        ordered
+            .iter()
+            .find(|ov| !ov.block_required)
+            .or_else(|| ordered.first())
+            .and_then(|ov| self.overload_bare_class_return(&ov.return_form, interner))
+    }
+
+    /// The reference `ReceiverAffinity.reorder` (`receiver_affinity.rb`): a
+    /// stable partition pulling forward every overload whose positional
+    /// parameters all name the receiver's class or a proper RBS ancestor of
+    /// it (`param_class_in_ancestry?` — a ClassInstance whose name equals the
+    /// receiver's class, or sits above it in `param_arg_ordering`; Optional
+    /// and Union walk their members, every other shape disqualifies). A
+    /// nullary overload and one with unreadable trailing params carry no
+    /// affinity; the rest param is unexamined, as upstream.
+    fn receiver_affinity_order<'o>(
+        &self,
+        overloads: &'o [OverloadSignature],
+        self_class: &str,
+    ) -> Vec<&'o OverloadSignature> {
+        let mut affinity: Vec<&OverloadSignature> = Vec::new();
+        let mut other: Vec<&OverloadSignature> = Vec::new();
+        for ov in overloads {
+            if self.overload_has_receiver_affinity(ov, self_class) {
+                affinity.push(ov);
+            } else {
+                other.push(ov);
+            }
+        }
+        affinity.extend(other);
+        affinity
+    }
+
+    fn overload_has_receiver_affinity(&self, ov: &OverloadSignature, self_class: &str) -> bool {
+        // `required.empty? && optional.empty? && trailing.empty?` disqualifies
+        // — a nullary (or rest-only) overload has no param classes to compare.
+        // Trailing params are unreadable in the retained shape, so a `(*T, U)`
+        // overload lands in the non-affinity bucket either way upstream could.
+        if ov.has_trailing_positionals
+            || (ov.required_positionals.is_empty() && ov.optional_positionals.is_empty())
+        {
+            return false;
+        }
+        ov.required_positionals
+            .iter()
+            .chain(&ov.optional_positionals)
+            .all(|p| self.param_class_in_ancestry(p, self_class))
+    }
+
+    fn param_class_in_ancestry(&self, param: &RetainedParamType, self_class: &str) -> bool {
+        match param {
+            RetainedParamType::ClassInstance(name, _) => {
+                let name = name.strip_prefix("::").unwrap_or(name);
+                name == self_class
+                    || matches!(
+                        self.index.param_arg_ordering(self_class, name),
+                        rigor_index::ClassOrdering::Subclass
+                    )
+            }
+            RetainedParamType::Optional(inner) => {
+                self.param_class_in_ancestry(inner, self_class)
+            }
+            RetainedParamType::Union(members) => members
+                .iter()
+                .all(|m| self.param_class_in_ancestry(m, self_class)),
+            _ => false,
+        }
+    }
+
+    /// `names_arg_class?` — the param is a lone class-instance spelling whose
+    /// name IS the argument's class (`(Integer)` for an `Integer` arg). The
+    /// retained name is already lexically resolved (`(Queue)` inside
+    /// `class Thread` stored as `Thread::Queue`), as the reference's
+    /// translated `param.class_name` is; a `::`-rooted spelling reads bare.
+    fn names_arg_class(param: &RetainedParamType, arg_class: &str) -> bool {
+        match param {
+            RetainedParamType::ClassInstance(name, _) => {
+                name.strip_prefix("::").unwrap_or(name) == arg_class
+            }
+            _ => false,
+        }
+    }
+
+    /// `ProvenOverload.proven_out?` — an overload declared before the pick is
+    /// proven out when EVERY positional parameter is a plain class disjoint
+    /// from every argument's class under both orderings. Union and optional
+    /// params recurse; a rest / trailing param is unreadable here and an
+    /// alias / interface / variable / literal proves nothing — either way the
+    /// overload stays a live contestant and the pick is contested.
+    fn overload_proven_out(&self, ov: &OverloadSignature, arg_classes: &[String]) -> bool {
+        if ov.has_rest_positionals || ov.has_trailing_positionals {
+            return false;
+        }
+        ov.required_positionals
+            .iter()
+            .chain(&ov.optional_positionals)
+            .all(|p| self.param_proven_disjoint(p, arg_classes))
+    }
+
+    fn param_proven_disjoint(&self, param: &RetainedParamType, arg_classes: &[String]) -> bool {
+        match param {
+            RetainedParamType::ClassInstance(name, _) => arg_classes
+                .iter()
+                .all(|a| self.index.classes_proven_disjoint(a, name)),
+            RetainedParamType::Optional(inner) => {
+                self.param_proven_disjoint(inner, arg_classes)
+            }
+            RetainedParamType::Union(members) => members
+                .iter()
+                .all(|m| self.param_proven_disjoint(m, arg_classes)),
+            _ => false,
+        }
+    }
+
+    /// The call's answer when the selected overload's `return_form` is a
+    /// single class name (`Integer`, `A::B`): its `Nominal`. Every other
+    /// written shape — a union, a tuple, `self`/`instance`, `bool`, a literal,
+    /// a generic application — is more than this slice translates; `None`
+    /// declines back to the cascade's `Dynamic[top]`.
+    fn overload_bare_class_return(
+        &self,
+        return_form: &str,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let name = return_form.strip_prefix("::").unwrap_or(return_form);
+        let bare = name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == ':');
+        if !bare {
+            return None;
+        }
+        let class_id = self
+            .index
+            .class_id(name)
+            .or_else(|| self.source.class_id(name))?;
+        Some(interner.intern(Type::Nominal {
+            class: class_id,
+            args: vec![],
+        }))
     }
 
     /// The index half of [`Typer::rbs_dispatch_declines_on_untyped_arg`]:
