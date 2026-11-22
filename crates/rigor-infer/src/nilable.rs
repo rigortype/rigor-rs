@@ -622,21 +622,37 @@ impl<'i> Typer<'i> {
                         // computes on the PRE-widening binding, exactly as
                         // `eval_index_or_write` does.
                         let stored = if operand && matches!(compound, Compound::Or) {
-                            let tracked = tenv
-                                .get(name.as_str())
-                                .is_some_and(|&pre| self.fully_tracked_type(pre, interner));
-                            if tracked {
-                                indices.first().and_then(|&k| {
-                                    crate::stable_index_key(ast.get(k)).map(|key| {
-                                        let ty = self.index_write_value_type(
-                                            ast, r, &indices, value, &compound, tenv,
+                            // `recordable_slot_address`'s `verbatim_slot?`
+                            // gates EVERY record mint — `slot_stored_type`
+                            // and here alike: a `String` carrier records
+                            // nothing (`s[0] ||= "x"; y = s[0]` reads the
+                            // unmodeled nilable element on the oracle —
+                            // `possible-nil`, not the minted `String | "x"`
+                            // that would fire `for "x" | String`,
+                            // rigor-rs#694 review, Q5).
+                            let pre = tenv.get(name.as_str()).copied();
+                            let key = indices
+                                .first()
+                                .and_then(|&k| crate::stable_index_key(ast.get(k)));
+                            match (pre, key) {
+                                (Some(pre), Some(key))
+                                    if self.fully_tracked_type(pre, interner)
+                                        && self.verbatim_slot(
+                                            pre,
+                                            matches!(
+                                                key,
+                                                rigor_types::ShapeKey::Int(v) if v < 0
+                                            ),
                                             interner,
-                                        );
-                                        (crate::indexed_narrowing_key(name, &key), ty)
-                                    })
-                                })
-                            } else {
-                                None
+                                        ) =>
+                                {
+                                    let ty = self.index_write_value_type(
+                                        ast, r, &indices, value, &compound, tenv,
+                                        interner,
+                                    );
+                                    Some((crate::indexed_narrowing_key(name, &key), ty))
+                                }
+                                _ => None,
                             }
                         } else {
                             None

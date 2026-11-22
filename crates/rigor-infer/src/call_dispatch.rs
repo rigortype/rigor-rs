@@ -468,13 +468,25 @@ impl<'i> Typer<'i> {
                             }
                             _ => ast.reads_local_within(ast.get(id).span()),
                         });
-                if let Some(folded) =
-                    (!stale_risk).then(|| folding::fold(&scalar, method, &arg_scalars)).flatten()
-                {
-                    if folding::oversized_string_result(&folded) {
-                        return interner.untyped();
+                if !stale_risk {
+                    match folding::fold_outcome(&scalar, method, &arg_scalars) {
+                        folding::FoldOutcome::Value(folded) => {
+                            if folding::oversized_string_result(&folded) {
+                                return interner.untyped();
+                            }
+                            return interner.intern(Type::Constant(folded));
+                        }
+                        // Upstream #2115's `WidenedResult`: a fold past
+                        // `INTEGER_FOLD_BIT_LIMIT` still knows its class —
+                        // the reference answers `Nominal[Integer]` (or
+                        // `Rational` for a negative exponent), where the
+                        // port's plain decline landed on `Dynamic` and
+                        // `x.zz` stayed silent (rigor-rs#694).
+                        folding::FoldOutcome::Widened(class) => {
+                            return self.nominal_or_untyped(class, interner);
+                        }
+                        folding::FoldOutcome::Declined => {}
                     }
-                    return interner.intern(Type::Constant(folded));
                 }
                 // rigor-rs#499 — a STALE pin cannot fold (the env literal is
                 // not the runtime value) but the oracle still answers the RBS
