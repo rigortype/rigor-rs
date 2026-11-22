@@ -171,11 +171,11 @@ use super::ownership::{
 };
 
 /// Mirrors `Inference::ScopeIndexer::TOP_LEVEL_DEF_KEY` — a `def` outside any
-/// class body (`scanner.rb:43`).
+/// class body (`scanner.rb:50`).
 const TOP_LEVEL_KEY: &str = "<toplevel>";
 
 /// Receiver-less calls in a class / module body that declare units or ancestry
-/// (`scanner.rb:48`). Everything else in a class body is out of scope in v1 —
+/// (`scanner.rb:55`). Everything else in a class body is out of scope in v1 —
 /// its statements run at load time, which is a unit of its own that no slice
 /// models yet.
 const DECLARATION_MACROS: &[&str] =
@@ -1520,7 +1520,7 @@ fn parameter_names(parameters: Option<&ParametersNode<'_>>) -> BTreeSet<String> 
 }
 
 /// The unit's `&blk` parameter name — upstream's `block_parameter_name`
-/// (`scanner.rb:283`), which is `parameters.block&.name&.to_s` and deliberately
+/// (`scanner.rb:343`), which is `parameters.block&.name&.to_s` and deliberately
 /// NOT part of `parameter_names`: a block parameter is not an ordinary one for
 /// the ownership judgment. An anonymous `&` has no name and answers None.
 fn block_parameter_name(parameters: Option<&ParametersNode<'_>>) -> Option<String> {
