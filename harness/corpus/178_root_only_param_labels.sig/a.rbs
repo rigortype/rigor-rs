@@ -1,0 +1,10 @@
+# resolve-type-names: false
+class R
+  # `# resolve-type-names: false` stands the whole `resolve_signature` down —
+  # these labels stay AS WRITTEN (`Mutex`, not `Thread::Mutex`) even though
+  # the bundled alias map could resolve them.
+  def a: (Mutex x) -> void
+  def b: (Mutex? x) -> void
+  def c: (Integer | Mutex x) -> void
+  def d: (Array[Mutex] x) -> void
+end

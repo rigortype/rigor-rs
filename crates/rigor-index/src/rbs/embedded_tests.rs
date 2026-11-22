@@ -800,42 +800,27 @@ fn resolve_lexical_name_scopes() {
     ]
     .into_iter()
     .collect();
+    let aliases = HashMap::new();
+    let resolve = |w| resolve_lexical_name_in(w, &[], &known, &aliases);
+    let resolve_in = |w, ctx: &[&'static str]| resolve_lexical_name_in(w, ctx, &known, &aliases);
     // Innermost hit: `X` inside [A, A::B] lands at `A::X`, not `::X`.
-    assert_eq!(
-        resolve_lexical_name("X", &["A", "A::B"], &known),
-        Some("A::X")
-    );
+    assert_eq!(resolve_in("X", &["A", "A::B"]), Some("A::X"));
     // Innermost hit wins over a same-named root decl.
-    assert_eq!(
-        resolve_lexical_name("Widget", &["W"], &known),
-        Some("W::Widget")
-    );
+    assert_eq!(resolve_in("Widget", &["W"]), Some("W::Widget"));
     // Root fallback when no enclosing scope knows the head.
-    assert_eq!(
-        resolve_lexical_name("Widget", &["Digest"], &known),
-        Some("Widget")
-    );
-    assert_eq!(
-        resolve_lexical_name("Class", &["Digest"], &known),
-        Some("Digest::Class")
-    );
+    assert_eq!(resolve_in("Widget", &["Digest"]), Some("Widget"));
+    assert_eq!(resolve_in("Class", &["Digest"]), Some("Digest::Class"));
     // A qualified name commits to the scope its head landed in: `Foo` hits
     // `Digest::Foo`, the `Bar` tail misses, so NOTHING resolves — no
     // backtracking to the outer `::Foo::Bar` (the resolver's `inject` nil).
-    assert_eq!(
-        resolve_lexical_name("Foo::Bar", &["Digest"], &known),
-        None
-    );
+    assert_eq!(resolve_in("Foo::Bar", &["Digest"]), None);
     // The same name resolves at root when no scope claims the head.
-    assert_eq!(
-        resolve_lexical_name("Foo::Bar", &["A"], &known),
-        Some("Foo::Bar")
-    );
+    assert_eq!(resolve_in("Foo::Bar", &["A"]), Some("Foo::Bar"));
     // An unknown head resolves nothing anywhere.
-    assert_eq!(
-        resolve_lexical_name("NoSuchZzz", &["A", "A::B"], &known),
-        None
-    );
+    assert_eq!(resolve_in("NoSuchZzz", &["A", "A::B"]), None);
+    // `::`-rooted: skips the lexical walk entirely.
+    assert_eq!(resolve("::Foo::Bar"), Some("Foo::Bar"));
+    assert_eq!(resolve("::NoSuchZzz"), None);
 }
 
 /// The `string` / `int` aliases accept their concrete arm directly and, via
@@ -952,3 +937,4 @@ fn atm_acceptance_alias_depth_cap_and_chain() {
 
     let _ = std::fs::remove_dir_all(&base);
 }
+mod resolved_param_name_tests;

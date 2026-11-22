@@ -1087,7 +1087,7 @@ impl CoreData {
     /// as before (the out-of-band stdlib-RBS refresh seam, audit-R2): the WHOLE
     /// dir plus the `DEFAULT_LIBRARIES` stdlib closure rooted at `<dir>/../stdlib`.
     /// The embedded path feeds the SAME bytes to the SAME parser as the override
-    /// path ([`ingest_rbs_source`]), so the resulting index is byte-identical to
+    /// path ([`ingest_group`]), so the resulting index is byte-identical to
     /// what the override dir produced when it holds the same signatures.
     pub fn load() -> Self {
         Self::load_with_plugins(&[])
@@ -1100,7 +1100,7 @@ impl CoreData {
     /// The core source is resolved exactly as [`Self::load`] does (the
     /// `RIGOR_RBS_CORE_DIR` override if set, else the embedded vendored set),
     /// and each plugin's `(name, contents)` entries are then fed to the SAME
-    /// [`ingest_rbs_source`] / `ruby-rbs` parser. The existing [`Builder::merge`]
+    /// [`ingest_group`] / `ruby-rbs` parser. The existing [`Builder::merge`]
     /// reopen-union folds each plugin's reopened `class String ... def squish`
     /// into the EXISTING `String` entry, so the plugin selectors join the core
     /// surface — byte-identical to feeding the reference's bundled RBS through
@@ -1122,7 +1122,7 @@ impl CoreData {
     /// own classes thereby join the loaded set, so [`Self::knows_class`] (the
     /// dispatch-rule gate, the analogue of the reference's `rbs_class_known?`)
     /// witnesses them. A `sig_dir` that doesn't exist on disk is inert
-    /// ([`ingest_rbs_dir`] skips a non-directory). User-authored RBS degrades
+    /// ([`ingest_project_dirs`] skips a non-directory). User-authored RBS degrades
     /// soundly: a per-file parse failure drops only that file's declarations
     /// (ADR-0016), and there is no global resolve pass that a malformed file
     /// could collapse (ADR-0033).
@@ -1169,11 +1169,12 @@ impl CoreData {
             let mut found = Vec::new();
             glob_rbs(dir, &mut found);
             found.sort();
-            for f in &found {
-                if let Ok(code) = std::fs::read_to_string(f) {
-                    ingest_rbs_source(&mut builder, &f.to_string_lossy(), &code);
-                }
-            }
+            let sources: Vec<(Option<conformance::Origin>, &'static str)> = found
+                .iter()
+                .filter_map(|f| std::fs::read_to_string(f).ok())
+                .map(|code| (None, intern(&code)))
+                .collect();
+            ingest_group(&mut builder, sources.into_iter());
             // The supplied core must be closed on its own: every type its
             // signatures name and every superclass / mixin it writes must be
             // declared by the core itself. Otherwise the reference builds
@@ -1184,15 +1185,14 @@ impl CoreData {
             // `class.rbs`). Checked now, before stdlib and overlay load, so
             // the env holds the core alone. rbs 3.4 / 3.10 / 4.2 cores pass.
             let gap = builder.core_health_failures_open();
-            for (name, contents) in EMBEDDED_RBS
-                .iter()
-                .filter(|(n, _)| !is_overlay(n) && !n.starts_with("core/"))
-            {
-                ingest_rbs_source(&mut builder, name, contents);
-            }
-            for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)) {
-                ingest_rbs_source(&mut builder, name, contents);
-            }
+            ingest_group(
+                &mut builder,
+                EMBEDDED_RBS
+                    .iter()
+                    .filter(|(n, _)| !is_overlay(n) && !n.starts_with("core/"))
+                    .chain(EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)))
+                    .map(|(_, c)| (None, *c)),
+            );
             if let Some(h) = builder.core_health.as_deref_mut() {
                 h.core_gap = gap;
             }
@@ -1220,14 +1220,18 @@ impl CoreData {
             builder.plugin_standdowns = scratch.project_member_keys;
         }
         builder.member_phase = MemberPhase::Plugin;
-        for plugin in plugins {
-            for (name, contents) in plugin.rbs {
-                let key = intern(&format!("plugin:{}:{name}", plugin.id));
-                builder.conformance.set_origin(Some(conformance::Origin::Plugin(key)));
-                ingest_rbs_source(&mut builder, name, contents);
-                builder.conformance.set_origin(None);
-            }
-        }
+        // All plugin files resolve their names against ONE complete name set
+        // (core + every plugin), exactly as the project group does.
+        let plugin_sources: Vec<(Option<conformance::Origin>, &'static str)> = plugins
+            .iter()
+            .flat_map(|plugin| {
+                plugin.rbs.iter().map(|(name, contents)| {
+                    let key = intern(&format!("plugin:{}:{name}", plugin.id));
+                    (Some(conformance::Origin::Plugin(key)), *contents)
+                })
+            })
+            .collect();
+        ingest_group(&mut builder, plugin_sources.into_iter());
 
         // 3) Ingest the project's own `sig/` RBS on top of core + plugin
         //    (ADR-0033). Same parser, same reopen-union merge. Snapshot the
@@ -1504,9 +1508,16 @@ impl CoreData {
             return false;
         }
 
+        // The whole override set is gathered FIRST and ingested as one
+        // [`ingest_group`] — the reference resolves every loaded source's
+        // names against the complete env, so a forward reference across
+        // files resolves here too (rigor-rs#811). Gather order is ingest
+        // order, unchanged: core dir, then the stdlib closure, overlay last.
+        let mut sources: Vec<(Option<conformance::Origin>, &'static str)> = Vec::new();
+
         // 1) The WHOLE core dir (~62 files), not a curated subset — so every
         //    core class + its full ancestor chain is loaded.
-        ingest_rbs_dir(builder, dir);
+        collect_rbs_sources(dir, &mut sources);
 
         // 2) The DEFAULT_LIBRARIES stdlib set, rooted at `<core>/../stdlib`,
         //    transitively closed over each lib's `manifest.yaml` deps (the
@@ -1527,7 +1538,7 @@ impl CoreData {
                 if !lib_dir.is_dir() {
                     continue; // ships RBS elsewhere / not in this tree ⇒ skip.
                 }
-                ingest_rbs_dir(builder, &lib_dir);
+                collect_rbs_sources(&lib_dir, &mut sources);
                 // Enqueue manifest dependencies (transitive closure).
                 for dep in manifest_deps(&lib_dir.join("manifest.yaml")) {
                     if !loaded.contains(&dep) {
@@ -1544,8 +1555,10 @@ impl CoreData {
         //    `RIGOR_RBS_CORE_DIR` refresh from silently re-opening the
         //    `DidYouMean.formatter` class of false positive.
         if let Some(root) = dir.parent() {
-            ingest_rbs_dir(builder, &root.join("overlay"));
+            collect_rbs_sources(&root.join("overlay"), &mut sources);
         }
+
+        ingest_group(builder, sources.into_iter());
 
         // "Usable" means the core dir yielded at least one class. The builder may
         // already hold classes from a prior fold, but the override is only ever
@@ -4996,6 +5009,13 @@ struct Builder {
     /// a receiver typed by one as `Dynamic[top]` — the dispatch gates need it
     /// to keep a stub from ever witnessing a diagnostic.
     synthesized_type_names: HashSet<&'static str>,
+    /// rigor-rs#811: the `TypeNameResolver` `aliases` table —
+    /// `new_name qualified → (old_name as WRITTEN, the decl's lexical ctx)` —
+    /// the map [`resolve_lexical_name`] normalises a class/module-alias
+    /// segment through (`class Mutex = Thread::Mutex` ⇒ `"Mutex" →
+    /// ("Thread::Mutex", [])`). Populated by the decl-name pre-pass and
+    /// re-recorded at ingest, so a single-phase ingest path keeps working.
+    class_alias_targets: HashMap<&'static str, (&'static str, Vec<&'static str>)>,
     /// Which load phase the members being ingested belong to — the
     /// duplicate-member and plugin stand-down bookkeeping below keys on it.
     member_phase: MemberPhase,
@@ -5466,13 +5486,6 @@ impl Builder {
     }
 
     /// Parse one RBS source and fold its top-level class/module declarations in.
-    fn ingest(&mut self, code: &str) {
-        let Ok(sig) = parse(code) else {
-            return;
-        };
-        self.ingest_sig(code, &sig, None);
-    }
-
     /// Fold one ALREADY-PARSED signature's top-level declarations in. `ctx` is
     /// the per-file resolution context a PROJECT signature ingests under
     /// (issue #168 — `use` imports and `# resolve-type-names: false`); `None`
@@ -5492,17 +5505,16 @@ impl Builder {
                 Node::Constant(c) => self.ingest_object_constant(&c, ctx),
                 Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code, &[], ctx),
                 Node::Interface(i) => self.ingest_interface(&i, &[]),
-                Node::ClassAlias(ca) => {
-                    // Not modelled as a dispatch surface — but its NEW name is a
-                    // known type for `use` maps and the missing-type scan, just
-                    // as `class_alias_decls` feeds `known_types` in the reference.
-                    self.known_type_names
-                        .insert(qualified_name(&[], &ca.new_name()));
-                }
-                Node::ModuleAlias(ma) => {
-                    self.known_type_names
-                        .insert(qualified_name(&[], &ma.new_name()));
-                }
+                Node::ClassAlias(ca) => self.record_class_alias(
+                    &ca.new_name(),
+                    &ca.old_name(),
+                    &[],
+                ),
+                Node::ModuleAlias(ma) => self.record_class_alias(
+                    &ma.new_name(),
+                    &ma.old_name(),
+                    &[],
+                ),
                 _ => {}
             }
         }
@@ -5539,6 +5551,30 @@ impl Builder {
         self.object_constants.entry(name).or_insert(class);
     }
 
+    /// rigor-rs#811: record a `class X = Y` / `module X = Y` declaration as
+    /// `new → (old written, decl ctx)` in `class_alias_targets`, the
+    /// `TypeNameResolver` `aliases` table [`resolve_lexical_name`] chases
+    /// (`Mutex` ⇒ `Thread::Mutex`, so an `expected:` label renders the
+    /// resolved target the oracle prints). First write wins. The new name
+    /// deliberately does NOT join `known_type_names`: that set mirrors the
+    /// resolver's `all_names` (class/interface/`type` decls only — an alias
+    /// is NOT a `has_type_name?` hit), and the consumers that mirror
+    /// `env.type_name?` / `UseMap::Table#known_types` (which DO merge
+    /// `class_alias_decls`) union `class_alias_targets` at their call sites.
+    fn record_class_alias(
+        &mut self,
+        new_name: &ruby_rbs::node::TypeNameNode,
+        old_name: &ruby_rbs::node::TypeNameNode,
+        enclosing: &[&'static str],
+    ) {
+        let qual = qualified_name(enclosing, new_name);
+        if let Some(old) = written_ref(old_name) {
+            self.class_alias_targets
+                .entry(qual)
+                .or_insert_with(|| (old, enclosing.to_vec()));
+        }
+    }
+
     /// Fold one `type X = ...` alias into the global map (ATM substrate). First
     /// write wins on reopen. The RHS is retained one level deep (aliases inside
     /// are kept as `Alias(..)` leaves, not expanded — Slice 2 owns expansion).
@@ -5568,9 +5604,20 @@ impl Builder {
                 _ => None,
             })
             .collect();
-        let rhs = retained_param_type(&ta.type_(), code, ctx, enclosing, &self.known_type_names);
-        self.type_alias_defs.entry(name).or_insert(rhs);
-        self.type_alias_params.entry(name).or_insert(params);
+        let rhs = retained_param_type(&ta.type_(), code, ctx, enclosing, self);
+        // rigor-rs#811: key by the QUALIFIED decl name AND (when distinct, and
+        // still vacant) the leaf — a use site retained as the resolved
+        // `Outer::foo` hits the qualified key; an unresolved `foo` keeps the
+        // leaf behaviour every earlier lookup relied on.
+        let qual = qualified_name(enclosing, &ta.name());
+        self.type_alias_defs.entry(qual).or_insert(rhs.clone());
+        self.type_alias_params
+            .entry(qual)
+            .or_insert_with(|| params.clone());
+        if qual != name {
+            self.type_alias_defs.entry(name).or_insert(rhs);
+            self.type_alias_params.entry(name).or_insert(params);
+        }
     }
 
     /// Fold one `interface _X ... end` into the global map (ATM substrate),
@@ -5580,7 +5627,8 @@ impl Builder {
         let Some(name) = type_name_str(&i.name()) else {
             return;
         };
-        self.known_type_names.insert(qualified_name(enclosing, &i.name()));
+        let qual = qualified_name(enclosing, &i.name());
+        self.known_type_names.insert(qual);
         let mut names: Vec<&'static str> = Vec::new();
         for member in i.members().iter() {
             if let Node::MethodDefinition(md) = member {
@@ -5590,7 +5638,15 @@ impl Builder {
                 }
             }
         }
-        self.interface_method_names.entry(name).or_insert(names);
+        // rigor-rs#811: qualified + leaf keys (see [`Self::ingest_type_alias`])
+        // — a retained `Hash::_Pair` hits the qualified key, an unresolved
+        // `_Pair` keeps finding the leaf entry.
+        self.interface_method_names
+            .entry(qual)
+            .or_insert_with(|| names.clone());
+        if qual != name {
+            self.interface_method_names.entry(name).or_insert(names);
+        }
     }
 
     fn ingest_class(
@@ -5751,14 +5807,14 @@ impl Builder {
         code: &str,
         ctx: Option<&FileSigCtx>,
         enclosing: &[&'static str],
-        known: &HashSet<&'static str>,
+        b: &Builder,
     ) {
         let key = match ivar {
             ruby_rbs::node::AttrIvarName::Unspecified => intern(&format!("@{name}")),
             ruby_rbs::node::AttrIvarName::Empty => return,
             ruby_rbs::node::AttrIvarName::Name(_) => "*",
         };
-        let ty = retained_param_type(ty, code, ctx, enclosing, known);
+        let ty = retained_param_type(ty, code, ctx, enclosing, b);
         entry.ivar_types.entry(key).or_insert(ty);
     }
 
@@ -5938,12 +5994,12 @@ impl Builder {
                         if md.overloading() {
                             entry
                                 .overloading_method_overloads
-                                .push((mname, method_overloads(&md, code, ctx, enclosing, &self.known_type_names)));
+                                .push((mname, method_overloads(&md, code, ctx, enclosing, self)));
                         } else {
                             entry
                                 .method_overloads
                                 .entry(mname)
-                                .or_insert_with(|| method_overloads(&md, code, ctx, enclosing, &self.known_type_names));
+                                .or_insert_with(|| method_overloads(&md, code, ctx, enclosing, self));
                         }
                     }
                     if matches!(
@@ -5977,12 +6033,12 @@ impl Builder {
                         if md.overloading() {
                             entry
                                 .overloading_singleton_overloads
-                                .push((mname, method_overloads(&md, code, ctx, enclosing, &self.known_type_names)));
+                                .push((mname, method_overloads(&md, code, ctx, enclosing, self)));
                         } else {
                             entry
                                 .singleton_method_overloads
                                 .entry(mname)
-                                .or_insert_with(|| method_overloads(&md, code, ctx, enclosing, &self.known_type_names));
+                                .or_insert_with(|| method_overloads(&md, code, ctx, enclosing, self));
                         }
                     }
                 }
@@ -5993,7 +6049,7 @@ impl Builder {
                 // singleton (`attr_reader self.x`).
                 Node::AttrReader(a) => {
                     if a.kind() != AttributeKind::Singleton {
-                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, &self.known_type_names);
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, self);
                     }
                     // Issue #168: a non-singleton attribute's TYPE is a
                     // member-level reference (`kind == :singleton` stands it
@@ -6009,7 +6065,7 @@ impl Builder {
                 }
                 Node::AttrWriter(a) => {
                     if a.kind() != AttributeKind::Singleton {
-                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, &self.known_type_names);
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, self);
                     }
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
@@ -6022,7 +6078,7 @@ impl Builder {
                 }
                 Node::AttrAccessor(a) => {
                     if a.kind() != AttributeKind::Singleton {
-                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, &self.known_type_names);
+                        Self::record_attr_ivar(entry, a.name().as_str(), a.ivar_name(), &a.type_(), code, ctx, enclosing, self);
                     }
                     if a.kind() != AttributeKind::Singleton {
                         let mut names = Vec::new();
@@ -6034,7 +6090,7 @@ impl Builder {
                     Self::record_attr(entry, a.kind(), name, true, true);
                 }
                 Node::InstanceVariable(iv) => {
-                    let ty = retained_param_type(&iv.type_(), code, ctx, enclosing, &self.known_type_names);
+                    let ty = retained_param_type(&iv.type_(), code, ctx, enclosing, self);
                     entry.ivar_types.entry(intern(iv.name().as_str())).or_insert(ty);
                 }
                 Node::Include(inc) => {
@@ -6144,6 +6200,20 @@ impl Builder {
                 // registered by simple name above.
                 Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code, enclosing, ctx),
                 Node::Interface(i) => self.ingest_interface(&i, enclosing),
+                // A NESTED class/module alias (`class X = Y` inside a body) is
+                // a known type and a name-resolution alias exactly like the
+                // top-level form — the reference registers it under its
+                // qualified name all the same.
+                Node::ClassAlias(ca) => self.record_class_alias(
+                    &ca.new_name(),
+                    &ca.old_name(),
+                    enclosing,
+                ),
+                Node::ModuleAlias(ma) => self.record_class_alias(
+                    &ma.new_name(),
+                    &ma.old_name(),
+                    enclosing,
+                ),
                 _ => {}
             }
         }
@@ -6492,6 +6562,17 @@ impl Builder {
                 entry.superclass = Some(object);
             }
         }
+        // `type_names` is the WIDER set (`has_type_name? || aliased_name?`,
+        // #168): `known_type_names` mirrors the resolver's `all_names` (no
+        // alias names — a tail `has_type_name?` must miss them so the
+        // `aliases.fetch` arm takes the chase, rigor-rs#811), so the
+        // class/module-alias names ride back in at export.
+        let type_names: HashSet<&'static str> = self
+            .known_type_names
+            .iter()
+            .copied()
+            .chain(self.class_alias_targets.keys().copied())
+            .collect();
         (
             self.classes,
             self.toplevel_classes,
@@ -6501,7 +6582,7 @@ impl Builder {
             self.qualified,
             self.short_to_qualified,
             self.object_constants,
-            self.known_type_names,
+            type_names,
             self.synthesized_type_names,
         )
     }
@@ -6515,16 +6596,32 @@ impl Builder {
     /// `all_names` does not discriminate, and the missing-type scan must not
     /// stub a declared interface.
     fn resolve_type_name_rbs(&self, name: &str, ctx: &[&'static str]) -> Option<&'static str> {
+        // `env.type_name?` counts `class_alias_decls` (`module_name?`) — the
+        // alias check rides along every `has_type_name?`-shaped probe.
         if let Some(abs) = name.strip_prefix("::") {
-            return self.known_type_names.get(abs).copied();
+            if let Some(&k) = self.known_type_names.get(abs) {
+                return Some(k);
+            }
+            return self
+                .class_alias_targets
+                .get_key_value(abs)
+                .map(|(k, _)| *k);
         }
         for scope in ctx.iter().rev() {
             let cand = format!("{scope}::{name}");
             if let Some(&k) = self.known_type_names.get(cand.as_str()) {
                 return Some(k);
             }
+            if let Some((k, _)) = self.class_alias_targets.get_key_value(cand.as_str()) {
+                return Some(k);
+            }
         }
-        self.known_type_names.get(name).copied()
+        if let Some(&k) = self.known_type_names.get(name) {
+            return Some(k);
+        }
+        self.class_alias_targets
+            .get_key_value(name)
+            .map(|(k, _)| *k)
     }
 }
 
@@ -6533,17 +6630,25 @@ impl Builder {
 /// failure on one file is skipped; the rest still load. Subdirectories are
 /// walked because both `core/` (e.g. `core/io/*.rbs`, `core/rubygems/*.rbs`) and
 /// some stdlib libs (`stdlib/<lib>/0/<sub>/*.rbs`) nest their signatures.
-fn ingest_rbs_dir(builder: &mut Builder, dir: &std::path::Path) {
+/// Recursively collect every readable `*.rbs` file under `dir` into
+/// `sources` — the gather half of the two-phase override ingest
+/// ([`ingest_dir_into`]): every source's declarations must join
+/// `known_type_names` before ANY of them ingests. Read/parse failures drop
+/// only their file (ADR-0016); the parse itself happens in [`ingest_group`].
+fn collect_rbs_sources(
+    dir: &std::path::Path,
+    sources: &mut Vec<(Option<conformance::Origin>, &'static str)>,
+) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
     for entry in entries.flatten() {
         let path = entry.path();
         if path.is_dir() {
-            ingest_rbs_dir(builder, &path);
+            collect_rbs_sources(&path, sources);
         } else if path.extension().is_some_and(|e| e == "rbs") {
             if let Ok(code) = std::fs::read_to_string(&path) {
-                ingest_rbs_source(builder, &path.to_string_lossy(), &code);
+                sources.push((None, intern(&code)));
             }
         }
     }
@@ -6711,16 +6816,16 @@ fn collect_decl_names_inner<'a>(
                     .known_type_names
                     .insert(qualified_name(enclosing, &ta.name()));
             }
-            Node::ClassAlias(ca) => {
-                builder
-                    .known_type_names
-                    .insert(qualified_name(enclosing, &ca.new_name()));
-            }
-            Node::ModuleAlias(ma) => {
-                builder
-                    .known_type_names
-                    .insert(qualified_name(enclosing, &ma.new_name()));
-            }
+            Node::ClassAlias(ca) => builder.record_class_alias(
+                &ca.new_name(),
+                &ca.old_name(),
+                enclosing,
+            ),
+            Node::ModuleAlias(ma) => builder.record_class_alias(
+                &ma.new_name(),
+                &ma.old_name(),
+                enclosing,
+            ),
             _ => {}
         }
     }
@@ -6732,7 +6837,13 @@ fn collect_decl_names_inner<'a>(
 /// `use Foo::*` clause expands through.
 fn use_map_children(builder: &Builder) -> HashMap<&'static str, Vec<&'static str>> {
     let mut children: HashMap<&'static str, Vec<&'static str>> = HashMap::new();
-    for &name in &builder.known_type_names {
+    // `Table#known_types` merges `class_alias_decls` too — a `use Lib::*`
+    // maps `Al` ⇒ `Lib::Al` when `Lib::Al` is an alias (rigor-rs#811).
+    for &name in builder
+        .known_type_names
+        .iter()
+        .chain(builder.class_alias_targets.keys())
+    {
         if let Some(pos) = name.rfind("::") {
             children.entry(&name[..pos]).or_default().push(name);
         }
@@ -6955,7 +7066,10 @@ fn synthesize_missing_referenced_types(
                     continue;
                 }
                 let cand = name.strip_prefix("::").unwrap_or(name);
-                if !builder.known_type_names.contains(cand) {
+                // `env.type_name?(::cand)` — `class_alias_decls` count too.
+                if !builder.known_type_names.contains(cand)
+                    && !builder.class_alias_targets.contains_key(cand)
+                {
                     missing.insert(cand.to_string());
                 }
             }
@@ -6973,7 +7087,10 @@ fn synthesize_missing_referenced_types(
                 idx = pos;
             }
         }
-        names.retain(|n| !builder.known_type_names.contains(n.as_str()));
+        names.retain(|n| {
+            !builder.known_type_names.contains(n.as_str())
+                && !builder.class_alias_targets.contains_key(n.as_str())
+        });
         if names.is_empty() {
             break;
         }
@@ -7121,20 +7238,38 @@ fn expand_path(path: &std::path::Path) -> std::path::PathBuf {
     out
 }
 
-/// Fold one RBS source's declarations into `builder`. The single per-file ingest
-/// point shared by BOTH the filesystem path ([`ingest_rbs_dir`], the
-/// `RIGOR_RBS_CORE_DIR` override) and the embedded path ([`ingest_embedded`]):
-/// both feed the SAME bytes to the SAME [`Builder::ingest`] / `ruby-rbs` parser,
-/// which is what makes the embedded default byte-identical to the runtime path.
-/// `name` is informational only (the path or embedded key) — the parser keys off
-/// `contents` alone, so it never affects the resulting index.
-fn ingest_rbs_source(builder: &mut Builder, _name: &str, contents: &str) {
-    builder.ingest(contents);
+/// Two-phase ingest for ONE group of RBS sources (the bundled set, the
+/// plugin set, a supplied core): PARSE every file and collect every declared
+/// name — including class/module-alias targets — into `known_type_names` /
+/// `class_alias_targets` FIRST, then ingest in the original order. This is
+/// the project path's structure applied to the bundled set, mirroring the
+/// reference's `resolve_type_names`, which sees the env COMPLETE when each
+/// file's names resolve — a `SourceList` param inside `module Gem` resolves
+/// `Gem::SourceList` even though `source_list.rbs` ingests after
+/// `rubygems.rbs` (rigor-rs#811). Files that fail to parse are skipped on
+/// both passes exactly as before.
+fn ingest_group(
+    builder: &mut Builder,
+    sources: impl Iterator<Item = (Option<conformance::Origin>, &'static str)>,
+) {
+    let mut parsed: Vec<(Option<conformance::Origin>, &'static str, SignatureNode<'static>)> =
+        Vec::new();
+    for (origin, code) in sources {
+        if let Ok(sig) = parse(code) {
+            collect_decl_names_inner(sig.declarations().iter(), &[], builder);
+            parsed.push((origin, code, sig));
+        }
+    }
+    for (origin, code, sig) in parsed {
+        builder.conformance.set_origin(origin);
+        builder.ingest_sig(code, &sig, None);
+    }
+    builder.conformance.set_origin(None);
 }
 
 /// Ingest the build-time-embedded vendored RBS set ([`EMBEDDED_RBS`]) — the
 /// default (no `RIGOR_RBS_CORE_DIR`) load path. Each `(relative-path, contents)`
-/// entry is fed to the SAME [`ingest_rbs_source`] the filesystem path uses, so
+/// entry is fed to the SAME [`ingest_group`] the filesystem path uses, so
 /// the index is identical to ingesting the vendored tree from disk. The embedded
 /// set is the whole `core/` ⊕ the `DEFAULT_LIBRARIES` stdlib closure already
 /// resolved at vendoring time, so no `manifest.yaml` walk is needed here.
@@ -7144,12 +7279,17 @@ fn ingest_embedded(builder: &mut Builder) {
     // then `core_overlay/` after the upstream set) so an upstream declaration
     // always wins on conflict. The sorted embed order would otherwise interleave
     // `overlay/` between `core/` and `stdlib/`.
-    for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| !is_overlay(n)) {
-        ingest_rbs_source(builder, name, contents);
-    }
-    for (name, contents) in EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)) {
-        ingest_rbs_source(builder, name, contents);
-    }
+    // One group over the whole set — `resolve_type_names` sees the complete
+    // env when names resolve, so every declared name (upstream AND overlay)
+    // joins `known_type_names` before any file ingests.
+    ingest_group(
+        builder,
+        EMBEDDED_RBS
+            .iter()
+            .filter(|(n, _)| !is_overlay(n))
+            .chain(EMBEDDED_RBS.iter().filter(|(n, _)| is_overlay(n)))
+            .map(|(_, c)| (None, *c)),
+    );
 }
 
 /// Whether an embedded entry belongs to the rigor-owned overlay tree
@@ -7752,7 +7892,7 @@ fn method_overloads(
     code: &str,
     ctx: Option<&FileSigCtx>,
     enclosing: &[&'static str],
-    known: &HashSet<&'static str>,
+    b: &Builder,
 ) -> Vec<OverloadSignature> {
     let mut out: Vec<OverloadSignature> = Vec::new();
     for overload in md.overloads().iter() {
@@ -7774,16 +7914,16 @@ fn method_overloads(
         // while the single-overload channel walks the raw `param.type` — where
         // a bare variable admits `nil` and is never faithfully checkable, so it
         // declines there.
-        let bounds = method_type_param_bounds(&mt, code, ctx, enclosing, known);
+        let bounds = method_type_param_bounds(&mt, code, ctx, enclosing, b);
         let required_positionals = ft
             .required_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, ctx, enclosing, known))
+            .map(|p| param_node_type(&p, code, ctx, enclosing, b))
             .collect();
         let optional_positionals = ft
             .optional_positionals()
             .iter()
-            .map(|p| param_node_type(&p, code, ctx, enclosing, known))
+            .map(|p| param_node_type(&p, code, ctx, enclosing, b))
             .collect();
         let required_positional_names = ft
             .required_positionals()
@@ -7839,7 +7979,7 @@ fn method_type_param_bounds(
     code: &str,
     ctx: Option<&FileSigCtx>,
     enclosing: &[&'static str],
-    known: &HashSet<&'static str>,
+    b: &Builder,
 ) -> Vec<(&'static str, RetainedParamType)> {
     mt.type_params()
         .iter()
@@ -7856,7 +7996,7 @@ fn method_type_param_bounds(
             // The bound is resolved with NO bounds in scope: a bound that
             // itself mentions a sibling variable is not a shape rbs core uses,
             // and resolving it would need fixpoint ordering for no gain.
-            Some((intern(name), retained_param_type(&bound, code, ctx, enclosing, known)))
+            Some((intern(name), retained_param_type(&bound, code, ctx, enclosing, b)))
         })
         .collect()
 }
@@ -7868,10 +8008,10 @@ fn param_node_type(
     code: &str,
     ctx: Option<&FileSigCtx>,
     enclosing: &[&'static str],
-    known: &HashSet<&'static str>,
+    b: &Builder,
 ) -> RetainedParamType {
     match param {
-        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, ctx, enclosing, known),
+        Node::FunctionParam(fp) => retained_param_type(&fp.type_(), code, ctx, enclosing, b),
         // Defensive: a positional that isn't a FunctionParam node (shouldn't
         // occur) is retained verbatim as an `Other` leaf.
         other => RetainedParamType::Other(node_written_form(other, code)),
@@ -7900,7 +8040,7 @@ fn retained_param_type(
     code: &str,
     ctx: Option<&FileSigCtx>,
     enclosing: &[&'static str],
-    known: &HashSet<&'static str>,
+    b: &Builder,
 ) -> RetainedParamType {
     match node {
         Node::VariableType(v) => {
@@ -7911,77 +8051,84 @@ fn retained_param_type(
                 RetainedParamType::Variable(intern(name.as_str()))
             }
         }
-        Node::ClassInstanceType(ci) => match retained_name(ctx, &ci.name()) {
-            Some(name) => {
-                // rigor-rs#809 (review): a RELATIVE class-instance name
-                // resolves lexically at build time, the way the reference's
-                // `resolve_type_names` leaves it before the definition build
-                // — `(Class c)` inside `module Digest` is `Digest::Class`,
-                // `(Queue q)` inside `class Thread` is `Thread::Queue`.
-                // Without it the written leaf is read as the ROOT class by
-                // the host mirror and ordering alike, and the `expected:`
-                // label keeps the leaf where the oracle renders the resolved
-                // name. `::`-rooted (and `use`-anchored) spellings skip the
-                // walk — they are already absolute.
-                let name = if written_ref_ctx(ctx, &ci.name())
-                    .is_some_and(|w| w.starts_with("::"))
-                {
-                    name
+        Node::ClassInstanceType(ci) => match written_ref_ctx(ctx, &ci.name()) {
+            Some(written) => {
+                // rigor-rs#811: the retained name is the reference's
+                // post-`resolve_type_names` spelling — `param.type.to_s`
+                // renders the env-resolved name (`expected Thread::Mutex`,
+                // `expected Gem::SourceList`), never the written leaf. The
+                // written form keeps its namespace (`member_name`'s flat
+                // leaf collapsed `Thread::Mutex` to `Mutex` for the bundled
+                // path — the source of the drifted labels); lexical
+                // resolution then chases class/module aliases
+                // (`Mutex` ⇒ `Thread::Mutex`). An unresolvable name keeps
+                // the written spelling, which renders identically when the
+                // written form was already qualified. A `resolve-type-names:
+                // false` file skips resolution wholesale — the reference's
+                // `resolve_signature` stands down there, so the name stays
+                // as written (`::`-marker dropped for display).
+                let stripped = written.strip_prefix("::").unwrap_or(written);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
                 } else {
-                    resolve_lexical_name(name, enclosing, known).unwrap_or(name)
+                    resolve_lexical_name(written, enclosing, b).unwrap_or(stripped)
                 };
                 RetainedParamType::ClassInstance(
                     name,
                     ci.args()
                         .iter()
-                        .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
+                        .map(|a| retained_param_type(&a, code, ctx, enclosing, b))
                         .collect(),
                 )
             }
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
-        Node::AliasType(a) => match retained_name(ctx, &a.name()) {
-            Some(name) => {
-                // A bare alias written inside a declaration resolves to the
-                // alias that declaration defines — `selector` inside
-                // `class String` retains `String::selector`, the reference's
-                // env-qualified name its `expected:` label renders
-                // (rigor-rs#463).
-                // `enclosing` entries are already qualified
-                // (`["A", "A::B"]`), so the prefix to prepend is the LAST.
-                let name = if !name.contains("::") {
-                    enclosing
-                        .last()
-                        .map(|scope| format!("{scope}::{name}"))
-                        .and_then(|qual| known.get(qual.as_str()).copied())
-                        .unwrap_or(name)
+        Node::AliasType(a) => match written_ref_ctx(ctx, &a.name()) {
+            Some(written) => {
+                // Type-alias names resolve through the non-class arm of
+                // `TypeNameResolver#resolve`: a bare `selector` inside
+                // `class String` retains `String::selector` (rigor-rs#463),
+                // `Foo::bar` resolves its namespace then needs the leaf
+                // declared beneath. `resolve-type-names: false` keeps the
+                // written name (`::`-marker dropped) — see ClassInstance.
+                let stripped = written.strip_prefix("::").unwrap_or(written);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
                 } else {
-                    name
+                    resolve_lexical_type_name(written, enclosing, b).unwrap_or(stripped)
                 };
                 RetainedParamType::Alias(
                     name,
                     a.args()
                         .iter()
-                        .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
+                        .map(|a| retained_param_type(&a, code, ctx, enclosing, b))
                         .collect(),
                 )
             }
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
-        Node::InterfaceType(i) => match retained_name(ctx, &i.name()) {
-            Some(name) => RetainedParamType::Interface(
-                name,
-                i.args()
-                    .iter()
-                    .map(|a| retained_param_type(&a, code, ctx, enclosing, known))
-                    .collect(),
-            ),
+        Node::InterfaceType(i) => match written_ref_ctx(ctx, &i.name()) {
+            Some(written) => {
+                let stripped = written.strip_prefix("::").unwrap_or(written);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_type_name(written, enclosing, b).unwrap_or(stripped)
+                };
+                RetainedParamType::Interface(
+                    name,
+                    i.args()
+                        .iter()
+                        .map(|a| retained_param_type(&a, code, ctx, enclosing, b))
+                        .collect(),
+                )
+            }
             None => RetainedParamType::Other(node_written_form(node, code)),
         },
         Node::UnionType(u) => RetainedParamType::Union(
             u.types()
                 .iter()
-                .map(|t| retained_param_type(&t, code, ctx, enclosing, known))
+                .map(|t| retained_param_type(&t, code, ctx, enclosing, b))
                 .collect(),
         ),
         Node::OptionalType(o) => RetainedParamType::Optional(Box::new(retained_param_type(
@@ -7989,68 +8136,176 @@ fn retained_param_type(
             code,
             ctx,
             enclosing,
-            known,
+            b,
         ))),
         Node::TupleType(t) => RetainedParamType::Tuple(
             t.types()
                 .iter()
-                .map(|e| retained_param_type(&e, code, ctx, enclosing, known))
+                .map(|e| retained_param_type(&e, code, ctx, enclosing, b))
                 .collect(),
         ),
         other => RetainedParamType::Other(node_written_form(other, code)),
     }
 }
 
-/// A retained-parameter leaf name under a project ctx: the post-
-/// `resolve_type_names` spelling WITHOUT the `::` marker (the ATM consumers
-/// compare registry spellings, which carry no root marker).
-fn retained_name(ctx: Option<&FileSigCtx>, tn: &ruby_rbs::node::TypeNameNode) -> Option<&'static str> {
-    member_name(ctx, tn).map(|n| n.strip_prefix("::").unwrap_or(n))
-}
-
-/// A [`RBS::Resolver::TypeNameResolver#resolve_namespace0`]-shaped lexical
-/// resolution for one RELATIVE written class-instance name (`::`-stripped,
-/// `use`-mapped already): the HEAD is tried innermost-scope outward through
-/// `enclosing`, then the root spelling; a hit COMMITS to that scope — every
-/// tail segment must resolve beneath it or the name resolves NOTHING (the
-/// resolver never backtracks to an outer scope once the head landed, and the
-/// builder then keeps the written name). `known` is the build's
-/// `known_type_names` — classes, modules, interfaces, type- and
-/// class/module-aliases — the resolver's `all_names ∪ aliased_name?`.
-/// `None` ⇒ stays written.
+/// A [`RBS::Resolver::TypeNameResolver#resolve`]-shaped lexical resolution
+/// for one written class-instance name (the `type_name.class?` arm — the
+/// whole name goes through `resolve_namespace0`): HEAD binds innermost-scope
+/// outward through `enclosing`, then the root spelling, on `has_type_name? ||
+/// aliased_name?`; a bound CLASS/MODULE-ALIAS normalises through its
+/// `old_name` target resolved in the ALIAS's own declaration context
+/// (`Mutex` ⇒ `Thread::Mutex`); a hit COMMITS to that scope — every tail
+/// segment must resolve beneath it (same alias rule) or the name resolves
+/// NOTHING. `::`-rooted names take the absolute path (root head only).
+/// `None` ⇒ the name stays written.
 fn resolve_lexical_name(
     written: &str,
     enclosing: &[&'static str],
-    known: &HashSet<&'static str>,
+    b: &Builder,
 ) -> Option<&'static str> {
-    let (head, tail) = match written.split_once("::") {
-        Some((h, t)) => (h, Some(t)),
-        None => (written, None),
-    };
-    for scope in enclosing.iter().rev().copied().chain([""]) {
-        let mut ns = if scope.is_empty() {
-            head.to_string()
-        } else {
-            format!("{scope}::{head}")
-        };
-        if !known.contains(ns.as_str()) {
-            continue;
-        }
-        let mut resolved = true;
-        if let Some(tail) = tail {
-            for seg in tail.split("::") {
-                let next = format!("{ns}::{seg}");
-                if known.contains(next.as_str()) {
-                    ns = next;
-                } else {
-                    resolved = false;
-                    break;
+    resolve_lexical_name_in(written, enclosing, &b.known_type_names, &b.class_alias_targets)
+}
+
+/// [`resolve_lexical_name`] over an explicit (known, aliases) table pair —
+/// the unit-testable core the Builder-wrapping call delegates to.
+fn resolve_lexical_name_in(
+    written: &str,
+    enclosing: &[&'static str],
+    known: &HashSet<&'static str>,
+    aliases: &HashMap<&'static str, (&'static str, Vec<&'static str>)>,
+) -> Option<&'static str> {
+    let mut visited: HashSet<String> = HashSet::new();
+    resolve_namespace0(written, enclosing, known, aliases, &mut visited).map(|s| intern(&s))
+}
+
+/// The non-class arm of `TypeNameResolver#resolve` — for `type`/`interface`
+/// leaf names (`foo`, `_Foo`): an EMPTY namespace tries
+/// `has_type_name?(scope::name)` innermost→root WITHOUT the alias hit the
+/// class arm takes (a `type`/`interface` name never lands on a class alias);
+/// a NON-empty namespace resolves through `resolve_namespace0` (aliases
+/// chase there), and the leaf must then be declared directly beneath it.
+fn resolve_lexical_type_name(
+    written: &str,
+    enclosing: &[&'static str],
+    b: &Builder,
+) -> Option<&'static str> {
+    let known = &b.known_type_names;
+    let aliases = &b.class_alias_targets;
+    let body = written.strip_prefix("::").unwrap_or(written);
+    match body.rsplit_once("::") {
+        None => {
+            // `resolve_type_name`: innermost scope outward, then root.
+            if !written.starts_with("::") {
+                for scope in enclosing.iter().rev() {
+                    let cand = format!("{scope}::{body}");
+                    if known.contains(cand.as_str()) {
+                        return Some(intern(&cand));
+                    }
                 }
             }
+            known.get(body).copied()
         }
-        return resolved.then(|| intern(&ns));
+        Some((ns, name)) => {
+            let mut visited: HashSet<String> = HashSet::new();
+            let ns = format!("{}{ns}", if written.starts_with("::") { "::" } else { "" });
+            let resolved = resolve_namespace0(&ns, enclosing, known, aliases, &mut visited)?;
+            let cand = format!("{resolved}::{name}");
+            known.get(cand.as_str()).copied()
+        }
     }
-    None
+}
+
+/// `TypeNameResolver#resolve_namespace0`: split `head, *tail` — the head
+/// binds on `has_type_name? || aliased_name?` (innermost→root, or root only
+/// when `::`-rooted) and COMMITS; a bound alias normalises its `old_name` in
+/// the alias's own decl context (`head = normalize(...) or return head` —
+/// the `or` binds after the assignment, so a failed normalisation makes the
+/// whole name fail to resolve); each tail segment must resolve directly
+/// beneath (`has_type_name?` — real decls only, `known` holds no alias
+/// names — else `aliases.fetch` → `normalize or return m`, a failure that
+/// likewise fails the WHOLE name). `visited` is the `normalize_namespace`
+/// cycle set: an alias chain back onto an in-progress name answers `false`,
+/// which both `or`-clauses read as failure.
+fn resolve_namespace0(
+    written: &str,
+    ctx: &[&'static str],
+    known: &HashSet<&'static str>,
+    aliases: &HashMap<&'static str, (&'static str, Vec<&'static str>)>,
+    visited: &mut HashSet<String>,
+) -> Option<String> {
+    let (absolute, body) = match written.strip_prefix("::") {
+        Some(rest) => (true, rest),
+        None => (false, written),
+    };
+    let mut segs = body.split("::");
+    let head = segs.next()?;
+    let tail: Vec<&str> = segs.collect();
+    // `resolve_head_namespace` — the `aliased_name?` half is folded into the
+    // `known`/`aliases` checks (`known_type_names` carries alias new names).
+    let mut ns: String = if absolute {
+        if known.contains(head) || aliases.contains_key(head) {
+            head.to_string()
+        } else {
+            return None;
+        }
+    } else {
+        let mut hit = None;
+        for scope in ctx.iter().rev().copied().chain([""]) {
+            let cand = if scope.is_empty() {
+                head.to_string()
+            } else {
+                format!("{scope}::{head}")
+            };
+            if known.contains(cand.as_str()) || aliases.contains_key(cand.as_str()) {
+                hit = Some(cand);
+                break;
+            }
+        }
+        hit?
+    };
+    // Head alias: `head = normalize_namespace(head, rhs, ctx) or return head`
+    // — `or` binds AFTER the assignment, so a failed normalisation leaves
+    // `head` falsy and the WHOLE name fails to resolve; the caller keeps the
+    // written spelling, which is what the oracle renders.
+    if let Some((rhs, actx)) = aliases.get(ns.as_str()) {
+        ns = normalize_alias(&ns, rhs, actx, known, aliases, visited)?;
+    }
+    // Tail: `namespace::seg` must be declared, or an alias that normalises.
+    for seg in tail {
+        let cand = format!("{ns}::{seg}");
+        if known.contains(cand.as_str()) {
+            ns = cand;
+            continue;
+        }
+        match aliases.get(cand.as_str()) {
+            Some((rhs, actx)) => match normalize_alias(&cand, rhs, actx, known, aliases, visited) {
+                Some(t) => ns = t,
+                None => return None,
+            },
+            None => return None,
+        }
+    }
+    Some(ns)
+}
+
+/// `TypeNameResolver#normalize_namespace`: resolve an alias's `old_name`
+/// (`rhs`, as WRITTEN — absolute included) in the ALIAS's own declaration
+/// context; `visited` guards `class A = A` / `A = B; B = A` cycles, where a
+/// re-entry answers `None` (the reference's `false`).
+fn normalize_alias(
+    name: &str,
+    rhs: &str,
+    actx: &[&'static str],
+    known: &HashSet<&'static str>,
+    aliases: &HashMap<&'static str, (&'static str, Vec<&'static str>)>,
+    visited: &mut HashSet<String>,
+) -> Option<String> {
+    if !visited.insert(name.to_string()) {
+        return None;
+    }
+    let r = resolve_namespace0(rhs, actx, known, aliases, visited);
+    visited.remove(name);
+    r
 }
 
 /// The verbatim written form of a type node, sliced from the RBS source `code`
