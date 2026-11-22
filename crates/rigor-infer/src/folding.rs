@@ -669,6 +669,9 @@ fn pow_exp_cost(exp: &PowExp) -> (usize, usize) {
 /// One fold's estimated word-ops: `exp_bits` square-and-multiply steps at
 /// `modmul_words` word-ops each, plus `shift_words` per iterated bit for the
 /// `ExpBits` chunk-halving a `PowExp::Big` exponent pays (rigor-rs#850).
+/// `modmul_words` is charged once per bit although a step is really a
+/// squaring plus ~half a multiply (~1.5 modmuls); the per-path limits'
+/// measured calibrations absorb that constant factor.
 fn powmod_work(exp: &PowExp, modmul_words: usize) -> u128 {
     let (exp_bits, shift_words) = pow_exp_cost(exp);
     (exp_bits as u128)
@@ -726,14 +729,16 @@ fn int_pow_mod_result(base: IntReceiver<'_>, e: &Scalar, m: &Scalar) -> FoldOutc
 /// word-op costs ~17ns in release (the per-digit `chunks_mul_small` alloc,
 /// `chunks_cmp` and fixup), so `1 << 24` bounds a fold at ~0.3s and still
 /// passes an RSA-2048 shape (~2k exp bits * ~69² words ≈ 9.9M work). `1 << 28`
-/// once let a single fold run ~4.5s (rigor-rs#837).
+/// once let a single fold run ~4.5s (rigor-rs#837). NOT interchangeable with
+/// [`POWMOD_U128_WORK_LIMIT`]: the paths' per-unit costs differ ~50×.
 const POWMOD_WORK_LIMIT: u128 = 1 << 24;
 
 /// The u128 path's budget: its modmul is a handful of `u128` ops (~8
 /// word-equivalents) and its `ExpBits` shift word-op is a cheap
 /// `decimal_shr_chunks` pass (~0.3ns — a 360k-digit exponent ran ~48G
-/// word-ops ≈ 13s ungated, rigor-rs#850). `1 << 30` bounds a fold at ~0.3s
-/// and still passes a ~53k-digit exponent.
+/// word-ops ≈ 13s ungated, rigor-rs#850). `1 << 30` bounds a fold at ~0.9s
+/// (measured at the ~53k-digit boundary, where the shift term dominates)
+/// and still passes that exponent.
 const POWMOD_U128_WORK_LIMIT: u128 = 1 << 30;
 
 /// `a.pow(e, m)` with an `i64` modulus — the whole computation stays under
@@ -796,7 +801,7 @@ fn int_pow_mod_chunks(base: IntReceiver<'_>, exp: PowExp, d: &str) -> FoldOutcom
     // term alone (exp_bits = C·30, m_words = 3) was a ~32s fold
     // (rigor-rs#850).
     let m_mag = decimal_chunks(d.trim_start_matches('-'));
-    if powmod_work(&exp, m_mag.len().pow(2)) > POWMOD_WORK_LIMIT {
+    if powmod_work(&exp, m_mag.len().saturating_pow(2)) > POWMOD_WORK_LIMIT {
         return FoldOutcome::Declined;
     }
     let cur = match base {
