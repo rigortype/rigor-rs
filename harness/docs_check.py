@@ -8,8 +8,9 @@ mechanical gate is a temporary state, not a decision; this script is the gate.
 
 Checks:
   1. Byte budgets on the session-loaded / on-demand doc set.
-  2. docs/CURRENT_WORK.md carries no status-essay marker — a landed arc folds
-     to ONE ledger line; its detail belongs in docs/notes/ or docs/adr/.
+  2. docs/CURRENT_WORK.md carries no status-essay marker — the file is an
+     in-flight baton, not a running log; detail belongs in docs/notes/,
+     docs/adr/ or the GitHub issue/PR.
   3. Local markdown links in the gated docs resolve (no dangling refs).
 
 Run from the repo root: python3 harness/docs_check.py
@@ -21,8 +22,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# (path, byte budget). CURRENT_WORK.md's budget is the mechanism that forces
-# folding: raise it only with a recorded argument, not to fit a new essay.
+# (path, byte budget). CURRENT_WORK.md's budget is the mechanism that keeps
+# it a baton: raise it only with a recorded argument, not to fit a new essay.
 BUDGETS = [
     ("docs/CURRENT_WORK.md", 24_576),
     ("docs/PORT_BACKLOG.md", 98_304),
@@ -55,7 +56,7 @@ def main() -> int:
     if cw.is_file() and ESSAY_MARKER in cw.read_text(encoding="utf-8"):
         failures.append(
             "docs/CURRENT_WORK.md: status-essay marker '▶▶' present — "
-            "fold the entry to one ledger line and move detail to docs/notes/"
+            "the file is a baton, not a log; move the detail to docs/notes/"
         )
 
     for rel in LINK_CHECKED:
