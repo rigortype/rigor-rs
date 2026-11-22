@@ -53,6 +53,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #830 CLOSED** (PR #831): collect.rs scanner.rb cites resynced (:43→:50, :48→:55, :283→:343); doc-only. [note](notes/20261122-issue-830-collect-cite-drift.md)
 - **2026-11-22 #805 CLOSED** (PR #828): stale `scanner.rb` cite `:201`→`:274`; doc-only. →#830. [note](notes/20261122-issue-805-stale-cite.md)
 - **2026-11-22 #766 CLOSED** (PR #823): FoldOutcome mints → `numeric_blow_up_class` + `fold_result_gate`; `(-4) ** -6803` Rational gain; 0 FP; →#826/#827. [note](notes/20261122-issue-766-fold-blowup-consolidation.md)
 - **2026-11-22 #818 CLOSED** (PR #824): severity PROFILES resynced 28→37 rows verbatim; explain drift guard. 0 FP; →#825. [note](notes/20261122-issue-818-severity-profiles.md)
@@ -142,29 +143,29 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-10-27 splits** #204/#234/#258/#260/#279/#416/#418/#420: infer lib 14,084→144, rules 4,497→95; ast 3,756→80; source_index 4,650→668; lower_node→5. [note](notes/20261027-lower-node-family-split.md)
 - **2026-10-08/14 dead-position + reach arc, folded** (#362–#404): dead.rs exclusion, reach leaks, arg-class gate, blocked/discarded. 0 FP. [dead](notes/20261008-i368-dead-positions.md)/[leaks](notes/20261014-i386-dead-position-leaks.md)
 - **2026-09-30/10-01 CLI + config parity, folded** (#155–#360, PRs #335–#375): Psych config, OptionParser; →#345–#349/#376. [config](notes/20260930-issue-158-config.md)/[optparse](notes/20260930-issue-155-optparse.md)
-- **2026-09-30/10-01 IndexedFlow arc, folded** (#304–#366, #333–#378): stored-slot narrowing + its dropping writes. 0 FP. [slots](notes/20260930-issue-325-slot-narrowing.md) / [blocks](notes/20261001-i366-block-attr-drop.md)
+- **2026-09-30/10-01 IndexedFlow arc, folded** (#304–#366, #333–#378): stored-slot narrowing + dropping writes. 0 FP. [slots](notes/20260930-issue-325-slot-narrowing.md) / [blocks](notes/20261001-i366-block-attr-drop.md)
 - **2026-09-28/30 index-write + scope arc, folded** (#134–#332): index/splice widening, operand replay, closure shadowing. 0 FP/818. [index](notes/20260929-issue-134-index-widening.md)/[operand](notes/20260929-issue-136-operand-scope.md)
 - **2026-09-28/30 output/config/RBS parity, folded** (#162–#201/#281–#323): baseline, output, sig use, witness/list keys. 0 FP. [formats](notes/20260928-issue-163-output-formats.md)/[rbs-use](notes/20260929-issue-168-rbs-use.md)
 - **2026-09-27 #138/#164/#167 ABANDONED** (PRs #184/#177/#183): full-parity review anti-pattern. [note](notes/20260927-abandoned-infer-pr-stream.md).
 - **2026-09-25/28 fold + binder slices, folded** (#121–#166/#148–#283): lookup folds, rebind/binder/splat shapes. 0 FP / 9,337. [rebind](notes/20260925-issue-133-jump-path-rebind.md)
-- **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver. 3,002→827 gaps, 0 FP; →#185–#189/#193. [note](notes/20260926-issue-141-class-eval-defs.md).
+- **2026-09-26 #141 CLOSED** (PR #179): eval-block defs attribute to the receiver. 3,002→827 gaps, 0 FP; →#185–#189. [note](notes/20260926-issue-141-class-eval-defs.md).
 - **2026-09-25 #129 CLOSED** (PR #150): `conforms-to` fires only if provable; 39 FP families in review; 0 FP; →#155–#163. [ADR-0044](adr/0044-conforms-to-directive.md), [note](notes/20260925-conforms-to-audit.md).
-- **2026-09-25 re-pin `v0.3.9 → e59b7b89`** (1,030 commits): 0 FP / 9,337. Raw 8+9 FPs (#1021; `fb781023`, #141); 10 invisible retractions →#133–#138. [note](notes/20260925-repin-e59b7b89.md)
+- **2026-09-25 re-pin `v0.3.9 → e59b7b89`** (1,030 commits): 0 FP / 9,337. Raw 8+9 FPs (#1021; `fb781023`, #141); 10 retractions →#133–#138. [note](notes/20260925-repin-e59b7b89.md)
 - **2026-09-21 #128 CLOSED** (PR #131) — store values named by their typed answer; 0 FP / 9,337; →#132. [note](notes/20260921-issue-128-store-value-typing.md).
-- **2026-09-21 re-pin `v0.3.8 → v0.3.9`** (447 commits): 0 FP / 9,337, gaps 799→892, 108 fixtures, 0 OVER; raw 4 FPs, 3 families. →#128–#130. [note](notes/20260921-repin-v039.md).
-- **2026-09-09 #123 CLOSED — 26 holes = THREE defects** — `::Kernel`→`Gem::Kernel` ×22, `prepend` ×5, SELF-TYPE ×6. 26→0, 0 FP / 9204. [note](notes/20260909-qualified-ancestor-closure-holes.md)
-- **2026-09-09 the 799 gaps ADJUDICATED** by mechanism: **395 behind decisions**; 71 rows on one rbs sig; `check` exit 0 on unparseable files (PR #125); ADR-0033 →#123/24 [799](notes/20260909-gap-adjudication-799.md).
-- **2026-09-09 #118 CLOSED** (PR #120) — generic dispatch declines to `Dynamic[top]` on join risk + untyped arg — 13 FPs closed, 0 matched lost. [note](notes/20260909-generic-dispatch-untyped-arg.md).
+- **2026-09-21 re-pin `v0.3.8 → v0.3.9`** (447 commits): 0 FP / 9,337, gaps 799→892; raw 4 FPs, 3 families. →#128–#130. [note](notes/20260921-repin-v039.md).
+- **2026-09-09 #123 CLOSED — 26 holes = THREE defects** — `::Kernel`→`Gem::Kernel` ×22, `prepend` ×5, SELF-TYPE ×6. 26→0, 0 FP. [note](notes/20260909-qualified-ancestor-closure-holes.md)
+- **2026-09-09 the 799 gaps ADJUDICATED**: **395 behind decisions**; `check` exit 0 on unparseable files (PR #125); ADR-0033 →#123/24 [799](notes/20260909-gap-adjudication-799.md).
+- **2026-09-09 #118 CLOSED** (PR #120) — generic dispatch declines to `Dynamic[top]` on join risk; 13 FPs closed. [note](notes/20260909-generic-dispatch-untyped-arg.md).
 - **2026-09-09 re-pin `v0.3.4 → v0.3.8`** — **0 FP / 9204, gaps 820→799**, 105 fixtures. Raw: 7 retractions + 12 sweep FPs. [note](notes/20260909-repin-v038.md) / [spec](notes/20260909-repin-v038-port-spec.md).
 - **2026-08-26/28 effects GATE lying ×3** (PRs #112/#115/#117) — deleted-arm, `methods:{}`, `omit?`. [s112](notes/20260826-s112-effects-instrument.md)/[s5](notes/20260826-effects-s5-probe.md)/[s116](notes/20260826-s116-snapshot-gate.md).
-- **2026-08-26 LSP honours `rootUri` / `workspaceFolders`** (PR #110) — enters the client's root rather than threading one. [note](notes/20260826-s111-lsp-rooturi.md).
-- **2026-08-25/26 effects 0–3 + frozen-index folded** — 35 MATCH/11 UNDER/0 OVER ([s3](notes/20260826-effects-s3-impl.md)); file order NORMATIVE, eviction BLOCKED, harvest NO-GO ([s113](notes/20260826-s113-fold-capture-impl.md)).
+- **2026-08-26 LSP honours `rootUri`/`workspaceFolders`** (PR #110) — enters the client's root. [note](notes/20260826-s111-lsp-rooturi.md).
+- **2026-08-25/26 effects 0–3 + frozen-index folded** — 35 MATCH/11 UNDER/0 OVER ([s3](notes/20260826-effects-s3-impl.md)); file order NORMATIVE, harvest NO-GO ([s113](notes/20260826-s113-fold-capture-impl.md)).
 - **2026-08-23/25 re-pin `v0.3.2→v0.3.4` + survey (HOLD)** — 0 FP / 9204, gaps 841→820; 50 raw FPs + retractions [note](notes/20260823-repin-v034.md); plugin drift/404s [survey](notes/20260825-upstream-survey-v034-master.md).
 - **2026-08-09 unresolved-const-receiver carrier REJECTED at 0 rows** (PR #89, closed). [note](notes/20260809-unresolved-const-receiver-carrier.md)
 - **2026-08-09 re-pin `v0.3.1→v0.3.2` (+rbs 4.1.1), folded** — 0 FP/9204, gaps 1125→841; shims→overlay; join-wipe; chain-guard meet. [repin](notes/20260809-repin-v032.md)/[meet](notes/20260809-chain-guard-meet.md)
 - **2026-08-08 era, folded (0 FP / 9204)** — narrowing/shape trio #70–#82; `Object` bucket #85; harvest #83/#84.
 - **2026-08-07/08 class-narrowing arc CLOSED, measured stop** (#63–#79): `narrow_class_other`; 0 FP / 9204. [spec](notes/20260807-class-narrowing-slice-spec.md)/[stage3](notes/20260807-narrowing-stage3-spec.md).
-- **2026-08-01/08 instruments + adjudication, folded** — 0-FP gate VACUITY risk; gap CENSUS; LSP keeps LAST GOOD. [fp](notes/20260807-fp-audit-port-side-blind-spots.md)/[census](notes/20260807-gap-census.md)/[lsp](notes/20260801-lsp-config-reload.md).
+- **2026-08-01/08 instruments + adjudication, folded** — 0-FP gate VACUITY risk; gap CENSUS. [fp](notes/20260807-fp-audit-port-side-blind-spots.md)/[census](notes/20260807-gap-census.md)/[lsp](notes/20260801-lsp-config-reload.md).
 - **2026-08-07 ADR-0042 S5: qualified return-lookup** (PR #64) — namespaced receivers via qualified registry; 14 closures, 0 FP/9204; fx 82 pins Tier-3. [spec](notes/20260807-adr0042-s5-return-lookup-spec.md).
 - **2026-08-07 upstream survey + feedback batch 2, folded** — self-diff moved 2 superseded diagnostics; retired GEM_HOME rbs selection ([note](notes/20260807-upstream-survey-v031-to-master.md)).
 - **2026-07-16–31 v0.3.0-RC→v0.3.1 era, folded** — rules ported (`47ec8625`); re-pin+rbs 4.1.0; LSP §12+MCP; sig-gen; BigMath. [specs](notes/20260716-v030-upstream-gap-survey.md)/[pin](notes/20260731-upstream-pin-v031-rbs41.md)/[lsp](notes/20260719-adr0042-gate-deliverables.md).
