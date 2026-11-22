@@ -1512,11 +1512,14 @@ impl PluginEntry {
 
 /// A run-level row the reference's plugin machinery emits —
 /// `plugin_loader.load-error` (entries that fail to resolve) or a plugin's
-/// own `plugin.<id>.load-error` file-missing row. These bypass
-/// `severity_overrides`/`severity_profile` upstream (oracle:
-/// `plugin_loader: "off"` leaves the row at error), so the severity is fixed
-/// here and callers must not re-stamp it. `disable:` reaches only a plugin's
-/// own row, by its qualified id or `plugin.<id>` (v0.4.4, #1953).
+/// own `plugin.<id>.load-error` file-missing row. `severity_overrides:` DOES
+/// reach them upstream (`SeverityStamp` covers the whole stream, #1985): a
+/// `plugin_loader` row answers to its qualified id (`plugin_loader.load-error`),
+/// its bare rule (`load-error`), or a family wildcard; a plugin's own row
+/// only to its qualified id (`plugin.<id>.load-error`) or its `plugin.<id>`
+/// family — so `plugin_loader: "off"` leaves the row at error while
+/// `plugin_loader.load-error: "off"` drops it. `disable:` reaches only a
+/// plugin's own row, by its qualified id or `plugin.<id>` (v0.4.4, #1953).
 #[derive(Debug)]
 pub struct PluginLoadRow {
     /// The qualified rule id text output prints (`[plugin_loader.load-error]`).
