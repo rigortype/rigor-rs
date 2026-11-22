@@ -453,7 +453,7 @@ impl<'i> Typer<'i> {
                     ("empty?", []) if recv_is_subject => {
                         let falsy = match interner.get(ty) {
                             Type::Nominal { class, .. } => match self.source.class_name_for_id(*class) {
-                                Some(name) if name == "Array" => Edge::Other,
+                                Some("Array") => Edge::Other,
                                 _ => Edge::Keep,
                             },
                             Type::Union(ms) => {
