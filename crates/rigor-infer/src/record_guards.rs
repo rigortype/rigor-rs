@@ -243,8 +243,13 @@ impl<'i> Typer<'i> {
     }
 
     fn guarded_locals_into(&self, ast: &LoweredAst, pred: NodeId, out: &mut Vec<String>) {
+        // A `(x)` operand is a `ParenthesesNode`, not a
+        // `LocalVariableReadNode` — `analyse`'s gates decline it upstream
+        // (rigor-rs#820), so it mints no record guard.
         let local = |id: NodeId| match ast.get(id) {
-            Node::LocalVariableRead { name, .. } => Some(name.clone()),
+            Node::LocalVariableRead { name, .. } if !ast.paren_unwrapped(id) => {
+                Some(name.clone())
+            }
             _ => None,
         };
         match ast.get(pred) {

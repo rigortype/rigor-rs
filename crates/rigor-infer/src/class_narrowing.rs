@@ -2233,9 +2233,12 @@ impl<'i> Typer<'i> {
                 // `stable_chain_address` returns nil for it (probes `c7b_ivar`,
                 // `m_two_hop`, `c7e_args_on_hop`, `m_block_on_hop`,
                 // `m_safe_nav_hop`; the last three are reference-silent too,
-                // the first two are recorded coverage gaps).
+                // the first two are recorded coverage gaps). A `(x)`
+                // receiver is a `ParenthesesNode` upstream —
+                // `analyse_class_predicate`/`stable_chain_address` decline
+                // it too (rigor-rs#820).
                 let (target, chain_call) = match ast.get(*r) {
-                    Node::LocalVariableRead { name, .. } => {
+                    Node::LocalVariableRead { name, .. } if !ast.paren_unwrapped(*r) => {
                         (GuardTarget::Local(name.clone()), None)
                     }
                     _ => {
@@ -2252,7 +2255,13 @@ impl<'i> Typer<'i> {
                 Some((vec![g], Vec::new()))
             }
             ("===", 1) => {
+                // `C === (x)` — the operand `(x)` is a `ParenthesesNode`,
+                // not a `LocalVariableReadNode`: unread upstream
+                // (rigor-rs#820).
                 let Node::LocalVariableRead { name, .. } = ast.get(args[0]) else { return None };
+                if ast.paren_unwrapped(args[0]) {
+                    return None;
+                }
                 let class = self.resolved_static_constant(ast, *r, *span)?;
                 let g = (GuardTarget::Local(name.clone()), GuardFact {
                     classes: vec![class],
@@ -2263,22 +2272,28 @@ impl<'i> Typer<'i> {
                 Some((vec![g], Vec::new()))
             }
             ("nil?", 0) => {
+                // `(x).nil?` — the paren'd receiver is unread upstream
+                // (rigor-rs#820).
                 let Node::LocalVariableRead { name, .. } = ast.get(*r) else { return None };
+                if ast.paren_unwrapped(*r) {
+                    return None;
+                }
                 Some((vec![nil_fact(name)], Vec::new()))
             }
             ("==" | "!=", 1) => {
                 // `x == (nil)` / `(nil) == x` are unread:
                 // `equality_local_literal`'s `static_literal_type` reads the
                 // `ParenthesesNode` itself and answers nil for it
-                // (rigor-rs#820).
+                // (rigor-rs#820). So is a `(x)` local on either side — the
+                // `is_a?(LocalVariableReadNode)` gate fails on it.
                 let name = match (ast.get(*r), ast.get(args[0])) {
                     (Node::LocalVariableRead { name, .. }, Node::NilLit { .. })
-                        if !ast.paren_unwrapped(args[0]) =>
+                        if !ast.paren_unwrapped(*r) && !ast.paren_unwrapped(args[0]) =>
                     {
                         name
                     }
                     (Node::NilLit { .. }, Node::LocalVariableRead { name, .. })
-                        if !ast.paren_unwrapped(*r) =>
+                        if !ast.paren_unwrapped(*r) && !ast.paren_unwrapped(args[0]) =>
                     {
                         name
                     }

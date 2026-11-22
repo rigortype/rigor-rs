@@ -421,6 +421,34 @@ impl<'i> Typer<'i> {
                 if block_body.is_empty() =>
             {
                 let (r, span) = (*r, *span);
+                // `(x).m(…)` and `a.m((x))` — `analyse`'s operand gates
+                // read `LocalVariableReadNode`/`ConstantReadNode`/…
+                // classes (`receiver_slot`, `receiver.is_a?`,
+                // `comparison_local_literal`'s `is_a?` checks), so a
+                // `ParenthesesNode` receiver or argument narrows no
+                // subject upstream (`(x).is_a?(C)`, `C === (x)`,
+                // `(x) < 2`, `nil == (x)` all keep on both edges —
+                // rigor-rs#820). Predicate-position parens DO read —
+                // `analyse` unwraps and recurses into them — so `!`'s
+                // operand is excluded. A paren'd RECEIVER declines the
+                // whole call — upstream never reaches the `nil&.m` fold
+                // (`(x)&.nil?` on a nil `x` keeps both edges). A paren'd
+                // ARGUMENT leaves the receiver analysed, so a provably-nil
+                // `&.` carrier still dies on the truthy edge
+                // (`x&.foo((y))` on a nil `x` folds to `nil`).
+                if method != "!" && subject.is_read(ast, r) && ast.paren_unwrapped(r) {
+                    return atom2(Edge::Keep, Edge::Keep);
+                }
+                if method != "!"
+                    && args.iter().any(|a| {
+                        subject.is_read(ast, *a) && ast.paren_unwrapped(*a)
+                    })
+                {
+                    return atom2(
+                        if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                        Edge::Keep,
+                    );
+                }
                 let recv_is_subject = subject.is_read(ast, r);
                 match (method.as_str(), args.as_slice()) {
                     ("!", []) => {
@@ -449,23 +477,17 @@ impl<'i> Typer<'i> {
                     // Constant or a non-Array nominal stays opaque, so the
                     // falsey edge only widens where the reference actually
                     // narrows (`x = []; if x.empty?; else x.frob` fires
-                    // `for []`, rigor-rs#820).
+                    // `for []`, rigor-rs#820). The class name resolves
+                    // through the CORE index — `source.class_name_for_id`
+                    // answers `None` for a core-range `ClassId`.
                     ("empty?", []) if recv_is_subject => {
+                        let is_array = |ty: TypeId| {
+                            matches!(interner.get(ty), Type::Nominal { class, .. }
+                                if self.index.class_name_for_id(*class) == Some("Array"))
+                        };
                         let falsy = match interner.get(ty) {
-                            Type::Nominal { class, .. } => match self.source.class_name_for_id(*class) {
-                                Some("Array") => Edge::Other,
-                                _ => Edge::Keep,
-                            },
-                            Type::Union(ms) => {
-                                if ms.iter().any(|m| {
-                                    matches!(interner.get(*m), Type::Nominal { class, .. }
-                                        if self.source.class_name_for_id(*class) == Some("Array"))
-                                }) {
-                                    Edge::Other
-                                } else {
-                                    Edge::Keep
-                                }
-                            }
+                            Type::Union(ms) if ms.iter().any(|m| is_array(*m)) => Edge::Other,
+                            _ if is_array(ty) => Edge::Other,
                             _ => Edge::Keep,
                         };
                         atom2(
@@ -491,7 +513,10 @@ impl<'i> Typer<'i> {
                             || (subject.is_read(ast, *arg)
                                 && ast.paren_unwrapped(r)) =>
                     {
-                        atom2(Edge::Keep, Edge::Keep)
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
                     }
                     // `x < (lit)` / `x.between?((1), 5)` —
                     // `comparison_local_literal` and
@@ -507,14 +532,20 @@ impl<'i> Typer<'i> {
                             || (subject.is_read(ast, *arg)
                                 && ast.paren_unwrapped(r)) =>
                     {
-                        atom2(Edge::Keep, Edge::Keep)
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
                     }
                     ("between?", [lo, hi])
                         if recv_is_subject
                             && (ast.paren_unwrapped(*lo)
                                 || ast.paren_unwrapped(*hi)) =>
                     {
-                        atom2(Edge::Keep, Edge::Keep)
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
                     }
                     ("==" | "!=", [arg]) if recv_is_subject => {
                         let nil_arg = matches!(
@@ -579,6 +610,7 @@ impl<'i> Typer<'i> {
                                     ty,
                                     true,
                                     interner,
+                                    nil_safe_nav,
                                 ),
                                 self.class_edge(
                                     ast,
@@ -588,6 +620,7 @@ impl<'i> Typer<'i> {
                                     ty,
                                     false,
                                     interner,
+                                    nil_safe_nav,
                                 ),
                             )
                         }
@@ -609,8 +642,8 @@ impl<'i> Typer<'i> {
                             (Edge::Keep, Edge::Keep)
                         } else {
                             atom2(
-                                self.class_edge(ast, r, span, false, ty, true, interner),
-                                self.class_edge(ast, r, span, false, ty, false, interner),
+                                self.class_edge(ast, r, span, false, ty, true, interner, nil_safe_nav),
+                                self.class_edge(ast, r, span, false, ty, false, interner, nil_safe_nav),
                             )
                         }
                     }
@@ -618,7 +651,10 @@ impl<'i> Typer<'i> {
                     // `ParenthesesNode` and answers nil for it: the
                     // predicate narrows nothing upstream (rigor-rs#820).
                     ("respond_to?", [m]) if recv_is_subject && ast.paren_unwrapped(*m) => {
-                        atom2(Edge::Keep, Edge::Keep)
+                        atom2(
+                            if nil_safe_nav { Edge::Empty } else { Edge::Keep },
+                            Edge::Keep,
+                        )
                     }
                     ("respond_to?", [m]) if recv_is_subject => {
                         let name = match ast.get(*m) {
@@ -706,6 +742,7 @@ impl<'i> Typer<'i> {
         ty: TypeId,
         edge: bool,
         interner: &Interner,
+        nil_safe_nav: bool,
     ) -> Edge {
         // The carrier the class test sees: a `Singleton[C]` is the CLASS
         // OBJECT `C`, which answers `is_a?`/`===` as `Class` (`File.is_a?
@@ -736,8 +773,12 @@ impl<'i> Typer<'i> {
             // `ParenthesesNode` and answers nil, rigor-rs#820) — but where
             // a rooted decline is unorderable, an UNREAD operand guards
             // nothing at all: the carrier survives on whichever edge this
-            // is, so `Keep`, not `Other`.
-            None if ast.paren_unwrapped(class_node) => return Edge::Keep,
+            // is, so `Keep`, not `Other` — except a provably-nil `&.`
+            // carrier, whose truthy edge is still dead (`nil&.is_a?` is
+            // `nil`).
+            None if ast.paren_unwrapped(class_node) => {
+                return if nil_safe_nav && edge { Edge::Empty } else { Edge::Keep };
+            }
             None => match ast.get(class_node) {
                 Node::ConstantRead { name, dynamic_base: false, rooted: true, .. }
                     if !name.is_empty() =>

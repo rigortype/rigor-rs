@@ -167,6 +167,8 @@ impl Walk<'_, '_> {
                 ty,
                 true,
                 self.interner,
+                // A `when`/`in` condition is never a `&.` receiver.
+                false,
             ),
             // `when` conditions narrow only on a class constant.
             _ if !in_arm => Edge::Keep,
