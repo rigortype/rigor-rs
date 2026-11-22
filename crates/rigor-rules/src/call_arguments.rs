@@ -490,11 +490,10 @@ fn stub_typed_param(index: &CoreIndex, param: &RetainedParamType, depth: usize) 
             // leaf-keyed, so a QUALIFIED head (`Outer::Inner`,
             // `Thread::Backtrace::Location`) must also consult the qualified
             // registry (rigor-rs#383). No leaf fallback: `Foo::Bar` missing
-            // must decline even when a different `Bar` exists. The alias
-            // table's half stays declined deliberately — the oracle renders a
-            // class alias's TARGET (`class Aliased = Thread::Mutex` ⇒
-            // `expected Thread::Mutex`), which the port cannot yet resolve,
-            // so declining beats a drifted emit.
+            // must decline even when a different `Bar` exists. Class-alias
+            // heads reach here already resolved to their TARGET
+            // (`class Aliased = Thread::Mutex` ⇒ `Thread::Mutex`,
+            // rigor-rs#811), which is exactly the name the oracle renders.
             index.is_synthesized_stub(name)
                 || !(index.knows_class(name) || index.knows_qualified_class(name))
         }

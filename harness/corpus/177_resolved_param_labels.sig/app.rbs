@@ -1,0 +1,43 @@
+# rigor-rs#811 — `expected:` labels render the env-resolved absolute name,
+# never the written leaf. Every row below drifted on master.
+class Top
+  class Widget
+  end
+
+  # Bare sibling: `Widget` resolves `Top::Widget` inside `class Top`.
+  def take: (Widget w) -> void
+end
+
+class W2
+  # Bundled class alias: `Mutex` (thread.rbs `class Mutex = Thread::Mutex`)
+  # normalises to its target.
+  def take_mutex: (Mutex m) -> void
+end
+
+class Aliased = Thread::Mutex
+
+class W3
+  # Project class alias as the param name.
+  def take_alias: (Aliased a) -> void
+end
+
+class Mixin
+  # Nested class alias: `B` qualifies under `Mixin` and its target resolves
+  # in the alias's own decl context.
+  class B = Outer::Inner
+
+  def take: (B b) -> void
+end
+
+module Outer
+  class Inner
+  end
+end
+
+class M
+  # Tail-position alias: `M::Mutex2` is not a `has_type_name?` hit, so the
+  # tail's `aliases.fetch` arm normalises through it.
+  class Mutex2 = Thread::Mutex
+
+  def m2: (Mutex2 x) -> void
+end

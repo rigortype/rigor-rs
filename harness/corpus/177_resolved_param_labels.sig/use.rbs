@@ -1,0 +1,12 @@
+# `use` maps are per-file — the clause and its use site share this file.
+use Lib::Al as Al
+
+class UseCl
+  # `use`-mapped single clause landing on an alias: `Al` rewrites to
+  # `::Lib::Al`, whose tail then chases the alias.
+  def f: (Al x) -> void
+end
+
+module Lib
+  class Al = Thread::Mutex
+end
