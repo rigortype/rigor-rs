@@ -136,12 +136,13 @@ impl fmt::Display for ResolvedSeverity {
 // The three PROFILES tables, dumped VERBATIM from the pinned reference
 // (`lib/rigor/configuration/severity_profile.rb`'s `PROFILES` constant, RC pin
 // — see the reference file for the per-row ADR commentary this port does not
-// duplicate). Do not edit or reorder; each has exactly 28 rows, alphabetical
+// duplicate). Do not edit or reorder; each has exactly 37 rows, alphabetical
 // by rule id.
 
 const LENIENT: &[(&str, ResolvedSeverity)] = &[
     ("assert.type-mismatch", ResolvedSeverity::Error),
     ("call.argument-type-mismatch", ResolvedSeverity::Warning),
+    ("call.deprecated-ruby2-keywords", ResolvedSeverity::Info),
     ("call.possible-nil-receiver", ResolvedSeverity::Warning),
     ("call.raise-non-exception", ResolvedSeverity::Warning),
     ("call.self-undefined-method", ResolvedSeverity::Off),
@@ -155,6 +156,10 @@ const LENIENT: &[(&str, ResolvedSeverity)] = &[
     ("def.override-visibility-reduced", ResolvedSeverity::Off),
     ("def.return-type-mismatch", ResolvedSeverity::Warning),
     ("dump.type", ResolvedSeverity::Info),
+    ("effect.annotations-unchecked", ResolvedSeverity::Info),
+    ("effect.envelope-exceeded", ResolvedSeverity::Warning),
+    ("effect.liskov-widened", ResolvedSeverity::Warning),
+    ("effect.unknown-label", ResolvedSeverity::Info),
     ("flow.always-raises", ResolvedSeverity::Warning),
     ("flow.always-truthy-condition", ResolvedSeverity::Info),
     ("flow.dead-assignment", ResolvedSeverity::Info),
@@ -163,6 +168,10 @@ const LENIENT: &[(&str, ResolvedSeverity)] = &[
     ("flow.shadowed-rescue-clause", ResolvedSeverity::Info),
     ("flow.unreachable-branch", ResolvedSeverity::Info),
     ("flow.unreachable-clause", ResolvedSeverity::Info),
+    ("global.readonly-write", ResolvedSeverity::Error),
+    ("global.write-type-mismatch", ResolvedSeverity::Warning),
+    ("plugin.api-surface", ResolvedSeverity::Off),
+    ("rbs.contradicting-signature", ResolvedSeverity::Error),
     ("rbs_extended.unsatisfied-conformance", ResolvedSeverity::Warning),
     ("static.value-use.void", ResolvedSeverity::Off),
     ("suppression.empty", ResolvedSeverity::Warning),
@@ -173,6 +182,7 @@ const LENIENT: &[(&str, ResolvedSeverity)] = &[
 const BALANCED: &[(&str, ResolvedSeverity)] = &[
     ("assert.type-mismatch", ResolvedSeverity::Error),
     ("call.argument-type-mismatch", ResolvedSeverity::Error),
+    ("call.deprecated-ruby2-keywords", ResolvedSeverity::Warning),
     ("call.possible-nil-receiver", ResolvedSeverity::Error),
     ("call.raise-non-exception", ResolvedSeverity::Error),
     ("call.self-undefined-method", ResolvedSeverity::Off),
@@ -186,6 +196,10 @@ const BALANCED: &[(&str, ResolvedSeverity)] = &[
     ("def.override-visibility-reduced", ResolvedSeverity::Warning),
     ("def.return-type-mismatch", ResolvedSeverity::Warning),
     ("dump.type", ResolvedSeverity::Info),
+    ("effect.annotations-unchecked", ResolvedSeverity::Info),
+    ("effect.envelope-exceeded", ResolvedSeverity::Warning),
+    ("effect.liskov-widened", ResolvedSeverity::Warning),
+    ("effect.unknown-label", ResolvedSeverity::Info),
     ("flow.always-raises", ResolvedSeverity::Error),
     ("flow.always-truthy-condition", ResolvedSeverity::Warning),
     ("flow.dead-assignment", ResolvedSeverity::Warning),
@@ -194,6 +208,10 @@ const BALANCED: &[(&str, ResolvedSeverity)] = &[
     ("flow.shadowed-rescue-clause", ResolvedSeverity::Warning),
     ("flow.unreachable-branch", ResolvedSeverity::Warning),
     ("flow.unreachable-clause", ResolvedSeverity::Info),
+    ("global.readonly-write", ResolvedSeverity::Error),
+    ("global.write-type-mismatch", ResolvedSeverity::Error),
+    ("plugin.api-surface", ResolvedSeverity::Off),
+    ("rbs.contradicting-signature", ResolvedSeverity::Error),
     ("rbs_extended.unsatisfied-conformance", ResolvedSeverity::Warning),
     ("static.value-use.void", ResolvedSeverity::Off),
     ("suppression.empty", ResolvedSeverity::Warning),
@@ -204,6 +222,7 @@ const BALANCED: &[(&str, ResolvedSeverity)] = &[
 const STRICT: &[(&str, ResolvedSeverity)] = &[
     ("assert.type-mismatch", ResolvedSeverity::Error),
     ("call.argument-type-mismatch", ResolvedSeverity::Error),
+    ("call.deprecated-ruby2-keywords", ResolvedSeverity::Error),
     ("call.possible-nil-receiver", ResolvedSeverity::Error),
     ("call.raise-non-exception", ResolvedSeverity::Error),
     ("call.self-undefined-method", ResolvedSeverity::Off),
@@ -217,6 +236,10 @@ const STRICT: &[(&str, ResolvedSeverity)] = &[
     ("def.override-visibility-reduced", ResolvedSeverity::Error),
     ("def.return-type-mismatch", ResolvedSeverity::Error),
     ("dump.type", ResolvedSeverity::Error),
+    ("effect.annotations-unchecked", ResolvedSeverity::Info),
+    ("effect.envelope-exceeded", ResolvedSeverity::Error),
+    ("effect.liskov-widened", ResolvedSeverity::Error),
+    ("effect.unknown-label", ResolvedSeverity::Warning),
     ("flow.always-raises", ResolvedSeverity::Error),
     ("flow.always-truthy-condition", ResolvedSeverity::Error),
     ("flow.dead-assignment", ResolvedSeverity::Error),
@@ -225,6 +248,10 @@ const STRICT: &[(&str, ResolvedSeverity)] = &[
     ("flow.shadowed-rescue-clause", ResolvedSeverity::Error),
     ("flow.unreachable-branch", ResolvedSeverity::Error),
     ("flow.unreachable-clause", ResolvedSeverity::Warning),
+    ("global.readonly-write", ResolvedSeverity::Error),
+    ("global.write-type-mismatch", ResolvedSeverity::Error),
+    ("plugin.api-surface", ResolvedSeverity::Off),
+    ("rbs.contradicting-signature", ResolvedSeverity::Error),
     ("rbs_extended.unsatisfied-conformance", ResolvedSeverity::Error),
     ("static.value-use.void", ResolvedSeverity::Off),
     ("suppression.empty", ResolvedSeverity::Warning),
@@ -300,10 +327,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn each_profile_table_has_28_rows() {
-        assert_eq!(LENIENT.len(), 28);
-        assert_eq!(BALANCED.len(), 28);
-        assert_eq!(STRICT.len(), 28);
+    fn each_profile_table_has_37_rows() {
+        assert_eq!(LENIENT.len(), 37);
+        assert_eq!(BALANCED.len(), 37);
+        assert_eq!(STRICT.len(), 37);
     }
 
     #[test]
@@ -389,6 +416,60 @@ mod tests {
             resolve("suppression.unknown-rule", ResolvedSeverity::Info, p, &[], &[]),
             ResolvedSeverity::Warning
         );
+    }
+
+    /// rigor-rs#818 — the nine rows resynced from the pinned reference (the
+    /// same ids #255 found missing from `explain`'s catalogue). The spot
+    /// checks cover the profile values that diverge from the authored
+    /// severity, which is what makes a missing row a trap.
+    #[test]
+    fn resynced_rows_spot_checks() {
+        // `global.write-type-mismatch` is authored :error but resolves like
+        // `call.argument-type-mismatch` under lenient; `global.readonly-write`
+        // is an error in every profile.
+        assert_eq!(
+            resolve("global.write-type-mismatch", ResolvedSeverity::Error, Profile::Lenient, &[], &[]),
+            ResolvedSeverity::Warning
+        );
+        assert_eq!(
+            resolve("global.readonly-write", ResolvedSeverity::Error, Profile::Lenient, &[], &[]),
+            ResolvedSeverity::Error
+        );
+        // `call.deprecated-ruby2-keywords`: info / warning / error.
+        assert_eq!(
+            resolve("call.deprecated-ruby2-keywords", ResolvedSeverity::Error, Profile::Lenient, &[], &[]),
+            ResolvedSeverity::Info
+        );
+        assert_eq!(
+            resolve("call.deprecated-ruby2-keywords", ResolvedSeverity::Error, Profile::Balanced, &[], &[]),
+            ResolvedSeverity::Warning
+        );
+        // The effect rows: `unknown-label` stops at :warning even under
+        // strict; `annotations-unchecked` stays :info in every profile.
+        assert_eq!(
+            resolve("effect.unknown-label", ResolvedSeverity::Error, Profile::Strict, &[], &[]),
+            ResolvedSeverity::Warning
+        );
+        assert_eq!(
+            resolve("effect.annotations-unchecked", ResolvedSeverity::Error, Profile::Strict, &[], &[]),
+            ResolvedSeverity::Info
+        );
+        assert_eq!(
+            resolve("effect.envelope-exceeded", ResolvedSeverity::Error, Profile::Strict, &[], &[]),
+            ResolvedSeverity::Error
+        );
+        // `plugin.api-surface` is :off and `rbs.contradicting-signature` is
+        // :error in all three profiles.
+        for p in [Profile::Lenient, Profile::Balanced, Profile::Strict] {
+            assert_eq!(
+                resolve("plugin.api-surface", ResolvedSeverity::Error, p, &[], &[]),
+                ResolvedSeverity::Off
+            );
+            assert_eq!(
+                resolve("rbs.contradicting-signature", ResolvedSeverity::Error, p, &[], &[]),
+                ResolvedSeverity::Error
+            );
+        }
     }
 
     #[test]
