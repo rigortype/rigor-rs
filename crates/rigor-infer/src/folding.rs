@@ -414,6 +414,14 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> FoldOutcome {
         return int_pow_result(a, b);
     }
 
+    // `Integer#pow(exp, mod)` — the reference's `invoke_ternary` path: `pow`
+    // is a catalog `:leaf`, and there is NO `numeric_blow_up_class` precheck
+    // for the two-arg shape — the result is bounded by |mod| anyway
+    // (rigor-rs#769).
+    if let ("pow", [e, m]) = (method, args) {
+        return int_pow_mod_result(IntReceiver::Int(a), e, m);
+    }
+
     // Binary on a single Integer argument.
     let b = match args {
         [Scalar::Int(b)] => *b,
@@ -611,9 +619,174 @@ fn int_pow_result(a: i64, b: &Scalar) -> FoldOutcome {
             )),
             _ => unreachable!("a non-unit base widened at numeric_blow_up_class"),
         },
-        // A Float exponent is not foldable (`safe?` declines the non-Integer
-        // arg before `numeric_blow_up_class`).
+        // A Float exponent: `rb_int_pow` coerces to doubles (`2 ** 0.5` →
+        // `1.4142135623730951`); a NaN — a Ruby Complex — declines like the
+        // reference's `foldable_constant_value?` (rigor-rs#769).
+        Scalar::Float(f) => float_pow_result(a as f64, *f),
         _ => FoldOutcome::Declined,
+    }
+}
+
+/// `a ** e` through doubles — `rb_int_pow`/`rb_float_pow`'s coerce fallback
+/// (`pow(a, b)` in C doubles). A NaN result is a Ruby Complex (`(-2) ** 0.5`),
+/// which the reference's `foldable_constant_value?` declines; `±Infinity`,
+/// `±0.0` and every finite value are foldable `Constant`s.
+fn float_pow_result(a: f64, e: f64) -> FoldOutcome {
+    let r = a.powf(e);
+    if r.is_nan() {
+        FoldOutcome::Declined
+    } else {
+        FoldOutcome::Value(Scalar::Float(r))
+    }
+}
+
+/// A non-negative `pow(exp, mod)` exponent at any width — an `i64`'s bits or
+/// a `BigInt`'s decimal-chunk bit stream. A negative exponent raises
+/// `RangeError` under a modulus and is declined by the caller; a non-Integer
+/// operand raises `TypeError` — both are `invoke_ternary`'s rescued declines.
+enum PowExp {
+    Small(u64),
+    Big(Vec<u64>),
+}
+
+/// The exponent's bits, least-significant first — the stream
+/// square-and-multiply consumes. `Small` reads the `u64`; `Big` halves the
+/// little-endian base-1e9 chunks with [`decimal_shr_chunks`].
+struct ExpBits(PowExp);
+
+impl Iterator for ExpBits {
+    type Item = bool;
+
+    fn next(&mut self) -> Option<bool> {
+        match &mut self.0 {
+            PowExp::Small(e) => {
+                if *e == 0 {
+                    None
+                } else {
+                    let bit = *e & 1 == 1;
+                    *e >>= 1;
+                    Some(bit)
+                }
+            }
+            PowExp::Big(chunks) => {
+                if chunks.iter().all(|&c| c == 0) {
+                    None
+                } else {
+                    let bit = chunks[0] & 1 == 1;
+                    decimal_shr_chunks(chunks, 1);
+                    Some(bit)
+                }
+            }
+        }
+    }
+}
+
+/// `Integer#pow(exp, mod)` — the reference's `invoke_ternary` fold
+/// (`constant_folding.rb`: `pow` is a catalog `:leaf`). Modular
+/// exponentiation, so the result has the divisor's sign and magnitude under
+/// |mod| (`2.pow(5, -3)` → `-1`, `2.pow(20000, 97)` → `35`). Ruby raises on a
+/// `0` modulus (`ZeroDivisionError`), a negative exponent (`RangeError`) and
+/// a non-Integer operand (`TypeError`) — all three decline, matching the
+/// reference's rescue-to-nil (rigor-rs#769).
+fn int_pow_mod_result(base: IntReceiver<'_>, e: &Scalar, m: &Scalar) -> FoldOutcome {
+    let exp = match e {
+        Scalar::Int(v) if *v >= 0 => PowExp::Small(v.unsigned_abs()),
+        Scalar::BigInt(d) if !d.starts_with('-') => PowExp::Big(decimal_chunks(d)),
+        _ => return FoldOutcome::Declined,
+    };
+    match m {
+        Scalar::Int(m) if *m != 0 => int_pow_mod_u128(base, exp, *m),
+        Scalar::BigInt(d) => int_pow_mod_chunks(base, exp, d),
+        _ => FoldOutcome::Declined,
+    }
+}
+
+/// `a.pow(e, m)` with an `i64` modulus — the whole computation stays under
+/// `u128` (`|m| <= 2**63`, so a product of residues is under `2**126`).
+fn int_pow_mod_u128(base: IntReceiver<'_>, exp: PowExp, m: i64) -> FoldOutcome {
+    let mm = (m as i128).unsigned_abs();
+    let mut cur = match base {
+        IntReceiver::Int(a) => i128::from(a).rem_euclid(mm as i128) as u128,
+        IntReceiver::Big(d) => decimal_mod_u128(d, mm),
+    };
+    let mut r = 1 % mm;
+    for bit in ExpBits(exp) {
+        if bit {
+            r = r * cur % mm;
+        }
+        cur = cur * cur % mm;
+    }
+    // The result takes the divisor's sign (`ruby_mod` semantics): the
+    // canonical residue `r` is the answer for `m > 0`, `r - |m|` for `m < 0`.
+    let signed = if m > 0 || r == 0 {
+        r as i128
+    } else {
+        r as i128 - mm as i128
+    };
+    // |signed| < |m| <= 2**63, so the cast cannot fail.
+    FoldOutcome::Value(Scalar::Int(i64::try_from(signed).unwrap_or(i64::MAX)))
+}
+
+/// `|d| mod mm` by base-1e9 Horner reduction — the canonical (non-negative)
+/// residue of a `Scalar::BigInt` receiver for [`int_pow_mod_u128`].
+fn decimal_mod_u128(d: &str, m: u128) -> u128 {
+    let chunks = decimal_chunks(d.trim_start_matches('-'));
+    let mut r = 0u128;
+    for &c in chunks.iter().rev() {
+        r = (r * 1_000_000_000 + u128::from(c)) % m;
+    }
+    if d.starts_with('-') && r != 0 { m - r } else { r }
+}
+
+/// `a.pow(e, m)` with a `BigInt` modulus — chunk modular exponentiation. The
+/// result is bounded by |m| and exits through [`big_scalar`]'s
+/// [`INTEGER_FOLD_BIT_LIMIT`] gate like every spelled integer result
+/// (rigor-rs#769). The work estimate (`exp_bits * m_words²`) is bounded — a
+/// pathological modulus past it declines, the zero-FP-safe side.
+fn int_pow_mod_chunks(base: IntReceiver<'_>, exp: PowExp, d: &str) -> FoldOutcome {
+    // ~`log2(exp) * m_words` modmul word-ops — decline a computation the
+    // reference's native bignum does invisibly but this port cannot afford.
+    const WORK_LIMIT: u128 = 1 << 28;
+    let exp_bits = match &exp {
+        PowExp::Small(e) => 64 - e.leading_zeros() as usize,
+        PowExp::Big(chunks) => chunks.len() * 30,
+    };
+    let m_mag = decimal_chunks(d.trim_start_matches('-'));
+    if (exp_bits as u128).saturating_mul((m_mag.len() as u128).pow(2)) > WORK_LIMIT {
+        return FoldOutcome::Declined;
+    }
+    let cur = match base {
+        IntReceiver::Int(a) => {
+            // |a| < 2**63 <= |m|: the canonical residue is `a` itself for
+            // `a >= 0`, `|m| - |a|` for `a < 0`.
+            let a_mag = decimal_chunks(&a.unsigned_abs().to_string());
+            if a >= 0 {
+                a_mag
+            } else {
+                chunks_sub(&m_mag, &a_mag)
+            }
+        }
+        IntReceiver::Big(bd) => {
+            let r = chunks_mod(&decimal_chunks(bd.trim_start_matches('-')), &m_mag);
+            if bd.starts_with('-') && !chunks_is_zero(&r) {
+                chunks_sub(&m_mag, &r)
+            } else {
+                r
+            }
+        }
+    };
+    let mut r = chunks_mod(&[1], &m_mag);
+    let mut cur = cur;
+    for bit in ExpBits(exp) {
+        if bit {
+            r = chunks_modmul(&r, &cur, &m_mag);
+        }
+        cur = chunks_modmul(&cur, &cur, &m_mag);
+    }
+    if d.starts_with('-') && !chunks_is_zero(&r) {
+        big_scalar(format!("-{}", chunks_to_decimal(false, &chunks_sub(&m_mag, &r))))
+    } else {
+        big_scalar(chunks_to_decimal(false, &r))
     }
 }
 
@@ -822,6 +995,194 @@ fn decimal_oversized(spelling: &str) -> bool {
     }
 }
 
+/// True when every base-1e9 chunk is zero.
+fn chunks_is_zero(chunks: &[u64]) -> bool {
+    chunks.iter().all(|&c| c == 0)
+}
+
+/// Order two little-endian base-1e9 chunk vectors by magnitude (leading
+/// zero words ignored).
+fn chunks_cmp(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+    fn len(a: &[u64]) -> usize {
+        a.iter().rposition(|&c| c != 0).map_or(0, |p| p + 1)
+    }
+    let (la, lb) = (len(a), len(b));
+    la.cmp(&lb).then_with(|| {
+        (0..la)
+            .rev()
+            .map(|i| a[i].cmp(&b[i]))
+            .find(|o| *o != std::cmp::Ordering::Equal)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+/// `a - b` on little-endian base-1e9 chunks — caller guarantees `a >= b`.
+fn chunks_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let mut out = a.to_vec();
+    out.resize(a.len().max(b.len()), 0);
+    chunks_sub_shift(&mut out, b, 0);
+    out
+}
+
+/// `u -= p * CHUNK**shift` in place — caller guarantees `p << shift <= u`.
+fn chunks_sub_shift(u: &mut Vec<u64>, p: &[u64], shift: usize) {
+    const CHUNK: u64 = 1_000_000_000;
+    let mut borrow = 0u64;
+    for (i, word) in u.iter_mut().enumerate().skip(shift) {
+        // `sub` can reach CHUNK (`p`-word CHUNK-1 plus a borrow) — `u[i]` is
+        // always below it, so the borrow arm is the only reachable one then.
+        let sub = p.get(i - shift).copied().unwrap_or(0) + borrow;
+        if *word >= sub {
+            *word -= sub;
+            borrow = 0;
+        } else {
+            *word += CHUNK - sub;
+            borrow = 1;
+        }
+    }
+    while u.last() == Some(&0) {
+        u.pop();
+    }
+}
+
+/// `a * f` on little-endian base-1e9 chunks for a `u128` factor
+/// (normalisation factors, quotient digits — always below `2 * CHUNK`).
+fn chunks_mul_small(a: &[u64], f: u128) -> Vec<u64> {
+    const CHUNK: u128 = 1_000_000_000;
+    let mut out = Vec::with_capacity(a.len() + 2);
+    let mut carry = 0u128;
+    for &c in a {
+        let cur = u128::from(c) * f + carry;
+        out.push((cur % CHUNK) as u64);
+        carry = cur / CHUNK;
+    }
+    while carry > 0 {
+        out.push((carry % CHUNK) as u64);
+        carry /= CHUNK;
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// `a / f` (exact) on little-endian base-1e9 chunks for a `u128` divisor —
+/// the denormalisation step of [`chunks_mod`].
+fn chunks_div_small(a: &[u64], f: u128) -> Vec<u64> {
+    const CHUNK: u128 = 1_000_000_000;
+    let mut out = vec![0u64; a.len()];
+    let mut r = 0u128;
+    for i in (0..a.len()).rev() {
+        let cur = r * CHUNK + u128::from(a[i]);
+        out[i] = (cur / f) as u64;
+        r = cur % f;
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// `a * b` on little-endian base-1e9 chunks — schoolbook, `u128`
+/// accumulation.
+fn chunks_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+    const CHUNK: u128 = 1_000_000_000;
+    let mut out = vec![0u64; a.len() + b.len() + 1];
+    for (i, &x) in a.iter().enumerate() {
+        let mut carry = 0u128;
+        for (j, &y) in b.iter().enumerate() {
+            let cur = u128::from(out[i + j]) + u128::from(x) * u128::from(y) + carry;
+            out[i + j] = (cur % CHUNK) as u64;
+            carry = cur / CHUNK;
+        }
+        let mut k = i + b.len();
+        while carry > 0 {
+            let cur = u128::from(out[k]) + carry;
+            out[k] = (cur % CHUNK) as u64;
+            carry = cur / CHUNK;
+            k += 1;
+        }
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// `a mod m` on little-endian base-1e9 chunks (`m` non-zero) — the division
+/// half of [`chunks_modmul`]. Each quotient digit is estimated from the
+/// leading words after normalising the divisor's top word past `CHUNK/2`
+/// (Knuth's bound: the estimate overshoots by at most 2, so the fixup loop
+/// is bounded).
+fn chunks_mod(a: &[u64], m: &[u64]) -> Vec<u64> {
+    const CHUNK: u128 = 1_000_000_000;
+    if chunks_cmp(a, m) == std::cmp::Ordering::Less {
+        return a.to_vec();
+    }
+    if m.len() == 1 {
+        let d = u128::from(m[0]);
+        let mut r = 0u128;
+        for &c in a.iter().rev() {
+            r = (r * CHUNK + u128::from(c)) % d;
+        }
+        return if r == 0 { vec![] } else { vec![r as u64] };
+    }
+    // Normalise so `v`'s top word is >= CHUNK/2.
+    let f = CHUNK / (u128::from(*m.last().unwrap_or(&1)) + 1);
+    let v = chunks_mul_small(m, f);
+    let mut u = chunks_mul_small(a, f);
+    let n = v.len();
+    let qlen = u.len() + 1 - n;
+    for j in (0..qlen).rev() {
+        // `u` shrinks below `j + n` as the high quotient digits resolve —
+        // both top words read 0 past its end.
+        let num = u128::from(u.get(j + n).copied().unwrap_or(0)) * CHUNK
+            + u128::from(u.get(j + n - 1).copied().unwrap_or(0));
+        let mut qd = (num / u128::from(v[n - 1])).min(CHUNK - 1);
+        let mut prod = chunks_mul_small(&v, qd);
+        // `prod << j <= u` iff `prod <= u >> j` (the `j` low words of `u`
+        // only shrink the difference further).
+        while chunks_cmp(&prod, &u[j.min(u.len())..]) == std::cmp::Ordering::Greater {
+            qd -= 1;
+            prod = chunks_mul_small(&v, qd);
+        }
+        if qd > 0 {
+            chunks_sub_shift(&mut u, &prod, j);
+        }
+    }
+    // Denormalise the remainder.
+    let r = chunks_div_small(&u, f);
+    debug_assert!(chunks_cmp(&r, m) == std::cmp::Ordering::Less);
+    r
+}
+
+/// `x * y mod m` on little-endian base-1e9 chunks.
+fn chunks_modmul(x: &[u64], y: &[u64], m: &[u64]) -> Vec<u64> {
+    chunks_mod(&chunks_mul(x, y), m)
+}
+
+/// `|d| ** e` spelled in decimal — the `Scalar::BigInt` counterpart of
+/// [`decimal_pow`]. `e` is bounded by the caller's `power_blow_up` estimate
+/// (a lower bound, so an oversized result is still possible): the spelled
+/// result exits through [`big_scalar`]'s gate, and the loop stops once the
+/// spelling provably passes [`INTEGER_FOLD_BIT_LIMIT`] — 457 base-1e9 words
+/// hold at least `9*456` digits ≈ 13.6k bits — answering the boundary
+/// spelling the gate widens (rigor-rs#769).
+fn chunks_pow(d: &str, e: u64) -> String {
+    const WORD_CAP: usize = 457;
+    let base = decimal_chunks(d);
+    let mut acc: Vec<u64> = vec![1];
+    for _ in 0..e {
+        acc = chunks_mul(&acc, &base);
+        if acc.len() > WORD_CAP {
+            // A spelling strictly past the limit — oversized under the
+            // negative-magnitude gate too (which compares `>`, not `>=`).
+            return decimal_shl(1, INTEGER_FOLD_BIT_LIMIT + 1);
+        }
+    }
+    chunks_to_decimal(false, &acc)
+}
+
 /// Ordering of two integer scalars at any width — `i64` pairs compare
 /// directly, `BigInt`s through their decimal spellings.
 fn int_scalar_cmp(a: &Scalar, b: &Scalar) -> Option<std::cmp::Ordering> {
@@ -972,20 +1333,41 @@ fn fold_bigint(d: &str, method: &str, args: &[Scalar]) -> FoldOutcome {
             bigint_shift(d, if method == "<<" { shift } else { shift.saturating_neg() })
         }
         ("**" | "pow", [b]) => bigint_pow_result(d, b),
+        // `Integer#pow(exp, mod)` on a BigInt receiver — the reference folds
+        // it through the same `invoke_ternary` catalog leaf (rigor-rs#769).
+        ("pow", [e, m]) => int_pow_mod_result(IntReceiver::Big(d), e, m),
         _ => FoldOutcome::Declined,
     }
 }
 
 /// The compute side of `**`/`pow` on a `Scalar::BigInt` base, reached once
-/// `numeric_blow_up_class` passed: only the unit-exponent folds remain —
-/// `v ** 0 == 1` at any width, and `v ** 1 == v` still subject to
-/// `fold_result`'s `oversized_number?` gate, which is [`big_scalar`]'s job.
-/// Everything else declines like the other BigInt arithmetic members
-/// (rigor-rs#695) — a Bignum exponent already widened at the precheck.
+/// `numeric_blow_up_class` passed: `v ** 0 == 1` at any width, `v ** 1 == v`,
+/// and any result small enough to survive `fold_result`'s
+/// `oversized_number?` gate is spelled by [`chunks_pow`] and exits through
+/// [`big_scalar`] — `(10**20) ** 2` answers the `10**40` literal like the
+/// reference (rigor-rs#769). A negative exponent's Rational DENOMINATOR is
+/// spelled the same way for [`rational_oversized`]'s gate (`(10**20) ** -1`
+/// declines like the fitting-denominator `i64` rows do). A Float exponent
+/// coerces the receiver through `rb_big2dbl` into [`float_pow_result`]. A
+/// Bignum exponent already widened at the precheck (|v| >= 2**63 is never a
+/// unit base), so it is unreachable here.
 fn bigint_pow_result(d: &str, arg: &Scalar) -> FoldOutcome {
     match arg {
-        Scalar::Int(0) => FoldOutcome::Value(Scalar::Int(1)),
-        Scalar::Int(1) => big_scalar(d.to_string()),
+        Scalar::Int(e) if *e < 0 => {
+            rational_oversized(chunks_pow(d.trim_start_matches('-'), e.unsigned_abs()))
+        }
+        Scalar::Int(e) => {
+            let spelled = chunks_pow(d.trim_start_matches('-'), *e as u64);
+            if d.starts_with('-') && *e % 2 == 1 {
+                big_scalar(format!("-{spelled}"))
+            } else {
+                big_scalar(spelled)
+            }
+        }
+        Scalar::Float(f) => match d.parse::<f64>() {
+            Ok(v) => float_pow_result(v, *f),
+            Err(_) => FoldOutcome::Declined,
+        },
         _ => FoldOutcome::Declined,
     }
 }
@@ -1050,6 +1432,27 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
     }
     if method == "<=>" {
         return float_cmp(a, args);
+    }
+    // `Float#**` (`rb_float_pow`, NUMERIC_BINARY's `:**`): Integer and Float
+    // exponents fold in doubles; a Bignum exponent converts through
+    // `rb_big2dbl` (`±Infinity` past f64 — the same rounding Rust's
+    // `str::parse::<f64>` performs, so `2.0 ** (10**30)` answers `Infinity`
+    // like the oracle). `Float#pow` is deliberately NOT folded: it is not in
+    // NUMERIC_BINARY and the catalog gates it off a Float receiver — the
+    // oracle answers `undefined method 'pow'` (rigor-rs#769). A NaN — a
+    // Ruby Complex — declines like the reference's
+    // `foldable_constant_value?`.
+    if method == "**" {
+        let e = match args {
+            [Scalar::Float(e)] => Some(*e),
+            [Scalar::Int(e)] => Some(*e as f64),
+            [Scalar::BigInt(d)] => d.parse::<f64>().ok(),
+            _ => None,
+        };
+        return e.and_then(|e| {
+            let r = a.powf(e);
+            (!r.is_nan()).then_some(Scalar::Float(r))
+        });
     }
     // Binary on a single Float argument. We deliberately do NOT fold
     // Float op Integer (mixed coercion) here — that stays simple and exact.
@@ -1848,6 +2251,111 @@ mod tests {
         assert!(sidecar_blows_up("ljust", &[Scalar::Int(3_000_000_000), Scalar::Str("-".into())]));
         assert!(sidecar_blows_up("center", &[Scalar::BigInt("99999999999999999999".into())]));
         assert!(!sidecar_blows_up("tr", &[Scalar::Int(9999)]));
+    }
+
+    /// rigor-rs#769 — the reference folds `Integer#pow(exp, mod)` through
+    /// `invoke_ternary` (a catalog `:leaf` with no `numeric_blow_up_class`
+    /// precheck), `BigInt`-receiver `**` computes small results, and
+    /// `Float#**` folds in doubles. Every expectation is oracle-verified.
+    #[test]
+    fn folds_pow_variants() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        // `pow(exp, mod)` — modular exponentiation, sign of the divisor.
+        assert_eq!(fold(&i(2), "pow", &[i(20000), i(97)]), Some(i(35)));
+        assert_eq!(fold(&i(2), "pow", &[i(5), i(3)]), Some(i(2)));
+        assert_eq!(fold(&i(2), "pow", &[i(5), i(-3)]), Some(i(-1)));
+        assert_eq!(fold(&i(2), "pow", &[i(4), i(-7)]), Some(i(-5)));
+        assert_eq!(fold(&i(2), "pow", &[i(20000), i(-97)]), Some(i(-62)));
+        assert_eq!(fold(&i(-7), "pow", &[i(3), i(5)]), Some(i(2)));
+        assert_eq!(fold(&i(-4), "pow", &[i(3), i(7)]), Some(i(6)));
+        assert_eq!(fold(&i(2), "pow", &[i(0), i(3)]), Some(i(1)));
+        assert_eq!(fold(&i(2), "pow", &[i(0), i(1)]), Some(i(0)));
+        // Raising rows decline like the reference's rescue: a `0` modulus
+        // (ZeroDivisionError) and a negative exponent (RangeError).
+        assert_eq!(fold(&i(2), "pow", &[i(5), i(0)]), None);
+        assert_eq!(fold(&i(2), "pow", &[i(-1), i(97)]), None);
+        // Non-Integer operands decline (TypeError).
+        assert_eq!(fold(&i(2), "pow", &[Scalar::Float(0.5), i(3)]), None);
+        assert_eq!(fold(&i(2), "pow", &[i(5), Scalar::Float(3.0)]), None);
+        // BigInt receiver / exponent / modulus.
+        assert_eq!(
+            fold(&big("100000000000000000000"), "pow", &[i(3), i(97)]),
+            Some(i(47))
+        );
+        assert_eq!(
+            fold(&i(2), "pow", &[big("10000000000000000000000000000000000000000"), i(97)]),
+            Some(i(61))
+        );
+        assert_eq!(
+            fold(&i(2), "pow", &[i(7), big("1000000000000000000000000000000")]),
+            Some(i(128))
+        );
+        assert_eq!(
+            fold(&i(3), "pow", &[i(100), big("-10000000000000000000000000")]),
+            Some(big("-8870234378727297892477999"))
+        );
+        assert_eq!(
+            fold(
+                &big("1000000000000000000000000000000"),
+                "pow",
+                &[i(9), big("9999999999999999999999999999999999999999999999999999")]
+            ),
+            Some(i(10000000000))
+        );
+        // BigInt `**` computes a result under the bit limit (`10**20) ** 2`).
+        assert_eq!(
+            fold(&big("100000000000000000000"), "**", &[i(2)]),
+            Some(big("10000000000000000000000000000000000000000"))
+        );
+        assert_eq!(
+            fold(&big("-100000000000000000000"), "**", &[i(3)]),
+            Some(big("-1000000000000000000000000000000000000000000000000000000000000"))
+        );
+        assert_eq!(
+            fold(&big("-100000000000000000000"), "**", &[i(2)]),
+            Some(big("10000000000000000000000000000000000000000"))
+        );
+        // A fitting Rational denominator declines like the `i64` rows; an
+        // oversized one widens (both read `None` through `fold`).
+        assert_eq!(fold(&big("100000000000000000000"), "**", &[i(-1)]), None);
+        assert_eq!(fold(&big("100000000000000000000"), "**", &[i(-200)]), None);
+        assert_eq!(fold(&big("100000000000000000000"), "**", &[i(0)]), Some(i(1)));
+        // `Float#**` folds in doubles — Infinity / underflow / signed zero
+        // results included; `pow` on a Float does NOT fold (undefined
+        // method on the oracle).
+        let f = Scalar::Float;
+        assert_eq!(fold(&f(2.0), "**", &[f(5.0)]), Some(f(32.0)));
+        assert_eq!(fold(&f(2.0), "**", &[i(5)]), Some(f(32.0)));
+        assert_eq!(fold(&f(2.0), "**", &[i(-3)]), Some(f(0.125)));
+        assert_eq!(fold(&f(-2.0), "**", &[i(-3)]), Some(f(-0.125)));
+        assert_eq!(fold(&f(2.0), "**", &[i(20000)]), Some(f(f64::INFINITY)));
+        assert_eq!(fold(&f(0.0), "**", &[f(-5.0)]), Some(f(f64::INFINITY)));
+        assert_eq!(
+            fold(&f(2.0), "**", &[big("1000000000000000000000000000000")]),
+            Some(f(f64::INFINITY))
+        );
+        assert_eq!(
+            fold(&f(0.5), "**", &[big("1000000000000000000000000000000")]),
+            Some(f(0.0))
+        );
+        // A NaN — a Ruby Complex — declines.
+        assert_eq!(fold(&f(-2.0), "**", &[f(0.5)]), None);
+        assert_eq!(fold(&f(2.0), "pow", &[f(5.0)]), None);
+        // Integer `**` / `pow` with a Float exponent coerce to doubles.
+        assert_eq!(
+            fold(&i(2), "**", &[f(0.5)]),
+            Some(Scalar::Float(2.0f64.powf(0.5)))
+        );
+        assert_eq!(
+            fold(&i(2), "pow", &[f(0.5)]),
+            Some(Scalar::Float(2.0f64.powf(0.5)))
+        );
+        assert_eq!(fold(&i(-2), "**", &[f(0.5)]), None);
+        assert_eq!(
+            fold(&big("100000000000000000000"), "**", &[f(0.5)]),
+            Some(f(1e20f64.powf(0.5)))
+        );
     }
 
     #[test]
