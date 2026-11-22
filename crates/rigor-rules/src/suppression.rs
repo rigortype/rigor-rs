@@ -30,10 +30,17 @@ pub(crate) const INTERNAL_ERROR_RULE: &str = "internal-error";
 const RULE_FAMILIES: &[&str] =
     &["call", "flow", "assert", "dump", "def", "global", "suppression", "static", "effect"];
 
+/// The family-wildcard tokens (reference `RULE_FAMILIES`). Shared with
+/// `rigor explain`, which prints a family's rules for a bare `<family>` token —
+/// one table, so the two cannot drift (rigor-rs#255).
+pub fn rule_families() -> &'static [&'static str] {
+    RULE_FAMILIES
+}
+
 /// The canonical rule ids rigor-rs can actually emit. Family expansion is
-/// checked against this set (`all` is the separate `SuppressSet::all` flag), so a
-/// `call` family token
-/// only ever expands to the `call.*` ids listed here (the reference expands
+/// checked against this set (`all` is the separate `SuppressSet::all` flag), so
+/// a `call` family token only ever expands to the `call.*` ids listed here (the
+/// reference expands
 /// against its full `ALL_RULES`, but the extra ids it would add match no
 /// rigor-rs diagnostic). A rule rigor-rs emits but this set omits escapes its
 /// family token — `call.unresolved-toplevel` did until #250.
@@ -66,7 +73,7 @@ pub fn implemented_rules() -> &'static [&'static str] {
     IMPLEMENTED_RULES
 }
 
-/// The reference's FULL `ALL_RULES` canonical catalogue (35 ids,
+/// The reference's FULL `ALL_RULES` canonical catalogue (36 ids,
 /// `check_rules/rule_ids.rb`). Deliberately BROADER than [`IMPLEMENTED_RULES`]:
 /// the config audit ([`is_inert_builtin_token`]) uses it to decide whether a
 /// `disable:`/`severity_overrides:` token names a real rule, so it must never
@@ -114,10 +121,25 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "global.write-type-mismatch",
     "global.readonly-write",
     "call.deprecated-ruby2-keywords",
+    // The one built-in id under `plugin.` — it sits in `ALL_RULES`, so
+    // `disable:` / `severity_overrides:` resolve it as a catalogue id before
+    // any plugin-id reading. The `plugin.` prefix already reads as a known
+    // non-check family, so this row is redundant for suppression — but
+    // `explain`'s catalogue test asserts ENTRIES equals this table, and the
+    // table must stay the FULL `ALL_RULES` (36 ids).
+    "plugin.api-surface",
 ];
 
+/// The reference's full `ALL_RULES` canonical catalogue. Shared with
+/// `rigor explain` so its catalogue can never disagree about which ids exist
+/// (rigor-rs#255).
+pub fn all_canonical_rules() -> &'static [&'static str] {
+    ALL_CANONICAL_RULES
+}
+
 /// True when `token` looks like a built-in-family rule id but matches none — its
-/// first `.`-segment is a built-in family (`call`/`flow`/`assert`/`dump`/`def`)
+/// first `.`-segment is a built-in family ([`RULE_FAMILIES`]: `call` / `flow` /
+/// `assert` / `dump` / `def` / `global` / `suppression` / `static` / `effect`)
 /// yet it is neither the bare family wildcard nor a known canonical id, so it is
 /// a likely typo whose `disable:`/`severity_overrides:` entry has no effect.
 ///
@@ -138,32 +160,47 @@ pub fn is_inert_builtin_token(token: &str) -> bool {
     !ALL_CANONICAL_RULES.contains(&token)
 }
 
-/// Maps a legacy short alias to its canonical id (reference `LEGACY_RULE_ALIASES`).
-/// Only the three implemented ids can ever match a real diagnostic; the remaining
-/// aliases are included for forward-compat (they expand to ids no rigor-rs
-/// diagnostic carries, so they are inert).
+/// Legacy unprefixed rule ids → canonical id (reference `LEGACY_RULE_ALIASES`).
+/// 13 of the 18 aliases map to ids rigor-rs actually emits; the remaining five
+/// (`self-undefined-method`, `dump-type`, `assert-type`,
+/// `method-visibility-mismatch`, `unreachable-clause`) are included for
+/// forward-compat — they expand to ids no rigor-rs diagnostic carries, so they
+/// are inert.
+const LEGACY_ALIASES: &[(&str, &str)] = &[
+    ("undefined-method", CALL_UNDEFINED_METHOD),
+    ("self-undefined-method", "call.self-undefined-method"),
+    ("wrong-arity", CALL_WRONG_ARITY),
+    ("argument-type-mismatch", CALL_ARGUMENT_TYPE_MISMATCH),
+    ("possible-nil-receiver", CALL_POSSIBLE_NIL_RECEIVER),
+    ("raise-non-exception", CALL_RAISE_NON_EXCEPTION),
+    ("dump-type", "dump.type"),
+    ("assert-type", "assert.type-mismatch"),
+    ("always-raises", "flow.always-raises"),
+    ("unreachable-branch", "flow.unreachable-branch"),
+    ("method-visibility-mismatch", "def.method-visibility-mismatch"),
+    ("ivar-write-mismatch", "def.ivar-write-mismatch"),
+    ("dead-assignment", "flow.dead-assignment"),
+    ("always-truthy-condition", "flow.always-truthy-condition"),
+    ("unreachable-clause", "flow.unreachable-clause"),
+    ("duplicate-hash-key", FLOW_DUPLICATE_HASH_KEY),
+    ("return-in-ensure", FLOW_RETURN_IN_ENSURE),
+    ("shadowed-rescue-clause", FLOW_SHADOWED_RESCUE_CLAUSE),
+];
+
+/// The full legacy-alias table (reference `LEGACY_RULE_ALIASES`), in the
+/// reference's hash order. Shared with `rigor explain`, which prints an entry's
+/// aliases by reversing it — one table, so the two cannot drift (rigor-rs#255).
+pub fn legacy_aliases() -> &'static [(&'static str, &'static str)] {
+    LEGACY_ALIASES
+}
+
+/// Maps a legacy short alias to its canonical id (reference
+/// `LEGACY_RULE_ALIASES`).
 pub fn legacy_alias(token: &str) -> Option<&'static str> {
-    match token {
-        "undefined-method" => Some(CALL_UNDEFINED_METHOD),
-        "self-undefined-method" => Some("call.self-undefined-method"),
-        "wrong-arity" => Some(CALL_WRONG_ARITY),
-        "argument-type-mismatch" => Some("call.argument-type-mismatch"),
-        "possible-nil-receiver" => Some(CALL_POSSIBLE_NIL_RECEIVER),
-        "dump-type" => Some("dump.type"),
-        "assert-type" => Some("assert.type-mismatch"),
-        "always-raises" => Some("flow.always-raises"),
-        "unreachable-branch" => Some("flow.unreachable-branch"),
-        "method-visibility-mismatch" => Some("def.method-visibility-mismatch"),
-        "ivar-write-mismatch" => Some("def.ivar-write-mismatch"),
-        "dead-assignment" => Some("flow.dead-assignment"),
-        "always-truthy-condition" => Some("flow.always-truthy-condition"),
-        "unreachable-clause" => Some("flow.unreachable-clause"),
-        "raise-non-exception" => Some("call.raise-non-exception"),
-        "duplicate-hash-key" => Some(FLOW_DUPLICATE_HASH_KEY),
-        "return-in-ensure" => Some(FLOW_RETURN_IN_ENSURE),
-        "shadowed-rescue-clause" => Some("flow.shadowed-rescue-clause"),
-        _ => None,
-    }
+    LEGACY_ALIASES
+        .iter()
+        .find(|(legacy, _)| *legacy == token)
+        .map(|(_, canonical)| *canonical)
 }
 
 /// The `pre-eval.*` ids (reference `PRE_EVAL_RULES`), the expansion of the
