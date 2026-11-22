@@ -308,6 +308,12 @@ const VERSION_CONSTANTS: &[&str] = &["Psych::VERSION"];
 /// `:truthy` / `:falsey` for a decidable version-guard predicate, `None` when the
 /// guard is undecidable (both arms stay live — the pre-existing behaviour).
 pub fn verdict(ast: &LoweredAst, predicate: NodeId, runtime: &RubyRuntime) -> Option<Verdict> {
+    // `verdict` dispatches on the Prism node class — a `ParenthesesNode`
+    // predicate is NOT a `CallNode`, so `if (RUBY_VERSION >= "999")`
+    // verdicts nil upstream and keeps both arms live (rigor-rs#820).
+    if ast.paren_unwrapped(predicate) {
+        return None;
+    }
     let Node::Call { receiver, method, args, block_body, args_all_plain, .. } = ast.get(predicate)
     else {
         return None;
@@ -340,6 +346,12 @@ fn is_equality(method: &str) -> bool {
 
 /// Reads one side of the comparison, or `None` when it is not readable.
 fn read_operand(ast: &LoweredAst, node: NodeId, runtime: &RubyRuntime) -> Option<Operand> {
+    // `read_operand`'s `case` likewise reads the `ParenthesesNode` itself:
+    // `RUBY_VERSION >= ("999")`, `(RUBY_VERSION) >= "999"` and a paren'd
+    // `Gem::Version.new` all verdict nil upstream (rigor-rs#820).
+    if ast.paren_unwrapped(node) {
+        return None;
+    }
     match ast.get(node) {
         Node::StringLit { value, .. } => Some(Operand::LiteralString(value.clone())),
         Node::ConstantRead { name, dynamic_base, .. } => {
@@ -662,6 +674,14 @@ mod tests {
             "a if Foo::VERSION < \"5.0\"",
             "a if defined?(Ractor)",
             "a if !(RUBY_VERSION < \"3.4\")",
+            // rigor-rs#820: `verdict`/`read_operand` dispatch on the Prism
+            // node CLASS — a `ParenthesesNode` (the comparison itself,
+            // either operand, or a `Gem::Version.new` operand) verdicts
+            // nil upstream.
+            "a if (RUBY_VERSION < \"3.4\")",
+            "a if (RUBY_VERSION) < \"3.4\"",
+            "a if RUBY_VERSION < (\"3.4\")",
+            "a if (Gem::Version.new(\"9.0\")) <= Gem::Version.new(RUBY_VERSION)",
         ] {
             assert_eq!(first_verdict(src, &host()), None, "{src}");
         }

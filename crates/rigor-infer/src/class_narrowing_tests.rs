@@ -1830,6 +1830,77 @@ fn class_narrowing_parenthesised_operand_matrix() {
             "x = \"s\"\nif (Integer) === x\n  1\nelse\n  x.frobnicate_zzz\nend\n",
             false,
         ),
+        // `x == (nil)` / `(nil) == x` / `x != (nil)` —
+        // `equality_local_literal`'s `static_literal_type` answers nil for
+        // the `ParenthesesNode`, so the equality narrows nothing.
+        (
+            "paren_eq_nil_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x == (nil)\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_eq_nil_else",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x == (nil)\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_nil_eq_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif (nil) == x\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_ne_nil_else",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x != (nil)\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // `x < (lit)` / `x.between?((1), 5)` — `numeric_literal_node?` is
+        // IntegerNode/FloatNode only, so the operand narrows nothing.
+        (
+            "paren_lt_body",
+            "frobnicate_zzz",
+            "x = 1\nif x < (2)\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_lt_else",
+            "frobnicate_zzz",
+            "x = 1\nif x < (2)\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_between_body",
+            "frobnicate_zzz",
+            "x = 1\nif x.between?((2), (5))\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // `x.respond_to?((:m))` — `static_hash_key` answers nil for the
+        // `ParenthesesNode`, so the predicate narrows nothing.
+        (
+            "paren_respond_to_body",
+            "frobnicate_zzz",
+            "x = nil\nif x.respond_to?((:foo))\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_respond_to_else",
+            "frobnicate_zzz",
+            "x = nil\nif x.respond_to?((:foo))\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // `x.is_a?((C)) && x.empty?` — the unread is_a? keeps the carrier,
+        // and `empty?`'s falsey edge narrows only `Nominal[Array]`
+        // (`analyse_array_emptiness_predicate`), so the `&&` falsey join
+        // keeps `"s"` too.
+        (
+            "paren_is_a_and_empty_else",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x.is_a?((Integer)) && x.empty?\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
         // Must-still-suppress controls: the UNparenthesised spelling still
         // decides (`"s"` is never an `Integer`).
         (

@@ -2267,9 +2267,21 @@ impl<'i> Typer<'i> {
                 Some((vec![nil_fact(name)], Vec::new()))
             }
             ("==" | "!=", 1) => {
+                // `x == (nil)` / `(nil) == x` are unread:
+                // `equality_local_literal`'s `static_literal_type` reads the
+                // `ParenthesesNode` itself and answers nil for it
+                // (rigor-rs#820).
                 let name = match (ast.get(*r), ast.get(args[0])) {
-                    (Node::LocalVariableRead { name, .. }, Node::NilLit { .. }) => name,
-                    (Node::NilLit { .. }, Node::LocalVariableRead { name, .. }) => name,
+                    (Node::LocalVariableRead { name, .. }, Node::NilLit { .. })
+                        if !ast.paren_unwrapped(args[0]) =>
+                    {
+                        name
+                    }
+                    (Node::NilLit { .. }, Node::LocalVariableRead { name, .. })
+                        if !ast.paren_unwrapped(*r) =>
+                    {
+                        name
+                    }
                     _ => return None,
                 };
                 let g = nil_fact(name);

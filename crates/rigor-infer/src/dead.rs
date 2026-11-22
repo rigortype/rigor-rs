@@ -1393,7 +1393,10 @@ impl<'i> Typer<'i> {
     }
 
     /// Collect `id` as a `==`-family comparison operand against `peer`,
-    /// when `id` is a bare local.
+    /// when `id` is a bare local. A parenthesised peer is unread:
+    /// `equality_local_literal`'s `static_literal_type` answers nil for the
+    /// `ParenthesesNode` itself (`x == (nil)` narrows nothing upstream,
+    /// rigor-rs#820).
     fn predicate_cmp_local(
         ast: &LoweredAst,
         id: NodeId,
@@ -1402,6 +1405,9 @@ impl<'i> Typer<'i> {
         out: &mut Vec<(String, DeadOp)>,
         dedup: bool,
     ) {
+        if ast.paren_unwrapped(peer) {
+            return;
+        }
         if let Node::LocalVariableRead { name, .. } | Node::LocalVariableWrite { name, .. } =
             ast.get(id)
         {
