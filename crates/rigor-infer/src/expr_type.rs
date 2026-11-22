@@ -742,6 +742,144 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// rigor-rs#770 — the `recv[k]` read on a verbatim-carrier UNION
+    /// (`{a:1} | [1]` `h[0]`). Answers the per-member element envelope the
+    /// reference's `dispatch_union` produces: each member erases to
+    /// `Hash[K,V]` / `Array[E]` (`hash_shape_type_args` /
+    /// `tuple_type_args`), `[]` answers the value arm, and the results
+    /// union. `Some` only when EVERY member contributes — a union holding a
+    /// non-verbatim member (`[1] | "s"`, `[1] | 2`) declines whole, as
+    /// `dispatch_union` declines when any member's dispatch does.
+    ///
+    /// The argument selects the `[]` overload upstream: with any
+    /// Tuple/`Array` member in the union, a `Range` or unresolved
+    /// (`Dynamic`/`Top`) argument takes the `(Range) -> Array[Elem]?`
+    /// overload — a slice, not the element — where every other argument
+    /// falls back to `(int) -> Elem` (PR #859 review: `s[0..1].each`,
+    /// `h[i]` with `i` untyped). The port answers the element envelope
+    /// only, so such an argument declines the whole read rather than guess.
+    /// `Hash`-only unions are unaffected — `Hash#[]` has one overload and
+    /// answers its value arm for any key.
+    pub(crate) fn union_index_read(
+        &self,
+        ast: &LoweredAst,
+        arg: NodeId,
+        ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let Type::Union(members) = interner.get(ty) else {
+            return None;
+        };
+        let members = members.clone();
+        if members
+            .iter()
+            .any(|&m| self.index_read_arrayish_member(m, interner))
+        {
+            let arg_ty = self.type_of(ast, arg, env, interner);
+            if self.index_arg_declines_union_read(arg_ty, interner) {
+                return None;
+            }
+        }
+        let mut parts = Vec::with_capacity(members.len());
+        for &m in &members {
+            parts.push(self.index_read_member_envelope(m, interner)?);
+        }
+        Some(self.union_members(parts, interner))
+    }
+
+    /// Whether the `union_index_read` argument selects the `(Range)`
+    /// `Array#[]` overload upstream rather than the `(int)` fallback the
+    /// element envelope answers: a `Range` carrier (literal ranges type
+    /// `Dynamic` today, so they are covered by the first arm) or an
+    /// argument whose type is not resolved at all. Every other carrier —
+    /// an `Integer` constant or bounded `IntegerRange`, a `String`, `nil`,
+    /// a `Tuple` — hits the `int` fallback upstream and keeps the envelope
+    /// answer.
+    fn index_arg_declines_union_read(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Dynamic(_) | Type::Top => true,
+            Type::Nominal { class, .. } => {
+                self.index.class_name_for_id(*class) == Some("Range")
+                    || self.source.class_name_for_id(*class) == Some("Range")
+            }
+            Type::Union(ms) => ms
+                .iter()
+                .any(|&m| self.index_arg_declines_union_read(m, interner)),
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.index_arg_declines_union_read(*base, interner)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a union member is a Tuple or an `Array` nominal — the member
+    /// kinds whose `[]` overload choice depends on the argument — resolving
+    /// refinements and differences through their base, as
+    /// [`Self::index_read_member_envelope`] does.
+    #[allow(clippy::only_used_in_recursion)]
+    fn index_read_arrayish_member(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Tuple(_) => true,
+            Type::Nominal { class, .. } => {
+                self.index.class_name_for_id(*class) == Some("Array")
+                    || self.source.class_name_for_id(*class) == Some("Array")
+            }
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.index_read_arrayish_member(*base, interner)
+            }
+            _ => false,
+        }
+    }
+
+    /// One union member's erased `[]` answer for
+    /// [`Self::union_index_read`]: a `Tuple` contributes its element join
+    /// (`tuple_type_args`), a `HashShape` its value join
+    /// (`hash_shape_type_args`), a `Hash`/`Array` nominal its value /
+    /// element type argument — `untyped` when the member carries no
+    /// element type to contribute (empty shape, bare nominal), matching the
+    /// unbound `Elem` the erased `[]` signature returns upstream. A
+    /// refinement or difference resolves through its base, as
+    /// [`Self::verbatim_slot`]'s `class_name_of` erasure does. Every other
+    /// carrier declines.
+    #[allow(clippy::only_used_in_recursion)]
+    fn index_read_member_envelope(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+        match interner.get(ty) {
+            Type::Tuple(elems) => {
+                let elems = elems.clone();
+                Some(if elems.is_empty() {
+                    interner.untyped()
+                } else {
+                    self.union_members(elems, interner)
+                })
+            }
+            Type::HashShape(members) => {
+                let values: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                Some(if values.is_empty() {
+                    interner.untyped()
+                } else {
+                    self.union_members(values, interner)
+                })
+            }
+            Type::Nominal { class, args } => {
+                let name = self
+                    .index
+                    .class_name_for_id(*class)
+                    .or_else(|| self.source.class_name_for_id(*class));
+                let idx = match name {
+                    Some("Array") => Some(0),
+                    Some("Hash") => Some(1),
+                    _ => None,
+                }?;
+                Some(args.get(idx).copied().unwrap_or_else(|| interner.untyped()))
+            }
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.index_read_member_envelope(*base, interner)
+            }
+            _ => None,
+        }
+    }
+
     /// `IndexedNarrowing.fully_tracked_receiver_type?`
     /// (indexed_narrowing.rb:92): a `Dynamic`/`Top` constituent means the
     /// collection can hold a caller-supplied slot value `||=` keeps.

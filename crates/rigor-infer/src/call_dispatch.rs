@@ -279,6 +279,23 @@ impl<'i> Typer<'i> {
                     }
                 }
             }
+
+            // rigor-rs#770 — the `recv[k]` read on a verbatim-carrier UNION.
+            // The reference's `dispatch_union` erases each union member to
+            // `Hash[K,V]` / `Array[E]` (`hash_shape_type_args` /
+            // `tuple_type_args`) and unions the `[]` returns, so `{a:1} | [1]`
+            // `h[0]` answers the element envelope `1`, and `{a:1} | {b:2}`
+            // `h[0]` answers `1 | 2` — never a memberwise slot lookup (the
+            // single-member path owns those) and never `Dynamic`. This is
+            // also the `current` half `slot_stored_type` reads for the
+            // `h[k] ||= v` record, which `verbatim_slot?` already admits for
+            // every-member-verbatim unions. A union holding any
+            // non-verbatim member declines whole — as `dispatch_union`
+            // declines when any member does — falling through to the same
+            // tiers that decline today.
+            if let Some(ty) = self.union_index_read(ast, args[0], recv_ty, env, interner) {
+                return ty;
+            }
         }
 
         // C3a Part B: `Module#name` / `Class#name` / `#to_s` on a CLASS OBJECT
