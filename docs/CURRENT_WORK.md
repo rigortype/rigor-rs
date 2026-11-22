@@ -53,6 +53,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #820 CLOSED** (PR #829): paren'd operands+subjects unread — `(C)`/`(x)`/`x&.nil?` NilQ. ~30 FPs + issue rows `=`; 0 FP; →#838–#847. [note](notes/20261122-issue-820-paren-operand-subject.md)
 - **2026-11-22 #769 CLOSED** (PR #836): fold `pow(exp,mod)` chunk powmod, BigInt `**` small results, `**`/`pow` × Float; `Float#pow` no-fold. 0 FP; →#837. [note](notes/20261122-issue-769-fold-pow-variants.md)
 - **2026-11-22 #825 CLOSED** (PR #832): severity `row_override` ported (+`FAMILY_FALLBACK_EXEMPT`). 0 FP; →#833–#835. [note](notes/20261122-issue-825-severity-row-override.md)
 - **2026-11-22 #830 CLOSED** (PR #831): collect.rs scanner.rb cites resynced; doc-only. [note](notes/20261122-issue-830-collect-cite-drift.md)
