@@ -704,15 +704,13 @@ fn int_pow_mod_result(base: IntReceiver<'_>, e: &Scalar, m: &Scalar) -> FoldOutc
 /// `a.pow(e, m)` with an `i64` modulus — the whole computation stays under
 /// `u128` (`|m| <= 2**63`, so a product of residues is under `2**126`).
 fn int_pow_mod_u128(base: IntReceiver<'_>, exp: PowExp, m: i64) -> FoldOutcome {
-    let mm = u128::from((m as i128).unsigned_abs());
-    let cur = match base {
+    let mm = (m as i128).unsigned_abs();
+    let mut cur = match base {
         IntReceiver::Int(a) => i128::from(a).rem_euclid(mm as i128) as u128,
         IntReceiver::Big(d) => decimal_mod_u128(d, mm),
     };
     let mut r = 1 % mm;
-    let mut bits = ExpBits(exp);
-    let mut cur = cur;
-    while let Some(bit) = bits.next() {
+    for bit in ExpBits(exp) {
         if bit {
             r = r * cur % mm;
         }
@@ -778,9 +776,8 @@ fn int_pow_mod_chunks(base: IntReceiver<'_>, exp: PowExp, d: &str) -> FoldOutcom
         }
     };
     let mut r = chunks_mod(&[1], &m_mag);
-    let mut bits = ExpBits(exp);
     let mut cur = cur;
-    while let Some(bit) = bits.next() {
+    for bit in ExpBits(exp) {
         if bit {
             r = chunks_modmul(&r, &cur, &m_mag);
         }
@@ -1031,15 +1028,15 @@ fn chunks_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
 fn chunks_sub_shift(u: &mut Vec<u64>, p: &[u64], shift: usize) {
     const CHUNK: u64 = 1_000_000_000;
     let mut borrow = 0u64;
-    for i in shift..u.len() {
+    for (i, word) in u.iter_mut().enumerate().skip(shift) {
         // `sub` can reach CHUNK (`p`-word CHUNK-1 plus a borrow) — `u[i]` is
         // always below it, so the borrow arm is the only reachable one then.
         let sub = p.get(i - shift).copied().unwrap_or(0) + borrow;
-        if u[i] >= sub {
-            u[i] -= sub;
+        if *word >= sub {
+            *word -= sub;
             borrow = 0;
         } else {
-            u[i] = u[i] + CHUNK - sub;
+            *word += CHUNK - sub;
             borrow = 1;
         }
     }
