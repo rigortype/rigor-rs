@@ -662,6 +662,14 @@ impl<'i> Typer<'i> {
             // early-returns `Keep` above. Whoever reaches here (`===` /
             // `case`) follows `lexical_class_name`, which keeps the
             // de-rooted spelling unconditionally (rigor-rs#672).
+            //
+            // A PARENThesised operand declines it too (`when (C)`, `(C)
+            // === x`, `x.is_a?((C))` — `static_class_name` reads the
+            // `ParenthesesNode` and answers nil, rigor-rs#820) — but where
+            // a rooted decline is unorderable, an UNREAD operand guards
+            // nothing at all: the carrier survives on whichever edge this
+            // is, so `Keep`, not `Other`.
+            None if ast.paren_unwrapped(class_node) => return Edge::Keep,
             None => match ast.get(class_node) {
                 Node::ConstantRead { name, dynamic_base: false, rooted: true, .. }
                     if !name.is_empty() =>

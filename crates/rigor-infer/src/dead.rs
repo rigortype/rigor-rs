@@ -1318,11 +1318,15 @@ impl<'i> Typer<'i> {
                     // a class test.
                     if method == "===" {
                         if let Some(r) = receiver {
+                            // `(C) === local` reads no class either —
+                            // `static_class_name` answers nil for the
+                            // `ParenthesesNode` itself (rigor-rs#820).
                             if let Node::ConstantRead {
                                 name: class,
                                 dynamic_base: false,
                                 ..
                             } = ast.get(*r)
+                                && !ast.paren_unwrapped(*r)
                             {
                                 if let Node::LocalVariableRead { name, .. }
                                 | Node::LocalVariableWrite { name, .. } = ast.get(args[0])
@@ -1359,11 +1363,15 @@ impl<'i> Typer<'i> {
                         | Node::LocalVariableWrite { name, .. } = ast.get(*r)
                         {
                             let op = match ast.get(args[0]) {
+                                // `(C)` is not a class operand upstream —
+                                // `static_class_name` reads the
+                                // `ParenthesesNode` and answers nil
+                                // (rigor-rs#820).
                                 Node::ConstantRead {
                                     name: class,
                                     dynamic_base: false,
                                     ..
-                                } => DeadOp::Isa {
+                                } if !ast.paren_unwrapped(args[0]) => DeadOp::Isa {
                                     class: class.to_string(),
                                     exact: method == "instance_of?",
                                     holds: polarity,

@@ -288,7 +288,10 @@ impl<'i> Typer<'i> {
         let Node::ConstantRead { name, dynamic_base, self_anchored, rooted, .. } = ast.get(id) else {
             return false;
         };
-        if name.is_empty() || *dynamic_base || *self_anchored {
+        // A parenthesised operand is not a static spelling either:
+        // `static_class_name` reads the `ParenthesesNode` and answers nil, so
+        // `x.is_a?((C))` / `(C) === x` guard nothing upstream (rigor-rs#820).
+        if name.is_empty() || *dynamic_base || *self_anchored || ast.paren_unwrapped(id) {
             return false;
         }
         if !*rooted {

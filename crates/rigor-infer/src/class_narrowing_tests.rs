@@ -1727,6 +1727,158 @@ fn class_narrowing_case_falsey_edge_matrix() {
     }
 }
 
+/// ISSUE-820 — a parenthesised class operand is UNREAD on the reference:
+/// `static_class_name` (`narrowing.rb:3362`) reads the `ParenthesesNode`
+/// itself and answers nil for it, so `when (C)` narrows neither edge, and
+/// `x.is_a?((C))` / `(C) === x` guard nothing. The literal members of
+/// `when_condition_class` stay paren-transparent (`when (nil)`,
+/// `when (1..3)`, `when (/re/)` — `case_equality_target_class`, the
+/// int-literal/-range paths and `regexp_literal?` all `unwrap_parens`
+/// first), so they are not covered by this decline.
+///
+/// `dead: false` — the reference FIRES at the call: the unread operand
+/// leaves the carrier on both edges. `dead: true` — must-still-suppress
+/// controls: the unparenthesised spelling still decides. Rows
+/// oracle-measured at pin `bbea1bac`.
+#[test]
+fn class_narrowing_parenthesised_operand_matrix() {
+    let rows: &[(&str, &str, &str, bool)] = &[
+        // `when (C)` — single and multi-condition clauses, both edges.
+        (
+            "paren_when_single_body",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen (Integer)\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_when_single_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen (Integer)\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_when_multi_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen (Integer), String\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_when_multi_mixed_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen String, (Integer)\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_when_double_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen ((Integer))\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_when_rooted_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen (::Integer)\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // `x.is_a?((C))` — every edge and the loop back-edge.
+        (
+            "paren_is_a_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x.is_a?((Integer))\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_is_a_else",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x.is_a?((Integer))\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_kind_of_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x.kind_of?((Integer))\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_instance_of_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x.instance_of?((Integer))\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_is_a_while_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nwhile x.is_a?((Integer))\n  x.frobnicate_zzz\n  break\nend\n",
+            false,
+        ),
+        (
+            "paren_is_a_while_after",
+            "frobnicate_zzz",
+            "x = \"s\"\nwhile x.is_a?((Integer))\n  break\nend\nx.frobnicate_zzz\n",
+            false,
+        ),
+        // `(C) === x` — receiver position, both edges.
+        (
+            "paren_case_eq_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif (Integer) === x\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "paren_case_eq_else",
+            "frobnicate_zzz",
+            "x = \"s\"\nif (Integer) === x\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // Must-still-suppress controls: the UNparenthesised spelling still
+        // decides (`"s"` is never an `Integer`).
+        (
+            "unparen_when_covers_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen Integer\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "unparen_is_a_dead_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif x.is_a?(Integer)\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "unparen_case_eq_dead_body",
+            "frobnicate_zzz",
+            "x = \"s\"\nif Integer === x\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+    ];
+    for (row, method, src, dead) in rows {
+        let ast = lower_src(src.as_bytes());
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let scopes = lexical_scopes(&ast);
+        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let pass = typer.class_narrowing_pass(&ast, &mut i);
+        let call = call_named(&ast, method);
+        assert_eq!(pass.dead.contains(&call), *dead, "paren-operand row {row}");
+    }
+
+    // The narrowing SNAPSHOT sees nothing either: `(C)` records no class
+    // fact where the unparenthesised control records `Integer`.
+    let (ast, snaps) =
+        class_snaps(b"def f(x)\n  if x.is_a?((Integer))\n    x.frobnicate_zzz\n  end\nend\n");
+    assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+    let (ast, snaps) =
+        class_snaps(b"def f(x)\n  if x.is_a?(Integer)\n    x.frobnicate_zzz\n  end\nend\n");
+    assert_eq!(
+        snaps.get(&call_named(&ast, "frobnicate_zzz")).map(String::as_str),
+        Some("Integer")
+    );
+    let (ast, snaps) =
+        class_snaps(b"def f(x)\n  case x\n  when (Integer)\n    x.frobnicate_zzz\n  end\nend\n");
+    assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
+}
+
 /// STAGE 3a-3 — single-hop chain guards, LOCAL roots
 /// (docs/notes/20260807-narrowing-stage3-spec.md, "3a-3 BUILT").
 ///
