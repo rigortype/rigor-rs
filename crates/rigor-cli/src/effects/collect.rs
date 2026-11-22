@@ -1473,7 +1473,7 @@ fn positional_arity(node: &CallNode<'_>) -> usize {
 }
 
 /// A receiver-less call in a class / module body that declares units or
-/// ancestry (`scanner.rb:201`).
+/// ancestry (`scanner.rb:274`).
 fn declaration(node: &CallNode<'_>) -> bool {
     node.receiver().is_none()
         && DECLARATION_MACROS.contains(&name_of(node.name().as_slice()).as_str())
