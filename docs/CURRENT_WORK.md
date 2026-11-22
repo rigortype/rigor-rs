@@ -58,6 +58,7 @@ seam, `harness/vendor_rbs.py` regenerates).
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #255 CLOSED** (PR #816): `explain` reads the shared rule tables — 36-id ENTRIES resync, 9 families, SkipReasonCatalog + `SKIP_IDS` single-source; all explain/sig-gen probes `=`; Approved `0a1f579b`; →#818. [note](notes/20261122-issue-255-explain-catalogue.md)
 - **2026-11-22 #809 CLOSED** (PR #815): ATM ordering: host mirror + lexical param-head resolution; ~50 rows `=`; 0 FP; →#817. [note](notes/20261122-issue-809-host-mirror.md)
 - **2026-11-22 #383 CLOSED** (PR #808): qualified param heads reach the ATM param gates; 30 probe rows `=`; 0 FP; →#809-812. [note](notes/20261122-issue-383-qualified-param-heads.md)
 - **2026-11-22 #681 CLOSED** (PR #806): loop-entry edge narrows untracked predicate subjects (ordered conjuncts, Isa, literal `==`); Approved `a4be2d25`; 150/164 `=`; 0 FP. [note](notes/20261122-issue-681-loop-entry-narrowing.md)
