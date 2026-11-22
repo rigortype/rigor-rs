@@ -5,8 +5,8 @@ what landed**. Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md);
 outcomes: `docs/notes/` + `docs/adr/`; history: `git log`.
 
 **Contract (`harness/docs_check.py`):** a landed arc gets ONE
-ledger line — verdict + numbers + link — detail goes to a dated
-note or ADR *first*. Hard byte budget.
+ledger line — detail goes to a dated note or ADR *first*. Hard
+byte budget.
 
 
 ## Now / Next
@@ -22,7 +22,7 @@ note or ADR *first*. Hard byte budget.
 
 State (2026-11-21, `v0.4.8`): harness **174 fixtures / 0
 unregistered**; standing sweep **0 FP / 437 = master**; effects gate 0
-OVER. Tools REFUSE stale builds. Clippy: `-D warnings`, fresh `CARGO_TARGET_DIR`.
+OVER. Clippy: `-D warnings`, fresh `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 - **Possible-nil / Tier B/C CLOSED, not deferred** — the closing slice deletes
@@ -53,32 +53,33 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #766 CLOSED** (PR #823): FoldOutcome mints → `numeric_blow_up_class` + `fold_result_gate`; `(-4) ** -6803` Rational gain; 0 FP; →#826/#827. [note](notes/20261122-issue-766-fold-blowup-consolidation.md)
 - **2026-11-22 #818 CLOSED** (PR #824): severity PROFILES resynced 28→37 rows verbatim; explain drift guard. 0 FP; →#825. [note](notes/20261122-issue-818-severity-profiles.md)
 - **2026-11-22 #710 case-guard half CLOSED** (PR #819): threaded `when`/`in` falsey edge; `in` arms modelled; brief FP rows `=`; 0 FP. →#820–#822. [note](notes/20261122-issue-710-case-falsey-edge.md)
-- **2026-11-22 #694 CLOSED** (PR #763): WidenedResult nominals — oversized `**`/`<<` folds, op-write binds, literal-union collapse reach `Nominal`; ~30 rows `=`; →#765–#771/#773–#775. [note](notes/20261121-issue-694-widened-result.md)
+- **2026-11-22 #694 CLOSED** (PR #763): WidenedResult nominals — oversized `**`/`<<` folds, op-write binds, literal-union collapse; ~30 rows `=`; →#765–#771/#773–#775. [note](notes/20261121-issue-694-widened-result.md)
 - **2026-11-22 #255 CLOSED** (PR #816): explain + sig.skipped catalogues synced to shared rule tables; all probes `=`; →#818. [note](notes/20261122-issue-255-explain-catalogue.md)
-- **2026-11-22 #809 CLOSED** (PR #815): ATM ordering: host mirror + lexical param heads; ~50 rows `=`; 0 FP; →#817. [note](notes/20261122-issue-809-host-mirror.md)
+- **2026-11-22 #809 CLOSED** (PR #815): ATM: host mirror + lexical param heads; ~50 rows `=`; 0 FP; →#817. [note](notes/20261122-issue-809-host-mirror.md)
 - **2026-11-22 #383 CLOSED** (PR #808): qualified param heads reach the ATM gates; 30 rows `=`; 0 FP; →#809–#812. [note](notes/20261122-issue-383-qualified-param-heads.md)
 - **2026-11-22 #681 CLOSED** (PR #806): loop-entry edge narrows untracked predicate subjects (ordered conjuncts, Isa, literal `==`); 150/164 `=`; 0 FP. [note](notes/20261122-issue-681-loop-entry-narrowing.md)
 - **2026-11-22 #326 CLOSED** (PR #807): baseline scalars via Psych's ScalarScanner (`!ruby/` tags, quoted folds, `ruby_sort`); ~160 rows `=`; 0 FP. [note](notes/20261122-issue-326-baseline-psych-scalars.md)
-- **2026-11-21 #616 CLOSED** (PR #804): `record_declaration` gate into macro arms; cite refresh; `define_method_unit` triple. 0 FP; →#805. [note](notes/20261121-issue-616-fidelity.md)
+- **2026-11-21 #616 CLOSED** (PR #804): `record_declaration` gate into macro arms; `define_method_unit` triple. 0 FP; →#805. [note](notes/20261121-issue-616-fidelity.md)
 - **2026-11-21 #640 CLOSED** (PR #800): env dead-arm judge; `for 1`→`for Integer`; 0 FP. [note](notes/20261121-issue-640-dead-arm-env.md)
 - **2026-11-21 #253 CLOSED** (PR #799): `rigor:disable` class capture + Psych severity booleans; 19/19 `=`; 0 FP; →#801–#803. [note](notes/20261121-issue-253-suppression-psych-booleans.md)
 - **2026-11-21 #492 CLOSED** (PR #789): override-replaced parents + heredoc closure env; 13/13 `=`; 0 FP; →#793–#798. [note](notes/20261121-issue-492-override-heredoc-env.md)
-- **2026-11-21 #328 CLOSED** (PR #790): per-file diagnostics in the reference's stage order; brief rows `=`; 0 FP; →#791/#792. [note](notes/20261121-issue-328-diagnostic-stage-order.md)
-- **2026-11-21 #629 CLOSED** (PR #786): effects `catalog_target` settles the typer arm's syntax subset; MATCH 5693→5812, 0 OVER; →#787/#788. [note](notes/20261121-issue-629-index-write-ownership.md)
-- **2026-11-21 #771 file-scope half CLOSED** (PR #776): content args on widened carriers; 23 rows `=`; 0 FP; →#777–#785 (#781 def-body). [note](notes/20261121-issue-771-mutation-content-args.md)
+- **2026-11-21 #328 CLOSED** (PR #790): per-file diagnostics in reference stage order; brief rows `=`; 0 FP; →#791/#792. [note](notes/20261121-issue-328-diagnostic-stage-order.md)
+- **2026-11-21 #629 CLOSED** (PR #786): effects `catalog_target` settles typer-arm syntax subset; MATCH 5693→5812, 0 OVER; →#787/#788. [note](notes/20261121-issue-629-index-write-ownership.md)
+- **2026-11-21 #771 file-scope half CLOSED** (PR #776): content args on widened carriers; 23 rows `=`; 0 FP; →#777–#785. [note](notes/20261121-issue-771-mutation-content-args.md)
 - **2026-11-21 #424 CLOSED** (PR #764): nested-class time — 4 rescans → containment trie; 4k 100s→3.7s; 0 FP; →#772. [note](notes/20261121-issue-424-nested-class-time.md)
-- **2026-11-21 #685 CLOSED** (PR #761): `Algebra::union`/`flatten_union_members` member-set builders (`top`/`bot` verbatim); 4 raw mints routed. 0 FP. [note](notes/20261121-issue-685-union-canonicalization.md)
+- **2026-11-21 #685 CLOSED** (PR #761): `Algebra::union`/`flatten_union_members` member-set builders; 4 raw mints routed. 0 FP. [note](notes/20261121-issue-685-union-canonicalization.md)
 - **2026-11-21 #639 CLOSED** (PR #756): loop-cap jump/once bodies + rebindable ivars; 8 master FPs closed; 0 FP; →#757–#759. [note](notes/20261121-issue-639-loop-cap-jump-ivar.md)
 - **2026-11-21 #439 CLOSED** (PR #753): reach-memo audit in CI; 0 FP. →#754. [note](notes/20261121-issue-439-reach-memo-audit-gate.md)
-- **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand (x-polarity gate, dom-write cut); 0 FP; →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
-- **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts the self-extend's instance-side entry + RBS fallback; live FP gone; 0 FP; →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
+- **2026-11-21 #683 CLOSED** (PR #751): loop-cap self-write `compound` re-derived per operand (x-polarity gate); 0 FP; →#684/#752. [note](notes/20261121-issue-683-loop-cap-self-write.md)
+- **2026-11-21 #667 CLOSED** (PR #742): `singleton_truncated` counts self-extend instance-side entry + RBS fallback; live FP gone; 0 FP; →#748–#750. [note](notes/20261121-issue-667-singleton-self-extend-budget.md)
 - **2026-11-20 #446 CLOSED** (PR #741): refinement decline — refine-body census + `own_method_answers` walk; 0 FP; →#743–#747. [note](notes/20261121-issue446-refinement-decline-spec.md)
-- **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + stack.yml; ADR-0045 x86_64 rungs (alloc, never 2 MiB overflow); Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
-- **2026-11-20 #724 CLOSED** (PR #739): pool-audit `use` alias/glob of the pool builders in `fn main` flags (#676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
+- **2026-11-20 #428 CLOSED** (PR #706): `harness/stack/` = #412 tools on the post-#431 ladder + stack.yml; ADR-0045 x86_64 rungs; Windows →#707. [note](notes/20261120-issue-428-stack-tools.md)
+- **2026-11-20 #724 CLOSED** (PR #739): pool-audit flags `use` alias/glob of pool builders in `fn main` (#676 hole); test-only, 0 FP. [note](notes/20261120-issue-724-main-pool-aliased-use.md)
 - **2026-11-20 #696 CLOSED** (PR #730): ShapeDispatch String carriers (`decimal-int-string`/`non-empty-string`); drift 47→46, 0 FP. →#733–#738, #600. [note](notes/20261120-issue-696-decimal-int-string.md)
-- **2026-11-20 #427 CLOSED** (PR #726): env memo stores uid-scoped interner-bound answers; `.map` repro doubled per link → never finishes; check 68 s; 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
+- **2026-11-20 #427 CLOSED** (PR #726): uid-scoped interner env memo; `.map` repro doubled per link → never finishes; check 68 s; 0 FP. →#729/#731/#732. [note](notes/20261120-issue-427-map-chain-memo.md)
 - **2026-11-20 #643 CLOSED** (PR #725): named Finding struct + conformance start_offset; refactor, 0 FP / 437 gaps = master; →#727/#728. [note](notes/20261120-issue-643-findings-tuple.md)
 - **2026-11-20 #676 CLOSED** (PR #723): pool-ordering audit — planted inversion: threads test passes, audit fails at the line; →#724. [note](notes/20261120-issue-676-pool-ordering-audit.md)
 - **2026-11-20 #345 CLOSED** (PR #720): pre_eval glob→dir earns not-found row; `.uniq`/order ported; 0 FP; →#721/#722. [note](notes/20261120-issue-345-preeval-glob-dir.md)
@@ -87,7 +88,7 @@ Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
 - **2026-11-20 #347 CLOSED** (PR #713): `.rigor.yml` safe_load crash mirror; 0 FP every head, unmodelled arms decline. →#715. [note](notes/20261120-issue-347-yaml-psych-rejects.md)
 - **2026-11-20 #672 CLOSED** (PR #708): rooted guard operands top-level; 0 FP, +3 dependabot rows. →#709/#710/#714. [note](notes/20261120-issue-672-rooted-class-guard.md)
 - **2026-11-20 #673 CLOSED** (PR #711): dynamic-base rescue designator (`k::X`) opaque — `dynamic_base` gates all five consumers. 0 FP. →#712. [note](notes/20261120-issue-673-rescue-dynamic-base.md)
-- **2026-11-20 #677 CLOSED** (PR #703): fallback warning: one line per new worst stack; `RLIMIT_STACK` rank, refusal quoted. →#676/#705. [note](notes/20261120-issue-677-stack-fallback-warn.md)
+- **2026-11-20 #677 CLOSED** (PR #703): fallback warning: one line per new worst stack; `RLIMIT_STACK` rank. →#676/#705. [note](notes/20261120-issue-677-stack-fallback-warn.md)
 - **2026-11-20 #441 CLOSED** (PR #698): `local_reach` absorption; scanner.rb 19→0.6s, onevar_48 46m→0.3s. →#699/#700/#704. [note](notes/20261120-issue-441-absorption.md)
 - **2026-11-20 #678 CLOSED** (PR #702): pool-build failure exits 70; `help`/`version`/`upgrade` skip+poison. →#676/#677. [note](notes/20261120-issue-678-pool-exit-code.md)
 - **2026-11-20 #424 seq-modif** (PR #697): kill-scan folds + env checkpoints + delta joins; 8k 35.8→2.1s (oracle 5.5). →#701. [note](notes/20261120-issue-424-seq-modif-rows.md)
