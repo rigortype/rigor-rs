@@ -1,10 +1,10 @@
 # rigor-rs — Current Work
 
-The session-to-session baton: **what is in flight, what to pull next, and a
-one-line ledger of what landed**. Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md);
+The baton: **what is in flight, what to pull next, and a one-line ledger of
+what landed**. Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md);
 outcomes: `docs/notes/` + `docs/adr/`; history: `git log`.
 
-**Contract (gated by `harness/docs_check.py`):** a landed arc gets ONE
+**Contract (`harness/docs_check.py`):** a landed arc gets ONE
 ledger line — verdict + numbers + link — detail goes to a dated
 note or ADR *first*. Hard byte budget.
 
@@ -13,51 +13,47 @@ note or ADR *first*. Hard byte budget.
 
 ▶ NEXT: ADR-127 floor coverage cost; follow-ups #491/#493/#600/#605;
 #771 def-body half #781; mutation seams →#777–#785.
-- **CLOSED arcs** (do not re-open): ADR-0042 migration + compat
+- **CLOSED arcs**: ADR-0042 migration + compat
   [plan](notes/20260718-compat-next-stage-plan.md).
-- **CLI (v0.3.0 RC)** — `--bleeding-edge`/severity/`coverage` done;
+- **CLI** — `--bleeding-edge`/severity/`coverage` done;
   `--protection`/`--mutation`/`type-scan` deferred
   ([scoping](notes/20260719-coverage-command-scoping.md)).
-- **Pin `v0.4.8`** (rbs 4.2.0). Both exception tables EMPTY — new
-  entries are real findings (`UPSTREAM.md` hazards, overlay/`sig/shims`
-  trap).
+- **Pin `v0.4.8`** (rbs 4.2.0). Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-21, `v0.4.8`): harness **174 fixtures / 0
 unregistered**; standing sweep **0 FP / 437 = master**; effects gate 0
-OVER.
-Grading tools REFUSE stale builds. Clippy: `-D warnings`, FRESH `CARGO_TARGET_DIR`.
+OVER. Tools REFUSE stale builds. Clippy: `-D warnings`, fresh `CARGO_TARGET_DIR`.
 
 ## Standing conclusions (do not re-litigate without new evidence)
 - **Possible-nil / Tier B/C CLOSED, not deferred** — the closing slice deletes
-  the concrete-arm FP-safety mechanism; `fp_audit` scores it 0 FP (the parity
-  gate points the wrong way,
-  [tier-bc](notes/20260717-tier-bc-track-closed.md)). **SCOPE: 85
-  `Dynamic`-arm rows, not the 93 concrete-arm**.
+  the concrete-arm FP-safety mechanism; `fp_audit` 0 FP (parity gate points
+  the wrong way, [tier-bc](notes/20260717-tier-bc-track-closed.md)). SCOPE:
+  85 `Dynamic`-arm rows, not the 93 concrete-arm.
 - **Reference-FP undefined-method clusters, CLOSED** — `pre_eval:` cross-file
   monkey-patch (inverts the ADR-0033 provenance gate), `nil` receiver,
-  rdoc parser `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
-  Re-adjudicated `v0.3.8` ([799](notes/20260909-gap-adjudication-799.md)):
-  **395 of 799 behind decisions.**
+  rdoc `Hash` ([141](notes/20260807-gap-adjudication-141.md)).
+  `v0.3.8` re-adjudication: **395/799 behind decisions**
+  ([799](notes/20260909-gap-adjudication-799.md)).
 - **5 FP-safe flow slices closed 0 gaps** — no slice without an `fp_audit
   --gaps` prediction ([flow-frontier](notes/20260706-flow-frontier-exhausted.md)).
 - **Receiver-typing lever open**: gap census buckets by mechanism
   ([census](notes/20260807-gap-census.md)); 4 slices closed **47 rows**;
-  re-run `gap_census.py --sweep` each.
-- **Effects TRANSITIVE LABEL lane DECLINED — not portable at parity** (s4): four typer-free rules, best 5 OVER — labels stay UNDER; parity outranks the prize. [probe](notes/20260826-effects-s4-probe.md).
+  re-run `gap_census.py --sweep`.
+- **Effects transitive-label lane DECLINED — not parity-portable** (s4): best 5 OVER; labels stay UNDER — parity outranks. [probe](notes/20260826-effects-s4-probe.md).
 - **sig-gen closed** — byte surface 0, `--write` sound.
-- **Plugin work:** pure-RBS bundle closed [note](notes/20260710-pure-rbs-bundle-track-closed.md);
+- **Plugin work:** pure-RBS closed [note](notes/20260710-pure-rbs-bundle-track-closed.md);
   sidecar + perf retired [ADR-0037](adr/0037-sidecar-perf-slices-retired-by-measurement.md).
 
 ## Build & gates
 
-Gate tiers + commands: `AGENTS.md` → Gates.
+Tiers + commands: `AGENTS.md` → Gates.
 
 Oracle: pinned `reference/rigor` (`UPSTREAM.md`, fresh cwd); sweep
-`harness/sweep-corpora.yml`; RBS vendored (ADR-0007; `RIGOR_RBS_CORE_DIR`
-seam, `vendor_rbs.py` regenerates).
+`harness/sweep-corpora.yml`; RBS vendored (ADR-0007; `RIGOR_RBS_CORE_DIR`).
 
 ## Ledger (newest first; one line per arc/slice)
 
+- **2026-11-22 #710 case-guard half CLOSED** (PR #819): threaded `when`/`in` falsey edge; `in` arms modelled; brief FP rows `=`; 0 FP. →#820–#822. [note](notes/20261122-issue-710-case-falsey-edge.md)
 - **2026-11-22 #694 CLOSED** (PR #763): WidenedResult nominals — oversized `**`/`<<` folds, op-write binds, literal-union collapse reach `Nominal`; ~30 rows `=`; →#765–#771/#773–#775. [note](notes/20261121-issue-694-widened-result.md)
 - **2026-11-22 #255 CLOSED** (PR #816): explain + sig.skipped catalogues synced to shared rule tables; all probes `=`; →#818. [note](notes/20261122-issue-255-explain-catalogue.md)
 - **2026-11-22 #809 CLOSED** (PR #815): ATM ordering: host mirror + lexical param heads; ~50 rows `=`; 0 FP; →#817. [note](notes/20261122-issue-809-host-mirror.md)
