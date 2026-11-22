@@ -1,0 +1,222 @@
+{
+  "fixture": "harness/corpus/176_overload_pass0_select.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 18,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 50,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 20,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 22,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `zz' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 24,
+      "column": 25,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 26,
+      "column": 32,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 31,
+      "severity": "error",
+      "message": "undefined method `zz' for Numeric"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 41,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 30,
+      "column": 27,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 31,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 36,
+      "column": 20,
+      "severity": "error",
+      "message": "undefined method `zz' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `zz' for -1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 40,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for 0.3333333333333333"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 28,
+      "severity": "error",
+      "message": "undefined method `zz' for 2.0833333333333335"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 43,
+      "column": 29,
+      "severity": "error",
+      "message": "undefined method `zz' for 3333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333333"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 45,
+      "column": 35,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 46,
+      "column": 42,
+      "severity": "error",
+      "message": "undefined method `zz' for Rational"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 49,
+      "column": 24,
+      "severity": "error",
+      "message": "undefined method `zz' for Float"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 51,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer | Rational"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 36,
+      "severity": "error",
+      "message": "undefined method `zz' for [Integer, Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 30,
+      "severity": "error",
+      "message": "undefined method `zz' for bool"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 56,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 60,
+      "column": 19,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 61,
+      "column": 23,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 62,
+      "column": 33,
+      "severity": "error",
+      "message": "undefined method `zz' for Integer"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 63,
+      "column": 21,
+      "severity": "error",
+      "message": "undefined method `zz' for 0"
+    }
+  ]
+}
