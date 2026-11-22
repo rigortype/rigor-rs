@@ -558,27 +558,84 @@ fn emittable(c: &Candidate) -> bool {
     matches!(c.classification, "new_method" | "tighter_return")
 }
 
-/// The skip reasons the stderr summary counts (reference
-/// `SUMMARISED_SKIP_REASONS`): every `sig.skipped.*` id except the four with a
-/// report of their own (`unrenderable-rbs`, `unresolvable-superclass`,
-/// `inline-declared`, `inline-differs`).
-const SUMMARISED_SKIP_REASONS: &[&str] = &[
-    "sig.skipped.complex-shape",
-    "sig.skipped.user-authored",
-    "sig.skipped.untyped-return",
-    "sig.skipped.overridden-by-unsigned-subclass",
-    "sig.skipped.inline-generic-class",
-    "sig.skipped.generic-reopening",
-    "sig.skipped.top-level-def",
-    "sig.skipped.uncertain-module-function",
+// ---------------------------------------------------------------------------
+// The `sig.skipped.*` vocabulary (reference
+// `SigGen::Classification::SKIP_DIAGNOSTIC_IDS`, all 16). One table — the skip
+// paths below, the stderr summary formula and `rigor explain`'s skip-reason
+// catalogue (`crate::explain::SKIP_ENTRIES`) all read these ids, so a reason
+// can never drift onto a name `explain` cannot answer (rigor-rs#255).
+// ---------------------------------------------------------------------------
+
+/// `sig.skipped.*` ids the generator produces — and the four it cannot produce
+/// yet (`overridden-bot`, `abstract-method`, `template-method`,
+/// `platform-guarded`), carried so the table stays the full reference
+/// vocabulary in `SKIP_DIAGNOSTIC_IDS` hash order.
+pub(crate) const SKIP_COMPLEX_SHAPE: &str = "sig.skipped.complex-shape";
+pub(crate) const SKIP_USER_AUTHORED: &str = "sig.skipped.user-authored";
+pub(crate) const SKIP_UNTYPED_RETURN: &str = "sig.skipped.untyped-return";
+pub(crate) const SKIP_UNRENDERABLE_RBS: &str = "sig.skipped.unrenderable-rbs";
+pub(crate) const SKIP_UNRESOLVABLE_SUPERCLASS: &str = "sig.skipped.unresolvable-superclass";
+pub(crate) const SKIP_OVERRIDDEN_BY_UNSIGNED_SUBCLASS: &str =
+    "sig.skipped.overridden-by-unsigned-subclass";
+pub(crate) const SKIP_OVERRIDDEN_BOT: &str = "sig.skipped.overridden-bot";
+pub(crate) const SKIP_ABSTRACT_METHOD: &str = "sig.skipped.abstract-method";
+pub(crate) const SKIP_TEMPLATE_METHOD: &str = "sig.skipped.template-method";
+pub(crate) const SKIP_INLINE_DECLARED: &str = "sig.skipped.inline-declared";
+pub(crate) const SKIP_INLINE_GENERIC_CLASS: &str = "sig.skipped.inline-generic-class";
+pub(crate) const SKIP_GENERIC_REOPENING: &str = "sig.skipped.generic-reopening";
+pub(crate) const SKIP_INLINE_DIFFERS: &str = "sig.skipped.inline-differs";
+pub(crate) const SKIP_TOP_LEVEL_DEF: &str = "sig.skipped.top-level-def";
+pub(crate) const SKIP_UNCERTAIN_MODULE_FUNCTION: &str =
+    "sig.skipped.uncertain-module-function";
+pub(crate) const SKIP_PLATFORM_GUARDED: &str = "sig.skipped.platform-guarded";
+
+/// Every `sig.skipped.*` id, in the reference's `SKIP_DIAGNOSTIC_IDS` hash
+/// order. `rigor explain` asserts its skip-reason catalogue covers exactly
+/// this set.
+pub(crate) const SKIP_IDS: &[&str] = &[
+    SKIP_COMPLEX_SHAPE,
+    SKIP_USER_AUTHORED,
+    SKIP_UNTYPED_RETURN,
+    SKIP_UNRENDERABLE_RBS,
+    SKIP_UNRESOLVABLE_SUPERCLASS,
+    SKIP_OVERRIDDEN_BY_UNSIGNED_SUBCLASS,
+    SKIP_OVERRIDDEN_BOT,
+    SKIP_ABSTRACT_METHOD,
+    SKIP_TEMPLATE_METHOD,
+    SKIP_INLINE_DECLARED,
+    SKIP_INLINE_GENERIC_CLASS,
+    SKIP_GENERIC_REOPENING,
+    SKIP_INLINE_DIFFERS,
+    SKIP_TOP_LEVEL_DEF,
+    SKIP_UNCERTAIN_MODULE_FUNCTION,
+    SKIP_PLATFORM_GUARDED,
 ];
+
+/// The four ids with a stderr report of their own — excluded from the summary
+/// count, exactly the reference's `SUMMARISED_SKIP_REASONS` subtraction
+/// (`unrenderable_rbs`, `unresolvable_superclass`, `inline_declared`,
+/// `inline_differs`).
+const OWN_REPORT_SKIP_IDS: &[&str] = &[
+    SKIP_UNRENDERABLE_RBS,
+    SKIP_UNRESOLVABLE_SUPERCLASS,
+    SKIP_INLINE_DECLARED,
+    SKIP_INLINE_DIFFERS,
+];
+
+/// Whether `reason` counts in the stderr summary — the reference's derived
+/// `SUMMARISED_SKIP_REASONS` (every `sig.skipped.*` id minus the four with a
+/// report of their own), computed rather than spelled out so a newly ported
+/// skip id joins the summary the day its path lands.
+fn summarised(reason: &str) -> bool {
+    SKIP_IDS.contains(&reason) && !OWN_REPORT_SKIP_IDS.contains(&reason)
+}
 
 /// Reference `SigGenCommand#report_skipped` (#778): one stderr line counting
 /// the methods the generator declined and why, in text mode only. The
 /// breakdown keeps the order each reason first appears in.
 fn report_skipped(skips: &[&'static str]) {
     let mut counts: Vec<(&str, usize)> = Vec::new();
-    for reason in skips.iter().filter(|r| SUMMARISED_SKIP_REASONS.contains(r)) {
+    for reason in skips.iter().filter(|r| summarised(r)) {
         match counts.iter_mut().find(|(r, _)| r == reason) {
             Some((_, n)) => *n += 1,
             None => counts.push((reason, 1)),
@@ -656,7 +713,7 @@ fn finalize_superclasses(
             {
                 return c;
             }
-            demoted(c, "sig.skipped.generic-reopening")
+            demoted(c, SKIP_GENERIC_REOPENING)
         })
         .collect();
 
@@ -714,7 +771,7 @@ fn finalize_superclasses(
     let candidates: Vec<Candidate> = candidates
         .into_iter()
         .map(|c| match owner_of(&c.class_name, &unresolvable) {
-            Some(_) => demoted(c, "sig.skipped.unresolvable-superclass"),
+            Some(_) => demoted(c, SKIP_UNRESOLVABLE_SUPERCLASS),
             None => c,
         })
         .collect();
@@ -762,8 +819,8 @@ fn finalize_superclasses(
                 // row either way.
                 // The reference demotes EVERY row of the class — an earlier
                 // `untyped-return` reason is replaced too.
-                if c.skip_reason != Some("sig.skipped.unresolvable-superclass") {
-                    c = demoted(c, "sig.skipped.unresolvable-superclass");
+                if c.skip_reason != Some(SKIP_UNRESOLVABLE_SUPERCLASS) {
+                    c = demoted(c, SKIP_UNRESOLVABLE_SUPERCLASS);
                 }
                 all_rows.push(c);
             }
@@ -851,7 +908,7 @@ fn demote_overridden_base_methods(
         .into_iter()
         .map(|c| {
             if emittable(&c) && overridden.contains(&(c.class_name.clone(), c.method_name.clone())) {
-                demoted(c, "sig.skipped.overridden-by-unsigned-subclass")
+                demoted(c, SKIP_OVERRIDDEN_BY_UNSIGNED_SUBCLASS)
             } else {
                 c
             }
@@ -993,7 +1050,7 @@ fn generate_file_with_info(
         for &child in body {
             let end = ast.get(child).span().1;
             while let Some((name, _)) = top_level.next_if(|(_, start)| *start < end) {
-                out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
+                out.push(non_emitted(path, "", &name, "instance", Some(SKIP_TOP_LEVEL_DEF)));
             }
             if is_namespace_node(&ast, child, &[], &layouts) {
                 walk_namespace(
@@ -1046,7 +1103,7 @@ fn generate_file_with_info(
         }
     }
     for (name, _) in top_level {
-        out.push(non_emitted(path, "", &name, "instance", Some("sig.skipped.top-level-def")));
+        out.push(non_emitted(path, "", &name, "instance", Some(SKIP_TOP_LEVEL_DEF)));
     }
     // `live_definitions` (reference): Ruby keeps the LAST certain definer of a
     // `(class, kind, name)` slot, and a def is written only when it survives
@@ -1661,7 +1718,7 @@ fn walk_namespace(
                 &class_name,
                 name,
                 "instance",
-                Some("sig.skipped.uncertain-module-function"),
+                Some(SKIP_UNCERTAIN_MODULE_FUNCTION),
             )),
             Emit::Nested(child) => walk_namespace(
                 ast,
@@ -2471,7 +2528,7 @@ fn method_candidate(
         .iter()
         .any(|&m| matches!(interner.get(m), Type::Top | Type::Dynamic(_)))
     {
-        return row(Some("sig.skipped.untyped-return"));
+        return row(Some(SKIP_UNTYPED_RETURN));
     }
 
     // Sort by the DESCRIBE string (reference `sort_members` — `describe(:short)`,
@@ -2493,7 +2550,7 @@ fn method_candidate(
         if e == "untyped" {
             // The whole member erases to `untyped`, so the reference's union
             // does too (`dynamic_top?` reads the erased form).
-            return row(Some("sig.skipped.untyped-return"));
+            return row(Some(SKIP_UNTYPED_RETURN));
         }
         if e.contains("untyped") {
             // …unless the untyped sits inside a bare generic's type-arg slot:

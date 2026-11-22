@@ -123,8 +123,10 @@ const ALL_CANONICAL_RULES: &[&str] = &[
     "call.deprecated-ruby2-keywords",
     // The one built-in id under `plugin.` — it sits in `ALL_RULES`, so
     // `disable:` / `severity_overrides:` resolve it as a catalogue id before
-    // any plugin-id reading (the `plugin.` prefix already reads as a known
-    // non-check family, so this row is redundant but keeps the table full).
+    // any plugin-id reading. The `plugin.` prefix already reads as a known
+    // non-check family, so this row is redundant for suppression — but
+    // `explain`'s catalogue test asserts ENTRIES equals this table, and the
+    // table must stay the FULL `ALL_RULES` (36 ids).
     "plugin.api-surface",
 ];
 

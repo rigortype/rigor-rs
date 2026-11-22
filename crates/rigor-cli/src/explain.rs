@@ -840,100 +840,102 @@ struct SkipEntry {
 
 /// The skip-reason catalogue — content mirrors the reference's
 /// `SkipReasonCatalog::ENTRIES` verbatim, in the same insertion order (the
-/// index prints [`SKIP_ENTRIES`] unsorted, unlike the rule catalogue).
+/// index prints [`SKIP_ENTRIES`] unsorted, unlike the rule catalogue). The ids
+/// are `sig_gen`'s `SKIP_*` constants, the one `sig.skipped.*` vocabulary — a
+/// test asserts they cover exactly [`crate::sig_gen::SKIP_IDS`].
 const SKIP_ENTRIES: &[SkipEntry] = &[
     SkipEntry {
-        id: "sig.skipped.untyped-return",
+        id: crate::sig_gen::SKIP_UNTYPED_RETURN,
         summary: "The method's return types as Dynamic[top], so no signature was written.",
         explanation: "Rigor inferred the body but the value it returns has no proven type — the last expression widened to Dynamic[top] somewhere up its chain. Emitting `untyped` here would record noise as a contract: the file would gain a signature that says nothing and stops a later, better inference from being noticed. This is the commonest skip reason on a project whose dependencies have no RBS.",
         next_step: "Do not write the return type by hand — the skip is the finding. Trace the returned expression back to where it became dynamic (`rigor annotate PATH` reads the `#=>` column, `rigor trace --format=json --line=N` for one line) and close THAT: install or write RBS for the dependency, enable the plugin for the framework, or report an engine gap.",
     },
     SkipEntry {
-        id: "sig.skipped.user-authored",
+        id: crate::sig_gen::SKIP_USER_AUTHORED,
         summary: "An RBS declaration for this method already exists and was left alone.",
         explanation: "Not a gap. The project already states a type for this member, and sig-gen does not overwrite a hand-authored contract without being told to. Where `sig/` and an inline annotation both declare the member, ADR-112 WD5's consistency rule decides which binds.",
         next_step: "Read the existing declaration. If it disagrees with what Rigor infers, raise the disagreement rather than silently retyping it; pass `--overwrite` only once you have decided the generated type is the better contract.",
     },
     SkipEntry {
-        id: "sig.skipped.unrenderable-rbs",
+        id: crate::sig_gen::SKIP_UNRENDERABLE_RBS,
         summary: "Rigor rendered a line that `rbs` itself rejects, so the method was dropped.",
         explanation: "A defect in Rigor's renderer, not in your code. The method is skipped rather than written so one pathological signature cannot make the whole generated file unparseable, and the count is reported so the defect is not silent.",
         next_step: "Report it, with the method and the file. `rigor sig-gen --print PATH` shows what was generated for the rest of the file and is the useful attachment.",
     },
     SkipEntry {
-        id: "sig.skipped.complex-shape",
+        id: crate::sig_gen::SKIP_COMPLEX_SHAPE,
         summary: "Reserved for a shape too complex to render; no code path produces it today.",
         explanation: "The identifier is part of the reserved `sig.skipped.*` family and is carried so the family stays stable, but no generator path emits it.",
         next_step: "If you have actually seen this id in output, that is itself worth reporting — it means a path exists that this catalogue does not describe.",
     },
     SkipEntry {
-        id: "sig.skipped.unresolvable-superclass",
+        id: crate::sig_gen::SKIP_UNRESOLVABLE_SUPERCLASS,
         summary: "The class's superclass chain does not end in a class the RBS environment knows.",
         explanation: "Writing the declaration would make things worse rather than better: RBS would read the class as rooted at an unknown parent and collapse it on the next run, losing the members it can resolve today.",
         next_step: "Give the environment the missing ancestor — install or write RBS for the gem that defines it, or add the project file that declares it to the analysed paths — then re-run `rigor sig-gen`.",
     },
     SkipEntry {
-        id: "sig.skipped.inline-declared",
+        id: crate::sig_gen::SKIP_INLINE_DECLARED,
         summary: "The member is declared inline, and `sig_gen.inline_declared: skip` keeps it out of `sig/`.",
         explanation: "Not a gap. The project asked sig-gen to leave every method its inline `# @rbs` / `#:` reader declares out of `sig/`, the setting for a project whose Steep reads the same annotations (`inline: true` beside `signature \"sig\"`), where a `sig/` copy would declare the method twice (`DuplicatedMethodDefinition`). Rigor still reads the inline declaration when it analyses the source; a consumer reading only the shipped `sig/` does not see this method.",
         next_step: "Nothing, if the setting is intended. To ship the member in `sig/`, remove `sig_gen.inline_declared: skip` from `.rigor.yml` and stop Steep from reading the annotations of the files you generate for.",
     },
     SkipEntry {
-        id: "sig.skipped.inline-generic-class",
+        id: crate::sig_gen::SKIP_INLINE_GENERIC_CLASS,
         summary: "The class is generic by an inline declaration, and sig-gen does not write type parameters.",
         explanation: "The class (or one it is nested in) takes type parameters from `# @rbs generic`, and `sig/` either does not declare it yet or declares it with differently named parameters. sig-gen would have to open it with a header that has no type parameters, which rbs rejects (`GenericParameterMismatchError`) — the class, and every class whose signature mentions it, would fail its definition build and read `Dynamic[top]` — or write members whose `T` the `sig/` declaration does not bind. The inline declaration still binds when the source is analysed.",
         next_step: "Declare the class in `sig/` with the same type parameters as the inline declaration (`class Box[T]` ... `end`) and re-run; sig-gen then writes the members into it.",
     },
     SkipEntry {
-        id: "sig.skipped.generic-reopening",
+        id: crate::sig_gen::SKIP_GENERIC_REOPENING,
         summary: "The method reopens a generic class whose type parameters sig-gen cannot copy onto a header.",
         explanation: "The class (or one it is nested in) is declared generic by loaded RBS — core, stdlib, a gem or `sig/` — and one of its type parameters has an upper bound or a default. sig-gen copies a declaration's type parameters onto the header it writes only when every one is plain, because a bound or default is a type spelled relative to the declaring file and can name a different class under another nesting. A header without the parameters, or with ones that differ, is rejected by rbs (`GenericParameterMismatchError`): the class, and every class whose signature mentions it, would fail its definition build.",
         next_step: "Declare the class in `sig/` with the declaration's own type parameters (`class Box[T < Comparable]` ... `end`) and re-run; sig-gen then writes the members into that declaration.",
     },
     SkipEntry {
-        id: "sig.skipped.inline-differs",
+        id: crate::sig_gen::SKIP_INLINE_DIFFERS,
         summary: "The method's inline declaration and its `sig/` declaration disagree; neither was changed.",
         explanation: "The method is declared inline by `# @rbs` / `#:` and in `sig/` (a `def` or an `attr_*`), and the two do not state the same types, or `sig/` lacks an annotation written inline. Parameter names, union spelling and a `::` that does not change what a name resolves to are ignored; overload order is not, because RBS answers a call with the first overload that matches. For a parameter-only annotation (`# @rbs name: T`, no `return:`) only the parameters are compared, and the return follows the ordinary proposal rules. sig-gen does not presume either side right, so it refuses, and `--write` and `--check` exit 1.",
         next_step: "Decide which declaration is right. To keep the inline one, re-run with `--overwrite`, which replaces the whole `sig/` member with it (an overload written only in `sig/` is dropped); to keep the `sig/` one, edit the annotation to match, or delete it. A parameter-only annotation whose parameters differ stays refused under `--overwrite`, because its return would be inferred under the `sig/` parameters: delete the `sig/` member and re-run, or add `# @rbs return:` so nothing is inferred.",
     },
     SkipEntry {
-        id: "sig.skipped.overridden-by-unsigned-subclass",
+        id: crate::sig_gen::SKIP_OVERRIDDEN_BY_UNSIGNED_SUBCLASS,
         summary: "A subclass overrides this method and its override was not itself emitted.",
         explanation: "A declaration on the parent is inherited by every subclass that does not redeclare the member. Emitting it here would hand the subclass a type describing the parent's body, not the override the subclass actually runs.",
         next_step: "Generate signatures for the overriding subclass too — widen the `sig-gen` path set to cover it — and the parent's declaration becomes safe to emit.",
     },
     SkipEntry {
-        id: "sig.skipped.overridden-bot",
+        id: crate::sig_gen::SKIP_OVERRIDDEN_BOT,
         summary: "The method's body never returns, and the analysed code overrides the method.",
         explanation: "The inferred return is `bot`, but the analysed code defines the method again, with `def` or `define_method`: a subclass (signed or not), a class that includes the method's module, a module included later or prepended, or an extending class's own singleton method. `bot` describes only the base body the overrides replace, and every override returns a value, so the declaration would contradict each of them (#3029).",
         next_step: "Declare the return every implementation shares (often `untyped` or the overrides' common type) by hand in `sig/`.",
     },
     SkipEntry {
-        id: "sig.skipped.abstract-method",
+        id: crate::sig_gen::SKIP_ABSTRACT_METHOD,
         summary: "The method is abstract: its body only raises an error asking for an implementation.",
         explanation: "The body ends in `raise NotImplementedError`, in an error class named `Abstract...` or `NotImplemented...`, or in a raise whose message asks for the method to be implemented, defined or overridden. Its inferred return is `bot`, but the method is meant to be replaced, and the replacements may live outside the analysed code, as in a plugin gem (#3029).",
         next_step: "Declare the return the implementations must provide by hand in `sig/`.",
     },
     SkipEntry {
-        id: "sig.skipped.template-method",
+        id: crate::sig_gen::SKIP_TEMPLATE_METHOD,
         summary: "The method's `bot` return may come only from calling an overridden or abstract method.",
         explanation: "The inferred return is `bot`, and the body does not end in a direct `raise`, `fail`, `throw`, `exit` or `abort`. It calls a method the analysed code overrides or declares abstract, directly or through a chain of self-dispatched calls, so the `bot` may be only the base body of that call, which an override replaces at run time. The call is matched by name, whatever its receiver (#3029).",
         next_step: "Declare the return by hand in `sig/`, usually the return the overridden hook's implementations share.",
     },
     SkipEntry {
-        id: "sig.skipped.top-level-def",
+        id: crate::sig_gen::SKIP_TOP_LEVEL_DEF,
         summary: "A top-level `def` defines a private `Object` method, and sig-gen writes no signature for it.",
         explanation: "Not a gap in inference. A `def` outside any `class` or `module` has no class to declare the member under, and Ruby makes it a private method on `Object`. sig-gen reports it instead of dropping it silently, so a file that defines only top-level methods is not mistaken for one that was never read. Whether to emit it as a private `Object` method is undecided (#1676); `def self.x` and `def` inside a block body are not reported.",
         next_step: "Nothing is required. To type the method, move it into a module (`module_function` or `extend self` keeps the call sites), or write the `Object` declaration by hand in `sig/`.",
     },
     SkipEntry {
-        id: "sig.skipped.uncertain-module-function",
+        id: crate::sig_gen::SKIP_UNCERTAIN_MODULE_FUNCTION,
         summary: "Whether the method is a module function depends on a visibility call that may not run.",
         explanation: "A bare `module_function` makes the module's later methods module functions, and a later bare `public`, `private` or `protected` ends that. Here such a call sits in control flow or a block between the two, so it may or may not run, and the method is either a module function (`def self?.name`) or an instance method only (`def name`). sig-gen writes neither rather than guess (#1968).",
         next_step: "Move the visibility call to the module body's own statements, or name the methods it should cover (`public :name`, `module_function :name`), so the reading is certain.",
     },
     SkipEntry {
-        id: "sig.skipped.platform-guarded",
+        id: crate::sig_gen::SKIP_PLATFORM_GUARDED,
         summary: "The method is defined in a file loaded only under a platform guard, so its proposal was withheld.",
         explanation: "The file is `require`d / `require_relative`d only inside a conditional on `RUBY_ENGINE`, `RUBY_PLATFORM` or `defined?(…)`, so it is not an ordinary definition for every platform — the shape is `if RUBY_ENGINE == 'truffleruby'` guarding a pure-Ruby fallback whose real methods a C extension provides elsewhere. sig-gen withholds the proposal when another scanned file also defines the method (the guarded copy would compete with or duplicate the definition this platform loads), or when the inferred return is `bot` — the shape a raising stub takes, and never a contract worth writing from a file the current engine may never read (#3035).",
         next_step: "Declare the method for the platform the project targets — hand-write the `sig/` entry, or cover the file that defines it on this platform in the `sig-gen` paths — rather than taking the guarded file's stub as the contract.",
@@ -1400,8 +1402,19 @@ mod tests {
         // The catalogue covers every `sig.skipped.*` id and keeps the
         // reference's insertion order (the index prints it unsorted).
         assert_eq!(SKIP_ENTRIES.len(), 16);
-        assert_eq!(SKIP_ENTRIES[0].id, "sig.skipped.untyped-return");
-        assert_eq!(SKIP_ENTRIES[15].id, "sig.skipped.platform-guarded");
+        assert_eq!(SKIP_ENTRIES[0].id, crate::sig_gen::SKIP_UNTYPED_RETURN);
+        assert_eq!(SKIP_ENTRIES[15].id, crate::sig_gen::SKIP_PLATFORM_GUARDED);
+    }
+
+    /// The skip-reason catalogue answers every id `sig_gen` can print (and no
+    /// more) — the reference's `cli_spec` gate that every
+    /// `SKIP_DIAGNOSTIC_IDS` member resolves in `explain`.
+    #[test]
+    fn skip_catalogue_covers_the_sig_gen_vocabulary() {
+        use std::collections::BTreeSet;
+        let entries: BTreeSet<&str> = SKIP_ENTRIES.iter().map(|e| e.id).collect();
+        let ids: BTreeSet<&str> = crate::sig_gen::SKIP_IDS.iter().copied().collect();
+        assert_eq!(entries, ids);
     }
 
     #[test]
