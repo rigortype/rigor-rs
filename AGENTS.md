@@ -52,8 +52,12 @@ thing that stops two agents taking the same issue.
    owns the PR then merges it itself, under the conditions in
    `docs/agents/review.md` → "Self-merge"; anything outside them waits for a
    human.
-8. **Fold after merge.** Write the detail into a dated `docs/notes/` file or
-   an ADR, then add one ledger line to `docs/CURRENT_WORK.md`.
+8. **Fold after merge.** Record what landed, the measured outcome and
+   follow-ups on the GitHub issue/PR; durable detail goes in a dated
+   `docs/notes/` file or an ADR. Do NOT append a per-PR/per-issue line to
+   `docs/CURRENT_WORK.md` — it is not a running log. Write there only
+   non-obvious in-flight matters that cross issue boundaries, and prune
+   entries that are done or captured elsewhere.
 
 **Abandoning a claim:** remove `in-progress`, and comment on the issue with what
 you learned and the branch holding any work worth keeping. The ADR or issue text
@@ -186,8 +190,11 @@ What the gates cannot see, so probe it by hand:
 
 - Record hard-to-reverse, surprising, real-tradeoff decisions as ADRs, with
   the slice's **measured** outcome (even "0 gaps, deferred").
-- `docs/CURRENT_WORK.md` holds Now/Next plus one ledger line per closed arc.
-  Byte budgets are enforced by `harness/docs_check.py`.
+- `docs/CURRENT_WORK.md` holds Now/Next only: non-obvious in-flight matters
+  that cross issue boundaries. It is not a running log — ordinary facts
+  (what landed, follow-ups, per-issue notes) live on the GitHub issue/PR;
+  prune entries that are done. Byte budgets are enforced by
+  `harness/docs_check.py`.
 - Small doc-only changes go straight to master; code goes through a PR.
   Before such a commit from the main checkout, run
   `git submodule update reference/rigor` and check that `git status` shows no

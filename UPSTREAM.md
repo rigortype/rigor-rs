@@ -531,5 +531,6 @@ chasing a non-bug.)
    `python3 harness/effects_diff.py`: the
    effects gate has its own retraction class (`v0.3.5` made `super` taint).
 8. Update the tag/commit in this file (and `PROVENANCE.md` if rbs moved), record
-   the numbers in `harness/CORPUS.md`, write a dated note in `docs/notes/`, and
-   fold ONE ledger line into `docs/CURRENT_WORK.md`.
+   the numbers in `harness/CORPUS.md` and on the PR, write a dated note in
+   `docs/notes/`, and update the pin line in `docs/CURRENT_WORK.md` — the
+   note and PR carry the record; no ledger entry.
