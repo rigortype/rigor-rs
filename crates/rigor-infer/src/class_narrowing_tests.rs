@@ -1599,6 +1599,134 @@ fn class_narrowing_case_shadow_and_block_declines() {
     assert!(!snaps.contains_key(&call_named(&ast, "frobnicate_zzz")));
 }
 
+/// ISSUE-710 — the threaded `case`/`when` falsey edge
+/// (`eval_case_when_branches`, `statement_evaluator.rb:2489`). Every row is
+/// oracle-measured against the pinned reference: `dead: true` — the
+/// reference is SILENT at the call and rigor-rs must suppress it through
+/// [`ClassNarrowing::dead`]; `dead: false` — the must-still-fire control,
+/// the call's carrier survives on both engines. The reference's own
+/// `flow.unreachable-clause` infos are un-emitted coverage, never asserted.
+///
+/// `use_` names the call under test; `x` is always a precise `1`.
+#[test]
+fn class_narrowing_case_falsey_edge_matrix() {
+    let rows: &[(&str, &str, &str, bool)] = &[
+        // The covering `when Integer` drops the subject out of the FALSEY
+        // edge: a later clause body and the `else` enter from `Bot`.
+        (
+            "covered_when_silences_later_clause",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen Integer\n  1\nwhen String\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "covered_when_silences_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen Integer\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "covered_multi_cond_silences_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen Integer, String\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "covered_int_lit_silences_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen 1\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        // …and the clause body itself still witnesses under the truthy meet.
+        (
+            "must_fire_covering_body",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen Integer\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        (
+            "must_fire_disjoint_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen String\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // A disjoint clause collapses its own body, not the falsey edge:
+        // the `else` keeps the `1` carrier.
+        (
+            "disjoint_when_dead_body",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen String\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        // `when 2` removes the ONE literal from the falsey edge — `x` is
+        // `1`, so the edge (and the else) keeps it. The clause body
+        // collapsed: `1` can never equal `2`.
+        (
+            "non_matching_int_lit_body",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen 2\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "must_fire_after_non_matching_int_lit",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen 2\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // An integer RANGE is not `fully_narrowable` (the complement is
+        // two-piece): the falsey edge keeps the carrier wholesale —
+        // `when Integer` after `when 1..3` still witnesses on the reference.
+        (
+            "must_fire_int_range_then_class",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nwhen 1..3\n  1\nwhen Integer\n  x.frobnicate_zzz\nend\n",
+            false,
+        ),
+        // `case`/`in` — a bare class pattern narrows like a `when`, on both
+        // edges; an unknown constant is a class target the ordering demotes.
+        (
+            "in_class_covers_else",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nin Integer\n  1\nelse\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        (
+            "in_unknown_const_dead_arm",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nin NoSuchZz\n  x.frobnicate_zzz\nend\n",
+            true,
+        ),
+        // A `case`/`in` without `else` has no no-match arm
+        // (`pattern_case_matches_every_path?`): the continuation joins only
+        // the arm edges — a disjoint `in` arm collapses the subject after
+        // the `case`.
+        (
+            "case_in_no_else_disjoint_after",
+            "frobnicate_zzz",
+            "x = \"s\"\ncase x\nin Integer\n  1\nend\nx.frobnicate_zzz\n",
+            true,
+        ),
+        // …while a surviving arm keeps the union inhabited.
+        (
+            "must_fire_case_in_no_else_after",
+            "frobnicate_zzz",
+            "x = 1\ncase x\nin [a]\n  1\nend\nx.frobnicate_zzz\n",
+            false,
+        ),
+    ];
+    for (row, method, src, dead) in rows {
+        let ast = lower_src(src.as_bytes());
+        let index = CoreIndex::new();
+        let source = SourceIndex::build(&ast, &index);
+        let scopes = lexical_scopes(&ast);
+        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
+        let mut i = Interner::new();
+        let pass = typer.class_narrowing_pass(&ast, &mut i);
+        let call = call_named(&ast, method);
+        assert_eq!(pass.dead.contains(&call), *dead, "case-falsey row {row}");
+    }
+}
+
 /// STAGE 3a-3 — single-hop chain guards, LOCAL roots
 /// (docs/notes/20260807-narrowing-stage3-spec.md, "3a-3 BUILT").
 ///

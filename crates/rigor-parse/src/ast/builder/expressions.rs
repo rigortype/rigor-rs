@@ -275,6 +275,7 @@ impl<'src> Builder<'src> {
             return self.push(Node::Range {
                 left,
                 right,
+                exclude_end: range.is_exclude_end(),
                 span: span_of(&range.location()),
             });
         }

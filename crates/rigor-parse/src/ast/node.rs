@@ -751,6 +751,9 @@ pub enum Node {
     Range {
         left: Option<NodeId>,
         right: Option<NodeId>,
+        /// `a...b` — the high bound is excluded (`case_equality_integer_range`
+        /// subtracts one from a literal `high` for it, `narrowing.rb:3307`).
+        exclude_end: bool,
         span: Span,
     },
     /// An instance/class/global variable read (`@x`, `@@x`, `$x`). Typed

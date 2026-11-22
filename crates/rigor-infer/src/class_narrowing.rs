@@ -9,7 +9,7 @@ use std::rc::Rc;
 
 use rigor_index::ClassOrdering;
 use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
-use rigor_types::{Interner, Type};
+use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{
     collect_flow_writes, indexed_flow_writes, multi_target_binder,
@@ -115,6 +115,234 @@ impl GuardTarget {
         match self {
             GuardTarget::Local(n) | GuardTarget::Chain(n, _) => n,
         }
+    }
+}
+
+/// One `when` condition / `in` class pattern, classified the way the
+/// reference's `apply_case_when_condition` (`narrowing.rb:3254`) reads it.
+/// The class decides BOTH the truthy-edge meet in the clause body AND
+/// whether the clause's falsey edge may narrow further — `fully_narrowable`,
+/// which an unread condition or an integer range switches off.
+#[derive(Debug)]
+enum CaseCond {
+    /// `C === subject`: a static class/module constant resolved lexically
+    /// (`lexical_class_name` — resolved, never declined: the MEET side reads
+    /// a project-shadowed or unresolvable name as a class too, and the
+    /// ordering demotes it), a `nil`/`true`/`false` literal
+    /// (`SINGLETON_WHEN_LITERAL_CLASSES` → `NilClass`/`TrueClass`/
+    /// `FalseClass`), or a range literal whose `range_target_class` is
+    /// `Numeric`/`String`.
+    Class(String),
+    /// `k === subject` for an integer literal — value equality, read only on
+    /// an integer-rooted carrier (`integer_rooted_type?`). The truthy meet is
+    /// `narrow_integer_equal`, the falsey `narrow_integer_not_equal`;
+    /// `fully_narrowable: true`. `(i64 value, normalized digit spelling)` —
+    /// `None`/`String` for a Bignum.
+    IntLit(Option<i64>, String),
+    /// `(a..b) === subject` on an integer-rooted carrier —
+    /// `integer_range_when_result`'s `fully_narrowable: false` (the
+    /// complement is two-piece), so the clause hands the falsey edge the
+    /// ENTRY scope back.
+    IntRange(IntBound, IntBound),
+    /// `/re/ === subject` — `fully_narrowable: true`; the truthy narrows by
+    /// `to_str` membership (`regexp_case_equality_type`), the falsey keeps
+    /// the accumulator.
+    Regexp,
+    /// `apply_case_when_condition` answered nil — calls, writes, splats and
+    /// the literals no rule reads (`"s"`, `:s`, `1.5`, an interpolated
+    /// regexp). A clause with an unread member answers `untyped` for its
+    /// body and hands the entry scope to the falsey edge.
+    Unread,
+}
+
+/// A `case_equality_integer_range` bound — an integer literal's value or the
+/// open-ended infinity an absent endpoint supplies.
+#[derive(Clone, Debug)]
+enum IntBound {
+    NegInf,
+    /// `(i64 value, normalized signed-decimal spelling)` — `None` + spelling
+    /// for a Bignum the `i64` cannot hold.
+    Lit(Option<i64>, String),
+    PosInf,
+}
+
+impl IntBound {
+    /// `high -= 1` for a `...` range's literal upper bound
+    /// (`case_equality_integer_range`, `narrowing.rb:3307`).
+    fn dec(&self) -> IntBound {
+        match self {
+            IntBound::Lit(Some(v), _) => {
+                let v = *v - 1;
+                IntBound::Lit(Some(v), v.to_string())
+            }
+            IntBound::Lit(None, d) => IntBound::Lit(None, dec_int_spelling(d)),
+            b => b.clone(),
+        }
+    }
+}
+
+/// A signed-decimal spelling minus one, for Bignum `...` bounds the `i64`
+/// cannot hold.
+fn dec_int_spelling(d: &str) -> String {
+    if let Some(rest) = d.strip_prefix('-') {
+        // -N - 1 = -(N + 1)
+        let mut digits: Vec<u8> = rest.bytes().collect();
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            if digits[i] == b'9' {
+                digits[i] = b'0';
+                if i == 0 {
+                    digits.insert(0, b'1');
+                    break;
+                }
+            } else {
+                digits[i] += 1;
+                break;
+            }
+        }
+        format!("-{}", String::from_utf8(digits).unwrap_or_default())
+    } else if d == "0" {
+        "-1".to_string()
+    } else {
+        let mut digits: Vec<u8> = d.bytes().collect();
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            if digits[i] == b'0' {
+                digits[i] = b'9';
+            } else {
+                digits[i] -= 1;
+                break;
+            }
+            if i == 0 {
+                break;
+            }
+        }
+        normalize_int_spelling(&String::from_utf8(digits).unwrap_or_default())
+    }
+}
+
+/// Canonicalize a signed decimal spelling — strip leading zeros past the
+/// sign (`"007"` → `"7"`, `"-0"`/`"00"` → `"0"`).
+fn normalize_int_spelling(d: &str) -> String {
+    let (neg, rest) = match d.strip_prefix('-') {
+        Some(r) => (true, r),
+        None => (false, d),
+    };
+    let rest = rest.trim_start_matches('0');
+    let rest = if rest.is_empty() { "0" } else { rest };
+    if neg && rest != "0" {
+        format!("-{rest}")
+    } else {
+        rest.to_string()
+    }
+}
+
+/// `a.cmp(b)` where `a` may be a Bignum spelling (always outside `i64`, so
+/// its sign alone orders it against any `i64`).
+fn cmp_int_i64(v: Option<i64>, digits: &str, b: i64) -> std::cmp::Ordering {
+    match v {
+        Some(a) => a.cmp(&b),
+        None => {
+            if digits.starts_with('-') {
+                std::cmp::Ordering::Less
+            } else {
+                std::cmp::Ordering::Greater
+            }
+        }
+    }
+}
+
+/// `a.cmp(b)` for two integer values in `(i64, spelling)` form — Bignum vs
+/// Bignum compares sign, magnitude length, then the digits themselves.
+fn cmp_int_spellings(a: &str, b: &str) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    let an = a.starts_with('-');
+    let bn = b.starts_with('-');
+    if an != bn {
+        return if an { Less } else { Greater };
+    }
+    let (a, b) = (a.trim_start_matches('-'), b.trim_start_matches('-'));
+    let ord = a.len().cmp(&b.len()).then_with(|| a.cmp(b));
+    if an { ord.reverse() } else { ord }
+}
+
+/// `scalar.cmp(bound)` for an integer-valued [`Scalar`] — a bound is never
+/// Equal to an infinity, so only `Lit` compares.
+fn cmp_scalar_bound(s: &Scalar, b: &IntBound) -> std::cmp::Ordering {
+    use std::cmp::Ordering::*;
+    match b {
+        IntBound::NegInf => Greater,
+        IntBound::PosInf => Less,
+        IntBound::Lit(v, d) => match (s, v) {
+            (Scalar::Int(a), Some(b)) => a.cmp(b),
+            // An `i64` never equals a Bignum; the Bignum's sign orders them.
+            (Scalar::Int(_), None) => {
+                if d.starts_with('-') { Greater } else { Less }
+            }
+            (Scalar::BigInt(a), Some(b)) => cmp_int_i64(None, a.as_str(), *b),
+            (Scalar::BigInt(a), None) => cmp_int_spellings(a, d),
+            _ => Equal, // a non-integer scalar — unreachable by the caller gate
+        },
+    }
+}
+
+/// `lo <= scalar <= hi` for an integer-valued [`Scalar`].
+fn int_scalar_in_bounds(s: &Scalar, lo: &IntBound, hi: &IntBound) -> bool {
+    cmp_scalar_bound(s, lo) != std::cmp::Ordering::Less
+        && cmp_scalar_bound(s, hi) != std::cmp::Ordering::Greater
+}
+
+/// Whether an `IntegerRange` carrier `[min, max]` is wholly outside
+/// `[lo, hi]` — the `Bot` meet of `intersect_integer_range`.
+fn int_ranges_disjoint(
+    min: Option<i64>,
+    max: Option<i64>,
+    lo: &IntBound,
+    hi: &IntBound,
+) -> bool {
+    // `max < lo`: the carrier sits wholly below the range.
+    let below = match (max, lo) {
+        (Some(m), IntBound::Lit(v, d)) => cmp_int_i64(*v, d, m) == std::cmp::Ordering::Greater,
+        (Some(_), IntBound::PosInf) => true,
+        _ => false,
+    };
+    // `min > hi`: the carrier sits wholly above it.
+    let above = match (min, hi) {
+        (Some(m), IntBound::Lit(v, d)) => cmp_int_i64(*v, d, m) == std::cmp::Ordering::Less,
+        (Some(_), IntBound::NegInf) => true,
+        _ => false,
+    };
+    below || above
+}
+
+/// Whether an `IntegerRange` `[min, max]` contains the integer literal
+/// `(value, digits)`.
+fn int_range_covers(
+    min: Option<i64>,
+    max: Option<i64>,
+    value: Option<i64>,
+    digits: &str,
+) -> bool {
+    let after_lo = match min {
+        Some(m) => cmp_int_i64(value, digits, m) != std::cmp::Ordering::Less,
+        None => true,
+    };
+    let before_hi = match max {
+        Some(m) => cmp_int_i64(value, digits, m) != std::cmp::Ordering::Greater,
+        None => true,
+    };
+    after_lo && before_hi
+}
+
+/// `constant.value == k` for a `when k` integer literal —
+/// `narrow_integer_equal_constant` / `narrow_integer_not_equal`.
+fn int_scalar_eq(s: &Scalar, value: Option<i64>, digits: &str) -> bool {
+    match (s, value) {
+        (Scalar::Int(v), Some(k)) => *v == k,
+        (Scalar::BigInt(d), _) => cmp_int_spellings(d, digits) == std::cmp::Ordering::Equal,
+        _ => false,
     }
 }
 
@@ -2331,19 +2559,265 @@ impl<'i> Typer<'i> {
         self.index.knows_qualified_class(qname) || self.index.is_qualified_project_sig_class(qname)
     }
 
+    /// `integer_rooted_type?` (`narrowing.rb:3310`) for a `case` subject's
+    /// tenv carrier: a `Constant` Integer, an `IntegerRange`, a bare
+    /// `Nominal[Integer]` — or, on the reference, an all-integer union,
+    /// which this slice declines like every other union carrier.
+    fn integer_rooted(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Constant(Scalar::Int(_) | Scalar::BigInt(_)) | Type::IntegerRange { .. } => {
+                true
+            }
+            Type::Nominal { class, args } => {
+                args.is_empty() && self.index.class_name_for_id(*class) == Some("Integer")
+            }
+            _ => false,
+        }
+    }
+
+    /// One `when` condition's `===` class — `apply_case_when_condition`
+    /// (`narrowing.rb:3254`) minus the subject-dependent parts the caller
+    /// supplies as `integer_rooted`.
+    fn case_cond_class(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        integer_rooted: bool,
+        use_span: rigor_parse::Span,
+    ) -> CaseCond {
+        match ast.get(id) {
+            Node::ConstantRead { name, dynamic_base, rooted, .. } => {
+                if name.is_empty() || *dynamic_base {
+                    return CaseCond::Unread;
+                }
+                // `lexical_class_name` — resolved at the use site's prefix
+                // and NEVER declined: the MEET side reads a class target
+                // where the mint gate would decline a project shadow.
+                if *rooted {
+                    CaseCond::Class(name.to_string())
+                } else {
+                    let prefix = self.enclosing_prefix(use_span);
+                    CaseCond::Class(self.resolve_constant_as_written(name, prefix, false))
+                }
+            }
+            Node::NilLit { .. } => CaseCond::Class("NilClass".to_string()),
+            Node::TrueLit { .. } => CaseCond::Class("TrueClass".to_string()),
+            Node::FalseLit { .. } => CaseCond::Class("FalseClass".to_string()),
+            Node::RegexpLit { .. } => CaseCond::Regexp,
+            Node::IntegerLit { value, digits, .. } if integer_rooted => CaseCond::IntLit(
+                *value,
+                digits
+                    .clone()
+                    .unwrap_or_else(|| value.map(|v| v.to_string()).unwrap_or_default()),
+            ),
+            Node::Range { left, right, exclude_end, .. } => {
+                // `case_equality_integer_range`: both present endpoints are
+                // integer literals (an absent one is an infinity). Only then
+                // does `integer_rooted_type?` pick the RANGE answer; a
+                // well-formed integer range on any other carrier falls
+                // through to `when_condition_class`, where every endpoint
+                // being an `IntegerNode` makes `range_target_class`
+                // answer `Numeric`.
+                let bound = |ep: &Option<NodeId>| -> Option<Option<(Option<i64>, String)>> {
+                    match ep {
+                        None => Some(None),
+                        Some(n) => match ast.get(*n) {
+                            Node::IntegerLit { value, digits, .. } => Some(Some((
+                                *value,
+                                digits
+                                    .clone()
+                                    .unwrap_or_else(|| {
+                                        value.map(|v| v.to_string()).unwrap_or_default()
+                                    }),
+                            ))),
+                            _ => None,
+                        },
+                    }
+                };
+                match (bound(left), bound(right)) {
+                    (Some(lo), Some(hi)) => {
+                        if integer_rooted {
+                            let mk = |b: Option<(Option<i64>, String)>, inf: IntBound| match b {
+                                None => inf,
+                                Some((v, d)) => {
+                                    IntBound::Lit(v, normalize_int_spelling(&d))
+                                }
+                            };
+                            let lo = mk(lo, IntBound::NegInf);
+                            let hi = mk(hi, IntBound::PosInf);
+                            let hi = if *exclude_end { hi.dec() } else { hi };
+                            CaseCond::IntRange(lo, hi)
+                        } else {
+                            CaseCond::Class("Numeric".to_string())
+                        }
+                    }
+                    _ => {
+                        // `range_target_class`: an `IntegerNode`/`FloatNode`
+                        // endpoint answers `Numeric`, a `StringNode` one
+                        // `String`; anything else is unread.
+                        let numeric = |ep: &Option<NodeId>| {
+                            ep.is_some_and(|n| {
+                                matches!(
+                                    ast.get(n),
+                                    Node::IntegerLit { .. } | Node::FloatLit { .. }
+                                )
+                            })
+                        };
+                        let string = |ep: &Option<NodeId>| {
+                            ep.is_some_and(|n| matches!(ast.get(n), Node::StringLit { .. }))
+                        };
+                        if numeric(left) || numeric(right) {
+                            CaseCond::Class("Numeric".to_string())
+                        } else if string(left) || string(right) {
+                            CaseCond::Class("String".to_string())
+                        } else {
+                            CaseCond::Unread
+                        }
+                    }
+                }
+            }
+            _ => CaseCond::Unread,
+        }
+    }
+
+    /// The TRUTHY-edge meet one `when`/`in` condition applies to the
+    /// subject's precise carrier — `None` keeps the carrier (the `met`
+                /// members the union rides), `Some(Bot)` collapses,
+    /// `Some(Widened)` is the `untyped` answer.
+    fn case_cond_meet(
+        &self,
+        local: &str,
+        cond: &CaseCond,
+        tenv: &TypeEnv,
+        cenv: &Facts,
+        interner: &Interner,
+    ) -> Option<ClassFact> {
+        match cond {
+            CaseCond::Class(name) => {
+                self.guard_meet_precise(local, name, false, tenv, cenv, interner)
+            }
+            // `narrow_integer_equal` — a `Constant` collapses on any other
+            // value, an `IntegerRange` when it cannot contain the literal;
+            // a bare `Nominal[Integer]` re-pins to `Constant[k]` — a live
+            // carrier either way.
+            CaseCond::IntLit(value, digits) => match interner.get(*tenv.get(local)?) {
+                Type::Constant(s) => {
+                    (!int_scalar_eq(s, *value, digits)).then_some(ClassFact::Bot)
+                }
+                Type::IntegerRange { min, max } => {
+                    (!int_range_covers(*min, *max, *value, digits)).then_some(ClassFact::Bot)
+                }
+                _ => None,
+            },
+            // `integer_range_when_result`'s truthy — the carrier intersected
+            // with the range: a `Constant` outside collapses, an
+            // `IntegerRange` disjoint from it collapses.
+            CaseCond::IntRange(lo, hi) => match interner.get(*tenv.get(local)?) {
+                Type::Constant(s) => {
+                    (!int_scalar_in_bounds(s, lo, hi)).then_some(ClassFact::Bot)
+                }
+                Type::IntegerRange { min, max } => {
+                    int_ranges_disjoint(*min, *max, lo, hi).then_some(ClassFact::Bot)
+                }
+                _ => None,
+            },
+            // `regexp_case_equality_member`: the member keeps whole when its
+            // class `converts_with_to_str?` — String, a class whose
+            // signature/ancestry/source declares `to_str`, or a class no
+            // signature declares — and otherwise narrows to its
+            // `String | Symbol` parts. A member collapses only when BOTH
+            // projections do — a `Disjoint` ordering on each side; a
+            // `Superclass` ordering still answers a live `Nominal[target]`.
+            // The `to_str`-signature and declared-ancestry keeps this
+            // approximation misses are coverage losses, never FPs.
+            CaseCond::Regexp => {
+                let ty = *tenv.get(local)?;
+                let carrier = self.index.class_name_of(interner, ty)?;
+                let disjoint = |target: &str| {
+                    matches!(
+                        self.index.class_ordering(carrier, target),
+                        ClassOrdering::Disjoint
+                    )
+                };
+                (disjoint("String") && disjoint("Symbol")).then_some(ClassFact::Bot)
+            }
+            CaseCond::Unread => None,
+        }
+    }
+
+    /// The FALSEY-edge subtraction one condition applies — the clause-level
+    /// `fully_narrowable` gate already excluded `IntRange` and `Unread`
+    /// members and a `Regexp` contributes nothing, so this answers "does the
+    /// carrier drop out of the edge entirely".
+    fn case_cond_covers(
+        &self,
+        local: &str,
+        cond: &CaseCond,
+        tenv: &TypeEnv,
+        interner: &Interner,
+    ) -> bool {
+        let Some(&ty) = tenv.get(local) else { return false };
+        match cond {
+            // `narrow_*_not_class` drops the carrier exactly when it IS the
+            // target — `subclass_of?`'s `{subclass, equal}` — for every
+            // carrier the positive-edge rules model (`narrow_other_class`'s
+            // negative half keeps anything else UNCHANGED: a `Dynamic`, an
+            // `IntegerRange`, a `Singleton`, a `Union`).
+            CaseCond::Class(name) => {
+                if !matches!(
+                    interner.get(ty),
+                    Type::Constant(_) | Type::Nominal { .. } | Type::Tuple(_) | Type::HashShape(_)
+                ) {
+                    return false;
+                }
+                let Some(carrier) = self.index.class_name_of(interner, ty) else {
+                    return false;
+                };
+                matches!(
+                    self.index.class_ordering(carrier, name),
+                    ClassOrdering::Subclass | ClassOrdering::Equal
+                )
+            }
+            // `narrow_integer_not_equal` removes the ONE literal value: a
+            // `Constant[k]` drops out; a single-point `IntegerRange[k,k]`
+            // empties; everything else keeps.
+            CaseCond::IntLit(value, digits) => match interner.get(ty) {
+                Type::Constant(s) => int_scalar_eq(s, *value, digits),
+                Type::IntegerRange { min: Some(lo), max: Some(hi) } => {
+                    lo == hi && *value == Some(*lo)
+                }
+                _ => false,
+            },
+            _ => false,
+        }
+    }
+
     /// Narrow through one `case`/`when` node (statement or expression
-    /// position) — reference `case_when_scopes` (`narrowing.rb:374`), the
-    /// strict-subset envelope:
-    /// - the subject is a bare `LocalVariableRead` whose type is Dynamic/Top;
-    /// - a clause narrows ONLY when it has EXACTLY ONE condition and that
-    ///   condition is a static constant, resolved lexically, unshadowed
-    ///   (multi-condition unions — probe a6 — decline, FP-safe);
-    /// - clause bodies only; NO falsey threading between clauses (we never
-    ///   narrow negative edges), no propagation past the `case`;
-    /// - a `case`/`in` pattern branch (a `BeginRescue` carrier, not a `When`)
-    ///   is unmodeled — no descent, matching the pre-slice behavior;
-    /// - after the `case`: widen written locals, clear ALL facts (the same
-    ///   conservative join every conditional gets);
+    /// position) — reference `case_when_scopes`/`case_clause_scopes`
+    /// (`narrowing.rb:519,583`), the strict-subset envelope:
+    /// - the subject is a bare `LocalVariableRead` whose type is Dynamic/Top
+    ///   (the `subject`/`bot_subject` pair);
+    /// - a clause narrows the Dynamic subject ONLY when it has EXACTLY ONE
+    ///   condition and that condition is a static constant, resolved
+    ///   lexically, unshadowed (multi-condition unions — probe a6 — decline,
+    ///   FP-safe);
+    /// - the per-condition meet a PRECISE carrier takes in a clause body is
+    ///   `apply_case_when_condition` (`narrowing.rb:3254`): class targets
+    ///   (`when C`/`in C`, `nil`/`true`/`false`, non-integer ranges →
+    ///   `Numeric`/`String`), an integer literal (`when k`), an integer range
+    ///   (`when a..b`) and a regexp literal are each READ; anything else is
+    ///   unread and an all-unread clause keeps the entry carrier while a
+    ///   mixed one widens it (`case_when_body_type` → `untyped`);
+    /// - the FALSEY edge threads clause to clause
+    ///   (`eval_case_when_branches`, `statement_evaluator.rb:2489`): each
+    ///   clause's body enters from the accumulated no-match scope and the
+    ///   `else` — real, or a `case`/`when`'s implicit no-match arm — from
+    ///   the last one. The subject is the only local that moves on it:
+    ///   `narrow_not_class` drops a covered carrier to `Bot` once EVERY
+    ///   condition of the covering clauses was narrowable
+    ///   (`fully_narrowable`); a `case`/`in` WITHOUT `else` has no no-match
+    ///   arm at all (`pattern_case_matches_every_path?`) — no else edge is
+    ///   pushed and the subject's post-`case` fact is the arm-edge union;
     /// - **position gate** (`stmt_position`): a `case` reached as a call
     ///   receiver, as an argument, or as a `return` operand narrows NOTHING —
     ///   the reference is silent there (probes p2, p3, p7) while it fires in
@@ -2398,78 +2872,192 @@ impl<'i> Typer<'i> {
         // Join-retention slice: the pre-`case` facts, snapshot AFTER the subject
         // was evaluated (each clause clones `cenv` from exactly here).
         let pre_join = cenv.clone();
-        // Were ALL branches descended? A `case`/`in` pattern clause is not, so
-        // its effects are invisible to the edge evidence. Rebinds are still
-        // caught by the span kill below, but an `invalidate_chain_after_call`
-        // is not recorded in `writes` at all — so the chain half of the restore
-        // is enabled only when every branch produced a real edge.
+        // The threaded FALSEY edge — the reference's
+        // `eval_case_when_branches` (`statement_evaluator.rb:2489`) walks the
+        // clauses in source order, and each clause's body enters from the
+        // scope the PRECEDING clauses' no-match edges left behind: a subject
+        // whose carrier a `when`/`in` class test covers is `Bot` in every
+        // later clause and in the `else`. `falsey` accumulates exactly that —
+        // the `case`'s entry facts, each clause's condition effects, and the
+        // subject's subtraction — so clause bodies clone from IT, not from
+        // `cenv` (rigor-rs#710).
+        let mut falsey = cenv.clone();
+        // Were ALL branches descended? `edges` is the restore's only evidence
+        // for the `in` arms as well as the `when`s — a carrier this slice
+        // still cannot place leaves the chain half of the restore disabled.
         let mut all_descended = true;
         let mut edges: Vec<Facts> = Vec::new();
         // Parallel to `edges`: does that clause's body TERMINATE? Only
         // [`propagate_widened`] reads it — a `when` arm that returns widens
         // nothing for the code after the `case`.
         let mut edge_terminates: Vec<bool> = Vec::new();
+        // The `case`/`in` flag `pattern_case_matches_every_path?` reads: an
+        // all-`in` `case` without `else` has no no-match arm to join.
+        let mut saw_when = false;
+        let mut saw_in = false;
+        // `when_test_rebinds_subject?` (#1963): once a `when` test writes the
+        // subject, NO later clause narrows it — the variable no longer holds
+        // the value the tests match.
+        let mut subject_rebound = false;
+        // `integer_rooted_type?` reads the subject's tenv carrier, which the
+        // clause loop never rewrites — compute it once.
+        let integer_rooted = bot_subject
+            .as_ref()
+            .and_then(|local| tenv.get(local.as_str()))
+            .is_some_and(|&ty| self.integer_rooted(ty, interner));
         for br in branches {
-            let Node::When { conditions, body, .. } = ast.get(br) else {
-                // A `case`/`in` pattern carrier — unmodeled, no descent
-                // (pre-slice behavior; the trailing clear-all covers effects).
-                all_descended = false;
-                continue;
-            };
-            let (conditions, body) = (conditions.clone(), body.clone());
-            // Each clause runs on a clone of the PRE-`case` facts: clauses are
-            // alternatives, and we never thread a falsey edge between them.
+            // `conditions` are the `===` operands the clause narrows by (an
+            // `in` arm contributes its bare-class pattern, or nothing);
+            // `body` is what descends under the truthy edge.
+            let (conditions, body, in_arm): (Vec<NodeId>, Vec<NodeId>, Option<rigor_parse::Span>) =
+                match ast.get(br) {
+                    Node::When { conditions, body, .. } => {
+                        saw_when = true;
+                        (conditions.clone(), body.clone(), None)
+                    }
+                    // A `case`/`in` arm — a clause-less `BeginRescue` carrier
+                    // whose FIRST body node is the lowered pattern
+                    // (`[pattern, …stmts]`). A bare class pattern (`in C`,
+                    // `in C::D`, `in ::C`, `in C => x` — the capture is
+                    // unwrapped to the constant by the lowering) matches
+                    // exactly when `subject.is_a?(C)`, so it narrows like a
+                    // one-condition `when` — `case_clause_scopes` →
+                    // `bare_class_pattern_node` (`narrowing.rb:583`). Every
+                    // other pattern narrows neither edge (`[scope, scope]`),
+                    // but its body still descends: the threaded falsey is
+                    // what silences it after a covering clause.
+                    Node::BeginRescue { body, clauses, ensure_body, has_else, span, .. }
+                        if clauses.is_empty() && ensure_body.is_empty() && !*has_else =>
+                    {
+                        saw_in = true;
+                        let conds: Vec<NodeId> = body
+                            .first()
+                            .filter(|&&p| matches!(ast.get(p), Node::ConstantRead { .. }))
+                            .copied()
+                            .into_iter()
+                            .collect();
+                        (conds, body.iter().skip(1).copied().collect(), Some(*span))
+                    }
+                    _ => {
+                        all_descended = false;
+                        continue;
+                    }
+                };
             let mut t = tenv.clone();
-            let mut c = cenv.clone();
-            // Conditions evaluate under the un-narrowed facts (they decide the
-            // edge; a call condition still records its own uses).
+            let mut c = falsey.clone();
+            // The `when` tests (and an `in` class pattern) run BEFORE the
+            // body and before every later clause — `run_when_test` — so
+            // their effects thread down the falsey spine: a condition that
+            // writes kills what it rebinds for every later edge, not just
+            // this body.
             for &cond in &conditions {
                 self.class_flow_expr(ast, cond, &mut t, &mut c, coarse, writes, interner, out, false);
             }
+            // …and they continue on the falsey edge itself.
+            falsey = c.clone();
+            if !subject_rebound {
+                if let Some(local) = &bot_subject {
+                    subject_rebound = conditions.iter().any(|&cond| {
+                        writes_within(writes, ast.get(cond).span())
+                            .iter()
+                            .any(|(_, n)| n == local)
+                    });
+                }
+            }
+            // A `case`/`in` pattern's own bindings (`in [a, b]`, `in C => x`)
+            // ride an `UnmodeledWrite` sharing the ARM's span — they rebind
+            // on the match edge only, so the body clone forgets any incoming
+            // fact they held while the falsey edge keeps it.
+            if let Some(arm_span) = in_arm {
+                for &(wspan, ref name) in writes_within(writes, arm_span) {
+                    if wspan == arm_span {
+                        c.kill_local(name);
+                        t.remove(name.as_str());
+                    }
+                }
+            }
             if let (Some(local), [only]) = (&subject, conditions.as_slice()) {
-                if let Some(class) = self.resolved_static_constant(ast, *only, case_span) {
-                    // Review R3: a clause conflicting with an existing
-                    // DIFFERENT-class fact for the subject drops the stale fact
-                    // and never inserts (the reference's carrier is a Nominal
-                    // there, out of the Dynamic-only envelope). Same class keeps.
-                    let fact = ClassFact::Narrowed(class);
-                    if c.locals.get(local).is_some_and(|existing| existing != &fact) {
-                        c.locals.remove(local);
-                    } else {
-                        c.locals.insert(local.clone(), fact);
+                if !subject_rebound {
+                    if let Some(class) = self.resolved_static_constant(ast, *only, case_span) {
+                        // Review R3: a clause conflicting with an existing
+                        // DIFFERENT-class fact for the subject drops the stale fact
+                        // and never inserts (the reference's carrier is a Nominal
+                        // there, out of the Dynamic-only envelope). Same class keeps.
+                        let fact = ClassFact::Narrowed(class);
+                        if c.locals.get(local).is_some_and(|existing| existing != &fact) {
+                            c.locals.remove(local);
+                        } else {
+                            c.locals.insert(local.clone(), fact);
+                        }
                     }
                 }
             } else if let Some(local) = &bot_subject {
                 // `case x when C1, C2` runs `C1 === x || C2 === x` and the
                 // reference UNIONS the per-condition narrowings
-                // (`accumulate_case_when_scopes`), so the clause body is `Bot`
-                // only when EVERY condition collapses — `when Hash, Array` on an
+                // (`case_when_body_type`), so the clause body is `Bot` only
+                // when EVERY condition collapses — `when Hash, Array` on an
                 // Array keeps the carrier and still witnesses (probes
                 // `case_multi_disj` vs `case_multi_mixed`). An empty clause
                 // cannot occur; `all` over one condition is the single-constant
                 // case, which lands here whenever `subject` declined it.
                 //
-                // Since the re-pin the per-condition meet is three-valued: one
-                // UNORDERABLE condition class widens the whole clause, exactly
-                // as an `||` union member does in `apply_guards` (row b8,
-                // `case h when UnknownZzzClass`, reference-silent where rigor-rs
-                // fired `for Array`). Row b30 is the shaped-carrier control the
-                // widening must not swallow: a `[1, 2]` subject stays `Bot` and
-                // the call after the `case` fires on both engines.
-                let met: Vec<Option<ClassFact>> = conditions
-                    .iter()
-                    .map(|&cond| {
-                        self.resolved_static_constant(ast, cond, case_span).and_then(|class| {
-                            self.guard_meet_precise(local, &class, false, tenv, &c, interner)
-                        })
+                // A clause mixing a READ condition with an UNREAD one answers
+                // `untyped` for the whole body (`case_when_body_type` — the
+                // body may have been reached through the unread member), the
+                // same answer one UNORDERABLE class gives (row b8,
+                // `case h when UnknownZzzClass`). Row b30 is the shaped-carrier
+                // control the widening must not swallow: a `[1, 2]` subject
+                // stays `Bot` and the call after the `case` fires on both
+                // engines.
+                let mut classified: Vec<CaseCond> = Vec::with_capacity(conditions.len());
+                let mut met: Vec<Option<ClassFact>> = Vec::with_capacity(conditions.len());
+                let mut any_unread = false;
+                for &cond in &conditions {
+                    let cc = self.case_cond_class(ast, cond, integer_rooted, case_span);
+                    match &cc {
+                        CaseCond::Unread => any_unread = true,
+                        _ => met.push(self.case_cond_meet(local, &cc, tenv, &c, interner)),
+                    }
+                    classified.push(cc);
+                }
+                if !subject_rebound {
+                    if any_unread && !met.is_empty() {
+                        c.locals.insert(local.clone(), ClassFact::Widened);
+                    } else if !any_unread {
+                        let all_collapse = !met.is_empty()
+                            && met.iter().all(|m| m.as_ref() == Some(&ClassFact::Bot));
+                        if met.iter().any(|m| m.as_ref() == Some(&ClassFact::Widened)) {
+                            c.locals.insert(local.clone(), ClassFact::Widened);
+                        } else if all_collapse {
+                            c.locals.insert(local.clone(), ClassFact::Bot);
+                        }
+                    }
+                }
+                // The FALSEY edge the next clause (and `else`) enters from.
+                // `case_when_types` returns `current` unless EVERY condition
+                // was read AND narrowable (`fully_narrowable` — an integer
+                // range's two-piece complement and any unread member hand
+                // the entry back untouched). Class targets subtract by
+                // `narrow_not_class`, an integer literal by
+                // `narrow_integer_not_equal`; a regexp contributes nothing.
+                if !subject_rebound
+                    && classified.iter().all(|cc| {
+                        matches!(
+                            cc,
+                            CaseCond::Class(_) | CaseCond::IntLit(..) | CaseCond::Regexp
+                        )
                     })
-                    .collect();
-                let all_collapse =
-                    !met.is_empty() && met.iter().all(|m| m.as_ref() == Some(&ClassFact::Bot));
-                if met.iter().any(|m| m.as_ref() == Some(&ClassFact::Widened)) {
-                    c.locals.insert(local.clone(), ClassFact::Widened);
-                } else if all_collapse {
-                    c.locals.insert(local.clone(), ClassFact::Bot);
+                    && !matches!(
+                        falsey.locals.get(local),
+                        Some(ClassFact::Bot | ClassFact::Widened)
+                    )
+                {
+                    for cc in &classified {
+                        if self.case_cond_covers(local, cc, tenv, interner) {
+                            falsey.locals.insert(local.clone(), ClassFact::Bot);
+                            break;
+                        }
+                    }
                 }
             }
             // Clause bodies INHERIT the `case`'s position: a block inside an
@@ -2478,16 +3066,21 @@ impl<'i> Typer<'i> {
             edges.push(c);
             edge_terminates.push(!body.is_empty() && branch_terminates(ast, &body));
         }
-        {
-            // The `else` body is a NEGATIVE edge — never narrowed.
+        // The `else` — a real one, or a `case`/`when`'s implicit no-match arm
+        // (`eval_case_else` hands it the final `falsey_scope` either way).
+        // A `case`/`in` WITHOUT `else` raises `NoMatchingPatternError` on no
+        // match, so the continuation joins ONLY matched arms
+        // (`pattern_case_matches_every_path?`) — no else edge exists there.
+        if !saw_in || saw_when || !else_body.is_empty() {
             let mut t = tenv.clone();
-            let mut c = cenv.clone();
+            let mut c = falsey.clone();
             self.class_flow_scope(
                 ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
             edges.push(c);
             edge_terminates.push(!else_body.is_empty() && branch_terminates(ast, &else_body));
         }
+        let case_in_no_else = saw_in && !saw_when && else_body.is_empty();
         widen_flow_writes(writes_within(writes, case_span).iter(), case_span, tenv, interner);
         // A `case`/`in` clause is not descended, so its rebinds are invisible to
         // the edge evidence — kill by span as well as by edge.
@@ -2511,11 +3104,39 @@ impl<'i> Typer<'i> {
             case_span,
             predicate_locals.as_ref().filter(|_| all_descended),
         );
-        for (name, fact) in joined_subject {
-            match fact {
-                Some(f) => cenv.locals.insert(name, f),
-                None => cenv.locals.remove(&name),
-            };
+        if case_in_no_else {
+            // `unmatched_pattern_result`: the continuation joins ONLY the
+            // matched-arm scopes — the subject's post-`case` fact is the
+            // arm-edge union. `untyped` absorbs (`Widened ∪ T = Widened`),
+            // `Bot` is the join identity, and a carrier that survives on ANY
+            // edge keeps the union inhabited (the reference's union still
+            // holds it — decline the rest, the verdict `check` renders
+            // rides the surviving carrier).
+            for name in &subject_excl {
+                let mut any_widened = false;
+                let mut all_bot = !edges.is_empty();
+                for edge in &edges {
+                    match edge.locals.get(name) {
+                        Some(ClassFact::Widened) => any_widened = true,
+                        Some(ClassFact::Bot) => {}
+                        _ => all_bot = false,
+                    }
+                }
+                if any_widened {
+                    cenv.locals.insert(name.clone(), ClassFact::Widened);
+                } else if all_bot {
+                    cenv.locals.insert(name.clone(), ClassFact::Bot);
+                } else {
+                    cenv.locals.remove(name);
+                }
+            }
+        } else {
+            for (name, fact) in joined_subject {
+                match fact {
+                    Some(f) => cenv.locals.insert(name, f),
+                    None => cenv.locals.remove(&name),
+                };
+            }
         }
         // AFTER the subject restore above, which would otherwise overwrite the
         // widening for the one local that most often carries it: the `case`
