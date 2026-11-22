@@ -1081,6 +1081,107 @@ fn return_type_resolves_when_receiver_not_folded() {
     assert_eq!(idx.class_name_of(&i, ty), Some("String"));
 }
 
+/// rigor-rs#775 — `Integer#/` carries divergent overloads (`(Integer) ->
+/// Integer | (Float) -> Float | …`), so the flat `method_return` slot holds
+/// nothing for a non-constant receiver. The pass-0 selector then picks the
+/// first arm whose parameter names the argument's own class: `i / 3` ->
+/// `Integer`, `i / 3.0` -> `Float`.
+#[test]
+fn divergent_overload_set_answers_from_arg_class() {
+    let ast = lower_src(b"i = 0\ni / 3\ni / 3.0\n");
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut env = typer.build_toplevel_env(&ast, &mut i);
+    let int_id = idx.class_id("Integer").unwrap();
+    let float_id = idx.class_id("Float").unwrap();
+    env.insert(
+        "i".into(),
+        i.intern(Type::Nominal { class: int_id, args: vec![] }),
+    );
+
+    let calls: Vec<NodeId> = ast
+        .iter()
+        .filter_map(|(id, n)| match n {
+            Node::Call { method, .. } if method == "/" => Some(id),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(calls.len(), 2);
+    let int_ty = typer.type_of(&ast, calls[0], &env, &mut i);
+    assert_eq!(
+        i.get(int_ty),
+        &Type::Nominal { class: int_id, args: vec![] }
+    );
+    let float_ty = typer.type_of(&ast, calls[1], &env, &mut i);
+    assert_eq!(
+        i.get(float_ty),
+        &Type::Nominal { class: float_id, args: vec![] }
+    );
+}
+
+/// When no overload matches at all, the reference's `no_match_fallback`
+/// answers the first block-free overload in receiver-affinity order — an
+/// overlay-prepped disjoint arm (the bigdecimal reopen's `Integer#/
+/// (BigDecimal)`) cannot win by position, so `i / "a"` answers `Integer`.
+#[test]
+fn unmatched_divergent_overload_fails_soft_to_affinity_first() {
+    let ast = lower_src(b"i = 0\ni / \"a\"\n");
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut env = typer.build_toplevel_env(&ast, &mut i);
+    let int_id = idx.class_id("Integer").unwrap();
+    env.insert(
+        "i".into(),
+        i.intern(Type::Nominal { class: int_id, args: vec![] }),
+    );
+    let call = find_call(&ast, "/");
+    let ty = typer.type_of(&ast, call, &env, &mut i);
+    assert_eq!(i.get(ty), &Type::Nominal { class: int_id, args: vec![] });
+}
+
+/// Pass 0 requires every engaged param to be a lone class naming the
+/// argument's own class. `Float#/` is `(Complex) -> Complex | (Numeric) ->
+/// Float`; `f / 3` gradual-matches `(Numeric)` first, but `Numeric` names a
+/// superclass, not `Integer` — the port declines (the reference answers it
+/// in the strict pass, which is unported) rather than guess `Float`.
+#[test]
+fn gradual_match_naming_a_superclass_declines() {
+    let ast = lower_src(b"f = 0.0\nf / 3\n");
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut env = typer.build_toplevel_env(&ast, &mut i);
+    let float_id = idx.class_id("Float").unwrap();
+    env.insert(
+        "f".into(),
+        i.intern(Type::Nominal { class: float_id, args: vec![] }),
+    );
+    let call = find_call(&ast, "/");
+    let ty = typer.type_of(&ast, call, &env, &mut i);
+    assert_eq!(ty, i.untyped());
+}
+
+/// A non-bare `return_form` this slice cannot translate — `Integer#divmod`'s
+/// `[Integer, Integer]` tuple — declines even on a proven match.
+#[test]
+fn non_bare_overload_return_declines() {
+    let ast = lower_src(b"i = 0\ni.divmod(3)\n");
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let mut env = typer.build_toplevel_env(&ast, &mut i);
+    let int_id = idx.class_id("Integer").unwrap();
+    env.insert(
+        "i".into(),
+        i.intern(Type::Nominal { class: int_id, args: vec![] }),
+    );
+    let call = find_call(&ast, "divmod");
+    let ty = typer.type_of(&ast, call, &env, &mut i);
+    assert_eq!(ty, i.untyped());
+}
+
 #[test]
 fn array_literal_types_to_array_nominal() {
     // `[1, 2]` types to a bare Array Nominal so a typo (`.frist`) is

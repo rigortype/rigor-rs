@@ -4155,6 +4155,37 @@ impl CoreData {
         ClassOrdering::Unknown
     }
 
+    /// The `arg <=> param` ordering [`Self::param_accepts_arg_class`]
+    /// consults — the reference `class_subtype_result` (`acceptance.rb`),
+    /// host-mirror first with the RBS chains behind it. Exposed for
+    /// overload-selection consumers (rigor-rs#775's receiver-affinity sort,
+    /// the reference's `ReceiverAffinity.class_in_ancestry?`).
+    pub fn param_arg_ordering(&self, arg_class: &str, param_name: &str) -> ClassOrdering {
+        self.param_accepts_ordering(arg_class, param_name)
+    }
+
+    /// rigor-rs#775 — the reference `ProvenOverload` `disjoint_param?` leaf
+    /// (`proven_overload.rb`): `param_name` is a plain declared CLASS — an
+    /// RBS `module` or a synthesized stub proves nothing — and BOTH class
+    /// orderings call it disjoint from `arg_class`: the host-mirror one
+    /// (`environment.class_ordering`, `resolve_class` on the live process)
+    /// AND the RBS-loader one. An argument the host process cannot resolve
+    /// gets no disjoint verdict from `host_ordering` at all — exactly the
+    /// uncertainty that sends the reference's pass-0 pick to `contested?`.
+    pub fn classes_proven_disjoint(&self, arg_class: &str, param_name: &str) -> bool {
+        let param_name = param_name.strip_prefix("::").unwrap_or(param_name);
+        if self.is_qualified_module(param_name) || self.is_synthesized_stub(param_name) {
+            return false;
+        }
+        matches!(
+            Self::host_ordering(arg_class, param_name),
+            Some(ClassOrdering::Disjoint)
+        ) && matches!(
+            self.class_ordering(arg_class, param_name),
+            ClassOrdering::Disjoint
+        )
+    }
+
     /// The `class_subtype_result` verdict for one (arg, param) pair answered
     /// entirely from the generated `HOST_CLASSES` mirror (rigor-rs#809).
     /// `None` ⇒ the argument does not host-resolve, the reference's `maybe`,
