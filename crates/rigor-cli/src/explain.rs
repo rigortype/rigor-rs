@@ -74,12 +74,12 @@ impl Entry {
 /// anchors included, so the fragment half of the contract is unchanged.
 const DOCUMENTATION_BASE: &str = "https://rigor.typedduck.fail/manual/04-diagnostics/";
 
-/// The rule-token vocabulary — family wildcards, legacy aliases, the full
-/// canonical id set — lives in `rigor-rules` (`RULE_FAMILIES` /
-/// `LEGACY_RULE_ALIASES` / `ALL_CANONICAL_RULES`, `check_rules/rule_ids.rb`).
-/// `explain` reads those tables directly (rigor-rs#255): a second copy here had
-/// drifted three families (`global`, `static`, `effect`) and four `effect.*`
-/// entries behind the reference.
+// The rule-token vocabulary — family wildcards, legacy aliases, the full
+// canonical id set — lives in `rigor-rules` (`RULE_FAMILIES` /
+// `LEGACY_RULE_ALIASES` / `ALL_CANONICAL_RULES`, `check_rules/rule_ids.rb`).
+// `explain` reads those tables directly (rigor-rs#255): a second copy here had
+// drifted three families (`global`, `static`, `effect`) and four `effect.*`
+// entries behind the reference.
 
 /// The full rule catalogue — content mirrors the reference's
 /// `RuleCatalog::ENTRIES` verbatim (every authored string), so `explain`
