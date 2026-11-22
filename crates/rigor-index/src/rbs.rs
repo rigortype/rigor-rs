@@ -7176,7 +7176,7 @@ fn expand_path(path: &std::path::Path) -> std::path::PathBuf {
 /// `Gem::SourceList` even though `source_list.rbs` ingests after
 /// `rubygems.rbs` (rigor-rs#811). Files that fail to parse are skipped on
 /// both passes exactly as before.
-fn ingest_group<'a>(
+fn ingest_group(
     builder: &mut Builder,
     sources: impl Iterator<Item = (Option<conformance::Origin>, &'static str)>,
 ) {
