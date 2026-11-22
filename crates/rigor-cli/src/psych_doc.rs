@@ -252,7 +252,7 @@ pub(crate) fn parse_first_document(text: &str) -> Result<Raw, SyntaxError> {
     }
 }
 
-fn push(stack: &mut Vec<Partial>, root: &mut Option<Raw>, node: Raw) {
+fn push(stack: &mut [Partial], root: &mut Option<Raw>, node: Raw) {
     match stack.last_mut() {
         Some(partial) => partial.push_node(node),
         None => *root = Some(node),
