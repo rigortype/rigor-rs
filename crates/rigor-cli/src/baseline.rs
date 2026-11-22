@@ -3374,4 +3374,290 @@ mod tests {
         assert!(e.is_fatal());
         assert!(e.to_string().contains("unknown encoding name"), "{e}");
     }
+
+    // -----------------------------------------------------------------
+    // issue #327 — libyaml parse + `NoAliasRuby`/`ToRuby` visit
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn syntax_constructs_fail_like_psych() {
+        // Every shape the dialect reader silently misread is a
+        // `Psych::SyntaxError` fatal now (upstream: uncaught, exit 1).
+        for (name, src) in [
+            // Tab indentation is not a token.
+            ("tab", "---\nversion: 1\nignored:\n\t- file: a.rb\n\t  rule: r\n\t  count: 1\n"),
+            // An unclosed flow collection.
+            ("flow", "---\nversion: 1\nignored:\n- file: a.rb\n  rule: [unclosed\n  count: 1\n"),
+            // A bad escape inside a double-quoted scalar.
+            ("escape", "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r\n  count: 1\n  message: \"a\\[b\"\n"),
+            // Junk after a closed quote.
+            ("junk", "---\nversion: 1\nignored:\n- file: 'a.rb' junk\n  rule: r\n  count: 1\n"),
+            // `key:value` with no space is not a member.
+            ("nospace", "---\nversion:1\nignored: []\n"),
+            // Malformed flows.
+            ("flow2", "version: 1\nignored: [ ,a]\n"),
+            ("flow3", "version: 1\nignored: [a,,b]\n"),
+            // An incompatible `%YAML` directive.
+            ("directive", "%YAML 1.3\n---\nversion: 1\nignored: []\n"),
+        ] {
+            let e = Baseline::parse(src, "t").unwrap_err();
+            assert!(e.is_fatal(), "{name}: expected fatal, got {e}");
+            assert!(
+                e.to_string().starts_with("Psych::SyntaxError: (t):"),
+                "{name}: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn tab_baseline_does_not_silence() {
+        // The tab row is the worst case from the issue body: the dialect
+        // parser saw no rows and ran with an EMPTY baseline. It must die.
+        let e = Baseline::parse(
+            "---\nversion: 1\nignored:\n\t- file: a.rb\n\t  rule: call.undefined-method\n\t  count: 1\n",
+            "b.yml",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal());
+        assert!(e.to_string().contains("(b.yml):"), "{e}");
+    }
+
+    #[test]
+    fn aliases_die_but_anchors_load() {
+        // `&f` alone is fine (probed upstream); any `*alias` use raises
+        // `Psych::AliasesNotEnabled` under `safe_load`'s `aliases: false`.
+        let b = baseline_with_row("- file: &f a.rb\n  rule: r\n  count: 1").unwrap();
+        assert_eq!(b.buckets()[0].file, KeyScalar::Str("a.rb".to_string()));
+        let e = baseline_with_row("- file: &f a.rb\n  rule: r\n  count: 1\n  message: *f")
+            .unwrap_err();
+        assert!(e.is_fatal());
+        assert!(e.to_string().contains("AliasesNotEnabled"), "{e}");
+        // An unanchored alias dies the same way.
+        let e = baseline_with_row("- file: *nope\n  rule: r\n  count: 1").unwrap_err();
+        assert!(e.is_fatal());
+        // `<<: *anchor` dies at the alias, before the merge runs.
+        let e = Baseline::parse(
+            "version: 1\nbase: &b {file: a.rb}\nignored:\n- <<: *b\n  count: 1\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("AliasesNotEnabled"), "{e}");
+    }
+
+    #[test]
+    fn duplicate_keys_are_last_wins() {
+        // The reference's Hash load keeps the LAST pair — the dialect
+        // parser accumulated `ignored:` rows from both lists.
+        let e = Baseline::parse(
+            "version: 1\nignored:\n- file: a.rb\n  rule: r\n  count: 1\nignored:\n- file: b.rb\n  rule: s\n  count: 1\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(e.size(), 1);
+        assert_eq!(e.buckets()[0].file, KeyScalar::Str("b.rb".to_string()));
+        // Inside a row too.
+        let e = baseline_with_row("- file: a.rb\n  file: b.rb\n  rule: r\n  count: 1").unwrap();
+        assert_eq!(e.buckets()[0].file, KeyScalar::Str("b.rb".to_string()));
+    }
+
+    #[test]
+    fn merge_keys_splice_pairs() {
+        // `<<:` with a mapping value splices its pairs in document order.
+        let b = Baseline::parse(
+            "version: 1\nignored:\n- <<: {file: a.rb, rule: r}\n  count: 1\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 1);
+        assert_eq!(b.buckets()[0].file, KeyScalar::Str("a.rb".to_string()));
+        // A sequence value merges each element in reverse order.
+        let b = Baseline::parse(
+            "version: 1\nignored:\n- <<: [{file: a.rb}, {rule: r, count: 1}]\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.buckets()[0].file, KeyScalar::Str("a.rb".to_string()));
+        // A non-Hash element TypeErrors into a literal `<<` key upstream —
+        // here that just means `file:` is still missing.
+        let e = Baseline::parse(
+            "version: 1\nignored:\n- <<: [{file: a.rb}, 5]\n  count: 1\n",
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "t: ignored[0] missing `file:`");
+        // `!!str '<<'` is a literal key, not a merge (the raw `k.tag`
+        // check).
+        let e = Baseline::parse(
+            "version: 1\nignored:\n- <<: !!str '<<'\n  count: 1\n",
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(e.to_string(), "t: ignored[0] missing `file:`");
+    }
+
+    #[test]
+    fn quoted_scalars_hold_their_content() {
+        // `#`/`---` inside an open quoted scalar is content, not a comment
+        // or a document marker — the dialect reader dropped those lines.
+        let b = Baseline::parse(
+            "---\nversion: 1\nignored:\n- file: \"foo\n  #x\n  bar.rb\"\n  rule: r\n  count: 1\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            b.buckets()[0].file,
+            KeyScalar::Str("foo #x bar.rb".to_string())
+        );
+        // `|+` keeps trailing blank lines; `>-` strips them.
+        let b = Baseline::parse(
+            "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r\n  count: 1\n  message: |+\n    line1\n\n\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(
+            b.buckets()[0].message.as_deref(),
+            Some("line1\n\n\n")
+        );
+        let b = Baseline::parse(
+            "---\nversion: 1\nignored:\n- file: a.rb\n  rule: r\n  count: 1\n  message: >-\n    folded\n\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.buckets()[0].message.as_deref(), Some("folded"));
+    }
+
+    #[test]
+    fn real_yaml_shapes_the_dialect_missed() {
+        // Flow row heads, `{…}` roots, `? ` complex keys, pending tags —
+        // all plain YAML now, not deferred gaps.
+        let b = Baseline::parse(
+            "{version: 1, ignored: [{file: a.rb, rule: r, count: 1}]}",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 1);
+        let b = Baseline::parse(
+            "---\n? version\n: 1\nignored:\n- file: a.rb\n  rule: r\n  count: 1\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 1);
+        let b = Baseline::parse(
+            "---\nversion: 1\nignored:\n- {file: a.rb, rule: r, count: 1}\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 1);
+        // A second document is never read — its syntax error is invisible.
+        let b = Baseline::parse(
+            "version: 1\nignored: []\n---\nbad: [unclosed\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 0);
+    }
+
+    #[test]
+    fn typed_version_forms() {
+        // `version == 1` is Ruby `==`: Integer and Float 1.0 pass; the
+        // `:version` SYMBOL key does not read back as `raw["version"]`.
+        let b = Baseline::parse("version: 1.0\nignored: []\n", "t").unwrap();
+        assert_eq!(b.size(), 0);
+        let e = Baseline::parse(":version: 1\nignored: []\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: unsupported `version: nil` (expected 1)");
+        // The empty file loads `nil` — `expected a Hash …, got NilClass`.
+        let e = Baseline::parse("", "t").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "t: expected a Hash at top level, got NilClass"
+        );
+        let e = Baseline::parse("5\n", "t").unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "t: expected a Hash at top level, got Integer"
+        );
+    }
+
+    #[test]
+    fn collection_tags_resolve_through_the_restricted_loader() {
+        // `!omap`/`!set` on a MAPPING resolve Psych classes the restricted
+        // loader rejects, before children visit.
+        let e = Baseline::parse("version: 1\nignored: !omap {a: 1}\n", "t").unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("Psych::Omap"), "{e}");
+        let e = Baseline::parse("version: 1\nignored: !set {a: 1}\n", "t").unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("Psych::Set"), "{e}");
+        // `!omap` on a SEQUENCE is `Psych::Omap.new` — no permission check
+        // — and pairs off each element's first/last child into a Hash
+        // (`is_a?(Array)` still fails for it as an `ignored:` value).
+        let b = Baseline::parse(
+            "version: 1\nignored: !omap\n- [version, 1]\n- [ignored, []]\n",
+            "t",
+        )
+        .unwrap_err();
+        assert_eq!(b.to_string(), "t: `ignored:` must be an Array");
+        // …but as the DOCUMENT root it is the Hash `raw` itself.
+        let b = Baseline::parse(
+            "!omap\n- [version, 1]\n- [ignored, []]\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 0);
+        // `!seq:K`/`!map:K`/`!str:K` resolve before children: `Symbol`
+        // alone is permitted (and `Symbol.allocate` dies), `nil.allocate`
+        // for an empty name.
+        let e = Baseline::parse("version: 1\nignored: !seq:Symbol [1]\n", "t").unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("allocator undefined"), "{e}");
+        let e = Baseline::parse("version: 1\nignored: !seq: [1]\n", "t").unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("allocate"), "{e}");
+        let e = Baseline::parse("version: 1\nignored: !map:Foo {a: 1}\n", "t").unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("Foo"), "{e}");
+        // `!ruby/object:Hash` revives WITHOUT a permission check.
+        let e = Baseline::parse("version: 1\nignored: !ruby/object:Hash {a: 1}\n", "t")
+            .unwrap_err();
+        assert_eq!(e.to_string(), "t: `ignored:` must be an Array");
+    }
+
+    #[test]
+    fn str_maps_and_ivars_init() {
+        // `!str {str: foo}` loads the string; extra members run
+        // `instance_variable_set` on it — a frozen receiver or bad ivar
+        // name dies upstream.
+        let e = Baseline::parse("version: 1\nignored: !str {str: foo}\n", "t").unwrap_err();
+        assert_eq!(e.to_string(), "t: `ignored:` must be an Array");
+        let b = Baseline::parse(
+            "version: 1\nignored: !str {str: [], a: 1}\n",
+            "t",
+        )
+        .unwrap();
+        assert_eq!(b.size(), 0);
+        let e = Baseline::parse("version: 1\nignored: !str {a: 1}\n", "t").unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("FrozenError"), "{e}");
+        let e = Baseline::parse(
+            "version: 1\nignored: !str {str: foo, \"a b\": 1}\n",
+            "t",
+        )
+        .unwrap_err();
+        assert!(e.is_fatal() && e.to_string().contains("instance variable name"), "{e}");
+    }
+
+    #[test]
+    fn generate_parse_round_trip() {
+        // The writer's own shapes — a message with `\n\n` and `#` — load
+        // back through the libyaml path (issue #327's acceptance row).
+        let d = diag(
+            "call.undefined-method",
+            "undefined method `merge' for Array #\n\nsecond paragraph",
+        );
+        let b = Baseline::from_diagnostics(
+            &[("a.rb".to_string(), &d)],
+            MatchMode::Message,
+        );
+        let text = b.to_yaml();
+        let reparsed = Baseline::parse(&text, "t").unwrap();
+        assert_eq!(reparsed.size(), 1);
+        assert_eq!(
+            reparsed.buckets()[0].message.as_deref(),
+            b.buckets()[0].message.as_deref()
+        );
+    }
 }

@@ -541,7 +541,8 @@ fn visit_str_map(t: &str, pairs: &[(Raw, Raw)]) -> Result<Loaded, String> {
         return Ok(string.unwrap_or(Loaded::Scalar(PsychScalar::Nil)));
     }
     // `init_with`: `o.instance_variable_set` per member — a frozen receiver
-    // dies first; an invalid `@name` dies `NameError`.
+    // dies first (an absent `str` member leaves `string` nil, frozen too);
+    // an invalid `@name` dies `NameError`.
     for member_key in &members {
         if let Some(err) = frozen_receiver(&string) {
             return Err(err);
@@ -557,10 +558,18 @@ fn visit_str_map(t: &str, pairs: &[(Raw, Raw)]) -> Result<Loaded, String> {
 }
 
 /// The `FrozenError` `instance_variable_set` raises on an immediate
-/// receiver, `None` for a receiver that can take ivars (String/Array/Hash/
-/// allocated objects) or an absent one already returned.
+/// receiver — including an ABSENT `str` member, which leaves `string` as
+/// `nil` (`can't modify frozen NilClass: nil`, probed). `None` for a
+/// receiver that can take ivars (String/Array/Hash/allocated objects).
 fn frozen_receiver(string: &Option<Loaded>) -> Option<String> {
-    let loaded = string.as_ref()?;
+    let loaded = match string {
+        Some(l) => l,
+        None => {
+            return Some(
+                "FrozenError: can't modify frozen NilClass: nil".to_string()
+            );
+        }
+    };
     let (class, inspect) = match loaded {
         Loaded::Scalar(PsychScalar::Nil) => ("NilClass", "nil".to_string()),
         Loaded::Scalar(PsychScalar::Bool(b)) => {
