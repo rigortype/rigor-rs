@@ -750,16 +750,86 @@ impl<'i> Typer<'i> {
     /// union. `Some` only when EVERY member contributes — a union holding a
     /// non-verbatim member (`[1] | "s"`, `[1] | 2`) declines whole, as
     /// `dispatch_union` declines when any member's dispatch does.
-    pub(crate) fn union_index_read(&self, ty: TypeId, interner: &mut Interner) -> Option<TypeId> {
+    ///
+    /// The argument selects the `[]` overload upstream: with any
+    /// Tuple/`Array` member in the union, a `Range` or unresolved
+    /// (`Dynamic`/`Top`) argument takes the `(Range) -> Array[Elem]?`
+    /// overload — a slice, not the element — where every other argument
+    /// falls back to `(int) -> Elem` (PR #859 review: `s[0..1].each`,
+    /// `h[i]` with `i` untyped). The port answers the element envelope
+    /// only, so such an argument declines the whole read rather than guess.
+    /// `Hash`-only unions are unaffected — `Hash#[]` has one overload and
+    /// answers its value arm for any key.
+    pub(crate) fn union_index_read(
+        &self,
+        ast: &LoweredAst,
+        arg: NodeId,
+        ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
         let Type::Union(members) = interner.get(ty) else {
             return None;
         };
         let members = members.clone();
+        if members
+            .iter()
+            .any(|&m| self.index_read_arrayish_member(m, interner))
+        {
+            let arg_ty = self.type_of(ast, arg, env, interner);
+            if self.index_arg_declines_union_read(arg_ty, interner) {
+                return None;
+            }
+        }
         let mut parts = Vec::with_capacity(members.len());
         for &m in &members {
             parts.push(self.index_read_member_envelope(m, interner)?);
         }
         Some(self.union_members(parts, interner))
+    }
+
+    /// Whether the `union_index_read` argument selects the `(Range)`
+    /// `Array#[]` overload upstream rather than the `(int)` fallback the
+    /// element envelope answers: a `Range` carrier (literal ranges type
+    /// `Dynamic` today, so they are covered by the first arm) or an
+    /// argument whose type is not resolved at all. Every other carrier —
+    /// an `Integer` constant or bounded `IntegerRange`, a `String`, `nil`,
+    /// a `Tuple` — hits the `int` fallback upstream and keeps the envelope
+    /// answer.
+    fn index_arg_declines_union_read(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Dynamic(_) | Type::Top => true,
+            Type::Nominal { class, .. } => {
+                self.index.class_name_for_id(*class) == Some("Range")
+                    || self.source.class_name_for_id(*class) == Some("Range")
+            }
+            Type::Union(ms) => ms
+                .iter()
+                .any(|&m| self.index_arg_declines_union_read(m, interner)),
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.index_arg_declines_union_read(*base, interner)
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a union member is a Tuple or an `Array` nominal — the member
+    /// kinds whose `[]` overload choice depends on the argument — resolving
+    /// refinements and differences through their base, as
+    /// [`Self::index_read_member_envelope`] does.
+    #[allow(clippy::only_used_in_recursion)]
+    fn index_read_arrayish_member(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Tuple(_) => true,
+            Type::Nominal { class, .. } => {
+                self.index.class_name_for_id(*class) == Some("Array")
+                    || self.source.class_name_for_id(*class) == Some("Array")
+            }
+            Type::Refined { base, .. } | Type::Difference { base, .. } => {
+                self.index_read_arrayish_member(*base, interner)
+            }
+            _ => false,
+        }
     }
 
     /// One union member's erased `[]` answer for
@@ -792,7 +862,11 @@ impl<'i> Typer<'i> {
                 })
             }
             Type::Nominal { class, args } => {
-                let idx = match self.index.class_name_for_id(*class) {
+                let name = self
+                    .index
+                    .class_name_for_id(*class)
+                    .or_else(|| self.source.class_name_for_id(*class));
+                let idx = match name {
                     Some("Array") => Some(0),
                     Some("Hash") => Some(1),
                     _ => None,

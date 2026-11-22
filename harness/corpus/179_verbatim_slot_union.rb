@@ -48,6 +48,46 @@ h9 = c ? [1] : [2]
 h9[-1] ||= 5
 h9[-1].zzz                   # silent both sides
 
+# With a Tuple/Array member in the union, the argument selects the `[]`
+# overload upstream: a Range or an unresolved argument takes the
+# `(Range) -> Array[Elem]?` slice overload, which the envelope arm does
+# not model — the read declines whole. (PR #859 review rows.)
+args = c ? ["a", "b"] : ["c"]
+puts args[1..].join(",")     # silent both sides
+
+h12 = c ? [1] : [2]
+h12[0..1].zzz                # silent both sides
+
+r13 = 0..1
+h13 = c ? [1] : [2]
+h13[r13].zzz                 # silent both sides
+
+h14 = c ? { a: 1 } : [1]
+h14[0..1].zzz                # silent both sides
+
+h15 = c ? [1] : [2]
+h15[c ? 0 : (0..1)].zzz      # silent both sides
+
+i16 = eval("0")
+h16 = c ? [1] : [2]
+h16[i16].zzz                 # silent both sides
+
+# Hash-only unions have a single `Hash#[]` overload — the argument does
+# not select anything, so even a Range or unresolved key answers the
+# value envelope.
+g17 = c ? { a: 1 } : { b: 2 }
+g17[eval("0")].zzz            # for 1 | 2
+
+g18 = c ? { a: 1 } : { b: 2 }
+g18[0..1].zzz                # for 1 | 2
+
+# Non-Range concrete keys hit the `(int)` fallback on both engines.
+h19 = c ? [1] : [2]
+h19["x"].zzz                 # for 1 | 2
+
+h20 = c ? [1] : [2]
+h20[[0]].zzz                 # for 1 | 2
+
 # Controls: the single-carrier rows keep their existing answers.
 h10 = { a: 1 }
 h10[:a] ||= 2

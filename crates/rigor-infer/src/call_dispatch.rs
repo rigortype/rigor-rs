@@ -293,7 +293,7 @@ impl<'i> Typer<'i> {
             // non-verbatim member declines whole — as `dispatch_union`
             // declines when any member does — falling through to the same
             // tiers that decline today.
-            if let Some(ty) = self.union_index_read(recv_ty, interner) {
+            if let Some(ty) = self.union_index_read(ast, args[0], recv_ty, env, interner) {
                 return ty;
             }
         }
