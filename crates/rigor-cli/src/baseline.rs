@@ -491,402 +491,76 @@ impl Baseline {
         Baseline::parse(&text, &path.display().to_string())
     }
 
-    /// Parse a baseline YAML document. Hand-rolled (the manifest / `.rigor.yml`
-    /// loaders follow the same hand-rolled-parser precedent) so the read path
-    /// stays in lock-step with the byte-exact writer and needs no serde shape.
-    ///
-    /// # Psych scalar dialect (probed against `YAML.dump` output)
-    ///
-    /// A row value may be a *folded* scalar — `baseline generate
-    /// --match-mode=message` emits `Regexp.escape`d messages as plain scalars
-    /// that libyaml wraps past column 80 at a breakable space, continuing on
-    /// deeper-indented lines (the fold rejoins as a single space on load;
-    /// each blank line rejoins as a `\n`). Quoted scalars may also span lines.
-    /// Continuation handling below covers every shape Psych emits: folded
+    /// Parse a baseline YAML document through the same pipeline the
+    /// reference's `Baseline.load` runs: `YAML.safe_load_file`'s libyaml
+    /// parse and `ToRuby`/`NoAliasRuby` visit first — issue #327: syntax the
+    /// old line-dialect reader silently misread (tab indentation, unclosed
+    /// flow, bad escapes, junk after a closed quote) is `Psych::SyntaxError`
+    /// here, aliases die, `<<` merges and last-wins duplicate keys apply —
+    /// then the `parse_loaded`/`parse_row` shape checks in upstream order.
     ///
     /// # Typed scalars (issue #326)
     ///
-    /// `safe_load_file(path, permitted_classes: [Symbol])` resolves a PLAIN
-    /// scalar's text through `ScalarScanner#tokenize` *before* `parse_row`
-    /// validates it — `count: 0x10` is the Integer 16, `message: false` a
-    /// falsy no-message row, `file: 5` an inert Integer key, a `2024-01-01`
-    /// date a `Psych::DisallowedClass` death (uncaught — [`LoadError::Fatal`]
-    /// here). [`classify_scalar`] mirrors that typing; quoted scalars are
-    /// Strings, and a `!tag` routes through `ToRuby#deserialize`'s arms.
-    /// plain, multi-line `'…'`/`"…"` scalars, `|`/`>` block scalars, and a
-    /// `!tag` prefix (`!!str '<<'`). A line deeper than the row's member-key
-    /// column is scalar content, never a key.
+    /// Every scalar — `version:`, `ignored:` and unknown keys, row fields,
+    /// nested sequence items — resolves through [`crate::psych_doc`]'s port
+    /// of `ScalarScanner`/`ToRuby` *before* any shape check runs, so a
+    /// `Psych::DisallowedClass`/`Float()` death anywhere in the file beats
+    /// the `is_a?(Hash)`/`version:`/`ignored:` errors beside it, exactly as
+    /// `safe_load_file`'s load-then-validate order dictates.
     pub fn parse(text: &str, label: &str) -> Result<Baseline, LoadError> {
-        // `version` keeps its loaded scalar until the end — the reference
-        // validates the VALUE (`version == 1`), so a quoted `"1"` must
-        // reject as `unsupported \`version: "1"\``, not parse, while `1.0`
-        // and `0x1` pass (both `== 1` upstream).
-        let mut version: Option<PsychScalar> = None;
-        // `rows = raw["ignored"] || []` — the LOADED value's truthiness
-        // decides (`ignored: false`/`no`/`off` are `[]` upstream, accepted);
-        // the `is_a?(Array)` check runs AFTER `version`, so a truthy
-        // non-array scalar defers to the end (issue #326 review).
-        let mut ignored_scalar: Option<PsychScalar> = None;
-        let mut ignored_empty_array = false;
-        // Rows are collected, not validated, during the scan — upstream
-        // `YAML.safe_load_file` types every scalar in the document before
-        // `parse_loaded` validates anything, so a DisallowedClass/Float()
-        // death ANYWHERE in the file beats every row error, and the version
-        // and ignored-Array checks run before the first row error.
-        let mut rows: Vec<RowAcc> = Vec::new();
+        use crate::psych_doc::Loaded;
+        let doc = crate::psych_doc::load(text, label).map_err(LoadError::fatal)?;
 
-        // Row accumulator: fields seen for the current `- file:` item.
-        let mut cur: Option<RowAcc> = None;
-        let mut in_ignored = false;
-        // Column of the `-` that opened the current row and of its member
-        // keys (`file:`), for `- item` vs continuation disambiguation.
-        let mut item_col = 0usize;
-        let mut member_col = 0usize;
-        // A document that is a bare SEQUENCE (`- x` at column 0 before any
-        // top-level `key:`) — its items still type (a `2024-01-01` anywhere
-        // is a DisallowedClass death) and the `expected a Hash …, got
-        // Array` error defers to after the scan, before `version:`
-        // (upstream check order: `raw.is_a?(Hash)` → `version` → `ignored`
-        // → rows).
-        let mut top_level_seq = false;
-        // Whether the last top-level `key:` left its value PENDING — a
-        // `- item` that follows at column 0 belongs to that key's nested
-        // sequence (`version:\n- 1` loads `[1]`, `gen:\n- x` loads too);
-        // `Valued` means the key had an inline scalar (`ignored: ~\n- x`
-        // is `Psych::SyntaxError` upstream).
-        let mut top_ctx: Option<TopCtx> = None;
-        // Scalars of a `version:` sequence — `[1]` renders the
-        // `unsupported \`version: [1]\`` text upstream.
-        let mut version_items: Vec<PsychScalar> = Vec::new();
-        // Sequence items under a pending top-level key (`gen:` — typed for
-        // DisallowedClass deaths, then discarded) or the doc's root
-        // sequence (whose early `got Array` return discards them anyway).
-        let mut cur_extra = false;
-        // `---` opens doc 1; a SECOND `---` or an `...` line AT COLUMN 0
-        // ends it — `safe_load` reads only the first document. Indented
-        // markers are scalar text.
-        let mut doc_open = false;
-
-        for raw_line in text.lines() {
-            let trimmed = raw_line.trim();
-            let indent = raw_line.len() - raw_line.trim_start().len();
-            if indent == 0 && (trimmed == "..." || (trimmed == "---" && doc_open)) {
-                break;
+        // `raise LoadError … unless raw.is_a?(Hash)` — a document that
+        // loaded to anything else reports its class (`got Integer`,
+        // `got Array`, `got NilClass` for the empty file).
+        let pairs = match doc {
+            Loaded::Map(pairs) => pairs,
+            other => {
+                return Err(LoadError::load(format!(
+                    "{label}: expected a Hash at top level, got {}",
+                    other.class_name()
+                )));
             }
-            // The document marker (column 0 only) and comment lines never
-            // join a scalar — an indented `---`/`...` is scalar text.
-            if (indent == 0 && trimmed == "---") || trimmed.starts_with('#') {
-                doc_open |= indent == 0 && trimmed == "---";
-                continue;
-            }
-            // Any other line is doc-1 content — a later `---` opens doc 2.
-            doc_open = true;
+        };
 
-            if trimmed.is_empty() {
-                // A blank line inside a row is a pending fold break for the
-                // scalar it follows (consumed only if a continuation comes).
-                if let Some(acc) = cur.as_mut() {
-                    acc.pending_breaks += 1;
-                }
-                continue;
-            }
-
-            // An UNCLOSED quoted scalar swallows every line until its closing
-            // quote — including ones that look like keys or `- ` items (Psych
-            // folds the break to one space; `\` at line end suppresses it).
-            if let Some(acc) = cur.as_mut() {
-                if acc.quote_open() {
-                    acc.continue_scalar(trimmed);
-                    continue;
-                }
-                if acc.head_open() {
-                    acc.head_continue(trimmed);
-                    continue;
-                }
-            }
-
-            // A column-0 `- ` item: under `ignored:` it is a row; before
-            // ANY top-level `key:` it opens the document's root sequence
-            // (the deferred `got Array`); under a PENDING `key:` it is the
-            // key's nested sequence; under a valued key it is
-            // `Psych::SyntaxError` upstream.
-            let is_dash = trimmed == "-" || trimmed.starts_with("- ");
-            let mut pending_item = false;
-            if !in_ignored && indent == 0 && is_dash {
-                match top_ctx {
-                    None => top_level_seq = true,
-                    Some(TopCtx::Pending(_)) => pending_item = true,
-                    Some(TopCtx::Valued) => {
-                        return Err(LoadError::fatal(format!(
-                            "Psych::SyntaxError: ({label}): did not find expected '-' indicator"
-                        )));
-                    }
-                }
-            }
-
-            // Top-level keys (no indentation).
-            if !raw_line.starts_with(' ') && !raw_line.starts_with('-') {
-                // A non-`-` line at column 0 inside a sequence document
-                // can't start a mapping — `Psych::SyntaxError` upstream.
-                if top_level_seq {
-                    return Err(LoadError::fatal(format!(
-                        "Psych::SyntaxError: ({label}): did not find expected '-' indicator"
-                    )));
-                }
-                if !trimmed.contains(':') {
-                    // The doc's root scalar — upstream reports its loaded
-                    // CLASS (`got Integer`/`NilClass`/`TrueClass`), and a
-                    // DisallowedClass death fires here, before the shape
-                    // check.
-                    let (head, kind, tag) = scalar_head(trimmed);
-                    let v = classify_scalar(
-                        tag,
-                        &unyaml_scalar(head),
-                        matches!(kind, ScalarKind::Plain) && tag.is_none(),
-                    )
-                    .map_err(LoadError::fatal)?;
-                    return Err(LoadError::load(format!(
-                        "{label}: expected a Hash at top level, got {}",
-                        v.class_name()
-                    )));
-                }
-                // Close any open item before leaving its sequence —
-                // flush_head types the deferred scalar head here (document
-                // order); a `version:` sequence item feeds the `[1]`
-                // unsupported-version inspect.
-                if let Some(mut acc) = cur.take() {
-                    let flushed = acc.flush_head()?;
-                    if cur_extra {
-                        if matches!(top_ctx, Some(TopCtx::Pending(TopKey::Version))) {
-                            version_items.push(flushed.unwrap_or_else(|| acc.map_value()));
-                        }
-                    } else {
-                        rows.push(acc);
-                    }
-                }
-                cur_extra = false;
-                in_ignored = false;
-                if let Some(rest) = trimmed.strip_prefix("version:") {
-                    // `version: 1 # schema` — the ` #…` is a comment. The
-                    // scalar loads typed upstream: `1`/`1.0`/`0x1`/`!int 1`
-                    // pass `== 1`, `"1"`/`1e0`/`true` don't, a Date dies.
-                    // `version:` bare leaves the key PENDING — a `- item`
-                    // sequence under it loads `[…]` (reported verbatim).
-                    let value = rest.trim_start();
-                    let (head, kind, tag) = scalar_head(value);
-                    let decoded = unyaml_scalar(head);
-                    version = Some(
-                        classify_scalar(tag, &decoded, matches!(kind, ScalarKind::Plain))
-                            .map_err(LoadError::fatal)?,
-                    );
-                    // A new `version:` line supersedes any sequence a
-                    // previous pending `version:` collected (`version:`
-                    // duplicated — the last key wins upstream).
-                    version_items.clear();
-                    top_ctx = if head.is_empty() {
-                        Some(TopCtx::Pending(TopKey::Version))
-                    } else {
-                        Some(TopCtx::Valued)
-                    };
-                } else if let Some(rest) = trimmed.strip_prefix("ignored:") {
-                    // `ignored:` bare or comment-only leaves the key's value
-                    // unset — the block sequence below IS the value, so
-                    // `in_ignored` stays open. Any PRESENT inline scalar —
-                    // even a nil one (`~`/`null`/`Null`/`NULL`) — already
-                    // consumed the value, and a following `- …` row is a
-                    // Psych::SyntaxError upstream; closing `in_ignored` lands
-                    // that row on the `expected a Hash …, got Array` error.
-                    // `ignored: []` is an explicit empty array; a quoted or
-                    // `!tag`d value is a String upstream — like any other
-                    // non-nil inline it fails `rows.is_a?(Array)`.
-                    let value = rest.trim_start();
-                    let (inline, kind, tag) = scalar_head(value);
-                    // A scalar Psych types as a `DisallowedClass` (or whose
-                    // `Float()` conversion raises) kills the whole load
-                    // upstream — `ignored: 2024-01-01` never reaches
-                    // `rows.is_a?(Array)`.
-                    let loaded = classify_scalar(
-                        tag,
-                        &unyaml_scalar(inline),
-                        matches!(kind, ScalarKind::Plain) && tag.is_none(),
-                    )
-                    .map_err(LoadError::fatal)?;
-                    let is_plain = matches!(kind, ScalarKind::Plain) && tag.is_none();
-                    // A bare tag (`ignored: !!seq`) or anchor leaves the
-                    // key pending the same way — the `- items` ARE the
-                    // value upstream (an `ignored: !!seq` doc is a valid
-                    // row sequence, probed).
-                    in_ignored = inline.is_empty();
-                    // `ignored:`'s `- items` are rows either way — the
-                    // pending flag is irrelevant here (in_ignored routes
-                    // them); a valued inline means the next `- ` is the
-                    // upstream SyntaxError `did not find expected key`.
-                    top_ctx = Some(TopCtx::Valued);
-                    if is_plain && inline == "[]" {
-                        // An explicit empty array — the `is_a?(Array)` check
-                        // passes on its own; nothing to defer.
-                        ignored_empty_array = true;
-                    } else {
-                        // The LOADED value's truthiness (`ignored: false` is
-                        // `false || []` → `[]`, accepted) decides the
-                        // deferred `is_a?(Array)` check after `version`.
-                        ignored_scalar = Some(loaded);
-                    }
-                } else {
-                    // Any other top-level key is ignored upstream — but its
-                    // scalar still typed during `safe_load`, so a
-                    // `generated_at: 2024-01-01` Date dies here, and a
-                    // `gen:` pending key takes a `- item` sequence.
-                    if let Some((_, value)) = trimmed.split_once(':') {
-                        let (head, kind, tag) = scalar_head(value.trim_start());
-                        classify_scalar(
-                            tag,
-                            &unyaml_scalar(head),
-                            matches!(kind, ScalarKind::Plain) && tag.is_none(),
-                        )
-                        .map_err(LoadError::fatal)?;
-                        top_ctx = if head.is_empty() {
-                            Some(TopCtx::Pending(TopKey::Other))
-                        } else {
-                            Some(TopCtx::Valued)
-                        };
-                    }
-                }
-                continue;
-            }
-
-            // A deeper-indented `- item` under a pending top-level key is
-            // the key's sequence too (`version:\n  - 1` → `[1]`,
-            // `gen:\n  - 2024-01-01` → the DisallowedClass death) — probed.
-            if !in_ignored
-                && indent > 0
-                && is_dash
-                && matches!(top_ctx, Some(TopCtx::Pending(_)))
-                && cur.is_none()
-            {
-                let v = seq_scalar_text(trimmed[1..].trim_start())?;
-                if matches!(top_ctx, Some(TopCtx::Pending(TopKey::Version))) {
-                    version_items.push(v);
-                }
-                continue;
-            }
-
-            if !in_ignored && !top_level_seq && !pending_item && cur.is_none() {
-                continue;
-            }
-
-            // A new array item begins with `- ` (or bare `-`) at (or left
-            // of) the row's dash column; deeper `- ` text is a folded
-            // continuation. The first key (`file:`) rides on the same line
-            // as the dash in the reference's emitter.
-            if is_dash && (cur.is_none() || indent <= item_col) {
-                if let Some(mut acc) = cur.take() {
-                    let flushed = acc.flush_head()?;
-                    if cur_extra {
-                        if matches!(top_ctx, Some(TopCtx::Pending(TopKey::Version))) {
-                            version_items.push(flushed.unwrap_or_else(|| acc.map_value()));
-                        }
-                    } else {
-                        rows.push(acc);
-                    }
-                }
-                cur_extra = pending_item;
-                item_col = indent;
-                let rest = trimmed.get(2..).unwrap_or("");
-                member_col = indent + 2 + (rest.len() - rest.trim_start().len());
-                let mut acc = RowAcc { idx: rows.len(), ..RowAcc::default() };
-                acc.apply(rest.trim_start(), label, true)?;
-                cur = Some(acc);
-            } else if let Some(acc) = cur.as_mut() {
-                if acc.takes_seq_item() && is_dash && indent >= member_col {
-                    // A `- item` of a pending `key:`'s nested sequence (or
-                    // of a bare `-` row's own sequence) — the elements
-                    // type (`2024-01-01` dies DisallowedClass upstream).
-                    acc.seq_item(trimmed[1..].trim_start(), label)?;
-                } else if indent > member_col {
-                    if acc.not_a_hash && acc.head_empty
-                        && !is_dash
-                        && key_split(trimmed).is_some()
-                    {
-                        // `-\n    file:` — a deeper-indented member still
-                        // belongs to the bare-`-` row (the mapping's key
-                        // column moves to the first member's indent).
-                        member_col = indent;
-                        acc.apply(trimmed, label, false)?;
-                    } else {
-                        // Folded / block-scalar continuation of the value.
-                        acc.continue_scalar(raw_line);
-                    }
-                } else {
-                    // A member key of the current item.
-                    acc.apply(trimmed, label, false)?;
-                }
-            }
-        }
-        if let Some(mut acc) = cur.take() {
-            let flushed = acc.flush_head()?;
-            if cur_extra {
-                if matches!(top_ctx, Some(TopCtx::Pending(TopKey::Version))) {
-                    version_items.push(flushed.unwrap_or_else(|| acc.map_value()));
-                }
-            } else {
-                rows.push(acc);
-            }
-        }
-
-        // `unless raw.is_a?(Hash)` — a bare-sequence document types every
-        // item first (deaths above), then reports Array, before `version:`.
-        if top_level_seq {
-            return Err(LoadError::load(format!(
-                "{label}: expected a Hash at top level, got Array"
-            )));
-        }
-
-        // A `version:` sequence loads `[…]` — `[1]` renders the upstream
-        // `unsupported \`version: [1]\`` verbatim.
-        if !version_items.is_empty() {
-            let joined = version_items
-                .iter()
-                .map(PsychScalar::inspect)
-                .collect::<Vec<_>>()
-                .join(", ");
-            version = Some(PsychScalar::Opaque { to_s: format!("[{joined}]"), class: "Array" });
-        }
-
-        // `unless version == CURRENT_VERSION` upstream — a missing `version:`
-        // is `nil`, reported with the same message as a wrong one. The check
-        // is Ruby `==`: Integer 1 and Float 1.0 both pass (probed: `1.0`,
-        // `0x1`, `01`, `+1`, `!int 1`/`!float 1.0` accept; `1e0` is a String
-        // — Psych's FLOAT arm needs a dot — and rejects as `"1e0"`).
-        let version_ok = matches!(
-            version,
-            Some(PsychScalar::Int(ref i)) if i.value == CURRENT_VERSION as i128
-        ) || matches!(version, Some(PsychScalar::Float(f)) if f == 1.0);
+        // `unless version == CURRENT_VERSION` — Ruby `==`: the Integer 1
+        // and the Float 1.0 both pass; a missing `version:` is `nil`,
+        // reported with the same text as a wrong one.
+        let version_ok = match Loaded::get(&pairs, "version") {
+            Some(Loaded::Scalar(PsychScalar::Int(i))) => i.value == CURRENT_VERSION as i128,
+            Some(Loaded::Scalar(PsychScalar::Float(f))) => *f == 1.0,
+            _ => false,
+        };
         if !version_ok {
-            let shown = version
-                .as_ref()
-                .map_or_else(|| "nil".to_string(), PsychScalar::inspect);
+            let shown = Loaded::get(&pairs, "version")
+                .map_or_else(|| "nil".to_string(), Loaded::inspect);
             return Err(LoadError::load(format!(
                 "{label}: unsupported `version: {shown}` (expected {CURRENT_VERSION})"
             )));
         }
 
-        // `rows = raw["ignored"] || []`, then `rows.is_a?(Array)` — checked
-        // after `version` upstream. `ignored: false`/`~`/`null` are `[]`
-        // (falsy); `ignored: []` is an actual empty array; any truthy other
-        // scalar fails.
-        if ignored_scalar.as_ref().is_some_and(|v| !v.falsy()) && !ignored_empty_array {
-            return Err(LoadError::load(format!(
-                "{label}: `ignored:` must be an Array"
-            )));
-        }
+        // `rows = raw["ignored"] || []`, then
+        // `raise … unless rows.is_a?(Array)` — falsy (`~`/`null`/`false` or
+        // absent) is the empty list; a truthy non-Array fails here.
+        let rows: &[Loaded] = match Loaded::get(&pairs, "ignored") {
+            None => &[],
+            Some(Loaded::Scalar(s)) if s.falsy() => &[],
+            Some(Loaded::Seq(items)) => items,
+            Some(_) => {
+                return Err(LoadError::load(format!(
+                    "{label}: `ignored:` must be an Array"
+                )));
+            }
+        };
 
-        let mut buckets: Vec<Bucket> = Vec::new();
-        for acc in rows {
-            buckets.push(acc.into_bucket(label)?);
+        let mut buckets: Vec<Bucket> = Vec::with_capacity(rows.len());
+        for (idx, row) in rows.iter().enumerate() {
+            buckets.push(row_bucket(row, label, idx)?);
         }
         Ok(Baseline { buckets })
     }
+
 
     /// Build a baseline from a current run's diagnostics. Paths are stored
     /// project-root-relative; in `Message` mode each distinct message becomes
@@ -1155,6 +829,89 @@ fn bucket_eq(a: &Bucket, b: &Bucket) -> bool {
     a.file == b.file && a.rule == b.rule && a.message == b.message && a.count == b.count
 }
 
+/// `parse_row` — one `ignored:` element's bucket: `is_a?(Hash)`, then the
+/// `file:`/`rule:`/`count:`/`message:` field checks in the reference's
+/// order.
+fn row_bucket(row: &crate::psych_doc::Loaded, label: &str, idx: usize) -> Result<Bucket, LoadError> {
+    use crate::psych_doc::Loaded;
+    let pairs = match row {
+        Loaded::Map(pairs) => pairs,
+        _ => {
+            return Err(LoadError::load(format!(
+                "{label}: ignored[{idx}] must be a Hash"
+            )));
+        }
+    };
+
+    // `file = row["file"] or raise`, `rule = row["rule"] or raise` — the
+    // TYPED value's truthiness decides (nil/false are missing; `file: 5`
+    // and `file: true` are truthy non-String keys — an inert bucket).
+    let file = match Loaded::get(pairs, "file") {
+        Some(v) if !v.falsy() => v.to_key(),
+        _ => {
+            return Err(LoadError::load(format!(
+                "{label}: ignored[{idx}] missing `file:`"
+            )));
+        }
+    };
+    let rule = match Loaded::get(pairs, "rule") {
+        Some(v) if !v.falsy() => v.to_key(),
+        _ => {
+            return Err(LoadError::load(format!(
+                "{label}: ignored[{idx}] missing `rule:`"
+            )));
+        }
+    };
+
+    // `count.is_a?(Integer) && count.positive?` upstream — every other type
+    // reports its `inspect` (`got "5"`, `got 1.5`, `got true`, `got :x`,
+    // `got nil`, `got [1]`), an Integer its canonical decimal (`got -16`
+    // for `-0x10`). A huge Integer counts as `usize::MAX` — the reference's
+    // `expect`-free threshold semantics need no bignum.
+    let count = match Loaded::get(pairs, "count") {
+        Some(Loaded::Scalar(PsychScalar::Int(i))) if i.value > 0 => {
+            usize::try_from(i.value).unwrap_or(usize::MAX)
+        }
+        other => {
+            let shown = other.map_or_else(|| "nil".to_string(), Loaded::inspect);
+            return Err(LoadError::load(format!(
+                "{label}: ignored[{idx}] `count:` must be a positive Integer (got {shown})"
+            )));
+        }
+    };
+
+    Ok(match Loaded::get(pairs, "message") {
+        // `if (message = row["message"])` — a falsy typed value (nil,
+        // `false`/`no`/`off`) is the rule-ID row, not a `/false/` bucket.
+        Some(v) if !v.falsy() => {
+            // `compile_message_regex(message.to_s)` — a non-String keys its
+            // `to_s` (`message: 0x10` compiles `/16/`, not `/0x10/`).
+            let m = v.to_s();
+            // The reference compiles the row's Regexp at load and raises
+            // LoadError on a bad pattern — dropping the whole baseline —
+            // rather than degrading the row to a rule bucket (issue #162:
+            // Ruby-only SYNTAX stays upstream-deferred; the failure mode is
+            // the contract). The error text after the colon is the engine's
+            // own — Onigmo's RegexpError has no Rust analogue — so the
+            // reason is kept terse (`…: /source/` like RegexpError).
+            if let Err(e) = Regex::new(&m) {
+                let full = e.to_string();
+                let reason = full
+                    .rsplit_once("error:")
+                    .map_or(full.as_str(), |(_, r)| r)
+                    .trim()
+                    .to_string();
+                return Err(LoadError::load(format!(
+                    "{label}: ignored[{idx}] `message:` is not a valid Regexp: \
+                     {reason}: /{m}/"
+                )));
+            }
+            Bucket::message_row(file, rule, m, count)
+        }
+        _ => Bucket::rule_row_typed(file, rule, count),
+    })
+}
+
 fn status_for(actual: usize, count: usize) -> DriftStatus {
     if actual == 0 {
         DriftStatus::Cleared
@@ -1188,1085 +945,6 @@ enum BinKey {
     NoBucket(String, String),
 }
 
-/// Whether the last top-level `key:` left its value pending (a `- item`
-/// sequence can follow) or already consumed it inline.
-#[derive(Clone, Copy)]
-enum TopCtx {
-    Pending(TopKey),
-    Valued,
-}
-
-/// Which pending top-level key a `- item` sequence attaches to — only
-/// `version:` keeps its elements (for the `[1]` unsupported-version
-/// inspect); other keys' elements type for deaths, then discard.
-#[derive(Clone, Copy)]
-enum TopKey {
-    Version,
-    Other,
-}
-
-/// Which row field the last `key:` line wrote — the field a folded or
-/// block-scalar continuation line feeds.
-#[derive(Clone, Copy)]
-enum Field {
-    File,
-    Rule,
-    Message,
-    Count,
-    Other,
-}
-
-/// The YAML scalar flavor of the last-written value — decides how
-/// continuation lines join it.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-enum ScalarKind {
-    /// Unquoted; continuation folds the break to one space (a run of blank
-    /// lines folds to that many `\n`).
-    #[default]
-    Plain,
-    /// `"…"` — open until an unescaped `"` is seen; `\` at line end
-    /// suppresses the fold space.
-    DoubleQuoted,
-    /// `'…'` — open until an unescaped `'` (`''` is an escaped quote).
-    SingleQuoted,
-    /// `|`/`>` block scalar (plus `-`/`+` chomping) — deeper-indented lines
-    /// are literal content.
-    Block { folded: bool, chomp: Chomp },
-}
-
-/// Block-scalar trailing-newline handling (`|` vs `|-` vs `|+`).
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Chomp {
-    /// `|-`: strip trailing newlines.
-    Strip,
-    /// `|`: keep a single trailing newline.
-    Clip,
-    /// `|+`: keep all trailing newlines.
-    Keep,
-}
-
-/// One row field's accumulated value. `raw` holds the scalar SOURCE for
-/// quoted scalars (quotes/escapes in place, decoded at flush) and the folded
-/// text for plain ones; `lines` holds a `|`/`>` block scalar's content lines.
-#[derive(Default)]
-struct FieldVal {
-    raw: String,
-    kind: ScalarKind,
-    /// The `!`-tag token on the scalar (`!foo`, `!!str`, `!ruby/regexp`) —
-    /// `ToRuby#deserialize` routes tagged scalars through its `case o.tag`
-    /// arms rather than the plain/quoted rule (issue #326).
-    tag: Option<String>,
-    /// A tag with NO scalar text (`file: !ruby/regexp`) still resolves —
-    /// and can still die on the tag alone (`class_loader.regexp`). The
-    /// resolved [`PsychScalar`] is stored here at `apply` time.
-    resolved: Option<PsychScalar>,
-    /// Elements of a nested `- item` sequence under a `key:` with no scalar
-    /// (`meta:\n  - x` — upstream loads the Array; each element types, so a
-    /// `2024-01-01` there is still a DisallowedClass death).
-    seq: Vec<PsychScalar>,
-    lines: Vec<String>,
-    /// A block scalar's content indentation, set by its first content line;
-    /// deeper lines keep their extra columns relative to it.
-    block_indent: Option<usize>,
-}
-
-/// In-progress accumulator for one `ignored:` row during parsing.
-///
-/// `file`/`rule`/`message`/`count` hold *raw* text so a multi-line scalar can
-/// keep accumulating; they are decoded at [`RowAcc::into_bucket`]. `count`
-/// stays quoted/raw — `"5"` must fail the integer check, matching the
-/// reference's `count.is_a?(Integer)` rejecting a YAML string.
-#[derive(Default)]
-struct RowAcc {
-    /// `ignored[N]` position — the reference puts it in every row error.
-    idx: usize,
-    file: Option<FieldVal>,
-    rule: Option<FieldVal>,
-    message: Option<FieldVal>,
-    count: Option<FieldVal>,
-    /// Sink for continuations of unknown keys (`meta:` etc.).
-    other: FieldVal,
-    /// Which field the last `key:` line wrote — a deeper-indented line or an
-    /// open quoted scalar's next line continues it.
-    last: Option<Field>,
-    /// Whether `last`'s quoted scalar lacks its closing quote — while open it
-    /// swallows EVERY next line, at any indent (YAML flow-scalar semantics).
-    quote_open: bool,
-    /// Blank lines since the last value line — consumed as fold breaks by the
-    /// next continuation (a run of n blanks folds to n `\n`s), else discarded.
-    pending_breaks: usize,
-    /// The row's `- ` head was a scalar/nested-seq, not a `key: value` — the
-    /// row loads non-Hash upstream. `must be a Hash` defers to
-    /// [`RowAcc::into_bucket`] so `version:`/`ignored:` checks and later
-    /// DisallowedClass deaths still win (upstream check order).
-    not_a_hash: bool,
-    /// The head's accumulated folded text — a plain scalar continues on
-    /// colon-less member lines (`- 5\n  more` is the String "5 more"
-    /// upstream). Classified once at row close ([`RowAcc::flush_head`]):
-    /// the JOINED text is what `tokenize` sees, so `2024-01-01 more` is a
-    /// String, not a Date death.
-    head_raw: String,
-    /// The head's scalar shape — only Plain heads fold member continuations.
-    head_kind: ScalarKind,
-    head_tag: Option<String>,
-    /// Bare `-` (or `- # comment`) — the element is the indented block: a
-    /// `key:` member opens a mapping (a real row), `- ` members a nested
-    /// sequence (the row is an Array), a colon-less member a scalar.
-    head_empty: bool,
-    /// `- - x` — the element is a nested sequence; `- ` members keep
-    /// feeding it (`- - x\n  - y` → `[[x, y]]` upstream → `must be a
-    /// Hash`), while `key:`/colon-less members are SyntaxError (a seq
-    /// takes no mapping).
-    head_nested: bool,
-    /// A quoted head lacking its closing quote — swallows member lines
-    /// like [`RowAcc::quote_open`] does for fields (`- 'x\n  y'` is one
-    /// String element upstream → `must be a Hash`).
-    head_quote_open: bool,
-    /// Elements of a nested sequence under a bare `-` or `- -` head
-    /// (`-\n  - x` / `- - x\n  - y` load `[x]`/`[x, y]` upstream) — typed
-    /// (fatal-able), and rendered for a `version:` sequence's `[[1]]`
-    /// inspect.
-    row_seq: Vec<PsychScalar>,
-    /// `key => typed-value` pairs of a mapping item — a `version:`
-    /// sequence's map elements render `{\"a\" => 1}` upstream.
-    map_items: Vec<(String, PsychScalar)>,
-    /// Whether `head_raw`/`row_seq` already classified at row close.
-    head_flushed: bool,
-}
-
-impl RowAcc {
-    /// Whether the last scalar is an unclosed quoted one — such a scalar
-    /// swallows the next line whole (keys, items, deeper content alike).
-    fn quote_open(&self) -> bool {
-        self.quote_open
-    }
-
-    fn field_mut(&mut self, f: Field) -> &mut FieldVal {
-        match f {
-            Field::File => self.file.get_or_insert_with(FieldVal::default),
-            Field::Rule => self.rule.get_or_insert_with(FieldVal::default),
-            Field::Message => self.message.get_or_insert_with(FieldVal::default),
-            Field::Count => self.count.get_or_insert_with(FieldVal::default),
-            Field::Other => &mut self.other,
-        }
-    }
-
-    fn field_ref(&self, f: Field) -> Option<&FieldVal> {
-        match f {
-            Field::File => self.file.as_ref(),
-            Field::Rule => self.rule.as_ref(),
-            Field::Message => self.message.as_ref(),
-            Field::Count => self.count.as_ref(),
-            Field::Other => None,
-        }
-    }
-
-    /// The field's Psych-loaded value under `safe_load_file(path,
-    /// permitted_classes: [Symbol])` — `ScalarScanner#tokenize` on a plain
-    /// scalar, the String itself for quoted/block scalars, the
-    /// `deserialize` tag arms for tagged ones (issue #326). `nil` and
-    /// `false` are the falsy values `row["k"] or raise` and
-    /// `if row["message"]` drop on; a `DisallowedClass`/`Float()` death is
-    /// the [`LoadError::Fatal`] surface, not a row error.
-    fn typed(&self, f: Field) -> Result<PsychScalar, LoadError> {
-        let Some(fv) = self.field_ref(f) else {
-            return Ok(PsychScalar::Nil);
-        };
-        if !fv.seq.is_empty() {
-            // `key:\n  - x\n  - y` loads an Array — `Array#to_s`/`#inspect`
-            // are the element inspects joined (`["foo"]`, `[5]`).
-            let joined = fv
-                .seq
-                .iter()
-                .map(PsychScalar::inspect)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Ok(PsychScalar::Opaque { to_s: format!("[{joined}]"), class: "Array" });
-        }
-        if let Some(v) = &fv.resolved {
-            return Ok(v.clone());
-        }
-        let decoded = self.decode(f).unwrap_or_default();
-        classify_scalar(
-            fv.tag.as_deref(),
-            &decoded,
-            matches!(fv.kind, ScalarKind::Plain),
-        )
-        .map_err(LoadError::fatal)
-    }
-
-    /// Apply a line inside the current `- ` item — the text after `- `
-    /// (a row head, where the scalar/member distinction decides whether
-    /// the row is a mapping at all) or a member line.
-    fn apply(&mut self, fragment: &str, label: &str, row_head: bool) -> Result<(), LoadError> {
-        if row_head {
-            return self.row_head(fragment, label);
-        }
-        self.member_line(fragment, label)
-    }
-
-    /// The `- X` row head. `X` is a `key: value` only when [`key_split`]
-    /// finds a member-shaped colon — `a:b`, `'a: b'`, `:sym`, `[a: 1]`,
-    /// `http://x` and `- file: x` are scalars/nested sequences upstream,
-    /// so the row is non-Hash (`must be a Hash`, deferred so `version:`/
-    /// `ignored:` checks and later DisallowedClass deaths precede it).
-    fn row_head(&mut self, fragment: &str, label: &str) -> Result<(), LoadError> {
-        // `- - x` — the element is itself a sequence; its inner scalar
-        // still types (`- - 2024-01-01` dies DisallowedClass upstream) and
-        // later `- ` members keep feeding it (`- - x\n  - y` → `[x, y]`).
-        if fragment == "-" || fragment.starts_with("- ") {
-            self.not_a_hash = true;
-            self.head_nested = true;
-            let v = seq_scalar_text(fragment[1..].trim_start())?;
-            self.row_seq.push(v);
-            return Ok(());
-        }
-        if let Some((key, _)) = key_split(fragment) {
-            // `'a: b'`/`[a: 1]`-shaped heads are scalars upstream — a
-            // member-shaped key (`'a':`, `{a:`, `a:`) is a real field.
-            if member_key(key).is_some() {
-                return self.field_line(fragment, label);
-            }
-        }
-        // A scalar (or empty) head — `must be a Hash` at `into_bucket`.
-        // The head's classify waits for row close: a colon-less member
-        // folds into it and the JOINED text is what `tokenize` sees
-        // (`- 2024-01-01\n  more` is the String "2024-01-01 more"
-        // upstream, not a Date death), and an open quoted head swallows
-        // member lines until its close (`- 'x\n  y'`).
-        self.not_a_hash = true;
-        let (head, kind, tag) = scalar_head(fragment);
-        self.head_empty = head.is_empty();
-        self.head_raw = head.to_string();
-        self.head_kind = kind;
-        self.head_tag = tag.map(str::to_string);
-        self.head_quote_open = match kind {
-            ScalarKind::DoubleQuoted => !dq_closed(head),
-            ScalarKind::SingleQuoted => !sq_closed(head),
-            _ => false,
-        };
-        Ok(())
-    }
-
-    /// One member line inside the current `- ` item.
-    fn member_line(&mut self, fragment: &str, label: &str) -> Result<(), LoadError> {
-        if self.not_a_hash {
-            if fragment == "-" || fragment.starts_with("- ") {
-                // Under a bare `-` or `- -` head this is the row's nested
-                // sequence (`-\n  - x` → `[x]`, `- - x\n  - y` → `[x, y]`
-                // — both `must be a Hash`); under a scalar head it is
-                // `did not find expected key` upstream (a scalar element
-                // cannot carry children).
-                if self.head_empty || self.head_nested {
-                    let v = seq_scalar_text(fragment[1..].trim_start())?;
-                    self.row_seq.push(v);
-                    self.pending_breaks = 0;
-                    return Ok(());
-                }
-                return Err(LoadError::fatal(format!(
-                    "Psych::SyntaxError: ({label}): did not find expected key \
-                     while parsing a block mapping"
-                )));
-            }
-            // Any other member under a nested-seq (`- -`) head is `did
-            // not find expected key` upstream — a sequence takes no
-            // mapping.
-            if self.head_nested {
-                return Err(LoadError::fatal(format!(
-                    "Psych::SyntaxError: ({label}): did not find expected key \
-                     while parsing a block mapping"
-                )));
-            }
-            if key_split(fragment).is_some() {
-                // A `key:` under a BARE `-` opens a mapping — the element
-                // is a real Hash (`-\n  file: a.rb` is a valid row);
-                // under a scalar head `- 5\n  x: 1` is `mapping values
-                // are not allowed` upstream.
-                if self.head_empty {
-                    self.not_a_hash = false;
-                    self.head_flushed = true;
-                    return self.field_line(fragment, label);
-                }
-                return Err(LoadError::fatal(format!(
-                    "Psych::SyntaxError: ({label}): mapping values are not allowed in this context"
-                )));
-            }
-            // A colon-less member folds into the head's plain scalar
-            // (`- 5\n  more` → "5 more" upstream — still `must be a
-            // Hash`, and `2024-01-01 more` is a String, no death). A
-            // non-Plain head cannot take a continuation.
-            if self.head_kind == ScalarKind::Plain {
-                let pending = std::mem::take(&mut self.pending_breaks);
-                if !self.head_raw.is_empty() {
-                    self.head_raw.push_str(&if pending > 0 {
-                        "\n".repeat(pending)
-                    } else {
-                        " ".to_string()
-                    });
-                }
-                self.head_raw.push_str(fragment.trim());
-                return Ok(());
-            }
-            return Err(LoadError::fatal(format!(
-                "Psych::SyntaxError: ({label}): mapping values are not allowed in this context"
-            )));
-        }
-        // A `- item` at the member column is a nested sequence element of a
-        // PENDING `key:` (`meta:\n  - x` — upstream loads the Array under
-        // the key and types each element).
-        if fragment == "-" || fragment.starts_with("- ") {
-            return self.seq_item(fragment[1..].trim_start(), label);
-        }
-        self.field_line(fragment, label)
-    }
-
-    /// A `key: value` member (or row head) inside a mapping row.
-    fn field_line(&mut self, fragment: &str, label: &str) -> Result<(), LoadError> {
-        let Some((key, value)) = key_split(fragment) else {
-            // A bare `bogus` member line — `could not find expected ':'`.
-            return Err(LoadError::fatal(format!(
-                "Psych::SyntaxError: ({label}): could not find expected ':'"
-            )));
-        };
-        // `'rule':` maps `rule` upstream — a quoted key resolves to its
-        // inner text; an UNCLOSED quoted key is a syntax error upstream.
-        let Some(key_name) = member_key(key.trim()) else {
-            return Err(LoadError::fatal(format!(
-                "Psych::SyntaxError: ({label}): did not find expected key \
-                 while parsing a block mapping"
-            )));
-        };
-        let (head, kind, tag) = scalar_head(value.trim_start());
-        let field = match key_name.as_str() {
-            "file" => Field::File,
-            "rule" => Field::Rule,
-            "message" => Field::Message,
-            "count" => Field::Count,
-            _ => Field::Other,
-        };
-        if matches!(field, Field::Other) {
-            // `other` is a shared sink — a new unknown `key:` opens a fresh
-            // pending field (`meta2:` after `meta:\n  - x` is a NEW key's
-            // value upstream, not a continuation).
-            self.other = FieldVal::default();
-        }
-        self.last = Some(field);
-        self.pending_breaks = 0;
-        // Eagerly type the scalar in DOCUMENT ORDER — `safe_load` typed it
-        // before `parse_row` ran, so its DisallowedClass/`Float()` death
-        // beats every validation error, including an unknown `meta:` field's
-        // (upstream typed it too). The loaded value is kept for a
-        // `version:`-sequence map element's `{"a" => 1}` inspect; a
-        // multi-line plain/quoted scalar re-classifies its full text at
-        // `typed()` (a `file: 2024-01-01` head plus a continuation line is
-        // the documented corner where the eager death is one line early).
-        let typed_v = if !head.is_empty() {
-            Some(
-                classify_scalar(
-                    tag,
-                    &unyaml_scalar(head),
-                    matches!(kind, ScalarKind::Plain) && tag.is_none(),
-                )
-                .map_err(LoadError::fatal)?,
-            )
-        } else {
-            None
-        };
-        self.map_items.push((format!("{key_name:?}"), typed_v.unwrap_or(PsychScalar::Nil)));
-        // `key:` with an empty value leaves the field PENDING — a nested
-        // `- item` sequence becomes the value. A bare TAG (`file: !str`,
-        // `meta: !foo`) stays pending too (the tag attaches to whatever
-        // value follows); its resolution is deferred to `typed()`.
-        if head.is_empty() {
-            if let Some(t) = tag {
-                *self.field_mut(field) =
-                    FieldVal { tag: Some(t.to_string()), ..FieldVal::default() };
-            }
-            self.quote_open = false;
-            return Ok(());
-        }
-        self.quote_open = match kind {
-            ScalarKind::DoubleQuoted => !dq_closed(head),
-            ScalarKind::SingleQuoted => !sq_closed(head),
-            _ => false,
-        };
-        *self.field_mut(field) = FieldVal {
-            raw: head.to_string(),
-            kind,
-            tag: tag.map(str::to_string),
-            ..FieldVal::default()
-        };
-        Ok(())
-    }
-
-    /// Whether the last `key:` left its value PENDING (`meta:` with no
-    /// inline scalar) — a `- item` that follows belongs to that key's
-    /// nested sequence. A valued field or a bare-scalar row cannot take one
-    /// (`did not find expected key` / `mapping values are not allowed`
-    /// upstream).
-    fn last_is_pending(&self) -> bool {
-        let Some(field) = self.last else { return false };
-        let fv = match field {
-            Field::Other => &self.other,
-            // `last` is set by the `key:` line itself — an absent FieldVal
-            // means that line wrote no value: pending.
-            _ => match self.field_ref(field) {
-                Some(fv) => fv,
-                None => return true,
-            },
-        };
-        // `seq` is NOT checked — a field collecting `- item`s stays
-        // pending so the sequence keeps growing. A bare TAG (`meta: !foo`)
-        // leaves the key pending too — the sequence IS the tagged value
-        // (probed: `meta: !foo\n  - x` loads upstream).
-        fv.raw.is_empty()
-            && fv.resolved.is_none()
-            && matches!(fv.kind, ScalarKind::Plain)
-    }
-
-    /// Whether the current `- ` item accepts a member `- item` line — a
-    /// pending `key:`'s nested sequence, or the nested sequence under a
-    /// bare `-` / `- -` row head.
-    fn takes_seq_item(&self) -> bool {
-        self.last_is_pending()
-            || (self.not_a_hash && (self.head_empty || self.head_nested))
-    }
-
-    /// One `- item` — the pending `key:`'s nested-sequence element, or an
-    /// element of a bare-`-` row's own sequence. Each element types (a
-    /// `2024-01-01` there is the same DisallowedClass death as an inline
-    /// scalar); under a valued field or scalar head the line is uncaught
-    /// `Psych::SyntaxError` upstream.
-    fn seq_item(&mut self, item: &str, label: &str) -> Result<(), LoadError> {
-        if !self.takes_seq_item() {
-            return Err(LoadError::fatal(format!(
-                "Psych::SyntaxError: ({label}): did not find expected key \
-                 while parsing a block mapping"
-            )));
-        }
-        let v = seq_scalar_text(item)?;
-        if self.not_a_hash {
-            self.row_seq.push(v);
-        } else {
-            let field = self.last.expect("last_is_pending implies last");
-            self.field_mut(field).seq.push(v);
-        }
-        self.pending_breaks = 0;
-        Ok(())
-    }
-
-    /// Classify the deferred `- X` scalar head at row close — `safe_load`
-    /// sees the FOLDED text, so `- 2024-01-01\n  more` is the String
-    /// "2024-01-01 more" (no death) while a lone `- 2024-01-01` is the
-    /// DisallowedClass death. Returns the loaded element — a `version:`
-    /// sequence collects item values for its `[[1]]`/`{"a" => 1}`
-    /// inspect (a nested seq renders `[…]`, a folded scalar its own
-    /// inspect, a map item `{…}` via [`RowAcc::map_value`]).
-    fn flush_head(&mut self) -> Result<Option<PsychScalar>, LoadError> {
-        if !self.not_a_hash || self.head_flushed {
-            return Ok(None);
-        }
-        self.head_flushed = true;
-        if !self.row_seq.is_empty() {
-            let joined = self
-                .row_seq
-                .iter()
-                .map(PsychScalar::inspect)
-                .collect::<Vec<_>>()
-                .join(", ");
-            return Ok(Some(PsychScalar::Opaque {
-                to_s: format!("[{joined}]"),
-                class: "Array",
-            }));
-        }
-        classify_scalar(
-            self.head_tag.as_deref(),
-            &unyaml_scalar(&self.head_raw),
-            matches!(self.head_kind, ScalarKind::Plain) && self.head_tag.is_none(),
-        )
-        .map(Some)
-        .map_err(LoadError::fatal)
-    }
-
-    /// The `{"a" => 1, …}` inspect of a mapping item — the element a
-    /// `version:` sequence collected.
-    fn map_value(&self) -> PsychScalar {
-        let joined = self
-            .map_items
-            .iter()
-            .map(|(k, v)| format!("{k} => {}", v.inspect()))
-            .collect::<Vec<_>>()
-            .join(", ");
-        PsychScalar::Opaque { to_s: format!("{{{joined}}}"), class: "Hash" }
-    }
-
-    /// An open-quote head — like [`RowAcc::quote_open`], member lines at
-    /// ANY indent fold into the scalar until its close.
-    fn head_open(&self) -> bool {
-        self.head_quote_open
-    }
-
-    /// Fold a line into the open quoted head — same rules as
-    /// [`RowAcc::continue_scalar`] for quoted fields.
-    fn head_continue(&mut self, text: &str) {
-        let pending = std::mem::take(&mut self.pending_breaks);
-        let text = text.trim();
-        match self.head_kind {
-            ScalarKind::DoubleQuoted => {
-                let backslashes = self
-                    .head_raw
-                    .trim_end()
-                    .chars()
-                    .rev()
-                    .take_while(|&c| c == '\\')
-                    .count();
-                if backslashes % 2 == 1 {
-                    let t = self.head_raw.trim_end().len();
-                    self.head_raw.truncate(t - 1);
-                } else if pending > 0 {
-                    self.head_raw.push_str(&"\n".repeat(pending));
-                } else {
-                    self.head_raw.push(' ');
-                }
-                self.head_raw.push_str(text);
-                if dq_closed(&self.head_raw) {
-                    self.head_quote_open = false;
-                }
-            }
-            _ => {
-                if pending > 0 {
-                    self.head_raw.push_str(&"\n".repeat(pending));
-                } else {
-                    self.head_raw.push(' ');
-                }
-                self.head_raw.push_str(text);
-                if self.head_kind == ScalarKind::SingleQuoted && sq_closed(&self.head_raw) {
-                    self.head_quote_open = false;
-                }
-            }
-        }
-    }
-
-    /// Feed a continuation line (deeper-indented than the member keys, or
-    /// inside an open quoted scalar) into the last field's scalar.
-    fn continue_scalar(&mut self, raw_line: &str) {
-        let Some(field) = self.last else { return };
-        let pending = std::mem::take(&mut self.pending_breaks);
-        let fv = self.field_mut(field);
-        match fv.kind {
-            ScalarKind::Plain => {
-                let sep = if pending > 0 { "\n".repeat(pending) } else { " ".to_string() };
-                fv.raw.push_str(&sep);
-                fv.raw.push_str(raw_line.trim());
-            }
-            ScalarKind::DoubleQuoted => {
-                // Inside quotes a break folds to one space; a `\` at the end
-                // of a double-quoted line escapes the break entirely — drop
-                // that backslash along with the fold.
-                let suppressed = fv.raw.trim_end().ends_with('\\')
-                    && fv.raw.trim_end().chars().rev().take_while(|&c| c == '\\').count() % 2 == 1;
-                if suppressed {
-                    let t = fv.raw.trim_end().len();
-                    fv.raw.truncate(t - 1);
-                } else if pending > 0 {
-                    fv.raw.push_str(&"\n".repeat(pending));
-                } else {
-                    fv.raw.push(' ');
-                }
-                fv.raw.push_str(raw_line.trim());
-                if dq_closed(&fv.raw) {
-                    self.quote_open = false;
-                }
-            }
-            ScalarKind::SingleQuoted => {
-                if pending > 0 {
-                    fv.raw.push_str(&"\n".repeat(pending));
-                } else {
-                    fv.raw.push(' ');
-                }
-                fv.raw.push_str(raw_line.trim());
-                if sq_closed(&fv.raw) {
-                    self.quote_open = false;
-                }
-            }
-            ScalarKind::Block { .. } => {
-                // Blank lines inside a block scalar are literal empty lines.
-                for _ in 0..pending {
-                    fv.lines.push(String::new());
-                }
-                let indent = raw_line.len() - raw_line.trim_start().len();
-                let block_indent = *fv.block_indent.get_or_insert(indent);
-                fv.lines.push(raw_line.get(block_indent..).unwrap_or("").to_string());
-            }
-        }
-    }
-
-    /// Decode a field's accumulated text (folds and escapes applied). For
-    /// `count` the caller separately checks the scalar was PLAIN — a quoted
-    /// `"5"` is a YAML String upstream and fails `count.is_a?(Integer)` there.
-    fn decode(&self, field: Field) -> Option<String> {
-        let fv = self.field_ref(field)?;
-        match fv.kind {
-            ScalarKind::Block { folded, chomp } => Some(block_value(&fv.lines, folded, chomp)),
-            _ => Some(unyaml_scalar(&fv.raw)),
-        }
-    }
-
-    fn into_bucket(self, label: &str) -> Result<Bucket, LoadError> {
-        let idx = self.idx;
-        // `row.is_a?(Hash)` — a bare-scalar row (`- 5`, `- [1]`, `- nil`)
-        // deferred its shape error here so `version:`/`ignored:` checks
-        // and document-order DisallowedClass deaths still precede it.
-        if self.not_a_hash {
-            return Err(LoadError::load(format!("{label}: ignored[{idx}] must be a Hash")));
-        }
-        // Type all four fields before validating any — `safe_load` typed
-        // the whole document before `parse_row`, so a `message: 2024-01-01`
-        // death beats the `count: 0` error beside it (issue #326 review).
-        let file_v = self.typed(Field::File)?;
-        let rule_v = self.typed(Field::Rule)?;
-        let count_v = self.typed(Field::Count)?;
-        let message_v = self.typed(Field::Message)?;
-        // `file = row["file"] or raise`, `rule = row["rule"] or raise` — the
-        // TYPED value's truthiness decides (nil/false are missing; `file: 5`
-        // and `file: true` are truthy non-String keys — an inert bucket).
-        let file = match file_v {
-            v if v.falsy() => {
-                return Err(LoadError::load(format!(
-                    "{label}: ignored[{idx}] missing `file:`"
-                )))
-            }
-            v => v.into_key(),
-        };
-        let rule = match rule_v {
-            v if v.falsy() => {
-                return Err(LoadError::load(format!(
-                    "{label}: ignored[{idx}] missing `rule:`"
-                )))
-            }
-            v => v.into_key(),
-        };
-        // `count.is_a?(Integer) && count.positive?` upstream — every other
-        // type reports its `inspect` (`got "5"`, `got 1.5`, `got true`,
-        // `got :x`, `got nil`), an Integer its canonical decimal (`got -16`
-        // for `-0x10`). A huge Integer counts as `usize::MAX` — the
-        // reference's `expect`-free threshold semantics need no bignum.
-        let count = match count_v {
-            PsychScalar::Int(i) if i.value > 0 => usize::try_from(i.value).unwrap_or(usize::MAX),
-            v => {
-                return Err(LoadError::load(format!(
-                    "{label}: ignored[{idx}] `count:` must be a positive Integer (got {})",
-                    v.inspect()
-                )))
-            }
-        };
-        Ok(match message_v {
-            // `if (message = row["message"])` — a falsy typed value (nil,
-            // `false`/`no`/`off`) is the rule-ID row, not a `/false/` bucket.
-            v if v.falsy() => Bucket::rule_row_typed(file, rule, count),
-            v => {
-                // `compile_message_regex(message.to_s)` — a non-String keys
-                // its `to_s` (`message: 0x10` compiles `/16/`, not `/0x10/`).
-                let m = v.to_s();
-                // The reference compiles the row's Regexp at load and raises
-                // LoadError on a bad pattern — dropping the whole baseline —
-                // rather than degrading the row to a rule bucket (issue #162:
-                // Ruby-only SYNTAX stays upstream-deferred; the failure mode
-                // is the contract). The error text after the colon is the
-                // engine's own — Onigmo's RegexpError has no Rust analogue —
-                // so the reason is kept terse (`…: /source/` like RegexpError).
-                if let Err(e) = Regex::new(&m) {
-                    let full = e.to_string();
-                    let reason = full
-                        .rsplit_once("error:")
-                        .map_or(full.as_str(), |(_, r)| r)
-                        .trim()
-                        .to_string();
-                    return Err(LoadError::load(format!(
-                        "{label}: ignored[{idx}] `message:` is not a valid Regexp: \
-                         {reason}: /{m}/"
-                    )));
-                }
-                Bucket::message_row(file, rule, m, count)
-            }
-        })
-    }
-}
-
-/// A `|`/`>` block scalar's decoded content from its collected lines:
-/// `>` folds joins between non-empty lines to a space (empty lines force
-/// `\n`); chomping then settles trailing newlines.
-fn block_value(lines: &[String], folded: bool, chomp: Chomp) -> String {
-    let mut out = String::new();
-    for (i, l) in lines.iter().enumerate() {
-        if i > 0 {
-            if folded && !l.is_empty() && !lines[i - 1].is_empty() {
-                out.push(' ');
-            } else {
-                out.push('\n');
-            }
-        }
-        out.push_str(l);
-    }
-    match chomp {
-        Chomp::Strip => {
-            while out.ends_with('\n') {
-                out.pop();
-            }
-        }
-        Chomp::Clip => {
-            while out.ends_with('\n') {
-                out.pop();
-            }
-            if !lines.is_empty() {
-                out.push('\n');
-            }
-        }
-        Chomp::Keep => {
-            if !lines.is_empty() {
-                out.push('\n');
-            }
-        }
-    }
-    out
-}
-
-/// Classify and split a `key:`-line's value head: returns the scalar's
-/// initial raw text, its kind, and the `!`-tag token if one led the value
-/// (`!!str '<<'` decodes as `'<<'` under `deserialize`'s `!str` arm;
-/// `!foo 5` tokenizes `5`). A trailing ` #` comment is stripped.
-/// Split a `key: value` fragment — the member colon is the first `:`
-/// followed by a space or the end of the line and the key must be
-/// non-empty (`a:b`, `http://x`, `:sym` have no member colon — scalars
-/// upstream; `a:: b` keys on `a:`). The key text is trimmed on the right
-/// only; the caller matches it or rejects quoted/flow heads.
-fn key_split(fragment: &str) -> Option<(&str, &str)> {
-    let bytes = fragment.as_bytes();
-    // A `'`/`"`-led fragment is a quoted key — its member colon sits after
-    // the CLOSING quote (`'a: b': c` keys on `a: b`; `''` escapes in sq,
-    // a `\` in dq). No close → the fragment is a scalar, not a member.
-    if matches!(bytes.first(), Some(b'\'' | b'"')) {
-        let q = bytes[0];
-        let mut i = 1;
-        let close = loop {
-            let p = bytes[i..].iter().position(|&b| b == q)?;
-            let idx = i + p;
-            if q == b'\'' && bytes.get(idx + 1) == Some(&b'\'') {
-                i = idx + 2;
-            } else if q == b'"'
-                && bytes[..idx].iter().rev().take_while(|&&b| b == b'\\').count() % 2
-                    == 1
-            {
-                i = idx + 1;
-            } else {
-                break idx;
-            }
-        };
-        let rest = fragment[close + 1..].trim_start();
-        let rest = rest.strip_prefix(':')?;
-        if !rest.is_empty() && !rest.starts_with([' ', '\t']) {
-            return None;
-        }
-        return Some((&fragment[..close + 1], rest));
-    }
-    let i = (0..bytes.len()).find(|&j| {
-        bytes[j] == b':' && matches!(bytes.get(j + 1), None | Some(b' ' | b'\t'))
-    })?;
-    let key = fragment[..i].trim_end();
-    if key.is_empty() {
-        return None;
-    }
-    Some((key, &fragment[i + 1..]))
-}
-
-/// A member-shaped key — plain text, a CLOSED quoted scalar (`'a'` → `a`,
-/// so `'a': 1` maps `"a" => 1` upstream while `'a: b'` is a scalar head),
-/// or a `{` flow head (the accidentally-correct `missing file:`).
-/// `[`- and unclosed-quote heads are scalars upstream, not members.
-fn member_key(key: &str) -> Option<String> {
-    if key.starts_with('[') {
-        return None;
-    }
-    for q in ['\'', '"'] {
-        if let Some(rest) = key.strip_prefix(q) {
-            return rest.strip_suffix(q).map(str::to_string);
-        }
-    }
-    Some(key.to_string())
-}
-
-/// Split a flow collection's inner text on top-level commas — a comma
-/// inside a quoted scalar or a nested `[…]`/`{…}` does not split
-/// (`['x, y']` is one element upstream; `\` escapes in dq, `''` in sq).
-fn flow_items(inner: &str) -> Vec<&str> {
-    let bytes = inner.as_bytes();
-    let mut items = Vec::new();
-    let mut start = 0;
-    let mut depth = 0usize;
-    let mut i = 0;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'[' | b'{' => depth += 1,
-            b']' | b'}' => depth = depth.saturating_sub(1),
-            b'\'' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\'' {
-                        if bytes.get(i + 1) == Some(&b'\'') { i += 1; } else { break; }
-                    }
-                    i += 1;
-                }
-            }
-            b'"' => {
-                i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' {
-                        i += 2;
-                        continue;
-                    }
-                    if bytes[i] == b'"' {
-                        break;
-                    }
-                    i += 1;
-                }
-            }
-            b',' if depth == 0 => {
-                items.push(&inner[start..i]);
-                start = i + 1;
-            }
-            _ => {}
-        }
-        i += 1;
-    }
-    items.push(&inner[start..]);
-    items
-}
-
-/// The `inspect`-joined `[…]` a flow sequence loads — each element
-/// types (a `2024-01-01` inside still dies DisallowedClass). Elements
-/// that are themselves `k: v` pairs load as one-pair maps (`[a: 1]` →
-/// `[{"a" => 1}]` upstream).
-fn classify_flow_seq(inner: &str) -> Result<PsychScalar, String> {
-    let inner = inner.trim();
-    if inner.is_empty() {
-        return Ok(PsychScalar::Opaque { to_s: "[]".to_string(), class: "Array" });
-    }
-    let mut parts = Vec::new();
-    for item in flow_items(inner) {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        let v = if (item.starts_with('[') && item.ends_with(']'))
-            || (item.starts_with('{') && item.ends_with('}'))
-        {
-            classify_scalar(None, item, true)?
-        } else if let Some((k, v)) = key_split(item) {
-            // A `k: v` element — a one-pair map upstream.
-            let key_inspect = format!("{k:?}");
-            let val = flow_scalar(v.trim())?;
-            PsychScalar::Opaque {
-                to_s: format!("{{{key_inspect} => {}}}", val.inspect()),
-                class: "Hash",
-            }
-        } else {
-            flow_scalar(item)?
-        };
-        parts.push(v.inspect());
-    }
-    Ok(PsychScalar::Opaque { to_s: format!("[{}]", parts.join(", ")), class: "Array" })
-}
-
-/// Classify one flow element — the same `scalar_head` + `unyaml` + kind
-/// the block parser applies, so a quoted element decodes its quotes
-/// (`'a, b'` → the String `a, b`, whose inspect is `"a, b"`).
-fn flow_scalar(item: &str) -> Result<PsychScalar, String> {
-    let (head, kind, tag) = scalar_head(item);
-    classify_scalar(
-        tag,
-        &unyaml_scalar(head),
-        matches!(kind, ScalarKind::Plain) && tag.is_none(),
-    )
-}
-
-/// The `inspect`-joined `{…}` a flow mapping loads — keys and values
-/// type (`{a: 2024-01-01}` dies DisallowedClass upstream).
-fn classify_flow_map(inner: &str) -> Result<PsychScalar, String> {
-    let inner = inner.trim();
-    if inner.is_empty() {
-        return Ok(PsychScalar::Opaque { to_s: "{}".to_string(), class: "Hash" });
-    }
-    let mut parts = Vec::new();
-    for item in flow_items(inner) {
-        let item = item.trim();
-        if item.is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = key_split(item) {
-            classify_scalar(None, k.trim(), true)?;
-            let val = flow_scalar(v.trim())?;
-            parts.push(format!("{:?} => {}", k.trim(), val.inspect()));
-        } else {
-            // A bare flow-map entry (`{a}`) — types as a scalar.
-            let v = flow_scalar(item)?;
-            parts.push(format!("{} => nil", v.inspect()));
-        }
-    }
-    Ok(PsychScalar::Opaque { to_s: format!("{{{}}}", parts.join(", ")), class: "Hash" })
-}
-
-/// The [`PsychScalar`] one `- item`'s text resolves to — the same typing
-/// `safe_load` performs on the sequence element, one level of `key:`/
-/// nested-sequence unwrapping included (`- a: 2024-01-01` and
-/// `- - 2024-01-01` die DisallowedClass upstream).
-fn seq_scalar_text(item: &str) -> Result<PsychScalar, LoadError> {
-    if let Some((_k, v)) = key_split(item) {
-        return seq_scalar_text(v.trim_start());
-    }
-    if item == "-" || item.starts_with("- ") {
-        return seq_scalar_text(item[1..].trim_start());
-    }
-    let (head, kind, tag) = scalar_head(item);
-    classify_scalar(
-        tag,
-        &unyaml_scalar(head),
-        matches!(kind, ScalarKind::Plain) && tag.is_none(),
-    )
-    .map_err(LoadError::fatal)
-}
-
-fn scalar_head(value: &str) -> (&str, ScalarKind, Option<&str>) {
-    let mut v = value;
-    // A `#` in value position is a comment — the scalar is empty.
-    if v.starts_with('#') {
-        return ("", ScalarKind::Plain, None);
-    }
-    // One `!`-tag or `&`-anchor token then the scalar (`!!str '<<'`,
-    // `! 'x'`, `&a x`, `!t &a x` — either order). A tag/anchor with no
-    // following scalar leaves the value PENDING (`meta: !foo\n  - x` loads
-    // the sequence under the tag). `*name` aliases stay in `v` —
-    // `safe_load`'s alias handling dies on them (probed: `file: *x` is
-    // `Psych::BadAlias` upstream).
-    let mut tag = None;
-    loop {
-        if let Some(rest) = v.strip_prefix('&') {
-            match rest.find([' ', '\t']) {
-                Some(i) => v = rest[i..].trim_start(),
-                None => v = "",
-            }
-        } else if v.starts_with('!') {
-            match v[1..].find([' ', '\t']) {
-                Some(i) => {
-                    tag = Some(&v[..1 + i]);
-                    v = v[1 + i..].trim_start();
-                }
-                None => {
-                    tag = Some(v);
-                    v = "";
-                }
-            }
-        } else {
-            break;
-        }
-    }
-    // `!<URI>` is the verbatim tag spelling — Psych reports the tag as the
-    // bare URI (`!<!str>` → `!str`, `!<tag:yaml.org,2002:str>` →
-    // `tag:yaml.org,2002:str`), so unwrap it before `deserialize` routes.
-    let tag = tag.map(|t| {
-        t.strip_prefix("!<")
-            .and_then(|inner| inner.strip_suffix('>'))
-            .unwrap_or(t)
-    });
-    let kind = match v.chars().next() {
-        Some('"') => ScalarKind::DoubleQuoted,
-        Some('\'') => ScalarKind::SingleQuoted,
-        Some('|' | '>') => {
-            let folded = v.starts_with('>');
-            let chomp = match v.as_bytes().get(1) {
-                Some(b'-') => Chomp::Strip,
-                Some(b'+') => Chomp::Keep,
-                _ => Chomp::Clip,
-            };
-            ScalarKind::Block { folded, chomp }
-        }
-        _ => ScalarKind::Plain,
-    };
-    let v = match kind {
-        ScalarKind::Plain => {
-            // ` #` opens a comment in a plain scalar — and a `#`-first
-            // remainder left by a stripped tag/anchor is comment-only
-            // (`!foo # c` → the value stays PENDING, probed).
-            if v.starts_with('#') {
-                ""
-            } else {
-                match v.find(" #") {
-                    Some(i) => v[..i].trim_end(),
-                    None => v.trim_end(),
-                }
-            }
-        }
-        ScalarKind::Block { .. } => v,
-        ScalarKind::DoubleQuoted | ScalarKind::SingleQuoted => {
-            // Keep the whole quoted span; a ` #…` after the close is comment.
-            let quote = v.as_bytes()[0];
-            let mut end = 1usize;
-            let bytes = v.as_bytes();
-            while end < bytes.len() {
-                if bytes[end] == quote {
-                    if quote == b'\'' && bytes.get(end + 1) == Some(&b'\'') {
-                        end += 2;
-                        continue;
-                    }
-                    break;
-                }
-                if quote == b'"' && bytes[end] == b'\\' {
-                    end += 1;
-                }
-                end += 1;
-            }
-            if end < bytes.len() { &v[..=end] } else { v }
-        }
-    };
-    (v, kind, tag)
-}
-
-/// Does a double-quoted scalar source hold its closing quote?
-fn dq_closed(raw: &str) -> bool {
-    if !raw.starts_with('"') {
-        return false;
-    }
-    let bytes = raw.as_bytes();
-    let mut i = 1;
-    while i < bytes.len() {
-        match bytes[i] {
-            b'\\' => i += 1,
-            b'"' => return true,
-            _ => {}
-        }
-        i += 1;
-    }
-    false
-}
-
-/// Does a single-quoted scalar source hold its closing quote (`''` escapes)?
-fn sq_closed(raw: &str) -> bool {
-    if !raw.starts_with('\'') {
-        return false;
-    }
-    let bytes = raw.as_bytes();
-    let mut i = 1;
-    while i < bytes.len() {
-        if bytes[i] == b'\'' {
-            if bytes.get(i + 1) == Some(&b'\'') {
-                i += 2;
-                continue;
-            }
-            return true;
-        }
-        i += 1;
-    }
-    false
-}
 
 // ---------------------------------------------------------------------------
 // Typed scalars — `ScalarScanner#tokenize` + `ToRuby#deserialize` (issue #326)
@@ -2277,7 +955,7 @@ fn sq_closed(raw: &str) -> bool {
 /// `parse_row`'s `row["file"]`/`row["rule"]`/`row["count"]`/`row["message"]`
 /// and `parse_loaded`'s `raw["version"]`/`raw["ignored"]` see.
 #[derive(Clone, Debug)]
-enum PsychScalar {
+pub(crate) enum PsychScalar {
     /// `nil` — `~`/`null`/empty, falsy.
     Nil,
     /// `true`/`false` — `yes`/`no`/`on`/`off`/`true`/`false`, case-insensitive
@@ -2301,20 +979,20 @@ enum PsychScalar {
 
 /// A loaded Integer — saturated `value` plus canonical decimal `digits`.
 #[derive(Clone, Debug)]
-struct PsychInt {
-    value: i128,
-    digits: String,
+pub(crate) struct PsychInt {
+    pub(crate) value: i128,
+    pub(crate) digits: String,
 }
 
 impl PsychScalar {
     /// `row["k"] or raise` / `if row["message"]` — Ruby falsy is nil|false.
-    fn falsy(&self) -> bool {
+    pub(crate) fn falsy(&self) -> bool {
         matches!(self, PsychScalar::Nil | PsychScalar::Bool(false))
     }
 
     /// `raw.class` text — the `expected a Hash at top level, got …` class
     /// name and the `can't convert X into Float` subject.
-    fn class_name(&self) -> &str {
+    pub(crate) fn class_name(&self) -> &str {
         match self {
             PsychScalar::Nil => "NilClass",
             PsychScalar::Bool(true) => "TrueClass",
@@ -2329,7 +1007,7 @@ impl PsychScalar {
 
     /// Ruby `to_s` — the `message:` Regexp source for non-String values
     /// (`0x10` → `16`, `true` → `true`, `:x` → `x`).
-    fn to_s(&self) -> String {
+    pub(crate) fn to_s(&self) -> String {
         match self {
             PsychScalar::Nil => String::new(),
             PsychScalar::Bool(b) => b.to_string(),
@@ -2343,7 +1021,7 @@ impl PsychScalar {
 
     /// Ruby `inspect` — the `unsupported \`version: …\`` and
     /// ``got …`` error texts (`"5"`, `1.5`, `true`, `:x`, `nil`, `-16`).
-    fn inspect(&self) -> String {
+    pub(crate) fn inspect(&self) -> String {
         match self {
             PsychScalar::Nil => "nil".to_string(),
             PsychScalar::Bool(b) => b.to_string(),
@@ -2357,7 +1035,7 @@ impl PsychScalar {
 
     /// The bucket key this value keys on — `Str` alone can match a
     /// diagnostic's String path/rule (`file: 5` keys an inert bucket).
-    fn into_key(self) -> KeyScalar {
+    pub(crate) fn into_key(self) -> KeyScalar {
         match self {
             PsychScalar::Str(s) => KeyScalar::Str(s),
             PsychScalar::Int(i) => KeyScalar::Int(i.digits),
@@ -2379,23 +1057,15 @@ impl PsychScalar {
 /// an UNCAUGHT exception — `Psych::DisallowedClass`, `Float()`'s
 /// `ArgumentError`, `can't convert`'s `TypeError` — carried as the
 /// `<Class>: <message>` text [`LoadError::fatal`] reports.
-fn classify_scalar(tag: Option<&str>, text: &str, plain: bool) -> Result<PsychScalar, String> {
-    // A plain `*alias` dies at parse level under `safe_load`'s
-    // `aliases: false` (probed: `Psych::AliasesNotEnabled`) — before any
-    // deserialization.
-    if plain && tag.is_none() && text.starts_with('*') {
-        return Err(
-            "Psych::AliasesNotEnabled: Alias parsing was not enabled".to_string()
-        );
-    }
-    // A `[…]`/`{…}` flow collection — upstream loads the seq/map, typing
-    // every element (`meta: [2024-01-01]` dies DisallowedClass).
-    if plain && tag.is_none() && text.starts_with('[') && text.ends_with(']') {
-        return classify_flow_seq(&text[1..text.len() - 1]);
-    }
-    if plain && tag.is_none() && text.starts_with('{') && text.ends_with('}') {
-        return classify_flow_map(&text[1..text.len() - 1]);
-    }
+pub(crate) fn classify_scalar(
+    tag: Option<&str>,
+    text: &str,
+    plain: bool,
+) -> Result<PsychScalar, String> {
+    // `text` is libyaml's cooked scalar content — flow collections and
+    // aliases never arrive here (they are sequence/mapping/alias EVENTS in
+    // `crate::psych_doc`), so the plain/tagged/quoted split is all that
+    // remains of `deserialize`'s dispatch.
     match tag {
         None if plain => tokenize_scalar(text),
         None => Ok(PsychScalar::Str(text.to_string())),
@@ -3381,75 +2051,6 @@ fn double_quote(s: &str) -> String {
     out
 }
 
-/// The reader side of [`push_kv`]'s quoted styles: strip a surrounding quote
-/// pair and unescape, else return the plain scalar as-is.
-fn unyaml_scalar(s: &str) -> String {
-    let s = s.trim();
-    if s.len() >= 2 && s.starts_with('\'') && s.ends_with('\'') {
-        return s[1..s.len() - 1].replace("''", "'");
-    }
-    if s.len() >= 2 && s.starts_with('"') && s.ends_with('"') {
-        // Double-quoted: handle the common backslash escapes Psych would emit.
-        let inner = &s[1..s.len() - 1];
-        return unescape_double(inner);
-    }
-    s.to_string()
-}
-
-fn unescape_double(s: &str) -> String {
-    // YAML 1.1 double-quoted escapes (Psych/libyaml's set, not just the common
-    // five) — `\x`/`\u`/`\U` are hex codepoints; `\N`/`\_`/`\L`/`\P` are the
-    // Unicode space/separator escapes; an unknown escape keeps its backslash
-    // (Psych would SyntaxError — a non-matching bucket is the safe decline).
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c == '\\' {
-            match chars.next() {
-                Some('0') => out.push('\0'),
-                Some('a') => out.push('\u{7}'),
-                Some('b') => out.push('\u{8}'),
-                Some('n') => out.push('\n'),
-                Some('t' | '\t') => out.push('\t'),
-                Some('v') => out.push('\u{b}'),
-                Some('f') => out.push('\u{c}'),
-                Some('r') => out.push('\r'),
-                Some('e') => out.push('\u{1b}'),
-                Some('"') => out.push('"'),
-                Some('/') => out.push('/'),
-                Some('\\') => out.push('\\'),
-                Some(' ') => out.push(' '),
-                Some('N') => out.push('\u{85}'),
-                Some('_') => out.push('\u{a0}'),
-                Some('L') => out.push('\u{2028}'),
-                Some('P') => out.push('\u{2029}'),
-                Some('x') => out.push(hex_escape(&mut chars, 2)),
-                Some('u') => out.push(hex_escape(&mut chars, 4)),
-                Some('U') => out.push(hex_escape(&mut chars, 8)),
-                Some(other) => {
-                    out.push('\\');
-                    out.push(other);
-                }
-                None => out.push('\\'),
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
-/// Decode a `\xHH`/`\uHHHH`/`\UHHHHHHHH` codepoint escape; an invalid or
-/// non-scalar-value escape decodes to U+FFFD (Psych would SyntaxError).
-fn hex_escape(chars: &mut std::str::Chars<'_>, width: usize) -> char {
-    let mut v = 0u32;
-    for _ in 0..width {
-        let Some(c) = chars.next() else { return '\u{fffd}' };
-        let Some(d) = c.to_digit(16) else { return '\u{fffd}' };
-        v = v * 16 + d;
-    }
-    char::from_u32(v).unwrap_or('\u{fffd}')
-}
 
 /// Whether a value must be single-quoted because its plain form would reparse
 /// as a non-String — Psych's `not String === @ss.tokenize(o)` check, ported

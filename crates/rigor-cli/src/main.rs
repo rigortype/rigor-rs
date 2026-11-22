@@ -34,6 +34,7 @@ mod ci_detector;
 mod diagnostic_formats;
 use diagnostic_formats::Rendered;
 mod baseline;
+mod psych_doc;
 use baseline::{Baseline, Bucket, DriftStatus, MatchMode, DEFAULT_BASELINE_PATH};
 mod optparse;
 use optparse::{Item, Value};
