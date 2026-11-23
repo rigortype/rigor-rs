@@ -53,7 +53,7 @@ pub(crate) use multi_target::*;
 pub use definitions::{MethodBody, ParamShape, Visibility};
 pub(crate) use definitions::*;
 pub(crate) use recovery::*;
-pub use constants::ConstMutation;
+pub use constants::{ConstMutation, ConstWrite};
 pub use ancestry_facts::{AncestryFacts, GATED_FEATURES, MixinSide, UnpositionedMixin, WILDCARD as MIXIN_WILDCARD, UNNAMED as MIXIN_UNNAMED};
 pub(crate) use ancestry_facts::collect_ancestry_facts;
 pub use singleton_locals::SingletonLocals;

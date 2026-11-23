@@ -422,6 +422,115 @@ pub(crate) fn collect_const_mutations(root: &PrismNode<'_>) -> Vec<ConstMutation
     census.out
 }
 
+/// rigor-rs#656 — one plain `=` constant WRITE (`K = …` / `M::K = …`), recorded
+/// for rigor-infer's `PredefinedConstantRefinements` shadow gate: a project
+/// write that binds a name a folded-constant read's lexical ladder consults
+/// stops the fold of the six exact-value Float constants (`Math::PI`,
+/// `Float::INFINITY`, …) — the reference's in-source-constant precedence and
+/// `WRITTEN_CANDIDATE` stop (`Reflection.constant_type_at`).
+///
+/// Only the plain `=` forms are recorded — probed on the oracle (2026-11-23):
+/// `Math::PI ||= 5`, `Math::PI &&= 5`, `Math::PI += 1` and the multiwrite
+/// target `X, Math::PI = 1, 5` all leave a `Math::PI` read folding to
+/// `3.141592653589793`, while a bare `Math::PI =` or a `PI =` under
+/// `module Math` stops it.
+///
+/// The census is RAW: it names each write's target as written under its
+/// lexical class/module prefix (a `class <<` body keeps the enclosing prefix —
+/// an over-shadow that only ever under-emits); the SourceIndex expands the
+/// lexical candidates.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConstWrite {
+    /// The enclosing `class`/`module` header names, outermost first — the
+    /// same convention as [`ConstMutation::prefix`].
+    pub prefix: Vec<String>,
+    /// The constant name AS WRITTEN: the bare name (`"PI"`) of a
+    /// `ConstantWriteNode`, or the strict path (`"Math::PI"`) of a
+    /// `ConstantPathWriteNode` — a leading `::` is never rendered;
+    /// [`Self::rooted`] carries it. A path whose base cannot be statically
+    /// named (`k::X`, `self::X`) records nothing.
+    pub name: String,
+    /// `true` when the target was a `A::B` PATH write
+    /// (`ConstantPathWriteNode`) — it contributes every lexical-resolution
+    /// candidate of the path's HEAD, like a read does. A bare name binds the
+    /// enclosing cref only (`prefix + name`, one candidate).
+    pub is_path: bool,
+    /// `true` when a path target was `::`-rooted (`::Math::PI = …`) — it
+    /// binds the top-level name unconditionally, so no lexical candidate
+    /// joins apply.
+    pub rooted: bool,
+}
+
+/// `constant_write_census` (`scope_indexer.rb`): every plain-`=` constant
+/// write in the file, for [`ConstWrite`]. Runs on the Prism tree because a
+/// `M::K = …` path write lowers to a nameless [`Node::UnmodeledWrite`].
+pub(crate) fn collect_const_writes(root: &PrismNode<'_>) -> Vec<ConstWrite> {
+    use ruby_prism::Visit;
+
+    struct Census {
+        out: Vec<ConstWrite>,
+        prefix: Vec<String>,
+    }
+
+    impl<'pr> Visit<'pr> for Census {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            let name = constant_path_string(&node.constant_path());
+            if name.is_empty() {
+                ruby_prism::visit_class_node(self, node);
+                return;
+            }
+            self.prefix.push(name);
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.prefix.pop();
+        }
+
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            let name = constant_path_string(&node.constant_path());
+            if name.is_empty() {
+                ruby_prism::visit_module_node(self, node);
+                return;
+            }
+            self.prefix.push(name);
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.prefix.pop();
+        }
+
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.out.push(ConstWrite {
+                prefix: self.prefix.clone(),
+                name: constant_string(node.name().as_slice()),
+                is_path: false,
+                rooted: false,
+            });
+            // Descend the rvalue: `C = (D = 1)` chains name both writes.
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+
+        fn visit_constant_path_write_node(
+            &mut self,
+            node: &ruby_prism::ConstantPathWriteNode<'pr>,
+        ) {
+            if let Some(name) = strict_constant_path_string(&node.target().as_node()) {
+                self.out.push(ConstWrite {
+                    prefix: self.prefix.clone(),
+                    name,
+                    is_path: true,
+                    rooted: rooted_constant_path(&node.target().as_node()),
+                });
+            }
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+    }
+
+    let mut census = Census { out: Vec::new(), prefix: Vec::new() };
+    census.visit(root);
+    census.out
+}
+
 /// The name of a constant *reference* used as a superclass (`< Bar`,
 /// `< Foo::Bar`): the **last** path component, since that is what the
 /// source-superclass chain walk resolves against the SourceIndex / RBS by simple

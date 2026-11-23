@@ -448,7 +448,7 @@ impl<'i> Typer<'i> {
             // Any miss ⇒ fall through to Dynamic[top] (silent). Note: a `Foo.new`
             // receiver is intercepted earlier in `type_call` (before the constant
             // is typed), so `Time.new` still yields a Time INSTANCE, not Singleton.
-            Node::ConstantRead { name, span, dynamic_base, .. } => {
+            Node::ConstantRead { name, span, dynamic_base, rooted, .. } => {
                 // The reference's `type_of_constant_path` falls back to Dynamic
                 // when `qualified_name_or_nil` is nil — a dynamic base anywhere
                 // in the chain (`self::X`, `k::X`, `self.class::X`). C5 and the
@@ -512,6 +512,25 @@ impl<'i> Typer<'i> {
                     if let Some(class) = self.source.class_id(name) {
                         return interner.intern(Type::Singleton(class));
                     }
+                }
+                // rigor-rs#656 — `Builtins::PredefinedConstantRefinements`
+                // tier 1 (`FOLDED_CONSTANTS`): the six exact-value Float
+                // constants fold to `Constant[Float]` — `Math::PI` /
+                // `Math::E` (C's `M_PI` / `M_E`) and the four IEEE-754
+                // binary64 magnitudes `Float::INFINITY` / `::MAX` / `::MIN` /
+                // `::EPSILON`. `Float::NAN` is deliberately absent upstream
+                // (`NaN == NaN` is `false`, so a `Constant[NAN]` would
+                // corrupt type equality). This is the reference's
+                // `constant_for_name` rung — BELOW the in-source constant
+                // folds and singleton gates above — so a project `Math::PI =`
+                // write keeps winning; a write that merely NAMES a candidate
+                // (any file, any literal-ness — the `constant_shadowers`
+                // stop) declines to `Dynamic[top]`, exactly where the
+                // reference's `WRITTEN_CANDIDATE` lands.
+                if let Some(value) = folded_float_constant(name)
+                    && !self.source.constant_write_shadows(name, prefix, *rooted)
+                {
+                    return interner.intern(Type::Constant(Scalar::Float(value)));
                 }
                 interner.untyped()
             }
@@ -2205,6 +2224,28 @@ impl<'i> Typer<'i> {
 /// `Array#&` / `#|` / `#-` use — but Ruby's `Float::NAN.eql?(Float::NAN)` is
 /// FALSE while identical bits compare equal here, so a NaN would be the one
 /// value this fold could get wrong.
+/// rigor-rs#656 — `Builtins::PredefinedConstantRefinements::FOLDED_CONSTANTS`
+/// (`builtins/predefined_constant_refinements.rb`): the exact-value fold
+/// whitelist, keyed by the UNROOTED qualified name the lowered
+/// `ConstantRead.name` already carries. Values are bit-identical across
+/// every MRI build (C's `M_PI` / `M_E`, the four IEEE-754 binary64
+/// magnitudes), which is the upstream admission criterion; `Float::NAN` is
+/// deliberately NOT folded upstream and neither here.
+fn folded_float_constant(name: &str) -> Option<f64> {
+    Some(match name {
+        "Math::PI" => std::f64::consts::PI,
+        "Math::E" => std::f64::consts::E,
+        "Float::INFINITY" => f64::INFINITY,
+        // Upstream's `Float::MIN` is DBL_MIN — the smallest POSITIVE normal
+        // binary64 — which Rust spells `MIN_POSITIVE` (`f64::MIN` is the
+        // most negative finite value).
+        "Float::MIN" => f64::MIN_POSITIVE,
+        "Float::MAX" => f64::MAX,
+        "Float::EPSILON" => f64::EPSILON,
+        _ => return None,
+    })
+}
+
 fn tuple_constant_values(elems: &[TypeId], interner: &Interner) -> Option<Vec<Scalar>> {
     elems
         .iter()

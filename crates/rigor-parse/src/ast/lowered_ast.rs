@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::ruby_prism::ParseResult;
 use crate::LineIndex;
 
-use super::{collect_ancestry_facts, AncestryFacts, collect_const_mutations, Builder, ConstMutation, Node, NodeId, Span, StatementsKind};
+use super::{collect_ancestry_facts, AncestryFacts, collect_const_mutations, collect_const_writes, Builder, ConstMutation, ConstWrite, Node, NodeId, Span, StatementsKind};
 
 /// Monotonic source of [`FileKey::Anonymous`]. One `lower()` call == one
 /// pathless input, so a process-global counter gives every such lowering a
@@ -85,6 +85,9 @@ pub struct LoweredAst {
     /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
     /// table rather than owned nodes.
     const_mutations: Vec<ConstMutation>,
+    /// rigor-rs#656 — every plain `=` constant write in this file. See
+    /// [`ConstWrite`] for why this is a side table rather than owned nodes.
+    const_writes: Vec<ConstWrite>,
     /// Upstream v0.4.6 (#2285) — every block call / `for` whose body mutates
     /// an element in place, with the locals its receiver may read. See
     /// [`LoweredAst::element_mutations`].
@@ -271,6 +274,12 @@ impl LoweredAst {
     /// [`ConstMutation`].
     pub fn const_mutations(&self) -> &[ConstMutation] {
         &self.const_mutations
+    }
+
+    /// rigor-rs#656: every plain `=` constant write in this file — see
+    /// [`ConstWrite`].
+    pub fn const_writes(&self) -> &[ConstWrite] {
+        &self.const_writes
     }
 
     /// Upstream v0.4.6 (#2285 / issue #2262, `DeepErasure`): `(span of a
@@ -644,6 +653,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
     let const_mutations = collect_const_mutations(&root_prism);
+    let const_writes = collect_const_writes(&root_prism);
     let element_mutations = super::element_mutation::collect(&root_prism);
     let mut ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
     ancestry_facts.required_features = super::ancestry_facts::required_vendored_features(source);
@@ -700,6 +710,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         root,
         file_key,
         const_mutations,
+        const_writes,
         element_mutations,
         local_read_starts,
         carrier_spans,

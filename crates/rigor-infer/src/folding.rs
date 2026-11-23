@@ -1660,7 +1660,14 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         // ±Infinity/NaN whose downstream display is sidecar territory (ADR-0008).
         _ => return None,
     };
-    Some(res)
+    // A NaN result declines (`foldable_constant_value?`), like `**` above:
+    // the reference never holds a `Constant[NaN]` (`NaN == NaN` is `false`,
+    // so it would corrupt type equality) — `1e400 - 1e400` and
+    // `Float::INFINITY - Float::INFINITY` type `Float` there, not `NaN`.
+    match res {
+        Scalar::Float(f) if f.is_nan() => None,
+        _ => Some(res),
+    }
 }
 
 /// `Float#<=>` (`flo_cmp`), which the reference folds by calling it
