@@ -2468,6 +2468,32 @@ mod tests {
         assert_eq!(fold(&f(1.0), "<=>", &[]), None);
     }
 
+    /// `foldable_constant_value?` — a NaN arithmetic RESULT declines; the
+    /// reference never holds a `Constant[NaN]` (`NaN == NaN` is `false`,
+    /// so it would corrupt type equality). `1e400 - 1e400` minted
+    /// `Constant[NaN]` on master until rigor-rs#656's fold made the shape
+    /// common; it now declines like `**` already did.
+    #[test]
+    fn float_arithmetic_declines_nan_results() {
+        let f = Scalar::Float;
+        assert_eq!(fold(&f(f64::INFINITY), "-", &[f(f64::INFINITY)]), None);
+        assert_eq!(
+            fold(&f(f64::INFINITY), "+", &[f(f64::NEG_INFINITY)]),
+            None
+        );
+        assert_eq!(fold(&f(f64::INFINITY), "*", &[f(0.0)]), None);
+        // Finite and infinite non-NaN results still fold.
+        assert_eq!(
+            fold(&f(f64::INFINITY), "+", &[f(f64::INFINITY)]),
+            Some(f(f64::INFINITY))
+        );
+        assert_eq!(
+            fold(&f(f64::INFINITY), "*", &[f(-1.0)]),
+            Some(f(f64::NEG_INFINITY))
+        );
+        assert_eq!(fold(&f(1.5), "-", &[f(0.5)]), Some(f(1.0)));
+    }
+
     #[test]
     fn unknown_method_declines() {
         assert_eq!(fold(&Scalar::Int(1), "sample", &[]), None);

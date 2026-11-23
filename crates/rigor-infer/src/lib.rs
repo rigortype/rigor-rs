@@ -174,3 +174,9 @@ mod collection_shape_tests;
 /// `docs/notes/20260807-collection-shape-slice-spec.md` §1.
 #[cfg(test)]
 mod collection_shape_stage2_tests;
+
+/// rigor-rs#656 — `PredefinedConstantRefinements` tier 1: the six
+/// exact-value Float constants fold, the `constant_shadowers` stop, and
+/// the non-shadowing write forms (all oracle-probed).
+#[cfg(test)]
+mod predefined_constants_tests;
