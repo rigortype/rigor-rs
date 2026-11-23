@@ -17,14 +17,17 @@ ships no `sig/` or `rbs_collection`). Parity severities only (error/warning).
 Usage:  python3 harness/fp_audit.py [--gaps] [--sweep] [<dir-of-.rb> ...]
         --gaps  also aggregates coverage gaps (reference-only) by rule — the map
                 of where to spend coverage effort.
-        --sweep runs the STANDING sweep set (`harness/sweep-corpora.yml`) instead
-                of a hand-typed directory list. Extra directories may still be
-                passed; they run after the standing set. A listed corpus that is
-                not present on this machine is reported as SKIPPED, never
-                silently dropped.
+        --sweep runs the standing or CI-subset manifest in SWEEP_CORPORA
+                (default `harness/sweep-corpora.yml`) instead of a hand-typed
+                directory list. Extra directories may still be passed; they
+                run after the manifest. A listed corpus that is not present
+                is reported as SKIPPED, never silently dropped. Manifest
+                `path` values may be absolute or repo-relative (resolved
+                against SWEEP_CORPORA_ROOT, default the repo root).
 Env:    RIGOR_RS_BIN (default target/release/rigor — auto-built when absent, and
         REFUSED when older than the newest file under crates/),
-        REFERENCE_RIGOR_DIR (default reference/rigor).
+        REFERENCE_RIGOR_DIR (default reference/rigor),
+        SWEEP_CORPORA, SWEEP_CORPORA_ROOT.
 
 Exit:   0 only when every requested corpus produced a VALID comparison with zero
         FP candidates. Any FP, any batch where either side failed, and any
@@ -357,8 +360,21 @@ def sweep_targets():
         entries = yaml.safe_load(f).get("corpora", [])
     present, absent = [], []
     for e in entries:
-        (present if os.path.isdir(e["path"]) else absent).append(e)
+        item = dict(e)
+        item["path"] = resolve_corpus_path(e["path"])
+        (present if os.path.isdir(item["path"]) else absent).append(item)
     return present, absent
+
+
+def resolve_corpus_path(path):
+    """Absolute paths are used as-is; relative paths are under SWEEP_CORPORA_ROOT
+    (default: the repo root). The standing manifest keeps machine-local
+    absolute checkouts; the CI subset uses repo-relative clone destinations.
+    """
+    if os.path.isabs(path):
+        return path
+    root = os.environ.get("SWEEP_CORPORA_ROOT", REPO)
+    return os.path.abspath(os.path.join(root, path))
 
 
 if __name__ == "__main__":

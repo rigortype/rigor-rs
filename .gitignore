@@ -12,3 +12,6 @@ __pycache__/
 # The spike/ probe is a throwaway, standalone crate — its lockfile stays out.
 /spike/prism_probe/Cargo.lock
 /spike/rbs_probe/Cargo.lock
+
+# Shallow-cloned survey corpora used by the advisory CI subset sweep.
+/ci-corpora/

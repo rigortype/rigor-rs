@@ -1,0 +1,37 @@
+# The CI subset of the false-positive sweep.
+#
+# This is NOT a replacement for the standing set in `sweep-corpora.yml`.
+# It covers the smaller public survey gems that Actions can shallow-clone;
+# mastodon and gitlab-foss stay machine-local / periodic. The clones are
+# unpinned default branches, so numbers may drift from the machine-local
+# rigor-survey checkouts — the job is advisory until promoted.
+#
+# Paths are repo-relative and resolved by `fp_audit.py` against the repo
+# root (or SWEEP_CORPORA_ROOT). The workflow clones into `ci-corpora/`.
+
+corpora:
+  - label: survey/mail
+    path: ci-corpora/mail
+    why: >-
+      A gem with a vendored bundle — so it also sweeps rdoc, rspec and friends.
+      Carried 14 of the 24 FPs the standing set once could not see, and is
+      where inline-RBS annotations (rdoc's `#:` comments) actually occur.
+
+  - label: survey/concurrent-ruby
+    path: ci-corpora/concurrent-ruby
+    why: >-
+      Metaprogramming-heavy, low-dependency library code; exercises arity and
+      argument-type checks the Rails corpora barely reach.
+
+  - label: survey/net-ssh
+    path: ci-corpora/net-ssh
+    why: >-
+      Protocol/IO code with a high possible-nil density per file — the
+      densest gap-per-file corpus in the standing set.
+
+  - label: survey/haml/lib
+    path: ci-corpora/haml/lib
+    why: >-
+      The upstream #239 instance/class same-name defect (`ScriptCompiler
+      .find_and_preserve`) is a real instance here — a shape worth keeping
+      under measurement.
