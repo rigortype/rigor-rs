@@ -15,6 +15,7 @@ use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
 use rigor_parse::pre_eval::{PatchVisibility, PreEvalItem, PreEvalScanError};
+use rigor_parse::{LoweredAst, Node, NodeId};
 
 use super::SourceIndex;
 
@@ -32,6 +33,40 @@ pub enum PatchCall {
     /// method, block and lambda body. Anywhere else a protected patch may be
     /// reachable, so it answers.
     Explicit { toplevel: bool },
+}
+
+/// The [`PatchCall`] a user-facing call reads under — the reference's
+/// `explicit_non_self_receiver?(call_node)` plus `callable?`'s `self_type`
+/// read. A `self` receiver (or a question asked with no call node at all) is
+/// implicit; any other receiver is an explicit call whose `toplevel` bit is
+/// [`main_self_at`] of the call site.
+pub fn patch_call_for(
+    ast: &LoweredAst,
+    receiver: Option<NodeId>,
+    call_span: (usize, usize),
+) -> PatchCall {
+    let implicit = receiver
+        .is_none_or(|r| matches!(ast.get(r), Node::SelfExpr { .. }));
+    if implicit {
+        PatchCall::Implicit
+    } else {
+        PatchCall::Explicit { toplevel: main_self_at(ast, call_span) }
+    }
+}
+
+/// Whether `self` at `span` is certainly `main` (an `Object`): no class,
+/// module, `class <<`, method, block or lambda body encloses it. Anywhere
+/// else `self` may be something else, which a protected patch may answer.
+pub fn main_self_at(ast: &LoweredAst, span: (usize, usize)) -> bool {
+    let inside = |s: (usize, usize)| s.0 <= span.0 && span.1 <= s.1;
+    !ast.iter().any(|(_, n)| match n {
+        Node::ClassDef { .. }
+        | Node::ModuleDef { .. }
+        | Node::Definition { .. }
+        | Node::Lambda { .. } => inside(n.span()),
+        Node::Call { block_span: Some(b), .. } => inside(*b),
+        _ => false,
+    })
 }
 
 /// The resolved registry of every `pre_eval:` file the run reads.

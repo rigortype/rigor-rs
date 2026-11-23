@@ -110,6 +110,19 @@ impl SourceIndex {
         self_kind: DefKind,
         method: &str,
     ) -> Option<Scalar> {
+        // A patch on the receiver's walk BETWEEN `self_qual` and the
+        // resolved `owner` answers ahead of the def (the reference walks
+        // from the receiver, not the definer); the fold key's own check
+        // covers only `owner`'s walk.
+        if self.pre_eval_may_answer(
+            core,
+            self_qual,
+            method,
+            self_kind == DefKind::Singleton,
+            crate::PatchCall::Implicit,
+        ) {
+            return None;
+        }
         let (owner, kind) = match self_kind {
             DefKind::Singleton => self.resolve_singleton_slot(self_qual, method)?,
             DefKind::Instance => (self.resolve_instance_owner(core, self_qual, method)?, DefKind::Instance),
@@ -124,7 +137,12 @@ impl SourceIndex {
     /// `format(1)` to `42`, which outranks `Kernel#format`'s `String` return —
     /// the `def_nodes["<toplevel>"]` merge is project-wide on the oracle.
     /// `None` when no toplevel def of the name folds a scalar.
-    pub fn toplevel_def_literal(&self, method: &str, arg_count: usize) -> Option<Scalar> {
+    pub fn toplevel_def_literal(
+        &self,
+        core: &CoreIndex,
+        method: &str,
+        arg_count: usize,
+    ) -> Option<Scalar> {
         // The call must satisfy SOME def site's arity — `format("%d", 2)`
         // against `def format(x)` keeps `Kernel#format` on the reference.
         let arity_ok = self
@@ -132,6 +150,19 @@ impl SourceIndex {
             .get(method)
             .is_some_and(|ranges| ranges.iter().any(|(lo, hi)| arg_count >= *lo && arg_count <= *hi));
         if !arity_ok {
+            return None;
+        }
+        // The bare call's receiver is `main` (an `Object`): a patch on its
+        // walk answers ahead of the toplevel `def` (ADR-17, `Object` / `Kernel`
+        // / `BasicObject` and their patch mixins — the same walk
+        // `call_toplevel` asks).
+        if self.pre_eval_may_answer(
+            core,
+            "Object",
+            method,
+            false,
+            crate::PatchCall::Implicit,
+        ) {
             return None;
         }
         self.literal_returns
@@ -219,10 +250,21 @@ impl SourceIndex {
         if let Some(v) = memo.get(key) {
             return v.clone();
         }
-        // ADR-17: a `pre_eval:` patch of the name may be the method that
-        // runs (the reference's patched tier answers `Dynamic` ahead of the
-        // project's own `def`), so its body is no evidence.
-        if self.pre_eval_defines_name(&key.1) {
+        // ADR-17: a `pre_eval:` patch of the name on the DEFINER's walk may
+        // be the method that runs (the reference's patched tier answers
+        // `Dynamic` ahead of the project's own `def`), so its body is no
+        // evidence. Asked of `key.0` through `lookup_through_ancestors` — a
+        // patch of the name on an unrelated class leaves the def to fold.
+        // `Implicit`: the fold is call-site-agnostic, so a patch of ANY
+        // visibility declines (a coverage loss next to the reference's
+        // `callable?`, never a wrong literal).
+        if self.pre_eval_may_answer(
+            core,
+            &key.0,
+            &key.1,
+            key.2 == DefKind::Singleton,
+            crate::PatchCall::Implicit,
+        ) {
             return None;
         }
         // rigor-rs#450: a project-`sig/` class whose singleton surface
@@ -321,6 +363,18 @@ impl SourceIndex {
             // the fold is param-INDEPENDENT; if the body reads a param the
             // recursive fold declines on that param leaf.
             FoldExpr::SelfCall { method } => {
+                // A patch on the receiver's walk between `self_qual` and the
+                // resolved owner answers the call ahead of the def, exactly
+                // as it does at [`Self::implicit_self_literal`].
+                if self.pre_eval_may_answer(
+                    core,
+                    self_qual,
+                    method,
+                    self_kind == DefKind::Singleton,
+                    crate::PatchCall::Implicit,
+                ) {
+                    return None;
+                }
                 let (owner, kind) = match self_kind {
                     DefKind::Singleton => self.resolve_singleton_slot(self_qual, method)?,
                     DefKind::Instance => {

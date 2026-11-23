@@ -821,10 +821,26 @@ impl<'i> Typer<'i> {
             }
             // ADR-17: a `pre_eval:` patch of the name may answer ahead of the
             // class's own `def` (the reference's patched tier sits above the
-            // discovered-method tier and answers `Dynamic`). Coarse by name:
-            // declining only costs precision.
+            // discovered-method tier and answers `Dynamic`) — but only one on
+            // the RECEIVER's walk (`lookup_through_ancestors`): a patch of the
+            // name on an unrelated class leaves the call to the def. The
+            // `defines_name` guard keeps the no-registry run free of the
+            // `main_self_at` AST walk `patch_call_for` pays per call (#422's
+            // per-node-hook hazard); it does not change the verdict, which
+            // `may_answer` would return false for anyway (its own first two
+            // checks are the same `opaque` / `names.contains`).
             if self.source.pre_eval_defines_name(method) {
-                return interner.untyped();
+                let patch_call = crate::patch_call_for(
+                    ast,
+                    Some(receiver),
+                    ast.get(receiver).span(),
+                );
+                if self
+                    .source
+                    .pre_eval_may_answer(self.index, &src_name, method, false, patch_call)
+                {
+                    return interner.untyped();
+                }
             }
             if let Some(ret_core) = self.source.method_return(&src_name, method) {
                 if let Some(class_id) = self.index.class_id(ret_core) {

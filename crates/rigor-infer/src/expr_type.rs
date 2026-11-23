@@ -1875,7 +1875,10 @@ impl<'i> Typer<'i> {
         // reference keeps the Kernel binding — probed: `[1].each {
         // format(1).bit_length }` fires `for String` on BOTH engines — so the
         // fold declines there and the call falls through to the Kernel path.
-        if let Some(scalar) = self.source.toplevel_def_literal(method, args.len()) {
+        if let Some(scalar) = self
+            .source
+            .toplevel_def_literal(self.index, method, args.len())
+        {
             if let Some(site) = span {
                 if !self.self_answers(ast, site, method) && !self.inside_block(ast, site) {
                     return Some(interner.intern(Type::Constant(scalar)));
