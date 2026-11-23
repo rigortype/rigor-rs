@@ -26,6 +26,11 @@ impl<'i> Typer<'i> {
     // contracts, the Ruby sidecar for non-Rust-foldable calls (ADR-0008/0023).
     // too_many_arguments: the call context (receiver, args and their
     // plain-positional flag, env, interner) is one logical bundle.
+    // `receiver_override`: the `safe_navigation_call_type` port substitutes
+    // the nil-stripped fragment for the receiver TYPE the dispatch reads
+    // (node-keyed gates still see the call's own receiver node), exactly the
+    // reference's `call_dispatch_type_for(node, receiver_override:)`
+    // (`expression_typer.rb:2132`). `None` on every other path.
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn type_call(
         &self,
@@ -36,6 +41,7 @@ impl<'i> Typer<'i> {
         args_plain_positional: bool,
         env: &TypeEnv,
         interner: &mut Interner,
+        receiver_override: Option<TypeId>,
     ) -> TypeId {
         let ty = self.type_call_declines(
             ast,
@@ -46,6 +52,7 @@ impl<'i> Typer<'i> {
             env,
             interner,
             true,
+            receiver_override,
         );
         self.decline_fold_gap(ast, receiver, env, ty, interner)
     }
@@ -126,7 +133,7 @@ impl<'i> Typer<'i> {
     ) -> TypeId {
         // The synthesized `recv[k]`/`recv.attr` read carries only the index /
         // plain exprs — plain positional by construction.
-        self.type_call_declines(ast, receiver, method, args, true, env, interner, false)
+        self.type_call_declines(ast, receiver, method, args, true, env, interner, false, None)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -140,6 +147,7 @@ impl<'i> Typer<'i> {
         env: &TypeEnv,
         interner: &mut Interner,
         user_facing: bool,
+        receiver_override: Option<TypeId>,
     ) -> TypeId {
         // Tier 4 (in-source / RBS `.new`): `X.new` where `X` is a constant
         // naming a class known to the RBS index OR the SourceIndex types to a
@@ -216,7 +224,8 @@ impl<'i> Typer<'i> {
             }
         }
 
-        let recv_ty = self.type_of(ast, receiver, env, interner);
+        let recv_ty =
+            receiver_override.unwrap_or_else(|| self.type_of(ast, receiver, env, interner));
 
         // Upstream v0.4.3 (#1836, rigor #1752): a class-object call whose
         // name a root refinement in scope defines types `Dynamic` — so a
