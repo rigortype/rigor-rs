@@ -1990,17 +1990,24 @@ fn int_decimal_round(
     b_neg: bool,
     b_mag: &[u64],
 ) -> FoldOutcome {
-    if !b_neg {
+    // `ndigits` is a C `int` — `5.round(2147483648)` and `round(-2147483649)`
+    // raise `RangeError` on the oracle, which declines to the RBS `Integer`
+    // answer. A `|nd|` past `i64` (a Bignum precision) is certainly past
+    // `int`.
+    let Ok(nd) = chunks_to_decimal(false, b_mag).parse::<i64>() else {
+        return FoldOutcome::Declined;
+    };
+    let nd = if b_neg { -nd } else { nd };
+    if !(i32::MIN as i64..=i32::MAX as i64).contains(&nd) {
+        return FoldOutcome::Declined;
+    }
+    if nd >= 0 {
         // `nd >= 0` — every member answers the receiver.
         return big_scalar(chunks_to_decimal(a_neg, a_mag));
     }
     let mag_str = chunks_to_decimal(false, a_mag);
     // `k = -nd`, the dropped decimal places.
-    let k: usize = if b_mag.len() > 1 {
-        usize::MAX
-    } else {
-        usize::try_from(b_mag[0]).unwrap_or(usize::MAX)
-    };
+    let k = usize::try_from(-nd).unwrap_or(usize::MAX);
     if k > mag_str.len() {
         // The whole magnitude drops: the rounding sides answer `0`, and
         // `floor` on a negative / `ceil` on a positive keeps a spelled
@@ -2270,6 +2277,32 @@ fn int_binary_float(a: &Scalar, method: &str, f: f64) -> FoldOutcome {
                 limb_bit(&a_limbs, i)
             };
             FoldOutcome::Value(Scalar::Int(i64::from(bit)))
+        }
+        "floor" | "ceil" | "round" | "truncate" => {
+            // A Float `ndigits` coerces via `to_i` — `big.round(-5.0)` is
+            // `big.round(-5)`, and an out-of-range Float saturates the way
+            // `rb_to_int` does (`1e300` -> self, `-1e300` -> the
+            // all-dropped arm decides `0` or the `10**k` Widened).
+            let Some((a_neg, a_mag)) = int_operand_chunks(a) else {
+                return FoldOutcome::Declined;
+            };
+            if !f.is_finite() {
+                return FoldOutcome::Declined;
+            }
+            // `ndigits` is a C `int` — past `i32` the call raises
+            // `RangeError` (`5.round(1e18)`), which declines to the RBS
+            // `Integer` answer.
+            let nd = f as i64;
+            if !(i32::MIN as i64..=i32::MAX as i64).contains(&nd) {
+                return FoldOutcome::Declined;
+            }
+            int_decimal_round(
+                a_neg,
+                &a_mag,
+                method,
+                nd < 0,
+                &decimal_chunks(&nd.unsigned_abs().to_string()),
+            )
         }
         _ => FoldOutcome::Declined,
     }
