@@ -888,7 +888,7 @@ impl<'i> Typer<'i> {
     /// `&&`/`||` counts only its left operand, a `begin`/`rescue` qualifies only
     /// when its own body and EVERY rescue clause must exit, and an `ensure`
     /// that must exit qualifies on its own — exactly the reference's shape.
-    fn stmt_never_completes(&self, ast: &LoweredAst, id: NodeId) -> bool {
+    pub(crate) fn stmt_never_completes(&self, ast: &LoweredAst, id: NodeId) -> bool {
         match ast.get(id) {
             // A jump statement: `break`/`return`/`redo`/`retry` end the path;
             // `next` completes the block normally (Prism's `NextNode` is not in

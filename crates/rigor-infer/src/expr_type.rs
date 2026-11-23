@@ -576,6 +576,44 @@ impl<'i> Typer<'i> {
                     self.nominal_or_untyped("Hash", interner)
                 }
             }
+            // `l && r` / `l || r` AS AN EXPRESSION — the reference's
+            // `type_of_and_or` delegates to `eval_and_or`
+            // (`statement_evaluator.rb:4386`): the result is
+            // `narrow_falsey(l) | r` for `&&` / `narrow_truthy(l) | r`
+            // for `||` (`[1] || {b: 2}` → `[1] | { b: 2 }`, `nil || 2` →
+            // `2`), narrowed to the skipped fragment alone when the right
+            // operand is dead (`right_operand_dead?` — only a CONSTANT
+            // left decides: `1 || 2` → `1`, `nil && 2` → `nil`) or when it
+            // never completes (`"a" or raise` → `"a"`; `union_members`
+            // folds a `Bot`-typed right away either way). The reference
+            // also refuses the dead-operand elision on an
+            // optimistic-origin mark; the port has no OptimisticOrigin
+            // channel, and the mark only rides predicate folds a literal
+            // `Constant` left cannot reach — a literal left is unmarked on
+            // both sides. The right operand is typed under the UN-narrowed
+            // env: `eval_and_or` narrows it by the left edge, a precision
+            // that only ever widens the join — the safe side.
+            Node::Logical { left, right, is_and, .. } => {
+                let lt = self.type_of(ast, *left, env, interner);
+                let rt = self.type_of(ast, *right, env, interner);
+                let skipped = if *is_and {
+                    self.narrow_falsey(lt, interner)
+                } else {
+                    self.narrow_truthy(lt, interner)
+                };
+                let right_dead = match interner.get(lt) {
+                    Type::Constant(s) => {
+                        let truthy = !matches!(s, Scalar::Nil | Scalar::Bool(false));
+                        if *is_and { !truthy } else { truthy }
+                    }
+                    _ => false,
+                };
+                if right_dead || self.stmt_never_completes(ast, *right) {
+                    skipped
+                } else {
+                    self.union_members(vec![skipped, rt], interner)
+                }
+            }
             // An `if`/`unless`/ternary AS AN EXPRESSION evaluates to the union of
             // its branch values (reference `type_of_if`): each branch's tail
             // value, with a missing `else` contributing `nil`. A KNOWN-polarity
