@@ -12,7 +12,8 @@ Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md). Hard byte budget
 ## Now / Next
 
 ▶ NEXT: ADR-127 floor coverage cost; follow-ups #493/#600/#605,
-paren/`&.` residuals #838–#847; mutation seams →#777–#785.
+paren/`&.` residuals #838–#847; mutation seams →#777–#785;
+#877 residuals #893–#896.
 - **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-22, `v0.4.8`): **174 fixtures / 0 unregistered**; sweep
