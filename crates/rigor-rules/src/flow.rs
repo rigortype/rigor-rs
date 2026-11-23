@@ -323,11 +323,13 @@ fn is_integer_rooted(interner: &Interner, index: &CoreIndex, ty: rigor_types::Ty
 /// - it never crosses a body boundary: a `Definition`, a `Lambda`, or a
 ///   `Call`'s literal `block_body` (the lowered `BlockNode` — `block_span`
 ///   present; a `&expr` block-pass is an evaluated operand, not a
-///   boundary). `BEGIN`/`END` ride `StatementsKind::Inert` carriers the port
+///   boundary). `END` bodies ride `StatementsKind::Inert` carriers the port
 ///   does not distinguish from `defined?`/`super` operands, so the ascent
-///   crosses them — where the reference keeps the diagnostic (`BEGIN {
-///   5 / 0 }` inside a rescued `begin`), the port stays silent. Class /
-///   module bodies are NOT boundaries — they evaluate inline.
+///   crosses them — `begin; END { 5 / 0 }; rescue; end` fires on the oracle
+///   (a deferred body is a boundary) where the port stays silent, the safe
+///   side. (`BEGIN` inside a `begin` is a parse error on both engines, so
+///   its corner is unwritable.) Class / module bodies are NOT boundaries —
+///   they evaluate inline.
 ///
 /// The rescue-clause check is `rescue_chain_catches?` + `class_catches?`:
 /// any clause may catch, and a clause catches when any exception it names

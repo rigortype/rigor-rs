@@ -1809,16 +1809,13 @@ fn int_binary(a: &Scalar, method: &str, b: &Scalar) -> FoldOutcome {
             }
         }
         "allbits?" | "anybits?" | "nobits?" => {
-            let a_limbs = chunks_to_limbs(&a_mag);
-            let b_limbs = chunks_to_limbs(&b_mag);
-            let (m_neg, m_limbs) = limbs_bitop(a_neg, &a_limbs, b_neg, &b_limbs, "&");
-            let masked = limbs_is_zero(&m_limbs) && !m_neg;
-            let all = limbs_eq_signed(m_neg, &m_limbs, b_neg, &b_limbs);
-            let yes = match method {
-                "allbits?" => all,
-                "anybits?" => !masked,
-                _ => masked,
-            };
+            let yes = int_bittest_eval(
+                a_neg,
+                &chunks_to_limbs(&a_mag),
+                b_neg,
+                &chunks_to_limbs(&b_mag),
+                method,
+            );
             FoldOutcome::Value(Scalar::Bool(yes))
         }
         // `gcd` is bounded by its operands but a pinned operand can
@@ -1963,7 +1960,12 @@ fn int_digits(a_mag: &[u64], b_mag: &[u64]) -> FoldOutcome {
     }
     const LIFT_LIMIT: usize = 32;
     let mut mag = a_mag.to_vec();
-    let mut out: Vec<Scalar> = Vec::new();
+    // `0.digits(base)` is `[0]` — the loop never runs on a zero receiver.
+    let mut out: Vec<Scalar> = if chunks_is_zero(a_mag) {
+        vec![Scalar::Int(0)]
+    } else {
+        Vec::new()
+    };
     while !chunks_is_zero(&mag) {
         if out.len() >= LIFT_LIMIT {
             return FoldOutcome::Declined;
@@ -2304,6 +2306,28 @@ fn int_binary_float(a: &Scalar, method: &str, f: f64) -> FoldOutcome {
                 &decimal_chunks(&nd.unsigned_abs().to_string()),
             )
         }
+        // The bit-test predicates coerce the mask via `to_int` —
+        // `big.allbits?(3.9)` reads mask `3`, and a huge Float reads its
+        // EXACT integer (`nobits?(1e300)` — `1e300`'s low bits are zeros,
+        // so the mask is disjoint). (`digits`' base does NOT coerce —
+        // `0.digits(3.0)` raises, declining to `Array[Integer]`.)
+        "allbits?" | "anybits?" | "nobits?" => {
+            if !f.is_finite() {
+                return FoldOutcome::Declined;
+            }
+            let Some((a_neg, a_mag)) = int_operand_chunks(a) else {
+                return FoldOutcome::Declined;
+            };
+            let (b_neg, b_limbs) = f64_to_int_limbs(f);
+            let yes = int_bittest_eval(
+                a_neg,
+                &chunks_to_limbs(&a_mag),
+                b_neg,
+                &b_limbs,
+                method,
+            );
+            FoldOutcome::Value(Scalar::Bool(yes))
+        }
         _ => FoldOutcome::Declined,
     }
 }
@@ -2435,6 +2459,64 @@ fn limbs_cmp(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
 
 fn limbs_eq_signed(a_neg: bool, a: &[u32], b_neg: bool, b: &[u32]) -> bool {
     a_neg == b_neg && limbs_cmp(a, b) == std::cmp::Ordering::Equal
+}
+
+/// `(self & mask) <=> mask | (self & mask) <=> 0` — the bit-test
+/// predicates over sign + u32-limb magnitudes, shared by the Integer and
+/// Float-mask arms (`to_int` truncation spells the mask the same way).
+fn int_bittest_eval(
+    a_neg: bool,
+    a_limbs: &[u32],
+    b_neg: bool,
+    b_limbs: &[u32],
+    method: &str,
+) -> bool {
+    let (m_neg, m_limbs) = limbs_bitop(a_neg, a_limbs, b_neg, b_limbs, "&");
+    let masked = limbs_is_zero(&m_limbs) && !m_neg;
+    let all = limbs_eq_signed(m_neg, &m_limbs, b_neg, b_limbs);
+    match method {
+        "allbits?" => all,
+        "anybits?" => !masked,
+        _ => masked,
+    }
+}
+
+/// A Float as an `(negative, u32-limb magnitude)` integer — the `to_int`
+/// truncation the bit-test masks take: `f = m * 2**e` exactly, shifted
+/// into limbs (a negative exponent keeps only the magnitude's floor —
+/// `3.9` -> `3`, `-1e300` keeps its exact 1000-bit spelling).
+fn f64_to_int_limbs(f: f64) -> (bool, Vec<u32>) {
+    let mut neg = f.is_sign_negative() && f != 0.0;
+    let bits = f.abs().to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if raw_exp == 0 {
+        (frac, -1074i64)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1075)
+    };
+    let limbs = if e >= 0 {
+        let mut limbs = vec![m as u32, (m >> 32) as u32];
+        while limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        limbs_shl(&mut limbs, e as u64);
+        limbs
+    } else {
+        let k = (-e) as u64;
+        let floor = if k >= 64 { 0u64 } else { m >> k };
+        let mut limbs = vec![floor as u32, (floor >> 32) as u32];
+        while limbs.last() == Some(&0) {
+            limbs.pop();
+        }
+        limbs
+    };
+    // `-1e-320` truncates to `0` — a `-0` mask must read as `+0`
+    // (`5.allbits?(-0)` is `true` on the oracle).
+    if limbs.is_empty() {
+        neg = false;
+    }
+    (neg, limbs)
 }
 
 /// `a << shift` in place on little-endian u32 limbs.
@@ -3416,6 +3498,9 @@ mod tests {
             fold_outcome(&i(5), "digits", &[i(3)]),
             FoldOutcome::Tuple(vec![i(2), i(1)])
         );
+        // `0.digits(base)` is `[0]` — the divmod loop never runs on a
+        // zero receiver.
+        assert_eq!(fold_outcome(&i(0), "digits", &[i(3)]), FoldOutcome::Tuple(vec![i(0)]));
         // `digits` declines on a bad base, a negative receiver, or a
         // >32-element expansion (`STRING_ARRAY_LIFT_LIMIT`).
         assert_eq!(fold(&n, "digits", &[i(0)]), None);
@@ -3465,6 +3550,21 @@ mod tests {
         assert_eq!(fold(&n, "anybits?", &[i(3)]), Some(Scalar::Bool(true)));
         assert_eq!(fold(&n, "nobits?", &[i(3)]), Some(Scalar::Bool(false)));
         assert_eq!(fold(&i(5), "allbits?", &[i(3)]), Some(Scalar::Bool(false)));
+        // A Float mask/base coerces via `to_int` (`to_i` truncation).
+        assert_eq!(
+            fold(&n, "allbits?", &[Scalar::Float(3.9)]),
+            Some(Scalar::Bool(true))
+        );
+        assert_eq!(
+            fold(&n, "anybits?", &[Scalar::Float(2.9)]),
+            Some(Scalar::Bool(true))
+        );
+        assert_eq!(
+            fold(&n, "nobits?", &[Scalar::Float(2.0)]),
+            Some(Scalar::Bool(false))
+        );
+        // … but `digits`' base does NOT coerce (`0.digits(3.0)` raises).
+        assert_eq!(fold(&i(0), "digits", &[Scalar::Float(3.0)]), None);
         // gcd / lcm are non-negative magnitudes; `gcd(a, 0) = |a|`.
         assert_eq!(fold(&n, "gcd", &[big("888888888888888888888888")]), Some(i(3333)));
         assert_eq!(fold(&n, "gcd", &[i(0)]), Some(big("99999999999999999999")));
