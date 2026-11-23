@@ -555,7 +555,13 @@ impl<'i> Typer<'i> {
                     ..
                 } => {
                     publish(&dead, &mut dirty);
-                    let folded_truthy = self.expr_truthiness(ast, *predicate, seen);
+                    // rigor-rs#909 — `branch_certainty` answers the version
+                    // guard FIRST (`statement_evaluator.rb:2408`): the scan
+                    // marks the arm the reference never evaluates, so its
+                    // writes/mutations never reach a use (the flow folds and
+                    // the span filter consult the same verdict).
+                    let folded_truthy = crate::version_guard::guard_truthiness(ast, *predicate)
+                        .or_else(|| self.expr_truthiness(ast, *predicate, seen));
                     if fold_audit {
                         scanned_preds.push((
                             *predicate,
@@ -653,7 +659,11 @@ impl<'i> Typer<'i> {
                 *self.dead_partial.borrow_mut() = partial;
                 let pkey = (ast.uid() as usize, pred.0);
                 self.truthy_in_flight.borrow_mut().insert(pkey);
-                let fresh = self.expr_truthiness_fold(ast, pred, &mut Vec::new());
+                // rigor-rs#909 — refold the scan's COMPOSITE (guard half
+                // first, then the contextual fold) so a guard predicate's
+                // context-free answer keeps passing the audit.
+                let fresh = crate::version_guard::guard_truthiness(ast, pred)
+                    .or_else(|| self.expr_truthiness_fold(ast, pred, &mut Vec::new()));
                 self.truthy_in_flight.borrow_mut().remove(&pkey);
                 assert_eq!(
                     fresh, used,

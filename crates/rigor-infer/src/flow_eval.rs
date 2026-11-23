@@ -4528,7 +4528,9 @@ impl<'i> Typer<'i> {
                 ..
             } => {
                 let span = ast.get(id).span();
-                match self.expr_truthiness(ast, *predicate, &mut Vec::new()) {
+                match crate::version_guard::guard_truthiness(ast, *predicate)
+                    .or_else(|| self.expr_truthiness(ast, *predicate, &mut Vec::new()))
+                {
                     Some(truthy) => {
                         let live = if truthy != *is_unless {
                             then_body.clone()
@@ -4581,7 +4583,9 @@ impl<'i> Typer<'i> {
                                 &mut replay,
                                 interner,
                             );
-                            self.bind_statement(ast, *s, &mut replay, interner);
+                            self.bind_live_arm_stmts(
+                                ast, std::slice::from_ref(s), &mut replay, effects, indexed, dead, interner,
+                            );
                         }
                         widen_flow_writes(live_rebinds.iter(), span, env, interner);
                         self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
@@ -4589,7 +4593,9 @@ impl<'i> Typer<'i> {
                             ast, live_mutations.iter(), indexed, id, span, env, interner,
                         );
                         for s in &live {
-                            self.bind_statement(ast, *s, env, interner);
+                            self.bind_live_arm_stmts(
+                                ast, std::slice::from_ref(s), env, effects, indexed, dead, interner,
+                            );
                         }
                         for (name, ty) in replay.iter() {
                             if before.get(&**name) != Some(ty) {
@@ -4893,6 +4899,49 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(live_rebinds.iter(), span, env, interner);
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+            }
+        }
+    }
+
+    /// Bind the statements of a certainty-folded `if`'s LIVE arm — the port
+    /// of the reference evaluating ONLY the live branch
+    /// (`live_branch_for_if` → `eval_branch_or_nil`). The lowered arm
+    /// carries two carriers a plain per-statement [`Self::bind_statement`]
+    /// walk cannot see through:
+    ///
+    /// * an `else` clause lowers to a single clause-less `BeginRescue`
+    ///   carrier ([`LoweredAst::is_else_carrier`]) whose body IS the else's
+    ///   statements — a `bind_statement` on the carrier binds nothing, so a
+    ///   falsey fold's live `else` silently lost every write (`if
+    ///   RUBY_VERSION < "3.4"; a = "s"; else; a = 1; end; a.w` was silent
+    ///   here, `for 1` on the oracle — rigor-rs#909);
+    /// * an `elsif` link lowers to a nested `If` the reference evaluates as
+    ///   its OWN `eval_if` — its predicate folds by the same
+    ///   guard-then-literal certainty, and an undecided link joins its arms
+    ///   per name exactly as the unfolded statement walk does (recursing
+    ///   into [`Self::bind_check_statement_effects`]'s own `Node::If` arm).
+    ///
+    /// Everything else is the live statement it appears to be.
+    #[allow(clippy::too_many_arguments)]
+    fn bind_live_arm_stmts(
+        &self,
+        ast: &LoweredAst,
+        live: &[NodeId],
+        env: &mut TypeEnv,
+        effects: &FlowEffects,
+        indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
+        interner: &mut Interner,
+    ) {
+        for &s in live {
+            if ast.is_else_carrier(s) {
+                let Node::BeginRescue { body, .. } = ast.get(s) else { continue };
+                let body = body.clone();
+                self.bind_live_arm_stmts(ast, &body, env, effects, indexed, dead, interner);
+            } else if matches!(ast.get(s), Node::If { .. }) {
+                self.bind_check_statement_effects(ast, s, env, effects, indexed, dead, interner);
+            } else {
+                self.bind_statement(ast, s, env, interner);
             }
         }
     }
@@ -5707,7 +5756,15 @@ impl<'i> Typer<'i> {
                 // the continuation. It is still walked into a DISCARDED env
                 // so the always-truthy snapshots inside it record the
                 // scope-fill the reference's `propagate` produces.
-                match self.predicate_certainty(pty, interner) {
+                // rigor-rs#909 — `branch_certainty` answers the version guard
+                // FIRST (`statement_evaluator.rb:2408`): a decidable guard
+                // runs ONE arm, so the dead arm's writes/value never join.
+                // `Unreadable` declines here (both arms live — the port
+                // cannot tell which arm the reference's own runtime killed,
+                // and the wider join is coverage loss, never a false elide).
+                match crate::version_guard::guard_truthiness(ast, predicate)
+                    .or_else(|| self.predicate_certainty(pty, interner))
+                {
                     Some(truthy) => {
                         let (live, dead_arm) = if truthy != is_unless {
                             (&then_body, &else_body)

@@ -11,8 +11,12 @@
 # `Inference::VersionGuard.verdict` is a PURE function of the AST, and
 # `CheckRules::DeadVersionGuardArms.filter` then drops every diagnostic whose
 # location falls inside the dead arm — for every rule EXCEPT `suppression.*`.
-# The evaluator's separate elision of the dead arm's WRITES is typing precision
-# rather than FP safety and is deliberately NOT ported (see the last block).
+# The evaluator's separate elision of the dead arm's WRITES (`eval_if` →
+# `branch_certainty`, which answers the guard FIRST) is ported too since
+# rigor-rs#909: `guard_truthiness` feeds the flow folds, so the dead arm's
+# writes and value never join the post-`if` scope (f34–f39). The DEF-BODY
+# spelling (f20) remains a coverage gap — the port's check env never pins
+# def-body locals at all (rigor-rs#688).
 #
 # HOST RUBY: the reference folds these guards against ITS OWN runtime while
 # rigor-rs bakes `HOST_RUBY_VERSION` / `HOST_RUBY_ENGINE` ("4.0.5" / "ruby",
@@ -190,11 +194,68 @@ if RUBY_VERSION < "3.4"
   "abc".frobnicate_f21 # rigor:disable not.a.rule
 end
 
+# --- THE WRITE ELISION (rigor-rs#909): the flow folds consume the guard ------
+#
+# `branch_certainty` answers the guard BEFORE the narrowing fold
+# (`statement_evaluator.rb:2408`), so the arm it kills is never evaluated: its
+# writes and value never join the post-`if` scope. Every row was oracle-measured
+# with `harness/probe.py` (both engines, full tuples) before landing.
+
+# (f34) a FALSEY guard runs only its `else` — the dead then-write never joins,
+# and the live else-write overwrites the entry binding: `x_f34` reads `"t"`.
+x_f34 = "s"
+if RUBY_VERSION < "3.4"
+  x_f34 = 1
+else
+  x_f34 = "t"
+end
+x_f34.frobnicate_f34
+
+# (f35) a TRUTHY guard runs only its body, over an existing entry binding: the
+# empty `else` contributes nothing, so `x_f35` reads `"s"` (not `"s" | 1`).
+x_f35 = 1
+if RUBY_VERSION >= "3.0"
+  x_f35 = "s"
+end
+x_f35.frobnicate_f35
+
+# (f36) the ternary VALUE side folds the same way — `type_of(If)` answers the
+# guard before the type polarity, so the dead half's `1`-or-`"s"` union is just
+# the live `"… : 1"` half.
+x_f36 = (RUBY_VERSION < "3.4" ? "s" : 1)
+x_f36.frobnicate_f36
+
+# (f37) an `elsif` chain folds each link on its own — both guards are falsey on
+# any Ruby this toolchain runs on, so the `else` alone runs.
+if RUBY_VERSION < "3.4"
+  a_f37 = 1
+elsif RUBY_VERSION < "3.3"
+  a_f37 = 2
+else
+  a_f37 = 3
+end
+a_f37.frobnicate_f37
+
+# (f38) a writeback mutation inside the dead arm never ran, so it must not
+# widen the live carrier either — `h_f38` stays `[1]`, the entry binding.
+h_f38 = [1]
+if RUBY_VERSION >= "3.0"
+else
+  h_f38 << 2
+end
+h_f38.frobnicate_f38
+
+# (f39) f20's TOPLEVEL twin — the shape rigor-rs#909 ported. The dead arm's
+# write never joins, so `x_f39` keeps the entry `1`.
+x_f39 = 1
+x_f39 = "s" if RUBY_VERSION < "3.4"
+x_f39.frobnicate_f39
+
 # --- REGISTERED COVERAGE GAPS (the reference fires, rigor-rs does not) -------
 
-# (f20) the evaluator ALSO elides the dead arm's WRITES from the post-`if`
-# scope, so upstream still types `x` as `1` and reports the typo. That half is
-# typing precision, not FP safety, and is deliberately not ported.
+# (f20) the evaluator's write elision reaches DEF bodies on the reference; the
+# port's check env never pins def-body locals at all (rigor-rs#688), so the
+# toplevel half (f39) is ported while this def-body spelling stays silent.
 def f20_write_elision_not_ported
   x = 1
   x = "s" if RUBY_VERSION < "3.4"
