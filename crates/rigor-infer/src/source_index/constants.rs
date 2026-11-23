@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use rigor_parse::{FileKey, LoweredAst, Node, NodeId};
 use rigor_types::{Scalar, ShapeKey};
 
-use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex};
+use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex, TypedConstWrite};
 
 impl SourceIndex {
     /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
@@ -149,6 +149,90 @@ impl SourceIndex {
         }
         let (_, (ns, file, lit)) = hit?;
         (file == use_file && c5_namespace_visible(ns, use_prefix)).then_some(lit)
+    }
+
+    /// rigor-rs#910 — the same-file `=` writes of constant `name` visible
+    /// at a use site with lexical prefix `use_prefix`: the typed half of the
+    /// C5 consult, with [`Self::literal_constant`]'s per-file and
+    /// lexical-visibility gates but neither the literal-only nor the
+    /// single-assignment gate — the reference's `in_source_constants`
+    /// records `type_of` for EVERY `=` write's rvalue and unions repeated
+    /// writes. The winner is still the innermost visible defining
+    /// namespace; a `rooted` read (`::X`) consults toplevel entries only.
+    /// The caller types the returned `values` and applies `mutated`.
+    pub(crate) fn typed_const_write(
+        &self,
+        name: &str,
+        use_prefix: &[String],
+        use_file: &FileKey,
+        rooted: bool,
+    ) -> Option<&TypedConstWrite> {
+        self.typed_const_writes
+            .get(name)?
+            .iter()
+            .filter(|w| w.file == *use_file)
+            .filter(|w| !rooted || w.namespace.is_empty())
+            .filter(|w| c5_namespace_visible(&w.namespace, use_prefix))
+            .max_by_key(|w| c5_namespace_depth(&w.namespace))
+    }
+
+    /// rigor-rs#910 — the qualified-path spelling of [`Self::typed_const_write`]
+    /// (`M::X.bogus` where `module M; X = Object.new`), mirroring
+    /// [`Self::qualified_literal_constant`]: the same prefix-run candidate
+    /// keys, the same ambiguity decline, then the same file/visibility
+    /// gates on the resolved entry. A `rooted` path read (`::M::X`)
+    /// consults only the as-written key.
+    pub(crate) fn qualified_typed_const_write(
+        &self,
+        name: &str,
+        use_prefix: &[String],
+        use_file: &FileKey,
+        rooted: bool,
+    ) -> Option<&TypedConstWrite> {
+        if !name.contains("::") {
+            return None;
+        }
+        let mut hit: Option<&String> = None;
+        for i in 0..=use_prefix.len() {
+            if rooted && i > 0 {
+                break;
+            }
+            let key = if i == 0 {
+                name.to_string()
+            } else {
+                format!("{}::{}", use_prefix[..i].join("::"), name)
+            };
+            if let Some((k, _)) = self.qualified_typed_const_writes.get_key_value(&key) {
+                match hit {
+                    // The same constant reached by two spellings is not an
+                    // ambiguity; two DIFFERENT keys are.
+                    Some(prev) if prev != k => return None,
+                    Some(_) => {}
+                    None => hit = Some(k),
+                }
+            }
+        }
+        let key = hit?;
+        self.qualified_typed_const_writes
+            .get(key)?
+            .iter()
+            .find(|w| w.file == *use_file && c5_namespace_visible(&w.namespace, use_prefix))
+    }
+
+    /// rigor-rs#910 — the ancestor-candidate half of [`Self::typed_const_write`]
+    /// (`class Sub < Base; X` reaching `Base::X`), mirroring
+    /// [`Self::literal_constant_at`]: an already-QUALIFIED name, the same
+    /// per-file gate, no lexical filter (the caller's candidate IS the
+    /// resolved spelling).
+    pub(crate) fn typed_const_write_at(
+        &self,
+        qualified: &str,
+        file: &FileKey,
+    ) -> Option<&TypedConstWrite> {
+        self.qualified_typed_const_writes
+            .get(qualified)?
+            .iter()
+            .find(|w| w.file == *file)
     }
 
     /// C1 (constant-shadow gate): whether a BARE read of constant `name` at a use
@@ -361,6 +445,10 @@ pub(crate) fn collect_literal_constants(
             match seen.get(&qualified) {
                 Some(&at) => {
                     out[at].writes += 1;
+                    // rigor-rs#910 — the reference's `in_source_constants`
+                    // unions every write's rvalue; the typed rung needs the
+                    // RHS node of the repeat writes too.
+                    out[at].values.push(*value);
                 }
                 None => {
                     // Issue #540: a constant this file MUTATES is harvested
@@ -374,9 +462,11 @@ pub(crate) fn collect_literal_constants(
                         .map(|l| widen_if_mutated(&qualified, l, mutated));
                     seen.insert(qualified.clone(), out.len());
                     out.push(HarvestedConstWrite {
+                        mutated: mutated.contains(&qualified),
                         qualified,
                         namespace: prefix.to_vec(),
                         lit,
+                        values: vec![*value],
                         writes: 1,
                     });
                 }

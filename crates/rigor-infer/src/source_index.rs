@@ -57,7 +57,7 @@ mod harvest;
 
 use std::collections::{HashMap, HashSet};
 
-use rigor_parse::{FileKey, Visibility};
+use rigor_parse::{FileKey, NodeId, Visibility};
 use rigor_types::{Scalar, ShapeKey};
 pub(crate) use method_returns::*;
 pub(crate) use constants::*;
@@ -343,7 +343,32 @@ pub(crate) struct HarvestedConstWrite {
     /// The harvested value of this file's FIRST write (`None` ⇒ not fully
     /// literal). A repeat write never re-harvests, exactly as before.
     lit: Option<ConstLit>,
+    /// rigor-rs#910: the RHS node of EVERY `=` write of this qualified name
+    /// in this file, in walk order — the reference's `in_source_constants`
+    /// accumulator unions `type_of` over each rvalue, so the typed rung
+    /// needs all of them where the literal harvest took only the first.
+    values: Vec<NodeId>,
+    /// rigor-rs#910: whether this file's mutation census
+    /// ([`mutated_constant_names`]) names the qualified constant — the
+    /// `widen_mutated_constants` Dynamic wrap the typed rung applies to the
+    /// unioned answer (`X = Object.new; X << 1` is silent in the oracle).
+    mutated: bool,
     writes: usize,
+}
+
+/// rigor-rs#910 — one file's `=` writes of a qualified constant name, kept
+/// for the in-source RHS-typing rung: the RHS node of every write (the
+/// reference unions `body_scope.type_of` over each), the write's defining
+/// namespace chain (the consult is lexical, like C5's), the assigning
+/// [`FileKey`] (the reference's `in_source_constants` table is rebuilt per
+/// file), and the file's own mutation-census flag.
+#[derive(Clone)]
+pub(crate) struct TypedConstWrite {
+    pub qualified: String,
+    pub namespace: Vec<String>,
+    pub file: FileKey,
+    pub values: Vec<NodeId>,
+    pub mutated: bool,
 }
 
 /// One project `def` site whose interprocedural literal-tail return may fold,
@@ -591,6 +616,24 @@ pub struct SourceIndex {
     /// `require_relative`, while rigor-rs fired. The HARVEST stays project-wide
     /// (the single-assignment gate must still see every file).
     literal_constants: HashMap<String, Vec<HarvestedConst>>,
+    /// rigor-rs#910 — the in-source RHS-typing table, keyed by BARE name
+    /// like `literal_constants` but WITHOUT the literal-only and
+    /// single-assignment gates: the reference's `in_source_constants`
+    /// records `type_of` for EVERY `=` write's rvalue and unions repeated
+    /// writes (`X = Object.new; X = "s"` ⇒ `"s" | Object`). Entries still
+    /// carry the assigning file (the reference's table is per-file — a
+    /// cross-file read declines) and the defining namespace (the consult
+    /// is lexical, innermost wins), and the merge still drops a name a
+    /// class/module declaration owns (the decl rungs sit above
+    /// `in_source_constants` in `constant_type_at`). Backs
+    /// [`Self::typed_const_write`].
+    typed_const_writes: HashMap<String, Vec<TypedConstWrite>>,
+    /// The qualified-name twin of [`Self::typed_const_writes`] for the
+    /// `A::B::C` path-read and ancestor-candidate consults — mirrors
+    /// `qualified_literal_constants`. Backs
+    /// [`Self::qualified_typed_const_write`] and
+    /// [`Self::typed_const_write_at`].
+    qualified_typed_const_writes: HashMap<String, Vec<TypedConstWrite>>,
     /// Collection-shape stage 2e: the SAME harvested values as
     /// `literal_constants`, keyed instead by the constant's FULLY-QUALIFIED name
     /// (`"Gitlab::Ci::Reports::CodequalityReports::SEVERITY_PRIORITIES"`).

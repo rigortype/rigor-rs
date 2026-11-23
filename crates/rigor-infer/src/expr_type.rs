@@ -143,7 +143,12 @@ impl<'i> Typer<'i> {
         // without it each call site of a deep chain (`2 ** 2 ** …`,
         // `1 + 1 + …`, `x.a.a…`) re-types its remaining suffix, quadratic
         // per site and cubic over the arg-reach fanout.
-        if matches!(ast.get(id), Node::Call { .. }) {
+        // rigor-rs#910 — while an in-source constant rvalue is typing, the
+        // memo is bypassed on BOTH sides: a stored post-settle answer (typed
+        // with the typed-constant rung live) would leak into a scope the
+        // reference builds without the table, and a fresh answer computed
+        // under the flag must not be served to a post-settle reader either.
+        if matches!(ast.get(id), Node::Call { .. }) && self.const_rvalue_typing.get() == 0 {
             if !self
                 .reach_index(ast)
                 .env_sensitive_within(ast.get(id).span())
@@ -485,6 +490,25 @@ impl<'i> Typer<'i> {
                 {
                     return self.intern_const_lit(lit, interner);
                 }
+                // rigor-rs#910 — the reference's `in_source_constants` rung:
+                // `type_of` the file's own `=` writes' rvalues and union
+                // them. The consult sits in `constant_type_at` BELOW the
+                // singleton/discovered-class rungs, so a NAMESPACED winner
+                // (`module M; String = Object.new` — the `M::String`
+                // candidate outranks the bare `String` singleton) answers
+                // before the singleton gates while a TOPLEVEL one (`String
+                // = Object.new`) must wait for them — `singleton_for_name`
+                // outranks `in_source_constants` there (`for
+                // singleton(String)`, not `for Object`).
+                let mut deferred_const: Option<TypeId> = None;
+                if let Some((ty, namespaced)) =
+                    self.typed_constant(ast, name, prefix, *rooted, interner)
+                {
+                    if namespaced {
+                        return ty;
+                    }
+                    deferred_const = Some(ty);
+                }
                 // C1: replace the pre-C1 bare-name project-wide suppression
                 // (`!source.knows_class(name)`) with a LEXICALLY PRECISE
                 // shadow gate: a nested project `module Time` suppresses the
@@ -531,9 +555,16 @@ impl<'i> Typer<'i> {
                 // the in-source rungs above already own same-file writes, so
                 // a cross-file write that would fold is a rare coverage loss
                 // and never a wrong answer.
+                // rigor-rs#910 — a TOPLEVEL typed write answers here,
+                // below the singleton rungs (matching `constant_type_at`'s
+                // order) and above the write-shadow stop (the write that
+                // feeds it IS the census entry that would stop the rung).
+                if let Some(ty) = deferred_const {
+                    return ty;
+                }
                 if !self.source.constant_write_shadows(name, prefix, *rooted) {
                     if let Some(ty) =
-                        self.constant_for_name(name, prefix, *rooted, ast.file_key(), interner)
+                        self.constant_for_name(ast, name, prefix, *rooted, ast.file_key(), interner)
                     {
                         return ty;
                     }
@@ -1323,6 +1354,157 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// rigor-rs#910 — the `in_source_constants` rung for a `ConstantRead`:
+    /// the type of the file's own `=` writes of `name`, unioned, or `None`.
+    /// The returned bool is whether the resolved constant is NAMESPACED —
+    /// the caller answers a namespaced winner before the singleton gates
+    /// and a toplevel one after them (the reference's per-candidate
+    /// `constant_type_at` order: `singleton_for_name` / discovered classes,
+    /// then `in_source_constants`).
+    ///
+    /// `None` while `const_rvalue_typing` is set: the reference types each
+    /// rvalue under a scope the accumulator is installed into only after
+    /// the walk, so a read inside an rvalue never sees another write's
+    /// typed value (`B = Object.new; A = B` is silent in the oracle).
+    /// `None` too when a DECL rung owns the resolved name — a project or
+    /// RBS `class`/`module` at the candidate outranks
+    /// `in_source_constants` (`constant_type_at` consults it first).
+    fn typed_constant(
+        &self,
+        ast: &LoweredAst,
+        name: &str,
+        prefix: &[String],
+        rooted: bool,
+        interner: &mut Interner,
+    ) -> Option<(TypeId, bool)> {
+        if self.const_rvalue_typing.get() > 0 {
+            return None;
+        }
+        let file = ast.file_key();
+        let w = if name.contains("::") {
+            self.source
+                .qualified_typed_const_write(name, prefix, file, rooted)?
+        } else {
+            self.source.typed_const_write(name, prefix, file, rooted)?
+        };
+        if self.source.project_declares_constant(&w.qualified)
+            || self.index.knows_qualified_class(&w.qualified)
+        {
+            return None;
+        }
+        let ty = self.in_source_const_type(ast, w, interner);
+        Some((ty, w.qualified.contains("::")))
+    }
+
+    /// rigor-rs#910 — the ancestor-candidate spelling of
+    /// [`Self::typed_constant`] (`Base::X` reached through `class Sub <
+    /// Base`): the decl rungs are checked by the caller, the file gate is
+    /// the same per-file one `literal_constant_at` applies.
+    fn typed_constant_at(
+        &self,
+        ast: &LoweredAst,
+        qualified: &str,
+        file: &FileKey,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        if self.const_rvalue_typing.get() > 0 {
+            return None;
+        }
+        let w = self.source.typed_const_write_at(qualified, file)?;
+        Some(self.in_source_const_type(ast, w, interner))
+    }
+
+    /// rigor-rs#910 — the reference's `record_constant_write` accumulator:
+    /// `EmptySeed.erase(node, body_scope.type_of(node.value))` unioned over
+    /// every `=` write of the constant in the file. The rvalues type under
+    /// an EMPTY env — the census scope carries no locals, so a `X = y`
+    /// rvalue lands `Dynamic[top]` exactly as the reference's does — with
+    /// `const_rvalue_typing` set for the duration (the in-source table is
+    /// not installed while rvalues type) and the call memo bypassed (see
+    /// [`Typer::type_of`]). The file's own mutation census wraps the union
+    /// in `Dynamic` — the reference's `widen_mutated_constants`.
+    ///
+    /// [`Typer::type_of`]: Self::type_of
+    fn in_source_const_type(
+        &self,
+        ast: &LoweredAst,
+        w: &crate::source_index::TypedConstWrite,
+        interner: &mut Interner,
+    ) -> TypeId {
+        self.const_rvalue_typing
+            .set(self.const_rvalue_typing.get() + 1);
+        let env = TypeEnv::new();
+        let mut members = Vec::with_capacity(w.values.len());
+        for &rhs in &w.values {
+            members.push(match self.empty_seed_nominal(ast, rhs, interner) {
+                Some(t) => t,
+                None => self.type_of(ast, rhs, &env, interner),
+            });
+        }
+        self.const_rvalue_typing
+            .set(self.const_rvalue_typing.get() - 1);
+        let ty = rigor_types::Algebra::union(interner, &members);
+        if w.mutated {
+            interner.intern(Type::Dynamic(ty))
+        } else {
+            ty
+        }
+    }
+
+    /// rigor-rs#910 — `EmptySeed.erase` (`scope_indexer/empty_seed.rb`): a
+    /// constant seeded with an empty literal is the accumulator idiom —
+    /// the census records it without its emptiness: `[]` as
+    /// `Array[untyped]`, `{}` as `Hash[untyped, untyped]`, `""` (and `+""`,
+    /// `X.dup` of a seed) as `String`. `Some(ty)` is the erased carrier;
+    /// `None` is no empty seed and the caller `type_of`s the rvalue.
+    /// `String.new`/`Array.new`/`Hash.new` already type as their nominal.
+    fn empty_seed_nominal(
+        &self,
+        ast: &LoweredAst,
+        node: NodeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let nominal = |name: &str, args: Vec<TypeId>, interner: &mut Interner| {
+            match self.index.class_id(name) {
+                Some(class) => interner.intern(Type::Nominal { class, args }),
+                None => interner.untyped(),
+            }
+        };
+        match ast.get(node) {
+            Node::StringLit { value, .. } if value.is_empty() => {
+                Some(nominal("String", vec![], interner))
+            }
+            Node::ArrayLit { elements, .. } if elements.is_empty() => {
+                let u = interner.untyped();
+                Some(nominal("Array", vec![u], interner))
+            }
+            Node::HashLit { elements, .. } if elements.is_empty() => {
+                let u = interner.untyped();
+                Some(nominal("Hash", vec![u, u], interner))
+            }
+            // `X.dup` of a seed keeps the seed's erased carrier.
+            Node::Call { receiver: Some(r), method, args, block_body, .. }
+                if method == "dup" && args.is_empty() && block_body.is_empty() =>
+            {
+                self.empty_seed_nominal(ast, *r, interner)
+            }
+            // `+""` — the unfrozen empty String the accumulator idiom
+            // spells under `# frozen_string_literal: true`.
+            Node::Call { receiver: Some(r), method, args, block_body, .. }
+                if method == "+@"
+                    && args.is_empty()
+                    && block_body.is_empty()
+                    && matches!(
+                        ast.get(*r),
+                        Node::StringLit { value, .. } if value.is_empty()
+                    ) =>
+            {
+                Some(nominal("String", vec![], interner))
+            }
+            _ => None,
+        }
+    }
+
     /// rigor-rs#878 — `Environment#constant_for_name` (`environment.rb:838`)
     /// fused with `constant_type_at`'s per-candidate binding check
     /// (`reflection.rb`): for EACH candidate the reference's
@@ -1359,6 +1541,7 @@ impl<'i> Typer<'i> {
     /// [`SourceIndex::constant_write_shadows`]: crate::SourceIndex::constant_write_shadows
     fn constant_for_name(
         &self,
+        ast: &LoweredAst,
         name: &str,
         prefix: &[String],
         rooted: bool,
@@ -1415,6 +1598,18 @@ impl<'i> Typer<'i> {
                     // (`Base::K = 5` + `class Sub < Base; K` → `for 5`).
                     if let Some(lit) = self.source.literal_constant_at(&candidate, file) {
                         return Some(self.intern_const_lit(lit, interner));
+                    }
+                    // rigor-rs#910 — and the typed half of the same
+                    // in-source rung (`Base::X = Object.new` ⇒ `for
+                    // Object`): above the write-stop below, but only when
+                    // no decl rung binds the candidate — `constant_type_at`
+                    // orders singleton/discovered ABOVE `in_source_constants`.
+                    if !bound(&candidate) {
+                        if let Some(ty) =
+                            self.typed_constant_at(ast, &candidate, file, interner)
+                        {
+                            return Some(ty);
+                        }
                     }
                     if self.source.constant_write_candidates_contains(&candidate)
                         || bound(&candidate)
