@@ -491,6 +491,21 @@ fn depth_two_bang_of_singleton_call_folds() {
 }
 
 #[test]
+fn toplevel_def_literal_ignores_the_pre_eval_registry() {
+    // rigor-rs#491 review F2 — the reference folds a toplevel
+    // `def f7(x) = 42` at a bare `f7(1)` even while a `pre_eval:` patch
+    // binds the name on `Kernel` (or `Object`; probed on both engines:
+    // `q.zz9` fires `for 42`), so the fold must keep its scalar with the
+    // registry installed — the toplevel def path never consults it.
+    let core = CoreIndex::new();
+    let (_a, mut idx) = build_one(b"def f7(x) = 42\n", &core);
+    idx.set_pre_eval_patches(Some(std::sync::Arc::new(PreEvalPatches::build(vec![
+        rigor_parse::pre_eval::scan_pre_eval(b"module Kernel\n  def f7 = 1\nend\n"),
+    ]))));
+    assert_eq!(idx.toplevel_def_literal("f7", 1), Some(Scalar::Int(42)));
+}
+
+#[test]
 fn cross_owner_const_call_declines() {
     // `Bar` defines `read_only?`; `Foo` does not. A `Foo.read_only?` fold must
     // DECLINE (own-class resolution — a same-name method elsewhere is never

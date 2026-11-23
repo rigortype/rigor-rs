@@ -30,8 +30,12 @@ fn glob_pattern(path: &str) -> bool {
 /// - [`expand_entry`] (the patch registry) reads the reference's own match
 ///   set — a file `Dir.glob` does not return must not be read (rigor-rs#491
 ///   item 4). Its options match the reference's `Dir.glob` (no flags): a
-///   leading `.` only matches literally, and case folding follows the
-///   platform — probed (ruby 4.0.5): `a*` matches `A.rb` on the default
+///   leading `.` is FNM_PERIOD — never matched by a wildcard, but read when
+///   the pattern names the dot literally (`Dir.glob("patch/.h*.rb")` reads
+///   `patch/.hidden.rb`; the crate's enumeration flag drops the file before
+///   matching can see it, so the rule is a re-match post-filter in
+///   [`expand_entry_with`]) — and case folding follows the platform —
+///   probed (ruby 4.0.5): `a*` matches `A.rb` on the default
 ///   case-insensitive APFS volume and matches nothing on a case-sensitive
 ///   filesystem, while `File.fnmatch` stays case-sensitive on both. The
 ///   crate cannot tell a case-sensitive volume apart on macOS, so it folds
@@ -80,9 +84,27 @@ fn expand_entry_with(entry: &str, options: glob::MatchOptions) -> Option<Vec<Pat
         }
         None => pattern,
     };
-    let mut out: Vec<PathBuf> = glob::glob_with(&full, options)
+    // The crate's `require_literal_leading_dot` drops every dotfile ENTRY at
+    // readdir time (glob-0.3.3 `src/lib.rs`, the `children.retain` in the
+    // `fill_todo` loop), which cannot express FNM_PERIOD's naming half: a
+    // pattern that NAMES the dot — `Dir.glob("patch/.h*.rb")` — must still
+    // read `patch/.hidden.rb` (probed on ruby 4.0.5). So the enumeration
+    // runs with the flag off (dotfiles visited), and each result is
+    // re-matched with the flag on, where the crate applies the rule per
+    // component exactly as Ruby does: a leading `.` is matched only by a
+    // literal `.` in the pattern; `*`, `?`, a class and `**` cannot match it
+    // (glob-0.3.3 `matches_from` — verified against `Dir.glob` shapes).
+    let compiled = glob::Pattern::new(&full).ok()?;
+    let enumerate = glob::MatchOptions {
+        require_literal_leading_dot: false,
+        ..options
+    };
+    let mut out: Vec<PathBuf> = glob::glob_with(&full, enumerate)
         .ok()?
         .filter_map(Result::ok)
+        .filter(|p| {
+            !options.require_literal_leading_dot || compiled.matches_path_with(p, options)
+        })
         .collect();
     out.sort();
     Some(out)
@@ -314,6 +336,38 @@ mod tests {
         let pat = format!("{}/[^a]*.rb", dir.display());
         let got = expand_entry(&pat).unwrap();
         assert_eq!(got, vec![dir.join("b.rb")], "[^a] excludes a.rb");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// FNM_PERIOD's naming half (#491 review F1): a dot-leading file IS read
+    /// when the pattern names the dot literally (`Dir.glob("patch/.h*.rb")`
+    /// returns `patch/.hidden.rb` — probed on ruby 4.0.5), and is NOT read
+    /// under a wildcard. The crate's `require_literal_leading_dot` drops the
+    /// entry at readdir time, so `expand_entry_with` enumerates with the flag
+    /// off and re-matches with it on.
+    #[test]
+    fn dotfile_named_by_the_pattern_is_read() {
+        let dir = std::env::temp_dir().join(format!("rigor-pre-eval-dot-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join(".hidden.rb"), "").unwrap();
+        let named = format!("{}/.h*.rb", dir.display());
+        assert_eq!(
+            expand_entry(&named).unwrap(),
+            vec![dir.join(".hidden.rb")],
+            "the pattern names the dot: the dotfile is read"
+        );
+        let wildcard = format!("{}/*.rb", dir.display());
+        assert!(
+            expand_entry(&wildcard).unwrap().is_empty(),
+            "a wildcard never reads the dotfile"
+        );
+        let literal = format!("{}/.hidden.rb", dir.display());
+        assert_eq!(
+            expand_entry(&literal).unwrap(),
+            vec![dir.join(".hidden.rb")],
+            "the literal entry itself is read"
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

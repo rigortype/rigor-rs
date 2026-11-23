@@ -137,12 +137,13 @@ impl SourceIndex {
     /// `format(1)` to `42`, which outranks `Kernel#format`'s `String` return —
     /// the `def_nodes["<toplevel>"]` merge is project-wide on the oracle.
     /// `None` when no toplevel def of the name folds a scalar.
-    pub fn toplevel_def_literal(
-        &self,
-        core: &CoreIndex,
-        method: &str,
-        arg_count: usize,
-    ) -> Option<Scalar> {
+    ///
+    /// rigor-rs#491 review F2: this fold does NOT consult the `pre_eval:`
+    /// registry — the reference folds a toplevel `def f7(x) = 42` at a bare
+    /// `f7(1)` even while a patch binds the name on `Kernel` or `Object`
+    /// (probed on both engines: `zz9 for 42` fires), so an on-walk patch must
+    /// not decline it.
+    pub fn toplevel_def_literal(&self, method: &str, arg_count: usize) -> Option<Scalar> {
         // The call must satisfy SOME def site's arity — `format("%d", 2)`
         // against `def format(x)` keeps `Kernel#format` on the reference.
         let arity_ok = self
@@ -150,19 +151,6 @@ impl SourceIndex {
             .get(method)
             .is_some_and(|ranges| ranges.iter().any(|(lo, hi)| arg_count >= *lo && arg_count <= *hi));
         if !arity_ok {
-            return None;
-        }
-        // The bare call's receiver is `main` (an `Object`): a patch on its
-        // walk answers ahead of the toplevel `def` (ADR-17, `Object` / `Kernel`
-        // / `BasicObject` and their patch mixins — the same walk
-        // `call_toplevel` asks).
-        if self.pre_eval_may_answer(
-            core,
-            "Object",
-            method,
-            false,
-            crate::PatchCall::Implicit,
-        ) {
             return None;
         }
         self.literal_returns
