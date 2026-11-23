@@ -1482,24 +1482,14 @@ impl<'i> Typer<'i> {
                 let u = interner.untyped();
                 Some(nominal("Hash", vec![u, u], interner))
             }
-            // `X.dup` of a seed keeps the seed's erased carrier.
+            // `X.dup` of a seed keeps the seed's erased carrier. (`+""` is
+            // NOT handled here: the oracle's `X = +"")` renders `for ""`, not
+            // `for String`, so it falls through to `type_of` like any other
+            // call — measured, `docs` probe set for #910.)
             Node::Call { receiver: Some(r), method, args, block_body, .. }
                 if method == "dup" && args.is_empty() && block_body.is_empty() =>
             {
                 self.empty_seed_nominal(ast, *r, interner)
-            }
-            // `+""` — the unfrozen empty String the accumulator idiom
-            // spells under `# frozen_string_literal: true`.
-            Node::Call { receiver: Some(r), method, args, block_body, .. }
-                if method == "+@"
-                    && args.is_empty()
-                    && block_body.is_empty()
-                    && matches!(
-                        ast.get(*r),
-                        Node::StringLit { value, .. } if value.is_empty()
-                    ) =>
-            {
-                Some(nominal("String", vec![], interner))
             }
             _ => None,
         }
