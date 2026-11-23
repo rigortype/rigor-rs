@@ -25,6 +25,11 @@ name: ci
 # docs-only PR does not hang on skipped Rust jobs. `paths-ignore` stays
 # on `push` only: the same filter on `pull_request` or `merge_group`
 # would leave a required check pending and block the queue.
+#
+# macOS workspace tests are NOT in this workflow: they delayed every PR
+# (and flaked when runners were scarce). They live in ci-macos.yml
+# (nightly on master, workflow_dispatch, and a path-filtered pull_request
+# that never shares this run) and as a pre-publish job in release.yml.
 on:
   push:
     branches: [main, master]
@@ -88,14 +93,10 @@ jobs:
           fi
 
   test:
-    name: build + test (${{ matrix.os }})
+    name: build + test (ubuntu-latest)
     needs: changes
     if: needs.changes.outputs.code == 'true'
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-latest]
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -105,8 +106,7 @@ jobs:
           components: clippy
 
       # bindgen (ruby-prism-sys / ruby-rbs-sys) needs libclang at build time.
-      - name: Install libclang (Linux)
-        if: runner.os == 'Linux'
+      - name: Install libclang
         run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
 
       # Cache the registry + build artifacts across runs.

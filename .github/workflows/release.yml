@@ -32,8 +32,34 @@ permissions:
   contents: write
 
 jobs:
+  # Full macOS workspace tests must pass before any release asset is built
+  # or uploaded. The `build` rows also smoke `rigor doctor` on native macOS
+  # targets; that is not a substitute for this suite.
+  macos-test:
+    name: macOS tests (pre-publish)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
   build:
     name: build ${{ matrix.target }}
+    needs: [macos-test]
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
