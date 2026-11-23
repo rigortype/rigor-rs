@@ -18,6 +18,16 @@ excuses specific extras. `run_snapshot.rb` differs only in WHERE the expected
 reference diagnostics come from (a committed JSON snapshot vs. a live reference
 run) — it never touches `REFERENCE_RIGOR_DIR`.
 
+### Ruby: the harness needs the reference's version
+
+`harness/lib.rb` uses endless method definitions, so every harness script
+(`run.rb`, `run_snapshot.rb`, `snapshot.rb`) and `fp_audit.py`'s reference
+side need the same Ruby the reference pins (`UPSTREAM.md`: ruby >= 4.0). The
+macOS system `/usr/bin/ruby` is 2.6 and dies with a confusing
+`syntax error, unexpected '='` in `lib.rb` — run the gate through a version
+manager instead, e.g. `mise exec ruby@4.0.5 -- ruby harness/run_snapshot.rb`
+(puts that Ruby's `bin` on `PATH` for `fp_audit.py` too).
+
 ### Live gate (local, needs the reference)
 
 From the repo root:
