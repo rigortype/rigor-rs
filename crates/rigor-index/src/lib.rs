@@ -256,6 +256,26 @@ impl CoreIndex {
         self.data.is_qualified_project_sig_class(qname)
     }
 
+    /// upstream #2438 — `open_project_singleton?`'s member-less arm
+    /// (`RbsLoader#memberless_project_class?`): every declaration of the
+    /// qualified `qname` is the project's own `sig/` decl AND none declares
+    /// a surface member (method, attribute, alias or mixin). A member-less
+    /// class leaves its singleton surface to whatever the source declares,
+    /// so `call.undefined-method` pairs this with the source-side
+    /// `open_source_class?` port before witnessing `C.typo` on a project-sig
+    /// class.
+    pub fn memberless_project_class(&self, qname: &str) -> bool {
+        self.data.memberless_project_class(qname)
+    }
+
+    /// The written superclass a member-less project declaration records —
+    /// the `open_tail?` half of the reference's `open_source_class?`,
+    /// consulted for the last class of the source chain when that chain
+    /// wrote no superclass of its own.
+    pub fn memberless_project_superclass(&self, qname: &str) -> Option<&'static str> {
+        self.data.memberless_project_superclass(qname)
+    }
+
     /// Whether `class_name` was declared at GENUINE top level (empty namespace)
     /// in the loaded RBS — a conservative companion to [`CoreIndex::knows_class`].
     ///

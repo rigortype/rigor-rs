@@ -1,0 +1,14 @@
+class Empty
+end
+class Empty::Deep
+end
+class My::Sub < Resolv::DNS::Resource::IN::A
+end
+module Mixin::Thing
+end
+class Full::Klass
+  def inst: () -> Integer
+end
+class SelfMeth::Klass
+  def self.q: () -> Integer
+end

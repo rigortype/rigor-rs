@@ -1017,7 +1017,18 @@ struct ClassEntry {
     /// `M`'s INSTANCE methods into THIS class/module's SINGLETON surface (the
     /// class object gains them as class methods — e.g. `SecureRandom` does
     /// `extend Random::Formatter`, so `SecureRandom.hex` is a real class method).
+    /// The SHORT-map consumers read this; the qualified singleton surface
+    /// reads [`Self::extends_written`] instead, which resolves the name as
+    /// WRITTEN in its member context (rigor-rs#908 review: a flat `class
+    /// Foo::Bar; extend Util` resolves `Util` at ROOT only — a `Foo::Util`
+    /// module must NOT answer it — and an `extend` landing on a class is
+    /// `RBS::MixinClassError`, which fails the whole definition).
     extends: Vec<&'static str>,
+    /// The same `extend` members as `(written name, member ctx)` pairs —
+    /// [`Self::includes_written`]'s shape — for the qualified singleton
+    /// surface, which resolves them through
+    /// [`Self::resolve_written_ref`].
+    extends_written: Vec<(&'static str, Vec<&'static str>)>,
     /// `true` when the REFERENCE cannot build this class's INSTANCE definition —
     /// `RbsLoader#instance_definition` fail-softs to `nil`, so every instance
     /// call on it degrades to `Dynamic[Top]` and the oracle is silent about it.
@@ -1045,6 +1056,32 @@ struct ClassEntry {
     /// The singleton twin of [`Self::instance_def_nil`] — `String.zork`
     /// fires under a bare `class Hash` while `Kernel.zork` goes silent.
     singleton_def_nil: bool,
+}
+
+impl ClassEntry {
+    /// upstream #2438 — the surface test of `memberless_project_class?`
+    /// (`RbsLoader#surface_member?`): a declaration holds a surface member
+    /// when it declares a `MethodDefinition`, `Attribute`, `Alias` or
+    /// `Mixin`; one holding none of those is "member-less", so the class's
+    /// singleton surface is only what source decides (the type params,
+    /// self-type clauses, ivar types and written superclass a decl may
+    /// still carry are not members).
+    fn memberless(&self) -> bool {
+        self.methods.is_empty()
+            && self.singleton_methods.is_empty()
+            && self.aliases.is_empty()
+            && self.singleton_aliases.is_empty()
+            && self.attr_methods.is_empty()
+            && self.singleton_attr_methods.is_empty()
+            && self.extends.is_empty()
+            && self.extends_written.is_empty()
+            && self.includes.is_empty()
+            && self.prepends.is_empty()
+            && self.includes_written.is_empty()
+            && self.prepends_written.is_empty()
+            && self.overloading_methods.is_empty()
+            && self.overloading_singletons.is_empty()
+    }
 }
 
 /// Which signature source the loaded [`CoreData`] was built from. Surfaced by
@@ -1798,8 +1835,8 @@ impl CoreData {
         // truncated/unbuildable, leaves the surface unknown.
         for &anc in &chain {
             if let Some(entry) = self.qualified.get(anc) {
-                for &module in &entry.extends {
-                    if !self.extend_surface_complete(module) {
+                for (w, ctx) in &entry.extends_written {
+                    if !self.extend_surface_complete(w, ctx) {
                         complete = false;
                     }
                 }
@@ -1844,8 +1881,8 @@ impl CoreData {
         //     the fold is inherited down the superclass chain.
         for &anc in chain {
             if let Some(entry) = self.qualified.get(anc) {
-                for &module in &entry.extends {
-                    if self.extend_surface_has_instance(module, method) {
+                for (w, ctx) in &entry.extends_written {
+                    if self.extend_surface_has_instance(w, ctx, method) {
                         return true;
                     }
                 }
@@ -1871,45 +1908,50 @@ impl CoreData {
         false
     }
 
-    /// Whether the `extend`ed module `module` (stored as its written leaf,
-    /// e.g. `"Formatter"` for `extend Random::Formatter`) contributes a known
-    /// INSTANCE surface containing `method` — resolved like
-    /// [`Self::qualified_class_has_singleton_method`]'s old arm: the short-key
-    /// map first (extended modules are typically top-level), then the
-    /// unambiguous-qualified fallback; the qualified fallback's instance
-    /// surface walks [`Self::qualified_ancestors`]. `false` when nothing
-    /// resolves — a surface the caller's completeness side then marks
-    /// unknown.
-    fn extend_surface_has_instance(&self, module: &str, method: &str) -> bool {
-        if self.classes.contains_key(module) {
-            let (mod_chain, _) = self.ancestors(module);
-            return self.lookup_on_chain(&mod_chain, method).is_some()
-                || self.attr_on_chain(&mod_chain, method);
+    /// Whether the `extend` member `(written, ctx)` resolves to a MODULE
+    /// whose INSTANCE surface contains `method` — resolved as written
+    /// through [`Self::resolve_written_ref`] (rigor-rs#908 review: a flat
+    /// `class Foo::Bar; extend Util` resolves `Util` at ROOT only — a
+    /// `Foo::Util` module must NOT answer it — while a nested decl's `extend
+    /// Util` resolves `Nested::Util` lexically). An extend landing on a
+    /// CLASS is `RBS::MixinClassError`: the whole definition fails and the
+    /// module folds NOTHING, so `false` here (the caller's completeness
+    /// side marks the surface unknown). `false` when nothing resolves — a
+    /// surface the completeness side then marks unknown.
+    fn extend_surface_has_instance(&self, written: &str, ctx: &[&'static str], method: &str) -> bool {
+        let Some(q) = self.resolve_written_ref(written, ctx) else {
+            return false;
+        };
+        let Some(m) = self.qualified.get(q) else {
+            return false;
+        };
+        if !m.is_module {
+            return false;
         }
-        if let Some(m) = self.resolve_short_unambiguous(module) {
-            let (mod_chain, _) = self.qualified_ancestors(m);
-            return self.qualified_lookup_on_chain(&mod_chain, method, 0).is_some()
-                || self.qualified_attr_on_chain(&mod_chain, method);
-        }
-        false
+        let (mod_chain, _) = self.qualified_ancestors(q);
+        self.qualified_lookup_on_chain(&mod_chain, method, 0).is_some()
+            || self.qualified_attr_on_chain(&mod_chain, method)
     }
 
-    /// Whether the `extend`ed module `module`'s INSTANCE surface is fully
-    /// known — the same resolution as [`Self::extend_surface_has_instance`]
-    /// but for completeness: an unresolvable extend, or one whose ancestor
-    /// walk is itself truncated (missing ancestor, unbuildable entry — the
-    /// `ancestors`/`qualified_ancestors` `at_start` rule already folds a
-    /// leaf-unbuildable module into `false`), marks the singleton surface
-    /// unknown. Mirrors `singleton_lookup`'s "a referenced `extend`ed module
-    /// that isn't loaded truncates the surface" rule.
-    fn extend_surface_complete(&self, module: &str) -> bool {
-        if self.classes.contains_key(module) {
-            return self.ancestors(module).1;
+    /// Whether the `extend` member `(written, ctx)` resolves to a MODULE
+    /// whose INSTANCE surface is fully known — the same resolution as
+    /// [`Self::extend_surface_has_instance`] but for completeness: an
+    /// unresolvable extend, a class extend target (`RBS::MixinClassError`
+    /// — the whole definition fails), or a module whose ancestor walk is
+    /// itself truncated marks the singleton surface unknown. Mirrors
+    /// `singleton_lookup`'s "a referenced `extend`ed module that isn't
+    /// loaded truncates the surface" rule.
+    fn extend_surface_complete(&self, written: &str, ctx: &[&'static str]) -> bool {
+        let Some(q) = self.resolve_written_ref(written, ctx) else {
+            return false;
+        };
+        let Some(m) = self.qualified.get(q) else {
+            return false;
+        };
+        if !m.is_module {
+            return false;
         }
-        match self.resolve_short_unambiguous(module) {
-            Some(m) => self.qualified_ancestors(m).1,
-            None => false,
-        }
+        self.qualified_ancestors(q).1
     }
 
     /// Walk the full flattened ancestor chain; a method is present if ANY
@@ -4859,6 +4901,7 @@ impl CoreData {
                     // The stub models no `extend` directives (no class-method
                     // surface under the fallback); empty keeps it conservative.
                     extends: Vec::new(),
+                    extends_written: Vec::new(),
                     // The stub carries none of the `UNBUILDABLE_DEFINITIONS`
                     // classes, so the flags are inert under the fallback.
                     instance_unbuildable: false,
@@ -5135,6 +5178,33 @@ impl CoreData {
     /// typo witnesses through the qualified path.
     pub fn is_qualified_project_sig_class(&self, qname: &str) -> bool {
         self.qualified_project_sig_classes.contains(qname)
+    }
+
+    /// upstream #2438 — `RbsLoader#memberless_project_class?`: every
+    /// declaration of `qname` is the project's own `sig/` decl AND none
+    /// declares a surface member. The reference computes project-authorship
+    /// per decl and then reads the decls; the port's
+    /// `qualified_project_sig_classes` is the INTRODUCED set (a bundled
+    /// name reopened in `sig/` was already in the qualified registry — not
+    /// authored — and so is not here, exactly like the reference's
+    /// `project_authored_entry?`), and the merged entry's member-less
+    /// surface test covers the "no decl declares a member" half.
+    pub fn memberless_project_class(&self, qname: &str) -> bool {
+        self.qualified_project_sig_classes.contains(qname)
+            && self.qualified.get(qname).is_some_and(|e| e.memberless())
+    }
+
+    /// `memberless_project_classes[qname]` — the written superclass a
+    /// member-less project declaration records, resolved to a qualified
+    /// key (the raw, possibly `::`-rooted, spelling when it cannot be
+    /// resolved — the caller's `discovered_classes` read treats an
+    /// unresolvable name and a non-project one the same).
+    pub fn memberless_project_superclass(&self, qname: &str) -> Option<&'static str> {
+        if !self.memberless_project_class(qname) {
+            return None;
+        }
+        let (w, ctx) = self.qualified.get(qname)?.superclass_written.as_ref()?;
+        Some(self.resolve_written_ref(w, ctx).unwrap_or(w))
     }
 
     /// How many distinct classes the loaded RBS surface registered. A coarse
@@ -6437,6 +6507,12 @@ impl Builder {
                             entry.extends.push(modname);
                         }
                     }
+                    if let Some(w) = written_ref_ctx(ctx, &ext.name()) {
+                        let pair = (w, enclosing.to_vec());
+                        if !entry.extends_written.contains(&pair) {
+                            entry.extends_written.push(pair);
+                        }
+                    }
                 }
                 Node::Alias(a) => {
                     // `alias new old` aliases a method to another. An INSTANCE
@@ -6812,6 +6888,13 @@ impl Builder {
         for ext in entry.extends {
             if !slot.extends.contains(&ext) {
                 slot.extends.push(ext);
+            }
+        }
+        // Written extend refs union across reopens the same way the
+        // include/prepend pairs above do.
+        for pair in entry.extends_written {
+            if !slot.extends_written.contains(&pair) {
+                slot.extends_written.push(pair);
             }
         }
     }
