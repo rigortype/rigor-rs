@@ -422,6 +422,16 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> FoldOutcome {
         return int_pow_mod_result(IntReceiver::Int(a), e, m);
     }
 
+    // A Bignum or Float operand on `+`/`-`/`*` — `int + big` promotes past
+    // `i64`, `int + 1.5` coerces to a Float — computes through the same
+    // arbitrary-width path a BigInt receiver uses (rigor-rs#695). Other
+    // operand kinds still decline through the `Scalar::Int` arm below.
+    if let ("+" | "-" | "*", [b]) = (method, args) {
+        if matches!(b, Scalar::BigInt(_) | Scalar::Float(_)) {
+            return int_arith(&Scalar::Int(a), method, b);
+        }
+    }
+
     // Binary on a single Integer argument.
     let b = match args {
         [Scalar::Int(b)] => *b,
@@ -1334,14 +1344,15 @@ fn rational_oversized(denominator: String) -> FoldOutcome {
     }
 }
 
-/// Folds on a `Scalar::BigInt` receiver (rigor-rs#682). Only the members
-/// whose answer reads straight off the decimal spelling — predicates, sign
-/// ops, `to_s`, `succ`/`pred`, integer comparisons, and `<<`/`>>` — are
-/// folded; other binary arithmetic (`+`, `*`, `&`, …) needs the operand
-/// width the core does not model and declines to the RBS answer, the
-/// zero-FP-safe side. `**`/`pow` still declines to fold — but the WIDENED
-/// answer is decidable at the `numeric_blow_up_class` precheck
-/// (rigor-rs#694, [`bigint_pow_result`]).
+/// Folds on a `Scalar::BigInt` receiver (rigor-rs#682). The members whose
+/// answer reads straight off the decimal spelling — predicates, sign ops,
+/// `to_s`, `succ`/`pred`, integer comparisons, and `<<`/`>>` — are folded,
+/// and `+`/`-`/`*` compute through the arbitrary-width chunk path
+/// [`int_arith`] (rigor-rs#695); division, modulo and the bit ops (`&`,
+/// `|`, `^`, `[]`, `~`) still decline to the RBS answer, the zero-FP-safe
+/// side. `**`/`pow` still declines to fold — but the WIDENED answer is
+/// decidable at the `numeric_blow_up_class` precheck (rigor-rs#694,
+/// [`bigint_pow_result`]).
 fn fold_bigint(d: &str, method: &str, args: &[Scalar]) -> FoldOutcome {
     // `numeric_blow_up_class` at the head — the same operand precheck
     // `fold_int` consults.
@@ -1385,8 +1396,135 @@ fn fold_bigint(d: &str, method: &str, args: &[Scalar]) -> FoldOutcome {
         // `Integer#pow(exp, mod)` on a BigInt receiver — the reference folds
         // it through the same `invoke_ternary` catalog leaf (rigor-rs#769).
         ("pow", [e, m]) => int_pow_mod_result(IntReceiver::Big(d), e, m),
+        // `+`/`-`/`*` at arbitrary width — integer operands combine as
+        // sign + magnitude chunks, a Float operand coerces through
+        // `rb_big2dbl` (rigor-rs#695).
+        ("+" | "-" | "*", [b]) => int_arith(&Scalar::BigInt(d.to_string()), method, b),
         _ => FoldOutcome::Declined,
     }
+}
+
+/// `a <op> b` (`+` / `-` / `*`) on integer scalars at any width — the
+/// `Scalar::BigInt` arithmetic `fold_bigint` declined before (rigor-rs#695).
+///
+/// Integer operands are sign + little-endian base-1e9 chunks — the spelling
+/// [`decimal_chunks`] / [`chunks_mul`] / [`chunks_to_decimal`] already carry,
+/// so no new representation. `+`/`-` cost O(width); `*` is schoolbook
+/// O(w_a·w_b), so a bit-length lower bound on the operands answers
+/// `FoldOutcome::Widened` up front when it already clears
+/// [`INTEGER_FOLD_BIT_LIMIT`] — the `WidenedResult` the reference's
+/// `oversized_number?` mints, without spelling the product out. A spelled
+/// result exits through [`big_scalar`]'s gate like every integer result.
+///
+/// A Float operand coerces the integer operand the way `rb_big2dbl` /
+/// C's `(double)v` do (`big + 1.5` -> `1.0e20`, `1 + 1.5` -> `2.5`). A NaN —
+/// `inf * -0.0` is a Ruby Complex — declines like the reference's
+/// `foldable_constant_value?`, which never holds a NaN `Constant`.
+fn int_arith(a: &Scalar, method: &str, b: &Scalar) -> FoldOutcome {
+    if let Scalar::Float(f) = b {
+        let a = match a {
+            Scalar::Int(v) => *v as f64,
+            Scalar::BigInt(d) => match d.parse::<f64>() {
+                Ok(v) => v,
+                Err(_) => return FoldOutcome::Declined,
+            },
+            _ => return FoldOutcome::Declined,
+        };
+        let r = match method {
+            "+" => a + f,
+            "-" => a - f,
+            "*" => a * f,
+            _ => return FoldOutcome::Declined,
+        };
+        return if r.is_nan() {
+            FoldOutcome::Declined
+        } else {
+            FoldOutcome::Value(Scalar::Float(r))
+        };
+    }
+    let Some((a_neg, a_mag)) = int_operand_chunks(a) else {
+        return FoldOutcome::Declined;
+    };
+    let Some((b_neg, b_mag)) = int_operand_chunks(b) else {
+        return FoldOutcome::Declined;
+    };
+    let (neg, mag) = match method {
+        "+" => signed_chunk_sum(a_neg, &a_mag, b_neg, &b_mag),
+        "-" => signed_chunk_sum(a_neg, &a_mag, !b_neg, &b_mag),
+        "*" => {
+            // `0 * big` is `0` — check before the bit-length bound, which
+            // would otherwise widen the certain zero.
+            if chunks_is_zero(&a_mag) || chunks_is_zero(&b_mag) {
+                return FoldOutcome::Value(Scalar::Int(0));
+            }
+            // `floor(log2 |v|)` lower bounds: `|a·b| >= 2**(lb_a + lb_b)`,
+            // so the product's `bit_length` clears the limit the moment
+            // the bounds do (`v >= 2**13606` is `bit_length 13607`).
+            if chunks_bits_lb(&a_mag).saturating_add(chunks_bits_lb(&b_mag))
+                >= u128::from(INTEGER_FOLD_BIT_LIMIT)
+            {
+                return FoldOutcome::Widened("Integer");
+            }
+            (a_neg != b_neg, chunks_mul(&a_mag, &b_mag))
+        }
+        _ => return FoldOutcome::Declined,
+    };
+    big_scalar(chunks_to_decimal(neg, &mag))
+}
+
+/// An integer scalar as (negative, little-endian base-1e9 magnitude chunks)
+/// for [`int_arith`]. `Scalar::BigInt` is never 0; a `Scalar::Int(0)`
+/// magnitude parses to the all-zero chunks [`chunks_is_zero`] reads.
+fn int_operand_chunks(s: &Scalar) -> Option<(bool, Vec<u64>)> {
+    match s {
+        Scalar::Int(v) => Some((*v < 0, decimal_chunks(&v.unsigned_abs().to_string()))),
+        Scalar::BigInt(d) => {
+            Some((d.starts_with('-'), decimal_chunks(d.trim_start_matches('-'))))
+        }
+        _ => None,
+    }
+}
+
+/// The signed `a + b` combine over magnitude chunks: equal signs add the
+/// magnitudes, opposite signs subtract the smaller and keep the larger's
+/// sign. `b_neg` arrives already adjusted for `-` (the caller flips it).
+fn signed_chunk_sum(a_neg: bool, a: &[u64], b_neg: bool, b: &[u64]) -> (bool, Vec<u64>) {
+    if a_neg == b_neg {
+        (a_neg, chunks_add(a, b))
+    } else {
+        match chunks_cmp(a, b) {
+            std::cmp::Ordering::Greater => (a_neg, chunks_sub(a, b)),
+            std::cmp::Ordering::Less => (b_neg, chunks_sub(b, a)),
+            std::cmp::Ordering::Equal => (false, Vec::new()),
+        }
+    }
+}
+
+/// `a + b` on little-endian base-1e9 chunks.
+fn chunks_add(a: &[u64], b: &[u64]) -> Vec<u64> {
+    const CHUNK: u64 = 1_000_000_000;
+    let mut out = Vec::with_capacity(a.len().max(b.len()) + 1);
+    let mut carry = 0u64;
+    for i in 0..a.len().max(b.len()) {
+        let cur = a.get(i).copied().unwrap_or(0) + b.get(i).copied().unwrap_or(0) + carry;
+        out.push(cur % CHUNK);
+        carry = cur / CHUNK;
+    }
+    while carry > 0 {
+        out.push(carry % CHUNK);
+        carry /= CHUNK;
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// A lower bound on `floor(log2 |v|)` for a base-1e9 chunk vector —
+/// `v >= 1e9**(len-1)`, the chunk analogue of [`bigint_base_bits_lb`].
+fn chunks_bits_lb(chunks: &[u64]) -> u128 {
+    const LOG2_1E9: f64 = 29.897_352_854_986_263;
+    (chunks.len().saturating_sub(1) as f64 * LOG2_1E9) as u128
 }
 
 /// The compute side of `**`/`pow` on a `Scalar::BigInt` base, reached once
@@ -2072,11 +2210,70 @@ mod tests {
         assert_eq!(fold(&n, "<<", &[huge.clone()]), None);
         assert_eq!(fold(&n, ">>", &[huge.clone()]), Some(i(0)));
         assert_eq!(fold(&n, ">>", &[big("-99999999999999999999999999999999999999")]), None);
-        // Bignum arithmetic (besides shifts) and cross-kind `==` decline
-        // (the RBS answer).
-        assert_eq!(fold(&n, "+", &[i(1)]), None);
-        assert_eq!(fold(&n, "*", &[i(2)]), None);
+        // Cross-kind `==` declines (the RBS answer).
         assert_eq!(fold(&n, "==", &[Scalar::Str("x".into())]), None);
+    }
+
+    /// rigor-rs#695 — `+`/`-`/`*` on a `Scalar::BigInt` receiver, or with a
+    /// BigInt operand, fold exactly like the reference's arbitrary-precision
+    /// `public_send`. `/`, `%` and the bit ops still decline.
+    #[test]
+    fn folds_bigint_arithmetic() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        let n = big("99999999999999999999");
+        let neg = big("-99999999999999999999");
+        // Integer operand, either direction.
+        assert_eq!(fold(&n, "+", &[i(1)]), Some(big("100000000000000000000")));
+        assert_eq!(fold(&n, "-", &[i(3)]), Some(big("99999999999999999996")));
+        assert_eq!(fold(&n, "*", &[i(3)]), Some(big("299999999999999999997")));
+        assert_eq!(fold(&i(1), "+", &[n.clone()]), Some(big("100000000000000000000")));
+        assert_eq!(fold(&i(5), "-", &[n.clone()]), Some(big("-99999999999999999994")));
+        assert_eq!(fold(&i(3), "*", &[n.clone()]), Some(big("299999999999999999997")));
+        // BigInt operand both ways, all sign combinations.
+        assert_eq!(fold(&n, "+", &[n.clone()]), Some(big("199999999999999999998")));
+        assert_eq!(fold(&n, "-", &[big("99999999999999999998")]), Some(i(1)));
+        assert_eq!(fold(&n, "-", &[n.clone()]), Some(i(0)));
+        assert_eq!(fold(&neg, "+", &[i(1)]), Some(big("-99999999999999999998")));
+        assert_eq!(fold(&neg, "-", &[i(1)]), Some(big("-100000000000000000000")));
+        assert_eq!(fold(&neg, "*", &[i(-2)]), Some(big("199999999999999999998")));
+        assert_eq!(fold(&neg, "*", &[i(2)]), Some(big("-199999999999999999998")));
+        assert_eq!(fold(&neg, "+", &[n.clone()]), Some(i(0)));
+        // Zero factors and results demote to `Scalar::Int`.
+        assert_eq!(fold(&n, "*", &[i(0)]), Some(i(0)));
+        assert_eq!(fold(&i(0), "*", &[n.clone()]), Some(i(0)));
+        // A Float operand coerces through `rb_big2dbl` / `(double)v`.
+        assert_eq!(fold(&n, "+", &[Scalar::Float(1.5)]), Some(Scalar::Float(1e20)));
+        assert_eq!(fold(&i(1), "+", &[Scalar::Float(1.5)]), Some(Scalar::Float(2.5)));
+        // `inf * -0.0` is a Ruby NaN — declined (never a `Constant`).
+        let inf_recv = big(&"9".repeat(400));
+        assert_eq!(fold(&inf_recv, "*", &[Scalar::Float(-0.0)]), None);
+        // `/`, `%`, bit ops, and non-numeric operands still decline.
+        assert_eq!(fold(&n, "/", &[i(3)]), None);
+        assert_eq!(fold(&n, "%", &[i(3)]), None);
+        assert_eq!(fold(&n, "&", &[i(3)]), None);
+        assert_eq!(fold(&n, "+", &[Scalar::Str("x".into())]), None);
+    }
+
+    /// `big * big` (and `int * big`) past `INTEGER_FOLD_BIT_LIMIT` answers
+    /// the reference's `WidenedResult` without spelling the product
+    /// (rigor-rs#695).
+    #[test]
+    fn widens_bigint_products_past_the_bit_limit() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        let wide = big(&"9".repeat(5000));
+        assert_eq!(fold_outcome(&wide, "*", &[i(9)]), FoldOutcome::Widened("Integer"));
+        assert_eq!(fold(&wide, "*", &[i(9)]), None);
+        let half = big(&"9".repeat(2500));
+        assert_eq!(
+            fold_outcome(&half, "*", &[half.clone()]),
+            FoldOutcome::Widened("Integer")
+        );
+        // `+`/`-` on an oversized receiver still compute then gate the
+        // same way (`big_scalar` — fold() sees the Widened as None).
+        assert_eq!(fold(&wide, "+", &[i(1)]), None);
+        assert_eq!(fold(&wide, "-", &[wide.clone()]), Some(Scalar::Int(0)));
     }
 
     /// The `oversized_number?` result gate applies on a BigInt receiver too:

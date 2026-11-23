@@ -2508,8 +2508,8 @@ fn def_local_env_folds_operator_writes() {
         ("a = 1; begin; foo; rescue; a += 5; end; a", None),  // ref: (1 | 6)
         ("a = 1; begin; a += 1; ensure; a += 5; end; a", None),  // ref: 7
         ("a = 7; a /= 0; a", None),  // ref: Integer
-        ("a = 1; a += 1.5; a", None),  // ref: Float
-        ("a = 1.5; a += 1; a", None),  // ref: Float
+        ("a = 1; a += 1.5; a", Some("Float")),
+        ("a = 1.5; a += 1; a", None),  // ref: Float (Float receiver + Int arg still declines)
         ("a = 1; a += nil; a", None),  // ref: Integer
         ("a = 1; a += \"x\"; a", None),  // ref: Integer
         ("a = :s; a += 1; a", None),  // ref: None
