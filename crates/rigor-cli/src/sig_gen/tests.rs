@@ -2152,7 +2152,10 @@ def k31(c); x = 1; x = 2 if c; x; end
     assert_eq!(rows["k18"], r##"def k18: (untyped) -> 1"##);
     assert!(!rows.contains_key("k19"), "k19 must decline: {rows:?}");
     assert!(!rows.contains_key("k20"), "k20 must decline: {rows:?}");
-    assert!(!rows.contains_key("k22"), "k22 must decline: {rows:?}");
+    // rigor-rs#864: `type_of(Logical)` folds `true && false` → `false`, so the
+    // dead conditional write elides and `x` keeps `1` — the reference emits
+    // `-> 1` here too (oracle-probed `sig-gen --print`).
+    assert_eq!(rows["k22"], r##"def k22: (untyped) -> 1"##);
     assert_eq!(rows["k23"], r##"def k23: (untyped) -> 2"##);
     assert_eq!(rows["k24"], r##"def k24: (untyped) -> 2"##);
     assert_eq!(rows["k31"], r##"def k31: (untyped) -> (1 | 2)"##);
