@@ -23,7 +23,7 @@ pub mod line_index;
 pub use line_index::LineIndex;
 
 pub use ast::{
-    lower, lower_with_key, AncestryFacts, BlockParamKind, ConstName, GATED_FEATURES, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, MIXIN_UNNAMED, ConstMutation, FileKey, HashKey, HashKeyTag,
+    lower, lower_with_key, AncestryFacts, BlockParamKind, ConstName, GATED_FEATURES, MixinSide, UnpositionedMixin, MIXIN_WILDCARD, MIXIN_UNNAMED, ConstMutation, ConstWrite, FileKey, HashKey, HashKeyTag,
     Compound, IndexTargetKey, IndexWrites, IvarWrite, JumpKind, LoopKind, LoweredAst, MethodBody, MultiTarget, MultiTargets, Node,
     NodeId, OpWriteKind, ParamShape, RebindFacts, RebindReceiver, RebindSite, REBIND_METHOD_OBJECT_CALLS, RescueClause,
     Span, StatementsKind, Visibility,

@@ -9,7 +9,7 @@ use rigor_parse::{FileKey, LoweredAst, Node};
 
 use super::{
     collect_declared_names, collect_literal_constants, collect_meta_new_writes,
-    collect_override_classes, def_root_cx, DefKind,
+    collect_override_classes, def_root_cx, qualify, DefKind,
     file_orphan_defs, infer_method_returns, invert_definers, mutated_constant_names, walk_defs,
     walk_fold_defs, ConstLit, DefTables, FileDefs, FoldDefs, FoldSite, Harvest, HarvestedClass,
     HarvestedFoldDef, SourceIndex, WrittenChain,
@@ -423,6 +423,28 @@ impl SourceIndex {
                 ast.ancestry_facts(),
                 h.override_classes.iter().map(|oc| oc.qualified.as_str()),
             );
+        }
+
+        // rigor-rs#656: the plain-`=` constant-write census, joined
+        // project-wide with every write's lexical-resolution candidates
+        // expanded (a bare `PI =` under `module Math` binds exactly
+        // `Math::PI`; a `M::K =` path write contributes each prefix-run
+        // candidate of its head, like a read — an over-approximation that
+        // only ever under-emits the fold it gates).
+        for (_, ast) in files {
+            for w in ast.const_writes() {
+                if w.is_path {
+                    idx.constant_write_candidates.insert(w.name.clone());
+                    if !w.rooted {
+                        for j in 1..=w.prefix.len() {
+                            idx.constant_write_candidates
+                                .insert(qualify(&w.prefix[..j], &w.name));
+                        }
+                    }
+                } else {
+                    idx.constant_write_candidates.insert(qualify(&w.prefix, &w.name));
+                }
+            }
         }
 
         // Upstream v0.4.6 (#1817 / #2183): the rebinding-callee census,

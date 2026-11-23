@@ -1660,7 +1660,14 @@ fn fold_float(a: f64, method: &str, args: &[Scalar]) -> Option<Scalar> {
         // ±Infinity/NaN whose downstream display is sidecar territory (ADR-0008).
         _ => return None,
     };
-    Some(res)
+    // A NaN result declines (`foldable_constant_value?`), like `**` above:
+    // the reference never holds a `Constant[NaN]` (`NaN == NaN` is `false`,
+    // so it would corrupt type equality) — `1e400 - 1e400` and
+    // `Float::INFINITY - Float::INFINITY` type `Float` there, not `NaN`.
+    match res {
+        Scalar::Float(f) if f.is_nan() => None,
+        _ => Some(res),
+    }
 }
 
 /// `Float#<=>` (`flo_cmp`), which the reference folds by calling it
@@ -2459,6 +2466,32 @@ mod tests {
         assert_eq!(fold(&f(f64::NAN), "<=>", &[i(1)]), None);
         assert_eq!(fold(&f(1.0), "<=>", &[f(f64::INFINITY)]), None);
         assert_eq!(fold(&f(1.0), "<=>", &[]), None);
+    }
+
+    /// `foldable_constant_value?` — a NaN arithmetic RESULT declines; the
+    /// reference never holds a `Constant[NaN]` (`NaN == NaN` is `false`,
+    /// so it would corrupt type equality). `1e400 - 1e400` minted
+    /// `Constant[NaN]` on master until rigor-rs#656's fold made the shape
+    /// common; it now declines like `**` already did.
+    #[test]
+    fn float_arithmetic_declines_nan_results() {
+        let f = Scalar::Float;
+        assert_eq!(fold(&f(f64::INFINITY), "-", &[f(f64::INFINITY)]), None);
+        assert_eq!(
+            fold(&f(f64::INFINITY), "+", &[f(f64::NEG_INFINITY)]),
+            None
+        );
+        assert_eq!(fold(&f(f64::INFINITY), "*", &[f(0.0)]), None);
+        // Finite and infinite non-NaN results still fold.
+        assert_eq!(
+            fold(&f(f64::INFINITY), "+", &[f(f64::INFINITY)]),
+            Some(f(f64::INFINITY))
+        );
+        assert_eq!(
+            fold(&f(f64::INFINITY), "*", &[f(-1.0)]),
+            Some(f(f64::NEG_INFINITY))
+        );
+        assert_eq!(fold(&f(1.5), "-", &[f(0.5)]), Some(f(1.0)));
     }
 
     #[test]

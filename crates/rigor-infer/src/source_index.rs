@@ -606,6 +606,15 @@ pub struct SourceIndex {
     /// globals, and a project that names one anywhere is reason enough to
     /// decline. Backs [`Self::project_writes_constant`].
     project_constant_write_names: HashSet<String>,
+    /// rigor-rs#656: every QUALIFIED name a plain `=` constant write could
+    /// bind — the union of each write's lexical-resolution candidates (see
+    /// [`rigor_parse::ConstWrite`]). Project-wide and cross-file, like the
+    /// reference's `constant_shadowers` census: a `Math::PI =` in ANY file
+    /// (or a `PI =` under `module Math`, or a `M::Math::PI =` path write
+    /// anywhere its head resolves) stops the `Math::PI` fold at every read
+    /// site whose ladder reaches the name. Backs
+    /// [`Self::constant_write_shadows`].
+    constant_write_candidates: HashSet<String>,
     /// rigor-rs#672: the reference's `discovered_classes` —
     /// `collect_class_decls`'s accumulator: every nameable `class`/`module`
     /// declaration (`class A; class M` ⇒ `"A::M"`) AND every meta-new

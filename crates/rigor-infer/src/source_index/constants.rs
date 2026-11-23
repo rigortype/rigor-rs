@@ -155,6 +155,34 @@ impl SourceIndex {
         }
     }
 
+    /// rigor-rs#656 — the write side of the `PredefinedConstantRefinements`
+    /// shadow gate: whether ANY project `=` constant write could bind a name
+    /// the lexical ladder for a read of `name` at `use_prefix` consults —
+    /// the reference's `WRITTEN_CANDIDATE` stop
+    /// (`Reflection.constant_type_at`), which turns the read `Dynamic[top]`
+    /// even where a lower rung (the fold) would otherwise answer.
+    ///
+    /// The read's candidates mirror [`Self::qualified_literal_constant`]:
+    /// `use_prefix[..i]::name` for every initial segment run plus `name`
+    /// itself (a `rooted` read has only `name`). Project-wide and
+    /// cross-file, as the reference's `constant_shadowers` census is.
+    /// Deliberately blind to the write's VALUE: a literal write is folded by
+    /// C5 / `qualified_literal_constant` BEFORE this gate is consulted at the
+    /// same file, and the cross-file published scalar is a coverage loss the
+    /// port does not model yet — declining is the safe side of both.
+    pub fn constant_write_shadows(&self, name: &str, use_prefix: &[String], rooted: bool) -> bool {
+        if rooted {
+            return self.constant_write_candidates.contains(name);
+        }
+        if self.constant_write_candidates.contains(name) {
+            return true;
+        }
+        (1..=use_prefix.len()).any(|i| {
+            self.constant_write_candidates
+                .contains(&qualify(&use_prefix[..i], name))
+        })
+    }
+
     /// Whether the project defines a constant named `name` ANYWHERE (toplevel,
     /// nested, or as a discovered class/module) — the scope-INDEPENDENT
     /// companion to [`Self::constant_shadowed`]. Used by `type_dot_new`'s
