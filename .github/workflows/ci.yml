@@ -19,14 +19,19 @@
 # warning fails the run. The release pipeline lives in release.yml.
 name: ci
 
+# The merge queue on master (ruleset applied separately) runs this
+# workflow on each queued entry merged onto the entries ahead of it
+# (`merge_group`). "CI required" is the single required fan-in so a
+# docs-only PR does not hang on skipped Rust jobs. `paths-ignore` stays
+# on `push` only: the same filter on `pull_request` or `merge_group`
+# would leave a required check pending and block the queue.
 on:
   push:
     branches: [main, master]
     paths-ignore:
       - "**/*.md"
   pull_request:
-    paths-ignore:
-      - "**/*.md"
+  merge_group:
 
 # Cancel superseded runs on the same ref.
 concurrency:
@@ -34,8 +39,58 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Always runs on pull_request and merge_group. A paths-filtered required
+  # check hangs pending, so docs-only PRs skip the Rust jobs here instead
+  # of at the trigger. Push already skipped md-only trees via paths-ignore.
+  changes:
+    name: Detect code changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.detect.outputs.code }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: detect
+        name: Detect non-Markdown changes
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          MG_BASE: ${{ github.event.merge_group.base_sha }}
+          MG_HEAD: ${{ github.event.merge_group.head_sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "pull_request" ]; then
+            BASE="$PR_BASE"
+            HEAD="$PR_HEAD"
+          elif [ "$EVENT" = "merge_group" ]; then
+            BASE="$MG_BASE"
+            HEAD="$MG_HEAD"
+          else
+            # push: paths-ignore already skipped Markdown-only pushes
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if ! git diff --name-only "$BASE" "$HEAD" > /tmp/changed.txt; then
+            echo "Could not diff $BASE..$HEAD; failing safe to code=true"
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if grep -qvE '\.md$' /tmp/changed.txt; then
+            echo "code=true" >> "$GITHUB_OUTPUT"
+            echo "Non-Markdown changes:"
+            grep -vE '\.md$' /tmp/changed.txt || true
+          else
+            echo "code=false" >> "$GITHUB_OUTPUT"
+            echo "Markdown only — skipping the Rust jobs."
+          fi
+
   test:
     name: build + test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -82,6 +137,8 @@ jobs:
   # built binary + the snapshots — NOT the reference checkout.
   parity:
     name: snapshot parity gate
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -124,6 +181,8 @@ jobs:
   # `ruby harness/snapshot.rb` being re-run.
   reference-snapshots:
     name: snapshots match the live reference
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -147,3 +206,24 @@ jobs:
 
       - name: Snapshots are current
         run: ruby harness/snapshot.rb --check
+
+  # Single required check for the merge queue. Must always run (never
+  # `if:`-skip): a skipped required check hangs pending. When the diff is
+  # Markdown-only the Rust jobs are skipped and this job still succeeds.
+  ci-required:
+    name: CI required
+    needs: [changes, test, parity, reference-snapshots]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate
+        run: |
+          set -euo pipefail
+          echo "changes=${{ needs.changes.result }} code=${{ needs.changes.outputs.code }}"
+          echo "test=${{ needs.test.result }} parity=${{ needs.parity.result }} reference-snapshots=${{ needs.reference-snapshots.result }}"
+          test "${{ needs.changes.result }}" = "success"
+          if [ "${{ needs.changes.outputs.code }}" = "true" ]; then
+            test "${{ needs.test.result }}" = "success"
+            test "${{ needs.parity.result }}" = "success"
+            test "${{ needs.reference-snapshots.result }}" = "success"
+          fi
