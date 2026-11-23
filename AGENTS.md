@@ -80,21 +80,39 @@ probes** (`harness/probe.py`) on every row the change touches, plus
 still fires.
 
 **Every push (CI on the draft, about 6 minutes, `gh pr checks`).** Workspace
-tests on Linux and macOS; `cargo clippy --workspace --all-targets -- -D
+tests on Linux; `cargo clippy --workspace --all-targets -- -D
 warnings` on the pinned 1.88 toolchain; `run_snapshot.rb`; `snapshot.rb
 --check` against the live reference (the two together are `run.rb`); the docs
-budget. CI is the authority for clippy: a newer local clippy disagrees with
-1.88 (e.g. `only_used_in_recursion`). To check locally, run
+budget. macOS workspace tests are not part of PR or merge-queue CI — they
+run nightly on master, before a release is published, via
+`workflow_dispatch`, and on a pull request only when obviously
+macOS-dependent paths change, in a **separate** workflow (`ci-macos.yml`)
+that does not delay `ci.yml`. That check is advisory and is not part of
+`CI required`. The path filter is `crates/rigor-cli/src/pre_eval.rs`
+(the only `target_os = "macos"` compile-time branch, for `Dir.glob` case
+folding) and the workflow file itself. CI is the authority for clippy: a
+newer local clippy disagrees with 1.88 (e.g. `only_used_in_recursion`).
+To check locally, run
 `cargo +1.88.0 clippy --workspace --all-targets --locked -- -D warnings` in a
 fresh `CARGO_TARGET_DIR`: a warm target skips crates that already passed.
 
-**Once, before ready (local).**
+**FP sweep.** A CI subset of small public survey corpora runs on every PR
+and in the merge queue (workflow `fp-sweep-ci.yml`,
+`harness/sweep-corpora-ci.yml`). That check is **advisory** until it is
+promoted to required — do not block merge on it. The full standing set
+(`harness/sweep-corpora.yml`: mastodon, gitlab-foss, and the same survey
+trees at the machine-local checkouts) stays a local or periodic run,
+because those trees are large machine-specific checkouts.
+
+**Once, before ready (local, `review:full`).**
 - `cargo build --release` then `python3 harness/fp_audit.py --gaps --sweep`:
-  0 FP over the standing set (`harness/sweep-corpora.yml`), about 3 minutes.
-  The corpora are local checkouts, so this cannot run in CI. It measures
-  `target/release`, not the debug build `gate.sh` makes, and refuses a release
-  binary older than the crate sources.
-- The review (`docs/agents/review.md`).
+  0 FP over the standing set, about 3 minutes. The CI subset is not a
+  substitute for this. It measures `target/release`, not the debug build
+  `gate.sh` makes, and refuses a release binary older than the crate
+  sources.
+- The review (`docs/agents/review.md`) starts on the feature-complete head
+  in parallel with CI; ready and merge still wait for Approved and the
+  gates above.
 
 What the gates cannot see, so probe it by hand:
 

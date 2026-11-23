@@ -23,7 +23,8 @@ python3 harness/fp_audit.py reference/rigor/examples # any directories instead
 | Variable              | Default                                     | Purpose                                |
 |-----------------------|---------------------------------------------|----------------------------------------|
 | `REFERENCE_RIGOR_DIR` | `reference/rigor` (the PINNED submodule)    | The oracle. Pointing this at a working checkout compares against a different version — UPSTREAM.md hazard 3 |
-| `SWEEP_CORPORA`       | `harness/sweep-corpora.yml`                 | The standing sweep set's manifest      |
+| `SWEEP_CORPORA`       | `harness/sweep-corpora.yml`                 | Sweep manifest (`sweep-corpora-ci.yml` in CI) |
+| `SWEEP_CORPORA_ROOT`  | the repo root                               | Root for repo-relative manifest `path` values |
 | `RIGOR_RS_BIN`        | `target/release/rigor` (under repo root)    | Path to the rigor-rs binary. Same default in `fp_audit.py` and `gap_census.py` |
 
 ### Which binary IS rigor-rs

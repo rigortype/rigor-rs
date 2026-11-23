@@ -1,0 +1,82 @@
+# Advisory CI subset of the standing FP sweep (AGENTS.md → Gates).
+#
+# Shallow-clones a few small public survey gems and runs
+# `fp_audit.py --gaps --sweep` against `harness/sweep-corpora-ci.yml`.
+# Not a required check: it must not block self-merge or the merge queue
+# until it is promoted. `continue-on-error` keeps the workflow green if
+# the job fails; review.md also lists this check as advisory because
+# `gh pr checks` still reports a failed job as a failure.
+#
+# The standing set (mastodon, gitlab-foss, and these same survey trees at
+# the machine-local checkout) remains a local / periodic full sweep.
+name: fp-sweep-ci
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: fp-sweep-ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  sweep:
+    name: fp audit (CI subset)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - uses: dtolnay/rust-toolchain@1.88
+
+      - name: Install libclang
+        run: sudo apt-get update && sudo apt-get install -y clang libclang-dev
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: release-fp-sweep
+
+      # Pre-build with network; fp_audit.py's auto-build is `--offline`.
+      - name: Build release rigor
+        run: cargo build --release --locked -p rigor-cli
+
+      # The reference requires Ruby 4.0 (its Gemfile: ">= 4.0.0", "< 4.1").
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Install the reference's runtime gems
+        run: |
+          for g in prism rbs language_server-protocol; do
+            v=$(sed -n "s/^    $g (\\(.*\\))$/\\1/p" reference/rigor/Gemfile.lock)
+            test -n "$v" || { echo "no $g pin in reference/rigor/Gemfile.lock"; exit 1; }
+            gem install --no-document "$g:$v"
+          done
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install PyYAML
+        run: pip install pyyaml
+
+      - name: Shallow-clone the CI subset corpora
+        run: |
+          set -euo pipefail
+          mkdir -p ci-corpora
+          # Unpinned default branches: may drift from the machine-local
+          # rigor-survey checkouts. This job is advisory.
+          git clone --depth 1 --filter=blob:none https://github.com/mikel/mail.git ci-corpora/mail
+          git clone --depth 1 --filter=blob:none https://github.com/ruby-concurrency/concurrent-ruby.git ci-corpora/concurrent-ruby
+          git clone --depth 1 --filter=blob:none https://github.com/net-ssh/net-ssh.git ci-corpora/net-ssh
+          git clone --depth 1 --filter=blob:none https://github.com/haml/haml.git ci-corpora/haml
+
+      - name: Sweep the CI subset
+        env:
+          RIGOR_RS_BIN: ${{ github.workspace }}/target/release/rigor
+          SWEEP_CORPORA: harness/sweep-corpora-ci.yml
+        run: python3 harness/fp_audit.py --gaps --sweep
