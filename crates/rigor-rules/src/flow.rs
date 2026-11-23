@@ -280,8 +280,10 @@ pub(crate) fn check_always_raises(
 /// Integer-rooted ⇒ the caller declines.
 fn is_integer_rooted(interner: &Interner, index: &CoreIndex, ty: rigor_types::TypeId) -> bool {
     match interner.get(ty) {
-        // A value-pinned Integer literal (`Constant[Int(5)]`).
-        Type::Constant(Scalar::Int(_)) => true,
+        // A value-pinned Integer literal — `Constant[Int(5)]` or a Bignum
+        // (`Constant[BigInt]`); the reference's `value.is_a?(Integer)` covers
+        // both widths (rigor-rs#877).
+        Type::Constant(Scalar::Int(_) | Scalar::BigInt(_)) => true,
         // Any bounded Integer range is Integer-rooted (the reference fires on
         // `Type::IntegerRange` unconditionally).
         Type::IntegerRange { .. } => true,

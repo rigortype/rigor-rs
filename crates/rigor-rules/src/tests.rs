@@ -3136,6 +3136,29 @@ fn always_raises_fires_on_named_ops() {
 }
 
 #[test]
+fn always_raises_fires_on_bignum_receiver_div_zero() {
+    // `99999999999999999999 / 0` — a `Constant[BigInt]` receiver is
+    // Integer-rooted on the oracle (`value.is_a?(Integer)` covers Bignum),
+    // so the literal-zero divisor still fires (rigor-rs#877).
+    for (src, op) in [
+        (b"99999999999999999999 / 0\n" as &[u8], "/"),
+        (b"99999999999999999999 % 0\n", "%"),
+        (b"99999999999999999999.div(0)\n", "div"),
+        (b"99999999999999999999.modulo(0)\n", "modulo"),
+        (b"99999999999999999999.divmod(0)\n", "divmod"),
+    ] {
+        let diags = always_raises_diags(src);
+        assert_eq!(diags.len(), 1, "expected one diag for {op}, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            format!("always raises ZeroDivisionError: `{op}' by zero on Integer receiver")
+        );
+    }
+    // A Bignum DIVISOR is not the constant `0` — still silent.
+    assert!(always_raises_diags(b"5 / 99999999999999999999\n").is_empty());
+}
+
+#[test]
 fn always_raises_silent_on_nonzero_divisor() {
     // `5 / 2` — a valid division, never raises ⇒ silent.
     assert!(always_raises_diags(b"5 / 2\n").is_empty());
