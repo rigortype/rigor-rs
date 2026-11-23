@@ -3884,6 +3884,7 @@ impl<'i> Typer<'i> {
     /// as the mutator widens it, or drops the record when the widening
     /// declines. A call that may not have evaluated drops the record
     /// instead — the reference's join diverges the narrowing away.
+    #[allow(clippy::too_many_arguments)]
     fn apply_slot_mutation(
         &self,
         ast: &LoweredAst,
