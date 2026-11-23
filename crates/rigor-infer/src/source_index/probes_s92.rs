@@ -648,22 +648,19 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
     }
 
     // C5.
-    let mut lit_first: HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)> =
-        HashMap::new();
-    let mut lit_multi: HashSet<String> = HashSet::new();
-    let mut typed_writes: Vec<crate::source_index::TypedConstWrite> = Vec::new();
+    let mut lit_acc = LegacyLitAcc::default();
     for ast in asts {
         legacy_collect_literal_constants(
             ast,
             ast.root(),
             &[],
             ast.file_key(),
-            &mut lit_first,
-            &mut lit_multi,
             &mutated_constant_names(ast),
-            &mut typed_writes,
+            &mut lit_acc,
         );
     }
+    let (lit_first, lit_multi, typed_writes) =
+        (lit_acc.first, lit_acc.multi, lit_acc.typed);
     for qualified in lit_first.keys() {
         let bare = qualified.rsplit("::").next().unwrap_or(qualified).to_string();
         idx.project_constant_write_names.insert(bare);
@@ -838,22 +835,27 @@ fn legacy_collect_override_classes(
     }
 }
 
+/// The `legacy_collect_literal_constants` accumulators — bundled so the
+/// walk stays under clippy's argument cap.
+#[derive(Default)]
+struct LegacyLitAcc {
+    first: HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)>,
+    multi: HashSet<String>,
+    typed: Vec<crate::source_index::TypedConstWrite>,
+}
+
 fn legacy_collect_literal_constants(
     ast: &LoweredAst,
     node: NodeId,
     prefix: &[String],
     file: &FileKey,
-    first: &mut HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)>,
-    multi: &mut HashSet<String>,
     mutated: &HashSet<String>,
-    typed: &mut Vec<crate::source_index::TypedConstWrite>,
+    acc: &mut LegacyLitAcc,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                legacy_collect_literal_constants(
-                    ast, child, prefix, file, first, multi, mutated, typed,
-                );
+                legacy_collect_literal_constants(ast, child, prefix, file, mutated, acc);
             }
         }
         Node::ClassDef { name, body, .. } | Node::ModuleDef { name, body, .. } => {
@@ -871,10 +873,8 @@ fn legacy_collect_literal_constants(
                     child,
                     &child_prefix,
                     file,
-                    first,
-                    multi,
                     mutated,
-                    typed,
+                    acc,
                 );
             }
         }
@@ -883,22 +883,23 @@ fn legacy_collect_literal_constants(
             let lit = super::constants::empty_seed_lit(ast, *value)
                 .unwrap_or_else(|| const_lit_of(ast, *value))
                 .map(|l| widen_if_mutated(&qualified, l, mutated));
-            match first.entry(qualified.clone()) {
+            match acc.first.entry(qualified.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => {
-                    multi.insert(e.key().clone());
+                    acc.multi.insert(e.key().clone());
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert((prefix.to_vec(), file.clone(), lit));
                 }
             }
             // rigor-rs#910 — the typed table keeps every write's rvalue.
-            if let Some(w) = typed
+            if let Some(w) = acc
+                .typed
                 .iter_mut()
                 .find(|w| w.qualified == qualified && w.file == *file)
             {
                 w.values.push(*value);
             } else {
-                typed.push(crate::source_index::TypedConstWrite {
+                acc.typed.push(crate::source_index::TypedConstWrite {
                     mutated: mutated.contains(&qualified),
                     qualified,
                     namespace: prefix.to_vec(),
