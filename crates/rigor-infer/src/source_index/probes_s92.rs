@@ -144,6 +144,50 @@ fn fingerprint(idx: &SourceIndex, sorted: bool) -> Vec<(&'static str, String)> {
         ),
     ));
     out.push((
+        "typed_const_writes",
+        sort_join(
+            idx.typed_const_writes
+                .iter()
+                .map(|(k, v)| {
+                    let mut es: Vec<String> = v
+                        .iter()
+                        .map(|w| {
+                            format!(
+                                "{}#{f:?}={:?}/{}",
+                                w.namespace.join("::"),
+                                w.values,
+                                w.mutated,
+                                f = w.file
+                            )
+                        })
+                        .collect();
+                    if sorted {
+                        es.sort();
+                    }
+                    format!("{k}->[{}]", es.join(","))
+                })
+                .collect(),
+        ),
+    ));
+    out.push((
+        "qualified_typed_const_writes",
+        sort_join(
+            idx.qualified_typed_const_writes
+                .iter()
+                .map(|(k, v)| {
+                    let mut es: Vec<String> = v
+                        .iter()
+                        .map(|w| format!("{f:?}={:?}/{}", w.values, w.mutated, f = w.file))
+                        .collect();
+                    if sorted {
+                        es.sort();
+                    }
+                    format!("{k}->[{}]", es.join(","))
+                })
+                .collect(),
+        ),
+    ));
+    out.push((
         "project_constant_write_names",
         sort_join(idx.project_constant_write_names.iter().cloned().collect()),
     ));
@@ -607,6 +651,7 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
     let mut lit_first: HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)> =
         HashMap::new();
     let mut lit_multi: HashSet<String> = HashSet::new();
+    let mut typed_writes: Vec<crate::source_index::TypedConstWrite> = Vec::new();
     for ast in asts {
         legacy_collect_literal_constants(
             ast,
@@ -616,6 +661,7 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
             &mut lit_first,
             &mut lit_multi,
             &mutated_constant_names(ast),
+            &mut typed_writes,
         );
     }
     for qualified in lit_first.keys() {
@@ -635,6 +681,19 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
                 .insert(qualified, (namespace.clone(), file.clone(), l.clone()));
             idx.literal_constants.entry(bare).or_default().push((namespace, file, l));
         }
+    }
+    // rigor-rs#910 — the typed-RHS table: same gates as merge (the
+    // class/module collision alone; no literal or single-assignment gate).
+    for w in typed_writes {
+        let bare = w.qualified.rsplit("::").next().unwrap_or(&w.qualified).to_string();
+        if idx.override_classes.contains_key(&w.qualified) || idx.classes.contains_key(&bare) {
+            continue;
+        }
+        idx.typed_const_writes.entry(bare).or_default().push(w.clone());
+        idx.qualified_typed_const_writes
+            .entry(w.qualified.clone())
+            .or_default()
+            .push(w);
     }
 
     // Pass 2.
@@ -787,12 +846,13 @@ fn legacy_collect_literal_constants(
     first: &mut HashMap<String, (Vec<String>, FileKey, Option<ConstLit>)>,
     multi: &mut HashSet<String>,
     mutated: &HashSet<String>,
+    typed: &mut Vec<crate::source_index::TypedConstWrite>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
                 legacy_collect_literal_constants(
-                    ast, child, prefix, file, first, multi, mutated,
+                    ast, child, prefix, file, first, multi, mutated, typed,
                 );
             }
         }
@@ -814,6 +874,7 @@ fn legacy_collect_literal_constants(
                     first,
                     multi,
                     mutated,
+                    typed,
                 );
             }
         }
@@ -822,13 +883,28 @@ fn legacy_collect_literal_constants(
             let lit = super::constants::empty_seed_lit(ast, *value)
                 .unwrap_or_else(|| const_lit_of(ast, *value))
                 .map(|l| widen_if_mutated(&qualified, l, mutated));
-            match first.entry(qualified) {
+            match first.entry(qualified.clone()) {
                 std::collections::hash_map::Entry::Occupied(e) => {
                     multi.insert(e.key().clone());
                 }
                 std::collections::hash_map::Entry::Vacant(e) => {
                     e.insert((prefix.to_vec(), file.clone(), lit));
                 }
+            }
+            // rigor-rs#910 — the typed table keeps every write's rvalue.
+            if let Some(w) = typed
+                .iter_mut()
+                .find(|w| w.qualified == qualified && w.file == *file)
+            {
+                w.values.push(*value);
+            } else {
+                typed.push(crate::source_index::TypedConstWrite {
+                    mutated: mutated.contains(&qualified),
+                    qualified,
+                    namespace: prefix.to_vec(),
+                    file: file.clone(),
+                    values: vec![*value],
+                });
             }
         }
         _ => {}
@@ -1171,7 +1247,7 @@ fn assert_paths_agree(asts: &[&LoweredAst], core: &CoreIndex, label: &str) {
     let old_idx = build_project_legacy(asts, core);
 
     let (fresh, legacy) = (fingerprint(&new_idx, true), fingerprint(&old_idx, true));
-    assert_eq!(fresh.len(), 18, "the fingerprint must cover every field");
+    assert_eq!(fresh.len(), 20, "the fingerprint must cover every field");
     if let Some((field, x, y)) = diff(&fresh, &legacy).into_iter().next() {
         panic!("[{label}] canonical field `{field}` diverged\n  merge  : {x}\n  legacy : {y}");
     }
@@ -1625,7 +1701,13 @@ fn coupling_pass3_reads_the_merged_constant_table() {
     let a = lower(&parse(b"MAX = 5\nclass A\n  def m\n    MAX\n  end\nend\n"));
     let b = lower(&parse(b"MAX = 6\n"));
     assert_eq!(SourceIndex::build_project(&[&a], &core).method_return("A", "m"), Some("Integer"));
-    assert_eq!(SourceIndex::build_project(&[&a, &b], &core).method_return("A", "m"), None);
+    // The C5 literal table still declines the cross-file duplicate …
+    let two = SourceIndex::build_project(&[&a, &b], &core);
+    assert!(!two.literal_constants.contains_key("MAX"));
+    // … but rigor-rs#910's per-file typed table answers `a.rb`'s own write
+    // — exactly what the reference's per-file `in_source_constants` gives
+    // (`MAX = 5` in a.rb + `MAX = 6` in b.rb ⇒ `MAX` in a.rb reads `5`).
+    assert_eq!(two.method_return("A", "m"), Some("Integer"));
 }
 
 /// INVARIANT 2, example 4 (probe §2.2) — the Pass-4b overridable degrade is
