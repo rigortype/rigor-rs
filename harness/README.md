@@ -169,6 +169,17 @@ or scoping bug — [note](../docs/notes/20260731-survey-fp-triage-24.md)).
 python3 harness/fp_audit.py --gaps --sweep   # the standing set, per-rule gap map
 ```
 
+A **CI subset** of the smaller public survey gems (mail, concurrent-ruby,
+net-ssh, haml) is listed in `harness/sweep-corpora-ci.yml` and run by
+`.github/workflows/fp-sweep-ci.yml` on pull requests and in the merge queue.
+That job is advisory until promoted; it is not a substitute for the standing
+set. Paths in the CI manifest are repo-relative (`ci-corpora/...`);
+`fp_audit.py` resolves them against the repo root (or `SWEEP_CORPORA_ROOT`).
+
+```sh
+SWEEP_CORPORA=harness/sweep-corpora-ci.yml python3 harness/fp_audit.py --gaps --sweep
+```
+
 `--sweep` exists so the sweep set is a committed, reviewable thing instead of
 whatever directories the last session typed. That drift is not hypothetical: the
 survey corpora sat outside the hand-typed set and carried 24 false positives

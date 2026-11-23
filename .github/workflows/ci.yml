@@ -5,9 +5,10 @@
 # (AGENTS.md → Gates). Fixture parity is split in two reference-free/port-free
 # halves that together equal `harness/run.rb`: `parity` compares the port with
 # the committed snapshots, and `reference-snapshots` checks those snapshots
-# against the live reference at the pinned submodule. The FP sweep
-# (`harness/fp_audit.py --sweep`) needs machine-local corpora and stays a
-# LOCAL pre-ready gate.
+# against the live reference at the pinned submodule. The standing-set
+# FP sweep (`harness/fp_audit.py --sweep` on `sweep-corpora.yml`) needs
+# machine-local corpora and stays a local / periodic pre-ready gate. A
+# smaller public subset runs in the advisory `fp-sweep-ci.yml` workflow.
 #
 # rustfmt is intentionally not enforced (the codebase is hand-formatted; a
 # recorded decision — see docs/adr/0032-source-formatting-policy.md and the
