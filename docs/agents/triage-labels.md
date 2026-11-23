@@ -18,3 +18,16 @@ When a skill mentions a role (e.g. "apply the AFK-ready triage label"), use the 
 yet opened a draft PR for. It sits beside the state role rather than replacing
 it, and is removed once the draft PR (with `Closes #N`) exists. The protocol is
 in `AGENTS.md` → "Work loop".
+
+## Review tiers (pull requests)
+
+These labels select the review bar in `docs/agents/review.md`. They are not
+triage roles and do not replace `ready-for-agent` / `in-progress`. A PR
+carries at most one. **No review-tier label means `review:full`.**
+
+| Label          | Meaning                                                                 |
+| -------------- | ----------------------------------------------------------------------- |
+| `review:full`  | Default. Adversarial oracle re-probe; standing-set fp_audit before merge. |
+| `review:light` | Docs or comments only. Not for `harness/`, `docs_check.py`, `AGENTS.md`, or `docs/agents/review.md`. Short review; `docs.yml` green is enough. |
+| `review:human` | Human-only path (or so labelled). Agents do not self-merge.             |
+
