@@ -87,7 +87,9 @@ use ruby_rbs::node::{MethodDefinitionKind, Node as RbsNode, RBSLocationRange};
 
 use rigor_index::CoreIndex;
 use rigor_infer::{SourceIndex, TypeEnv, Typer};
-use rigor_parse::{lower, parse_bounded, LoweredAst, Node, NodeId, ParamShape, Visibility};
+use rigor_parse::{
+    lower, parse_bounded, ConstName, LoweredAst, Node, NodeId, ParamShape, Visibility,
+};
 use rigor_types::{ClassId, Interner, Type, TypeId};
 
 mod meta_class;
@@ -718,17 +720,20 @@ fn finalize_superclasses(
         .collect();
 
     let shell_files = info.shell_files.clone();
-    let declared_by_run = |kept: &[&Candidate]| -> HashSet<String> {
+    let declared_by_run = |kept: &[&Candidate]| -> HashSet<ConstName> {
         let written_cands: Vec<&&Candidate> = kept.iter().filter(|c| written(c)).collect();
         let paths: HashSet<&str> = written_cands.iter().map(|c| c.file.as_str()).collect();
-        let mut declared: HashSet<String> =
-            written_cands.iter().map(|c| c.class_name.clone()).collect();
+        let mut declared: HashSet<ConstName> =
+            written_cands.iter().map(|c| ConstName::from(c.class_name.as_str())).collect();
         for (file, shell) in &shell_files {
             if paths.contains(file.as_str()) {
-                declared.insert(shell.clone());
+                declared.insert(ConstName::from(shell.as_str()));
             }
         }
-        let wrappers: Vec<String> =
+        // The wrapper names prefix-share one allocation each (`wrapper_names`),
+        // so a depth-d written class extends the set by O(d) bytes, not the
+        // O(d²) per-level `join("::")` once wrote (rigor-rs#663).
+        let wrappers: Vec<ConstName> =
             declared.iter().flat_map(|n| superclasses::wrapper_names(n)).collect();
         declared.extend(wrappers);
         declared
@@ -784,19 +789,21 @@ fn finalize_superclasses(
     // `stamp_generic_reopenings` / `header_type_params`: every generic class
     // (plain parameters only) the run may open a header for — each
     // candidate's class (a skipped one's too, #2580), the classes it is
-    // nested in, and the shells.
-    let mut names: Vec<String> = candidates
+    // nested in, and the shells. The prefix lists share one allocation per
+    // name (`namespace_prefixes`), and only a name the loaded RBS actually
+    // spells — a small, depth-independent set — is copied into `params`.
+    let mut names: Vec<ConstName> = candidates
         .iter()
         .filter(|c| !c.class_name.is_empty())
-        .map(|c| c.class_name.clone())
-        .chain(info.shells.iter().cloned())
+        .map(|c| ConstName::from(c.class_name.as_str()))
+        .chain(info.shells.iter().map(|s| ConstName::from(s.as_str())))
         .flat_map(|n| generics::namespace_prefixes(&n))
         .collect();
     names.sort();
     names.dedup();
     for n in names {
         if let Some(spelling) = generics.header_spelling(&n) {
-            info.params.insert(n, spelling);
+            info.params.insert(n.to_string(), spelling);
         }
     }
 

@@ -12,6 +12,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use rigor_parse::ConstName;
 use rigor_parse::ruby_prism::{self, ClassNode, ModuleNode, Node as PrismNode, ParseResult, Visit};
 
 /// One `class` header with a plain-constant superclass.
@@ -148,10 +149,14 @@ pub fn resolve_token(
     token.to_string()
 }
 
-/// `wrapper_names`: `A::B::C` is written inside `A` and `A::B`.
-pub fn wrapper_names(name: &str) -> Vec<String> {
-    let segs: Vec<&str> = name.split("::").collect();
-    (1..segs.len()).map(|n| segs[..n].join("::")).collect()
+/// `wrapper_names`: `A::B::C` is written inside `A` and `A::B` — every
+/// `::`-level but the name itself, each prefix-sharing ONE allocation (the
+/// `namespace_prefixes` technique, rigor-rs#663).
+pub fn wrapper_names(name: &str) -> Vec<ConstName> {
+    let mut wrappers = super::generics::prefix_chain(name);
+    // `(1...segments.size)`: the full name is not its own wrapper.
+    wrappers.pop();
+    wrappers
 }
 
 /// `unresolved_superclass_root`: the first superclass token on `name`'s
@@ -160,7 +165,7 @@ pub fn wrapper_names(name: &str) -> Vec<String> {
 pub fn unresolved_root(
     name: &str,
     supers: &HashMap<String, String>,
-    emitted: &HashSet<String>,
+    emitted: &HashSet<ConstName>,
     rbs_known: &dyn Fn(&str) -> bool,
 ) -> Option<String> {
     let mut seen: HashSet<String> = HashSet::new();
@@ -174,7 +179,7 @@ pub fn unresolved_root(
         if rbs_known(&base) {
             return None;
         }
-        if !emitted.contains(&base) {
+        if !emitted.contains(base.as_str()) {
             return Some(superclass.clone());
         }
         current = base;
@@ -197,6 +202,9 @@ mod tests {
         assert_eq!(resolve_token("B", &["B".into()], "B::B", &declared), "B");
         assert_eq!(resolve_token("::Base", &["A".into()], "A::K", &declared), "::Base");
         assert_eq!(wrapper_names("A::B::C"), vec!["A".to_string(), "A::B".to_string()]);
+        // The full name is not its own wrapper; a single segment has none.
+        assert!(wrapper_names("A").is_empty());
+        assert!(wrapper_names("").is_empty());
     }
 
     #[test]
@@ -208,7 +216,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let emitted: HashSet<String> = ["Typed".to_string(), "Kid2".to_string()].into_iter().collect();
+        let emitted: HashSet<ConstName> = ["Typed", "Kid2"].into_iter().map(ConstName::from).collect();
         let known = |n: &str| n == "StandardError";
         assert_eq!(unresolved_root("Kid", &supers, &emitted, &known).as_deref(), Some("::Base"));
         assert_eq!(unresolved_root("Kid2", &supers, &emitted, &known), None);
