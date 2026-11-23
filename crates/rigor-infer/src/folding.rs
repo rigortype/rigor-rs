@@ -171,8 +171,8 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
                 | "floor" | "ceil" | "round" | "truncate"
                 | "abs" | "succ" | "pred" | "even?" | "odd?" | "zero?" | "to_s"
                 | "+@" | "-@"
-                // BigInt-receiver only so far (rigor-rs#877): the i64
-                // unary family is the issue's own deferred slice.
+                // Added for the BigInt receiver in rigor-rs#877; the i64
+                // receiver folds the same family since rigor-rs#893.
                 | "~" | "bit_length" | "next" | "magnitude" | "to_i" | "to_int"
                 | "to_f" | "nonzero?" | "finite?" | "infinite?" | "inspect"
                 | "abs2" | "to_r" | "to_c" | "rationalize"
@@ -415,6 +415,36 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> FoldOutcome {
         // `-1` still read the nominal where the reference folds the scalar).
         ("+@", []) => return FoldOutcome::Value(Scalar::Int(a)),
         ("-@", []) => return FoldOutcome::Value(int_scalar(-i128::from(a))),
+        // The rest of the reference's `INTEGER_UNARY` catalogue on an `i64`
+        // receiver (rigor-rs#893) — the same members [`fold_bigint`] spells on
+        // the Bignum side. `~` is `-(v + 1)` — the whole `i64` domain stays
+        // inside `i64` (`~i64::MIN` is `i64::MAX`); `next` is `succ`'s alias
+        // and `magnitude` is `abs`'s, both promoting past `i64` through
+        // [`int_scalar`]'s Bignum spelling like `succ`/`abs` do.
+        ("~", []) => return FoldOutcome::Value(int_scalar(-i128::from(a) - 1)),
+        ("next", []) => return FoldOutcome::Value(int_scalar(i128::from(a) + 1)),
+        ("magnitude", []) => return FoldOutcome::Value(int_scalar(i128::from(a).abs())),
+        ("bit_length", []) => {
+            return FoldOutcome::Value(Scalar::Int(ruby_bit_length(a) as i64));
+        }
+        // `to_i`/`to_int`/`floor`/`ceil`/`round`/`truncate` answer the
+        // receiver itself; `nonzero?` answers the receiver or `nil` — the
+        // oracle's fold, not `false` (`0.nonzero?` -> `for nil`).
+        ("to_i" | "to_int" | "floor" | "ceil" | "round" | "truncate", []) => {
+            return FoldOutcome::Value(Scalar::Int(a));
+        }
+        ("nonzero?", []) => {
+            return FoldOutcome::Value(if a == 0 { Scalar::Nil } else { Scalar::Int(a) });
+        }
+        // `finite?` is `true` on every Integer; `infinite?` is `nil`.
+        ("finite?", []) => return FoldOutcome::Value(Scalar::Bool(true)),
+        ("infinite?", []) => return FoldOutcome::Value(Scalar::Nil),
+        ("inspect", []) => return FoldOutcome::Value(Scalar::Str(a.to_string())),
+        // `abs2` is `v * v` — `i64::MIN`'s square promotes through
+        // [`int_scalar`]'s spelling, far under the bit limit.
+        ("abs2", []) => return FoldOutcome::Value(int_scalar(i128::from(a) * i128::from(a))),
+        // `to_f` is `rb_big2dbl` — a correct round-to-nearest `f64`.
+        ("to_f", []) => return FoldOutcome::Value(Scalar::Float(a as f64)),
         _ => {}
     }
 
@@ -482,9 +512,7 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> FoldOutcome {
     // `<=>`, `lcm`, `gcd`, `divmod`, `gcdlcm`, `digits`, the bit-test
     // predicates, the decimal rounders) and the operands the i64 fast path
     // cannot take (a Bignum or Float operand on the existing `\`/`%`/`&`/
-    // `|`/`^`/`[]` — `3 & big`, `5 % 2.5`). The i64-unary members the
-    // issue's carve-out defers (`~`, `bit_length`, `next`, `magnitude`,
-    // `to_i`, `finite?`, `nonzero?`, …) stay declined here.
+    // `|`/`^`/`[]` — `3 & big`, `5 % 2.5`).
     if let (m, [b]) = (method, args) {
         if matches!(
             m,
@@ -3225,6 +3253,44 @@ mod tests {
         assert_eq!(fold(&i(i64::MIN), "%", &[i(3)]), Some(i(1)));
     }
 
+    /// rigor-rs#893 — the `INTEGER_UNARY` members an `i64` receiver declined
+    /// while [`fold_bigint`] spelled them. Every expectation is the oracle's
+    /// probed fold: `nonzero?` answers the receiver or `nil` (never `false`),
+    /// `infinite?` is `nil`, and `i64`-overflow results promote to the
+    /// `Scalar::BigInt` spelling like `succ`/`abs`.
+    #[test]
+    fn folds_the_i64_integer_unary_family() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        assert_eq!(fold(&i(5), "~", &[]), Some(i(-6)));
+        assert_eq!(fold(&i(-5), "~", &[]), Some(i(4)));
+        assert_eq!(fold(&i(i64::MIN), "~", &[]), Some(i(i64::MAX)));
+        assert_eq!(fold(&i(5), "next", &[]), Some(i(6)));
+        assert_eq!(fold(&i(i64::MAX), "next", &[]), Some(big("9223372036854775808")));
+        assert_eq!(fold(&i(5), "bit_length", &[]), Some(i(3)));
+        assert_eq!(fold(&i(-8), "bit_length", &[]), Some(i(3)));
+        assert_eq!(fold(&i(0), "bit_length", &[]), Some(i(0)));
+        assert_eq!(fold(&i(-1), "bit_length", &[]), Some(i(0)));
+        assert_eq!(fold(&i(-5), "magnitude", &[]), Some(i(5)));
+        assert_eq!(fold(&i(i64::MIN), "magnitude", &[]), Some(big("9223372036854775808")));
+        for m in ["to_i", "to_int", "floor", "ceil", "round", "truncate"] {
+            assert_eq!(fold(&i(-5), m, &[]), Some(i(-5)), "{m}");
+        }
+        assert_eq!(fold(&i(5), "nonzero?", &[]), Some(i(5)));
+        assert_eq!(fold(&i(-5), "nonzero?", &[]), Some(i(-5)));
+        assert_eq!(fold(&i(0), "nonzero?", &[]), Some(Scalar::Nil));
+        assert_eq!(fold(&i(5), "finite?", &[]), Some(Scalar::Bool(true)));
+        assert_eq!(fold(&i(5), "infinite?", &[]), Some(Scalar::Nil));
+        assert_eq!(fold(&i(-5), "inspect", &[]), Some(Scalar::Str("-5".into())));
+        assert_eq!(fold(&i(5), "abs2", &[]), Some(i(25)));
+        assert_eq!(
+            fold(&i(i64::MIN), "abs2", &[]),
+            Some(big("85070591730234615865843651857942052864"))
+        );
+        assert_eq!(fold(&i(5), "to_f", &[]), Some(Scalar::Float(5.0)));
+        assert_eq!(fold(&i(i64::MAX), "to_f", &[]), Some(Scalar::Float(9.223372036854776e18)));
+    }
+
     /// The reference's `INTEGER_FOLD_BIT_LIMIT` / `oversized_number?` gates,
     /// applied to shifts and `**` (`shift_blow_up?` is `receiver.bit_length +
     /// shift`; a negative receiver counts `|v| - 1` bits).
@@ -3582,9 +3648,8 @@ mod tests {
         assert_eq!(fold(&i(99), "round", &[i(-1)]), Some(i(100)));
         assert_eq!(fold(&i(5), "round", &[i(-20)]), Some(i(0)));
         assert_eq!(fold(&i(-25), "round", &[i(-1)]), Some(i(-30)));
-        // Shared on an i64 receiver (the issue's deferred unary family
-        // stays declined — `~`, `to_i`, `bit_length`, `next`, `magnitude`,
-        // `nonzero?`, `finite?`, `infinite?`, `inspect`, `abs2`).
+        // Shared on an i64 receiver (the issue's unary family landed in
+        // rigor-rs#893 — `folds_the_i64_integer_unary_family`).
         assert_eq!(fold(&i(5), "ceildiv", &[i(3)]), Some(i(2)));
         assert_eq!(fold(&i(5), "remainder", &[i(3)]), Some(i(2)));
         assert_eq!(fold(&i(5), "fdiv", &[i(2)]), Some(Scalar::Float(2.5)));
@@ -3594,9 +3659,6 @@ mod tests {
         );
         assert_eq!(fold(&i(5), "gcd", &[i(0)]), Some(i(5)));
         assert_eq!(fold(&i(5), "lcm", &[i(3)]), Some(i(15)));
-        assert_eq!(fold(&i(5), "to_i", &[]), None);
-        assert_eq!(fold(&i(5), "~", &[]), None);
-        assert_eq!(fold(&i(5), "nonzero?", &[]), None);
         // BigInt unary family — self-returning members re-gate through
         // `big_scalar`; the rest spell themselves.
         assert_eq!(fold(&n, "to_i", &[]), Some(big("99999999999999999999")));
