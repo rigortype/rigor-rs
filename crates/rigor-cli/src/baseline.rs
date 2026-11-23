@@ -488,7 +488,13 @@ impl Baseline {
             };
             LoadError::fatal(text)
         })?;
-        Baseline::parse(&text, &path.display().to_string())
+        // `File.open(path, 'r:bom|utf-8')` drops a leading UTF-8 BOM before
+        // libyaml sees the text. libyaml under the forced `YAML_UTF8_ENCODING`
+        // reads U+FEFF as content (a column), which silently detaches the
+        // `version:` line or turns a `---` header into a SyntaxError. Same
+        // fix config.rs applies to `.rigor.yml`.
+        let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
+        Baseline::parse(text, &path.display().to_string())
     }
 
     /// Parse a baseline YAML document through the same pipeline the
@@ -3658,6 +3664,28 @@ mod tests {
         assert_eq!(
             reparsed.buckets()[0].message.as_deref(),
             b.buckets()[0].message.as_deref()
+        );
+    }
+
+    #[test]
+    fn load_strips_utf8_bom() {
+        // `File.open(path, 'r:bom|utf-8')` drops the BOM upstream; an
+        // editor-saved baseline with a BOM must still load (review of
+        // #327 found the silent-drop shape).
+        let dir = std::env::temp_dir().join(format!("rigor_base_bom_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("bom.yml");
+        std::fs::write(
+            &path,
+            "\u{feff}---\nversion: 1\nignored:\n- file: a.rb\n  rule: r.x\n  count: 1\n",
+        )
+        .unwrap();
+        let b = Baseline::load(&path).unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(b.size(), 1);
+        assert_eq!(
+            b.buckets()[0].file,
+            KeyScalar::Str("a.rb".to_string())
         );
     }
 }
