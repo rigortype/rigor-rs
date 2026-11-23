@@ -8,6 +8,7 @@
 
 use std::collections::HashMap;
 
+use rigor_parse::ConstName;
 use ruby_rbs::node::{Node as RbsNode, TypeParamVariance};
 
 use super::{collect_rbs_files, decl_full_name};
@@ -171,9 +172,37 @@ impl Generics {
 }
 
 /// `namespace_prefixes`: `A::B::C` → `A`, `A::B`, `A::B::C`.
-pub fn namespace_prefixes(class_name: &str) -> Vec<String> {
-    let segs: Vec<&str> = class_name.split("::").collect();
-    (1..=segs.len()).map(|n| segs[..n].join("::")).collect()
+///
+/// The name is stored ONCE and every level recorded by its byte length —
+/// the [`add_declared`]-technique (rigor-infer
+/// `source_index/def_attribution.rs`): a depth-d header costs O(d) bytes
+/// instead of the O(d²) the per-level `join("::")` wrote (rigor-rs#663).
+pub fn namespace_prefixes(class_name: &str) -> Vec<ConstName> {
+    prefix_chain(class_name)
+}
+
+/// Every `::`-level of `name`, each a [`ConstName`] prefix-sharing one
+/// allocation: `A::B::C` → `A`, `A::B`, `A::B::C` (the full name included).
+/// Segment arithmetic only — no intermediate segment list, no per-level
+/// string. Every boundary is a segment end, so each prefix slice is valid
+/// UTF-8, exactly as the old `join("::")` rendered it (a leading `::` reads
+/// as an empty first segment; an empty name is one empty segment).
+pub(in crate::sig_gen) fn prefix_chain(name: &str) -> Vec<ConstName> {
+    let full: std::sync::Arc<str> = std::sync::Arc::from(name);
+    let mut out = Vec::with_capacity(name.matches("::").count() + 1);
+    let mut end = 0usize;
+    let mut first = true;
+    for seg in name.split("::") {
+        // The `::` goes between segments (`first`), exactly as `join`.
+        if first {
+            first = false;
+        } else {
+            end += 2;
+        }
+        end += seg.len();
+        out.push(ConstName::prefix_of(&full, end));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -187,6 +216,24 @@ mod tests {
         assert_eq!(g.header_spelling("Array").as_deref(), Some("[unchecked out E]"));
         assert_eq!(g.header_spelling("String"), None);
         assert_eq!(namespace_prefixes("A::B"), vec!["A".to_string(), "A::B".to_string()]);
+    }
+
+    /// The prefix chain renders exactly what the per-level `join("::")` wrote,
+    /// edge spellings included: an empty name is one empty segment, a rooted
+    /// name leads with an empty segment, and a trailing `::` ends with one.
+    #[test]
+    fn prefix_chain_matches_per_level_join() {
+        let joined = |name: &str| {
+            let segs: Vec<&str> = name.split("::").collect();
+            (1..=segs.len()).map(|n| segs[..n].join("::")).collect::<Vec<_>>()
+        };
+        for name in ["", "A", "A::B::C", "::A", "A::", "A::::B", "::A::B::"] {
+            assert_eq!(
+                namespace_prefixes(name),
+                joined(name),
+                "prefix chain of {name:?} diverged from the per-level join"
+            );
+        }
     }
 
     /// The bundled declarations agree with each other: no core or stdlib
