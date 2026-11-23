@@ -1333,6 +1333,7 @@ impl SourceIndex {
     ///   * the member-less project declaration's own written superclass —
     ///     consulted when the source chain wrote none (`open_tail?`) —
     ///     names no project class.
+    ///
     /// An instance-side `include`/`prepend` never opens it (they add
     /// instance methods only), and a chain walk past [`CHAIN_LIMIT`] reads
     /// open, mirroring `truncated?`.
