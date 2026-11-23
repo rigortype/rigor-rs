@@ -1464,6 +1464,14 @@ impl<'i> Typer<'i> {
         node: NodeId,
         interner: &mut Interner,
     ) -> Option<TypeId> {
+        // The reference's `empty_seed?` reads the raw syntax: a seed literal
+        // wrapped in parens is a ParenthesesNode, never the String/Array/Hash
+        // spelling it holds — `X = ("")` renders `for ""`, `X = ([])` `for
+        // []`. The lowering unwraps single-statement parens, so the marker is
+        // what keeps those spellings out of the erase.
+        if ast.paren_unwrapped(node) {
+            return None;
+        }
         let nominal = |name: &str, args: Vec<TypeId>, interner: &mut Interner| {
             match self.index.class_id(name) {
                 Some(class) => interner.intern(Type::Nominal { class, args }),
@@ -1482,14 +1490,29 @@ impl<'i> Typer<'i> {
                 let u = interner.untyped();
                 Some(nominal("Hash", vec![u, u], interner))
             }
-            // `X.dup` of a seed keeps the seed's erased carrier. (`+""` is
-            // NOT handled here: the oracle's `X = +"")` renders `for ""`, not
-            // `for String`, so it falls through to `type_of` like any other
-            // call — measured, `docs` probe set for #910.)
+            // `X.dup` of a seed keeps the seed's erased carrier (`"".dup` ⇒
+            // `for String`); the parens check on entry already handles
+            // `("").dup` ⇒ `for ""`.
             Node::Call { receiver: Some(r), method, args, block_body, .. }
                 if method == "dup" && args.is_empty() && block_body.is_empty() =>
             {
                 self.empty_seed_nominal(ast, *r, interner)
+            }
+            // `+""` — the unfrozen empty String the accumulator idiom spells
+            // under `# frozen_string_literal: true` — erases like `"")` UNLESS
+            // the receiver was parenthesized: `+""` ⇒ `for String` but
+            // `+("")` ⇒ `for ""` (both measured).
+            Node::Call { receiver: Some(r), method, args, block_body, .. }
+                if method == "+@"
+                    && args.is_empty()
+                    && block_body.is_empty()
+                    && !ast.paren_unwrapped(*r)
+                    && matches!(
+                        ast.get(*r),
+                        Node::StringLit { value, .. } if value.is_empty()
+                    ) =>
+            {
+                Some(nominal("String", vec![], interner))
             }
             _ => None,
         }

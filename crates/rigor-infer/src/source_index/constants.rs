@@ -35,18 +35,34 @@ impl SourceIndex {
     /// constant. The reference's constant-value table is per-file (see the field
     /// docs); before this gate a same-namespace cross-file read folded here and
     /// was silent in the oracle.
+    ///
+    /// rigor-rs#910 review — the lexical winner resolves PROJECT-WIDE first,
+    /// and only then does the per-file gate apply: a deeper-namespace `=`
+    /// write in ANOTHER file still binds the candidate (the
+    /// `constant_shadowers` stop answers `Dynamic[top]` there), so a
+    /// cross-file innermost entry must DECLINE the consult, never fall
+    /// through to a shallower same-file one — `X = 5` in e.rb does not
+    /// answer inside `module M` when d.rb writes `M::X` (the oracle is
+    /// silent on that shape).
     pub fn literal_constant(
         &self,
         name: &str,
         use_prefix: &[String],
         use_file: &FileKey,
     ) -> Option<&ConstLit> {
-        self.literal_constants
-            .get(name)?
+        let entries = self.literal_constants.get(name)?;
+        let depth = entries
             .iter()
-            .filter(|(_, file, _)| file == use_file)
             .filter(|(ns, _, _)| c5_namespace_visible(ns, use_prefix))
-            .max_by_key(|(ns, _, _)| c5_namespace_depth(ns))
+            .map(|(ns, _, _)| c5_namespace_depth(ns))
+            .max()?;
+        entries
+            .iter()
+            .find(|(ns, file, _)| {
+                file == use_file
+                    && c5_namespace_visible(ns, use_prefix)
+                    && c5_namespace_depth(ns) == depth
+            })
             .map(|(_, _, lit)| lit)
     }
 
@@ -157,9 +173,14 @@ impl SourceIndex {
     /// lexical-visibility gates but neither the literal-only nor the
     /// single-assignment gate — the reference's `in_source_constants`
     /// records `type_of` for EVERY `=` write's rvalue and unions repeated
-    /// writes. The winner is still the innermost visible defining
-    /// namespace; a `rooted` read (`::X`) consults toplevel entries only.
-    /// The caller types the returned `values` and applies `mutated`.
+    /// writes. The winner is the innermost visible defining namespace
+    /// resolved PROJECT-WIDE, like [`Self::literal_constant`] — a
+    /// deeper-namespace write in another file binds the candidate even
+    /// where this file's table lacks it, and only then does the per-file
+    /// gate apply (a cross-file winner declines, never falls through to a
+    /// shallower same-file entry — the census stop owns that shape). A
+    /// `rooted` read (`::X`) consults toplevel entries only. The caller
+    /// types the returned `values` and applies `mutated`.
     pub(crate) fn typed_const_write(
         &self,
         name: &str,
@@ -167,13 +188,19 @@ impl SourceIndex {
         use_file: &FileKey,
         rooted: bool,
     ) -> Option<&TypedConstWrite> {
-        self.typed_const_writes
-            .get(name)?
+        let entries = self.typed_const_writes.get(name)?;
+        let depth = entries
             .iter()
-            .filter(|w| w.file == *use_file)
             .filter(|w| !rooted || w.namespace.is_empty())
             .filter(|w| c5_namespace_visible(&w.namespace, use_prefix))
-            .max_by_key(|w| c5_namespace_depth(&w.namespace))
+            .map(|w| c5_namespace_depth(&w.namespace))
+            .max()?;
+        entries.iter().find(|w| {
+            w.file == *use_file
+                && (!rooted || w.namespace.is_empty())
+                && c5_namespace_visible(&w.namespace, use_prefix)
+                && c5_namespace_depth(&w.namespace) == depth
+        })
     }
 
     /// rigor-rs#910 — the qualified-path spelling of [`Self::typed_const_write`]
