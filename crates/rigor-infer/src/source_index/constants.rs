@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use rigor_parse::{FileKey, LoweredAst, Node, NodeId};
 use rigor_types::{Scalar, ShapeKey};
 
-use super::{qualify, split_qualified, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex};
+use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex};
 
 impl SourceIndex {
     /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
@@ -55,6 +55,24 @@ impl SourceIndex {
                 ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
             })
         })
+    }
+
+    /// rigor-rs#878 — the harvested literal for an already-QUALIFIED name
+    /// (`"Base::K"`) — the ancestor-candidate half of [`Self::literal_constant`],
+    /// which only resolves a bare `name` against `use_prefix`. Same per-file
+    /// gate (the reference's in-source constants table is rebuilt per file).
+    pub(crate) fn literal_constant_at(&self, qualified: &str, file: &FileKey) -> Option<&ConstLit> {
+        self.qualified_literal_constants
+            .get(qualified)
+            .filter(|(_, f, _)| f == file)
+            .map(|(_, _, lit)| lit)
+    }
+
+    /// rigor-rs#878 — whether a plain `=` write binds this exact QUALIFIED
+    /// candidate (`"Base::K"`) — the ancestor-candidate half of the
+    /// `constant_shadowers` census [`Self::constant_write_shadows`] consults.
+    pub(crate) fn constant_write_candidates_contains(&self, qualified: &str) -> bool {
+        self.constant_write_candidates.contains(qualified)
     }
 
     /// Collection-shape stage 2b: whether the project ASSIGNS a constant with
@@ -183,6 +201,38 @@ impl SourceIndex {
         })
     }
 
+    /// rigor-rs#878 — whether the project declares a `class`/`module` at
+    /// EXACTLY `candidate` (a qualified name like `"M::ARGV"`, or a bare
+    /// leaf at top level) — the decl half of the reference's
+    /// `singleton_for_name(candidate) || in_source_constants[candidate]`
+    /// check that `Reflection.constant_type_at` runs per lexical
+    /// candidate BEFORE `constant_for_name`. Differs from
+    /// [`Self::constant_shadowed`] in precision: `constant_shadowed` asks
+    /// whether a bare read's LADDER is shadowed (a decl at `M::ARGV`
+    /// legitimately shadows `ARGV` read inside `module M`), while this
+    /// asks whether ONE qualified name is bound — `M::ARGV` does not
+    /// bind the toplevel `ARGV` candidate (measured: the oracle still
+    /// fires `ARGV.bogus` → `Array[String]` after `module M; module
+    /// ARGV`). `knows_discovered_decl` does the exact qualified match;
+    /// the `classes` fallback only fires when the leaf was never seen
+    /// by the qualified walk (`constant_shadowed`'s `None` arm — a
+    /// `def`-nested or walk-gap decl, whose qualified name IS its leaf).
+    pub fn project_declares_constant(&self, candidate: &str) -> bool {
+        if self.knows_discovered_decl(candidate) {
+            return true;
+        }
+        let Some(pos) = candidate.rfind("::") else {
+            return self.toplevel_constants.contains(candidate)
+                || (!self.nested_constant_namespaces.contains_key(candidate)
+                    && self.classes.contains_key(candidate));
+        };
+        let (ns_part, leaf) = (&candidate[..pos], &candidate[pos + 2..]);
+        match self.nested_constant_namespaces.get(leaf) {
+            Some(nss) => nss.iter().any(|ns| ns.join("::") == ns_part),
+            None => self.classes.contains_key(leaf),
+        }
+    }
+
     /// Whether the project defines a constant named `name` ANYWHERE (toplevel,
     /// nested, or as a discovered class/module) — the scope-INDEPENDENT
     /// companion to [`Self::constant_shadowed`]. Used by `type_dot_new`'s
@@ -247,7 +297,14 @@ pub(crate) fn collect_literal_constants(
             if name.is_empty() {
                 return;
             }
-            let child_prefix = split_qualified(&qualify(prefix, name));
+            // Atomic `Module.nesting` entries — `class Float::Sub` is ONE
+            // entry, not `Float` + `Sub` (rigor-rs#878 review; see
+            // [`collect_lexical_scopes`]).
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
                 collect_literal_constants(ast, child, &child_prefix, out, seen, mutated);
             }

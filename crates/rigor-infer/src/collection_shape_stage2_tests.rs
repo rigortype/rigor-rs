@@ -148,3 +148,153 @@ fn s2e_cross_namespace_path_declines() {
 fn s2b_nilable_object_constant_return_declines() {
     assert_eq!(ty_of_last_recv_call(b"def f\n  x = ENV['HOME']\nend\n"), "Dynamic[top]");
 }
+
+// --- 878: `constant_for_name` (RBS constant decls + refinements) ---------
+
+/// FIRE (oracle probes): a bare non-class constant read types through the
+/// `constant_for_name` rung — tier-2 runtime-String refinement
+/// (`RUBY_VERSION` → `non-empty-string`, so `.upcase` is `String`) and
+/// RBS `constant_type` (`ARGV` → `Array[String]`, `Float::DIG` →
+/// `Integer`, `ENV` → `RBS::Unnamed::ENVClass`). Tier-1
+/// `FOLDED_CONSTANTS` mints a `Constant(Float)` (`Math::PI` → `3.14…`),
+/// which call dispatch does not yet carry a method answer for — a
+/// pre-existing folded-constant gap, not this rung's.
+#[test]
+fn c878_refinement_and_rbs_constants_type() {
+    assert_eq!(
+        ty_of_last_recv_call(b"def f\n  x = ARGV.length\nend\n"),
+        "Integer"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"def f\n  x = RUBY_VERSION.upcase\nend\n"),
+        "String"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"def f\n  x = Float::DIG.to_s\nend\n"),
+        "String"
+    );
+}
+
+/// FIRE (oracle probe): the lexical ladder reaches the toplevel candidate
+/// — `ARGV` read inside `module M` still types `Array[String]` because the
+/// `M::ARGV` candidate is unbound and the walk continues to `ARGV`.
+#[test]
+fn c878_lexical_ladder_reaches_toplevel() {
+    assert_eq!(
+        ty_of_last_recv_call(b"module M\n  def f\n    x = ARGV.length\n  end\nend\n"),
+        "Integer"
+    );
+}
+
+/// DECLINE (oracle probes): a project binding at ANY candidate ends the
+/// walk — `module M; module ARGV` binds the `M::ARGV` candidate so the
+/// read inside `M` stays Dynamic (the oracle is silent there), while a
+/// TOPLEVEL `ARGV` read is untouched (the oracle still fires
+/// `Array[String]` — `M::ARGV` is not its candidate).
+#[test]
+fn c878_project_decl_binds_only_its_candidate() {
+    assert_eq!(
+        ty_of_last_recv_call(
+            b"module M\n  module ARGV\n  end\n  def f\n    x = ARGV.length\n  end\nend\n"
+        ),
+        "Dynamic[top]"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(
+            b"module M\n  module ARGV\n  end\nend\ndef f\n  x = ARGV.length\nend\n"
+        ),
+        "Integer"
+    );
+}
+
+/// DECLINE (oracle probes): a toplevel `class`/`module`/`=` binding of the
+/// constant's own name ends the walk — `module ENV`, `class RUBY_VERSION`
+/// and `ARGV = compute` all keep their reads Dynamic where the oracle is
+/// silent (or answers via its in-source rungs, unported).
+#[test]
+fn c878_toplevel_project_binding_declines() {
+    assert_eq!(
+        ty_of_last_recv_call(b"module ENV\nend\ndef f\n  x = ENV.keys\nend\n"),
+        "Dynamic[top]"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"class RUBY_VERSION\nend\ndef f\n  x = RUBY_VERSION.upcase\nend\n"),
+        "Dynamic[top]"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(b"ARGV = compute\ndef f\n  x = ARGV.length\nend\n"),
+        "Dynamic[top]"
+    );
+}
+
+/// DECLINE (rigor-rs#878 review, oracle probes): `Module.nesting` entries are
+/// AS-WRITTEN — `class Float::Sub` contributes ONE entry `Float::Sub`, so
+/// `DIG` inside it is `Float::Sub::DIG`, then `DIG` — never `Float::DIG`
+/// (the oracle is silent; splitting the entries fired `for Integer`).
+#[test]
+fn c878_review_compact_nesting_is_one_entry() {
+    assert_eq!(
+        ty_of_last_recv_call(b"class Float::Sub\n  def f\n    x = DIG + 1\n  end\nend\n"),
+        "Dynamic[top]"
+    );
+    // Must-still-fire: nested `module Float; class Sub` DOES reach
+    // `Float::DIG` (the oracle fires `for Integer`).
+    assert_eq!(
+        ty_of_last_recv_call(
+            b"module Float\n  class Sub\n    def f\n      x = DIG + 1\n    end\n  end\nend\n"
+        ),
+        "Integer"
+    );
+}
+
+/// DECLINE (rigor-rs#878 review, oracle probe): the ancestor rung sits
+/// BETWEEN the nesting walk and the top level — a `Base::ARGV` write
+/// binds `ARGV` inside `class Sub < Base` before the toplevel `ARGV`
+/// rung (the oracle is silent; skipping the rung read `Array[String]`).
+#[test]
+fn c878_review_ancestor_binding_ends_the_walk() {
+    assert_eq!(
+        ty_of_last_recv_call(
+            b"class Base\n  ARGV = $x\nend\nclass Sub < Base\n  def f\n    x = ARGV.length\n  end\nend\n"
+        ),
+        "Dynamic[top]"
+    );
+}
+
+/// FIRE (rigor-rs#878 review, oracle probes): the ancestor rung ANSWERS
+/// too — a same-file literal `Base::K = 5` folds `for 5` inside
+/// `class Sub < Base` (the reference's in-source constants table), and a
+/// `Float` namespace the project itself discovers (`class Float::Sub`)
+/// makes `Sub < Float` consult `Float::DIG`.
+#[test]
+fn c878_review_ancestor_rung_answers() {
+    assert_eq!(
+        ty_of_last_recv_call(
+            b"class Base\n  K = 5\nend\nclass Sub < Base\n  def f\n    x = K + 1\n  end\nend\n"
+        ),
+        "Integer"
+    );
+    assert_eq!(
+        ty_of_last_recv_call(
+            b"class Float::Sub\nend\nclass Sub < Float\n  def f\n    x = DIG + 1\n  end\nend\n"
+        ),
+        "Integer"
+    );
+    // Without the project `Float` discovery, `Sub < Float` consults nothing
+    // (external superclass edge — the oracle is silent).
+    assert_eq!(
+        ty_of_last_recv_call(b"class Sub < Float\n  def f\n    x = DIG + 1\n  end\nend\n"),
+        "Dynamic[top]"
+    );
+}
+
+/// DECLINE (rigor-rs#878 review, oracle probe): `BigDecimal::ROUND_MODE`'s
+/// declared type lives in the host-installed gem's `sig/` (an alias the
+/// reference declines), not the vendored `Integer` — silent on both.
+#[test]
+fn c878_review_host_gem_sig_declines() {
+    assert_eq!(
+        ty_of_last_recv_call(b"def f\n  x = BigDecimal::ROUND_MODE + 1\nend\n"),
+        "Dynamic[top]"
+    );
+}

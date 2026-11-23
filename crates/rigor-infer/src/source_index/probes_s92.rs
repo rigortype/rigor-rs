@@ -492,20 +492,19 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
     }
 
     // Pass 1b.
+    let mut decl_ns_pairs: Vec<(String, Vec<String>)> = Vec::new();
     for (file, ast) in asts.iter().enumerate() {
-        legacy_collect_override_classes(&mut idx, file, ast, ast.root(), &[]);
+        legacy_collect_override_classes(&mut idx, file, ast, ast.root(), &[], &mut decl_ns_pairs);
     }
 
-    // C1.
-    let qualified_defs: Vec<String> = idx.override_classes.keys().cloned().collect();
-    for qualified in &qualified_defs {
-        let segs: Vec<&str> = qualified.split("::").collect();
-        let Some((name, ns)) = segs.split_last() else { continue };
-        if ns.is_empty() {
-            idx.toplevel_constants.insert((*name).to_string());
+    // C1 — atomic `Module.nesting` chains like merge's C1 (rigor-rs#878
+    // review): `class Float::Sub` contributes `["Float::Sub"]`, not
+    // `["Float", "Sub"]`.
+    for (name, ns_vec) in decl_ns_pairs {
+        if ns_vec.is_empty() {
+            idx.toplevel_constants.insert(name);
         } else {
-            let ns_vec: Vec<String> = ns.iter().map(|s| (*s).to_string()).collect();
-            let entry = idx.nested_constant_namespaces.entry((*name).to_string()).or_default();
+            let entry = idx.nested_constant_namespaces.entry(name).or_default();
             if !entry.contains(&ns_vec) {
                 entry.push(ns_vec);
             }
@@ -664,6 +663,20 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
         }
     }
 
+    // Pass 2d (rigor-rs#878 — mirrors `harvest.rs`): register every class an
+    // RBS constant-decl type can mint so the merge path's `names` equals the
+    // legacy build's.
+    for name in core.constant_decl_class_names() {
+        if !idx.classes.contains_key(name)
+            && (core.knows_class(name) || core.knows_qualified_class(name))
+        {
+            if !idx.name_to_id.contains_key(name) {
+                idx.declaration_only_classes.insert(name.to_string());
+            }
+            idx.register(name);
+        }
+    }
+
     // Pass 3.
     let (returns, param_bound) = infer_method_returns(&idx, core, asts);
     idx.method_returns = returns;
@@ -683,11 +696,12 @@ fn legacy_collect_override_classes(
     ast: &LoweredAst,
     node: NodeId,
     prefix: &[String],
+    decl_ns_pairs: &mut Vec<(String, Vec<String>)>,
 ) {
     match ast.get(node) {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             for &child in body {
-                legacy_collect_override_classes(idx, file, ast, child, prefix);
+                legacy_collect_override_classes(idx, file, ast, child, prefix, decl_ns_pairs);
             }
         }
         Node::ClassDef {
@@ -704,6 +718,10 @@ fn legacy_collect_override_classes(
                 return;
             }
             let qualified = qualify(prefix, name);
+            decl_ns_pairs.push((
+                qualified.rsplit("::").next().unwrap().to_string(),
+                decl_namespace(prefix, name),
+            ));
             idx.ingest_override_class(
                 file,
                 &qualified,
@@ -716,9 +734,13 @@ fn legacy_collect_override_classes(
                 false,
                 &[],
             );
-            let child_prefix = split_qualified(&qualified);
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
-                legacy_collect_override_classes(idx, file, ast, child, &child_prefix);
+                legacy_collect_override_classes(idx, file, ast, child, &child_prefix, decl_ns_pairs);
             }
         }
         Node::ModuleDef {
@@ -728,6 +750,10 @@ fn legacy_collect_override_classes(
                 return;
             }
             let qualified = qualify(prefix, name);
+            decl_ns_pairs.push((
+                qualified.rsplit("::").next().unwrap().to_string(),
+                decl_namespace(prefix, name),
+            ));
             idx.ingest_override_class(
                 file,
                 &qualified,
@@ -740,9 +766,13 @@ fn legacy_collect_override_classes(
                 true,
                 &[],
             );
-            let child_prefix = split_qualified(&qualified);
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
-                legacy_collect_override_classes(idx, file, ast, child, &child_prefix);
+                legacy_collect_override_classes(idx, file, ast, child, &child_prefix, decl_ns_pairs);
             }
         }
         _ => {}
@@ -770,7 +800,11 @@ fn legacy_collect_literal_constants(
             if name.is_empty() {
                 return;
             }
-            let child_prefix = split_qualified(&qualify(prefix, name));
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
                 legacy_collect_literal_constants(
                     ast,
@@ -1102,7 +1136,11 @@ fn legacy_walk_fold_defs(
                     }
                 }
             }
-            let child_prefix = split_qualified(&qualified);
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
                 legacy_walk_fold_defs(ast_idx, ast, child, &child_prefix, defs);
             }

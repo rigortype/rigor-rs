@@ -556,6 +556,113 @@ impl RbsReturnShape {
     }
 }
 
+/// rigor-rs#878 — the retained declared type of an RBS **constant
+/// declaration** (`Float::NAN: Float`, `ARGV: Array[String]`,
+/// `ENV: RBS::Unnamed::ENVClass`) — the rigor-rs analogue of the RBS
+/// `RBS::Types::*` the reference's `translate_constant_decl` feeds
+/// `RbsTypeTranslator` (`environment/rbs_loader.rb`). The tree is one level
+/// deeper than [`RbsReturnShape`]: the translator answers for every shape a
+/// constant's type can take, so each variant mirrors the translator arm it
+/// feeds — `ClassInstance` keeps its type ARGUMENTS (`Array[String]` ⇒
+/// `Nominal["Array", [Nominal["String"]]]`), `Literal` keeps its scalar
+/// (`Errno::NOERROR::Errno` ⇒ `Constant[0]`), `Record` keeps its fields,
+/// `Intersection` its members, and `Proc`/`Nil`/`Bool`/`Optional`/`Union`/
+/// `Alias`/`ClassSingleton` map to the translator's dedicated arms.
+///
+/// [`Unknown`](Self::Unknown) is deliberately NOT the reference's `untyped`
+/// degrade but a DECLINE: the translator answers `Dynamic[top]` for shapes it
+/// cannot pin, and `translate_constant_decl` hands back the non-Bot answer —
+/// so the constant's type is `Dynamic[top]` either way, and declining the
+/// lookup yields the identical silent outcome while keeping the table from
+/// minting a misleading carrier. A `Variable` / `self` / `instance` /
+/// interface leaf — shapes whose translation reads a context a constant
+/// declaration never has — lands here too.
+///
+/// [`collect_class_names`](Self::collect_class_names) feeds the registry
+/// sweep that gives an RBS-only decl class (`RBS::Unnamed::ENVClass`,
+/// `Gem::Requirement`) a `ClassId`, so the interned `Nominal`/`Singleton`
+/// round-trips to its display name.
+#[derive(Debug, Clone)]
+pub enum RbsConstantShape {
+    /// A concrete class instance with retained args: `Float`,
+    /// `Array[String]` ⇒ `ClassInstance("Array", [ClassInstance("String", [])])`.
+    /// The name is the env-RESOLVED spelling (no `::` marker), matching the
+    /// qualified-registry key convention.
+    ClassInstance(&'static str, Vec<RbsConstantShape>),
+    /// `singleton(Foo)` — the class OBJECT itself (`Type::Singleton`).
+    ClassSingleton(&'static str),
+    /// An RBS literal `0`, `"s"`, `:sym`, `true`/`false` ⇒ `Constant[scalar]`.
+    Literal(rigor_types::Scalar),
+    /// `^() -> void` and every other proc shape ⇒ `Nominal[Proc]` (the
+    /// reference's `translate_proc_nominal`).
+    Proc,
+    /// `nil` ⇒ `Constant[nil]`.
+    Nil,
+    /// `bool` ⇒ the `true | false` union (the reference's `BOOL_UNION`).
+    Bool,
+    /// `T?` ⇒ `union(T, Constant[nil])`.
+    Optional(Box<RbsConstantShape>),
+    /// `A | B | ...` ⇒ the memberwise union.
+    Union(Vec<RbsConstantShape>),
+    /// `[A, B]` ⇒ `Type::Tuple`.
+    Tuple(Vec<RbsConstantShape>),
+    /// `{ mode: Integer, ?encoding: Encoding }` ⇒ a closed `HashShape` —
+    /// `(key, type, optional)` triples in declaration order.
+    Record(Vec<(&'static str, RbsConstantShape, bool)>),
+    /// `A & B` ⇒ the translator's "first member carrying static evidence"
+    /// arm — the first member that is not [`Unknown`](Self::Unknown).
+    Intersection(Vec<RbsConstantShape>),
+    /// A `type` alias reference, retained UNEXPANDED (the reference expands
+    /// through the loader with an 8-deep budget); the infer side resolves it
+    /// through `resolve_type_alias` / `type_alias_params`.
+    Alias(&'static str, Vec<RbsConstantShape>),
+    /// Any other shape (`untyped`, `top`, `bot`, `void`, `self`, `instance`,
+    /// `class`, a variable, an interface) — the decline arm; see the enum doc.
+    Unknown,
+}
+
+impl RbsConstantShape {
+    /// Every class name this shape can mint a `Nominal`/`Singleton` for
+    /// (`ClassInstance`, `ClassSingleton`, `Proc` ⇒ `"Proc"`), recursively.
+    /// Feeds the Pass-2d registry sweep so `Float::NAN`'s `Float` arg,
+    /// `ENV`'s `RBS::Unnamed::ENVClass` or a decl's tuple elements get a
+    /// `ClassId` even when no analyzed source names them.
+    pub fn collect_class_names(&self, out: &mut Vec<&'static str>) {
+        match self {
+            RbsConstantShape::ClassInstance(name, args) => {
+                out.push(name);
+                for a in args {
+                    a.collect_class_names(out);
+                }
+            }
+            RbsConstantShape::ClassSingleton(name) => out.push(name),
+            RbsConstantShape::Proc => out.push("Proc"),
+            RbsConstantShape::Tuple(members)
+            | RbsConstantShape::Union(members)
+            | RbsConstantShape::Intersection(members) => {
+                for m in members {
+                    m.collect_class_names(out);
+                }
+            }
+            RbsConstantShape::Optional(inner) => inner.collect_class_names(out),
+            RbsConstantShape::Record(fields) => {
+                for (_, ty, _) in fields {
+                    ty.collect_class_names(out);
+                }
+            }
+            RbsConstantShape::Alias(_, args) => {
+                for a in args {
+                    a.collect_class_names(out);
+                }
+            }
+            RbsConstantShape::Literal(_)
+            | RbsConstantShape::Nil
+            | RbsConstantShape::Bool
+            | RbsConstantShape::Unknown => {}
+        }
+    }
+}
+
 /// One RBS overload's positional-parameter shape, retained per-overload (NOT
 /// merged into the arity envelope). The ATM substrate (Slice 1) keeps every
 /// overload separately — `Integer#+` has four, one per numeric operand type —
@@ -1042,6 +1149,15 @@ pub struct CoreData {
     /// constant-receiver arm, which types the CALL's return, never the constant
     /// itself. So this adds no new witnessing surface for the constant.
     object_constants: HashMap<&'static str, &'static str>,
+    /// rigor-rs#878 — EVERY RBS constant declaration (top-level `ARGV:` /
+    /// `Float::DIG:` AND member `K: T` inside a class/module body), keyed by
+    /// its qualified name (no `::` marker, the [`qualified_name`] convention),
+    /// mapped to its retained declared type — the `rbs_loader.constant_type`
+    /// half of the reference's `Environment#constant_for_name`. First write
+    /// wins. Read via [`Self::constant_type`].
+    ///
+    /// [`qualified_name`]: fn@qualified_name
+    constant_types: HashMap<&'static str, RbsConstantShape>,
     /// Issue #168: the qualified name of EVERY type the loaded env declares —
     /// classes, modules, interfaces, type aliases and class/module aliases —
     /// the `RBS::TypeNameResolver#all_names` analogue. The member-level
@@ -1420,6 +1536,7 @@ impl CoreData {
             mut qualified,
             short_to_qualified,
             object_constants,
+            constant_types,
             type_names,
             synthesized_type_names,
         ) = builder.finish();
@@ -1483,6 +1600,7 @@ impl CoreData {
                 qualified,
                 short_to_qualified,
                 object_constants,
+                constant_types,
                 type_names,
                 synthesized_type_names,
                 conformance,
@@ -2726,6 +2844,48 @@ impl CoreData {
     /// See [`Self::object_constants`] for the recording discipline.
     pub fn object_constant_class(&self, name: &str) -> Option<&'static str> {
         self.object_constants.get(name).copied()
+    }
+
+    /// rigor-rs#878 review — constant decls whose declared type the reference
+    /// reads from a HOST-RESOLVED `sig/`, not the vendored `stdlib/` copy:
+    /// `RBS::EnvironmentLoader` consults a resolvable installed gem's `sig/`
+    /// first (`libraries_without_shadowed_bigdecimal_math` documents the same
+    /// asymmetry for `BigDecimal` method types). On host ruby 4.0.5 the gem
+    /// `bigdecimal-4.x`'s `sig/` declares `ROUND_MODE: round_mode` — an ALIAS
+    /// the reference's `translate_constant_decl` declines to fold — while the
+    /// vendored `stdlib/bigdecimal/bigdecimal.rbs` says `ROUND_MODE: Integer`,
+    /// which would emit `call.undefined-method` where the oracle is silent.
+    /// A full vendored-vs-host env diff showed this is the only constant whose
+    /// decl type differs, and the fp-audit host IS the divergent host, so the
+    /// port declines these names (a permanent coverage-loss direction: a host
+    /// without the gem's sig would read the vendored `Integer`).
+    const HOST_GEM_SIG_CONSTANT_DECLINES: &[&str] = &["BigDecimal::ROUND_MODE"];
+
+    /// rigor-rs#878 — `rbs_loader.constant_type`: the retained declared type of
+    /// the RBS constant `name` (a QUALIFIED name with no `::` marker —
+    /// `"ARGV"`, `"Float::NAN"`, `"RBS::Unnamed::ENVClass"`…), or `None`
+    /// when no constant declaration covers it. Class objects are NOT answered
+    /// here — the `Singleton` rung above it owns those, exactly as the
+    /// reference's `constant_for_name` sits below `singleton_for_name`.
+    pub fn constant_type(&self, name: &str) -> Option<&RbsConstantShape> {
+        if Self::HOST_GEM_SIG_CONSTANT_DECLINES.contains(&name) {
+            return None;
+        }
+        self.constant_types.get(name)
+    }
+
+    /// rigor-rs#878: every class name a retained constant-declared type can
+    /// mint — the Pass-2d twin of [`Self::tuple_return_class_names`].
+    /// Declaration-driven (whatever the loaded env declares), so no name is
+    /// special-cased.
+    pub fn constant_decl_class_names(&self) -> Vec<&'static str> {
+        let mut out: Vec<&'static str> = Vec::new();
+        for shape in self.constant_types.values() {
+            shape.collect_class_names(&mut out);
+        }
+        out.sort_unstable();
+        out.dedup();
+        out
     }
 
     /// The return class of `class_name#method` **when called WITHOUT a block** —
@@ -4854,6 +5014,7 @@ impl CoreData {
             short_to_qualified: HashMap::new(),
             // The stub carries no RBS object-constant declarations.
             object_constants: HashMap::new(),
+            constant_types: HashMap::new(),
             // The stub models no wider known-type set and synthesizes no
             // missing-type stubs.
             type_names: HashSet::new(),
@@ -4939,6 +5100,7 @@ type BuiltData = (
     HashMap<&'static str, ClassEntry>,
     HashMap<&'static str, Vec<&'static str>>,
     HashMap<&'static str, &'static str>,
+    HashMap<&'static str, RbsConstantShape>,
     HashSet<&'static str>,
     HashSet<&'static str>,
 );
@@ -4993,6 +5155,8 @@ struct Builder {
     short_to_qualified: HashMap<&'static str, Vec<&'static str>>,
     /// Collection-shape stage 2b: see [`CoreData::object_constants`].
     object_constants: HashMap<&'static str, &'static str>,
+    /// rigor-rs#878: see [`CoreData::constant_types`].
+    constant_types: HashMap<&'static str, RbsConstantShape>,
     /// Issue #168: the qualified name of EVERY declaration the env provides —
     /// classes, modules, interfaces, type aliases and class/module aliases —
     /// the `UseMap::Table.known_types` / `TypeNameResolver#all_names`
@@ -5502,7 +5666,13 @@ impl Builder {
                 // Collection-shape stage 2b: a TOP-LEVEL `ENV: …` object
                 // constant. The nested dispatch (`collect_members`) deliberately
                 // does NOT mirror this — see `CoreData::object_constants`.
-                Node::Constant(c) => self.ingest_object_constant(&c, ctx),
+                Node::Constant(c) => {
+                    self.ingest_object_constant(&c, ctx);
+                    // rigor-rs#878: the `rbs_loader.constant_type` table, which
+                    // DOES take every constant decl — qualified top-level names
+                    // (`Float::DIG:`) included.
+                    self.ingest_constant_decl(&c, &[], ctx);
+                }
                 Node::TypeAlias(ta) => self.ingest_type_alias(&ta, code, &[], ctx),
                 Node::Interface(i) => self.ingest_interface(&i, &[]),
                 Node::ClassAlias(ca) => self.record_class_alias(
@@ -5549,6 +5719,23 @@ impl Builder {
         // names with no `::` root marker.
         let class = class.strip_prefix("::").unwrap_or(class);
         self.object_constants.entry(name).or_insert(class);
+    }
+
+    /// rigor-rs#878 — record one RBS constant declaration (`ARGV:` at top
+    /// level, `Float::DIG:` qualified at top level, `K: T` as a class/module
+    /// member) into [`CoreData::constant_types`], keyed by its qualified
+    /// decl name (the [`qualified_name`] convention: `enclosing`'s innermost
+    /// path + the decl's own namespace path + leaf, `::`-rooted names
+    /// unrooted). First write wins, the project-wide discipline.
+    fn ingest_constant_decl(
+        &mut self,
+        c: &ruby_rbs::node::ConstantNode,
+        enclosing: &[&'static str],
+        ctx: Option<&FileSigCtx>,
+    ) {
+        let name = qualified_name(enclosing, &c.name());
+        let shape = retained_const_type(&c.type_(), ctx, enclosing, self);
+        self.constant_types.entry(name).or_insert(shape);
     }
 
     /// rigor-rs#811: record a `class X = Y` / `module X = Y` declaration as
@@ -6181,6 +6368,7 @@ impl Builder {
                 }
                 // Bare section modifiers. They carry no members of their own —
                 // they flip the default visibility for what follows in this body.
+                Node::Constant(c) => self.ingest_constant_decl(&c, enclosing, ctx),
                 Node::Private(_) => section_private = true,
                 Node::Public(_) => section_private = false,
                 // A NESTED class/module declaration (e.g. `module PP; module
@@ -6582,6 +6770,7 @@ impl Builder {
             self.qualified,
             self.short_to_qualified,
             self.object_constants,
+            self.constant_types,
             type_names,
             self.synthesized_type_names,
         )
@@ -8025,6 +8214,148 @@ fn param_node_name(param: &Node) -> Option<&'static str> {
     match param {
         Node::FunctionParam(fp) => fp.name().map(|s| intern(s.as_str())),
         _ => None,
+    }
+}
+
+/// rigor-rs#878 — lower one RBS constant-declaration type node to a
+/// [`RbsConstantShape`], mirroring the `RbsTypeTranslator` arms
+/// (`translate_class_instance`, `translate_literal`, `translate_tuple`,
+/// `translate_record`, `translate_union`, `translate_optional`,
+/// `translate_bool`, `translate_nil`, `translate_proc_nominal`,
+/// `translate_class_singleton`, `translate_alias`, `translate_intersection`).
+/// Class-instance and alias names get the same env-resolved spelling
+/// [`retained_param_type`] records (`resolve_lexical_name` /
+/// `resolve_lexical_type_name` against the live [`Builder`]); anything whose
+/// translation needs a context a constant never has — a variable, `self`,
+/// `instance`, an interface — collapses to [`RbsConstantShape::Unknown`].
+fn retained_const_type(
+    node: &Node,
+    ctx: Option<&FileSigCtx>,
+    enclosing: &[&'static str],
+    b: &Builder,
+) -> RbsConstantShape {
+    match node {
+        Node::ClassInstanceType(ci) => match written_ref_ctx(ctx, &ci.name()) {
+            Some(written) => {
+                let stripped = written.strip_prefix("::").unwrap_or(written);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_name(written, enclosing, b).unwrap_or(stripped)
+                };
+                RbsConstantShape::ClassInstance(
+                    name,
+                    ci.args()
+                        .iter()
+                        .map(|a| retained_const_type(&a, ctx, enclosing, b))
+                        .collect(),
+                )
+            }
+            None => RbsConstantShape::Unknown,
+        },
+        Node::ClassSingletonType(t) => match written_ref_ctx(ctx, &t.name()) {
+            Some(written) => {
+                let stripped = written.strip_prefix("::").unwrap_or(written);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_name(written, enclosing, b).unwrap_or(stripped)
+                };
+                RbsConstantShape::ClassSingleton(name)
+            }
+            None => RbsConstantShape::Unknown,
+        },
+        Node::AliasType(a) => match written_ref_ctx(ctx, &a.name()) {
+            Some(written) => {
+                let stripped = written.strip_prefix("::").unwrap_or(written);
+                let name = if ctx.is_some_and(|c| c.root_only) {
+                    stripped
+                } else {
+                    resolve_lexical_type_name(written, enclosing, b).unwrap_or(stripped)
+                };
+                RbsConstantShape::Alias(
+                    name,
+                    a.args()
+                        .iter()
+                        .map(|a| retained_const_type(&a, ctx, enclosing, b))
+                        .collect(),
+                )
+            }
+            None => RbsConstantShape::Unknown,
+        },
+        Node::LiteralType(l) => match l.literal() {
+            Node::Integer(i) => {
+                let repr = i.string_representation();
+                match repr.as_str().parse::<i64>() {
+                    Ok(v) => RbsConstantShape::Literal(rigor_types::Scalar::Int(v)),
+                    // A literal past i64 pins its decimal spelling, the same
+                    // convention `Scalar::BigInt` uses for source literals.
+                    Err(_) => RbsConstantShape::Literal(rigor_types::Scalar::BigInt(
+                        repr.as_str().to_string(),
+                    )),
+                }
+            }
+            Node::String(s) => RbsConstantShape::Literal(rigor_types::Scalar::Str(
+                s.string().as_str().to_string(),
+            )),
+            Node::Symbol(s) => {
+                RbsConstantShape::Literal(rigor_types::Scalar::Sym(s.as_str().to_string()))
+            }
+            Node::Bool(v) => RbsConstantShape::Literal(rigor_types::Scalar::Bool(v.value())),
+            _ => RbsConstantShape::Unknown,
+        },
+        Node::TupleType(t) => RbsConstantShape::Tuple(
+            t.types()
+                .iter()
+                .map(|e| retained_const_type(&e, ctx, enclosing, b))
+                .collect(),
+        ),
+        Node::UnionType(u) => RbsConstantShape::Union(
+            u.types()
+                .iter()
+                .map(|t| retained_const_type(&t, ctx, enclosing, b))
+                .collect(),
+        ),
+        Node::OptionalType(o) => RbsConstantShape::Optional(Box::new(retained_const_type(
+            &o.type_(),
+            ctx,
+            enclosing,
+            b,
+        ))),
+        Node::IntersectionType(i) => RbsConstantShape::Intersection(
+            i.types()
+                .iter()
+                .map(|t| retained_const_type(&t, ctx, enclosing, b))
+                .collect(),
+        ),
+        Node::RecordType(r) => {
+            let mut fields = Vec::new();
+            for (k, f) in r.all_fields().iter() {
+                // The `RBSString`/`Symbol` accessors borrow the parser arena,
+                // so the key is interned on the spot rather than carried.
+                let key = match &k {
+                    Node::Symbol(s) => intern(s.as_str()),
+                    Node::String(s) => intern(s.string().as_str()),
+                    // A record key that is not a name — not reachable through
+                    // the RBS grammar today — declines the WHOLE record rather
+                    // than guess a member name.
+                    _ => return RbsConstantShape::Unknown,
+                };
+                let Node::RecordFieldType(rf) = f else {
+                    return RbsConstantShape::Unknown;
+                };
+                fields.push((
+                    key,
+                    retained_const_type(&rf.type_(), ctx, enclosing, b),
+                    !rf.required(),
+                ));
+            }
+            RbsConstantShape::Record(fields)
+        }
+        Node::ProcType(_) => RbsConstantShape::Proc,
+        Node::BoolType(_) => RbsConstantShape::Bool,
+        Node::NilType(_) => RbsConstantShape::Nil,
+        _ => RbsConstantShape::Unknown,
     }
 }
 

@@ -192,6 +192,45 @@ impl SourceIndex {
             .collect()
     }
 
+    /// rigor-rs#878 review — `Reflection.ancestor_constant_scopes`: the names
+    /// `constant_type_at` consults for `K` inside `class` AFTER the lexical
+    /// nesting rungs and BEFORE the top level — each written ancestor
+    /// (`include`/`prepend`, then superclass) resolved to the first lexical
+    /// candidate the PROJECT knows as a namespace
+    /// (`known_project_namespace?` = `discovered_classes.key?`, which includes
+    /// the synthesized prefixes — `class Float::Sub` makes `Float` project
+    /// knowledge, so `Sub < Float` consults `Float::K`). A candidate the
+    /// project only WRITES (`Foo = …` — `project_written_candidate?`) stops
+    /// that spelling's walk: Ruby binds the written constant, whose own
+    /// constants nothing here describes. An unresolved spelling — a purely
+    /// external mixin (`include Math` is silent on the oracle) — yields
+    /// nothing; superclass edges never yield an external owner at all.
+    /// [`override_ancestor_names`] differs: it resolves to a project CLASS
+    /// entry (override table), missing synthesized prefixes.
+    pub(crate) fn ancestor_constant_scopes(&self, class: &str) -> Vec<String> {
+        let segments: Vec<&str> = class.split("::").collect();
+        let mut out: Vec<String> = Vec::new();
+        for raw in self.written_ancestor_names(class) {
+            for i in (0..segments.len()).rev() {
+                let candidate = if i == 0 {
+                    raw.clone()
+                } else {
+                    format!("{}::{}", segments[..i].join("::"), raw)
+                };
+                if self.constant_write_candidates_contains(&candidate) {
+                    break;
+                }
+                if self.knows_discovered_class(&candidate) {
+                    if !out.contains(&candidate) {
+                        out.push(candidate);
+                    }
+                    break;
+                }
+            }
+        }
+        out
+    }
+
     /// The WRITTEN `superclass` of `class` resolved to a project class, or
     /// `None` — the `mixins: false` ancestor edge the reference's
     /// `singleton_def_through_ancestors` follows: a subclass inherits its
@@ -413,6 +452,7 @@ pub(crate) fn collect_override_classes(
             methods.extend(alias_adopted_methods(ast, body, &methods));
             out.push(HarvestedOverrideClass {
                 qualified: qualified.clone(),
+                decl_ns: decl_namespace(prefix, name),
                 superclass: superclass_path.clone(),
                 methods,
                 method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
@@ -422,7 +462,14 @@ pub(crate) fn collect_override_classes(
                 is_module: false,
                 refines: Vec::new(),
             });
-            let child_prefix = split_qualified(&qualified);
+            // rigor-rs#878 review: `Module.nesting` entries are AS-WRITTEN
+            // scope names — `class Float::Sub` contributes `Float::Sub`,
+            // not `Float` + `Sub` (see [`collect_lexical_scopes`]).
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
                 collect_override_classes(ast, child, &child_prefix, out);
             }
@@ -445,6 +492,7 @@ pub(crate) fn collect_override_classes(
             methods.extend(alias_adopted_methods(ast, body, &methods));
             out.push(HarvestedOverrideClass {
                 qualified: qualified.clone(),
+                decl_ns: decl_namespace(prefix, name),
                 superclass: None,
                 methods,
                 method_visibilities: parent_visibilities(method_visibilities, module_function_visibilities),
@@ -456,7 +504,14 @@ pub(crate) fn collect_override_classes(
                 // attached in `harvest` once every entry is collected.
                 refines: Vec::new(),
             });
-            let child_prefix = split_qualified(&qualified);
+            // rigor-rs#878 review: `Module.nesting` entries are AS-WRITTEN
+            // scope names — `class Float::Sub` contributes `Float::Sub`,
+            // not `Float` + `Sub` (see [`collect_lexical_scopes`]).
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
                 collect_override_classes(ast, child, &child_prefix, out);
             }
@@ -597,6 +652,21 @@ pub(crate) fn split_qualified(qualified: &str) -> Vec<String> {
     qualified.split("::").map(|s| s.to_string()).collect()
 }
 
+/// rigor-rs#878 review — the declaration namespace a `nested_constant_namespaces`
+/// entry records: the enclosing lexical chain (atomic `Module.nesting`
+/// entries) plus the declaration name's LEADING `::` segments. For
+/// `module M; class A` → `["M"]`; for `class A::B` at top level →
+/// `["A"]`; for `class K` inside `class Float::Sub` → `["Float::Sub"]` —
+/// the chain `["Float::Sub"]` vs the `["Float", "Sub"]` a
+/// `split("::")` on the qualified string would give, which wrongly
+/// answers `Float::K`-family candidates Ruby never consults.
+pub(crate) fn decl_namespace(prefix: &[String], name: &str) -> Vec<String> {
+    let mut ns = prefix.to_vec();
+    let segs = split_qualified(name);
+    ns.extend_from_slice(&segs[..segs.len().saturating_sub(1)]);
+    ns
+}
+
 /// C1: the per-file lexical class/module SCOPES — each `(span, qualified segment
 /// vector)` — so a `ConstantRead`'s use-site lexical prefix can be recovered by
 /// span containment (the innermost enclosing scope). Mirrors the qualification
@@ -652,8 +722,15 @@ fn collect_lexical_scopes(
             if name.is_empty() {
                 return; // un-namable (dynamic constant / `class << self`) ⇒ skip.
             }
-            let qualified = qualify(prefix, name);
-            let segs = split_qualified(&qualified);
+            // rigor-rs#878 review: a scope contributes ONE `Module.nesting`
+            // entry — its AS-WRITTEN name, `::`-segments included. Splitting
+            // `class Float::Sub` into `["Float", "Sub"]` invented a `Float`
+            // nesting level Ruby never consults (`Float::DIG` answered for
+            // `DIG` inside `class Float::Sub`, an oracle-silent FP). The
+            // qualified name is unchanged: `qualify(&["Float::Sub"], x)` ==
+            // `qualify(&["Float", "Sub"], x)`.
+            let mut segs = prefix.to_vec();
+            segs.push(name.clone());
             out.push((*span, segs.clone()));
             for &child in body {
                 collect_lexical_scopes(ast, child, &segs, out);

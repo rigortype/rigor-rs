@@ -1990,7 +1990,7 @@ impl<'i> Typer<'i> {
 
     /// `Type::Combinator.non_empty_string` —
     /// `Difference[String, Constant[""]]`.
-    fn non_empty_string(&self, interner: &mut Interner) -> Option<TypeId> {
+    pub(crate) fn non_empty_string(&self, interner: &mut Interner) -> Option<TypeId> {
         let class = self.index.class_id("String")?;
         let base = interner.intern(Type::Nominal { class, args: vec![] });
         let empty = interner.intern(Type::Constant(Scalar::Str(String::new())));
