@@ -118,6 +118,13 @@ pub fn fold_outcome(receiver: &Scalar, method: &str, args: &[Scalar]) -> FoldOut
                 _ => FoldOutcome::Declined,
             };
         }
+        // `Comparable#between?(min, max)` on a scalar receiver + scalar
+        // bracket — the reference's `try_fold_ternary` (`constant_folding.rb`),
+        // which folds `3.between?(1, 5)` / `"b".between?("a", "c")` /
+        // `:a.between?(:a, :z)` to `Constant` (rigor-rs#892). An arg that is
+        // not a pinned scalar declines (the reference answers the RBS `bool`
+        // there — a carrier the port's flat return slot cannot yet mint).
+        ("between?", [lo, hi]) => return fold_between(receiver, lo, hi),
         _ => {}
     }
     // A `Rational` / `Complex` constant the port's `Scalar` cannot hold —
@@ -175,22 +182,22 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
                 // receiver folds the same family since rigor-rs#893.
                 | "~" | "bit_length" | "next" | "magnitude" | "to_i" | "to_int"
                 | "to_f" | "nonzero?" | "finite?" | "infinite?" | "inspect"
-                | "abs2" | "to_r" | "to_c" | "rationalize"
+                | "abs2" | "to_r" | "to_c" | "rationalize" | "between?"
         ),
         "Float" => matches!(
             method,
             "+" | "-" | "*" | "<" | "<=" | ">" | ">=" | "==" | "abs" | "<=>"
-                | "+@" | "-@"
+                | "+@" | "-@" | "between?"
         ),
         "TrueClass" | "FalseClass" => matches!(method, "!" | "&" | "|" | "=="),
         "NilClass" => matches!(method, "!" | "&" | "|" | "=="),
-        "Symbol" => matches!(method, "to_s" | "=="),
+        "Symbol" => matches!(method, "to_s" | "==" | "between?"),
         "String" => matches!(
             method,
             "upcase" | "downcase" | "reverse" | "length" | "size" | "+" | "*"
                 | "==" | "empty?" | "[]" | "slice" | "byteslice" | "index"
                 | "getbyte" | "rindex" | "byteindex" | "byterindex" | "+@"
-                | "-@" | "to_s" | "to_str"
+                | "-@" | "to_s" | "to_str" | "between?"
         ),
         _ => false,
     }
@@ -391,6 +398,85 @@ pub trait RubyFolder {
     /// Execute `receiver.method(*args)` on scalar literals, returning the result
     /// scalar or `None`. The caller has already confirmed [`sidecar_foldable`].
     fn fold(&self, receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar>;
+}
+
+// --- Comparable#between? -----------------------------------------------------
+
+/// `Comparable#between?(min, max)` on a value-pinned receiver: `lo <= recv <=
+/// hi` through the receiver's own ordering, `false` when `lo > hi` — exactly
+/// Ruby's two-`<=>` answer, which never raises on a comparable pair (the
+/// incomparable-pair `ArgumentError` is unreachable here: every admitted pair
+/// is same-kind, or an Integer/Float mix, both of which `<=>` decides).
+///
+/// Receivers / args admitted: Integer (incl. Bignum inside `i128`), Float
+/// (a `NaN` anywhere declines — `Integer <=> NaN` answers `nil` and the call
+/// raises), String, Symbol. Mixed Integer/Float compares in `f64` only while
+/// every integer operand is inside the `2^53`-exact range — `Integer <=>
+/// Float` is EXACT in Ruby (`9007199254740993.between?(2.0**53, 2.0**53)` is
+/// `false`, which an `f64` receiver conversion would mis-answer), so a
+/// bigger integer operand declines rather than risk the pin.
+fn fold_between(receiver: &Scalar, lo: &Scalar, hi: &Scalar) -> FoldOutcome {
+    /// Exact integer value of a scalar, `None` for a non-integer or a
+    /// Bignum outside `i128`.
+    fn as_i128(s: &Scalar) -> Option<i128> {
+        match s {
+            Scalar::Int(v) => Some(i128::from(*v)),
+            Scalar::BigInt(d) => d.parse::<i128>().ok(),
+            _ => None,
+        }
+    }
+    /// `Ordering` of two numeric scalars — exact while both pin integers,
+    /// `f64` when a Float participates and every integer operand is inside
+    /// the 2^53-exact range; `None` declines (NaN, a Bignum past `i128`, or
+    /// a non-numeric operand).
+    fn numeric_ord(a: &Scalar, b: &Scalar) -> Option<std::cmp::Ordering> {
+        if let (Some(x), Some(y)) = (as_i128(a), as_i128(b)) {
+            return Some(x.cmp(&y));
+        }
+        let numeric = |s: &Scalar| -> Option<f64> {
+            match s {
+                Scalar::Float(f) if !f.is_nan() => Some(*f),
+                _ => {
+                    let v = as_i128(s)?;
+                    // 2^53 — the last `f64`-exact integer magnitude.
+                    if v.unsigned_abs() <= (1u128 << 53) {
+                        Some(v as f64)
+                    } else {
+                        None
+                    }
+                }
+            }
+        };
+        numeric(a)?.partial_cmp(&numeric(b)?)
+    }
+    let ord = match receiver {
+        Scalar::Int(_) | Scalar::BigInt(_) | Scalar::Float(_) => {
+            if matches!(receiver, Scalar::Float(f) if f.is_nan()) {
+                return FoldOutcome::Declined;
+            }
+            numeric_ord
+        }
+        Scalar::Str(a) => {
+            let (Scalar::Str(l), Scalar::Str(h)) = (lo, hi) else {
+                return FoldOutcome::Declined;
+            };
+            return FoldOutcome::Value(Scalar::Bool(l <= a && a <= h));
+        }
+        Scalar::Sym(a) => {
+            let (Scalar::Sym(l), Scalar::Sym(h)) = (lo, hi) else {
+                return FoldOutcome::Declined;
+            };
+            return FoldOutcome::Value(Scalar::Bool(l <= a && a <= h));
+        }
+        _ => return FoldOutcome::Declined,
+    };
+    // `min <= recv <= max` — `false` when the bracket is empty or misses.
+    match (ord(lo, receiver), ord(receiver, hi)) {
+        (Some(l), Some(r)) => FoldOutcome::Value(Scalar::Bool(
+            l != std::cmp::Ordering::Greater && r != std::cmp::Ordering::Greater,
+        )),
+        _ => FoldOutcome::Declined,
+    }
 }
 
 // --- Integer ----------------------------------------------------------------
