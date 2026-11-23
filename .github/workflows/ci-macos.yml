@@ -1,0 +1,54 @@
+# macOS workspace tests, kept out of ci.yml so they never delay a PR or
+# the merge queue (runners were scarce and every PR paid for a macOS leg).
+#
+# This workflow runs:
+#   - nightly on master (schedule; GitHub only fires this from the default
+#     branch, which is the recovery catch);
+#   - workflow_dispatch, so it can be run by hand;
+#   - pull_request, but only when obviously macOS-dependent paths change.
+#     The only compile-time `target_os = "macos"` branch in the tree is
+#     Dir.glob case folding in crates/rigor-cli/src/pre_eval.rs. The
+#     workflow file is included so edits to it can be exercised. There is
+#     no merge_group trigger — the queue is not delayed.
+#
+# The check is advisory: it is not part of "CI required". The job uses
+# continue-on-error so a red or missing runner does not fail `gh pr checks`.
+name: ci-macos
+
+on:
+  schedule:
+    # 05:17 UTC daily — off the top of the hour, after rigor's 04:37 slot.
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - "crates/rigor-cli/src/pre_eval.rs"
+      - ".github/workflows/ci-macos.yml"
+
+concurrency:
+  group: ci-macos-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test-macos:
+    name: build + test (macos, advisory)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@1.88
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --locked
+
+      - name: Test
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings

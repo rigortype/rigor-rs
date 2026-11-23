@@ -112,7 +112,7 @@ waits for a human:
   `CI required` fan-in; until then, the code CI jobs when the diff is
   not docs-only). For `review:full`, the standing-set `fp_audit --sweep`
   is also green on that tree. A `review:light` PR needs green `docs.yml`
-  only. Do not block on checks documented as advisory.
+  only. Do not block on checks documented as advisory. macOS workspace tests (`ci-macos.yml`, check name `build + test (macos, advisory)`) are not part of `CI required`: they do not run on merge_group or on ordinary PRs, only on a path-filtered pull_request, nightly, dispatch, or pre-release. If that check appears, ignore it when deciding whether required checks passed.
 - **Enqueue, do not wait for the previous merge's master CI.** Two PRs
   that are each green can break master together: #517 and #522 did on
   2026-11-08, and master went red until #565. Once the master merge
