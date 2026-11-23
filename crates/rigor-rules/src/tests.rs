@@ -5787,3 +5787,80 @@ fn issue_820_parenthesised_subject_matrix() {
         assert_eq!(diags, expect, "row {:?}", String::from_utf8_lossy(src));
     }
 }
+
+/// rigor-rs#862 — `x&.m` re-admits the skipped-call nil
+/// (`safe_navigation_call_type`, `expression_typer.rb:2042`): the call
+/// dispatches on the nil-stripped receiver and unions `nil` back in, so a
+/// chained `.zzz` on `s&.[](0)` reads `1 | nil` and stays silent where the
+/// bare `1` fragment used to witness `undefined method 'zzz' for 1`. A
+/// LITERAL `nil&.m` is the statically-skipped call (folds `nil` — the chain
+/// still witnesses `for nil`); an INFERRED exactly-nil receiver keeps the
+/// plain pipeline, matching the port's own `nil.m` fold gap. The compound
+/// `&.` write unions the nil in too (`with_compound_write_safe_nav`).
+///
+/// Rows oracle-measured at pin `bbea1bac` (fresh-dir probes): each entry is
+/// `(source, expected undefined-method messages in order)`.
+#[test]
+fn issue_862_safe_navigation_nil_arm() {
+    let undefined = |src: &[u8]| -> Vec<String> {
+        run(src)
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for (src, expect) in [
+        // The issue's headline rows: `s&.[](0)` is `1 | nil` upstream, not `1`.
+        (
+            &b"s = c ? [1] : nil\ns&.[](0).zzz\n"[..],
+            vec![],
+        ),
+        (
+            &b"u = c ? [1] : (c ? [2] : nil)\nu&.[](0).zzz\n"[..],
+            vec![],
+        ),
+        (
+            &b"x = c ? \"s\" : nil\nx&.upcase.frobnicate\n"[..],
+            vec![],
+        ),
+        // Non-nil receiver: `non_nil == receiver` ⇒ no phantom nil — the
+        // chain keeps witnessing exactly as a plain call does.
+        (
+            &b"x = \"s\"\nx&.upcase.frobnicate\n"[..],
+            vec!["undefined method `frobnicate' for \"S\""],
+        ),
+        // A LITERAL `nil&.m` folds to nil — the chain witnesses `for nil`.
+        (
+            &b"nil&.to_s.frobnicate\n"[..],
+            vec!["undefined method `frobnicate' for nil"],
+        ),
+        // `x&.m` itself never fires the union rule either
+        // (`union_undefined_method_diagnostic` declines on
+        // `safe_navigation?` AND on the nil arm).
+        (
+            &b"x = c ? 1 : nil\nx&.nonexistent_zz\n"[..],
+            vec![],
+        ),
+        // `recv&.attr ||= v` — the skipped write's nil unions in
+        // (`with_compound_write_safe_nav`), same nil-arm drop.
+        (
+            &b"h = c ? {a: 1} : nil\nx = h&.a ||= \"s\"\nx.zzz\n"[..],
+            vec![],
+        ),
+        // Must-still-fire controls: the same chains WITHOUT `&.` keep the
+        // reference's firings — `s = c ? [1] : nil; s[0]` stays silent
+        // upstream too (union receiver), but a non-nil carrier fires.
+        (
+            &b"s = c ? [1] : [2]\ns[0].zzz\n"[..],
+            vec!["undefined method `zzz' for 1 | 2"],
+        ),
+        (
+            &b"x = \"s\"\nx.upcase.frobnicate\n"[..],
+            vec!["undefined method `frobnicate' for \"S\""],
+        ),
+    ] {
+        let diags = undefined(src);
+        let expect: Vec<String> = expect.iter().map(|s| s.to_string()).collect();
+        assert_eq!(diags, expect, "row {:?}", String::from_utf8_lossy(src));
+    }
+}

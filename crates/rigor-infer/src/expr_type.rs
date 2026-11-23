@@ -370,6 +370,44 @@ impl<'i> Typer<'i> {
                     )
                 } else {
                     let args = args.clone();
+                    if safe_nav {
+                        // `x&.m` — `safe_navigation_call_type`
+                        // (`expression_typer.rb:2042`, upstream #518): the call
+                        // dispatches on the nil-stripped receiver and the nil
+                        // the skip produces unions back in — `s = c ? [1] :
+                        // nil; s&.[](0)` answers `1 | nil`, so a chained `.zzz`
+                        // stays silent where a bare `1` would witness
+                        // (rigor-rs#862). A LITERAL `nil&.m` is the
+                        // statically-skipped call and folds to nil; an
+                        // INFERRED exactly-nil receiver keeps the plain
+                        // pipeline — its Bot fragment traces to the #540/#541
+                        // wrong-nil uplinks — as does a Dynamic fragment.
+                        // `(nil)` unwraps to `NilLit` but follows the inferred
+                        // path, not the literal fold (rigor-rs#140).
+                        if matches!(ast.get(r), Node::NilLit { .. })
+                            && !ast.paren_unwrapped(r)
+                        {
+                            return interner.intern(Type::Constant(Scalar::Nil));
+                        }
+                        let recv_ty = self.type_of(ast, r, env, interner);
+                        let non_nil = self.narrow_non_nil(recv_ty, interner);
+                        if !matches!(interner.get(non_nil), Type::Bottom | Type::Dynamic(_))
+                            && non_nil != recv_ty
+                        {
+                            let inner = self.type_call(
+                                ast,
+                                r,
+                                &method,
+                                &args,
+                                args_plain_positional,
+                                env,
+                                interner,
+                                Some(non_nil),
+                            );
+                            let nil_ty = interner.intern(Type::Constant(Scalar::Nil));
+                            return rigor_types::Algebra::join(interner, inner, nil_ty);
+                        }
+                    }
                     self.type_call(
                         ast,
                         r,
@@ -378,6 +416,7 @@ impl<'i> Typer<'i> {
                         args_plain_positional,
                         env,
                         interner,
+                        None,
                     )
                 }
             }
@@ -607,10 +646,11 @@ impl<'i> Typer<'i> {
                 read_name,
                 compound,
                 value,
+                safe_nav,
                 ..
             } => {
-                let (r, read_name, compound, value) =
-                    (*r, read_name.clone(), compound.clone(), *value);
+                let (r, read_name, compound, value, safe_nav) =
+                    (*r, read_name.clone(), compound.clone(), *value, *safe_nav);
                 // rigor-rs#499: `&&=` reads its current as a user-facing call,
                 // so the nilable String lookup declines (`s.index &&= 1`): the
                 // flat `Integer` the write-value read keeps collapses under
@@ -618,12 +658,12 @@ impl<'i> Typer<'i> {
                 // `Integer | nil` and stays silent downstream. `||=` keeps the
                 // write-value read (#178): `narrow_truthy` is sound on it.
                 let current = if matches!(compound, Compound::And) {
-                    self.type_call(ast, r, &read_name, &[], true, env, interner)
+                    self.type_call(ast, r, &read_name, &[], true, env, interner, None)
                 } else {
                     self.type_call_for_write_value(ast, r, &read_name, &[], env, interner)
                 };
                 let rhs = self.type_of(ast, value, env, interner);
-                match compound {
+                let result = match compound {
                     Compound::Or => {
                         let truthy = self.narrow_truthy(current, interner);
                         rigor_types::Algebra::join(interner, truthy, rhs)
@@ -633,7 +673,17 @@ impl<'i> Typer<'i> {
                         rigor_types::Algebra::join(interner, falsey, rhs)
                     }
                     Compound::Op(_) => interner.untyped(),
+                };
+                // `recv&.attr ||= v` — `with_compound_write_safe_nav`
+                // (`expression_typer.rb:2102`): the `&.` skips the whole write
+                // on a nil receiver, so `nil` unions into the result
+                // unconditionally (rigor-rs#862 — same nil-arm drop as
+                // `x&.m`).
+                if safe_nav {
+                    let nil_ty = interner.intern(Type::Constant(Scalar::Nil));
+                    return rigor_types::Algebra::join(interner, result, nil_ty);
                 }
+                result
             }
             // Any other carrier (`@ivar`, constant, `self`, index, range,
             // logical, variable read) is not precisely typed in this slice ->

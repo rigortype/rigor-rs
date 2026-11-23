@@ -1393,8 +1393,9 @@ impl<'i> Typer<'i> {
     /// (which `Algebra::join` drops out of a union), a `Union` distributes,
     /// and every other shape — `Top`, `Dynamic`, `Singleton`, `Tuple`,
     /// `HashShape`, `Bot` — is its own non-nil fragment. Used by the
-    /// `safe_navigation_call_type` port in [`Self::type_block_call`].
-    fn narrow_non_nil(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+    /// `safe_navigation_call_type` port in [`Self::type_block_call`] and in
+    /// the block-less call path (`expr_type.rs`'s `Node::Call` arm).
+    pub(crate) fn narrow_non_nil(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
         match interner.get(ty).clone() {
             Type::Constant(Scalar::Nil) => interner.intern(Type::Bottom),
             Type::Nominal { class, .. }
