@@ -333,6 +333,19 @@ pub(crate) fn check_call(
         if pre_eval_answers(ast, receiver, message_span, typer, index, name, method, true) {
             return None;
         }
+        // upstream #2438 — `open_project_singleton?`: a member-less project
+        // `sig/` declaration + an OPEN source (no class body, a hook on
+        // either side, an `extend`, an external superclass, a member-less
+        // sig superclass or a truncated chain) ⇒ the singleton surface is
+        // unenumerable ⇒ decline the witness. The reference still fires on
+        // a CLOSED source (`sig class Foo::Bar` + `class Foo::Bar; end`
+        // reports `Foo::Bar.bogus`); in the port a project `class`/`module`
+        // decl shadows `singleton_for_name` upstream of this arm, so that
+        // witness is unreachable today — the `open_source_class` port stays
+        // faithful for when the mint gap closes.
+        if index.memberless_project_class(name) && typer.source().open_source_class(name, index) {
+            return None;
+        }
         let receiver_render = format!("singleton({name})");
         let message = format!("undefined method `{method}' for {receiver_render}");
         let severity = catalog(CALL_UNDEFINED_METHOD)

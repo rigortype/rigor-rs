@@ -948,6 +948,19 @@ const OBJECT_ROOTS: &[&str] = &["Object", "Kernel", "BasicObject"];
 const CLASS_OBJECT_INSTANCE_ROOTS: &[&str] = &["Class", "Module", "Object", "Kernel", "BasicObject"];
 /// `SingletonHookDecline::CONCERN`.
 const CONCERN: &str = "ActiveSupport::Concern";
+/// The reference's `OPENING_HOOKS` — the hooks whose presence on a class
+/// leaves its singleton surface open for `open_project_singleton?`.
+const OPENING_HOOKS: &[&str] = &[
+    "inherited",
+    "included",
+    "extended",
+    "prepended",
+    "method_missing",
+    "respond_to_missing?",
+];
+/// The reference's `CLOSED_ROOTS` — the two superclass names the
+/// open-surface chain treats as closed.
+const CLOSED_ROOTS: &[&str] = &["Object", "BasicObject"];
 
 /// The RBS ancestors of `class_name`, the class itself first; an incomplete
 /// chain reads as the class alone, as the reference's empty answer does.
@@ -1297,6 +1310,97 @@ impl SourceIndex {
                 self.instance_records(r, MISSING_HOOK)
                     || self.mixin_closure_may_answer(core, r, MISSING_HOOK, false, true)
             })
+    }
+
+    /// upstream #2438 — `open_source_class?` (the source half of
+    /// `open_project_singleton?`): whether `name`'s singleton surface may
+    /// hold methods its declarations do not show. A class is OPEN when,
+    /// for itself or a project class up its superclass chain:
+    ///   * no `class`/`module` body exists inside `paths:` at all — a
+    ///     `sig/`-only name, a synthesized namespace prefix (`class Foo::Bar`
+    ///     names `Foo` without a body — [`Self::knows_discovered_decl`]
+    ///     answers `false`), or a meta-new write the chain cannot model a
+    ///     superclass for (`Foo = Struct.new(...)` — the reference's
+    ///     `chain.opaque_tail?`), or
+    ///   * a `def` records an `inherited`, `included`, `extended`,
+    ///     `prepended`, `method_missing` or `respond_to_missing?` hook on
+    ///     either method side (`OPENING_HOOKS`), or
+    ///   * an `extend` adds a singleton-side mixin entry (`singleton_raws`
+    ///     — any spelling, the wildcard markers included), or
+    ///   * a written superclass reaches no project class — an external
+    ///     superclass edge; `Object`/`BasicObject` (`CLOSED_ROOTS`) are the
+    ///     closed roots the chain ends on, or
+    ///   * the member-less project declaration's own written superclass —
+    ///     consulted when the source chain wrote none (`open_tail?`) —
+    ///     names no project class.
+    ///
+    /// An instance-side `include`/`prepend` never opens it (they add
+    /// instance methods only), and a chain walk past [`CHAIN_LIMIT`] reads
+    /// open, mirroring `truncated?`.
+    ///
+    /// Reached only for project-sig classes whose receiver still minted
+    /// `Type::Singleton` — today a source `class`/`module` decl shadows
+    /// `singleton_for_name` (the mint reads `Instance`/`Dynamic`), so the
+    /// deeper arms sit dormant until that divergence closes; the
+    /// `knows_discovered_*` half carries the live verdicts.
+    pub fn open_source_class(&self, name: &str, index: &CoreIndex) -> bool {
+        if !self.knows_discovered_class(name) || !self.knows_discovered_decl(name) {
+            return true;
+        }
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut last: Option<String> = None;
+        let mut current = Some(name.to_string());
+        while let Some(c) = current {
+            if !seen.insert(c.clone()) {
+                break;
+            }
+            if seen.len() > CHAIN_LIMIT {
+                return true;
+            }
+            for hook in OPENING_HOOKS {
+                if self.project_declares_method(None, &c, hook)
+                    || self.owner_defines(&c, hook, DefKind::Instance)
+                    || self.owner_defines(&c, hook, DefKind::Singleton)
+                {
+                    return true;
+                }
+            }
+            if !self.singleton_raws(&c).is_empty() {
+                return true;
+            }
+            last = Some(c.clone());
+            current = match self.override_classes.get(&c).and_then(|e| e.superclass.as_ref()) {
+                Some(raw) => {
+                    let stripped = raw.strip_prefix("::").unwrap_or(raw);
+                    if CLOSED_ROOTS.contains(&stripped) {
+                        None
+                    } else {
+                        match self.resolve_override_ancestor(&c, raw) {
+                            Some(q) => Some(q),
+                            // The written superclass reaches no project
+                            // class — an external superclass edge leaves
+                            // the singleton surface open.
+                            None => return true,
+                        }
+                    }
+                }
+                None => None,
+            };
+        }
+        // `open_tail?` — the member-less project declaration's own written
+        // superclass of the LAST chain class, consulted when the source
+        // wrote none: not a project class means the class's singleton side
+        // keeps answering through whatever that name resolves to at
+        // runtime.
+        if let Some(last) = last {
+            if let Some(sup) = index.memberless_project_superclass(&last) {
+                let stripped = sup.strip_prefix("::").unwrap_or(sup);
+                if !CLOSED_ROOTS.contains(&stripped) && !self.knows_discovered_class(stripped) {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// Upstream v0.4.5 (#2086, `RbsReceiverSurface.subclass_may_define?`) —

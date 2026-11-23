@@ -1,0 +1,19 @@
+{
+  "fixture": "harness/corpus/180_memberless_project_singleton.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 13,
+      "severity": "error",
+      "message": "undefined method `bogus' for singleton(Full::Klass)"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `bogus' for singleton(SelfMeth::Klass)"
+    }
+  ]
+}

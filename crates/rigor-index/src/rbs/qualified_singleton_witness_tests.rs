@@ -25,12 +25,40 @@ fn qualified_singleton_witness_split_and_ancestry() {
     assert!(idx.class_has_singleton_method("ERB::Util", "h"));
     // An unknown qualified name stays silent (assume-present).
     assert!(idx.class_has_singleton_method("No::Such", "whatever"));
-    // Measure-first scope: a qualified CLASS (not module) stays SILENT even
-    // for a genuine typo — its inherited class-method chain is not walked in
-    // this slice (the measured dependabot `Gem::Specification` FP). Use a
-    // qualified class known to exist; `Gem::Specification` is heavily
-    // reopened in the vendored rbs.
+    // rigor-rs#908: a qualified CLASS witnesses absence over its inherited
+    // class-method chain — `Gem::Specification` (heavily reopened in the
+    // vendored rbs) answers `load` from `Gem::BasicSpecification`'s singleton
+    // surface while `no_such_zzz` is absent on a complete chain. The old
+    // measure-first bail stayed silent on classes because the chain walk
+    // did not exist (the dependabot `Gem::Specification` FPs were inherited
+    // methods judged absent — exactly what the walk now resolves).
     if idx.knows_qualified_class("Gem::Specification") {
-        assert!(idx.class_has_singleton_method("Gem::Specification", "no_such_zzz"));
+        assert!(idx.class_has_singleton_method("Gem::Specification", "load"));
+        assert!(!idx.class_has_singleton_method("Gem::Specification", "no_such_zzz"));
+    }
+}
+
+/// rigor-rs#908: a deeply-namespaced class-decl singleton (`Resolv::DNS::
+/// Resource::IN::A`, five segments) walks the qualified superclass chain
+/// (`IN::A < Resource < Query < Object < BasicObject`) — `bogus` is absent
+/// (fires `singleton(Resolv::DNS::Resource::IN::A)`) while `name`/`new`
+/// from the base-object surface stay present. `Digest::SHA256 < Digest::
+/// Base < Digest::Class` carries the inherited-singleton control.
+#[test]
+fn qualified_class_singleton_walks_superclass_chain() {
+    let idx = CoreData::load();
+    if !idx.knows_qualified_class("Resolv::DNS::Resource::IN::A") {
+        return; // stub fallback — nothing to assert.
+    }
+    assert!(!idx.class_has_singleton_method("Resolv::DNS::Resource::IN::A", "bogus"));
+    assert!(idx.class_has_singleton_method("Resolv::DNS::Resource::IN::A", "name"));
+    assert!(idx.class_has_singleton_method("Resolv::DNS::Resource::IN::A", "new"));
+    assert!(!idx.class_has_singleton_method("Resolv::DNS", "bogus"));
+    // Inherited singleton surface: `Digest::Class` declares the `digest` /
+    // `file` class methods `Digest::SHA256` answers (the measured-FP family).
+    if idx.knows_qualified_class("Digest::SHA256") {
+        assert!(idx.class_has_singleton_method("Digest::SHA256", "digest"));
+        assert!(idx.class_has_singleton_method("Digest::SHA256", "file"));
+        assert!(!idx.class_has_singleton_method("Digest::SHA256", "bogus"));
     }
 }
