@@ -264,10 +264,12 @@ impl<'i> Typer<'i> {
                 .get(name.as_str())
                 .copied()
                 .unwrap_or_else(|| interner.untyped()),
-            // `@i` / `@@i` / `$g` reads bind through the same env map — only
-            // `bind_statements_into` (sig-gen's def-local replay) writes these
-            // sigilled keys, so `check`'s envs see `untyped` as before
-            // (rigor-rs#548).
+            // `@i` / `@@i` / `$g` reads bind through the same env map —
+            // `bind_statement`'s sigilled arm writes these keys for both
+            // the sig-gen replay and the check envs (rigor-rs#548,
+            // rigor-rs#891); a conditional position never reaches one (the
+            // replay's arm joins drop a one-arm sigilled binding, the
+            // check binder's sigilled pre-step widens it stale).
             Node::VariableRead { name, .. } => env
                 .get(name.as_str())
                 .copied()

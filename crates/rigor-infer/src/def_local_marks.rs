@@ -103,6 +103,15 @@ pub(crate) fn is_ivar(name: &str) -> bool {
     name.starts_with('@') && !name.starts_with("@@")
 }
 
+/// Whether `name` is a sigilled variable — instance, class or global (`@x`,
+/// `@@c`, `$g`): a binding the reference carries in its per-kind scope maps
+/// (`Scope#ivar` / `#cvar` / `#global`), which an arm join drops unless both
+/// arms hold it (`join_bindings` keys present on both sides; nil-injection
+/// augments locals only) — the flat env's equivalent is the `untyped` decline.
+pub(crate) fn is_sigilled(name: &str) -> bool {
+    name.starts_with('@') || name.starts_with('$')
+}
+
 /// A call the reference narrows its receiver on (`x.nil?`, `x.is_a?(K)`,
 /// `x == v`, ...).
 fn narrowing_test(method: &str) -> bool {
@@ -228,9 +237,16 @@ impl DefLocalMarks {
                         all_writes.push((span.0, name));
                     }
                 }
-                Node::UnmodeledWrite { span, names, .. } => {
+                Node::UnmodeledWrite { span, names, ivar_write, .. } => {
                     for name in names {
                         all_writes.push((span.0, name.clone()));
+                    }
+                    // rigor-rs#891 — a sigilled op/and/or write (`@x += v`,
+                    // `$g ||= v`, `@@c &&= v`) rebinds a name no binder
+                    // folds: `widen_shell` must decline an earlier binding
+                    // of it exactly like a local's stale write.
+                    if let Some(w) = ivar_write {
+                        all_writes.push((span.0, w.name.clone()));
                     }
                 }
                 _ => {}
@@ -942,6 +958,31 @@ impl<'i> Typer<'i> {
                 out.extend(body_span(ast, else_body));
             }
             Node::Logical { right, .. } => out.push(ast.get(*right).span()),
+            // A write whose VALUE is a Logical: `replay_one`'s arm walks both
+            // operands (the left directly, the right through the
+            // nil-injecting join), so an operand that is itself a write —
+            // the shapes the arm binds exactly — is no stale shell. A
+            // COMPOUND operand (a call with a nested argument write, which
+            // the arm cannot bind) keeps its shell and declines.
+            Node::LocalVariableWrite { value, .. }
+                if matches!(ast.get(*value), Node::Logical { .. }) =>
+            {
+                if let Node::Logical { left, right, .. } = ast.get(*value) {
+                    for operand in [*left, *right] {
+                        if matches!(
+                            ast.get(operand),
+                            Node::LocalVariableWrite { .. }
+                                | Node::LocalVariableOpWrite { .. }
+                                | Node::MultiWrite { .. }
+                                | Node::InstanceVariableWrite { .. }
+                                | Node::VariableWrite { .. }
+                                | Node::BeginRescue { .. }
+                        ) {
+                            out.push(ast.get(operand).span());
+                        }
+                    }
+                }
+            }
             Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, .. } => {
                 if !*has_else {
                     if clauses.is_empty() && ensure_body.is_empty() {

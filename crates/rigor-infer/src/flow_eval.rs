@@ -388,22 +388,54 @@ impl<'i> Typer<'i> {
                     );
                 }
             }
-            Node::Logical { left, right, .. } if crate::def_local_marks::literal_like(ast, *left) => {
-                // `true && (a = 2)`: a literal left decides whether the right
-                // runs; the reference folds it. Not modelled.
-                self.replay_discard(ast, env, &[std::slice::from_ref(right)], interner, returns);
-                Self::widen_names(env, &marks.written_within(span), interner);
+            Node::Logical { left, right, .. } => {
+                // `eval_and_or` (`statement_evaluator.rb:4386`): the LEFT
+                // operand always runs, so its writes bind unconditionally
+                // in the continuation (`left_scope`). The RIGHT operand's
+                // scope joins nil-injected regardless of the left's
+                // polarity — even a Constant left that kills the right's
+                // VALUE keeps its writes (`nil && (a = 2)` reads
+                // `a : 2 | nil`; a folded-dead arm's write joins too) —
+                // and a right that never completes (`branch_terminates?`)
+                // drops its scope entirely. The literal-left fold the old
+                // arm declined was value-only; the scope treatment is
+                // uniform, so one arm serves both shapes.
+                self.replay_one(ast, marks, env, *left, interner, returns);
+                if !self.stmt_never_completes(ast, *right) {
+                    self.join_arm_writes(
+                        ast,
+                        env,
+                        &[(std::slice::from_ref(right), &[]), (&[], &[])],
+                        interner,
+                        returns,
+                    );
+                }
             }
-            Node::Logical { right, .. } => {
-                // `c && a = 1` / `c || a = 1`: the right side runs only
-                // when the left's truthiness reaches it — a one-arm join.
-                self.join_arm_writes(
-                    ast,
-                    env,
-                    &[(std::slice::from_ref(right), &[]), (&[], &[])],
-                    interner,
-                    returns,
-                );
+            // A write whose VALUE is a Logical: the operands run before
+            // the write lands, so their writes bind first — the left's
+            // unconditionally, the right's nil-injected (the same
+            // `eval_and_or` scope treatment as the statement arm above) —
+            // then the write itself binds the folded value.
+            // `x = (v = 1) || 2` reads `v : 1`, `x = 1 || (v = 2)` reads
+            // `v : 2 | nil`.
+            Node::LocalVariableWrite { value, .. }
+                if matches!(ast.get(*value), Node::Logical { .. }) =>
+            {
+                let (left, right) = match ast.get(*value) {
+                    Node::Logical { left, right, .. } => (*left, *right),
+                    _ => unreachable!(),
+                };
+                self.replay_one(ast, marks, env, left, interner, returns);
+                if !self.stmt_never_completes(ast, right) {
+                    self.join_arm_writes(
+                        ast,
+                        env,
+                        &[(std::slice::from_ref(&right), &[]), (&[], &[])],
+                        interner,
+                        returns,
+                    );
+                }
+                self.bind_statement(ast, stmt, env, interner);
             }
             // `begin`+`rescue`: the protected body and each clause are
             // alternative paths — `begin; a = 1; rescue; a = 2; end; a`
@@ -532,17 +564,10 @@ impl<'i> Typer<'i> {
             // `super(…)`, `yield(…)`, `defined?`, `BEGIN` / `END`): its
             // writes were declined by `widen_shell`; nothing binds.
             Node::Statements { .. } => {}
-            // `@x = v` binds the sigilled name — `def m; @i = 1; @i; end` reads
-            // `1` (rigor-rs#548). A class / global variable write is not
-            // tracked: the name stays unbound, so a read declines.
-            Node::InstanceVariableWrite { name, value, .. } => {
-                if ast.in_blocked_carrier(ast.get(stmt).span()) {
-                    return;
-                }
-                let (name, value) = (name.clone(), *value);
-                let ty = self.type_of(ast, value, env, interner);
-                env.insert(Rc::from(name.as_str()), ty);
-            }
+            // `@x = v` / `$g = v` / `@@c = v` bind the sigilled name
+            // through `bind_statement`'s shared arm — `def m; @i = 1;
+            // @i; end` reads `1` (rigor-rs#548), and a gvar/cvar write
+            // binds the same way (rigor-rs#891).
             // `a op= v` rebinds `a` to the fold of its entry binding and `v`:
             // `a = 1; a += 2` ⇒ `3`, `a = nil; a ||= 5` ⇒ `5`. Anything the
             // fold cannot decide exactly (an unbound / `untyped` entry, a
@@ -950,9 +975,14 @@ impl<'i> Typer<'i> {
             if arm_envs.iter().all(|ae| ae.get(name.as_str()) == entry.get(name.as_str())) {
                 continue;
             }
-            // An ivar unbound at entry reads its class seed there, not
-            // `nil`: the join declines it.
-            let absent = if crate::def_local_marks::is_ivar(&name) { interner.untyped() } else { nil };
+            // A sigilled name (ivar/cvar/gvar) unbound at entry reads its
+            // class seed there, not `nil`: the reference's arm join drops a
+            // binding one arm holds (`join_bindings` keeps only keys both
+            // sides bind, and `join_with_nil_injection` augments LOCALS
+            // only — `c or (@i = 2)` leaves `@i` unbound), so the flat env
+            // declines it (rigor-rs#891).
+            let absent =
+                if crate::def_local_marks::is_sigilled(&name) { interner.untyped() } else { nil };
             let mut members: Vec<TypeId> = Vec::new();
             for ae in &arm_envs {
                 let ty = ae.get(name.as_str()).or_else(|| entry.get(name.as_str())).copied().unwrap_or(absent);
@@ -4385,6 +4415,62 @@ impl<'i> Typer<'i> {
         dead: &crate::dead::DeadPositions,
         interner: &mut Interner,
     ) {
+        // rigor-rs#891 — a sigilled write (`@x`/`@@c`/`$g`) at a position
+        // this statement does not run unconditionally must not leave the
+        // name's earlier binding live: the reference joins the construct's
+        // arms (`@x = "s"; if c; @x = 1; end` reads `"s" | 1`), a join the
+        // flat env cannot reproduce — decline instead, before any arm
+        // re-binds the write it OWNS. Only a binding the env already holds
+        // can go stale; an unbound name stays unbound (its `untyped` read
+        // is already the decline). A write the dead set proves never runs
+        // (a folded-dead arm) keeps the entry binding — so does one inside
+        // an inert (`defined?`) or blocked carrier and one in a nested
+        // `def`/`class`/`module` body, all pre-filtered by the table.
+        //
+        // One exemption: a fixpoint-modeled `while`/`until` loop JOINS its
+        // body's tracked ivar writes with the entry binding (the `Loop`
+        // arm's continuation, the `@x = "s"; while c; @x = 1; end` →
+        // `"s" | 1` row), so pre-widening one would poison the fixpoint's
+        // entry seed and kill the join. Skip exactly the tracked names
+        // (rigor-rs#639's `rebindable_ivar?` set — a name the fixpoint
+        // does not track is never bound at entry, so its widen was a
+        // no-op); everything else the body writes (an untracked global, a
+        // jump-loop's ivar) keeps the widen.
+        let loop_tracked: Option<Vec<String>> = match ast.get(id) {
+            Node::Loop { body, kind, .. } => {
+                use crate::def_local_marks::ExitKind as K;
+                let marks = self.def_local_marks(ast);
+                let lspan = ast.get(id).span();
+                let jumps = marks.has_exit_within(lspan, &[K::Break, K::Next, K::Redo, K::Retry]);
+                let once = matches!(
+                    kind,
+                    rigor_parse::LoopKind::While { begin_modifier: true }
+                        | rigor_parse::LoopKind::Until { begin_modifier: true }
+                );
+                if jumps || once || matches!(kind, rigor_parse::LoopKind::For) {
+                    None
+                } else {
+                    crate::def_local_marks::body_span(ast, body)
+                        .map(|bs| self.loop_tracked_names(ast, env, &marks, bs).0)
+                }
+            }
+            _ => None,
+        };
+        {
+            let span = ast.get(id).span();
+            let untyped = interner.untyped();
+            for (wspan, name) in self.sigilled_writes(ast).iter() {
+                if !(span.0 <= wspan.0 && wspan.1 <= span.1 && dead.write_reaches(*wspan, (span.1, span.1))) {
+                    continue;
+                }
+                if loop_tracked.as_ref().is_some_and(|tracked| tracked.contains(name)) {
+                    continue;
+                }
+                if let Some(ty) = env.get_mut(name.as_str()) {
+                    *ty = untyped;
+                }
+            }
+        }
         match ast.get(id) {
             Node::LocalVariableWrite { value, .. } | Node::MultiWrite { value, .. } => {
                 let vspan = ast.get(*value).span();
@@ -4393,6 +4479,16 @@ impl<'i> Typer<'i> {
                 self.widen_mutated_locals(
                     ast, effects.mutations_within(vspan), indexed, *value, vspan, env, interner,
                 );
+                // The write's value is a Logical: its LEFT operand always
+                // runs, so a write directly in it binds — `x = (v = 1) || 2`
+                // reads `v : 1` (`eval_and_or`'s `left_scope`). The right
+                // operand's writes stay widened above: the reference
+                // nil-injects them (`v : 2 | nil`), a receiver whose nil
+                // arm the check surface declines on every probed row.
+                if let Node::Logical { left, .. } = ast.get(*value) {
+                    let left = *left;
+                    self.bind_statement(ast, left, env, interner);
+                }
                 self.bind_statement(ast, id, env, interner);
                 // An `h[k]` index target stores through `[]=` on the POST-binding
                 // scope — `swap, swap[:a] = swap, 1` stores into the object `swap`
@@ -4740,6 +4836,43 @@ impl<'i> Typer<'i> {
                 drop_indexed_narrowings(env, &name);
                 env.insert(Rc::from(name.as_str()), new_ty);
                 }
+            }
+            // A straight-line sigilled write binds the flat env — the read
+            // side (`type_of`'s `VariableRead` arm) has always keyed these
+            // names, but only the sig-gen replay ever wrote them
+            // (rigor-rs#548), so `check` read `untyped`. The value's LOCAL
+            // rebinds/mutations keep the plain-write arm's treatment (widen
+            // inside the value span), and the sigilled pre-step above already
+            // declined every conditional sigilled write this statement holds.
+            Node::InstanceVariableWrite { value, .. } | Node::VariableWrite { value, .. } => {
+                let vspan = ast.get(*value).span();
+                widen_flow_writes(effects.rebinds_within(vspan), vspan, env, interner);
+                self.drop_indexed_rebinds(effects.rebinds_within(vspan), vspan, indexed, env);
+                self.widen_mutated_locals(
+                    ast, effects.mutations_within(vspan), indexed, *value, vspan, env, interner,
+                );
+                self.bind_statement(ast, id, env, interner);
+            }
+            // A bare `&&`/`||`/`and`/`or` STATEMENT (`x = [1] or [2]`):
+            // the left operand always runs, so a write directly in it binds
+            // its value (`eval_and_or`'s `left_scope`); the right operand's
+            // writes stay widened — the reference nil-injects them, and
+            // every probed right-write row is check-silent there, so the
+            // decline is the safe side.
+            Node::Logical { left, .. } => {
+                let span = ast.get(id).span();
+                let live_rebinds: Vec<_> = effects
+                    .rebinds_within(span)
+                    .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                    .cloned()
+                    .collect();
+                let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
+                    dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                });
+                widen_flow_writes(live_rebinds.iter(), span, env, interner);
+                self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
+                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+                self.bind_statement(ast, *left, env, interner);
             }
             other => {
                 let span = other.span();
@@ -5894,18 +6027,21 @@ impl<'i> Typer<'i> {
         self_kind: DefKind,
         interner: &mut Interner,
     ) -> TypeId {
-        // `l && r` / `l || r`: a bare `type_of` declines a `Logical` to
-        // `Dynamic`, but the oracle's `scope.evaluate` (`expression_typer.rb:
-        // type_of_and_or`) gives the RESULT type — an elided edge contributes
-        // its operand (`a = "x"; b = nil; if a && b` → `Constant[nil]`:
-        // falsey `"x"` is `Bot` so the result is `b`'s), a live left edge
-        // unions its surviving fragment with `r`'s type (`u = ENV["K"]; if u
-        // && false` → `u | false` — NOT a Constant, so the oracle stays
-        // silent there). Computing the union — not a minted `bool` — is what
-        // keeps `check_always_truthy` firing exactly on the oracle's rows.
-        // `r` is typed against the UN-narrowed env: the true port of
-        // `evaluate` would narrow it by the left edge, a precision this
-        // slice leaves to `type_of`'s own `Logical` coverage.
+        // `l && r` / `l || r`: `type_of`'s own `Logical` arm (rigor-rs#864)
+        // gives the RESULT type, but it types each operand flat — the
+        // oracle's `scope.evaluate` (`expression_typer.rb:
+        // type_of_and_or`) narrows the RIGHT operand by the left's edge,
+        // which can settle the answer a flat union cannot: an elided
+        // edge contributes its operand (`a = "x"; b = nil; if a && b` →
+        // `Constant[nil]`: falsey `"x"` is `Bot` so the result is `b`'s),
+        // a live left edge unions its surviving fragment with `r`'s type
+        // (`u = ENV["K"]; if u && false` → `u | false` — NOT a Constant,
+        // so the oracle stays silent there). Computing the union — not a
+        // minted `bool` — is what keeps `check_always_truthy` firing
+        // exactly on the oracle's rows. `r` is typed against the
+        // UN-narrowed env here: the true port of `evaluate` would narrow
+        // it by the left edge, a precision this slice leaves to
+        // `type_of`'s own `Logical` coverage.
         if let Node::Logical { left, right, is_and, .. } = ast.get(predicate) {
             let lt = self.type_of(ast, *left, env, interner);
             let rt = self.type_of(ast, *right, env, interner);
@@ -5964,8 +6100,9 @@ impl<'i> Typer<'i> {
         self.type_of(ast, predicate, env, interner)
     }
 
-    /// Bind a single statement into `env` if it is a local write; recurse
-    /// through a `Statements` wrapper. Other statements have no binding effect.
+    /// Bind a single statement into `env` if it is a local or sigilled
+    /// write; recurse through a `Statements` wrapper. Other statements have no
+    /// binding effect.
     ///
     /// A write recovered under a CROSSED block/lambda binds the closure's own
     /// local, not the enclosing one it shadows — `super { |o| o = 1 }` must not
@@ -5983,6 +6120,34 @@ impl<'i> Typer<'i> {
             return;
         }
         match ast.get(id) {
+            // `@x = v` / `@@c = v` / `$g = v`: the reference's scope
+            // carries each sigilled kind in its own binding map
+            // (`Scope#ivar` / `#cvar` / `#global`,
+            // `expression_typer.rb:702-723`), and every sigilled read
+            // resolves through the same map — the port's env has always
+            // keyed sigilled names, so binding the write here lights the
+            // read side up (`def m; @i = 1; @i; end` reads `1`,
+            // rigor-rs#548; `@x = 1 || 2; @x.zzz` fires `for 1`,
+            // rigor-rs#891). A write at a position its statement does
+            // not run unconditionally declines through the callers: the
+            // replay's arm joins drop a binding one arm holds
+            // (`join_arm_writes_bound`'s sigilled absent rule), and the
+            // check binder widens the stale binding
+            // (`bind_check_statement_effects`'s sigilled pre-step).
+            Node::InstanceVariableWrite { name, value, .. } | Node::VariableWrite { name, value, .. } => {
+                let (name, value) = (name.clone(), *value);
+                let ty = self.type_of(ast, value, env, interner);
+                env.insert(Rc::from(name.as_str()), ty);
+            }
+            // `@x += v` / `$g ||= v` / `@@c &&= v` — a sigilled op/and/or
+            // write the binder cannot fold: whatever earlier binding the
+            // name holds is now STALE (the reference folds `1 + 1` to
+            // `2`; the port declines), so the name widens rather than
+            // leak the pre-write value (rigor-rs#891).
+            Node::UnmodeledWrite { ivar_write: Some(w), .. } => {
+                let name = w.name.clone();
+                env.insert(Rc::from(name.as_str()), interner.untyped());
+            }
             Node::LocalVariableWrite { name, value, .. } => {
                 if ast.closure_bound_names(id).contains(name) {
                     return;

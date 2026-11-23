@@ -257,9 +257,11 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
             } if MUTATOR_METHODS.contains(&method.as_str()) => {
                 // `mutated_reads`: the receiver may be a selection or a
                 // write, not only a bare read — `(c ? g : h) << 2` marks
-                // both `g` and `h` (rigor-rs#603).
+                // both `g` and `h` (rigor-rs#603). A sigilled receiver
+                // marks its name too (rigor-rs#891).
                 let mut names = Vec::new();
                 let _ = receiver_alias_locals(ast, *r, &mut names);
+                sigilled_alias_targets(ast, *r, &mut names);
                 names
                     .into_iter()
                     .map(|name| (id, *span, name, true))
@@ -273,6 +275,7 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
             {
                 let mut names = Vec::new();
                 let _ = receiver_alias_locals(ast, *r, &mut names);
+                sigilled_alias_targets(ast, *r, &mut names);
                 names
                     .into_iter()
                     .map(|name| (id, *span, name, true))
@@ -290,6 +293,7 @@ fn raw_flow_writes(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, String, 
                 // arm the selection answered — `mutated_reads` marks both.
                 let mut names = Vec::new();
                 let _ = receiver_alias_locals(ast, *r, &mut names);
+                sigilled_alias_targets(ast, *r, &mut names);
                 names
                     .into_iter()
                     .map(|name| (id, *span, name, true))
@@ -675,6 +679,55 @@ fn retain_flowable_rebinds(ast: &LoweredAst, out: &mut Vec<(NodeId, rigor_parse:
     });
 }
 
+/// Every TOP-LEVEL-scope sigilled write — `@x = v` / `@@c = v` / `$g = v` —
+/// as `(write span, sigilled name)`, for the check binder's stale-binding
+/// widen (rigor-rs#891): a sigilled write at a position its statement does
+/// not run unconditionally must not leave the name's earlier binding live,
+/// because the reference joins the construct's arms (`@x = "s"; if c; @x =
+/// 1; end` reads `"s" | 1`), a join the flat env cannot reproduce — it
+/// declines instead.
+///
+/// The filters mirror [`toplevel_rebinds`]'s: a write inside a nested
+/// `def` / `class` / `module` body belongs to that body's own scope and never
+/// reaches the top-level continuation (`$g = 0; class C; $g = "s"; end; $g`
+/// keeps `0` on the oracle), and one inside an inert (`defined?` operand) or
+/// blocked carrier never evaluates (`y = defined?(@x = 1)` keeps `@x`). No
+/// block shadow filter: a block body's sigilled write DOES reach the
+/// top-level continuation — a captured ivar/global is the block's too — so
+/// the widen's caller declines it like any other may-run write.
+pub(crate) fn sigilled_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    let scopes: Vec<rigor_parse::Span> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                Some(n.span())
+            }
+            _ => None,
+        })
+        .collect();
+    let mut out = Vec::new();
+    for (_, n) in ast.iter() {
+        let (name, span) = match n {
+            Node::InstanceVariableWrite { name, span, .. } | Node::VariableWrite { name, span, .. } => {
+                (name, *span)
+            }
+            // A sigilled op/and/or write (`@x += v`, `$g ||= v`) rebinds
+            // the name no binder can fold — the stale-binding widen must
+            // see it exactly like a plain write.
+            Node::UnmodeledWrite { span, ivar_write: Some(w), .. } => (&w.name, *span),
+            _ => continue,
+        };
+        if scopes.iter().any(|s| s.0 <= span.0 && span.1 <= s.1) {
+            continue;
+        }
+        if ast.in_inert_carrier(span) || ast.in_blocked_carrier(span) {
+            continue;
+        }
+        out.push((span, name.clone()));
+    }
+    out
+}
+
 /// The two scope filters [`toplevel_rebinds`] and [`toplevel_mutations`]
 /// share: the `def` / `class` / `module` spans (each an independent local
 /// scope) and the block/lambda SHADOW scopes as `(body descendant ids, names
@@ -757,9 +810,13 @@ pub(crate) fn toplevel_mutations(
                 }
                 // `mutated_reads`: the receiver may select or write, not
                 // only read — `(c ? g : h) << 2` marks `g` and `h`,
-                // `(g = f) << 2` marks `g` (rigor-rs#603).
+                // `(g = f) << 2` marks `g` (rigor-rs#603). A SIGILLED
+                // receiver (`@x`, a direct `@@c`/`$g`) marks its name the
+                // same way (rigor-rs#891): the reference's
+                // `MutationWidening` widens the binding the call mutates.
                 let mut names = Vec::new();
                 let _ = receiver_alias_locals(ast, *r, &mut names);
+                sigilled_alias_targets(ast, *r, &mut names);
                 if !names.is_empty() {
                     let drop_key = if effective == "[]=" {
                         // `f[k] = v` keys on `args[0]`; `f.send(:[]=, k, v)`
@@ -840,8 +897,16 @@ pub(crate) fn toplevel_mutations(
             ..
         } = n
         {
+            // A bare-LOCAL or direct-SIGILLED receiver (`@h[:k] = v`,
+            // `$g[:k] = v` — rigor-rs#891) widens its binding's carrier
+            // exactly as `h[k] = v` does.
+            let mut names = Vec::new();
             if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
-                out.push((id, *span, name.clone(), "[]=".to_string(), None));
+                names.push(name.clone());
+            }
+            sigilled_alias_targets(ast, *r, &mut names);
+            for name in names {
+                out.push((id, *span, name, "[]=".to_string(), None));
             }
         }
         // `h.attr ||= v` / `h.attr &&= v` / `h.attr op= v` — a compound
@@ -867,10 +932,17 @@ pub(crate) fn toplevel_mutations(
             ..
         } = n
         {
-            if is_shape_mutator(write_name)
-                && let Node::LocalVariableRead { name, .. } = ast.get(*r)
-            {
-                out.push((id, *span, name.clone(), write_name.clone(), None));
+            if is_shape_mutator(write_name) {
+                // A bare-LOCAL or direct-SIGILLED receiver (`@h.default
+                // ||= v` — rigor-rs#891).
+                let mut names = Vec::new();
+                if let Node::LocalVariableRead { name, .. } = ast.get(*r) {
+                    names.push(name.clone());
+                }
+                sigilled_alias_targets(ast, *r, &mut names);
+                for name in names {
+                    out.push((id, *span, name, write_name.clone(), None));
+                }
             }
         }
     }
@@ -2515,6 +2587,86 @@ fn receiver_alias_locals_at(
         Node::Logical { left, right, .. } => {
             receiver_alias_locals_at(ast, *left, depth + 1, out, false, non_local);
             receiver_alias_locals_at(ast, *right, depth + 1, out, false, non_local);
+        }
+        _ => {}
+    }
+}
+
+/// The SIGILLED names a mutator's receiver may evaluate to — `@x` at any
+/// selection depth, `@@c`/`$g` only in the direct (or parens-unwrapped)
+/// position, mirroring [`receiver_alias_locals`]'s walk shape. The
+/// mutation tables mark these exactly like a bare-local receiver
+/// (rigor-rs#891): the reference's `MutationWidening` widens an
+/// ivar/cvar/gvar binding the call mutates (`@x << "t"` on `@x = "s"`
+/// reads `String`), and the port's sigilled bindings need the same
+/// invalidation or they leak the stale literal carrier. Kept SEPARATE
+/// from `receiver_alias_locals` on purpose: the alias-mutation floor's
+/// upstream `targets(nil)` semantics keep a MIXED candidate set
+/// (`(c ? f : @a) << 2`) non-floorable, which pushing sigilled names
+/// into the shared walk would break.
+pub(crate) fn sigilled_alias_targets(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
+    sigilled_alias_targets_at(ast, id, 0, out, true);
+}
+
+fn sigilled_alias_targets_at(
+    ast: &LoweredAst,
+    id: NodeId,
+    depth: u32,
+    out: &mut Vec<String>,
+    direct: bool,
+) {
+    if depth > SELECTION_DEPTH {
+        return;
+    }
+    let mut push = |name: &String| {
+        if !out.contains(name) {
+            out.push(name.clone());
+        }
+    };
+    match ast.get(id) {
+        // `variable_write?` covers ivar writes too; a cvar/gvar write
+        // counts only in the direct position.
+        Node::InstanceVariableWrite { name, .. } => push(name),
+        Node::VariableRead { name, .. } | Node::VariableWrite { name, .. } => {
+            if (name.starts_with('@') && !name.starts_with("@@")) || direct {
+                push(name);
+            }
+        }
+        Node::Statements {
+            body,
+            kind: StatementsKind::Sequence,
+            ..
+        } => {
+            if let Some(&last) = body.last() {
+                sigilled_alias_targets_at(ast, last, depth + 1, out, false);
+            }
+        }
+        Node::BeginRescue { body, .. }
+            if ast.is_paren_carrier(id) || ast.is_else_carrier(id) =>
+        {
+            if let Some(&last) = body.last() {
+                sigilled_alias_targets_at(
+                    ast,
+                    last,
+                    depth + 1,
+                    out,
+                    direct && ast.is_paren_carrier(id),
+                );
+            }
+        }
+        Node::If {
+            then_body, else_body, ..
+        } => {
+            if let Some(&last) = then_body.last() {
+                sigilled_alias_targets_at(ast, last, depth + 1, out, false);
+            }
+            if let Some(&last) = else_body.last() {
+                sigilled_alias_targets_at(ast, last, depth + 1, out, false);
+            }
+        }
+        Node::Logical { left, right, .. } => {
+            sigilled_alias_targets_at(ast, *left, depth + 1, out, false);
+            sigilled_alias_targets_at(ast, *right, depth + 1, out, false);
         }
         _ => {}
     }

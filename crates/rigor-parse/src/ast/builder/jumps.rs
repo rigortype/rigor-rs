@@ -282,7 +282,16 @@ impl<'src> Builder<'src> {
             // rigor-rs#639 — an ivar op/and/or write (`@x += v`, `@x ||= v`,
             // `@x &&= v`) binds a NAME the loop-cap criterion tracks
             // (`loop_body_ivar_writes`), even though `names` stays
-            // locals-only.
+            // locals-only. rigor-rs#891 — a CLASS/global op/and/or write
+            // (`@@c += v`, `$g ||= v`) binds its sigilled name the same way:
+            // the field is the sigilled-name channel, and without it the
+            // lowered node records no name at all, so a binder that bound an
+            // earlier plain write (`$g = 1`) could never see the rebind.
+            let sigilled_op_write = |name: String, op: crate::OpWriteKind| crate::IvarWrite {
+                rereads: false,
+                name,
+                op,
+            };
             let ivar_write = node
                 .as_instance_variable_operator_write_node()
                 .map(|n| crate::IvarWrite {
@@ -291,6 +300,26 @@ impl<'src> Builder<'src> {
                         n.binary_operator().as_slice(),
                     )),
                     rereads: false,
+                })
+                .or_else(|| {
+                    node.as_class_variable_operator_write_node().map(|n| {
+                        sigilled_op_write(
+                            constant_string(n.name().as_slice()),
+                            crate::OpWriteKind::Operator(constant_string(
+                                n.binary_operator().as_slice(),
+                            )),
+                        )
+                    })
+                })
+                .or_else(|| {
+                    node.as_global_variable_operator_write_node().map(|n| {
+                        sigilled_op_write(
+                            constant_string(n.name().as_slice()),
+                            crate::OpWriteKind::Operator(constant_string(
+                                n.binary_operator().as_slice(),
+                            )),
+                        )
+                    })
                 })
                 .or_else(|| {
                     node.as_instance_variable_and_write_node()
@@ -304,6 +333,22 @@ impl<'src> Builder<'src> {
                         })
                 })
                 .or_else(|| {
+                    node.as_class_variable_and_write_node().map(|n| {
+                        sigilled_op_write(
+                            constant_string(n.name().as_slice()),
+                            crate::OpWriteKind::And,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    node.as_global_variable_and_write_node().map(|n| {
+                        sigilled_op_write(
+                            constant_string(n.name().as_slice()),
+                            crate::OpWriteKind::And,
+                        )
+                    })
+                })
+                .or_else(|| {
                     node.as_instance_variable_or_write_node()
                         .map(|n| {
                             let name = constant_string(n.name().as_slice());
@@ -313,6 +358,22 @@ impl<'src> Builder<'src> {
                                 op: crate::OpWriteKind::Or,
                             }
                         })
+                })
+                .or_else(|| {
+                    node.as_class_variable_or_write_node().map(|n| {
+                        sigilled_op_write(
+                            constant_string(n.name().as_slice()),
+                            crate::OpWriteKind::Or,
+                        )
+                    })
+                })
+                .or_else(|| {
+                    node.as_global_variable_or_write_node().map(|n| {
+                        sigilled_op_write(
+                            constant_string(n.name().as_slice()),
+                            crate::OpWriteKind::Or,
+                        )
+                    })
                 });
             self.push(Node::UnmodeledWrite {
                 span,
