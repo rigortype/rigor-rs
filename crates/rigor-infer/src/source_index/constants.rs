@@ -11,11 +11,24 @@ use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex}
 impl SourceIndex {
     /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
     /// site with lexical prefix `use_prefix`, or `None`. A recorded entry applies
-    /// iff its defining namespace is an initial segment run of `use_prefix` (Ruby
-    /// lexical lookup: toplevel is visible everywhere, a nested constant only
-    /// within its namespace); among visible entries the LONGEST-namespace
-    /// (innermost) wins. The `ConstantRead` arm consults this BEFORE the
-    /// singleton gate and re-interns the value via `Typer::intern_const_lit`.
+    /// iff its defining namespace is visible at the use site — the JOINED
+    /// qualified path of the defining chain equals the join of some WHOLE
+    /// initial run of `use_prefix`'s `Module.nesting` entries (Ruby lexical
+    /// lookup: toplevel is visible everywhere, a nested constant only within
+    /// its namespace); among visible entries the innermost (deepest path) wins.
+    /// The `ConstantRead` arm consults this BEFORE the singleton gate and
+    /// re-interns the value via `Typer::intern_const_lit`.
+    ///
+    /// The comparison runs at the joined-STRING level so one namespace unifies
+    /// across its spellings (rigor-rs#906): a compact write site `class A::B`
+    /// records the chain `["A::B"]` while a deep use site `module A; class B`
+    /// contributes the entries `["A", "B"]` — both name the module `A::B`, and
+    /// the reference's string-keyed `in_source_constants` table answers either
+    /// through the other. The use site's entries stay ATOMIC — a compact
+    /// `class A::B` contributes only the candidate `A::B::X`, never `A::X`
+    /// (splitting the entries was the rigor-rs#878 round-1 FP, where `DIG`
+    /// inside `class Float::Sub` wrongly answered `Float::DIG`) — so the WRITE
+    /// side's chains join, the use side's never split.
     ///
     /// `use_file` is the [`rigor_parse::FileKey`] of the file the use site is in,
     /// and an entry only applies when it matches the file that ASSIGNED the
@@ -32,8 +45,8 @@ impl SourceIndex {
             .get(name)?
             .iter()
             .filter(|(_, file, _)| file == use_file)
-            .filter(|(ns, _, _)| ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
-            .max_by_key(|(ns, _, _)| ns.len())
+            .filter(|(ns, _, _)| c5_namespace_visible(ns, use_prefix))
+            .max_by_key(|(ns, _, _)| c5_namespace_depth(ns))
             .map(|(_, _, lit)| lit)
     }
 
@@ -51,9 +64,7 @@ impl SourceIndex {
     /// redundancy is the point.)
     pub fn literal_constant_visible_any_file(&self, name: &str, use_prefix: &[String]) -> bool {
         self.literal_constants.get(name).is_some_and(|entries| {
-            entries.iter().any(|(ns, _, _)| {
-                ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
-            })
+            entries.iter().any(|(ns, _, _)| c5_namespace_visible(ns, use_prefix))
         })
     }
 
@@ -95,14 +106,15 @@ impl SourceIndex {
     /// it precisely, so this can only lose recall, never fire wrongly).
     ///
     /// A resolved key must then pass the SAME lexical-visibility filter
-    /// [`Self::literal_constant`] applies to the bare spelling: the constant's
-    /// DEFINING namespace has to be an initial segment run of `use_prefix`. This
-    /// makes stage 2e a pure SPELLING extension of the already-shipped C5 gate
-    /// rather than a wider resolution reach — load-bearing, and measured: without
-    /// it, a cross-namespace path (gitlab
+    /// [`Self::literal_constant`] applies to the bare spelling: the
+    /// constant's DEFINING namespace has to be visible at the use site — its
+    /// joined qualified path equal to the join of some WHOLE initial run of
+    /// `use_prefix`. This makes stage 2e a pure SPELLING extension of the
+    /// already-shipped C5 gate rather than a wider resolution reach —
+    /// load-bearing, and measured: without it, a cross-namespace path (gitlab
     /// `Gitlab::GitalyClient::DiffBlob::ATTRS` read from
-    /// `…::DiffBlobsStitcher`) folded here while the reference stayed silent, an
-    /// oracle FP on the sweep.
+    /// `…::DiffBlobsStitcher`) folded here while the reference stayed silent,
+    /// an oracle FP on the sweep.
     ///
     /// `use_file` applies the SAME per-file consumption gate as
     /// [`Self::literal_constant`] — a qualified path is only a SPELLING of the
@@ -136,8 +148,7 @@ impl SourceIndex {
             }
         }
         let (_, (ns, file, lit)) = hit?;
-        (file == use_file && ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..])
-            .then_some(lit)
+        (file == use_file && c5_namespace_visible(ns, use_prefix)).then_some(lit)
     }
 
     /// C1 (constant-shadow gate): whether a BARE read of constant `name` at a use
@@ -247,6 +258,42 @@ impl SourceIndex {
             || self.nested_constant_namespaces.contains_key(name)
             || self.classes.contains_key(name)
     }
+}
+
+/// C5 visibility: whether a defining-namespace chain `ns` — the write site's
+/// AS-WRITTEN `Module.nesting` entries — is visible at a use site whose own
+/// nesting entries are `use_prefix`. The JOINED qualified path of `ns` must
+/// equal the join of some WHOLE initial run of the use site's entries.
+///
+/// The WRITE side joins its entries (rigor-rs#906): a compact `class A::B`
+/// names the same module `A::B` as `module A; class B`, so a write chain
+/// `["A::B"]` is visible wherever the deep chain `["A", "B"]` is — the
+/// reference's string-keyed `in_source_constants` table answers either
+/// spelling through the other. The USE side stays ATOMIC: `class A::B`
+/// contributes only the candidate `A::B::X`, never `A::X`, because Ruby's
+/// `Module.nesting` pushes ONE entry per declaration keyword and a compact
+/// spelling does not open `A`'s pool — splitting the entries was the
+/// rigor-rs#878 round-1 FP, where `DIG` inside `class Float::Sub` wrongly
+/// answered `Float::DIG`. Strictly WIDENING vs the entry-wise compare: every
+/// chain the old filter admitted joins identically, so no visible entry
+/// stops being visible and no fold is retracted.
+fn c5_namespace_visible(ns: &[String], use_prefix: &[String]) -> bool {
+    (0..=use_prefix.len()).any(|i| {
+        ns.iter()
+            .flat_map(|s| s.split("::"))
+            .eq(use_prefix[..i].iter().flat_map(|s| s.split("::")))
+    })
+}
+
+/// The lexical DEPTH of a defining-namespace chain — its joined path's
+/// segment count, atomic entries expanded (`["A::B"]` is depth 2). The
+/// innermost (deepest) visible entry wins a C5 consult, mirroring the
+/// reference's innermost-first nesting walk; the as-written entry COUNT is no
+/// measure of depth once compact spellings exist (`["A::B"]` and `["A"]` both
+/// count one entry). Equal to the entry count for all-deep chains, so every
+/// tie the old `ns.len()` key decided it decides the same way.
+fn c5_namespace_depth(ns: &[String]) -> usize {
+    ns.iter().map(|s| s.split("::").count()).sum()
 }
 
 /// C5: the static scalar key a hash-key NODE denotes, or `None` when dynamic.
