@@ -4162,6 +4162,106 @@ mod tests {
         );
     }
 
+    /// rigor-rs#892 — `Comparable#between?` on pinned scalars. Every
+    /// expectation is the oracle's measured answer (`try_fold_ternary`):
+    /// `min <= recv <= max` through the receiver's own ordering, `false`
+    /// on an empty or missing bracket, declines where Ruby raises (NaN,
+    /// mixed kinds) or where an `f64` compare could mis-answer an exact
+    /// `Integer <=> Float` past 2^53.
+    #[test]
+    fn folds_between_on_scalars() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        let t = Some(Scalar::Bool(true));
+        let f = Some(Scalar::Bool(false));
+        // Integer receiver, integer and float brackets.
+        assert_eq!(fold(&i(3), "between?", &[i(1), i(5)]), t);
+        assert_eq!(fold(&i(3), "between?", &[i(5), i(1)]), f);
+        assert_eq!(fold(&i(-3), "between?", &[i(-5), i(-1)]), t);
+        assert_eq!(fold(&i(3), "between?", &[Scalar::Float(1.5), i(5)]), t);
+        assert_eq!(fold(&i(1), "between?", &[i(1), i(1)]), t);
+        // BigInt inside i128 folds exactly; past i128 declines (the oracle
+        // folds there — a coverage loss, never a wrong answer).
+        assert_eq!(fold(&big("99999999999999999999"), "between?", &[i(1), i(5)]), f);
+        assert_eq!(
+            fold(
+                &i(3),
+                "between?",
+                &[i(1), big("999999999999999999999999999999999999999")]
+            ),
+            None
+        );
+        // Float receiver; NaN anywhere declines (`Integer <=> NaN` raises).
+        assert_eq!(fold(&Scalar::Float(3.5), "between?", &[i(1), i(5)]), t);
+        assert_eq!(
+            fold(&Scalar::Float(f64::INFINITY), "between?", &[i(1), i(5)]),
+            f
+        );
+        assert_eq!(
+            fold(&i(3), "between?", &[i(1), Scalar::Float(f64::INFINITY)]),
+            t
+        );
+        assert_eq!(
+            fold(&Scalar::Float(f64::NAN), "between?", &[i(1), i(5)]),
+            None
+        );
+        assert_eq!(
+            fold(&i(3), "between?", &[Scalar::Float(f64::NAN), i(5)]),
+            None
+        );
+        // 2^53 boundary: `Integer <=> Float` is exact in Ruby — inside the
+        // f64-exact range it still folds, past it declines rather than
+        // round the receiver.
+        assert_eq!(
+            fold(
+                &i(9007199254740992),
+                "between?",
+                &[Scalar::Float(9007199254740992.0), Scalar::Float(9007199254740993.0)]
+            ),
+            t
+        );
+        assert_eq!(
+            fold(
+                &i(9007199254740993),
+                "between?",
+                &[Scalar::Float(9007199254740992.0), Scalar::Float(9007199254740993.0)]
+            ),
+            None
+        );
+        // String / Symbol receivers need same-kind brackets.
+        assert_eq!(
+            fold(
+                &Scalar::Str("b".into()),
+                "between?",
+                &[Scalar::Str("a".into()), Scalar::Str("c".into())]
+            ),
+            t
+        );
+        assert_eq!(
+            fold(
+                &Scalar::Str("a".into()),
+                "between?",
+                &[Scalar::Str("a".into()), i(5)]
+            ),
+            None
+        );
+        assert_eq!(
+            fold(
+                &Scalar::Sym("a".into()),
+                "between?",
+                &[Scalar::Sym("a".into()), Scalar::Sym("z".into())]
+            ),
+            t
+        );
+        // Bool / Nil receivers have no `between?` — decline (the caller's
+        // RBS tiers answer `for true` / `for nil` on the miss).
+        assert_eq!(
+            fold(&Scalar::Bool(true), "between?", &[Scalar::Bool(false), Scalar::Bool(true)]),
+            None
+        );
+        assert_eq!(fold(&Scalar::Nil, "between?", &[i(1), i(5)]), None);
+    }
+
     #[test]
     fn scalar_class_maps_carriers() {
         assert_eq!(scalar_class(&Scalar::Int(1)), "Integer");
