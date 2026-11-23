@@ -723,6 +723,26 @@ impl SourceIndex {
             idx.register(name);
         }
 
+        // Pass 2d (rigor-rs#878): register an id for every class an RBS
+        // CONSTANT-DECLARED type can mint — `ENV`'s `RBS::Unnamed::ENVClass`,
+        // `Gem::Requirement`, a decl's tuple/union elements. Pass 2 sees only
+        // classes the SOURCE names; a decl class is reached THROUGH the
+        // `constant_for_name` rung instead, so without this its `Nominal`
+        // cannot be minted and `constant_type` declines it. Same filters as
+        // Pass 2b: a name the source already claims keeps its source
+        // registration, a name the loaded RBS does not model is skipped, and
+        // a name no source file mentions is declaration-only.
+        for name in core.constant_decl_class_names() {
+            if !idx.classes.contains_key(name)
+                && (core.knows_class(name) || core.knows_qualified_class(name))
+            {
+                if !idx.name_to_id.contains_key(name) {
+                    idx.declaration_only_classes.insert(name.to_string());
+                }
+                idx.register(name);
+            }
+        }
+
         // === M3: AST-consuming passes ======================================
 
         let asts: Vec<&LoweredAst> = files.iter().map(|(_, ast)| *ast).collect();

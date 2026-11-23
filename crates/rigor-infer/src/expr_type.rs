@@ -513,23 +513,25 @@ impl<'i> Typer<'i> {
                         return interner.intern(Type::Singleton(class));
                     }
                 }
-                // rigor-rs#656 — `Builtins::PredefinedConstantRefinements`
-                // tier 1 (`FOLDED_CONSTANTS`): the six exact-value Float
-                // constants fold to `Constant[Float]` — `Math::PI` /
-                // `Math::E` (C's `M_PI` / `M_E`) and the four IEEE-754
-                // binary64 magnitudes `Float::INFINITY` / `::MAX` / `::MIN` /
-                // `::EPSILON`. `Float::NAN` is deliberately absent upstream
-                // (`NaN == NaN` is `false`, so a `Constant[NAN]` would
-                // corrupt type equality). This is the reference's
-                // `constant_for_name` rung — BELOW the in-source constant
-                // folds and singleton gates above — so a project `Math::PI =`
-                // write keeps winning; a write that merely NAMES a candidate
-                // (any file, any literal-ness — the `constant_shadowers`
-                // stop) declines to `Dynamic[top]`, exactly where the
-                // reference's `WRITTEN_CANDIDATE` lands.
-                if let Some(value) = folded_float_constant(name) {
-                    if !self.source.constant_write_shadows(name, prefix, *rooted) {
-                        return interner.intern(Type::Constant(Scalar::Float(value)));
+                // rigor-rs#656/#878 — the reference's `constant_for_name`
+                // rung (`environment.rb:838`), BELOW the in-source folds and
+                // the singleton gates above. Consulted per lexical candidate
+                // (innermost scope → toplevel, or just `name` for a `::`-rooted
+                // read), each candidate through the reference's own order —
+                // `PredefinedConstantRefinements.lookup` (tier-1 folded Float
+                // constants, then the tier-2 runtime String refinements) and
+                // then `rbs_loader.constant_type`. A project `=` write that
+                // merely NAMES a candidate (any file, any literal-ness — the
+                // `constant_shadowers` census) declines the whole rung to
+                // `Dynamic[top]`, where the reference's `WRITTEN_CANDIDATE`
+                // lands; the decline is the documented over-shadow — the
+                // reference only reaches the stop when NOTHING answers, but
+                // the in-source rungs above already own same-file writes, so
+                // a cross-file write that would fold is a rare coverage loss
+                // and never a wrong answer.
+                if !self.source.constant_write_shadows(name, prefix, *rooted) {
+                    if let Some(ty) = self.constant_for_name(name, prefix, *rooted, interner) {
+                        return ty;
                     }
                 }
                 interner.untyped()
@@ -1308,6 +1310,215 @@ impl<'i> Typer<'i> {
             Some(class) => interner.intern(Type::Nominal { class, args: vec![] }),
             None => interner.untyped(),
         }
+    }
+
+    /// rigor-rs#878 — `Environment#constant_for_name` (`environment.rb:838`)
+    /// fused with `constant_type_at`'s per-candidate binding check
+    /// (`reflection.rb`): for EACH candidate the reference's
+    /// `singleton_for_name(candidate) || in_source_constants[candidate]`
+    /// rungs answer first — a `class`/`module`/`sig` decl or a `=` write
+    /// binding ANY candidate ends the walk (the reference's rung types or
+    /// declines there; it never skips to a lower candidate's
+    /// `constant_for_name`). Only an unbound candidate consults the
+    /// constant-value rungs — `PredefinedConstantRefinements` tier 1
+    /// ([`folded_float_constant`]), tier 2 (`RUNTIME_STRING_CONSTANTS`,
+    /// [`runtime_string_constant`]) then `rbs_loader.constant_type`
+    /// ([`Self::rbs_constant_type`]) — in innermost-scope-out order.
+    /// `rooted` reads (`::X`) take the bare name alone, exactly like
+    /// [`SourceIndex::constant_write_shadows`]. `None` leaves the caller at
+    /// `Dynamic[top]`.
+    ///
+    /// The write half of the binding check is the caller's
+    /// `constant_write_shadows` gate (the `constant_shadowers` census —
+    /// value-blind, cross-file). The decl half lives here because it is
+    /// per-candidate: a project `module ENV` must not leave `ENV` reading
+    /// `ENVClass`, and a project `class RUBY_VERSION` must not leave
+    /// `RUBY_VERSION` reading `non-empty-string` — both measured as port
+    /// emissions where the oracle is silent (rigor-rs#878 review).
+    /// [`SourceIndex::project_declares_constant`] is the decl half — the
+    /// exact qualified match (`knows_discovered_decl`) plus the
+    /// walk-gap `classes` fallback, applied per candidate so a project
+    /// `M::ARGV` does not bind the toplevel `ARGV` candidate.
+    /// `knows_qualified_class` covers project `sig/` decls (a bundled
+    /// sig class can never be the name of a bundled constant decl — and
+    /// the reference would answer `singleton` there first anyway).
+    ///
+    /// [`SourceIndex::project_declares_constant`]: crate::SourceIndex::project_declares_constant
+    ///
+    /// [`SourceIndex::constant_write_shadows`]: crate::SourceIndex::constant_write_shadows
+    fn constant_for_name(
+        &self,
+        name: &str,
+        prefix: &[String],
+        rooted: bool,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        // `Some` ends the walk on a project/RBS binding (the type lives on
+        // rungs the port answers earlier — singleton gates — or declines
+        // as Dynamic); `None` consults the value rungs for the candidate.
+        let bound = |candidate: &str| -> bool {
+            self.source.project_declares_constant(candidate)
+                || self.index.knows_qualified_class(candidate)
+        };
+        if !rooted {
+            // Innermost lexical scope outward: `prefix[..len]::name` first —
+            // Ruby's `Module.nesting` walk.
+            for i in (1..=prefix.len()).rev() {
+                let candidate = crate::source_index::qualify(&prefix[..i], name);
+                if bound(&candidate) {
+                    return None;
+                }
+                if let Some(ty) = self.constant_type_for(&candidate, interner) {
+                    return Some(ty);
+                }
+            }
+        }
+        if bound(name) {
+            return None;
+        }
+        self.constant_type_for(name, interner)
+    }
+
+    /// One candidate through the rung's three sources, in the reference's
+    /// order: the tier-1 folded Float constants, the tier-2 runtime String
+    /// refinements, then the RBS constant-declaration table.
+    fn constant_type_for(&self, candidate: &str, interner: &mut Interner) -> Option<TypeId> {
+        if let Some(value) = folded_float_constant(candidate) {
+            return Some(interner.intern(Type::Constant(Scalar::Float(value))));
+        }
+        if runtime_string_constant(candidate) {
+            // `Type::Combinator.non_empty_string` — every listed name
+            // classifies to a non-empty String on the pinned host Ruby
+            // (verified against ruby 4.0.5; see the table's comment). A
+            // missing `String` class id degrades to `Dynamic[top]`, the same
+            // silent floor as a decline.
+            return Some(
+                self.non_empty_string(interner)
+                    .unwrap_or_else(|| interner.untyped()),
+            );
+        }
+        self.rbs_constant_type(candidate, interner)
+    }
+
+    /// `rbs_loader.constant_type`: the interned type of the RBS constant
+    /// declaration `name`, via the retained [`RbsConstantShape`] table, or
+    /// `None` when no declaration covers it / its type declines (the
+    /// reference's untranslatable-to-Bot answers land the same way — the
+    /// read falls to `Dynamic[top]` either way).
+    ///
+    /// [`RbsConstantShape`]: rigor_index::RbsConstantShape
+    fn rbs_constant_type(&self, name: &str, interner: &mut Interner) -> Option<TypeId> {
+        let shape = self.index.constant_type(name)?;
+        self.intern_const_shape(shape, interner)
+    }
+
+    /// Intern a retained RBS constant type — the rigor-rs half of
+    /// `RbsTypeTranslator` restricted to the shapes a constant declaration
+    /// can carry. `None` (the [`RbsConstantShape::Unknown`] leaf, an
+    /// unexpanded `Alias`, a class with no registry id) declines; inside an
+    /// argument/element position a decline becomes the `Dynamic[top]` leaf
+    /// the reference's `untyped` degrade writes there (see
+    /// [`Self::intern_const_shape_leaf`]).
+    ///
+    /// [`RbsConstantShape::Unknown`]: rigor_index::RbsConstantShape::Unknown
+    fn intern_const_shape(
+        &self,
+        shape: &rigor_index::RbsConstantShape,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        use rigor_index::RbsConstantShape as S;
+        match shape {
+            S::ClassInstance(name, args) => {
+                let class = self
+                    .index
+                    .class_id(name)
+                    .or_else(|| self.source.class_id(name))?;
+                let args = args
+                    .iter()
+                    .map(|a| self.intern_const_shape_leaf(a, interner))
+                    .collect();
+                Some(interner.intern(Type::Nominal { class, args }))
+            }
+            S::ClassSingleton(name) => {
+                let class = self
+                    .index
+                    .class_id(name)
+                    .or_else(|| self.source.class_id(name))?;
+                Some(interner.intern(Type::Singleton(class)))
+            }
+            S::Literal(scalar) => Some(interner.intern(Type::Constant(scalar.clone()))),
+            S::Nil => Some(interner.intern(Type::Constant(Scalar::Nil))),
+            S::Proc => Some(self.nominal_or_untyped("Proc", interner)),
+            S::Bool => {
+                // `translate_bool` — the `BOOL_UNION` fold `true | false`,
+                // which renders `bool` through the union display collapse.
+                let t = interner.intern(Type::Constant(Scalar::Bool(true)));
+                let f = interner.intern(Type::Constant(Scalar::Bool(false)));
+                Some(self.union_members(vec![t, f], interner))
+            }
+            S::Optional(inner) => {
+                let inner = self.intern_const_shape_leaf(inner, interner);
+                let nil = interner.intern(Type::Constant(Scalar::Nil));
+                Some(self.union_members(vec![inner, nil], interner))
+            }
+            S::Union(members) => {
+                let members = members
+                    .iter()
+                    .map(|m| self.intern_const_shape_leaf(m, interner))
+                    .collect();
+                Some(self.union_members(members, interner))
+            }
+            S::Tuple(elems) => {
+                let elems = elems
+                    .iter()
+                    .map(|e| self.intern_const_shape_leaf(e, interner))
+                    .collect();
+                Some(interner.intern(Type::Tuple(elems)))
+            }
+            S::Record(fields) => {
+                // `translate_record` — a closed `HashShape`, optional fields
+                // keeping their `?`-flag (absence is not a present-nil value).
+                let members = fields
+                    .iter()
+                    .map(|(key, ty, optional)| ShapeMember {
+                        key: ShapeKey::Sym((*key).to_string()),
+                        value: self.intern_const_shape_leaf(ty, interner),
+                        optional: *optional,
+                    })
+                    .collect();
+                Some(interner.intern(Type::HashShape(members)))
+            }
+            S::Intersection(members) => {
+                // `translate_intersection` — the FIRST member carrying static
+                // evidence; every value of `A & B` IS an `A`, so any single
+                // member is a sound superset read. A member that declines
+                // here (untyped) carries no evidence either — skip it.
+                members.iter().find_map(|m| {
+                    self.intern_const_shape(m, interner)
+                        .filter(|&t| !matches!(interner.get(t), Type::Dynamic(_)))
+                })
+            }
+            // `translate_alias` expands through the loader with an 8-deep
+            // budget. The three alias-typed vendored constants all expand to
+            // an interface (untyped there), so the decline is outcome-
+            // identical today; expansion is the follow-up if one ever isn't.
+            S::Alias(_, _) | S::Unknown => None,
+        }
+    }
+
+    /// A `RbsConstantShape` in an ARGUMENT / ELEMENT / MEMBER position: a
+    /// shape the translator cannot pin degrades to `untyped`
+    /// (`Dynamic[top]`) rather than deleting the SIBLING precision — the
+    /// same rule [`RbsReturnShape::Unknown`] documents.
+    ///
+    /// [`RbsReturnShape::Unknown`]: rigor_index::RbsReturnShape::Unknown
+    fn intern_const_shape_leaf(
+        &self,
+        shape: &rigor_index::RbsConstantShape,
+        interner: &mut Interner,
+    ) -> TypeId {
+        self.intern_const_shape(shape, interner)
+            .unwrap_or_else(|| interner.untyped())
     }
 
     /// Intern one RBS return-shape descriptor (`rigor_index::RbsReturnShape`)
@@ -2282,6 +2493,54 @@ fn folded_float_constant(name: &str) -> Option<f64> {
         "Float::EPSILON" => f64::EPSILON,
         _ => return None,
     })
+}
+
+/// rigor-rs#878 — `Builtins::PredefinedConstantRefinements` tier 2
+/// (`RUNTIME_STRING_CONSTANTS`): the closed set of interpreter constants the
+/// reference reads ONCE at load time from its own runtime and classifies —
+/// non-empty String ⇒ `non-empty-string`, a Ruby numeric literal ⇒
+/// `numeric-string`, anything else ⇒ no entry. The port cannot read a Ruby
+/// runtime, so the classification is BAKED (the `HOST_RUBY_VERSION` /
+/// `dead_version_guard.rs` precedent): every listed name resolves to a
+/// non-empty, non-numeric String on the pinned host (ruby 4.0.5 — verified
+/// 2026-11-23: `"4.0.5"`, `"2026-05-20"`, `"arm64-darwin23"`, `"/"`,
+/// `":"`, `"17.0.0"`, `"4.0.10"`, …) and that classification is
+/// platform-stable — only `File::ALT_SEPARATOR` differs by platform, and it
+/// is `nil` off Windows so it carries NO entry here, exactly as the
+/// reference's table omits it there (the read then falls through to the RBS
+/// `String?` decl, which unions nil in and stays silent under the nilable
+/// rule — identical outcome).
+///
+/// The admission criterion — a value fixed by the same interpreter choice
+/// that fixes the loaded core/stdlib RBS — is the one
+/// `Inference::VersionGuard::VERSION_CONSTANTS` already applies; a gem's
+/// constant never qualifies (the analyzer cannot see the project's
+/// `Gemfile.lock`).
+fn runtime_string_constant(name: &str) -> bool {
+    matches!(
+        name,
+        "RUBY_VERSION"
+            | "RUBY_RELEASE_DATE"
+            | "RUBY_PLATFORM"
+            | "RUBY_DESCRIPTION"
+            | "RUBY_COPYRIGHT"
+            | "RUBY_ENGINE"
+            | "RUBY_ENGINE_VERSION"
+            | "RUBY_REVISION"
+            | "Ruby::VERSION"
+            | "Ruby::RELEASE_DATE"
+            | "Ruby::PLATFORM"
+            | "Ruby::DESCRIPTION"
+            | "Ruby::COPYRIGHT"
+            | "Ruby::ENGINE"
+            | "Ruby::ENGINE_VERSION"
+            | "Ruby::REVISION"
+            | "File::SEPARATOR"
+            | "File::Separator"
+            | "File::PATH_SEPARATOR"
+            | "Encoding::UNICODE_VERSION"
+            | "Gem::VERSION"
+    )
 }
 
 fn tuple_constant_values(elems: &[TypeId], interner: &Interner) -> Option<Vec<Scalar>> {

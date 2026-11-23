@@ -32,7 +32,10 @@ pub mod plugins;
 mod gem_sig_census;
 mod rbs;
 
-pub use rbs::{ClassOrdering, OverloadSignature, RbsReturnShape, RbsSource, RetainedParamType};
+pub use rbs::{
+    ClassOrdering, OverloadSignature, RbsConstantShape, RbsReturnShape, RbsSource,
+    RetainedParamType,
+};
 /// The build-time-embedded vendored RBS `(path, contents)` table — sig-gen
 /// reads the declared type parameters of a reopened generic class from it.
 pub use rbs::EMBEDDED_RBS;
@@ -572,6 +575,18 @@ impl CoreIndex {
     /// [`rbs::CoreData::object_constant_class`].
     pub fn object_constant_class(&self, name: &str) -> Option<&'static str> {
         self.data.object_constant_class(name)
+    }
+
+    /// rigor-rs#878 — the retained RBS declared type of the constant `name`
+    /// (qualified, no `::` marker). See [`rbs::CoreData::constant_type`].
+    pub fn constant_type(&self, name: &str) -> Option<&RbsConstantShape> {
+        self.data.constant_type(name)
+    }
+
+    /// rigor-rs#878: every class name a retained constant-declared type can
+    /// mint. See [`rbs::CoreData::constant_decl_class_names`].
+    pub fn constant_decl_class_names(&self) -> Vec<&'static str> {
+        self.data.constant_decl_class_names()
     }
 
     /// rigor-rs#140 (upstream rigor#1105): `class_name`'s flattened ancestor

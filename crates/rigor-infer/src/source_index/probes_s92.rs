@@ -664,6 +664,20 @@ fn build_project_legacy(asts: &[&LoweredAst], core: &CoreIndex) -> SourceIndex {
         }
     }
 
+    // Pass 2d (rigor-rs#878 — mirrors `harvest.rs`): register every class an
+    // RBS constant-decl type can mint so the merge path's `names` equals the
+    // legacy build's.
+    for name in core.constant_decl_class_names() {
+        if !idx.classes.contains_key(name)
+            && (core.knows_class(name) || core.knows_qualified_class(name))
+        {
+            if !idx.name_to_id.contains_key(name) {
+                idx.declaration_only_classes.insert(name.to_string());
+            }
+            idx.register(name);
+        }
+    }
+
     // Pass 3.
     let (returns, param_bound) = infer_method_returns(&idx, core, asts);
     idx.method_returns = returns;
