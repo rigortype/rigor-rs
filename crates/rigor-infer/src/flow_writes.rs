@@ -607,6 +607,30 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
             };
             for (s, names) in element_mutations {
                 if *s == span {
+                    // Upstream v0.4.7 (#2395, `ElementReadWidening.
+                    // widen_element_read`): a BLOCKLESS mutator call keyed by
+                    // its own span whose receiver is a single-literal-key
+                    // `[]` read rooted at one of `names` rebuilds the
+                    // receiver's binding through that key at the slot landing
+                    // (`apply_slot_mutation`) — it is NOT a rebind. Keeping
+                    // the rebind here would floor the binding to `untyped`
+                    // before the rebuild reads it (`h = {a: []}; h[:a] << 1`
+                    // would lose the whole record shape); a rebuild that
+                    // declines leaves the binding standing, the reference's
+                    // own nil (`a = [1]; a[0] << 2` keeps `[1]`). A block call
+                    // (a `Loop`, or a `Call` with a block) and every element
+                    // path the slot table cannot express — a chained read, a
+                    // `first`/`last`/`dig` step, a non-literal key — keeps
+                    // its rebind.
+                    let slot_covered = matches!(n, Node::Call { receiver: Some(r), block_body, .. }
+                        if block_body.is_empty()
+                            && matches!(ast.get(*r),
+                                Node::Call { method, args, block_body: read_block, .. }
+                                    if method == "[]" && args.len() == 1 && read_block.is_empty())
+                            && element_slot(ast, *r).is_some());
+                    if slot_covered {
+                        continue;
+                    }
                     out.extend(names.iter().map(|name| (id, span, name.clone())));
                 }
             }

@@ -1869,6 +1869,87 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// The `+`-only half of the String projections an op-write expands to
+    /// (`local_variable_operator_write` dispatches `a + v` as the plain
+    /// call, `shape_dispatch.rb`): a `non-empty-string` ENTRY keeps its
+    /// difference for any argument (`empty_string_binary` — concatenation
+    /// cannot empty a non-empty buffer), a String-typed entry with a
+    /// `non-empty-string` argument takes the arg-driven fold
+    /// (`dispatch_string_binary_from_arg`), and a String-typed argument
+    /// alone answers the RBS erasure `String#+(String) -> String` the
+    /// plain-call dispatch already gives (`s.clear; s += ""` is `String`
+    /// on the oracle, rigor-rs#774). `None` — the caller falls to the
+    /// constant fold / decline — for a `Constant` entry (the literal fold
+    /// owns it) or a non-String side.
+    pub(crate) fn string_op_write_projection(
+        &self,
+        entry: TypeId,
+        v_ty: TypeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        // `non_empty_string_projection`'s `("+", 1)` row — first, because a
+        // `Difference` entry answers for ANY argument type.
+        if let Type::Difference { base, removed } = interner.get(entry).clone() {
+            if self.empty_witness_base_class(interner, base, removed) == Some("String") {
+                return Some(entry);
+            }
+        }
+        // "Any String-typed receiver (including Nominal, Refined, and
+        // Difference fallbacks)" — a `Constant` entry (or a union of
+        // them) is the literal fold's (`LiteralStringFolding` answers it
+        // first upstream: `c ? "a" : "b"` then `+= "c"` folds exactly),
+        // and every other carrier declines.
+        let constant_carrier = |ty: TypeId| match interner.get(ty) {
+            Type::Constant(_) => true,
+            Type::Union(ms) => {
+                !ms.is_empty()
+                    && ms.iter()
+                        .all(|&m| matches!(interner.get(m), Type::Constant(_)))
+            }
+            _ => false,
+        };
+        if constant_carrier(entry) {
+            return None;
+        }
+        if !self.string_erased_carrier(interner, entry) {
+            return None;
+        }
+        if self.non_empty_string_compatible(interner, v_ty) {
+            return self.non_empty_string(interner);
+        }
+        if self.string_erased_carrier(interner, v_ty) {
+            return self
+                .index
+                .class_id("String")
+                .map(|class| interner.intern(Type::Nominal { class, args: vec![] }));
+        }
+        None
+    }
+
+    /// Whether `ty` erases to `String` — the carrier set the `String#+`
+    /// dispatch answers for: a `String` `Nominal`, a String predicate
+    /// `Refined`, a String-witnessed `Difference`, a String `Constant`, or
+    /// a `Union` whose members all do.
+    fn string_erased_carrier(&self, interner: &Interner, ty: TypeId) -> bool {
+        match interner.get(ty).clone() {
+            Type::Constant(Scalar::Str(_)) => true,
+            Type::Nominal { class, .. } => self.index.class_name_for_id(class) == Some("String"),
+            Type::Refined { base, .. } => match interner.get(base).clone() {
+                Type::Nominal { class, .. } => {
+                    self.index.class_name_for_id(class) == Some("String")
+                }
+                _ => false,
+            },
+            Type::Difference { base, removed } => {
+                self.empty_witness_base_class(interner, base, removed) == Some("String")
+            }
+            Type::Union(ms) => {
+                !ms.is_empty() && ms.iter().all(|&m| self.string_erased_carrier(interner, m))
+            }
+            _ => false,
+        }
+    }
+
     /// `empty_removal_projection` (`shape_dispatch.rb`) over a
     /// `non-empty-string` (`Difference[String, Constant[""]]`) receiver.
     fn non_empty_string_projection(
@@ -1920,10 +2001,16 @@ impl<'i> Typer<'i> {
     }
 
     /// `Type::Combinator.non_empty_string_compatible?` — the carrier is a
-    /// `non-empty-string` `Difference` itself, an `Intersection` with such a
-    /// member, or a `Union` whose members all are.
+    /// non-empty String `Constant`, a `non-empty-string` `Difference`
+    /// itself, an `Intersection` with such a member, or a `Union` whose
+    /// members all are.
     fn non_empty_string_compatible(&self, interner: &Interner, ty: TypeId) -> bool {
         match interner.get(ty).clone() {
+            // `Constant then type.value.is_a?(String) && !type.value.empty?`
+            // — the arm the `+` fold's argument takes: a non-empty literal
+            // guarantees the concatenation is non-empty
+            // (`dispatch_string_binary_from_arg`, rigor-rs#774).
+            Type::Constant(Scalar::Str(s)) => !s.is_empty(),
             Type::Difference { base, removed } => {
                 self.empty_witness_base_class(interner, base, removed) == Some("String")
             }

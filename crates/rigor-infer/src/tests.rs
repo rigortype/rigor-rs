@@ -894,6 +894,157 @@ fn toplevel_check_env_for_index_and_carrier_writes() {
     assert_eq!(flat_get("r", &i), Some(Type::Constant(Scalar::Int(1))));
 }
 
+/// rigor-rs#774: the element-read half applies on straight-line code too —
+/// a `local[k].<mutator>` rebuilds `local`'s literal-shape carrier through
+/// `k` (`element_read_widening.rb`), where the old element-rebind mark
+/// floored the whole binding to `Dynamic`.
+#[test]
+fn element_read_mutations_rebuild_the_carrier() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let env_of = |src: &[u8]| {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        (env, i)
+    };
+    let elem_of = |i: &Interner, ty: TypeId| -> Option<TypeId> {
+        match i.get(ty) {
+            Type::HashShape(ms) => ms.first().map(|m| m.value),
+            Type::Tuple(es) => es.first().copied(),
+            _ => None,
+        }
+    };
+
+    // `h = {a: []}; h[:a] << 1` — only `:a`'s element widens.
+    let (env, i) = env_of(b"h = {a: []}\nh[:a] << 1\nh.w\n");
+    let h = env.get("h").copied().expect("h bound");
+    let elem = elem_of(&i, h).expect("a hash-shape element");
+    let a = i.get(elem).clone();
+    let Type::Nominal { args, .. } = a else {
+        panic!("expected Array nominal, got {a:?}")
+    };
+    assert_eq!(args.len(), 1, "Array[Dynamic | Integer] has one arg");
+    assert_eq!(
+        index.class_name_of(&i, elem),
+        Some("Array")
+    );
+
+    // `h = {a: \"s\"}; h[:a] << \"t\"` — a String element under a String
+    // mutator loses its pin to `String`.
+    let (env, i) = env_of(b"h = {a: \"s\"}\nh[:a] << \"t\"\nh.w\n");
+    let elem = elem_of(&i, *env.get("h").unwrap()).unwrap();
+    assert_eq!(index.class_name_of(&i, elem), Some("String"));
+
+    // `a = [[1], [2]]; a[0] << 5` — only the selected Tuple position
+    // rebuilds; `[2]` stays pinned.
+    let (env, i) = env_of(b"a = [[1], [2]]\na[0] << 5\na.w\n");
+    let Type::Tuple(es) = i.get(*env.get("a").unwrap()).clone() else {
+        panic!("expected a Tuple, got {:?}", i.get(*env.get("a").unwrap()))
+    };
+    assert_eq!(es.len(), 2);
+    assert_eq!(index.class_name_of(&i, es[0]), Some("Array"));
+    let Type::Tuple(inner) = i.get(es[1]).clone() else {
+        panic!("the untouched position keeps its Tuple, got {:?}", i.get(es[1]))
+    };
+    assert!(matches!(i.get(inner[0]), Type::Constant(Scalar::Int(2))));
+
+    // An element whose widening declines stands whole (`Integer#<<`
+    // mutates nothing — the reference's `widen_through_path` nil).
+    let (env, mut i) = env_of(b"a = [1]\na[0] << 1\na.w\n");
+    let one = i.intern(Type::Constant(Scalar::Int(1)));
+    let tup = i.intern(Type::Tuple(vec![one]));
+    assert_eq!(env.get("a"), Some(&tup));
+    let (env, i) = env_of(b"h = {a: 1}\nh[:a] << 1\nh.w\n");
+    let elem = elem_of(&i, *env.get("h").unwrap()).unwrap();
+    assert!(matches!(i.get(elem), Type::Constant(Scalar::Int(1))));
+
+    // A conditional element mutation keeps the entry binding — the
+    // rebind-join treatment master's own table gave it (`if c; a[0] << 2;
+    // end` reads `[1]` on the port AND on master; the oracle declines the
+    // join outright — a pre-existing divergence this slice keeps).
+    let (env, mut i) = env_of(b"a = [1]\nif c\n  a[0] << 2\nend\na.w\n");
+    let one = i.intern(Type::Constant(Scalar::Int(1)));
+    let tup = i.intern(Type::Tuple(vec![one]));
+    assert_eq!(env.get("a"), Some(&tup));
+}
+
+/// rigor-rs#774: a certainty-folded `if`'s LIVE arm is straight-line code
+/// to the check env, so a content mutation inside it lands the reference's
+/// own widening — a nominal (`String`, `Hash[…]`) or a keep — where the
+/// pre-change path rooted every arm mutation at the `if` and floored the
+/// binding to `Dynamic` (every expected value is the oracle's own answer).
+#[test]
+fn folded_if_arm_mutations_land_the_reference_answer() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let env_of = |src: &[u8]| {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        (env, i)
+    };
+
+    // `x << "c"` on the rebound pin widens to the `String` nominal.
+    let (env, i) = env_of(b"x = \"a\"\nif true\n  x = \"s\"\n  x << \"c\"\nend\nx.w\n");
+    assert_eq!(
+        index.class_name_of(&i, *env.get("x").unwrap()),
+        Some("String")
+    );
+
+    // `s += "e"` on the widened `String` answers `non-empty-string` — the
+    // plain-call `String + non-empty` projection the op-write expands to.
+    let (env, mut i) = env_of(b"if true\n  s = \"abc\"\n  s << \"d\"\n  s += \"e\"\nend\ns.w\n");
+    let nes = typer.non_empty_string(&mut i).expect("String registered");
+    assert_eq!(env.get("s"), Some(&nes));
+
+    // `s ||= "e"` / `s &&= "e"` fold against the widened `String`, not
+    // against `Dynamic` — the joins `"e" | String` and `"e"`.
+    let (env, mut i) = env_of(b"s = \"abc\"\nif true\n  s << \"d\"\n  s ||= \"e\"\nend\ns.w\n");
+    let e = i.intern(Type::Constant(Scalar::Str("e".into())));
+    let string = typer.nominal_or_untyped("String", &mut i);
+    let want = i.intern(Type::Union(vec![e, string]));
+    assert_eq!(env.get("s"), Some(&want));
+    let (env, mut i) = env_of(b"s = \"abc\"\nif true\n  s << \"d\"\n  s &&= \"e\"\nend\ns.w\n");
+    let e = i.intern(Type::Constant(Scalar::Str("e".into())));
+    assert_eq!(env.get("s"), Some(&e));
+
+    // A widening that declines keeps the binding it saw (`Integer#<<`
+    // mutates nothing): `x, y = 1, \"s\"; x << \"b\"` keeps `1`.
+    let (env, mut i) = env_of(b"x = \"a\"\nif true\n  x, y = 1, \"s\"\n  x << \"b\"\nend\nx.w\n");
+    let one = i.intern(Type::Constant(Scalar::Int(1)));
+    assert_eq!(env.get("x"), Some(&one));
+
+    // `h[:a] = 1` rebuilds the `{}` seed's nominal with the store's
+    // content join — the same `Hash[Dynamic | Symbol, Dynamic | Integer]`
+    // a straight-line `h[:a] = 1` mints.
+    let (env, i) = env_of(b"h = {}\nif true\n  h[:a] = 1\nend\nh.w\n");
+    let h = i.get(*env.get("h").unwrap()).clone();
+    let Type::Nominal { args, .. } = h else {
+        panic!("expected a Hash nominal, got {h:?}")
+    };
+    assert_eq!(args.len(), 2);
+    assert_eq!(
+        index.class_name_of(&i, *env.get("h").unwrap()),
+        Some("Hash")
+    );
+
+    // `h[:a] << 1` rebuilds THROUGH the literal key
+    // (`ElementReadWidening.widen_element_read`): the shape survives with
+    // only `:a`'s element widened.
+    let (env, i) = env_of(b"h = {a: []}\nif true\n  h[:a] << 1\nend\nh.w\n");
+    let Type::HashShape(ms) = i.get(*env.get("h").unwrap()).clone() else {
+        panic!("expected a HashShape, got {:?}", i.get(*env.get("h").unwrap()))
+    };
+    assert_eq!(ms.len(), 1);
+    assert_eq!(index.class_name_of(&i, ms[0].value), Some("Array"));
+
+    // A mutation in a NESTED undecided arm of the live arm still floors:
+    // only straight-line positions in the live arm are unconditional.
+    let (env, i) = env_of(b"x = \"a\"\nif true\n  if c\n    x << \"b\"\n  end\nend\nx.w\n");
+    assert!(matches!(env.get("x").map(|&t| i.get(t)), Some(Type::Dynamic(_))));
+}
+
 /// rigor-rs#153: the always-truthy constant propagation folds past a write
 /// that never runs in sequence, and declines past a conditional one.
 #[test]
