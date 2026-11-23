@@ -107,20 +107,29 @@ waits for a human:
   commits after it are merges of `origin/master`. Compare the PR's own diff
   before and after (`git diff <base>...<head>`, test files aside); any other
   change goes back for a fix-confirmation review.
-- **Green on the approved SHA, mergeable on today's master.** Required
-  checks pass on that head (`docs-check`, and the code CI jobs when the
-  diff is not docs-only). For `review:full`, the standing-set
-  `fp_audit --sweep` is also green on that tree. A `review:light` PR needs
-  green `docs.yml` only. `gh pr view N --json mergeStateStatus` says
-  `CLEAN`. If master moved since that CI run, `gh pr update-branch N` and
-  wait for CI again. Do not block on checks documented as advisory.
-- **Merge one at a time, oldest first.** Two PRs that are each green can break
-  master together: #517 and #522 did on 2026-11-08, and master went red until
-  #565. Before the next self-merge, `gh run list --branch master` shows CI
-  passing on the previous merge commit. PRs whose changed files do not overlap
-  may go out of order.
-- **Stacks.** Merge the parent first, then `gh pr edit N --base master`, wait for
-  `CLEAN`, and treat a conflict as a needed rebase, not a merge.
+- **Green on the approved SHA.** Required checks pass on that head
+  (`docs-check`, and — once the merge-queue ruleset is active — the
+  `CI required` fan-in; until then, the code CI jobs when the diff is
+  not docs-only). For `review:full`, the standing-set `fp_audit --sweep`
+  is also green on that tree. A `review:light` PR needs green `docs.yml`
+  only. Do not block on checks documented as advisory.
+- **Enqueue, do not wait for the previous merge's master CI.** Two PRs
+  that are each green can break master together: #517 and #522 did on
+  2026-11-08, and master went red until #565. Once the master merge
+  queue is enabled (repo ruleset, applied separately), enqueue with
+  `gh pr merge N --merge` and stop waiting on `gh run list --branch
+  master` for an earlier merge — the queue's `merge_group` run is the
+  combination check. The approved SHA remains pinned: if the queue
+  reports the head moved other than a queue rebase / merge of
+  `origin/master`, go back for a fix-confirmation review. Until that
+  ruleset is active, keep the previous one-at-a-time rule: before the
+  next self-merge, `gh run list --branch master` shows CI passing on
+  the previous merge commit; PRs whose changed files do not overlap may
+  go out of order. `gh pr view N --json mergeStateStatus` should be
+  `CLEAN` (or `STABLE` / in-queue once the ruleset is on).
+- **Stacks.** Merge (or enqueue) the parent first, then
+  `gh pr edit N --base master`, wait for `CLEAN`, and treat a conflict
+  as a needed rebase, not a merge.
 - **Human-only, whatever the verdict:** a `review:human` label; a pin bump
   or change under `reference/`, `.github/`, `harness/gate.sh` or
   `harness/docs_check.py`, an ADR, a change to `AGENTS.md` or
