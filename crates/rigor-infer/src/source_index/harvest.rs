@@ -680,6 +680,46 @@ impl SourceIndex {
             }
         }
 
+        // rigor-rs#910 — the in-source RHS-typing table: every `=` write
+        // keeps its RHS nodes regardless of literal-ness or repeat count
+        // (the reference records `type_of` for each rvalue and unions them
+        // per qualified name — a repeat write widens where C5 declines).
+        // The only shared gate is the class/module-collision one: a name a
+        // `class`/`module` declaration owns is answered by the decl rungs
+        // before `in_source_constants` is ever consulted
+        // (`constant_type_at` order), so the table drops it the same way.
+        for (h, ast) in files {
+            let h = h.borrow();
+            for w in &h.constant_writes {
+                let bare = w
+                    .qualified
+                    .rsplit("::")
+                    .next()
+                    .unwrap_or(&w.qualified)
+                    .to_string();
+                if idx.override_classes.contains_key(&w.qualified)
+                    || idx.classes.contains_key(&bare)
+                {
+                    continue;
+                }
+                let entry = crate::source_index::TypedConstWrite {
+                    qualified: w.qualified.clone(),
+                    namespace: w.namespace.clone(),
+                    file: ast.file_key().clone(),
+                    values: w.values.clone(),
+                    mutated: w.mutated,
+                };
+                idx.typed_const_writes
+                    .entry(bare)
+                    .or_default()
+                    .push(entry.clone());
+                idx.qualified_typed_const_writes
+                    .entry(w.qualified.clone())
+                    .or_default()
+                    .push(entry);
+            }
+        }
+
         // Pass 2b (MultiWrite substrate Slice 2): register an id for every class
         // an RBS TUPLE return names as an element. Pass 2 above can only see
         // classes the SOURCE mentions, but a tuple element is reached THROUGH a
