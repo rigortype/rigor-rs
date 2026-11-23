@@ -130,11 +130,11 @@ pub fn fold_outcome(receiver: &Scalar, method: &str, args: &[Scalar]) -> FoldOut
     // (`INTEGER_UNARY`) but `Float#to_c` does NOT — its RBS `Complex`
     // answer stands (`1.5.to_c` -> `for Complex` on the oracle).
     if args.is_empty()
-        && match (receiver, method) {
+        && matches!(
+            (receiver, method),
             (Scalar::Int(_) | Scalar::BigInt(_), "to_r" | "to_c" | "rationalize")
-            | (Scalar::Float(_), "to_r" | "rationalize") => true,
-            _ => false,
-        }
+                | (Scalar::Float(_), "to_r" | "rationalize")
+        )
     {
         return FoldOutcome::Unrepresentable;
     }
