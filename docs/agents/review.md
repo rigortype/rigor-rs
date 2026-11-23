@@ -46,11 +46,43 @@ three such findings non-actionable. The full-parity review that produced the
   budget reading and produce no verdict. Probe failures
   cheaply — try each provider once, then move on; do not retry a hang.
 
-Review once per PR, on the final head after CI is green, not on every push. A
+## Review tiers
+
+A PR carries at most one of these labels. **No review-tier label means
+`review:full`.**
+
+- **`review:full`** (the default). The adversarial review in "What to check":
+  re-probe parity claims, must-still-fire controls and counterexamples.
+  Required for any change to engine behaviour, gates, or fixtures that affect
+  diagnostics. Before merge, the approved SHA must have green required CI
+  **and** a green standing-set `fp_audit` (`python3 harness/fp_audit.py
+  --gaps --sweep`).
+- **`review:light`**. Documentation or comments only — prose, comments, typo
+  fixes in rustdoc. The diff must **not** touch `harness/`,
+  `harness/docs_check.py`, `AGENTS.md`, or `docs/agents/review.md`. Do not
+  spend an Opus adversarial re-probe; a short read that the diff stays in
+  this scope, plus green `docs.yml`, is enough. If the diff is out of scope
+  for light, drop the label and review as `full` (or `human`).
+- **`review:human`**. The human-only paths in "Self-merge", and any PR so
+  labelled. Agents do not self-merge these.
+
+The implementer may apply `review:light` or `review:human` when the diff
+qualifies; a mis-labelled PR is re-tiered by the reviewer, not merged under
+the wrong bar.
+
+## When to start the review
+
+Start the review on a **feature-complete** head, **in parallel with CI**, not
+after CI is green. Review once per PR on that head, not on every push. Do not
+wait for `gh pr checks` to start the review; if checks have already finished,
+read them rather than re-running those gates, and spend the time on probes
+and counterexamples.
+
+`gh pr ready` and self-merge still wait until the **approved SHA** has green
+required CI (and, for `review:full`, a green standing-set fp_audit). A
 `Needs fix` sends the PR back to the implementer only for landing-blocking
 items; every other finding in it is filed as an issue and disclosed in the PR
-body, and the review does not re-run on them. Read CI (`gh pr checks`) rather
-than re-running its gates; spend the time on probes and counterexamples.
+body, and the review does not re-run on them.
 
 Alongside each adversarial review, run a **Fable 5.1 design companion**
 (`claude -p … --model claude-fable-5-1`, or `opencode/claude-fable-5-1`), fed
@@ -75,9 +107,13 @@ waits for a human:
   commits after it are merges of `origin/master`. Compare the PR's own diff
   before and after (`git diff <base>...<head>`, test files aside); any other
   change goes back for a fix-confirmation review.
-- **Green on the head, mergeable on today's master.** `gh pr checks` passes on
-  that head and `gh pr view N --json mergeStateStatus` says `CLEAN`. If master
-  moved since that CI run, `gh pr update-branch N` and wait for CI again.
+- **Green on the approved SHA, mergeable on today's master.** Required
+  checks pass on that head (`docs-check`, and the code CI jobs when the
+  diff is not docs-only). For `review:full`, the standing-set
+  `fp_audit --sweep` is also green on that tree. A `review:light` PR needs
+  green `docs.yml` only. `gh pr view N --json mergeStateStatus` says
+  `CLEAN`. If master moved since that CI run, `gh pr update-branch N` and
+  wait for CI again. Do not block on checks documented as advisory.
 - **Merge one at a time, oldest first.** Two PRs that are each green can break
   master together: #517 and #522 did on 2026-11-08, and master went red until
   #565. Before the next self-merge, `gh run list --branch master` shows CI
@@ -85,10 +121,11 @@ waits for a human:
   may go out of order.
 - **Stacks.** Merge the parent first, then `gh pr edit N --base master`, wait for
   `CLEAN`, and treat a conflict as a needed rebase, not a merge.
-- **Human-only, whatever the verdict:** a pin bump or change under
-  `reference/`, `.github/`, `harness/gate.sh` or `harness/docs_check.py`, an
-  ADR, and a slice whose measured outcome is "0 gaps closed" (AGENTS.md →
-  Probing, "Measure before you build").
+- **Human-only, whatever the verdict:** a `review:human` label; a pin bump
+  or change under `reference/`, `.github/`, `harness/gate.sh` or
+  `harness/docs_check.py`, an ADR, a change to `AGENTS.md` or
+  `docs/agents/review.md`, and a slice whose measured outcome is "0 gaps
+  closed" (AGENTS.md → Probing, "Measure before you build").
 
 After the merge: the fold step (AGENTS.md step 8), then release the PR's
 worktree (`git worktree remove`; `--force` for a populated submodule once
