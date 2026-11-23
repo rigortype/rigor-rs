@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use rigor_parse::{FileKey, LoweredAst, Node, NodeId};
 use rigor_types::{Scalar, ShapeKey};
 
-use super::{qualify, split_qualified, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex};
+use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex};
 
 impl SourceIndex {
     /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
@@ -55,6 +55,24 @@ impl SourceIndex {
                 ns.len() <= use_prefix.len() && use_prefix[..ns.len()] == ns[..]
             })
         })
+    }
+
+    /// rigor-rs#878 — the harvested literal for an already-QUALIFIED name
+    /// (`"Base::K"`) — the ancestor-candidate half of [`Self::literal_constant`],
+    /// which only resolves a bare `name` against `use_prefix`. Same per-file
+    /// gate (the reference's in-source constants table is rebuilt per file).
+    pub(crate) fn literal_constant_at(&self, qualified: &str, file: &FileKey) -> Option<&ConstLit> {
+        self.qualified_literal_constants
+            .get(qualified)
+            .filter(|(_, f, _)| f == file)
+            .map(|(_, _, lit)| lit)
+    }
+
+    /// rigor-rs#878 — whether a plain `=` write binds this exact QUALIFIED
+    /// candidate (`"Base::K"`) — the ancestor-candidate half of the
+    /// `constant_shadowers` census [`Self::constant_write_shadows`] consults.
+    pub(crate) fn constant_write_candidates_contains(&self, qualified: &str) -> bool {
+        self.constant_write_candidates.contains(qualified)
     }
 
     /// Collection-shape stage 2b: whether the project ASSIGNS a constant with
@@ -279,7 +297,14 @@ pub(crate) fn collect_literal_constants(
             if name.is_empty() {
                 return;
             }
-            let child_prefix = split_qualified(&qualify(prefix, name));
+            // Atomic `Module.nesting` entries — `class Float::Sub` is ONE
+            // entry, not `Float` + `Sub` (rigor-rs#878 review; see
+            // [`collect_lexical_scopes`]).
+            let child_prefix = {
+                let mut p = prefix.to_vec();
+                p.push(name.clone());
+                p
+            };
             for &child in body {
                 collect_literal_constants(ast, child, &child_prefix, out, seen, mutated);
             }

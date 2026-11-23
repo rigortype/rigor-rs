@@ -2846,6 +2846,21 @@ impl CoreData {
         self.object_constants.get(name).copied()
     }
 
+    /// rigor-rs#878 review — constant decls whose declared type the reference
+    /// reads from a HOST-RESOLVED `sig/`, not the vendored `stdlib/` copy:
+    /// `RBS::EnvironmentLoader` consults a resolvable installed gem's `sig/`
+    /// first (`libraries_without_shadowed_bigdecimal_math` documents the same
+    /// asymmetry for `BigDecimal` method types). On host ruby 4.0.5 the gem
+    /// `bigdecimal-4.x`'s `sig/` declares `ROUND_MODE: round_mode` — an ALIAS
+    /// the reference's `translate_constant_decl` declines to fold — while the
+    /// vendored `stdlib/bigdecimal/bigdecimal.rbs` says `ROUND_MODE: Integer`,
+    /// which would emit `call.undefined-method` where the oracle is silent.
+    /// A full vendored-vs-host env diff showed this is the only constant whose
+    /// decl type differs, and the fp-audit host IS the divergent host, so the
+    /// port declines these names (a permanent coverage-loss direction: a host
+    /// without the gem's sig would read the vendored `Integer`).
+    const HOST_GEM_SIG_CONSTANT_DECLINES: &[&str] = &["BigDecimal::ROUND_MODE"];
+
     /// rigor-rs#878 — `rbs_loader.constant_type`: the retained declared type of
     /// the RBS constant `name` (a QUALIFIED name with no `::` marker —
     /// `"ARGV"`, `"Float::NAN"`, `"RBS::Unnamed::ENVClass"`…), or `None`
@@ -2853,6 +2868,9 @@ impl CoreData {
     /// here — the `Singleton` rung above it owns those, exactly as the
     /// reference's `constant_for_name` sits below `singleton_for_name`.
     pub fn constant_type(&self, name: &str) -> Option<&RbsConstantShape> {
+        if Self::HOST_GEM_SIG_CONSTANT_DECLINES.contains(&name) {
+            return None;
+        }
         self.constant_types.get(name)
     }
 

@@ -281,6 +281,15 @@ struct HarvestedClass {
 /// reach diagnostics (issue #92 §3.2) — the merge must never sort it.
 pub(crate) struct HarvestedOverrideClass {
     qualified: String,
+    /// The declaration's OWN namespace as a `Module.nesting` chain — the
+    /// enclosing scopes' as-written names plus this declaration name's
+    /// leading segments (empty for a top-level `class A`). Used by the
+    /// C1 `nested_constant_namespaces` table instead of re-splitting
+    /// `qualified`: `class Float::Sub; class K` gives `K` the namespace
+    // `["Float::Sub"]`, which `split("::")` on the qualified name
+    /// cannot distinguish from `module Float; class Sub; class K` —
+    /// the two nest differently in Ruby (rigor-rs#878 review).
+    decl_ns: Vec<String>,
     superclass: Option<String>,
     methods: Vec<String>,
     method_visibilities: Vec<(String, Visibility)>,

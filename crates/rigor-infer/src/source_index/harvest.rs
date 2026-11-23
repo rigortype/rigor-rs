@@ -606,21 +606,28 @@ impl SourceIndex {
 
         // C1: derive the constant-shadow tables from the lexically-qualified
         // override index built above (the same class/module set Ruby's lexical
-        // constant lookup sees). A key with no `::` is a TOPLEVEL definition
-        // (shadows everywhere); a namespaced key contributes its containing
-        // namespace under the constant's last segment (shadows only where
-        // lexically visible). Collected keys first to satisfy the borrow checker.
-        let qualified_defs: Vec<String> = idx.override_classes.keys().cloned().collect();
-        for qualified in &qualified_defs {
-            let segs: Vec<&str> = qualified.split("::").collect();
-            let Some((name, ns)) = segs.split_last() else { continue };
-            if ns.is_empty() {
-                idx.toplevel_constants.insert((*name).to_string());
-            } else {
-                let ns_vec: Vec<String> = ns.iter().map(|s| (*s).to_string()).collect();
-                let entry = idx.nested_constant_namespaces.entry((*name).to_string()).or_default();
-                if !entry.contains(&ns_vec) {
-                    entry.push(ns_vec);
+        // constant lookup sees). A decl with an EMPTY namespace chain is a
+        // TOPLEVEL definition (shadows everywhere); a namespaced one
+        // contributes its atomic `Module.nesting` chain under the constant's
+        // last segment (shadows only where lexically visible — rigor-rs#878
+        // review: `class Float::Sub` records `["Float::Sub"]`, so a decl
+        // inside it shadows `Float::Sub::K` candidates only, never `Float::K`).
+        for (h, _) in files {
+            let h = h.borrow();
+            for oc in &h.override_classes {
+                let Some(name) = oc.qualified.rsplit("::").next() else {
+                    continue;
+                };
+                if oc.decl_ns.is_empty() {
+                    idx.toplevel_constants.insert(name.to_string());
+                } else {
+                    let entry = idx
+                        .nested_constant_namespaces
+                        .entry(name.to_string())
+                        .or_default();
+                    if !entry.contains(&oc.decl_ns) {
+                        entry.push(oc.decl_ns.clone());
+                    }
                 }
             }
         }

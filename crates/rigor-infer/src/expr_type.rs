@@ -3,7 +3,7 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{Compound, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, FileKey, LoweredAst, Node, NodeId};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
@@ -530,7 +530,9 @@ impl<'i> Typer<'i> {
                 // a cross-file write that would fold is a rare coverage loss
                 // and never a wrong answer.
                 if !self.source.constant_write_shadows(name, prefix, *rooted) {
-                    if let Some(ty) = self.constant_for_name(name, prefix, *rooted, interner) {
+                    if let Some(ty) =
+                        self.constant_for_name(name, prefix, *rooted, ast.file_key(), interner)
+                    {
                         return ty;
                     }
                 }
@@ -1351,6 +1353,7 @@ impl<'i> Typer<'i> {
         name: &str,
         prefix: &[String],
         rooted: bool,
+        file: &FileKey,
         interner: &mut Interner,
     ) -> Option<TypeId> {
         // `Some` ends the walk on a project/RBS binding (the type lives on
@@ -1361,8 +1364,8 @@ impl<'i> Typer<'i> {
                 || self.index.knows_qualified_class(candidate)
         };
         if !rooted {
-            // Innermost lexical scope outward: `prefix[..len]::name` first —
-            // Ruby's `Module.nesting` walk.
+            // Step 1 — innermost lexical scope outward: `prefix[..len]::name`
+            // first — Ruby's `Module.nesting` walk.
             for i in (1..=prefix.len()).rev() {
                 let candidate = crate::source_index::qualify(&prefix[..i], name);
                 if bound(&candidate) {
@@ -1370,6 +1373,51 @@ impl<'i> Typer<'i> {
                 }
                 if let Some(ty) = self.constant_type_for(&candidate, interner) {
                     return Some(ty);
+                }
+            }
+            // Step 2 (upstream #354, `ancestor_constant_type`) — the
+            // ancestors of the innermost cresting scope, which Ruby
+            // consults BEFORE the top level: `class Sub < Base; K` reaches
+            // `Base::K`, so a `Base::K` write must stop the `K` rungs below
+            // (the `ARGV = $x` in `class Base` FP — rigor-rs#878 review).
+            // [`SourceIndex::ancestor_constant_scopes`] resolves each written
+            // ancestor to the project-known namespace the reference's
+            // `known_project_namespace?` admits — an RBS-only superclass
+            // contributes no name (`class Sub < Float; DIG` is silent on the
+            // oracle unless the project itself discovers `Float`).
+            let innermost = prefix.join("::");
+            if !innermost.is_empty() {
+                let mut queue: std::collections::VecDeque<String> =
+                    self.source.ancestor_constant_scopes(&innermost).into_iter().collect();
+                let mut seen = std::collections::HashSet::new();
+                seen.insert(innermost.clone());
+                let mut steps = 0usize;
+                while let Some(ancestor) = queue.pop_front() {
+                    if !seen.insert(ancestor.clone()) {
+                        continue;
+                    }
+                    steps += 1;
+                    if steps > crate::source_index::OVERRIDE_ANCESTOR_WALK_LIMIT {
+                        break; // cap: stop consulting ancestors, fall to bare name
+                    }
+                    let candidate = format!("{ancestor}::{name}");
+                    // `constant_type_at`'s in-source rung first: a same-file
+                    // literal write on the ancestor answers `for <lit>`
+                    // (`Base::K = 5` + `class Sub < Base; K` → `for 5`).
+                    if let Some(lit) = self.source.literal_constant_at(&candidate, file) {
+                        return Some(self.intern_const_lit(lit, interner));
+                    }
+                    if self.source.constant_write_candidates_contains(&candidate)
+                        || bound(&candidate)
+                    {
+                        return None;
+                    }
+                    if let Some(ty) = self.constant_type_for(&candidate, interner) {
+                        return Some(ty);
+                    }
+                    for next in self.source.ancestor_constant_scopes(&ancestor) {
+                        queue.push_back(next);
+                    }
                 }
             }
         }
