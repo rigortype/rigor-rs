@@ -1029,6 +1029,104 @@ fn cross_namespace_constant_not_folded() {
     assert_eq!(idx.literal_constant("DAYS", &[], _a.file_key()), None);
 }
 
+/// rigor-rs#906 — one namespace unifies across its spellings: the C5
+/// visibility compare runs at the joined-STRING level, so a compact write
+/// chain (`class A::B` records `["A::B"]`) is visible at a deep use site
+/// (`["A", "B", "C"]`) and a deep write chain at a compact use site — the
+/// reference's string-keyed in-source table answers either spelling through
+/// the other. The use side stays ATOMIC: a compact `class Float::Sub`
+/// consults only `Float::Sub::X`, never `Float::X` (the rigor-rs#878 round-1
+/// FP shape, oracle-silent).
+#[test]
+fn literal_constant_unifies_compact_and_deep_spellings() {
+    let core = CoreIndex::new();
+    // Compact write, deep use (the brief's row 1), at depth and one deeper.
+    let (a, idx) = build_one(
+        b"class A::B\n  K = 9\nend\nclass A\n  module B\n    class C\n      K\n    end\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.literal_constant("K", &seg(&["A", "B"]), a.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Int(9)))
+    );
+    assert_eq!(
+        idx.literal_constant("K", &seg(&["A", "B", "C"]), a.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Int(9)))
+    );
+    // Not visible at the toplevel or from an unrelated namespace.
+    assert_eq!(idx.literal_constant("K", &[], a.file_key()), None);
+    assert_eq!(idx.literal_constant("K", &seg(&["Q"]), a.file_key()), None);
+
+    // Deep write, compact use (the brief's row 2).
+    let (b, idx) = build_one(
+        b"class A\n  module B\n    J = 7\n  end\nend\nclass A::B\n  J\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.literal_constant("J", &seg(&["A::B"]), b.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Int(7)))
+    );
+
+    // The use side stays atomic: a compact `Float::Sub` use site does not
+    // see `module Float`'s write, while the deep spelling does (the
+    // must-still-fire control).
+    let (c, idx) = build_one(
+        b"module Float\n  DIG = 1\nend\nclass Float::Sub\n  DIG\nend\n",
+        &core,
+    );
+    assert_eq!(idx.literal_constant("DIG", &seg(&["Float::Sub"]), c.file_key()), None);
+    assert_eq!(
+        idx.literal_constant("DIG", &seg(&["Float", "Sub"]), c.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Int(1)))
+    );
+}
+
+/// rigor-rs#906 — innermost-wins across spellings: among visible entries the
+/// DEEPEST joined path wins (the reference walks its nesting innermost
+/// first), and the as-written entry count is no measure of depth — a compact
+/// `class M::N` write is depth 2 and beats a toplevel write of the same bare
+/// name where both are visible.
+#[test]
+fn literal_constant_innermost_wins_across_spellings() {
+    let core = CoreIndex::new();
+    let (a, idx) = build_one(
+        b"K = 1\nclass M::N\n  K = \"s\"\nend\nmodule M\n  class N\n    K\n  end\nend\nK\n",
+        &core,
+    );
+    // Both entries visible inside `M::N`; the compact write's joined path
+    // (depth 2) beats the toplevel write (depth 0).
+    assert_eq!(
+        idx.literal_constant("K", &seg(&["M", "N"]), a.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Str("s".into())))
+    );
+    // At the toplevel only the toplevel write is visible.
+    assert_eq!(
+        idx.literal_constant("K", &[], a.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Int(1)))
+    );
+}
+
+/// rigor-rs#906 — the qualified twin: a fully-qualified read passes the SAME
+/// joined-path visibility filter, so a compact write chain resolves through
+/// a deep use site, and a path read from an unrelated or shallower scope
+/// still declines.
+#[test]
+fn qualified_literal_constant_unifies_spellings() {
+    let core = CoreIndex::new();
+    let (a, idx) = build_one(
+        b"class A::B\n  K = 9\nend\nmodule A\n  class B\n    A::B::K\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.qualified_literal_constant("A::B::K", &seg(&["A", "B"]), a.file_key()),
+        Some(&ConstLit::Scalar(Scalar::Int(9)))
+    );
+    // Toplevel path read and an unrelated namespace still decline.
+    assert_eq!(idx.qualified_literal_constant("A::B::K", &[], a.file_key()), None);
+    let (_c, idx) = build_one(b"class Q::R\n  Z = 1\nend\nmodule Q\n  Q::R::Z\nend\n", &core);
+    assert_eq!(idx.qualified_literal_constant("Q::R::Z", &seg(&["Q"]), _c.file_key()), None);
+}
+
 #[test]
 fn multiple_assignment_declines_harvest() {
     // A constant written twice (same qualified name) is ambiguous ⇒ declined.
