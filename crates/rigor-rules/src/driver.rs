@@ -263,8 +263,8 @@ pub fn analyze_with_source_and_folder(
             })
             .or_else(|| {
                 check_always_raises(
-                    ast, recv, &method, &args, has_block, message_span, env, &typer, interner,
-                    index,
+                    ast, call_id, recv, &method, &args, has_block, message_span, env, &typer,
+                    interner, index,
                 )
             });
         let call_span = ast.get(call_id).span();

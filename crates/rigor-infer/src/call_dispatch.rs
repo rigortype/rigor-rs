@@ -519,6 +519,25 @@ impl<'i> Typer<'i> {
                             }
                             return interner.intern(Type::Constant(folded));
                         }
+                        // `lift_array_result` / `try_fold_divmod`: a
+                        // Tuple of pinned constants — `big.divmod(3)`
+                        // types `for [33333333333333333333, 0]` like the
+                        // oracle (rigor-rs#877).
+                        folding::FoldOutcome::Tuple(elems) => {
+                            let ids: Vec<TypeId> = elems
+                                .into_iter()
+                                .map(|s| interner.intern(Type::Constant(s)))
+                                .collect();
+                            return interner.intern(Type::Tuple(ids));
+                        }
+                        // The reference folds to a Rational/Complex
+                        // constant `Scalar` cannot hold; its pinned
+                        // carrier is silent downstream, so untyped — the
+                        // RBS `Rational`/`Complex` nominal would fire a
+                        // diagnostic the oracle never emits (rigor-rs#877).
+                        folding::FoldOutcome::Unrepresentable => {
+                            return interner.untyped();
+                        }
                         // Upstream #2115's `WidenedResult`: a fold past
                         // `INTEGER_FOLD_BIT_LIMIT` still knows its class —
                         // the reference answers `Nominal[Integer]` (or

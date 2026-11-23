@@ -3136,6 +3136,29 @@ fn always_raises_fires_on_named_ops() {
 }
 
 #[test]
+fn always_raises_fires_on_bignum_receiver_div_zero() {
+    // `99999999999999999999 / 0` — a `Constant[BigInt]` receiver is
+    // Integer-rooted on the oracle (`value.is_a?(Integer)` covers Bignum),
+    // so the literal-zero divisor still fires (rigor-rs#877).
+    for (src, op) in [
+        (b"99999999999999999999 / 0\n" as &[u8], "/"),
+        (b"99999999999999999999 % 0\n", "%"),
+        (b"99999999999999999999.div(0)\n", "div"),
+        (b"99999999999999999999.modulo(0)\n", "modulo"),
+        (b"99999999999999999999.divmod(0)\n", "divmod"),
+    ] {
+        let diags = always_raises_diags(src);
+        assert_eq!(diags.len(), 1, "expected one diag for {op}, got {diags:?}");
+        assert_eq!(
+            diags[0].message,
+            format!("always raises ZeroDivisionError: `{op}' by zero on Integer receiver")
+        );
+    }
+    // A Bignum DIVISOR is not the constant `0` — still silent.
+    assert!(always_raises_diags(b"5 / 99999999999999999999\n").is_empty());
+}
+
+#[test]
 fn always_raises_silent_on_nonzero_divisor() {
     // `5 / 2` — a valid division, never raises ⇒ silent.
     assert!(always_raises_diags(b"5 / 2\n").is_empty());
@@ -4900,15 +4923,19 @@ fn issue_436_reaching_write_cap_boundary() {
             .collect()
     }
     // One plain write plus `n` conditional ones: `n + 1` reaching writes.
-    // The probe call is `1.fdiv(v)`, not `"abc"[v]`: #178 declines every
-    // nilable String lookup whose argument reads a local, so `[]` can no
-    // longer observe the cap — `fdiv` folds on the pinned single value and
-    // declines on the same `multi` reach the cap mints.
+    // The probe call is `1.coerce(v)`, not `"abc"[v]` or `1.fdiv(v)`: #178
+    // declines every nilable String lookup whose argument reads a local, and
+    // rigor-rs#877 folds `fdiv` on the env's `Constant` pin (the oracle
+    // answers `for 1.0` at ANY count — its forward join dedups `1 | 1`), so
+    // the cap is observable only through a call whose fold declines and
+    // whose RBS tier withholds on the `multi` reach the cap mints. `coerce`
+    // is that call: RBS answers `for [Numeric, Numeric]` on the pinned
+    // single value, silent on the `multi`.
     let fan_def = |n: usize| {
-        format!("def f(c)\n  v = 1\n{}  1.fdiv(v).zz\nend\n", "  v = 1 if c\n".repeat(n))
+        format!("def f(c)\n  v = 1\n{}  1.coerce(v).zz\nend\n", "  v = 1 if c\n".repeat(n))
     };
     let fan_top =
-        |n: usize| format!("v = 1\n{}1.fdiv(v).zz\n", "v = 1 if rand > 0.5\n".repeat(n));
+        |n: usize| format!("v = 1\n{}1.coerce(v).zz\n", "v = 1 if rand > 0.5\n".repeat(n));
     for (shape, fan) in [("def", &fan_def as &dyn Fn(usize) -> String), ("top", &fan_top)] {
         assert_eq!(undefined(&fan(255)).len(), 1, "{shape}: 256 writes must still fire");
         assert!(undefined(&fan(256)).is_empty(), "{shape}: 257 writes must decline");
@@ -4919,7 +4946,7 @@ fn issue_436_reaching_write_cap_boundary() {
     // sees one write and fires. (A literal `if false` arm is no test: its
     // writes are not collector events at all.)
     let writes = "    v = 2\n".repeat(300);
-    let read = "  1.fdiv(v).zz\nend\n";
+    let read = "  1.coerce(v).zz\nend\n";
     let rescue_dead =
         format!("def f(c)\n  v = 1\n  begin\n    c.g\n  rescue\n{writes}    raise\n  end\n{read}");
     let fold_dead = format!("def f(c)\n  v = 1\n  t = nil\n  if t\n{writes}  end\n{read}");

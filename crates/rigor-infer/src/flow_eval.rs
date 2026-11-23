@@ -765,7 +765,12 @@ impl<'i> Typer<'i> {
                                 Some(a) => rigor_types::Algebra::join(interner, a, n),
                             });
                         }
-                        crate::folding::FoldOutcome::Declined => return untyped,
+                        // An op-write (`x /= y`) never asks for a Tuple
+                        // or an unrepresentable carrier — treat either as
+                        // a decline, same as `invoke`'s nil.
+                        crate::folding::FoldOutcome::Tuple(_)
+                        | crate::folding::FoldOutcome::Unrepresentable
+                        | crate::folding::FoldOutcome::Declined => return untyped,
                     }
                 }
                 acc.unwrap_or(untyped)
@@ -4310,6 +4315,37 @@ impl<'i> Typer<'i> {
             }
             _ => vec![],
         }
+    }
+
+    /// `node -> parent` over every [`Self::flow_children`] edge — the ancestor
+    /// index `flow.always-raises`'s `AlwaysRaisesShield` port walks when it
+    /// asks whether an enclosing `begin` may catch the proven
+    /// ZeroDivisionError (rigor-rs#877). `IndexWrite`'s
+    /// `receiver: None` arm adds the `indices`/`value` edges `flow_children`
+    /// leaves out (flow order never reaches them, but structurally they are
+    /// still the write's children).
+    pub fn ancestor_map(
+        &self,
+        ast: &LoweredAst,
+    ) -> std::collections::HashMap<NodeId, NodeId> {
+        let mut parents = std::collections::HashMap::new();
+        for (id, node) in ast.iter() {
+            for (child, _) in self.flow_children(node) {
+                parents.insert(child, id);
+            }
+            if let Node::IndexWrite {
+                receiver: None,
+                indices,
+                value,
+                ..
+            } = node
+            {
+                for &child in indices.iter().chain(std::iter::once(value)) {
+                    parents.insert(child, id);
+                }
+            }
+        }
+        parents
     }
 
     /// One statement of [`Self::build_toplevel_check_env`]: a direct write binds
