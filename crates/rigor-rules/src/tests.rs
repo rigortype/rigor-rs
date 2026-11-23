@@ -5891,3 +5891,117 @@ fn issue_862_safe_navigation_nil_arm() {
         assert_eq!(diags, expect, "row {:?}", String::from_utf8_lossy(src));
     }
 }
+
+// -- rigor-rs#891: Logical operand writes + sigilled write binding -------
+
+/// `call.undefined-method` messages for `src` (the `#891` probe rows' rule).
+fn undefined_891(src: &str) -> Vec<String> {
+    run(src.as_bytes())
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| d.message)
+        .collect()
+}
+
+#[test]
+fn logical_left_operand_write_witnesses_downstream_call() {
+    // rigor-rs#891, oracle-probed: `eval_and_or`'s LEFT operand always
+    // runs, so a write directly in it binds in the continuation —
+    // `x = (v = 1) || 2` reads `v : 1`, and the `or`-statement's left
+    // write (`(x = [1]) or [2]`) binds `x : [1]`.
+    assert_eq!(
+        undefined_891("x = (v = 1) || 2\nv.zzz\n"),
+        vec!["undefined method `zzz' for 1"]
+    );
+    assert_eq!(
+        undefined_891("x = [1] or [2]\nx.zzz\n"),
+        vec!["undefined method `zzz' for [1]"]
+    );
+    // The RIGHT operand's writes stay declined: the reference
+    // nil-injects them (`v : 2 | nil`), and a receiver with a nil arm
+    // never fires `call.undefined-method` — every row is
+    // reference-silent.
+    for src in [
+        "x = 1 or (v = 2)\nv.zzz\n",
+        "false or (v = 2)\nv.zzz\n",
+        "c = nil\nc or (v = 2)\nv.zzz\n",
+        "x = 1 || (v = 2)\nv.zzz\n",
+        "x = [1] || (v = 2)\nv.zzz\n",
+        "x = [1] or (a = 2; raise \"e\")\na.zzz\n",
+    ] {
+        assert_eq!(undefined_891(src), Vec::<String>::new(), "{src:?}");
+    }
+}
+
+#[test]
+fn straight_line_sigilled_writes_bind_the_check_env() {
+    // rigor-rs#891, oracle-probed: a straight-line `@x = v` / `$g = v` /
+    // `@@c = v` binds the flat env (`Scope#ivar`/`cvar`/`global`), so the
+    // read side fires exactly as the reference does — including a
+    // Logical-valued write and a rebind keeping the last value.
+    for (src, msg) in [
+        ("@x = 1 || 2\n@x.zzz\n", "undefined method `zzz' for 1"),
+        ("$x = 1 || 2\n$x.zzz\n", "undefined method `zzz' for 1"),
+        ("@@x = 1 || 2\n@@x.zzz\n", "undefined method `zzz' for 1"),
+        ("@x = \"s\"\n@x.zzz\n", "undefined method `zzz' for \"s\""),
+        ("$x = \"s\"\n$x.zzz\n", "undefined method `zzz' for \"s\""),
+        ("@@x = \"s\"\n@@x.zzz\n", "undefined method `zzz' for \"s\""),
+        ("@x = \"s\"; @x = 1\n@x.zzz\n", "undefined method `zzz' for 1"),
+        ("@x = \"s\"\nx = (@x = 1) || 2\n@x.zzz\n", "undefined method `zzz' for 1"),
+    ] {
+        assert_eq!(undefined_891(src), vec![msg.to_string()], "{src:?}");
+    }
+    // A write at a position its statement does not run unconditionally
+    // declines — the reference joins the arms (`"s" | 1`), which the flat
+    // env declines instead. A conditional IVAR row is reference-silent
+    // too; the `$g` variant fires on the reference and stays a filed
+    // coverage loss.
+    for src in [
+        "@x = \"s\" if c\n@x.zzz\n",
+        "@x = \"s\"\nif c\n  @x = 1\nend\n@x.zzz\n",
+        "@x = \"s\"\n[1].each { @x = 1 }\n@x.zzz\n",
+        "@x = \"s\"\ncase c\nwhen 1 then @x = 1\nend\n@x.zzz\n",
+    ] {
+        assert_eq!(undefined_891(src), Vec::<String>::new(), "{src:?}");
+    }
+    // Must-still-fire controls: the stale-binding widen must not reach a
+    // write the dead set proves never ran, an inert (`defined?`)
+    // operand, a nested `def` body, or the loop fixpoint's joined ivar.
+    assert_eq!(
+        undefined_891("@x = \"s\"\nif false\n  @x = 1\nend\n@x.zzz\n"),
+        vec!["undefined method `zzz' for \"s\""]
+    );
+    assert_eq!(
+        undefined_891("@x = \"s\"\nif true\n  @x = 1\nend\n@x.zzz\n"),
+        vec!["undefined method `zzz' for 1"]
+    );
+    assert_eq!(
+        undefined_891("@x = \"s\"\ny = defined?(@x = 1)\n@x.zzz\n"),
+        vec!["undefined method `zzz' for \"s\""]
+    );
+    assert_eq!(
+        undefined_891("@x = \"s\"\ndef f\n  @x = 1\nend\n@x.zzz\n"),
+        vec!["undefined method `zzz' for \"s\""]
+    );
+    assert_eq!(
+        undefined_891("@x = \"s\"\nwhile c\n  @x = 1\nend\n@x.zzz\n"),
+        vec!["undefined method `zzz' for \"s\" | 1"]
+    );
+    // A call between write and read keeps the binding (the reference
+    // resets only NARROWED ivars, never a plain binding).
+    assert_eq!(
+        undefined_891("@x = \"s\"\nputs 1\n@x.zzz\n"),
+        vec!["undefined method `zzz' for \"s\""]
+    );
+    // A sigilled op/and/or write the port cannot fold widens the name —
+    // the reference folds `1 + 1` to `2`; the port declines.
+    for src in [
+        "@n = 1\n@n += 1\n@n.zzz\n",
+        "$n = 1\n$n ||= 5\n$n.zzz\n",
+        "@@n = 1\n@@n += 1\n@@n.zzz\n",
+    ] {
+        assert_eq!(undefined_891(src), Vec::<String>::new(), "{src:?}");
+    }
+    // An unbound sigilled read stays `untyped` (never guess).
+    assert_eq!(undefined_891("@y.zzz\n"), Vec::<String>::new());
+}

@@ -905,10 +905,10 @@ pub enum Node {
         /// `discovered_classes`, which `class_known_to_scope?` consults for
         /// `is_a?(::Foo)`-family operands.
         meta_new_const: Option<String>,
-        /// rigor-rs#639: when this unmodeled write is an instance-variable
-        /// op/and/or write (`@x += v`, `@x ||= v`, `@x &&= v` — plain
-        /// `@x = v` is an owned [`Node::InstanceVariableWrite`]), the sigilled
-        /// name it binds and the write kind. The reference's
+        /// rigor-rs#639: when this unmodeled write is a SIGILLED
+        /// op/and/or write (`@x += v`, `@x ||= v`, `@@c &&= v`, `$g ||= v`
+        /// — plain `@x = v` is an owned [`Node::InstanceVariableWrite`]),
+        /// the sigilled name it binds and the write kind. The reference's
         /// `loop_body_ivar_writes` counts these on a bound ivar; `names`
         /// stays LOCAL-only (rigor-rs#352's pattern binds) so the rebind
         /// censuses do not see them.

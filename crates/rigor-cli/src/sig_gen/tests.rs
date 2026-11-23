@@ -1698,6 +1698,71 @@ fn def_local_env_keeps_what_a_call_cannot_invalidate() {
 }
 
 #[test]
+fn def_local_env_binds_logical_operand_writes() {
+    // rigor-rs#891 — every row byte-identical to the reference's
+    // `sig-gen --print` (oracle-probed): the LEFT operand of a `&&`/`||`
+    // always runs, so its writes bind unconditionally; the RIGHT
+    // operand's writes join nil-injected — `2 | nil` for a name unbound
+    // after the left, the post-left binding otherwise — and a right
+    // that never completes (`raise`) drops its scope entirely. A write
+    // whose VALUE is a Logical treats its operands the same way, and a
+    // sigilled write through a Logical binds the sigilled name.
+    let rows = def_rows(
+        "def_local_logical_operands",
+        "def q1; x = [1] or x = 2; x; end\n\
+         def q2; nil and (a = 2); a; end\n\
+         def q3; a = 0; false or (a = 2); a; end\n\
+         def q4; a = 0; true and (a = 2); a; end\n\
+         def q9; x = (v = 1) || 2; v; end\n\
+         def q10; x = 1 || (v = 2); v; end\n\
+         def q11; x = [1] || (v = 2); v; end\n\
+         def q12; y = (x = [1] or [2]); x; end\n\
+         def r1; x = 0; [1] or x = 2; x; end\n\
+         def r5; x = 0; x = [1] or (a = 2; raise \"e\"); x; end\n\
+         def r7; v = 0; c = nil; x = 1 || (v = 2); v; end\n\
+         def k1; x = 2; [1] or x = 0; x; end\n\
+         def k5; x = nil; [1] or x = 2; x; end\n\
+         def p; @x = 1 || 2; @x; end",
+    );
+    assert_eq!(rows["q1"], r##"def q1: () -> (2 | [1])"##);
+    assert_eq!(rows["q2"], r##"def q2: () -> (2 | nil)"##);
+    assert_eq!(rows["q3"], r##"def q3: () -> (0 | 2)"##);
+    assert_eq!(rows["q4"], r##"def q4: () -> (0 | 2)"##);
+    assert_eq!(rows["q9"], r##"def q9: () -> 1"##);
+    assert_eq!(rows["q10"], r##"def q10: () -> (2 | nil)"##);
+    assert_eq!(rows["q11"], r##"def q11: () -> (2 | nil)"##);
+    assert_eq!(rows["q12"], r##"def q12: () -> [1]"##);
+    assert_eq!(rows["r1"], r##"def r1: () -> (0 | 2)"##);
+    assert_eq!(rows["r5"], r##"def r5: () -> [1]"##);
+    assert_eq!(rows["r7"], r##"def r7: () -> (0 | 2)"##);
+    assert_eq!(rows["k1"], r##"def k1: () -> (0 | 2)"##);
+    assert_eq!(rows["k5"], r##"def k5: () -> (2 | nil)"##);
+    assert_eq!(rows["p"], r##"def p: () -> 1"##);
+}
+
+#[test]
+fn def_local_env_declines_logical_shapes_the_replay_cannot_model() {
+    // rigor-rs#891 residuals — the reference emits (or answers) each row
+    // and the port declines, a coverage loss, never a wrong signature:
+    // a typed left read is a decision the replay does not narrow
+    // (`replay_opaque`); a write nested in a call operand or a conditional
+    // binds on the reference's `OperandWalk`, which the port does not
+    // model; a one-arm sigilled write falls to the reference's file-wide
+    // union, which the port does not port.
+    let rows = def_rows(
+        "def_local_logical_declines",
+        "def t4(c); c = [1]; c and (a = 2); a; end\n\
+         def j5(c); x = [1]; y = x or (x = 2); x; end\n\
+         def l1(c); v = \"e\"; x = foo(v = 1) || 2; v; end\n\
+         def l2(c); v = \"e\"; x = 1 || foo(v = 2); v; end\n\
+         def l4(c); v = \"e\"; x = (if c; v = 1; end) || 2; v; end\n\
+         def g1(c); c = [1]; c or ($g = 2); $g; end\n\
+         def g2(c); c = [1]; c or (@i = 2); @i; end",
+    );
+    assert!(rows.is_empty(), "every row must decline: {rows:?}");
+}
+
+#[test]
 fn def_local_env_declines_a_local_handed_to_a_callee() {
     // rigor-rs#546 review 2: the reference's callee-mutated-parameter
     // analysis (`StatementEvaluator#argument_mutating_callees`) widens a
@@ -2216,7 +2281,9 @@ def s31(c); a = 1; b = a; b = 2 if c; b; end
     assert!(!rows.contains_key("s9"), "s9 must decline: {rows:?}");
     assert!(!rows.contains_key("s10"), "s10 must decline: {rows:?}");
     assert!(!rows.contains_key("s11"), "s11 must decline: {rows:?}");
-    assert!(!rows.contains_key("s12"), "s12 must decline: {rows:?}");
+    // rigor-rs#891: a Logical's LEFT operand always runs, so a write
+    // directly in it binds — byte-identical to the reference.
+    assert_eq!(rows["s12"], r##"def s12: (untyped) -> "s""##);
     assert!(!rows.contains_key("s13"), "s13 must decline: {rows:?}");
     assert!(!rows.contains_key("s14"), "s14 must decline: {rows:?}");
     assert!(!rows.contains_key("s15"), "s15 must decline: {rows:?}");
@@ -2230,7 +2297,9 @@ def s31(c); a = 1; b = a; b = 2 if c; b; end
     assert!(!rows.contains_key("s23"), "s23 must decline: {rows:?}");
     assert!(!rows.contains_key("s24"), "s24 must decline: {rows:?}");
     assert!(!rows.contains_key("s25"), "s25 must decline: {rows:?}");
-    assert!(!rows.contains_key("s26"), "s26 must decline: {rows:?}");
+    // rigor-rs#891: the `and`-statement's LEFT write binds (`a = 2 and c`
+    // reads `a : 2`) — byte-identical to the reference.
+    assert_eq!(rows["s26"], r##"def s26: (untyped) -> 2"##);
     assert!(!rows.contains_key("s27"), "s27 must decline: {rows:?}");
     assert_eq!(rows["s28"], r##"def s28: (untyped) -> (1 | 2)"##);
     assert_eq!(rows["s29"], r##"def s29: (untyped) -> 1"##);
@@ -2332,7 +2401,11 @@ def t19(c); a = 1; if c; a = 2; else; a = 3; end; a; end
     assert!(!rows.contains_key("t11"), "t11 must decline: {rows:?}");
     assert!(!rows.contains_key("t12"), "t12 must decline: {rows:?}");
     assert!(!rows.contains_key("t13"), "t13 must decline: {rows:?}");
-    assert!(!rows.contains_key("t14"), "t14 must decline: {rows:?}");
+    // rigor-rs#891: the `&&`'s right operand never completes, so its scope
+    // drops entirely (`branch_terminates?`) and the LEFT's binding — none
+    // here — is all that remains: `a` keeps `1`, byte-identical to the
+    // reference.
+    assert_eq!(rows["t14"], r##"def t14: (untyped) -> 1"##);
     assert!(!rows.contains_key("t15"), "t15 must decline: {rows:?}");
     assert!(!rows.contains_key("t16"), "t16 must decline: {rows:?}");
     assert_eq!(rows["t17"], r##"def t17: (untyped) -> (1 | 2)"##);
@@ -2695,9 +2768,13 @@ fn def_local_env_declines_ivar_writes_and_calls_the_replay_does_not_see() {
         ("@n = 1; @n = 2 if c; @n", Some("(1 | 2)")),
         ("@@n = 1; @@n += 1; @@n", None),  // ref: 2
         ("$n = 1; $n += 1; $n", None),  // ref: 2
-        ("@@n = 1; @@n", None),  // ref: 1
-        ("$n = 1; $n", None),  // ref: 1
-        ("@@n = 1; @@n = 2 if c; @@n", None),  // ref: (1 | 2)
+        // rigor-rs#891 — a straight-line cvar/gvar write binds the flat env
+        // (byte-identical to the reference).
+        ("@@n = 1; @@n", Some("1")),
+        ("$n = 1; $n", Some("1")),
+        // rigor-rs#891 — the If arm's join binds both edges, byte-identical
+        // to the reference.
+        ("@@n = 1; @@n = 2 if c; @@n", Some("(1 | 2)")),
     ];
     check_def_local_rows("def_local_env_declines_ivar_writes_and_calls_the_replay_does_not_see", rows);
 }
