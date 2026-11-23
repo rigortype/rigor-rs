@@ -670,8 +670,12 @@ impl Harness {
                 folder: None,
                 stamp: SeverityStamp::from_config(&cfg),
                 exclude: ExcludeMatcher::from_config(&root, &cfg),
-                pre_eval_declared: false,
-                pre_eval: None,
+                // The same wiring `run_stdio` gives its startup context: a
+                // `pre_eval:` list in the project `.rigor.yml` is honoured
+                // from the first dispatch, which the staleness test depends
+                // on (#491).
+                pre_eval_declared: !cfg.pre_eval.is_empty(),
+                pre_eval: crate::pre_eval::load(&cfg.pre_eval),
                 core_root_invalid: false,
                 overlay,
             });
@@ -1460,7 +1464,8 @@ fn watched_file_relevance_matches_the_config_and_signature_surface() {
     // `Gemfile.lock`, project `*.rb`, `sig/**/*.rbs` — but review N3 SPLIT it
     // by cost: only the config/signature files force a full tier-1 rebuild; a
     // project `.rb` re-harvests just that file's AST entry.
-    let src = |u: &str| classify_watched_files(&watched_change(u));
+    let cfg = Config::default();
+    let src = |u: &str| classify_watched_files(&watched_change(u), &cfg);
     assert_eq!(src("file:///p/.rigor.yml"), WatchedChange::Structural);
     assert_eq!(src("file:///p/Gemfile.lock"), WatchedChange::Structural);
     assert_eq!(src("file:///p/sig/user.rbs"), WatchedChange::Structural);
@@ -1475,7 +1480,10 @@ fn watched_file_relevance_matches_the_config_and_signature_surface() {
     assert_eq!(src("file:///p/vendor/other.rbs"), WatchedChange::None);
     assert_eq!(src("file:///p/notes.txt"), WatchedChange::None);
     assert_eq!(src("file:///p/README.md"), WatchedChange::None);
-    assert_eq!(classify_watched_files(&serde_json::json!({})), WatchedChange::None);
+    assert_eq!(
+        classify_watched_files(&serde_json::json!({}), &cfg),
+        WatchedChange::None
+    );
 
     // A batch mixing both kinds is STRUCTURAL: the full rebuild re-harvests
     // every source anyway, so the cheap path would be redundant work.
@@ -1483,7 +1491,88 @@ fn watched_file_relevance_matches_the_config_and_signature_surface() {
         { "uri": "file:///p/lib/a.rb" },
         { "uri": "file:///p/.rigor.yml" }
     ]});
-    assert_eq!(classify_watched_files(&mixed), WatchedChange::Structural);
+    assert_eq!(classify_watched_files(&mixed, &cfg), WatchedChange::Structural);
+}
+
+/// rigor-rs#491 item 2 (upstream #1613): an edit to a `.rb` file the
+/// `pre_eval:` list names re-baselines the whole context — the patched
+/// registry is re-read and every open buffer re-analysed against it.
+#[test]
+fn integration_s4b_pre_eval_file_edit_rebaselines_the_context() {
+    let p = TempProject::new("pre_eval");
+    // The patch file lives OUTSIDE `paths:` — the registry is the only
+    // thing its content feeds (it is never a project `.rb` to re-harvest).
+    std::fs::create_dir_all(p.root.join("patch")).unwrap();
+    let patch_file = p.root.join("patch/core.rb");
+    std::fs::write(&patch_file, "class String; def lit = 1; end\n").unwrap();
+    p.write_config("paths: [lib]\npre_eval:\n  - patch/core.rb\n");
+    p.write("app.rb", "s = \"x\"\ns.lit\n");
+    let mut h = Harness::start_project(
+        Duration::from_secs(30),
+        production_gate(),
+        serde_json::json!({}),
+        p.root.clone(),
+        OVERLAY_BUILD_BUDGET_DEFAULT,
+    );
+    h.notify("textDocument/didOpen", open_params(&p.uri("app.rb"), "s = \"x\"\ns.lit\n", 1));
+    assert!(
+        h.recv_diags().diagnostics.is_empty(),
+        "the `lit` patch on String answers the call: no diagnostic"
+    );
+
+    // The patch is edited ON DISK so it no longer defines `lit`. The event
+    // must re-baseline the context, not merely re-harvest a `.rb`.
+    std::fs::write(&patch_file, "class String; def other = 1; end\n").unwrap();
+    let patch_uri = format!(
+        "file://{}",
+        std::fs::canonicalize(&patch_file).unwrap().display()
+    );
+    h.notify(
+        "workspace/didChangeWatchedFiles",
+        serde_json::json!({ "changes": [ { "uri": patch_uri, "type": 2 } ] }),
+    );
+    let after = h.recv_diags();
+    assert_eq!(
+        after.diagnostics.len(),
+        1,
+        "the re-baselined registry no longer patches `lit`, so \"x\".lit is \
+         reported: {:?}",
+        after.diagnostics
+    );
+    h.shutdown();
+}
+
+/// rigor-rs#491 item 2 — a `.rb` file a `pre_eval:` entry names is on the
+/// STRUCTURAL surface (upstream #1613's re-baseline), not the cheap
+/// re-harvest path, and every other `.rb` stays cheap.
+#[test]
+fn pre_eval_files_classify_structural() {
+    let root = std::env::temp_dir().join(format!("rigor-lsp-pre-eval-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    std::fs::create_dir_all(root.join("patch")).unwrap();
+    std::fs::write(root.join("patch/core.rb"), "class String; def lit = 1; end\n").unwrap();
+    std::fs::create_dir_all(root.join("lib")).unwrap();
+    std::fs::write(root.join("lib/app.rb"), "x = 1\n").unwrap();
+    let canon = |p: &PathBuf| std::fs::canonicalize(p).unwrap();
+    let mut cfg = Config::default();
+    cfg.pre_eval = vec![
+        canon(&root.join("patch/core.rb")).to_string_lossy().into_owned(),
+        canon(&root).join("extra/*.rb").to_string_lossy().into_owned(),
+    ];
+    std::fs::create_dir_all(root.join("extra")).unwrap();
+    std::fs::write(root.join("extra/more.rb"), "class String; def m2 = 1; end\n").unwrap();
+
+    let uri = |p: &PathBuf| format!("file://{}", canon(p).display());
+    let src = |u: &str| classify_watched_files(&watched_change(u), &cfg);
+    // A literal entry and a glob match both classify STRUCTURAL.
+    assert_eq!(src(&uri(&root.join("patch/core.rb"))), WatchedChange::Structural);
+    assert_eq!(src(&uri(&root.join("extra/more.rb"))), WatchedChange::Structural);
+    // A project `.rb` NOT listed stays on the cheap path.
+    assert_eq!(
+        src(&uri(&root.join("lib/app.rb"))),
+        WatchedChange::Sources(vec![uri(&root.join("lib/app.rb"))])
+    );
+    std::fs::remove_dir_all(&root).unwrap();
 }
 
 #[test]

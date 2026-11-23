@@ -2451,7 +2451,7 @@ fn handle_message(
                 // Review N3: a project `.rb` save re-harvests ONLY that file's AST
                 // entry (sub-millisecond); only the config / signature surface
                 // pays the full synchronous tier-1 rebuild.
-                match classify_watched_files(&not.params) {
+                match classify_watched_files(&not.params, &st.cfg) {
                     WatchedChange::None => {}
                     WatchedChange::Sources(uris) => {
                         if let Some(msg) = reharvest_sources(ctx, st, &uris) {
@@ -2537,9 +2537,10 @@ enum WatchedChange {
     None,
     /// Project `*.rb` saves: re-harvest exactly these files' held entries.
     Sources(Vec<String>),
-    /// `.rigor.yml` / `Gemfile.lock` / `sig/**/*.rbs`: the plugin set or the
-    /// signature environment may have changed, so the `CoreIndex` AND the whole
-    /// overlay are rebuilt. Structural changes are genuinely rare, which is what
+    /// `.rigor.yml` / `Gemfile.lock` / `sig/**/*.rbs` / a `pre_eval:` file:
+    /// the plugin set, the signature environment or the patched-method
+    /// registry may have changed, so the `CoreIndex` AND the whole overlay
+    /// are rebuilt. Structural changes are genuinely rare, which is what
     /// made S4's synchronous-rebuild decision reasonable in the first place.
     Structural,
 }
@@ -2547,7 +2548,7 @@ enum WatchedChange {
 /// Classify a `workspace/didChangeWatchedFiles` payload. A structural change
 /// anywhere in the batch wins (it subsumes any source change in the same batch,
 /// since the full rebuild re-harvests everything).
-fn classify_watched_files(params: &serde_json::Value) -> WatchedChange {
+fn classify_watched_files(params: &serde_json::Value, cfg: &Config) -> WatchedChange {
     let Some(changes) = params.get("changes").and_then(|c| c.as_array()) else {
         return WatchedChange::None;
     };
@@ -2555,7 +2556,10 @@ fn classify_watched_files(params: &serde_json::Value) -> WatchedChange {
         .iter()
         .filter_map(|c| c.get("uri").and_then(serde_json::Value::as_str))
         .collect();
-    if uris.iter().any(|u| watched_file_is_structural(u)) {
+    if uris
+        .iter()
+        .any(|u| watched_file_is_structural(u, cfg))
+    {
         return WatchedChange::Structural;
     }
     let sources: Vec<String> = uris
@@ -2570,13 +2574,34 @@ fn classify_watched_files(params: &serde_json::Value) -> WatchedChange {
     }
 }
 
-/// Whether a changed URI is on the STRUCTURAL surface — the one that can move the
-/// plugin set or the RBS environment, and so needs a full tier-1 rebuild.
-fn watched_file_is_structural(uri: &str) -> bool {
-    uri.ends_with(".rigor.yml")
+/// Whether a changed URI is on the STRUCTURAL surface — the one that can move
+/// the plugin set, the RBS environment or the `pre_eval:` registry, and so
+/// needs a full tier-1 rebuild. A file a `pre_eval:` entry names — literally
+/// or through its glob — re-baselines the context exactly like a
+/// `.rigor.yml` edit (upstream #1613), instead of taking the cheap
+/// re-harvest path an ordinary project `.rb` takes.
+fn watched_file_is_structural(uri: &str, cfg: &Config) -> bool {
+    if uri.ends_with(".rigor.yml")
         || uri.ends_with(".rigor.dist.yml")
         || uri.ends_with("Gemfile.lock")
         || (uri.ends_with(".rbs") && uri.contains("/sig/"))
+    {
+        return true;
+    }
+    if cfg.pre_eval.is_empty() {
+        return false;
+    }
+    let Some(path) = file_uri_to_path(uri) else {
+        return false;
+    };
+    // The comparison is canonical where the file resolves, lexical where it
+    // does not (a DELETED patch still classifies — its registry shrinks).
+    // `expanded_files` is the same walk `pre_eval::load` scans, so a glob
+    // entry's freshly-created match counts too.
+    let needle = std::fs::canonicalize(&path).unwrap_or(path);
+    crate::pre_eval::expanded_files(&cfg.pre_eval)
+        .iter()
+        .any(|p| std::fs::canonicalize(p).unwrap_or_else(|_| p.clone()) == needle)
 }
 
 /// A stable string key for a document URI (the buffer table is keyed by it).
