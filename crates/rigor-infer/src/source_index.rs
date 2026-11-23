@@ -69,7 +69,7 @@ pub use refine_walk::scan_refinements;
 pub use refine_walk::RefineScan;
 #[doc(hidden)]
 pub use refinement_reach::UsingExpansion;
-pub use pre_eval::{PatchCall, PreEvalPatches};
+pub use pre_eval::{main_self_at, patch_call_for, PatchCall, PreEvalPatches};
 pub(crate) use override_index::*;
 
 /// C5 (const-literal harvest): an owned, interner-INDEPENDENT representation of a

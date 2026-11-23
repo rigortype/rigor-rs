@@ -242,27 +242,8 @@ fn pre_eval_answers(
     if !source.pre_eval_defines_name(method) {
         return false;
     }
-    let call = if matches!(ast.get(receiver), rigor_parse::Node::SelfExpr { .. }) {
-        rigor_infer::PatchCall::Implicit
-    } else {
-        rigor_infer::PatchCall::Explicit { toplevel: main_self_at(ast, message_span) }
-    };
+    let call = rigor_infer::patch_call_for(ast, Some(receiver), message_span);
     source.pre_eval_may_answer(index, class_name, method, singleton, call)
-}
-
-/// Whether `self` at `span` is certainly `main` (an `Object`): no class,
-/// module, `class <<`, method, block or lambda body encloses it. Anywhere
-/// else `self` may be something else, which a protected patch may answer.
-fn main_self_at(ast: &LoweredAst, span: (usize, usize)) -> bool {
-    let inside = |s: (usize, usize)| s.0 <= span.0 && span.1 <= s.1;
-    !ast.iter().any(|(_, n)| match n {
-        rigor_parse::Node::ClassDef { .. }
-        | rigor_parse::Node::ModuleDef { .. }
-        | rigor_parse::Node::Definition { .. }
-        | rigor_parse::Node::Lambda { .. } => inside(n.span()),
-        rigor_parse::Node::Call { block_span: Some(b), .. } => inside(*b),
-        _ => false,
-    })
 }
 
 /// Apply `call.undefined-method` to a single call with a receiver.
