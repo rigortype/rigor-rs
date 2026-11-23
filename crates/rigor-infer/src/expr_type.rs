@@ -3,7 +3,7 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{Compound, FileKey, LoweredAst, Node, NodeId};
+use rigor_parse::{Compound, FileKey, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
@@ -786,6 +786,23 @@ impl<'i> Typer<'i> {
                 }
                 result
             }
+            // A jump node in VALUE position — `return`, `break`, `next`,
+            // `redo`, `retry` — produces no value for the containing
+            // expression, so the reference's `type_of_jump`
+            // (`expression_typer.rb:1333`) answers `Bot` for all five Prism
+            // jump nodes and a `||`/`&&` operand that is one folds out of the
+            // union (`[1] || next` types `[1]`, rigor-rs#892). `next` is `Bot`
+            // here too: `stmt_never_completes`'s `JumpKind::Next` exclusion is
+            // the block-TIMING question (a `next` completes its iteration
+            // normally), not the value one. The `StatementsKind::Jump` carrier
+            // covers `break e` / `next e` / `redo` / `retry`; the
+            // `Other{jump: Some}` leaf covers the argument-less `next` /
+            // `break`.
+            Node::Return { .. }
+            | Node::Other { jump: Some(_), .. }
+            | Node::Statements { kind: StatementsKind::Jump(_), .. } => {
+                interner.intern(Type::Bottom)
+            }
             // Any other carrier (`@ivar`, constant, `self`, index, range,
             // logical, variable read) is not precisely typed in this slice ->
             // Dynamic[top] (never guess; keeps the call rule silent). Implicit-
@@ -1222,6 +1239,14 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) -> TypeId {
         match ast.get(id) {
+            // A `break e` / `next e` / `redo` / `retry` carrier IS the
+            // statement (its `body` holds the jump's ARGUMENTS, not a
+            // sequence): as a branch tail it produces no value — the
+            // reference's `type_of_jump` `Bot` — not its last argument's type
+            // (rigor-rs#892).
+            Node::Statements { kind: StatementsKind::Jump(_), .. } => {
+                interner.intern(Type::Bottom)
+            }
             Node::Statements { body, .. } | Node::BeginRescue { body, .. } => {
                 match body.clone().last() {
                     Some(&tail) => self.stmt_value_type(ast, tail, env, interner),

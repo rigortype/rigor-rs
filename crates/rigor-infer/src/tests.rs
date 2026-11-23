@@ -1,5 +1,5 @@
 use super::*;
-use rigor_parse::{lower, parse, Node};
+use rigor_parse::{lower, parse, Node, StatementsKind};
 use rigor_types::{Scalar, ShapeKey, ShapeMember, Type};
 
 fn lower_src(src: &[u8]) -> LoweredAst {
@@ -1348,6 +1348,54 @@ fn hash_dynamic_key_degrades_to_hash_nominal() {
     let env = typer.build_toplevel_env(&ast, &mut i);
     let ty = typer.type_of(&ast, find_hash(&ast), &env, &mut i);
     assert_eq!(idx.class_name_of(&i, ty), Some("Hash"));
+}
+
+/// rigor-rs#892 — a jump node in VALUE position types `Bot` (the
+/// reference's `type_of_jump`), so a `||`/`&&` operand that is one folds
+/// out of the union: `[1] || next` types `[1]`. `next` counts too —
+/// `stmt_never_completes`'s `JumpKind::Next` exclusion is the block-TIMING
+/// question, not the value one.
+#[test]
+fn jump_nodes_type_bot_in_value_position() {
+    let ast = lower_src(
+        b"3.times { a = ([1] || next); b = ([1] || break); c = ([1] || redo); d = ([1] || return) }\n",
+    );
+    let idx = CoreIndex::new();
+    let typer = Typer::new(&idx);
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_env(&ast, &mut i);
+    // Every jump carrier types Bot.
+    let jump_ids: Vec<NodeId> = ast
+        .iter()
+        .filter_map(|(id, n)| {
+            matches!(
+                n,
+                Node::Return { .. }
+                    | Node::Other { jump: Some(_), .. }
+                    | Node::Statements { kind: StatementsKind::Jump(_), .. }
+            )
+            .then_some(id)
+        })
+        .collect();
+    assert_eq!(jump_ids.len(), 4, "next/break/redo/return all lower");
+    for id in jump_ids {
+        let ty = typer.type_of(&ast, id, &env, &mut i);
+        assert_eq!(i.get(ty), &Type::Bottom);
+    }
+    // … and each `||` union drops the Bot operand, typing `[1]`.
+    let logical_ids: Vec<NodeId> = ast
+        .iter()
+        .filter_map(|(id, n)| matches!(n, Node::Logical { .. }).then_some(id))
+        .collect();
+    assert_eq!(logical_ids.len(), 4);
+    for id in logical_ids {
+        let ty = typer.type_of(&ast, id, &env, &mut i);
+        let Type::Tuple(elems) = i.get(ty) else {
+            panic!("expected Tuple[1], got {:?}", i.get(ty))
+        };
+        assert_eq!(elems.len(), 1);
+        assert_eq!(i.get(elems[0]), &Type::Constant(Scalar::Int(1)));
+    }
 }
 
 /// Type the outermost call in `src` (a `v = <hash>.<call>` line).

@@ -850,13 +850,13 @@ pub enum Node {
     // TODO(spec): grow the owned-node set toward full Prism coverage, and add
     /// An explicit `return` statement. `values` are the lowered argument
     /// expressions in source order — empty for a bare `return`, one for
-    /// `return e`, several for `return a, b`. A STATEMENT, not a value: the
-    /// typer's catch-all types it `Dynamic[top]` (exactly like the recovered-
-    /// children `Statements` carrier it replaced), so the check path is
-    /// behavior-preserving; sig-gen's `DefReturnTyper` port reads `values` to
-    /// union a def's explicit returns into its return type. The children live
-    /// in the arena so calls / local reads inside a return stay visible to the
-    /// rule walk (`flow.dead-assignment`, the call rules).
+    /// `return e`, several for `return a, b`. In VALUE position the typer
+    /// answers `Bot` (the reference's `type_of_jump`, rigor-rs#892): a `||` /
+    /// `&&` operand that is a jump folds out of the union. Sig-gen's
+    /// `DefReturnTyper` port reads `values` to union a def's explicit returns
+    /// into its return type. The children live in the arena so calls / local
+    /// reads inside a return stay visible to the rule walk
+    /// (`flow.dead-assignment`, the call rules).
     Return { values: Vec<NodeId>, span: Span },
     // synthetic-node variants (plugin/macro-generated definitions with no
     // source text) per ADR-0012 / ADR-0013. No plugins yet, so no synthetic
