@@ -46,6 +46,7 @@ pub mod folding;
 pub mod kernel_fold;
 pub mod multi_target_binder;
 pub mod source_index;
+pub mod version_guard;
 
 mod block_call;
 mod call_dispatch;

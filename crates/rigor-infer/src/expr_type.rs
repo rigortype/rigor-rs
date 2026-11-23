@@ -642,7 +642,14 @@ impl<'i> Typer<'i> {
                 let (truthy_ty, falsey_ty) =
                     if *is_unless { (else_ty, then_ty) } else { (then_ty, else_ty) };
                 let pred_ty = self.type_of(ast, *predicate, env, interner);
-                match self.predicate_polarity(interner, pred_ty) {
+                // rigor-rs#909 — a decidable version guard answers before the
+                // type polarity, exactly as `branch_certainty` does
+                // (`statement_evaluator.rb:2408`): the dead arm's VALUE is
+                // never evaluated on the reference, so `x = guard ? 1 : "s"`
+                // types `1`, not `"s" | 1`.
+                let polarity = crate::version_guard::guard_truthiness(ast, *predicate)
+                    .or_else(|| self.predicate_polarity(interner, pred_ty));
+                match polarity {
                     Some(true) => truthy_ty,
                     Some(false) => falsey_ty,
                     None => rigor_types::Algebra::join(interner, then_ty, else_ty),
