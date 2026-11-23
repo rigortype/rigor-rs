@@ -527,10 +527,10 @@ impl<'i> Typer<'i> {
                 // (any file, any literal-ness — the `constant_shadowers`
                 // stop) declines to `Dynamic[top]`, exactly where the
                 // reference's `WRITTEN_CANDIDATE` lands.
-                if let Some(value) = folded_float_constant(name)
-                    && !self.source.constant_write_shadows(name, prefix, *rooted)
-                {
-                    return interner.intern(Type::Constant(Scalar::Float(value)));
+                if let Some(value) = folded_float_constant(name) {
+                    if !self.source.constant_write_shadows(name, prefix, *rooted) {
+                        return interner.intern(Type::Constant(Scalar::Float(value)));
+                    }
                 }
                 interner.untyped()
             }

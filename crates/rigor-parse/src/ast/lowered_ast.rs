@@ -72,6 +72,18 @@ impl FileKey {
 }
 
 /// The owned AST: a flat arena of [`Node`]s plus the [`NodeId`] of the root
+/// rigor-rs#656 — the constant side tables of a [`LoweredAst`], boxed so the
+/// growing census set does not inflate the AST past `clippy::large_enum_variant`
+/// (`enum Lowered`, rigor-cli). See [`ConstMutation`] / [`ConstWrite`].
+#[derive(Clone)]
+pub struct ConstTables {
+    /// Upstream #540 (`fc3b8b42`): every site that MUTATES a constant-shaped
+    /// receiver. See [`ConstMutation`].
+    mutations: Vec<ConstMutation>,
+    /// rigor-rs#656: every plain `=` constant write. See [`ConstWrite`].
+    writes: Vec<ConstWrite>,
+}
+
 /// `Program`. Free of the Prism parse-buffer lifetime (ADR-0012).
 #[derive(Clone)]
 pub struct LoweredAst {
@@ -81,13 +93,12 @@ pub struct LoweredAst {
     /// for the AST's lifetime and preserved by `Clone` (a clone is the same
     /// file).
     file_key: FileKey,
-    /// Upstream #540 (`fc3b8b42`) — every site in this file that MUTATES a
-    /// constant-shaped receiver. See [`ConstMutation`] for why this is a side
-    /// table rather than owned nodes.
-    const_mutations: Vec<ConstMutation>,
-    /// rigor-rs#656 — every plain `=` constant write in this file. See
-    /// [`ConstWrite`] for why this is a side table rather than owned nodes.
-    const_writes: Vec<ConstWrite>,
+    /// The constant side tables — upstream #540's [`ConstMutation`] census
+    /// and rigor-rs#656's [`ConstWrite`] census — bundled behind ONE box so
+    /// each new census does not push `enum Lowered` (rigor-cli) past
+    /// `clippy::large_enum_variant` (the same pressure `CarrierSpans` and
+    /// `uid` already answer to).
+    const_tables: Box<ConstTables>,
     /// Upstream v0.4.6 (#2285) — every block call / `for` whose body mutates
     /// an element in place, with the locals its receiver may read. See
     /// [`LoweredAst::element_mutations`].
@@ -273,13 +284,13 @@ impl LoweredAst {
     /// Upstream #540's mutation census for this file, in walk order. See
     /// [`ConstMutation`].
     pub fn const_mutations(&self) -> &[ConstMutation] {
-        &self.const_mutations
+        &self.const_tables.mutations
     }
 
     /// rigor-rs#656: every plain `=` constant write in this file — see
     /// [`ConstWrite`].
     pub fn const_writes(&self) -> &[ConstWrite] {
-        &self.const_writes
+        &self.const_tables.writes
     }
 
     /// Upstream v0.4.6 (#2285 / issue #2262, `DeepErasure`): `(span of a
@@ -652,8 +663,10 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     };
     let root_prism = result.node();
     let root = builder.lower_node(&root_prism);
-    let const_mutations = collect_const_mutations(&root_prism);
-    let const_writes = collect_const_writes(&root_prism);
+    let const_tables = Box::new(ConstTables {
+        mutations: collect_const_mutations(&root_prism),
+        writes: collect_const_writes(&root_prism),
+    });
     let element_mutations = super::element_mutation::collect(&root_prism);
     let mut ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
     ancestry_facts.required_features = super::ancestry_facts::required_vendored_features(source);
@@ -709,8 +722,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         nodes: builder.nodes,
         root,
         file_key,
-        const_mutations,
-        const_writes,
+        const_tables,
         element_mutations,
         local_read_starts,
         carrier_spans,
