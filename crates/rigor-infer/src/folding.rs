@@ -40,10 +40,24 @@ use rigor_types::Scalar;
 pub enum FoldOutcome {
     /// A `Constant[…]` result (`fold_result`'s `[value]`).
     Value(Scalar),
+    /// A `Tuple[Constant…]` result — the reference's `lift_array_result` /
+    /// `try_fold_divmod` shape (`big.divmod(3)` -> `[q, r]`, `digits`,
+    /// `gcdlcm`). Elements are already result-gated by the producer.
+    Tuple(Vec<Scalar>),
     /// A `WidenedResult`: the fold knows only the result's class —
     /// `"Integer"`, `"Rational"`, … — for a number past
     /// `INTEGER_FOLD_BIT_LIMIT`.
     Widened(&'static str),
+    /// The fold SUCCEEDED on the reference but produced a Constant the
+    /// port's `Scalar` cannot hold — `Rational` / `Complex` results from
+    /// `to_r` / `to_c` / `rationalize` / `quo` on an Integer receiver
+    /// (rigor-rs#877). The reference's pinned Rational/Complex carrier
+    /// stays silent downstream (`x = 5.to_r; x.zzz` is silent there), so
+    /// the honest answer is untyped — NOT the RBS nominal, which would
+    /// fire `call.undefined-method` the reference never emits (a `quo`
+    /// call that RAISES declines instead, letting the RBS `Rational`
+    /// answer stand like the reference's).
+    Unrepresentable,
     /// The fold cannot decide (`invoke_*`'s `nil`).
     Declined,
 }
@@ -72,7 +86,10 @@ impl FoldOutcome {
 pub fn fold(receiver: &Scalar, method: &str, args: &[Scalar]) -> Option<Scalar> {
     match fold_outcome(receiver, method, args) {
         FoldOutcome::Value(s) => Some(s),
-        FoldOutcome::Widened(_) | FoldOutcome::Declined => None,
+        FoldOutcome::Widened(_)
+        | FoldOutcome::Tuple(_)
+        | FoldOutcome::Unrepresentable
+        | FoldOutcome::Declined => None,
     }
 }
 
@@ -103,6 +120,24 @@ pub fn fold_outcome(receiver: &Scalar, method: &str, args: &[Scalar]) -> FoldOut
         }
         _ => {}
     }
+    // A `Rational` / `Complex` constant the port's `Scalar` cannot hold —
+    // the reference folds `to_r` / `to_c` / `rationalize` on an Integer
+    // literal and `to_r` / `rationalize` on a Float literal to a pinned
+    // carrier that stays SILENT downstream (`x = 5.to_r; x.zzz` never
+    // witnesses there), so untyped is the honest answer — the RBS
+    // `Rational`/`Complex` nominal would fire a `call.undefined-method`
+    // the oracle never emits (rigor-rs#877). `Integer#to_c` folds there
+    // (`INTEGER_UNARY`) but `Float#to_c` does NOT — its RBS `Complex`
+    // answer stands (`1.5.to_c` -> `for Complex` on the oracle).
+    if args.is_empty()
+        && match (receiver, method) {
+            (Scalar::Int(_) | Scalar::BigInt(_), "to_r" | "to_c" | "rationalize")
+            | (Scalar::Float(_), "to_r" | "rationalize") => true,
+            _ => false,
+        }
+    {
+        return FoldOutcome::Unrepresentable;
+    }
     match receiver {
         Scalar::Int(a) => fold_int(*a, method, args),
         // A Bignum folds the members whose answer needs only the decimal
@@ -129,9 +164,18 @@ pub fn is_foldable(class: &str, method: &str) -> bool {
         "Integer" => matches!(
             method,
             "+" | "-" | "*" | "/" | "%" | "**" | "pow" | "&" | "|" | "^" | "<<" | ">>"
-                | "<" | "<=" | ">" | ">=" | "=="
+                | "<" | "<=" | ">" | ">=" | "==" | "<=>"
+                | "div" | "modulo" | "ceildiv" | "remainder" | "fdiv" | "quo"
+                | "lcm" | "gcd" | "divmod" | "gcdlcm" | "digits"
+                | "allbits?" | "anybits?" | "nobits?"
+                | "floor" | "ceil" | "round" | "truncate"
                 | "abs" | "succ" | "pred" | "even?" | "odd?" | "zero?" | "to_s"
                 | "+@" | "-@"
+                // BigInt-receiver only so far (rigor-rs#877): the i64
+                // unary family is the issue's own deferred slice.
+                | "~" | "bit_length" | "next" | "magnitude" | "to_i" | "to_int"
+                | "to_f" | "nonzero?" | "finite?" | "infinite?" | "inspect"
+                | "abs2" | "to_r" | "to_c" | "rationalize"
         ),
         "Float" => matches!(
             method,
@@ -430,6 +474,46 @@ fn fold_int(a: i64, method: &str, args: &[Scalar]) -> FoldOutcome {
         if matches!(b, Scalar::BigInt(_) | Scalar::Float(_)) {
             return int_arith(&Scalar::Int(a), method, b);
         }
+    }
+
+    // The rest of the reference's Integer binary catalogue — shared with
+    // the Bignum receiver's fold (rigor-rs#877): `int_binary` covers the
+    // members `fold_int` never had (`div`, `ceildiv`, `remainder`, `fdiv`,
+    // `<=>`, `lcm`, `gcd`, `divmod`, `gcdlcm`, `digits`, the bit-test
+    // predicates, the decimal rounders) and the operands the i64 fast path
+    // cannot take (a Bignum or Float operand on the existing `\`/`%`/`&`/
+    // `|`/`^`/`[]` — `3 & big`, `5 % 2.5`). The i64-unary members the
+    // issue's carve-out defers (`~`, `bit_length`, `next`, `magnitude`,
+    // `to_i`, `finite?`, `nonzero?`, …) stay declined here.
+    if let (m, [b]) = (method, args) {
+        if matches!(
+            m,
+            "div" | "modulo" | "ceildiv" | "remainder" | "fdiv" | "quo" | "<=>"
+                | "lcm" | "gcd" | "divmod" | "gcdlcm" | "digits" | "allbits?"
+                | "anybits?" | "nobits?" | "floor" | "ceil" | "round" | "truncate"
+        ) || (matches!(b, Scalar::BigInt(_) | Scalar::Float(_))
+            && matches!(m, "/" | "%" | "&" | "|" | "^" | "[]"))
+        {
+            return int_binary(&Scalar::Int(a), m, b);
+        }
+    }
+
+    // `digits` (base 10) — the spelling's own characters reversed into
+    // little-endian place values; an `i64` never reaches the
+    // `lift_array_result` cap of 32 (19 digits max). A negative receiver
+    // raises `Math::DomainError` and declines to `Array[Integer]`
+    // (rigor-rs#877).
+    if method == "digits" && args.is_empty() {
+        if a < 0 {
+            return FoldOutcome::Declined;
+        }
+        return FoldOutcome::Tuple(
+            a.to_string()
+                .bytes()
+                .rev()
+                .map(|c| Scalar::Int(i64::from(c - b'0')))
+                .collect(),
+        );
     }
 
     // Binary on a single Integer argument.
@@ -1169,22 +1253,36 @@ fn chunks_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
 }
 
 /// `a mod m` on little-endian base-1e9 chunks (`m` non-zero) — the division
-/// half of [`chunks_modmul`]. Each quotient digit is estimated from the
-/// leading words after normalising the divisor's top word past `CHUNK/2`
-/// (Knuth's bound: the estimate overshoots by at most 2, so the fixup loop
-/// is bounded).
+/// half of [`chunks_modmul`].
 fn chunks_mod(a: &[u64], m: &[u64]) -> Vec<u64> {
+    chunks_divmod(a, m).1
+}
+
+/// `a divmod m` on little-endian base-1e9 chunks (`m` non-zero) — the
+/// quotient digits the loop always computed, now returned with the
+/// remainder for the `/` `%` `div` `modulo` `ceildiv` `remainder` `divmod`
+/// `digits` `lcm`/`gcd` folds (rigor-rs#877). Each quotient digit is
+/// estimated from the leading words after normalising the divisor's top
+/// word past `CHUNK/2` (Knuth's bound: the estimate overshoots by at most
+/// 2, so the fixup loop is bounded).
+fn chunks_divmod(a: &[u64], m: &[u64]) -> (Vec<u64>, Vec<u64>) {
     const CHUNK: u128 = 1_000_000_000;
     if chunks_cmp(a, m) == std::cmp::Ordering::Less {
-        return a.to_vec();
+        return (Vec::new(), a.to_vec());
     }
     if m.len() == 1 {
         let d = u128::from(m[0]);
+        let mut q = vec![0u64; a.len()];
         let mut r = 0u128;
-        for &c in a.iter().rev() {
-            r = (r * CHUNK + u128::from(c)) % d;
+        for i in (0..a.len()).rev() {
+            let cur = r * CHUNK + u128::from(a[i]);
+            q[i] = (cur / d) as u64;
+            r = cur % d;
         }
-        return if r == 0 { vec![] } else { vec![r as u64] };
+        while q.last() == Some(&0) {
+            q.pop();
+        }
+        return (q, if r == 0 { vec![] } else { vec![r as u64] });
     }
     // Normalise so `v`'s top word is >= CHUNK/2.
     let f = CHUNK / (u128::from(*m.last().unwrap_or(&1)) + 1);
@@ -1192,6 +1290,7 @@ fn chunks_mod(a: &[u64], m: &[u64]) -> Vec<u64> {
     let mut u = chunks_mul_small(a, f);
     let n = v.len();
     let qlen = u.len() + 1 - n;
+    let mut q = vec![0u64; qlen];
     for j in (0..qlen).rev() {
         // `u` shrinks below `j + n` as the high quotient digits resolve —
         // both top words read 0 past its end.
@@ -1205,14 +1304,18 @@ fn chunks_mod(a: &[u64], m: &[u64]) -> Vec<u64> {
             qd -= 1;
             prod = chunks_mul_small(&v, qd);
         }
+        q[j] = qd as u64;
         if qd > 0 {
             chunks_sub_shift(&mut u, &prod, j);
         }
     }
+    while q.last() == Some(&0) {
+        q.pop();
+    }
     // Denormalise the remainder.
     let r = chunks_div_small(&u, f);
     debug_assert!(chunks_cmp(&r, m) == std::cmp::Ordering::Less);
-    r
+    (q, r)
 }
 
 /// `x * y mod m` on little-endian base-1e9 chunks.
@@ -1396,10 +1499,79 @@ fn fold_bigint(d: &str, method: &str, args: &[Scalar]) -> FoldOutcome {
         // `Integer#pow(exp, mod)` on a BigInt receiver — the reference folds
         // it through the same `invoke_ternary` catalog leaf (rigor-rs#769).
         ("pow", [e, m]) => int_pow_mod_result(IntReceiver::Big(d), e, m),
+        // `to_i`/`to_int`/`floor`/`ceil`/`round`/`truncate`/`nonzero?`
+        // answer the receiver itself on the oracle — the pin re-enters
+        // through `big_scalar`'s `oversized_number?` gate like the
+        // reference's `fold_result` (a past-limit literal widens to
+        // `Integer` on `to_i` too).
+        ("to_i" | "to_int" | "floor" | "ceil" | "round" | "truncate" | "nonzero?", []) => {
+            big_scalar(d.to_string())
+        }
+        // `next` is `succ`'s alias; `magnitude` is `abs`'s.
+        ("next", []) => big_scalar(decimal_step(d, true)),
+        ("magnitude", []) => big_scalar(d.trim_start_matches('-').to_string()),
+        // `finite?` is `true` on every Integer; `infinite?` is `nil`.
+        ("finite?", []) => FoldOutcome::Value(Scalar::Bool(true)),
+        ("infinite?", []) => FoldOutcome::Value(Scalar::Nil),
+        ("inspect", []) => FoldOutcome::Value(Scalar::Str(d.to_string())),
+        // `to_f` is `rb_big2dbl` — a correct round-to-nearest `f64`,
+        // `Infinity` past the representable range (foldable — only NaN
+        // is not).
+        ("to_f", []) => match d.parse::<f64>() {
+            Ok(v) if v.is_nan() => FoldOutcome::Declined,
+            Ok(v) => FoldOutcome::Value(Scalar::Float(v)),
+            Err(_) => FoldOutcome::Declined,
+        },
+        // `~v` is `-(v + 1)` — `decimal_step` does the magnitude work:
+        // positive `v` negates its `v + 1`, negative `-(A)` answers
+        // `A - 1`.
+        ("~", []) => big_scalar(if negative {
+            decimal_step(d.trim_start_matches('-'), false)
+        } else {
+            format!("-{}", decimal_step(d, true))
+        }),
+        // `bit_length` counts the magnitude's bits on a positive
+        // receiver; a negative `-(A)` counts `(A - 1)`'s — `(-8)` is
+        // `...1000`, three significant bits (`(-4)` is `...100`, two).
+        ("bit_length", []) => {
+            let limbs = chunks_to_limbs(&decimal_chunks(d.trim_start_matches('-')));
+            let limbs = if negative { limbs_dec(&limbs) } else { limbs };
+            let bits = limbs.iter().rposition(|&w| w != 0).map_or(0, |p| {
+                (p as i64) * 32 + (32 - limbs[p].leading_zeros() as i64)
+            });
+            FoldOutcome::Value(Scalar::Int(bits))
+        }
+        // `abs2` is `v * v` — the `*` path's bit-length bound widens a
+        // past-limit square up front.
+        ("abs2", []) => int_arith(&Scalar::BigInt(d.to_string()), "*", &Scalar::BigInt(d.to_string())),
+        // `digits` (base 10) — the decimal spelling's own characters,
+        // reversed into little-endian place values. A negative receiver
+        // raises `Math::DomainError` and declines to `Array[Integer]`;
+        // `lift_array_result` caps at 32 elements.
+        ("digits", []) => {
+            if negative || d.trim_start_matches('-').len() > 32 {
+                FoldOutcome::Declined
+            } else {
+                FoldOutcome::Tuple(
+                    d.bytes().rev().map(|c| Scalar::Int(i64::from(c - b'0'))).collect(),
+                )
+            }
+        }
         // `+`/`-`/`*` at arbitrary width — integer operands combine as
         // sign + magnitude chunks, a Float operand coerces through
         // `rb_big2dbl` (rigor-rs#695).
         ("+" | "-" | "*", [b]) => int_arith(&Scalar::BigInt(d.to_string()), method, b),
+        // The rest of the reference's Integer binary catalogue — the
+        // `/`/`%` family, `<=>`, bit ops and tests, gcd/lcm, `fdiv`/`quo`,
+        // `digits(base)`, the decimal rounders, `divmod`/`gcdlcm` — over
+        // the shared operand layer (rigor-rs#877).
+        (
+            "/" | "div" | "%" | "modulo" | "ceildiv" | "remainder" | "fdiv" | "quo"
+            | "<=>" | "&" | "|" | "^" | "[]" | "lcm" | "gcd" | "divmod" | "gcdlcm"
+            | "digits" | "allbits?" | "anybits?" | "nobits?" | "floor" | "ceil"
+            | "round" | "truncate",
+            [b],
+        ) => int_binary(&Scalar::BigInt(d.to_string()), method, b),
         _ => FoldOutcome::Declined,
     }
 }
@@ -1525,6 +1697,847 @@ fn chunks_add(a: &[u64], b: &[u64]) -> Vec<u64> {
 fn chunks_bits_lb(chunks: &[u64]) -> u128 {
     const LOG2_1E9: f64 = 29.897_352_854_986_263;
     (chunks.len().saturating_sub(1) as f64 * LOG2_1E9) as u128
+}
+
+// --- Shared integer binary ops (rigor-rs#877) -------------------------------
+//
+// The rest of the reference's Integer fold family — `NUMERIC_BINARY`, the
+// catalog leaves and `INTEGER_ARRAY_*` — over the same sign + base-1e9
+// chunk operands [`int_operand_chunks`] already produces. Shared by the
+// `Scalar::Int` and `Scalar::BigInt` receivers: a `Scalar::Int` receiver
+// only reaches here for the members `fold_int` never had or for operands
+// past `i64`, and a Bignum operand always rides the same code (the
+// promotion `+`/`-`/`*` took through [`int_arith`]).
+
+/// `a <op> b` on integer scalars at any width — the members of the
+/// reference's Integer binary catalogue the port declined before
+/// (rigor-rs#877). A `Float` operand coerces the way `invoke_binary`'s
+/// `public_send` does (`big / 3.0` -> `3.33…e19`, `big <=> 1e30` -> `-1`);
+/// a non-numeric operand declines to the RBS tier, EXCEPT `<=>`, which
+/// pins `nil` on the oracle (`big <=> "s"` -> `for nil`).
+fn int_binary(a: &Scalar, method: &str, b: &Scalar) -> FoldOutcome {
+    if let Scalar::Float(f) = b {
+        return int_binary_float(a, method, *f);
+    }
+    let Some((a_neg, a_mag)) = int_operand_chunks(a) else {
+        return FoldOutcome::Declined;
+    };
+    let Some((b_neg, b_mag)) = int_operand_chunks(b) else {
+        // `Integer#<=>` on a non-numeric pins `Constant[nil]` on the oracle
+        // (`big <=> "s"` -> `for nil`); every other member raises and the
+        // RBS tier answers (`& "s"` -> argument-type-mismatch + `Integer`).
+        return if method == "<=>" {
+            FoldOutcome::Value(Scalar::Nil)
+        } else {
+            FoldOutcome::Declined
+        };
+    };
+    match method {
+        "+" | "-" | "*" => int_arith(a, method, b),
+        "/" | "div" | "%" | "modulo" | "ceildiv" | "remainder" | "divmod" => {
+            // A `0` divisor raises on the oracle: the fold declines and the
+            // RBS answer stands (`for Integer`) — `flow.always-raises`
+            // fires separately on `/` `%` `div` `modulo` `divmod`
+            // (`ceildiv`/`remainder` are not in `INTEGER_RAISING_OPERATORS`).
+            if chunks_is_zero(&b_mag) {
+                FoldOutcome::Declined
+            } else {
+                int_divmod_family(a_neg, &a_mag, method, b_neg, &b_mag)
+            }
+        }
+        "fdiv" => {
+            let (Some(af), Some(bf)) = (scalar_to_f64(a), scalar_to_f64(b)) else {
+                return FoldOutcome::Declined;
+            };
+            let r = af / bf;
+            if r.is_nan() {
+                FoldOutcome::Declined
+            } else {
+                FoldOutcome::Value(Scalar::Float(r))
+            }
+        }
+        // `Integer#quo` on an Integer operand answers a Rational — a
+        // carrier `Scalar` cannot hold (the pinned constant is silent
+        // downstream on the oracle). A zero divisor raises → Declined.
+        "quo" => {
+            if chunks_is_zero(&b_mag) {
+                FoldOutcome::Declined
+            } else {
+                FoldOutcome::Unrepresentable
+            }
+        }
+        "<=>" => FoldOutcome::Value(Scalar::Int(match (a_neg, b_neg) {
+            (false, true) => 1,
+            (true, false) => -1,
+            _ => {
+                let o = chunks_cmp(&a_mag, &b_mag);
+                let o = if a_neg { o.reverse() } else { o };
+                match o {
+                    std::cmp::Ordering::Less => -1,
+                    std::cmp::Ordering::Equal => 0,
+                    std::cmp::Ordering::Greater => 1,
+                }
+            }
+        })),
+        "&" | "|" | "^" => {
+            let (neg, limbs) = limbs_bitop(
+                a_neg,
+                &chunks_to_limbs(&a_mag),
+                b_neg,
+                &chunks_to_limbs(&b_mag),
+                method,
+            );
+            big_scalar(chunks_to_decimal(neg, &limbs_to_chunks(&limbs)))
+        }
+        "[]" => {
+            // Bit reference `v[i]` — two's-complement infinite width. A
+            // negative index reads `0`; past the magnitude a positive
+            // receiver reads `0`, a negative one the sign bit (`(-v)[i]`
+            // is bit `i` of `~(v-1)`). A Bignum index is always past.
+            let a_limbs = chunks_to_limbs(&a_mag);
+            match b {
+                Scalar::Int(i) if *i < 0 => FoldOutcome::Value(Scalar::Int(0)),
+                Scalar::Int(i) => FoldOutcome::Value(Scalar::Int(i64::from(
+                    if a_neg {
+                        1 - limb_bit(&limbs_dec(&a_limbs), *i as u64)
+                    } else {
+                        limb_bit(&a_limbs, *i as u64)
+                    },
+                ))),
+                Scalar::BigInt(_) => FoldOutcome::Value(Scalar::Int(i64::from(a_neg))),
+                _ => FoldOutcome::Declined,
+            }
+        }
+        "allbits?" | "anybits?" | "nobits?" => {
+            let a_limbs = chunks_to_limbs(&a_mag);
+            let b_limbs = chunks_to_limbs(&b_mag);
+            let (m_neg, m_limbs) = limbs_bitop(a_neg, &a_limbs, b_neg, &b_limbs, "&");
+            let masked = limbs_is_zero(&m_limbs) && !m_neg;
+            let all = limbs_eq_signed(m_neg, &m_limbs, b_neg, &b_limbs);
+            let yes = match method {
+                "allbits?" => all,
+                "anybits?" => !masked,
+                _ => masked,
+            };
+            FoldOutcome::Value(Scalar::Bool(yes))
+        }
+        // `gcd` is bounded by its operands but a pinned operand can
+        // already sit past `INTEGER_FOLD_BIT_LIMIT` — spell through
+        // `big_scalar`'s oversized gate like every result.
+        "gcd" => big_scalar(chunks_to_decimal(false, &chunks_gcd(&a_mag, &b_mag))),
+        "lcm" => int_lcm(&a_mag, &b_mag),
+        "gcdlcm" => {
+            let g = chunks_gcd(&a_mag, &b_mag);
+            match int_lcm_inner(&a_mag, &b_mag, &g) {
+                None => FoldOutcome::Declined,
+                Some(l) => {
+                    let (Some(gs), Some(ls)) = (mag_scalar_opt(&g), mag_scalar_opt(&l))
+                    else {
+                        return FoldOutcome::Declined;
+                    };
+                    FoldOutcome::Tuple(vec![gs, ls])
+                }
+            }
+        }
+        "digits" => {
+            // `digits(base)` — base < 2 or a negative receiver raises (the
+            // reference's guard declines to `Array[Integer]`); the
+            // `lift_array_result` cap declines past 32 digits.
+            if a_neg || b_neg || b_mag.is_empty() {
+                return FoldOutcome::Declined;
+            }
+            int_digits(&a_mag, &b_mag)
+        }
+        "floor" | "ceil" | "round" | "truncate" => {
+            int_decimal_round(a_neg, &a_mag, method, b_neg, &b_mag)
+        }
+        _ => FoldOutcome::Declined,
+    }
+}
+
+/// `Integer#/`-family sign rules over magnitude chunks — the Knuth-D
+/// quotient [`chunks_mod`] already computed and discarded (rigor-rs#877).
+/// `/`/`div` floor toward `-inf`, `%`/`modulo` take the divisor's sign,
+/// `ceildiv` rounds toward `+inf`, `remainder` truncates toward `0`, and
+/// `divmod` lifts `[floor-q, sign-of-b-r]` to a Tuple of pinned constants.
+fn int_divmod_family(
+    a_neg: bool,
+    a_mag: &[u64],
+    method: &str,
+    b_neg: bool,
+    b_mag: &[u64],
+) -> FoldOutcome {
+    let (q, r) = chunks_divmod(a_mag, b_mag);
+    let rem_nz = !chunks_is_zero(&r);
+    match method {
+        "/" | "div" => {
+            // Floor division: a quotient's sign is the operand-sign
+            // product; opposite signs with a nonzero remainder step the
+            // quotient one further negative (`-5 / 3` -> `-2`, `-5 / -3`
+            // -> `1`).
+            let (neg, mag) = if a_neg != b_neg {
+                if rem_nz {
+                    (true, chunks_add(&q, &[1]))
+                } else {
+                    (!chunks_is_zero(&q), q)
+                }
+            } else {
+                (false, q)
+            };
+            big_scalar(chunks_to_decimal(neg, &mag))
+        }
+        "%" | "modulo" => {
+            if !rem_nz {
+                return FoldOutcome::Value(Scalar::Int(0));
+            }
+            // Sign of the DIVISOR: opposite signs give `r = |b| - rem`.
+            let (neg, mag) = if a_neg != b_neg {
+                (b_neg, chunks_sub(b_mag, &r))
+            } else {
+                (b_neg, r)
+            };
+            big_scalar(chunks_to_decimal(neg, &mag))
+        }
+        "ceildiv" => {
+            // Ceil division: same signs with a nonzero remainder step the
+            // quotient one further positive; opposite signs truncate
+            // toward `0` (`-big.ceildiv(4)` -> `-24999999999999999999`).
+            let (neg, mag) = if a_neg == b_neg {
+                (
+                    false,
+                    if rem_nz { chunks_add(&q, &[1]) } else { q },
+                )
+            } else {
+                (!chunks_is_zero(&q), q)
+            };
+            big_scalar(chunks_to_decimal(neg, &mag))
+        }
+        "remainder" => {
+            // Truncated — sign of the dividend.
+            let neg = a_neg && rem_nz;
+            big_scalar(chunks_to_decimal(neg, &r))
+        }
+        "divmod" => {
+            // `[floor-q, sign-of-b-r]` — `lift_array_result`'s per-element
+            // `foldable_constant_value?` declines the PAIR when either
+            // element spills `INTEGER_FOLD_BIT_LIMIT`, so spell each
+            // through the oversized gate first.
+            let (q_neg, q_mag) = if a_neg != b_neg {
+                if rem_nz {
+                    (true, chunks_add(&q, &[1]))
+                } else {
+                    (!chunks_is_zero(&q), q)
+                }
+            } else {
+                (false, q)
+            };
+            let (r_neg, r_mag) = if !rem_nz {
+                (false, Vec::new())
+            } else if a_neg != b_neg {
+                (b_neg, chunks_sub(b_mag, &r))
+            } else {
+                (b_neg, r)
+            };
+            let (Some(qs), Some(rs)) = (
+                spelled_scalar_opt(&chunks_to_decimal(q_neg, &q_mag)),
+                spelled_scalar_opt(&chunks_to_decimal(r_neg, &r_mag)),
+            ) else {
+                return FoldOutcome::Declined;
+            };
+            FoldOutcome::Tuple(vec![qs, rs])
+        }
+        _ => FoldOutcome::Declined,
+    }
+}
+
+/// `v.digits(base)` — base-b place values little-endian, as pinned Integer
+/// constants, capped at the reference's `lift_array_result` limit of 32
+/// elements (`STRING_ARRAY_LIFT_LIMIT`; a longer expansion declines to the
+/// `Array[Integer]` RBS answer — `big.digits(2)` is 67 long).
+fn int_digits(a_mag: &[u64], b_mag: &[u64]) -> FoldOutcome {
+    // The base must be >= 2; `b_mag` holds its chunks (a Bignum base is
+    // always >= 2, and a `0`/`1` base declines via this length check —
+    // `chunks_cmp` reads `[0]`/`[1]` magnitudes directly).
+    if chunks_cmp(b_mag, &[2]) == std::cmp::Ordering::Less {
+        return FoldOutcome::Declined;
+    }
+    const LIFT_LIMIT: usize = 32;
+    let mut mag = a_mag.to_vec();
+    let mut out: Vec<Scalar> = Vec::new();
+    while !chunks_is_zero(&mag) {
+        if out.len() >= LIFT_LIMIT {
+            return FoldOutcome::Declined;
+        }
+        let (q, r) = chunks_divmod(&mag, b_mag);
+        // A digit is always < base; the base itself fits i64 for any
+        // single-chunk value and a wider base makes this the last digit.
+        out.push(Scalar::Int(r.first().copied().unwrap_or(0) as i64));
+        mag = q;
+    }
+    FoldOutcome::Tuple(out)
+}
+
+/// `floor(nd)` / `ceil(nd)` / `round(nd)` / `truncate(nd)` on an integer
+/// receiver — the catalog leaf's decimal rounding: `nd >= 0` answers the
+/// receiver itself, `nd < 0` rounds the magnitude to a multiple of
+/// `10**-nd` (toward `-inf`, `+inf`, half-up, or `0` respectively).
+/// Spelled on the decimal digits — an integer's rounding never needs the
+/// chunk machinery.
+fn int_decimal_round(
+    a_neg: bool,
+    a_mag: &[u64],
+    method: &str,
+    b_neg: bool,
+    b_mag: &[u64],
+) -> FoldOutcome {
+    if !b_neg {
+        // `nd >= 0` — every member answers the receiver.
+        return big_scalar(chunks_to_decimal(a_neg, a_mag));
+    }
+    let mag_str = chunks_to_decimal(false, a_mag);
+    // `k = -nd`, the dropped decimal places.
+    let k: usize = if b_mag.len() > 1 {
+        usize::MAX
+    } else {
+        usize::try_from(b_mag[0]).unwrap_or(usize::MAX)
+    };
+    if k > mag_str.len() {
+        // The whole magnitude drops: the rounding sides answer `0`, and
+        // `floor` on a negative / `ceil` on a positive keeps a spelled
+        // `10**k` (`10**4096` is 13612 bits — past
+        // `INTEGER_FOLD_BIT_LIMIT` — so a `k` past 4096 is the
+        // reference's `WidenedResult`). `0.ceil(-k)` is `0`.
+        return match method {
+            "floor" if a_neg => int_round_ten_pow(k, true),
+            "ceil" if !a_neg && !chunks_is_zero(a_mag) => int_round_ten_pow(k, false),
+            _ => FoldOutcome::Value(Scalar::Int(0)),
+        };
+    }
+    let keep = mag_str.len() - k;
+    let (kept, dropped) = mag_str.split_at(keep);
+    let bump = match method {
+        // `round` — half up (Ruby's default `half: :up`): the dropped
+        // head at exactly `10**(k-1)` is `>= 5` only when the dropped
+        // span is `k` digits long and starts `5`-`9` (`5.round(-20)`
+        // drops 1 digit past a 20-digit span — far under half).
+        "round" => dropped.len() == k && dropped.as_bytes().first().is_some_and(|&c| c >= b'5'),
+        // `floor` — toward `-inf`: only a NEGATIVE receiver rounds its
+        // magnitude up, and only on a nonzero drop; `ceil` mirrors.
+        "floor" => a_neg && dropped.bytes().any(|c| c != b'0'),
+        "ceil" => !a_neg && dropped.bytes().any(|c| c != b'0'),
+        // `truncate` — toward `0`, never bumps.
+        _ => false,
+    };
+    // The kept prefix incremented by one, spelled in place — a carry
+    // rollover gains a digit (`99.round(-1)` -> `100`, and an all-dropped
+    // `5.round(-1)` spells `10`).
+    let mut prefix: Vec<u8> = if bump {
+        let mut p = kept.as_bytes().to_vec();
+        let mut i = p.len();
+        loop {
+            if i == 0 {
+                p.insert(0, b'1');
+                break;
+            }
+            i -= 1;
+            if p[i] < b'9' {
+                p[i] += 1;
+                break;
+            }
+            p[i] = b'0';
+        }
+        p
+    } else {
+        kept.as_bytes().to_vec()
+    };
+    if prefix.is_empty() {
+        return FoldOutcome::Value(Scalar::Int(0));
+    }
+    prefix.resize(prefix.len() + k, b'0');
+    let spelled = String::from_utf8(prefix).unwrap_or_default();
+    if a_neg {
+        big_scalar(format!("-{spelled}"))
+    } else {
+        big_scalar(spelled)
+    }
+}
+
+/// `±10**k` — a whole-magnitude-dropped `floor`/`ceil` result. `10**4096`
+/// is 13612 bits, past `INTEGER_FOLD_BIT_LIMIT`, so a `k` past 4096 is the
+/// reference's `WidenedResult` without spelling; below it, spell and let
+/// `big_scalar`'s oversized gate decide.
+fn int_round_ten_pow(k: usize, negative: bool) -> FoldOutcome {
+    if k > 4096 {
+        return FoldOutcome::Widened("Integer");
+    }
+    let spelled = format!("{}1{}", if negative { "-" } else { "" }, "0".repeat(k));
+    big_scalar(spelled)
+}
+
+/// `a.gcd(b)` — Euclid on magnitude chunks through [`chunks_mod`]; the
+/// result is always non-negative (`gcd(a, 0) = |a|`).
+fn chunks_gcd(a: &[u64], b: &[u64]) -> Vec<u64> {
+    let (mut x, mut y) = (a.to_vec(), b.to_vec());
+    while !chunks_is_zero(&y) {
+        let r = chunks_mod(&x, &y);
+        x = y;
+        y = r;
+    }
+    x
+}
+
+/// `a.lcm(b)` — `|a| / gcd * |b|`, `0` when either operand is `0` (Ruby's
+/// `lcm` never goes negative). Spelled through [`big_scalar`]'s oversized
+/// gate like every integer result.
+fn int_lcm(a_mag: &[u64], b_mag: &[u64]) -> FoldOutcome {
+    if chunks_is_zero(a_mag) || chunks_is_zero(b_mag) {
+        return FoldOutcome::Value(Scalar::Int(0));
+    }
+    match int_lcm_inner(a_mag, b_mag, &chunks_gcd(a_mag, b_mag)) {
+        Some(l) => big_scalar(chunks_to_decimal(false, &l)),
+        None => FoldOutcome::Declined,
+    }
+}
+
+/// The lcm magnitude chunks, or `None` when the spelled result would
+/// spill `INTEGER_FOLD_BIT_LIMIT` — used by both `lcm` and `gcdlcm`, where
+/// an oversized element declines the WHOLE pair (`lift_array_result`'s
+/// per-element `foldable_constant_value?`).
+fn int_lcm_inner(a_mag: &[u64], b_mag: &[u64], g: &[u64]) -> Option<Vec<u64>> {
+    if chunks_is_zero(a_mag) || chunks_is_zero(b_mag) {
+        return Some(Vec::new());
+    }
+    let (q, _) = chunks_divmod(a_mag, g);
+    let l = chunks_mul(&q, b_mag);
+    let spelled = chunks_to_decimal(false, &l);
+    if decimal_oversized(&spelled) {
+        None
+    } else {
+        Some(l)
+    }
+}
+
+/// An unsigned magnitude as an Integer scalar — `Scalar::Int` when it
+/// fits, `Scalar::BigInt` otherwise (never oversized: `gcd` is bounded by
+/// an operand).
+fn mag_scalar(mag: &[u64]) -> Scalar {
+    match mag_scalar_opt(mag) {
+        Some(s) => s,
+        None => Scalar::BigInt(chunks_to_decimal(false, mag)),
+    }
+}
+
+/// [`mag_scalar`] returning `None` when the spelling spills
+/// `INTEGER_FOLD_BIT_LIMIT` — `lift_array_result`'s per-element gate.
+fn mag_scalar_opt(mag: &[u64]) -> Option<Scalar> {
+    spelled_scalar_opt(&chunks_to_decimal(false, mag))
+}
+
+/// A signed decimal spelling as an Integer scalar, `None` past
+/// `INTEGER_FOLD_BIT_LIMIT` — the per-element `foldable_constant_value?`
+/// gate of `lift_array_result` / `divmod_result_to_pair`.
+fn spelled_scalar_opt(spelling: &str) -> Option<Scalar> {
+    if let Ok(v) = spelling.parse::<i64>() {
+        return Some(Scalar::Int(v));
+    }
+    if decimal_oversized(spelling) {
+        return None;
+    }
+    Some(Scalar::BigInt(spelling.to_string()))
+}
+
+/// An integer scalar as `f64` — `rb_big2dbl` / C's `(double)v` rounding,
+/// `None` for a non-numeric scalar.
+fn scalar_to_f64(s: &Scalar) -> Option<f64> {
+    match s {
+        Scalar::Int(v) => Some(*v as f64),
+        Scalar::BigInt(d) => d.parse::<f64>().ok(),
+        Scalar::Float(f) => Some(*f),
+        _ => None,
+    }
+}
+
+/// `a <op> b` where `b` is a `Scalar::Float` — the `public_send` coercion
+/// the reference performs (`rb_big2dbl` / `f` directly). The div family
+/// coerces to `f64` (`big / 3.0` -> `3.33…e19`); the bit ops, gcd/lcm,
+/// bit-test predicates, `digits` and the decimal rounders raise a
+/// `TypeError` on the oracle and decline to the RBS answer
+/// (`argument-type-mismatch` where it fires — `big & 3.0`).
+fn int_binary_float(a: &Scalar, method: &str, f: f64) -> FoldOutcome {
+    let a_f = scalar_to_f64(a);
+    match method {
+        "+" | "-" | "*" => int_arith(a, method, &Scalar::Float(f)),
+        "/" | "fdiv" | "quo" => {
+            let Some(a_f) = a_f else { return FoldOutcome::Declined };
+            let r = a_f / f;
+            if r.is_nan() {
+                FoldOutcome::Declined
+            } else {
+                FoldOutcome::Value(Scalar::Float(r))
+            }
+        }
+        "div" | "ceildiv" => {
+            let Some(a_f) = a_f else { return FoldOutcome::Declined };
+            let q = a_f / f;
+            // `div(0.0)` raises ZeroDivisionError, `ceildiv(1e-300)`
+            // FloatDomainError — non-finite declines like the oracle's
+            // rescue, which the RBS `Integer` answer then stands.
+            if !q.is_finite() {
+                return FoldOutcome::Declined;
+            }
+            let q = if method == "div" { q.floor() } else { q.ceil() };
+            big_scalar(format!("{q:.0}"))
+        }
+        "%" | "modulo" => {
+            let Some(a_f) = a_f else { return FoldOutcome::Declined };
+            // CRuby `flodivmod`: `fmod` then the divisor-sign adjustment —
+            // a `-0.0` keeps its sign (`-big % 2.5` -> `-0.0`).
+            let mut m = a_f % f;
+            if m != 0.0 && a_f * f < 0.0 {
+                m += f;
+            }
+            if m.is_nan() {
+                FoldOutcome::Declined
+            } else {
+                FoldOutcome::Value(Scalar::Float(m))
+            }
+        }
+        "remainder" => {
+            let Some(a_f) = a_f else { return FoldOutcome::Declined };
+            let r = a_f % f; // fmod — sign of the dividend.
+            if r.is_nan() {
+                FoldOutcome::Declined
+            } else {
+                FoldOutcome::Value(Scalar::Float(r))
+            }
+        }
+        "divmod" => {
+            let Some(a_f) = a_f else { return FoldOutcome::Declined };
+            // `flodivmod` — `fmod`, the divisor-sign adjustment, then the
+            // floor quotient spelled as an Integer (`big.divmod(3.0)` ->
+            // `[33333333333333331968, 1.0]`).
+            if f == 0.0 || !a_f.is_finite() {
+                return FoldOutcome::Declined;
+            }
+            let mut m = a_f % f;
+            if m != 0.0 && a_f * f < 0.0 {
+                m += f;
+            }
+            if m.is_nan() {
+                return FoldOutcome::Declined;
+            }
+            let div = ((a_f - m) / f).floor();
+            if !div.is_finite() {
+                return FoldOutcome::Declined;
+            }
+            let Some(qs) = spelled_scalar_opt(&format!("{div:.0}")) else {
+                return FoldOutcome::Declined;
+            };
+            FoldOutcome::Tuple(vec![qs, Scalar::Float(m)])
+        }
+        "<=>" => {
+            // Exact `Integer <=> Float` — `rb_big_cmp` compares the
+            // infinite-precision value, so `9007199254740993 <=> 9007199254740992.0`
+            // is `1` where an `f64` round-trip would say `0`.
+            let Some((a_neg, a_mag)) = int_operand_chunks(a) else {
+                return FoldOutcome::Declined;
+            };
+            match int_cmp_f64(a_neg, &chunks_to_limbs(&a_mag), f) {
+                Some(std::cmp::Ordering::Less) => FoldOutcome::Value(Scalar::Int(-1)),
+                Some(std::cmp::Ordering::Equal) => FoldOutcome::Value(Scalar::Int(0)),
+                Some(std::cmp::Ordering::Greater) => FoldOutcome::Value(Scalar::Int(1)),
+                None => FoldOutcome::Declined,
+            }
+        }
+        "[]" => {
+            // A Float index truncates (`big[1.9]` reads bit 1); a negative
+            // one reads `0`.
+            let Some((a_neg, a_mag)) = int_operand_chunks(a) else {
+                return FoldOutcome::Declined;
+            };
+            if !(f.is_finite() && f >= 0.0) {
+                return if f.is_finite() {
+                    FoldOutcome::Value(Scalar::Int(0))
+                } else {
+                    FoldOutcome::Declined
+                };
+            }
+            let i = f as u64;
+            let a_limbs = chunks_to_limbs(&a_mag);
+            let bit = if a_neg {
+                1 - limb_bit(&limbs_dec(&a_limbs), i)
+            } else {
+                limb_bit(&a_limbs, i)
+            };
+            FoldOutcome::Value(Scalar::Int(i64::from(bit)))
+        }
+        _ => FoldOutcome::Declined,
+    }
+}
+
+/// Exact `v <=> f` for an integer `v` of sign `a_neg` and u32-limb
+/// magnitude `a_limbs` — the `rb_big_cmp` semantics `Integer#<=>` executes
+/// on the oracle. `f` is `m * 2**e` exactly; past `2**53` a spelled f64
+/// still loses to the bignum it rounds from (`99999999999999999999 <=>
+/// 99999999999999999999.0` -> `-1`). `None` on NaN (unreachable — a NaN
+/// literal never pins).
+fn int_cmp_f64(a_neg: bool, a_limbs: &[u32], f: f64) -> Option<std::cmp::Ordering> {
+    use std::cmp::Ordering::*;
+    if f.is_nan() {
+        return None;
+    }
+    let f_neg = f.is_sign_negative() && f != 0.0;
+    let a_zero = limbs_is_zero(a_limbs);
+    // Sign first — a zero reads positive on both sides (`-0.0 == 0.0`).
+    match (a_neg && !a_zero, f_neg) {
+        (true, false) => return Some(Less),
+        (false, true) => return Some(Greater),
+        _ => {}
+    }
+    if a_zero && f == 0.0 {
+        return Some(Equal);
+    }
+    // Magnitude: `f = m * 2**e` (m <= 2**53, m odd unless f is a power of
+    // two at the subnormal floor).
+    let bits = f.abs().to_bits();
+    let raw_exp = ((bits >> 52) & 0x7ff) as i64;
+    let frac = bits & ((1u64 << 52) - 1);
+    let (m, e) = if raw_exp == 0 {
+        (frac, -1074i64)
+    } else {
+        (frac | (1u64 << 52), raw_exp - 1075)
+    };
+    let mag_ord = if e >= 0 {
+        // `f` is an integer `m << e` — compare magnitudes directly.
+        let mut f_limbs = vec![m as u32, (m >> 32) as u32];
+        while f_limbs.last() == Some(&0) {
+            f_limbs.pop();
+        }
+        limbs_shl(&mut f_limbs, e as u64);
+        limbs_cmp(a_limbs, &f_limbs)
+    } else {
+        // `f = m / 2**k`: compare `v` to `floor(f)`; an exact floor is
+        // equal only when the shifted-out fraction is zero — past `k = 64`
+        // the whole mantissa is fraction (`0 <=> 1e-320` is `-1`).
+        let k = (-e) as u64;
+        let floor = if k >= 64 { 0u64 } else { m >> k };
+        let frac_nz = if k >= 64 { m != 0 } else { (m & ((1u64 << k) - 1)) != 0 };
+        let floor_limbs = [floor as u32, (floor >> 32) as u32];
+        match limbs_cmp(a_limbs, &floor_limbs) {
+            Equal if frac_nz => Less,
+            o => o,
+        }
+    };
+    Some(if a_neg && !a_zero { mag_ord.reverse() } else { mag_ord })
+}
+
+// --- u32-limb bit ops -------------------------------------------------------
+
+/// Little-endian u32 limbs for base-1e9 chunks — the two's-complement bit
+/// view the `&`/`|`/`^`/`[]`/`bit_length` folds need.
+fn chunks_to_limbs(chunks: &[u64]) -> Vec<u32> {
+    const BASE: u64 = 1_000_000_000;
+    let mut limbs: Vec<u32> = Vec::new();
+    for &c in chunks.iter().rev() {
+        // `limbs = limbs * 1e9 + c` — schoolbook over a u64 carry.
+        let mut carry = c;
+        for w in limbs.iter_mut() {
+            let cur = u64::from(*w) * BASE + carry;
+            *w = cur as u32;
+            carry = cur >> 32;
+        }
+        while carry > 0 {
+            limbs.push(carry as u32);
+            carry >>= 32;
+        }
+    }
+    while limbs.last() == Some(&0) {
+        limbs.pop();
+    }
+    limbs
+}
+
+/// Little-endian base-1e9 chunks for u32 limbs — the way back from a bit
+/// op (a result's width is bounded by its operands', so this never spells
+/// more than the inputs).
+fn limbs_to_chunks(limbs: &[u32]) -> Vec<u64> {
+    const CHUNK: u128 = 1_000_000_000;
+    let mut out: Vec<u64> = Vec::new();
+    for &w in limbs.iter().rev() {
+        // `out = out * 2**32 + w`.
+        let mut carry = u128::from(w);
+        for c in out.iter_mut() {
+            let cur = u128::from(*c) * (1u128 << 32) + carry;
+            *c = (cur % CHUNK) as u64;
+            carry = cur / CHUNK;
+        }
+        while carry > 0 {
+            out.push((carry % CHUNK) as u64);
+            carry /= CHUNK;
+        }
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+fn limbs_is_zero(a: &[u32]) -> bool {
+    a.iter().all(|&w| w == 0)
+}
+
+fn limbs_cmp(a: &[u32], b: &[u32]) -> std::cmp::Ordering {
+    fn len(a: &[u32]) -> usize {
+        a.iter().rposition(|&w| w != 0).map_or(0, |p| p + 1)
+    }
+    let (la, lb) = (len(a), len(b));
+    la.cmp(&lb).then_with(|| {
+        (0..la)
+            .rev()
+            .map(|i| a[i].cmp(&b[i]))
+            .find(|o| *o != std::cmp::Ordering::Equal)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    })
+}
+
+fn limbs_eq_signed(a_neg: bool, a: &[u32], b_neg: bool, b: &[u32]) -> bool {
+    a_neg == b_neg && limbs_cmp(a, b) == std::cmp::Ordering::Equal
+}
+
+/// `a << shift` in place on little-endian u32 limbs.
+fn limbs_shl(a: &mut Vec<u32>, shift: u64) {
+    if a.is_empty() || shift == 0 {
+        return;
+    }
+    let words = (shift / 32) as usize;
+    let bits = (shift % 32) as u32;
+    if bits > 0 {
+        let mut carry = 0u32;
+        for w in a.iter_mut() {
+            let cur = (*w << bits) | carry;
+            carry = *w >> (32 - bits);
+            *w = cur;
+        }
+        if carry > 0 {
+            a.push(carry);
+        }
+    }
+    if words > 0 {
+        let mut shifted = vec![0u32; words];
+        shifted.extend_from_slice(a);
+        *a = shifted;
+    }
+}
+
+/// `a - 1` on a nonzero u32-limb magnitude — the `v - 1` a negative
+/// operand's two's-complement expansion reads (`-v` is `~(v-1)`).
+fn limbs_dec(a: &[u32]) -> Vec<u32> {
+    let mut out = a.to_vec();
+    for w in out.iter_mut() {
+        if *w > 0 {
+            *w -= 1;
+            break;
+        }
+        *w = u32::MAX;
+    }
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// `a + 1` on a u32-limb magnitude — closes `~(x)` back to `-x` (`~t` on
+/// the computed limbs is `-(t + 1)`).
+fn limbs_inc(a: &[u32]) -> Vec<u32> {
+    let mut out = a.to_vec();
+    let mut carry = 1u64;
+    for w in out.iter_mut() {
+        let cur = u64::from(*w) + carry;
+        *w = cur as u32;
+        carry = cur >> 32;
+        if carry == 0 {
+            break;
+        }
+    }
+    if carry > 0 {
+        out.push(carry as u32);
+    }
+    out
+}
+
+fn limbs_and(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = a.iter().zip(b).map(|(&x, &y)| x & y).collect();
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+fn limbs_or(a: &[u32], b: &[u32]) -> Vec<u32> {
+    (0..a.len().max(b.len()))
+        .map(|i| a.get(i).copied().unwrap_or(0) | b.get(i).copied().unwrap_or(0))
+        .collect()
+}
+
+fn limbs_xor(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = (0..a.len().max(b.len()))
+        .map(|i| a.get(i).copied().unwrap_or(0) ^ b.get(i).copied().unwrap_or(0))
+        .collect();
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+/// `a & ~b` — `a`'s bits where `b` is clear, bounded by `a`'s width (the
+/// complement's infinite ones past `b`'s span keep `a`).
+fn limbs_andnot(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out: Vec<u32> = a
+        .iter()
+        .enumerate()
+        .map(|(i, &x)| x & !b.get(i).copied().unwrap_or(0))
+        .collect();
+    while out.last() == Some(&0) {
+        out.pop();
+    }
+    out
+}
+
+fn limb_bit(a: &[u32], i: u64) -> u32 {
+    a.get((i / 32) as usize)
+        .map(|w| (w >> (i % 32)) & 1)
+        .unwrap_or(0)
+}
+
+/// `a <op> b` as two's-complement bit ops over sign + u32-limb magnitudes —
+/// returns `(negative, magnitude)`. A negative operand `-v` expands as
+/// `~(v-1)`, so each result reduces to positive limb ops plus one
+/// complement step (rigor-rs#877):
+///
+/// - `&` — `-a & b` is `b & ~(a-1)` = `b &~ (a-1)`; `-a & -b` is
+///   `~((a-1) | (b-1))` = `-(((a-1) | (b-1)) + 1)`.
+/// - `|` — `-a | b` is `~((a-1) &~ b)` = `-(((a-1) &~ b) + 1)`; `-a | -b`
+///   is `~((a-1) & (b-1))` = `-(((a-1) & (b-1)) + 1)`.
+/// - `^` — `-a ^ b` is `~((a-1) ^ b)` = `-(((a-1) ^ b) + 1)`; `-a ^ -b`
+///   is `(a-1) ^ (b-1)` (the complements cancel).
+fn limbs_bitop(a_neg: bool, a: &[u32], b_neg: bool, b: &[u32], op: &str) -> (bool, Vec<u32>) {
+    let at = if a_neg { limbs_dec(a) } else { a.to_vec() };
+    let bt = if b_neg { limbs_dec(b) } else { b.to_vec() };
+    match (op, a_neg, b_neg) {
+        ("&", false, false) => (false, limbs_and(a, b)),
+        ("&", true, false) => (false, limbs_andnot(b, &at)),
+        ("&", false, true) => (false, limbs_andnot(a, &bt)),
+        ("&", true, true) => (true, limbs_inc(&limbs_or(&at, &bt))),
+        ("|", false, false) => (false, limbs_or(a, b)),
+        ("|", true, false) => (true, limbs_inc(&limbs_andnot(&at, b))),
+        ("|", false, true) => (true, limbs_inc(&limbs_andnot(&bt, a))),
+        ("|", true, true) => (true, limbs_inc(&limbs_and(&at, &bt))),
+        ("^", false, false) => (false, limbs_xor(a, b)),
+        ("^", true, false) => (true, limbs_inc(&limbs_xor(&at, b))),
+        ("^", false, true) => (true, limbs_inc(&limbs_xor(a, &bt))),
+        ("^", true, true) => (false, limbs_xor(&at, &bt)),
+        _ => unreachable!("limbs_bitop on {op}"),
+    }
 }
 
 /// The compute side of `**`/`pow` on a `Scalar::BigInt` base, reached once
@@ -1838,7 +2851,11 @@ pub fn is_str_lookup(recv: &Scalar, method: &str) -> bool {
 /// `narrow_falsey` in `s.index &&= 1` to `1` where the oracle keeps
 /// `Integer | nil` and stays silent downstream.
 pub fn declines_unfolded(recv: &Scalar, method: &str) -> bool {
-    is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
+    is_str_lookup(recv, method)
+        || matches!(
+            (recv, method),
+            (Scalar::Float(_) | Scalar::Int(_) | Scalar::BigInt(_), "<=>")
+        )
 }
 
 /// The lookups #178 added to `declines_unfolded`. A compound index/attr
@@ -1855,7 +2872,11 @@ pub fn declines_str_index_family(recv: &Scalar, method: &str) -> bool {
 /// `nil`, or `Float#<=>`'s `nil` against a receiver a later write retypes), so
 /// the tier-1 fold must decline when the call reads a local.
 pub fn is_nilable_fold(recv: &Scalar, method: &str) -> bool {
-    is_str_lookup(recv, method) || matches!((recv, method), (Scalar::Float(_), "<=>"))
+    is_str_lookup(recv, method)
+        || matches!(
+            (recv, method),
+            (Scalar::Float(_) | Scalar::Int(_) | Scalar::BigInt(_), "<=>")
+        )
 }
 
 /// `String#[]` / `#slice` / `#byteslice` / `#index` on pinned scalars (issue
@@ -2255,10 +3276,11 @@ mod tests {
         // `inf * -0.0` is a Ruby NaN — declined (never a `Constant`).
         let inf_recv = big(&"9".repeat(400));
         assert_eq!(fold(&inf_recv, "*", &[Scalar::Float(-0.0)]), None);
-        // `/`, `%`, bit ops, and non-numeric operands still decline.
-        assert_eq!(fold(&n, "/", &[i(3)]), None);
-        assert_eq!(fold(&n, "%", &[i(3)]), None);
-        assert_eq!(fold(&n, "&", &[i(3)]), None);
+        // `/`, `%`, and the bit ops now fold at arbitrary width
+        // (rigor-rs#877); a non-numeric operand still declines.
+        assert_eq!(fold(&n, "/", &[i(3)]), Some(big("33333333333333333333")));
+        assert_eq!(fold(&n, "%", &[i(3)]), Some(i(0)));
+        assert_eq!(fold(&n, "&", &[i(3)]), Some(i(3)));
         assert_eq!(fold(&n, "+", &[Scalar::Str("x".into())]), None);
     }
 
@@ -2304,6 +3326,179 @@ mod tests {
         // … and an `i64` receiver compares against a Bignum argument.
         assert_eq!(fold(&i(5), "<", &[huge.clone()]), Some(Scalar::Bool(true)));
         assert_eq!(fold(&i(5), "==", &[huge]), Some(Scalar::Bool(false)));
+    }
+
+    /// The shared integer binary catalogue (rigor-rs#877): the `/`/`%`
+    /// sign rules, `ceildiv`/`remainder`/`fdiv`, `<=>` (including the exact
+    /// Bignum-vs-f64 compare), bit ops as two's-complement limb work,
+    /// `[]`, the bit-test predicates, `gcd`/`lcm`, `divmod`/`gcdlcm`/
+    /// `digits` as `FoldOutcome::Tuple`, and the decimal rounders — over
+    /// the sign + base-1e9 operand layer, shared by `Scalar::Int` and
+    /// `Scalar::BigInt` receivers. Every expected spelling was probed
+    /// against the oracle.
+    #[test]
+    fn folds_the_integer_binary_catalogue() {
+        let i = Scalar::Int;
+        let big = |d: &str| Scalar::BigInt(d.to_string());
+        let n = big("99999999999999999999");
+        let neg = big("-99999999999999999999");
+        let m = big("888888888888888888888888");
+        // `/`/`div` floor, `ceildiv` toward +inf, `remainder` truncated,
+        // `%`/`modulo` in the divisor's sign.
+        assert_eq!(fold(&n, "/", &[i(3)]), Some(big("33333333333333333333")));
+        // `-big / 4` floors a -2.5e19 quotient one further negative;
+        // `1e20` happens to be divisible by 3 (digit sum 180).
+        assert_eq!(fold(&neg, "/", &[i(4)]), Some(big("-25000000000000000000")));
+        assert_eq!(fold(&neg, "/", &[i(-3)]), Some(big("33333333333333333333")));
+        assert_eq!(fold(&n, "div", &[i(4)]), Some(big("24999999999999999999")));
+        assert_eq!(fold(&n, "ceildiv", &[i(4)]), Some(big("25000000000000000000")));
+        assert_eq!(fold(&neg, "ceildiv", &[i(4)]), Some(big("-24999999999999999999")));
+        assert_eq!(fold(&n, "%", &[i(3)]), Some(i(0)));
+        assert_eq!(fold(&neg, "%", &[i(4)]), Some(i(1)));
+        assert_eq!(fold(&n, "%", &[i(-4)]), Some(i(-1)));
+        assert_eq!(fold(&n, "remainder", &[i(4)]), Some(i(3)));
+        assert_eq!(fold(&neg, "remainder", &[i(4)]), Some(i(-3)));
+        // A zero divisor declines (the RBS tier stands + the raise).
+        for m_ in ["/", "div", "%", "modulo", "ceildiv", "remainder", "divmod"] {
+            assert_eq!(fold(&n, m_, &[i(0)]), None, "{m_} by zero");
+        }
+        // `divmod`/`gcdlcm`/`digits` are Tuple outcomes.
+        assert_eq!(
+            fold_outcome(&n, "divmod", &[i(3)]),
+            FoldOutcome::Tuple(vec![big("33333333333333333333"), i(0)])
+        );
+        assert_eq!(
+            fold_outcome(&neg, "divmod", &[i(4)]),
+            FoldOutcome::Tuple(vec![big("-25000000000000000000"), i(1)])
+        );
+        assert_eq!(
+            fold_outcome(&n, "gcdlcm", &[i(4)]),
+            FoldOutcome::Tuple(vec![i(1), big("399999999999999999996")])
+        );
+        assert_eq!(
+            fold_outcome(&i(5), "digits", &[]),
+            FoldOutcome::Tuple(vec![i(5)])
+        );
+        assert_eq!(
+            fold_outcome(&i(5), "digits", &[i(3)]),
+            FoldOutcome::Tuple(vec![i(2), i(1)])
+        );
+        // `digits` declines on a bad base, a negative receiver, or a
+        // >32-element expansion (`STRING_ARRAY_LIFT_LIMIT`).
+        assert_eq!(fold(&n, "digits", &[i(0)]), None);
+        assert_eq!(fold(&n, "digits", &[i(1)]), None);
+        assert_eq!(fold(&neg, "digits", &[]), None);
+        assert_eq!(fold(&n, "digits", &[i(2)]), None);
+        // `fdiv` / `quo` / `/` on a Float operand coerce to `f64`;
+        // `quo` on an Integer operand is `Unrepresentable` (Rational).
+        assert_eq!(fold(&n, "fdiv", &[i(4)]), Some(Scalar::Float(2.5e19)));
+        assert_eq!(fold(&n, "/", &[Scalar::Float(3.0)]), Some(Scalar::Float(1e20 / 3.0)));
+        assert_eq!(fold(&n, "quo", &[Scalar::Float(4.0)]), Some(Scalar::Float(2.5e19)));
+        assert_eq!(fold_outcome(&n, "quo", &[i(4)]), FoldOutcome::Unrepresentable);
+        assert_eq!(fold(&n, "quo", &[i(0)]), None); // raises -> RBS
+        // `<=>` — int/int, exact int/f64 (no `rb_big2dbl` loss on either
+        // side), and `nil` on a non-numeric.
+        assert_eq!(fold(&n, "<=>", &[i(3)]), Some(i(1)));
+        assert_eq!(fold(&i(5), "<=>", &[i(3)]), Some(i(1)));
+        assert_eq!(fold(&i(5), "<=>", &[i(5)]), Some(i(0)));
+        assert_eq!(fold(&i(5), "<=>", &[i(6)]), Some(i(-1)));
+        assert_eq!(
+            fold(&i(9007199254740993), "<=>", &[Scalar::Float(9007199254740992.0)]),
+            Some(i(1))
+        );
+        assert_eq!(
+            fold(&n, "<=>", &[Scalar::Float(99999999999999999999.0)]),
+            Some(i(-1))
+        );
+        assert_eq!(fold(&n, "<=>", &[Scalar::Str("a".into())]), Some(Scalar::Nil));
+        // Bit ops — two's-complement infinite width (spellings probed).
+        assert_eq!(fold(&n, "&", &[m.clone()]), Some(i(4846537325548899896)));
+        assert_eq!(fold(&n, "^", &[m]), Some(big("888979195814237791089095")));
+        assert_eq!(fold(&neg, "&", &[i(3)]), Some(i(1)));
+        assert_eq!(fold(&neg, "|", &[i(3)]), Some(big("-99999999999999999997")));
+        assert_eq!(fold(&n, "^", &[i(-1)]), Some(big("-100000000000000000000")));
+        assert_eq!(fold(&n, "~", &[]), Some(big("-100000000000000000000")));
+        assert_eq!(fold(&neg, "~", &[]), Some(big("99999999999999999998")));
+        // `[]` — bit reference, negative index `0`, sign bit past the
+        // magnitude, Float index truncates.
+        assert_eq!(fold(&n, "[]", &[i(5)]), Some(i(1)));
+        assert_eq!(fold(&neg, "[]", &[i(5)]), Some(i(0)));
+        assert_eq!(fold(&n, "[]", &[i(-3)]), Some(i(0)));
+        assert_eq!(fold(&i(5), "[]", &[i(100)]), Some(i(0)));
+        assert_eq!(fold(&i(-5), "[]", &[i(100)]), Some(i(1)));
+        assert_eq!(fold(&n, "[]", &[Scalar::Float(1.9)]), Some(i(1)));
+        // Bit-test predicates.
+        assert_eq!(fold(&n, "allbits?", &[i(3)]), Some(Scalar::Bool(true)));
+        assert_eq!(fold(&n, "anybits?", &[i(3)]), Some(Scalar::Bool(true)));
+        assert_eq!(fold(&n, "nobits?", &[i(3)]), Some(Scalar::Bool(false)));
+        assert_eq!(fold(&i(5), "allbits?", &[i(3)]), Some(Scalar::Bool(false)));
+        // gcd / lcm are non-negative magnitudes; `gcd(a, 0) = |a|`.
+        assert_eq!(fold(&n, "gcd", &[big("888888888888888888888888")]), Some(i(3333)));
+        assert_eq!(fold(&n, "gcd", &[i(0)]), Some(big("99999999999999999999")));
+        assert_eq!(fold(&n, "lcm", &[i(6)]), Some(big("199999999999999999998")));
+        assert_eq!(fold(&i(0), "lcm", &[i(5)]), Some(i(0)));
+        // Decimal rounders — `nd >= 0` answers the receiver; `nd < 0`
+        // rounds toward -inf / +inf / half-up / 0.
+        assert_eq!(fold(&n, "round", &[i(-5)]), Some(big("100000000000000000000")));
+        assert_eq!(fold(&n, "round", &[i(2)]), Some(big("99999999999999999999")));
+        assert_eq!(fold(&neg, "floor", &[i(-5)]), Some(big("-100000000000000000000")));
+        assert_eq!(fold(&n, "floor", &[i(-5)]), Some(big("99999999999999900000")));
+        assert_eq!(fold(&neg, "ceil", &[i(-5)]), Some(big("-99999999999999900000")));
+        assert_eq!(fold(&n, "truncate", &[i(-5)]), Some(big("99999999999999900000")));
+        assert_eq!(fold(&i(5), "round", &[i(-1)]), Some(i(10)));
+        assert_eq!(fold(&i(99), "round", &[i(-1)]), Some(i(100)));
+        assert_eq!(fold(&i(5), "round", &[i(-20)]), Some(i(0)));
+        assert_eq!(fold(&i(-25), "round", &[i(-1)]), Some(i(-30)));
+        // Shared on an i64 receiver (the issue's deferred unary family
+        // stays declined — `~`, `to_i`, `bit_length`, `next`, `magnitude`,
+        // `nonzero?`, `finite?`, `infinite?`, `inspect`, `abs2`).
+        assert_eq!(fold(&i(5), "ceildiv", &[i(3)]), Some(i(2)));
+        assert_eq!(fold(&i(5), "remainder", &[i(3)]), Some(i(2)));
+        assert_eq!(fold(&i(5), "fdiv", &[i(2)]), Some(Scalar::Float(2.5)));
+        assert_eq!(
+            fold_outcome(&i(5), "divmod", &[i(3)]),
+            FoldOutcome::Tuple(vec![i(1), i(2)])
+        );
+        assert_eq!(fold(&i(5), "gcd", &[i(0)]), Some(i(5)));
+        assert_eq!(fold(&i(5), "lcm", &[i(3)]), Some(i(15)));
+        assert_eq!(fold(&i(5), "to_i", &[]), None);
+        assert_eq!(fold(&i(5), "~", &[]), None);
+        assert_eq!(fold(&i(5), "nonzero?", &[]), None);
+        // BigInt unary family — self-returning members re-gate through
+        // `big_scalar`; the rest spell themselves.
+        assert_eq!(fold(&n, "to_i", &[]), Some(big("99999999999999999999")));
+        assert_eq!(fold(&n, "floor", &[]), Some(big("99999999999999999999")));
+        assert_eq!(fold(&n, "nonzero?", &[]), Some(big("99999999999999999999")));
+        assert_eq!(fold(&n, "next", &[]), Some(big("100000000000000000000")));
+        assert_eq!(fold(&neg, "magnitude", &[]), Some(big("99999999999999999999")));
+        assert_eq!(fold(&n, "finite?", &[]), Some(Scalar::Bool(true)));
+        assert_eq!(fold(&n, "infinite?", &[]), Some(Scalar::Nil));
+        assert_eq!(
+            fold(&n, "inspect", &[]),
+            Some(Scalar::Str("99999999999999999999".into()))
+        );
+        assert_eq!(fold(&n, "bit_length", &[]), Some(i(67)));
+        // `-(A)` counts `(A-1)`'s bits — same 67 here (a power-of-two
+        // magnitude is where it shrinks).
+        assert_eq!(fold(&neg, "bit_length", &[]), Some(i(67)));
+        assert_eq!(fold(&n, "to_f", &[]), Some(Scalar::Float(1e20)));
+        assert_eq!(
+            fold(&n, "abs2", &[]),
+            Some(big("9999999999999999999800000000000000000001"))
+        );
+        // `to_r`/`to_c`/`rationalize` pin a Rational / Complex constant the
+        // port's `Scalar` cannot hold — `Unrepresentable` (untyped), never
+        // the `for Rational` FP (rigor-rs#877).
+        assert_eq!(fold_outcome(&n, "to_r", &[]), FoldOutcome::Unrepresentable);
+        assert_eq!(fold_outcome(&n, "to_c", &[]), FoldOutcome::Unrepresentable);
+        assert_eq!(fold_outcome(&i(5), "to_r", &[]), FoldOutcome::Unrepresentable);
+        assert_eq!(fold_outcome(&i(5), "rationalize", &[]), FoldOutcome::Unrepresentable);
+        // `Float#to_c` is NOT `INTEGER_UNARY`-folded on the oracle — the
+        // `Complex` RBS answer stands.
+        assert_ne!(
+            fold_outcome(&Scalar::Float(1.5), "to_c", &[]),
+            FoldOutcome::Unrepresentable
+        );
     }
 
     #[test]

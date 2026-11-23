@@ -214,6 +214,7 @@ pub(crate) fn check_unreachable_branch(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn check_always_raises(
     ast: &LoweredAst,
+    call_id: rigor_parse::NodeId,
     receiver: rigor_parse::NodeId,
     method: &str,
     args: &[rigor_parse::NodeId],
@@ -248,6 +249,13 @@ pub(crate) fn check_always_raises(
     // A Float `0.0`, a non-zero constant, or any non-constant ⇒ decline.
     let arg_ty = typer.type_of(ast, *arg, env, interner);
     if !matches!(interner.get(arg_ty), Type::Constant(Scalar::Int(0))) {
+        return None;
+    }
+
+    // `AlwaysRaisesShield` (upstream #3036): the proven ZeroDivisionError
+    // still flows to an enclosing `begin`'s rescue before it escapes —
+    // `begin; x / 0; rescue; end` is silent on the oracle.
+    if always_raises_rescued(ast, call_id, env, typer, interner, index) {
         return None;
     }
 
@@ -300,6 +308,117 @@ fn is_integer_rooted(interner: &Interner, index: &CoreIndex, ty: rigor_types::Ty
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Port of the reference's `AlwaysRaisesShield#rescued?` (upstream #3036):
+/// does an enclosing `begin` (or `def … rescue … end`, which lowers to the
+/// same `BeginRescue` node) catch the proven `ZeroDivisionError` before it
+/// escapes? Deliberately conservative in BOTH directions, mirroring the
+/// class comment:
+///
+/// - it suppresses only when a rescue clause names a class the raised class
+///   orders at-or-below (`rescue ZeroDivisionError`, `rescue StandardError`,
+///   `rescue Exception`, or a bare `rescue` — implicit `StandardError`),
+///   resolved through the typer (`Type::Singleton` only — a non-constant or
+///   unresolvable exception reference contributes no coverage);
+/// - it never crosses a body boundary: a `Definition`, a `Lambda`, or a
+///   `Call`'s literal `block_body` (the lowered `BlockNode` — `block_span`
+///   present; a `&expr` block-pass is an evaluated operand, not a
+///   boundary). `BEGIN`/`END` ride `StatementsKind::Inert` carriers the port
+///   does not distinguish from `defined?`/`super` operands, so the ascent
+///   crosses them — where the reference keeps the diagnostic (`BEGIN {
+///   5 / 0 }` inside a rescued `begin`), the port stays silent. Class /
+///   module bodies are NOT boundaries — they evaluate inline.
+///
+/// The rescue-clause check is `rescue_chain_catches?` + `class_catches?`:
+/// any clause may catch, and a clause catches when any exception it names
+/// resolves to a class the raised class orders at-or-below (`Equal` or
+/// `Subclass` — the clause's class is the raised class or an ancestor).
+/// `Superclass`/`Disjoint`/`Unknown` keep the diagnostic.
+fn always_raises_rescued(
+    ast: &LoweredAst,
+    call_id: rigor_parse::NodeId,
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> bool {
+    let parents = typer.ancestor_map(ast);
+    let mut child = call_id;
+    let mut current = parents.get(&child).copied();
+    while let Some(cur) = current {
+        match ast.get(cur) {
+            // `protected_body?`: the ascent arrived through the begin's
+            // protected statements (`main_body`), not a rescue / else /
+            // ensure clause — those a `begin` does not catch. A reused
+            // carrier (`else`/`when`/`in`/parens) has empty `clauses`, so
+            // the chain check declines and the ascent continues.
+            Node::BeginRescue {
+                main_body, clauses, ..
+            } if main_body.contains(&child)
+                && rescue_chain_catches(ast, clauses, env, typer, interner, index) =>
+            {
+                return true;
+            }
+            Node::Definition { .. } | Node::Lambda { .. } => return false,
+            Node::Call {
+                block_body,
+                block_span,
+                ..
+            } if block_span.is_some() && block_body.contains(&child) => {
+                return false;
+            }
+            _ => {}
+        }
+        child = cur;
+        current = parents.get(&cur).copied();
+    }
+    false
+}
+
+/// Any clause of the `rescue … rescue …` chain may catch — the reference's
+/// `rescue_chain_catches?` over the lowered [`RescueClause`] view.
+fn rescue_chain_catches(
+    ast: &LoweredAst,
+    clauses: &[rigor_parse::RescueClause],
+    env: &rigor_infer::TypeEnv,
+    typer: &Typer,
+    interner: &mut Interner,
+    index: &CoreIndex,
+) -> bool {
+    clauses.iter().any(|clause| {
+        // A bare `rescue` (or `rescue => e` with no class list) names
+        // `StandardError` implicitly — `BARE_RESCUE_CLASS`.
+        if clause.exceptions.is_empty() {
+            return class_catches(index, "StandardError");
+        }
+        clause.exceptions.iter().any(|&exc| {
+            // `exception_class_name`: only a `Type::Singleton` counts — the
+            // rescue operand is the class object; a dynamic / instance-typed
+            // / unresolvable reference contributes no coverage.
+            let ty = typer.type_of(ast, exc, env, interner);
+            let Type::Singleton(class) = interner.get(ty) else {
+                return false;
+            };
+            // The `ClassId` lives in the SOURCE index's id space — resolve
+            // core first, then source (the `resolve_class_name` two-step
+            // `call.raise-non-exception` shares).
+            index
+                .class_name_for_id(*class)
+                .or_else(|| typer.source().class_name_for_id(*class))
+                .is_some_and(|name| class_catches(index, name))
+        })
+    })
+}
+
+/// `class_ordering(raised, rescued)` ∈ `{:equal, :subclass}` — the rescued
+/// class is `ZeroDivisionError` itself or an ancestor of it, so the clause
+/// catches (`StandardError`, `Exception`, `Object`, `BasicObject`).
+fn class_catches(index: &CoreIndex, rescued_class: &str) -> bool {
+    matches!(
+        index.class_ordering("ZeroDivisionError", rescued_class),
+        rigor_index::ClassOrdering::Equal | rigor_index::ClassOrdering::Subclass
+    )
+}
 
 // ---------------------------------------------------------------------------
 // flow.dead-assignment (ADR-0030) — pure AST/structural, no typer/index
