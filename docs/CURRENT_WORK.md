@@ -14,6 +14,10 @@ Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md). Hard byte budget
 ▶ NEXT: ADR-127 floor coverage cost; follow-ups #493/#600/#605,
 paren/`&.` residuals #838–#847; mutation seams →#777–#785;
 #877 residuals #894–#896; #898-review residuals #899–#903.
+- **Exit-predicate family** #955/#957/#963–#966: three syntactic twins of
+  `branch_terminates?` — `class_narrowing::stmt_terminates`,
+  `dead::stmt_exits`/`stmt_bot`, `collection_shape::coll_arm_terminates`.
+  A fix in one leaves the others diverging; change all, or consolidate.
 - **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-22, `v0.4.8`): **174 fixtures / 0 unregistered**; sweep
