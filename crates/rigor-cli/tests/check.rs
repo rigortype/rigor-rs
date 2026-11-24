@@ -1192,4 +1192,25 @@ fn ensure_begin_and_write_tail_termination_matrix() {
             "expected call.undefined-method `for {expected}` for {src:?}, got {diags:?}"
         );
     }
+
+    // A non-local write whose value is a call with an exiting OPERAND
+    // does not type `bot` on the oracle — the rescue arm stays live and
+    // the reference answers `for "a" | "e"`. The port must never drop
+    // the arm and answer the narrower `for "a"` (PR #962 review); the
+    // live-arm join itself is a separate, pre-existing coverage gap, so
+    // the port may stay silent here.
+    for src in [
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = foo(raise); end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; $q = foo(raise); end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; q, r = foo(raise); end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = raise.to_s; end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = Foo.new(raise); end; x.w\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.rule_id == CALL_UNDEFINED_METHOD
+                && d.message.ends_with("for \"a\"")),
+            "the arm must stay live (no `for \"a\"`) for {src:?}, got {diags:?}"
+        );
+    }
 }
