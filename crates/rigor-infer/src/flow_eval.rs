@@ -4722,19 +4722,57 @@ impl<'i> Typer<'i> {
                         } else {
                             else_body.clone()
                         };
+                        // rigor-rs#942 — `eval_if`/`eval_unless` return
+                        // the live arm's scope UNLESS the body arm
+                        // unconditionally exits AND there is no else
+                        // (`branch_terminates?(node.statements, live_type)
+                        // && node.subsequent.nil?`,
+                        // statement_evaluator.rb:2302; `… &&
+                        // node.else_clause.nil?`, :2336). `then_body` is
+                        // `node.statements` under both keywords, and an
+                        // else clause — even an empty `else; end` — keeps
+                        // `else_body` non-empty (it lowers to one
+                        // carrier), so `is_empty` reads
+                        // `subsequent.nil?`/`else_clause.nil?` exactly. A
+                        // live ELSE arm therefore never drops: `if
+                        // false; else; x << "b"; raise; end` answers
+                        // `for String` on the oracle, and a terminated
+                        // then arm beside an else keeps its writes
+                        // (`if true; x = "s"; raise; else; y = 1; end`
+                        // answers `for "s"`).
+                        let arm_terminates = else_body.is_empty()
+                            && crate::class_narrowing::branch_terminates(ast, then_body);
+                        // The dropped arm's own writes and mutations
+                        // contribute nothing to the post-`if` env — its
+                        // scope never reaches the join (`x = "a"; if
+                        // true; x = "s"; raise; end` keeps `"a"`) — so
+                        // exclude the live statements' spans from both
+                        // tables' slices on top of the dead-set filter.
+                        let live_stmt_spans: Vec<rigor_parse::Span> =
+                            live.iter().map(|&s| ast.get(s).span()).collect();
+                        let dropped_scope = |w: rigor_parse::Span| {
+                            arm_terminates
+                                && live_stmt_spans
+                                    .iter()
+                                    .any(|ls| ls.0 <= w.0 && w.1 <= ls.1)
+                        };
                         // Only the effects INSIDE the `if`'s span are ever
                         // applied — every consumer below keeps the span
                         // check — so the tables' span slice replaces the
                         // whole-table scan (rigor-rs#424).
                         let live_rebinds: Vec<_> = effects
                             .rebinds_within(span)
-                            .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                            .filter(|(w, _)| {
+                                dead.write_reaches(*w, (span.1, span.1))
+                                    && !dropped_scope(*w)
+                            })
                             .cloned()
                             .collect();
                         let live_mutations: Vec<_> = effects
                             .mutations_within(span)
                             .filter(|(w, _, m, _)| {
                                 dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                                    && !dropped_scope(*w)
                             })
                             .cloned()
                             .collect();
@@ -4770,40 +4808,16 @@ impl<'i> Typer<'i> {
                         // scope dies at the join, so its mutations contribute
                         // nothing to the post-`if` binding (`s = "abc"; if
                         // true; s << "d"; raise; end` keeps `"abc"` on the
-                        // oracle) — the per-statement landing below skips the
-                        // whole arm, exactly as the dead filter already
-                        // dropped its rebinds. The predicate above still
-                        // lands: it evaluated before the arm did (`if (s <<
-                        // "d"); raise; end` widens `s` on the oracle too).
-                        let arm_terminates =
-                            !live.is_empty() && crate::class_narrowing::branch_terminates(ast, &live);
+                        // oracle) — the `dropped_scope` filter above already
+                        // excluded the whole arm's writes and mutations, and
+                        // the fused replay below skips it. The predicate
+                        // above still lands: it evaluated before the arm did
+                        // (`if (s << "d"); raise; end` widens `s` on the
+                        // oracle too).
                         if !arm_terminates {
-                            for s in &live {
-                                let sspan = ast.get(*s).span();
-                                self.widen_mutated_locals(
-                                    ast,
-                                    live_mutations.iter(),
-                                    indexed, dead, true,
-                                    // Rooted at the LIVE STATEMENT, not the `if`:
-                                    // a certainty-folded arm runs unconditionally,
-                                    // so each of its statements is straight-line
-                                    // code to the path marks and a mutator call in
-                                    // one lands the nominal (`s << "d"` mints
-                                    // `String`) exactly as it would outside the
-                                    // `if`. Rooted at the `if` the statement rides
-                                    // a `Cond` edge and the mutation floors to
-                                    // `untyped`, where the reference's
-                                    // `live_branch_for_if` evaluation answers the
-                                    // nominal (rigor-rs#774).
-                                    *s,
-                                    sspan,
-                                    &mut replay,
-                                    interner,
-                                );
-                                self.bind_live_arm_stmts(
-                                    ast, std::slice::from_ref(s), &mut replay, effects, indexed, dead, interner,
-                                );
-                            }
+                            self.bind_live_arm_stmts(
+                                ast, &live, &live_mutations, &mut replay, effects, indexed, dead, interner,
+                            );
                         }
                         widen_flow_writes(live_rebinds.iter(), span, env, interner);
                         self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
@@ -4820,16 +4834,8 @@ impl<'i> Typer<'i> {
                             ast, live_mutations.iter(), indexed, dead, true, id, pspan, env, interner,
                         );
                         if !arm_terminates {
-                            for s in &live {
-                                let sspan = ast.get(*s).span();
-                                self.widen_mutated_locals(
-                                    ast, live_mutations.iter(), indexed, dead, true, *s, sspan, env, interner,
-                                );
-                            }
-                        }
-                        for s in &live {
                             self.bind_live_arm_stmts(
-                                ast, std::slice::from_ref(s), env, effects, indexed, dead, interner,
+                                ast, &live, &live_mutations, env, effects, indexed, dead, interner,
                             );
                         }
                         for (name, ty) in replay.iter() {
@@ -4935,26 +4941,43 @@ impl<'i> Typer<'i> {
                             let entry_for_write = env.get(name.as_str()).copied().unwrap_or_else(|| interner.untyped());
                             let t_write = arm_write_ty(self, ast, env, truthy_body, name, entry_for_write, interner);
                             let f_write = arm_write_ty(self, ast, env, falsey_body, name, entry_for_write, interner);
-                            // A terminating arm contributes the entry type —
-                            // its writes never reach the join (rigor-rs#451
-                            // review; `dead.write_reaches` above already
-                            // drops the write itself, but a name written in
-                            // BOTH arms needs the terminated edge floored).
-                            let t_term = !truthy_body.is_empty() && crate::class_narrowing::branch_terminates(ast, truthy_body);
-                            let f_term = !falsey_body.is_empty() && crate::class_narrowing::branch_terminates(ast, falsey_body);
+                            // rigor-rs#942 — `eval_if`/`eval_unless`'s
+                            // undecided-arm drops are PHYSICAL
+                            // (`node.statements` is the port's `then_body`
+                            // under both keywords; `subsequent`/`else_clause`
+                            // is `else_body`): the body arm terminating
+                            // beside NO else returns the other edge's scope —
+                            // per name the ENTRY binding (its writes never
+                            // reach the join — rigor-rs#451 review); an else
+                            // arm terminating beside a body returns the
+                            // body's scope alone; and `if_join` returns the
+                            // else's scope only for a body arm
+                            // `branch_certainly_exits?` — the strict test,
+                            // so a `begin`/`rescue` or a `Bot`-typed arm
+                            // still joins. Anything else joins both scopes.
                             let u = interner.untyped();
                             let entry_ty = env.get(name.as_str()).copied().unwrap_or(u);
-                            let t_ty = match (t_term, t_write) {
-                                (true, _) => entry_ty,
-                                (false, Some(v)) => v,
-                                (false, None) => entry_ty,
+                            let t_ty = t_write.unwrap_or(entry_ty);
+                            let f_ty = f_write.unwrap_or(entry_ty);
+                            let (body_ty, else_ty) =
+                                if *is_unless { (f_ty, t_ty) } else { (t_ty, f_ty) };
+                            let j = if else_body.is_empty()
+                                && !then_body.is_empty()
+                                && crate::class_narrowing::branch_terminates(ast, then_body)
+                            {
+                                entry_ty
+                            } else if !then_body.is_empty()
+                                && !else_body.is_empty()
+                                && crate::class_narrowing::branch_terminates(ast, else_body)
+                            {
+                                body_ty
+                            } else if !else_body.is_empty()
+                                && crate::class_narrowing::branch_certainly_exits(ast, then_body)
+                            {
+                                else_ty
+                            } else {
+                                rigor_types::Algebra::join(interner, t_ty, f_ty)
                             };
-                            let f_ty = match (f_term, f_write) {
-                                (true, _) => entry_ty,
-                                (false, Some(v)) => v,
-                                (false, None) => entry_ty,
-                            };
-                            let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
                             drop_indexed_narrowings(env, name);
                             env.insert(Rc::from(name.as_str()), j);
                         }
@@ -5164,11 +5187,33 @@ impl<'i> Typer<'i> {
     ///   into [`Self::bind_check_statement_effects`]'s own `Node::If` arm).
     ///
     /// Everything else is the live statement it appears to be.
+    ///
+    /// rigor-rs#942 — the walk is FUSED with the mutation landing: each
+    /// effective live statement lands its own mutations BEFORE its binds,
+    /// positionally (a pin the arm mutates — `s << "d"; s += "e"` — must
+    /// not fold a stale literal into a `Constant` the runtime never
+    /// produces, rigor-rs#694 review). Two carriers ride the same
+    /// unconditional treatment:
+    ///
+    /// * a clause-less `BeginRescue` — the `else` carrier above, a
+    ///   `(…; …)` paren group, a bare `begin … end` — runs its `body`
+    ///   unconditionally, so each body statement is itself an effective
+    ///   live statement (rooted at the carrier the `begin`-body `Cond`
+    ///   edge floored its mutations to `Dynamic`: `if false; else; x <<
+    ///   "b"; end` answers `for String` on the oracle, and `if true;
+    ///   begin; x = "s"; end; end` `for "s"`);
+    /// * a nested `if` delegates to [`Self::bind_check_statement_effects`]
+    ///   WHOLE — the inner arm lands its own span's mutations rooted at
+    ///   its own live statements. Rooted at the inner `if` from here,
+    ///   they ride a `Cond` edge and floor to `Dynamic` before the inner
+    ///   folded arm can mint the nominal (`if true; if true; x << "b";
+    ///   end; end` answers `for String` on the oracle).
     #[allow(clippy::too_many_arguments)]
     fn bind_live_arm_stmts(
         &self,
         ast: &LoweredAst,
         live: &[NodeId],
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
         env: &mut TypeEnv,
         effects: &FlowEffects,
         indexed: &IndexedFlow,
@@ -5176,14 +5221,40 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         for &s in live {
-            if ast.is_else_carrier(s) {
-                let Node::BeginRescue { body, .. } = ast.get(s) else { continue };
-                let body = body.clone();
-                self.bind_live_arm_stmts(ast, &body, env, effects, indexed, dead, interner);
-            } else if matches!(ast.get(s), Node::If { .. }) {
-                self.bind_check_statement_effects(ast, s, env, effects, indexed, dead, interner);
-            } else {
-                self.bind_statement(ast, s, env, interner);
+            match ast.get(s) {
+                Node::BeginRescue { body, clauses, .. } if clauses.is_empty() => {
+                    let body = body.clone();
+                    self.bind_live_arm_stmts(
+                        ast, &body, mutations, env, effects, indexed, dead, interner,
+                    );
+                }
+                Node::If { .. } => {
+                    self.bind_check_statement_effects(ast, s, env, effects, indexed, dead, interner);
+                }
+                _ => {
+                    let sspan = ast.get(s).span();
+                    self.widen_mutated_locals(
+                        ast,
+                        mutations.iter(),
+                        indexed, dead, true,
+                        // Rooted at the LIVE STATEMENT, not the `if`:
+                        // a certainty-folded arm runs unconditionally,
+                        // so each of its statements is straight-line
+                        // code to the path marks and a mutator call in
+                        // one lands the nominal (`s << "d"` mints
+                        // `String`) exactly as it would outside the
+                        // `if`. Rooted at the `if` the statement rides
+                        // a `Cond` edge and the mutation floors to
+                        // `untyped`, where the reference's
+                        // `live_branch_for_if` evaluation answers the
+                        // nominal (rigor-rs#774).
+                        s,
+                        sspan,
+                        env,
+                        interner,
+                    );
+                    self.bind_statement(ast, s, env, interner);
+                }
             }
         }
     }
