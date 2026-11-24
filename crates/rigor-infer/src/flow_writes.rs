@@ -1282,19 +1282,12 @@ pub(crate) fn node_child_ids(n: &Node, out: &mut Vec<NodeId>) {
             out.extend(predicate.iter().copied());
             out.extend_from_slice(body);
         }
-        Node::BeginRescue {
-            body,
-            ensure_body,
-            clauses,
-            ..
-        } => {
-            out.extend_from_slice(body);
-            out.extend_from_slice(ensure_body);
-            for clause in clauses {
-                out.extend_from_slice(&clause.exceptions);
-                out.extend_from_slice(&clause.body);
-            }
-        }
+        // `body` is the flat superset: the protected statements
+        // (`main_body`), every rescue clause's exceptions and statements,
+        // the `else` and the `ensure` all ride it. Descending the views as
+        // well visited each section twice — ×2 per nesting level
+        // (rigor-rs#963).
+        Node::BeginRescue { body, .. } => out.extend_from_slice(body),
         Node::Logical { left, right, .. } => {
             out.push(*left);
             out.push(*right);
@@ -2072,8 +2065,9 @@ fn passed_locals(ast: &LoweredAst, id: NodeId, out: &mut Vec<String>) {
             passed_locals(ast, *right, out);
         }
         // An `else` arm lowers as a `BeginRescue` carrier.
-        Node::BeginRescue { body, clauses, .. } => {
-            for &e in body.iter().chain(clauses.iter().flat_map(|c| c.body.iter())) {
+        // `body` already holds every rescue clause's statements (#963).
+        Node::BeginRescue { body, .. } => {
+            for &e in body {
                 passed_locals(ast, e, out);
             }
         }

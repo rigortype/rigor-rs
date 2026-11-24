@@ -776,21 +776,12 @@ fn child_ids(n: &Node, out: &mut Vec<NodeId>) {
             out.extend(predicate.iter().copied());
             out.extend_from_slice(body);
         }
-        Node::BeginRescue {
-            body,
-            main_body,
-            ensure_body,
-            clauses,
-            ..
-        } => {
-            out.extend_from_slice(body);
-            out.extend_from_slice(main_body);
-            out.extend_from_slice(ensure_body);
-            for clause in clauses {
-                out.extend_from_slice(&clause.exceptions);
-                out.extend_from_slice(&clause.body);
-            }
-        }
+        // `body` is the flat superset: the protected statements
+        // (`main_body`), every rescue clause's exceptions and statements,
+        // the `else` and the `ensure` all ride it. Descending the views as
+        // well visited each section twice — ×2 per nesting level
+        // (rigor-rs#963).
+        Node::BeginRescue { body, .. } => out.extend_from_slice(body),
         Node::Logical { left, right, .. } => {
             out.push(*left);
             out.push(*right);
