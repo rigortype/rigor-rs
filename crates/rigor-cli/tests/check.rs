@@ -1112,3 +1112,105 @@ fn block_bound_collection_mutated_under_condition_silent() {
         assert!(diags.is_empty(), "expected zero diagnostics: {diags:?}");
     }
 }
+
+/// rigor-rs#956 — the exit predicates see a clause-less real `begin` and a
+/// plain write's value position. A `begin … ensure … end` terminates iff
+/// its PROTECTED body does (the ensure contributes no value path —
+/// `begin; 1; ensure; raise; end` stays live on the oracle), and a write
+/// terminates iff its value does (`x = raise`, `q, r = raise`, `h[:k] =
+/// raise`, `o.attr = raise`) while operator/logical writes and non-value
+/// argument positions do not (`q += raise`, `foo(raise)`, `h[raise] = 1`).
+/// Every row is oracle-measured on the pinned reference.
+#[test]
+fn ensure_begin_and_write_tail_termination_matrix() {
+    // Terminating tail — the else arm's scope drops and the post-`if`
+    // read fires `for "s"` (the then arm's write) on BOTH engines.
+    for src in [
+        // The issue row.
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; raise; ensure; nil; end; end; x.w\n"[..],
+        // `main_body`'s last statement decides — writes before it are
+        // dropped with the arm, and the ensure's own statements do not
+        // count either way.
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; x = \"e\"; raise; ensure; y = 1; end; end; x.w\n"[..],
+        // `return` inside the protected body exits the same way.
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; return 1; ensure; nil; end; end; x.w\n"[..],
+        // Nested clause-less begins.
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; begin; raise; ensure; nil; end; ensure; nil; end; end; x.w\n"[..],
+        // Parenthesised and write-carried spellings of the same begin.
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; (begin; raise; ensure; nil; end); end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; q = (begin; raise; ensure; nil; end); end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; q = begin; raise; ensure; x = \"e\"; end; end; x.w\n"[..],
+        // The plain-write family — every form the oracle types `bot`
+        // when the value exits.
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; q = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; @q = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; @@q = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; $q = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; Q = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; q = r = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; q, r = raise; end; x.w\n"[..],
+        &b"x = \"a\"; if rand > 0; x = \"s\"; else; h = {}; h[:k] = raise; end; x.w\n"[..],
+        // The same begin / write tails drop a rescue arm on the oracle
+        // (`live_rescue_results`) — the post-`begin` scope keeps the
+        // entry binding `for "a"`.
+        &b"x = \"a\"; begin; raise; rescue; begin; raise; ensure; x = \"e\"; end; end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; begin; raise; ensure; nil; end; end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = raise; end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; h = {}; h[:k] = raise; end; x.w\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.rule_id == CALL_UNDEFINED_METHOD),
+            "expected call.undefined-method for {src:?}, got {diags:?}"
+        );
+    }
+
+    // Must-still-fire controls — tails that stay LIVE on the oracle, so
+    // the else arm's scope still joins (`for "a" | "s"`, or the arm's own
+    // write where the oracle joins it).
+    for (src, expected) in [
+        // The ensure's own exit does NOT terminate the begin.
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; 1; ensure; raise; end; end; x.w\n"[..], "\"a\" | \"s\""),
+        // A non-exiting protected body keeps the arm live.
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; nil; ensure; nil; end; end; x.w\n"[..], "\"a\" | \"s\""),
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; begin; x = \"e\"; ensure; nil; end; end; x.w\n"[..], "\"e\" | \"s\""),
+        // Operator/logical writes keep the arm live.
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; q = 1; q += raise; end; x.w\n"[..], "\"a\" | \"s\""),
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; q ||= raise; end; x.w\n"[..], "\"a\" | \"s\""),
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; q = nil; q &&= raise; end; x.w\n"[..], "\"a\" | \"s\""),
+        // An exit in a NON-value position does not count.
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; h = {}; h[raise] = 1; end; x.w\n"[..], "\"a\" | \"s\""),
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; foo(raise); end; x.w\n"[..], "\"a\" | \"s\""),
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; [raise]; end; x.w\n"[..], "\"a\" | \"s\""),
+        // A safe-nav setter skips the store on a nil receiver.
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; o = nil; o&.attr = raise; end; x.w\n"[..], "\"a\" | \"s\""),
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.rule_id == CALL_UNDEFINED_METHOD
+                && d.message.contains(expected)),
+            "expected call.undefined-method `for {expected}` for {src:?}, got {diags:?}"
+        );
+    }
+
+    // A non-local write whose value is a call with an exiting OPERAND
+    // does not type `bot` on the oracle — the rescue arm stays live and
+    // the reference answers `for "a" | "e"`. The port must never drop
+    // the arm and answer the narrower `for "a"` (PR #962 review); the
+    // live-arm join itself is a separate, pre-existing coverage gap, so
+    // the port may stay silent here.
+    for src in [
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = foo(raise); end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; $q = foo(raise); end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; q, r = foo(raise); end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = raise.to_s; end; x.w\n"[..],
+        &b"x = \"a\"; begin; raise; rescue; x = \"e\"; @q = Foo.new(raise); end; x.w\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(
+            !diags.iter().any(|d| d.rule_id == CALL_UNDEFINED_METHOD
+                && d.message.ends_with("for \"a\"")),
+            "the arm must stay live (no `for \"a\"`) for {src:?}, got {diags:?}"
+        );
+    }
+}

@@ -1603,16 +1603,30 @@ impl<'i> Typer<'i> {
                         && self.arm_exits(ast, else_body, seen)
                 }
             },
-            // A clause-less `begin` is a parenthesised / else-only carrier —
-            // its tail is the body's tail.
-            Node::BeginRescue { clauses, body, .. } if clauses.is_empty() => {
-                self.arm_exits(ast, body, seen)
+            // A clause-less `begin` is a parenthesised / else-only carrier
+            // (`main_body == body`) or a real `begin … ensure … end` — the
+            // flat `body`'s tail is then the ENSURE's last statement, but
+            // `ensure` contributes no value path, so the begin exits iff
+            // its protected body does (rigor-rs#956).
+            Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
+                self.arm_exits(ast, main_body, seen)
             }
             // A write whose value position exits types the write `Bot`
             // (`x = raise`); a call with an exit in an evaluated operand the
-            // same (`f(raise)`). A receiver call's exit is already covered by
-            // `receiver`'s own check.
+            // same (`f(raise)`). A receiver call's exit is already covered
+            // by `receiver`'s own check.
             Node::LocalVariableWrite { value, .. } => self.stmt_exits(ast, *value, seen),
+            // The other plain writes (`@q = raise`, `$q`/`@@q`/`Q = raise`,
+            // `q, r = raise` — rigor-rs#956) take the STRICT value test: a
+            // call value counts only when the call itself types `bot`, not
+            // when an operand exits (`rescue; x = "e"; @q = foo(raise)`
+            // keeps the arm live on the oracle, `for "a" | "e"`).
+            // Operator/logical writes stay excluded — `x += raise` and
+            // `x ||= raise` keep the arm live on the oracle.
+            Node::InstanceVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. }
+            | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, false),
             Node::Call {
                 receiver,
                 method,
@@ -1733,6 +1747,40 @@ impl<'i> Typer<'i> {
     /// value at all? Same shape walk minus the jump statements (they
     /// produce the jump's payload or the method's `nil`), plus the
     /// non-returning-call cases a `def` tail can carry.
+    /// Whether a non-local plain write's VALUE types `bot` (rigor-rs#956):
+    /// a call value counts only through its own `bot` type — a
+    /// receiverless `EXIT_CALLS` name, a Kernel-spelled non-returner
+    /// ([`Self::kernel_call_terminates`]), or a same-file toplevel `def`
+    /// with a provably-bot body ([`Self::def_exits`]) — never through an
+    /// exiting receiver or argument: `@q = foo(raise)`, `@q =
+    /// raise.to_s` and `@q = Foo.new(raise)` all keep a rescue arm live
+    /// on the oracle. Every other value shape defers to
+    /// [`Self::stmt_bot`] (`bot`, a `def` body) or [`Self::stmt_exits`].
+    fn write_value_bot(
+        &self,
+        ast: &LoweredAst,
+        value: NodeId,
+        seen: &mut Vec<String>,
+        bot: bool,
+    ) -> bool {
+        match ast.get(value) {
+            Node::Call {
+                receiver,
+                method,
+                span,
+                ..
+            } => {
+                (receiver.is_none() && EXIT_CALLS.contains(&method.as_str()))
+                    || self.kernel_call_terminates(ast, value)
+                    || (receiver.is_none()
+                        && !self.self_answers(ast, *span, method)
+                        && self.def_exits(ast, method, seen))
+            }
+            _ if bot => self.stmt_bot(ast, value, seen),
+            _ => self.stmt_exits(ast, value, seen),
+        }
+    }
+
     fn stmt_bot(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> bool {
         match ast.get(id) {
             // `return e` yields `e`'s value — `return raise` produces none.
@@ -1775,11 +1823,23 @@ impl<'i> Typer<'i> {
                     self.arm_bot(ast, then_body, seen) && self.arm_bot(ast, else_body, seen)
                 }
             },
-            // A clause-less `begin` is a parenthesised carrier — its tail.
-            Node::BeginRescue { clauses, body, .. } if clauses.is_empty() => {
-                self.arm_bot(ast, body, seen)
+            // A clause-less `begin` is a parenthesised carrier
+            // (`main_body == body`) or a real `begin … ensure … end` —
+            // `ensure` contributes no value, so the begin is `bot` iff its
+            // protected body is (rigor-rs#956).
+            Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
+                self.arm_bot(ast, main_body, seen)
             }
             Node::LocalVariableWrite { value, .. } => self.stmt_bot(ast, *value, seen),
+            // The other plain writes are `bot` iff their value is (`def
+            // die; @q = raise; end` — rigor-rs#956), under the strict call
+            // test [`Self::write_value_bot`] uses; operator/logical writes
+            // are not (a `||=`/`&&=` read edge or an `op=` dispatch still
+            // completes).
+            Node::InstanceVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. }
+            | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, true),
             Node::Logical { left, .. } => self.stmt_bot(ast, *left, seen),
             Node::Call {
                 receiver,
