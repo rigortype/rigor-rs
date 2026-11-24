@@ -1169,6 +1169,76 @@ fn terminating_arm_drops_recognise_nested_exits() {
     assert_eq!(env.get("x"), Some(&s));
 }
 
+/// rigor-rs#952 — the `else` clause of a `begin`/`rescue` joins its type
+/// unconditionally: a non-exiting `else` (even unreachable behind an
+/// exiting body, and even an EMPTY `else; end` — `nil` either way) keeps
+/// the begin non-`bot`, and an exiting `else` takes over the protected
+/// body's value path (the body itself need not exit). Every expected
+/// value is the oracle's own answer.
+#[test]
+fn terminating_begin_else_joins_its_value() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let env_of = |src: &[u8]| {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        (env, i)
+    };
+    let a_literal = |i: &mut Interner| i.intern(Type::Constant(Scalar::Str("a".into())));
+    let s_literal = |i: &mut Interner| i.intern(Type::Constant(Scalar::Str("s".into())));
+
+    // Folded arm: a non-exiting or empty `else` keeps the live arm's scope
+    // (`"s"` survives; the begin is not `bot`). The `unless false` fold and
+    // a two-clause rescue chain behave the same, as does `ensure` — it runs
+    // on every path but contributes no value.
+    for src in [
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  else\n    nil\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nunless false\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  else\n    nil\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  else\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    raise\n  rescue E1\n    raise\n  rescue E2\n    raise\n  else\n    nil\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  else\n    nil\n  ensure\n    y = 1\n  end\nend\nx.w\n".as_ref(),
+    ] {
+        let (env, mut i) = env_of(src);
+        let s = s_literal(&mut i);
+        assert_eq!(env.get("x"), Some(&s), "{}", String::from_utf8_lossy(src));
+    }
+
+    // Folded arm: an exiting `else` leaves the begin `bot` — the arm drops
+    // even when the protected body itself would not exit (`else` replaces
+    // the body's value path), and `ensure` still counts for nothing.
+    for src in [
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    nil\n  rescue\n    raise\n  else\n    raise\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  else\n    raise\n  ensure\n    y = 1\n  end\nend\nx.w\n".as_ref(),
+    ] {
+        let (env, mut i) = env_of(src);
+        let a = a_literal(&mut i);
+        assert_eq!(env.get("x"), Some(&a), "{}", String::from_utf8_lossy(src));
+    }
+
+    // Undecided arm: the non-`bot` begin keeps its arm's scope either side
+    // of the `if` — `"a" | "s"`.
+    for src in [
+        b"x = \"a\"\nif rand > 0\n  x = \"s\"\nelse\n  begin\n    raise\n  rescue\n    raise\n  else\n    nil\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif rand > 0\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  else\n    nil\n  end\nend\nx.w\n".as_ref(),
+    ] {
+        let (env, mut i) = env_of(src);
+        let (a, s) = (a_literal(&mut i), s_literal(&mut i));
+        let want = i.intern(Type::Union(vec![a, s]));
+        assert_eq!(env.get("x"), Some(&want), "{}", String::from_utf8_lossy(src));
+    }
+
+    // …while an exiting `else` drops the undecided arm exactly like no
+    // `else` at all: the else arm's scope gone (`"s"`), or the body arm's
+    // (`"a"` — the body arm need not exit itself).
+    let (env, mut i) = env_of(b"x = \"a\"\nif rand > 0\n  x = \"s\"\nelse\n  begin\n    raise\n  rescue\n    raise\n  else\n    raise\n  end\nend\nx.w\n");
+    let s = s_literal(&mut i);
+    assert_eq!(env.get("x"), Some(&s));
+    let (env, mut i) = env_of(b"x = \"a\"\nif rand > 0\n  x = \"s\"\n  begin\n    nil\n  rescue\n    raise\n  else\n    raise\n  end\nend\nx.w\n");
+    let a = a_literal(&mut i);
+    assert_eq!(env.get("x"), Some(&a));
+}
+
 /// rigor-rs#153: the always-truthy constant propagation folds past a write
 /// that never runs in sequence, and declines past a conditional one.
 #[test]
