@@ -4941,26 +4941,43 @@ impl<'i> Typer<'i> {
                             let entry_for_write = env.get(name.as_str()).copied().unwrap_or_else(|| interner.untyped());
                             let t_write = arm_write_ty(self, ast, env, truthy_body, name, entry_for_write, interner);
                             let f_write = arm_write_ty(self, ast, env, falsey_body, name, entry_for_write, interner);
-                            // A terminating arm contributes the entry type —
-                            // its writes never reach the join (rigor-rs#451
-                            // review; `dead.write_reaches` above already
-                            // drops the write itself, but a name written in
-                            // BOTH arms needs the terminated edge floored).
-                            let t_term = !truthy_body.is_empty() && crate::class_narrowing::branch_terminates(ast, truthy_body);
-                            let f_term = !falsey_body.is_empty() && crate::class_narrowing::branch_terminates(ast, falsey_body);
+                            // rigor-rs#942 — `eval_if`/`eval_unless`'s
+                            // undecided-arm drops are PHYSICAL
+                            // (`node.statements` is the port's `then_body`
+                            // under both keywords; `subsequent`/`else_clause`
+                            // is `else_body`): the body arm terminating
+                            // beside NO else returns the other edge's scope —
+                            // per name the ENTRY binding (its writes never
+                            // reach the join — rigor-rs#451 review); an else
+                            // arm terminating beside a body returns the
+                            // body's scope alone; and `if_join` returns the
+                            // else's scope only for a body arm
+                            // `branch_certainly_exits?` — the strict test,
+                            // so a `begin`/`rescue` or a `Bot`-typed arm
+                            // still joins. Anything else joins both scopes.
                             let u = interner.untyped();
                             let entry_ty = env.get(name.as_str()).copied().unwrap_or(u);
-                            let t_ty = match (t_term, t_write) {
-                                (true, _) => entry_ty,
-                                (false, Some(v)) => v,
-                                (false, None) => entry_ty,
+                            let t_ty = t_write.unwrap_or(entry_ty);
+                            let f_ty = f_write.unwrap_or(entry_ty);
+                            let (body_ty, else_ty) =
+                                if *is_unless { (f_ty, t_ty) } else { (t_ty, f_ty) };
+                            let j = if else_body.is_empty()
+                                && !then_body.is_empty()
+                                && crate::class_narrowing::branch_terminates(ast, then_body)
+                            {
+                                entry_ty
+                            } else if !then_body.is_empty()
+                                && !else_body.is_empty()
+                                && crate::class_narrowing::branch_terminates(ast, else_body)
+                            {
+                                body_ty
+                            } else if !else_body.is_empty()
+                                && crate::class_narrowing::branch_certainly_exits(ast, then_body)
+                            {
+                                else_ty
+                            } else {
+                                rigor_types::Algebra::join(interner, t_ty, f_ty)
                             };
-                            let f_ty = match (f_term, f_write) {
-                                (true, _) => entry_ty,
-                                (false, Some(v)) => v,
-                                (false, None) => entry_ty,
-                            };
-                            let j = rigor_types::Algebra::join(interner, t_ty, f_ty);
                             drop_indexed_narrowings(env, name);
                             env.insert(Rc::from(name.as_str()), j);
                         }

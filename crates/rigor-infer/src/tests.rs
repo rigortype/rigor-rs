@@ -1114,6 +1114,61 @@ fn folded_if_else_and_nested_arm_mutations_land() {
     assert_eq!(env.get("x"), Some(&s));
 }
 
+/// rigor-rs#942 review — `stmt_terminates` recurses the shapes
+/// `branch_terminates?`'s Bot half answers (an `if`/`unless` whose both
+/// arms exit, a `case`/`case…in` whose every arm exits, a `begin`/`rescue`
+/// whose body AND every clause exit, `exit!`'s `bot` signature) — and the
+/// undecided `if_join` applies the STRICT `branch_certainly_exits?` to the
+/// body arm, which a `begin`/`rescue` fails. Every expected value is the
+/// oracle's own answer.
+#[test]
+fn terminating_arm_drops_recognise_nested_exits() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let env_of = |src: &[u8]| {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        (env, i)
+    };
+    let a_literal = |i: &mut Interner| i.intern(Type::Constant(Scalar::Str("a".into())));
+    let s_literal = |i: &mut Interner| i.intern(Type::Constant(Scalar::Str("s".into())));
+
+    // Folded arm: a nested `if`/`case`/`begin` whose every path exits still
+    // drops the live arm's scope.
+    for src in [
+        b"x = \"a\"\nif true\n  x = \"s\"\n  if rand > 0\n    raise\n  else\n    raise\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  case rand\n  when Integer\n    raise\n  else\n    raise\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  case rand\n  in Integer\n    raise\n  else\n    raise\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  begin\n    raise\n  rescue\n    raise\n  end\nend\nx.w\n".as_ref(),
+        b"x = \"a\"\nif true\n  x = \"s\"\n  exit!\nend\nx.w\n".as_ref(),
+    ] {
+        let (env, mut i) = env_of(src);
+        let a = a_literal(&mut i);
+        assert_eq!(env.get("x"), Some(&a), "{}", String::from_utf8_lossy(src));
+    }
+
+    // Undecided arm: a body arm `branch_certainly_exits?` beside an else
+    // contributes the else's scope alone (`if c; if d; raise; else; raise;
+    // end; else; x = "s"` → `"s"`).
+    let (env, mut i) = env_of(b"x = \"a\"\nif rand > 0\n  if rand > 1\n    raise\n  else\n    raise\n  end\nelse\n  x = \"s\"\nend\nx.w\n");
+    let s = s_literal(&mut i);
+    assert_eq!(env.get("x"), Some(&s));
+
+    // …but a `begin`/`rescue` arm is NOT `branch_certainly_exits?` — its
+    // scope joins (`"a" | "s"` on the oracle).
+    let (env, mut i) = env_of(b"x = \"a\"\nif rand > 0\n  begin\n    raise\n  rescue\n    raise\n  end\nelse\n  x = \"s\"\nend\nx.w\n");
+    let (a, s) = (a_literal(&mut i), s_literal(&mut i));
+    let want = i.intern(Type::Union(vec![a, s]));
+    assert_eq!(env.get("x"), Some(&want));
+
+    // An else arm `branch_terminates?` DOES see the begin's all-exit type —
+    // the body's scope survives alone (`"s"`).
+    let (env, mut i) = env_of(b"x = \"a\"\nif rand > 0\n  x = \"s\"\nelse\n  begin\n    raise\n  rescue\n    raise\n  end\nend\nx.w\n");
+    let s = s_literal(&mut i);
+    assert_eq!(env.get("x"), Some(&s));
+}
+
 /// rigor-rs#153: the always-truthy constant propagation folds past a write
 /// that never runs in sequence, and declines past a conditional one.
 #[test]

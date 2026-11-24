@@ -3234,8 +3234,16 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
             matches!(kind, JumpKind::Next | JumpKind::Break)
         }
+        // `EXIT_CALL_NAMES` (`raise throw exit abort fail`,
+        // statement_evaluator.rb:9666) plus `exit!`: it is absent from the
+        // syntactic set but its Kernel signature returns `bot`, so
+        // `branch_terminates?` catches it through the type half — the same
+        // shape the `If`/`Case`/`BeginRescue` arms below approximate.
         Node::Call { receiver: None, method, .. }
-            if matches!(method.as_str(), "raise" | "throw" | "exit" | "abort" | "fail") =>
+            if matches!(
+                method.as_str(),
+                "raise" | "throw" | "exit" | "exit!" | "abort" | "fail"
+            ) =>
         {
             true
         }
@@ -3244,10 +3252,125 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         {
             branch_terminates(ast, body)
         }
+        // `branch_unconditionally_exits?` recurses into `if`/`unless` only
+        // when BOTH arms exit — an `if` with no else falls through on the
+        // falsey edge, so it never qualifies
+        // (statement_evaluator.rb:9688). Without this arm a folded
+        // arm's effects still landed where the reference drops the whole
+        // scope (`if true; x = "s"; if c; raise; else; raise; end; end`
+        // answered `for "a"` on the oracle — rigor-rs#942 review).
+        Node::If { then_body, else_body, .. } => {
+            !else_body.is_empty()
+                && branch_terminates(ast, then_body)
+                && branch_terminates(ast, else_body)
+        }
+        // `branch_terminates?`'s Bot half, approximated syntactically: a
+        // `case`/`case…in` whose every arm exits types `Bot`. The else
+        // clause must be present for a `case`/`when` (a missing else falls
+        // through to `nil`); a `case`/`in` — whose branches lower to
+        // `BeginRescue` carriers — cannot fall through at all (a non-match
+        // raises `NoMatchingPatternError`), so every branch body exiting
+        // already types `Bot`. The else body must exit whenever present.
+        Node::Case { branches, else_body, .. } => {
+            let all_in_branches = !branches.is_empty()
+                && branches
+                    .iter()
+                    .all(|&b| matches!(ast.get(b), Node::BeginRescue { .. }));
+            let falls_through = else_body.is_empty() && !all_in_branches;
+            !falls_through
+                && (else_body.is_empty() || branch_terminates(ast, else_body))
+                && branches.iter().all(|&b| stmt_terminates(ast, b))
+        }
+        // A `when` clause's exit is its body's — its conditions only pick
+        // WHICH body runs, they cannot complete the branch themselves.
+        Node::When { body, .. } => branch_terminates(ast, body),
+        // A `begin … rescue … end` exits only when the protected body
+        // exits AND every rescue clause exits — a normally-completing
+        // body or a non-exiting clause is a path that falls through
+        // (`begin; raise; rescue; raise; end` exits, so a folded arm
+        // ending in it drops its scope — rigor-rs#942 review). `ensure`
+        // runs on either path and contributes no value, so it does not
+        // count toward exiting.
+        Node::BeginRescue { main_body, clauses, .. } if !clauses.is_empty() => {
+            branch_terminates(ast, main_body)
+                && clauses
+                    .iter()
+                    .all(|c| branch_terminates(ast, &c.body))
+        }
         // A recovery carrier's children are flattened out of expression
         // structure (`raise X rescue nil` recovers the `raise` call), so only a
         // real sequence ends where its last child does.
         Node::Statements { body, kind: StatementsKind::Sequence, .. } => branch_terminates(ast, body),
+        _ => false,
+    }
+}
+
+/// `branch_certainly_exits?` (statement_evaluator.rb:9712) — the STRICT,
+/// syntactic-only exit test `if_join` applies to the body arm beside an
+/// `else`: a `return`/`next`/`break`, a receiverless `raise`/`fail`/`exit`/
+/// `exit!`/`abort`/`throw` call (the reference additionally checks
+/// `!scope.project_method_name?` — a decline-side gap the flat index
+/// cannot see here), a statement list or else/paren carrier whose last
+/// statement exits, an `if`/`unless` whose BOTH arms certainly exit, and
+/// a `case`/`case…in` with a present else whose every branch body
+/// certainly exits (`case_certainly_exits?`). A `begin`/`rescue` is
+/// deliberately NOT recognised — it is absent from the reference's case
+/// list — and neither is the `Bot` half [`branch_terminates`] adds.
+pub(crate) fn branch_certainly_exits(ast: &LoweredAst, body: &[NodeId]) -> bool {
+    match body.last() {
+        Some(&last) => stmt_certainly_exits(ast, last),
+        None => false,
+    }
+}
+
+fn stmt_certainly_exits(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::Return { .. } => true,
+        Node::Other { jump: Some(_), .. } => true,
+        Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
+            matches!(kind, JumpKind::Next | JumpKind::Break)
+        }
+        // `CERTAIN_EXIT_NAMES` — `exit!` is here and NOT in the looser
+        // `EXIT_CALL_NAMES` [`stmt_terminates`] mirrors
+        // (statement_evaluator.rb:9666 vs :9743).
+        Node::Call { receiver: None, method, .. }
+            if matches!(
+                method.as_str(),
+                "raise" | "fail" | "exit" | "exit!" | "abort" | "throw"
+            ) =>
+        {
+            true
+        }
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            branch_certainly_exits(ast, body)
+        }
+        // The carriers `branch_certainly_exits?` DOES unwrap — an
+        // `ElseNode`'s statements and a `ParenthesesNode`'s body. A real
+        // `begin` node is not in its case list, so only the two carrier
+        // identities qualify.
+        Node::BeginRescue { body, .. }
+            if ast.is_else_carrier(id) || ast.is_paren_carrier(id) =>
+        {
+            branch_certainly_exits(ast, body)
+        }
+        Node::If { then_body, else_body, .. } => {
+            !else_body.is_empty()
+                && branch_certainly_exits(ast, then_body)
+                && branch_certainly_exits(ast, else_body)
+        }
+        // `case_certainly_exits?` — an else clause must be PRESENT for
+        // either case kind (`!node.else_clause.nil?`,
+        // statement_evaluator.rb:9736) — a `case`/`in` without one is not
+        // recognised even though it cannot match-fall-through.
+        Node::Case { branches, else_body, .. } => {
+            !else_body.is_empty()
+                && branch_certainly_exits(ast, else_body)
+                && branches.iter().all(|&b| match ast.get(b) {
+                    Node::When { body, .. } => branch_certainly_exits(ast, body),
+                    Node::BeginRescue { body, .. } => branch_certainly_exits(ast, body),
+                    _ => false,
+                })
+        }
         _ => false,
     }
 }
