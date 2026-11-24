@@ -3284,15 +3284,38 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         // A `when` clause's exit is its body's — its conditions only pick
         // WHICH body runs, they cannot complete the branch themselves.
         Node::When { body, .. } => branch_terminates(ast, body),
-        // A `begin … rescue … end` exits only when the protected body
-        // exits AND every rescue clause exits — a normally-completing
-        // body or a non-exiting clause is a path that falls through
-        // (`begin; raise; rescue; raise; end` exits, so a folded arm
-        // ending in it drops its scope — rigor-rs#942 review). `ensure`
-        // runs on either path and contributes no value, so it does not
-        // count toward exiting.
-        Node::BeginRescue { main_body, clauses, .. } if !clauses.is_empty() => {
-            branch_terminates(ast, main_body)
+        // A `begin … rescue … end` exits only when every live VALUE path
+        // exits: every rescue clause, plus the normally-completing path —
+        // which is the protected body's own statements with no `else`,
+        // but the ELSE's statements when one is present (`else` replaces
+        // the body's value, so `begin; nil; rescue; raise; else; raise;
+        // end` is `bot` on the oracle even though `nil` never exits).
+        // The else joins unconditionally: `else; nil` — even unreachable
+        // behind an exiting body — keeps the begin non-`bot` and the arm
+        // live, and an empty `else; end` still contributes `nil`
+        // (rigor-rs#952). `ensure` runs on either path and contributes no
+        // value, so it does not count toward exiting.
+        Node::BeginRescue { main_body, body, clauses, ensure_body, has_else, .. }
+            if !clauses.is_empty() =>
+        {
+            // The else statements ride the flat `body` after every
+            // clause's exceptions+body and before `ensure_body`
+            // (ast/builder/control.rs); a real `begin` admits an `else`
+            // only beside a `rescue`, and `has_else` counts an empty one
+            // — whose missing statements leave an empty slice, a `nil`
+            // path `branch_terminates` declines.
+            let normal_path_exits = if *has_else {
+                let else_start = main_body.len()
+                    + clauses
+                        .iter()
+                        .map(|c| c.exceptions.len() + c.body.len())
+                        .sum::<usize>();
+                let else_end = body.len().saturating_sub(ensure_body.len());
+                branch_terminates(ast, body.get(else_start..else_end).unwrap_or(&[]))
+            } else {
+                branch_terminates(ast, main_body)
+            };
+            normal_path_exits
                 && clauses
                     .iter()
                     .all(|c| branch_terminates(ast, &c.body))
