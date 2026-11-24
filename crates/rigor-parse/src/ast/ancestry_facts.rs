@@ -2543,6 +2543,27 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             // The block's other arguments (a `->` lambda) keep the
             // enclosing `self`, as the reference's walk keeps them.
             Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None, opaque: true })
+        } else if eval
+            && self.frame().singleton
+            && recv.as_ref().is_none_or(|r| r.as_self_node().is_some())
+        {
+            // A bare / `self` eval block inside `class <<` does not rebind:
+            // `eval_body_singleton?` keeps it the singleton's body
+            // (`in_singleton_class && !eval_named_receiver?`), and the mixin
+            // walk's `walk_singleton_class_includes` passes `current_class =
+            // nil` with `singleton_self` set, so `rebound_block_self`
+            // answers OPAQUE_SELF. Continuing the singleton frame gives both:
+            // `def`s stay singleton-side, `include` files exactly as it does
+            // directly in `class <<`, and a `self::` receiver stays opaque.
+            let f = self.frame();
+            Some(Frame {
+                owner: f.owner.clone(),
+                singleton: true,
+                uncertain: false,
+                eval_owner: f.eval_owner.clone(),
+                self_base: None,
+                opaque: true,
+            })
         } else if eval {
             let instance_side = name == "instance_eval" || name == "instance_exec";
             let self_anchored_recv = recv
