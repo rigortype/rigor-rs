@@ -17,6 +17,12 @@ use crate::{
     ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
+/// [`CollSnap::class`] of a site [`Typer::record_coll_snap`] declines: one of
+/// its passes saw no collection carrier, or its passes join to a non-carrier
+/// (a union). Never
+/// escapes [`Typer::collection_shape_snapshots`].
+const DECLINED: &str = "";
+
 /// One collection-shape snapshot: the class a bare-local receiver's carrier
 /// dispatches on (`"Array"` / `"Hash"`), and the carrier itself at the use
 /// site — a literal `Tuple` / `HashShape` seed no mutator has widened yet, or a
@@ -105,6 +111,7 @@ impl<'i> Typer<'i> {
         };
         let mut tenv = TypeEnv::new();
         self.coll_flow_scope(ast, &body, &mut tenv, &ctx, interner, &mut out, true);
+        out.retain(|_, snap| snap.class != DECLINED);
         out
     }
 
@@ -274,6 +281,11 @@ impl<'i> Typer<'i> {
                 let mark = ctx.dirty.borrow().len();
                 let mut exit = tenv.clone();
                 self.coll_flow_scope(ast, &main_body, &mut exit, ctx, interner, out, stmt_position);
+                // The protected body's own post-scope, before the `else`
+                // clause: a retry arm that leaves the entry scope unchanged
+                // replays `main_body` over exactly the entry the primary walk
+                // started from, so its re-run IS this scope (rigor-rs#969).
+                let after_main = exit.clone();
                 self.coll_flow_scope(ast, &else_body, &mut exit, ctx, interner, out, stmt_position);
                 for cl in &clauses {
                     // Exception designators evaluate in the entry bindings and
@@ -334,16 +346,31 @@ impl<'i> Typer<'i> {
                         // retry` carries the ARM's widening back in and joins
                         // against the unmutated primary — silent, exactly as
                         // the reference.
-                        let mut rerun = arm;
-                        self.coll_flow_scope(
-                            ast,
-                            &main_body,
-                            &mut rerun,
-                            ctx,
-                            interner,
-                            out,
-                            stmt_position,
-                        );
+                        //
+                        // An arm whose post-scope equals the entry scope
+                        // (`rescue; retry`, or a write the entry already
+                        // holds) replays the primary walk verbatim: same env
+                        // in, so the same env out, the same carriers recorded
+                        // (re-merging an identical carrier is a no-op) and the
+                        // same `dirty` keys, already pushed past every
+                        // enclosing mark. Re-walking it anyway doubled the
+                        // work per nested `begin … rescue; retry` level
+                        // (rigor-rs#969).
+                        let rerun = if arm == *tenv {
+                            after_main.clone()
+                        } else {
+                            let mut rerun = arm;
+                            self.coll_flow_scope(
+                                ast,
+                                &main_body,
+                                &mut rerun,
+                                ctx,
+                                interner,
+                                out,
+                                stmt_position,
+                            );
+                            rerun
+                        };
                         exit = {
                             let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
                             self.coll_join_envs_delta(&exit, &rerun, &changed, interner)
@@ -901,20 +928,25 @@ impl<'i> Typer<'i> {
         }
     }
 
-    /// The collection class a receiver carrier projects to, or `None`. Mirrors
-    /// the reference's `receiver_descriptor` (`rbs_dispatch.rb:209-212`): a
-    /// `Tuple` dispatches as `Array` and a `HashShape` as `Hash`, and a kept
-    /// `Nominal[Array|Hash]` (mutator-widened or tier-folded) dispatches as
-    /// itself. Every other carrier — including a `Union` — declines.
     /// Record one call site's collection snapshot. A site re-evaluated by a
     /// retry re-run (the `begin`'s protected body replayed over the arm's
     /// retry-edge scope) records its carrier AGAIN — the reference's carrier
     /// at the site is the JOIN of every pass's env (`c = [1]; begin; c.nope;
-    /// rescue; c = [2]; retry; end` types `c` `[1] | [2]` there), so merge the
-    /// fresh carrier into the recorded one instead of overwriting it. The
-    /// union keeps its member classes' names when one collection class
-    /// survives (`coll_carrier` answers `None` on a union — the rule declines
-    /// it before rendering, so `class` never witnesses).
+    /// rescue; c = [2]; retry; end` types `c` `[1] | [2]` there). The snapshot
+    /// keeps that join only while it is itself a collection carrier; a union
+    /// is a surface this pass does not model, so the site DECLINES. So does a
+    /// site any of whose passes saw a non-collection carrier. A first pass
+    /// like that records a [`DECLINED`] tombstone (dropped at the end of the
+    /// walk) rather than leaving the site absent, or a later pass's lone
+    /// collection carrier would stand in for the join (rigor-rs#969 review: `c` typed
+    /// `Array | [2]`, then `c = [2]; retry`, fired `for [2]` where the
+    /// reference is silent). Recording is therefore idempotent — a pass that
+    /// re-records the same carrier changes nothing — which is what lets a
+    /// retry arm that leaves the entry scope unchanged skip its re-run.
+    ///
+    /// Before #969 a non-carrier pass was also joined, and `Algebra::join`
+    /// absorbs into `Dynamic`: `c = x` in the arm fired `for Array` where the
+    /// reference is silent.
     fn record_coll_snap(
         &self,
         out: &mut HashMap<NodeId, CollSnap>,
@@ -923,26 +955,31 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         if let Some(prev) = out.get(&id).copied() {
-            // A re-evaluated pass records a possibly DIFFERENT carrier: the
-            // site's type is their join (the re-run's `c` needs no collection
-            // class to contribute — `c = [2]` and `c = "s"` arms both join).
             if prev.carrier != ty {
-                let carrier = self.union_members(vec![prev.carrier, ty], interner);
-                out.insert(
-                    id,
-                    CollSnap {
-                        class: prev.class,
-                        carrier,
-                    },
-                );
+                // Join two collection carriers (`Hash[…]` passes whose
+                // type arguments differ join to one `Hash` and the reference
+                // fires there too); anything else declines: a non-carrier
+                // side (a `Dynamic` absorbs the join), or a join that is not
+                // itself a carrier (`[1] | [2]`, `[1] | "s"`).
+                let joined = if prev.class == DECLINED || self.coll_carrier(interner, ty).is_none() {
+                    None
+                } else {
+                    let carrier = self.union_members(vec![prev.carrier, ty], interner);
+                    self.coll_carrier(interner, carrier).map(|class| CollSnap { class, carrier })
+                };
+                out.insert(id, joined.unwrap_or(CollSnap { class: DECLINED, carrier: ty }));
             }
             return;
         }
-        if let Some(class) = self.coll_carrier(interner, ty) {
-            out.insert(id, CollSnap { class, carrier: ty });
-        }
+        let class = self.coll_carrier(interner, ty).unwrap_or(DECLINED);
+        out.insert(id, CollSnap { class, carrier: ty });
     }
 
+    /// The collection class a receiver carrier projects to, or `None`. Mirrors
+    /// the reference's `receiver_descriptor` (`rbs_dispatch.rb:209-212`): a
+    /// `Tuple` dispatches as `Array` and a `HashShape` as `Hash`, and a kept
+    /// `Nominal[Array|Hash]` (mutator-widened or tier-folded) dispatches as
+    /// itself. Every other carrier — including a `Union` — declines.
     fn coll_carrier(&self, interner: &Interner, ty: TypeId) -> Option<&'static str> {
         match interner.get(ty) {
             Type::Tuple(_) => Some("Array"),

@@ -964,11 +964,11 @@ pub(crate) fn check_collection_call(
     }
     // (2) The flow pass must have typed this exact call's receiver.
     let rigor_infer::CollSnap { class: class_name, carrier } = *snapshots.get(&call_id)?;
-    // A carrier re-evaluated by a retry re-run records the JOIN of every
-    // pass's env — a union. The union rule owns those receivers on the
-    // reference (its `nope` on `[1] | [2]` is silent while `zark` on
-    // `"s" | [1]` fires `for "s" | [1]`), and this snapshot cannot reach that
-    // surface, so it declines rather than invent a member or a bare nominal.
+    // A union carrier (a retry re-run's JOIN of every pass's env) is owned by
+    // the reference's union rule (its `nope` on `[1] | [2]` is silent while
+    // `zark` on `"s" | [1]` fires `for "s" | [1]`), a surface this snapshot
+    // cannot reach. The snapshot pass already drops a site whose passes
+    // disagree (`record_coll_snap`, rigor-rs#969); this stays as the guard.
     if matches!(interner.get(carrier), Type::Union(_)) {
         return None;
     }
