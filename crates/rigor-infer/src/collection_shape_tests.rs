@@ -14,25 +14,6 @@ fn coll_snaps(src: &[u8]) -> (LoweredAst, HashMap<NodeId, &'static str>) {
     (ast, snaps.into_iter().map(|(id, snap)| (id, snap.class)).collect())
 }
 
-/// Whether the snap's carrier for `method`'s call is a `Union` — the retry
-/// re-run's joined carrier (rigor-rs#493).
-fn snap_carrier_is_union(src: &[u8], method: &str) -> bool {
-    let ast = lower(&parse(src));
-    let (i, snaps) = {
-        let index = CoreIndex::new();
-        let source = SourceIndex::build(&ast, &index);
-        let scopes = lexical_scopes(&ast);
-        let typer = Typer::with_source(&index, &source).with_lexical_scopes(&scopes);
-        let mut i = Interner::new();
-        let snaps = typer.collection_shape_snapshots(&ast, &mut i);
-        (i, snaps)
-    };
-    let Some(snap) = snaps.get(&call_named(&ast, method)) else {
-        return false;
-    };
-    matches!(i.get(snap.carrier), rigor_types::Type::Union(_))
-}
-
 /// The node id of the first call named `method`, or panic.
 fn call_named(ast: &LoweredAst, method: &str) -> NodeId {
     ast.iter()
@@ -490,15 +471,17 @@ fn coll_rescue_retry_replays_primary() {
 /// The retry RE-RUN re-evaluates the protected body over the arm's scope —
 /// a bare-local call inside the body records its carrier a second time. The
 /// site's true carrier is the JOIN of the two passes (`c` reads `[1] | [2]`
-/// on the reference), so a differing re-run carrier joins the recorded snap
-/// rather than overwriting it: the union declines the collection rule and
-/// `c.nope` stays silent (rigor-rs#493 item 4).
+/// on the reference), which the snapshot does not model, so a site whose
+/// passes disagree declines (rigor-rs#493 item 4, #969).
 #[test]
-fn coll_rescue_retry_rebind_joins_site_carrier() {
-    let src =
-        b"def f\n  c = [1]\n  begin\n    c.nope\n  rescue\n    c = [2]\n    retry\n  end\nend\n";
-    assert_eq!(snap(src, "nope"), Some("Array"));
-    assert!(snap_carrier_is_union(src, "nope"));
+fn coll_rescue_retry_rebind_declines_site() {
+    assert_eq!(
+        snap(
+            b"def f\n  c = [1]\n  begin\n    c.nope\n  rescue\n    c = [2]\n    retry\n  end\nend\n",
+            "nope",
+        ),
+        None,
+    );
     // An arm that leaves the local alone re-records the SAME carrier — the
     // snap stands (`begin; c.nope; rescue; retry; end` fires `for [1]` on the
     // reference).
@@ -509,15 +492,37 @@ fn coll_rescue_retry_rebind_joins_site_carrier() {
         ),
         Some("Array"),
     );
-    // A non-collection re-run value joins too — `c = "s"` arms the site
-    // `"s" | [1]` on the reference (whose UNION rule fires it); the snap
-    // declines the joined carrier rather than keep the stale `[1]`.
-    assert!(
-        snap_carrier_is_union(
+    // A non-collection re-run value declines too (`c = "s"`).
+    assert_eq!(
+        snap(
             b"def f\n  c = [1]\n  begin\n    c.zark\n  rescue\n    c = \"s\"\n    retry\n  end\nend\n",
             "zark",
         ),
+        None,
     );
+}
+
+/// A disagreeing pass must not be JOINED into the recorded carrier:
+/// `Algebra::join` absorbs into `Dynamic`, and the joined `[1] | Dynamic`
+/// came out a bare `Dynamic` that kept the `Array` class (`c = x` in the arm
+/// fired `for Array`; reference silent). And a first pass with NO collection
+/// carrier must leave a tombstone, or a later pass's lone carrier stands in
+/// for the join (`c` typed `Dynamic` or `[1-ish] | [2]` on entry, then
+/// `c = [2]; retry`, fired `for [2]`; reference silent) — rigor-rs#969 review.
+#[test]
+fn coll_retry_disagreeing_passes_decline() {
+    let entry_union = "def f(foo)\n  c = [1]\n  if foo\n    c << 1\n  else\n    c = [2]\n  end\n";
+    for src in [
+        "def f(x)\n  c = [1]\n  begin\n    c.nope\n  rescue\n    c = x\n    retry\n  end\nend\n".to_owned(),
+        "def f(x)\n  c = [1]\n  c = x if x\n  begin\n    c.nope\n  rescue\n    c = [2]\n    retry\n  end\nend\n".to_owned(),
+        format!("{entry_union}  begin\n    c.nope\n  rescue TypeError\n    c = [2]\n    retry\n  end\nend\n"),
+        // The fast path's shapes: an entry-preserving arm after a rebinding
+        // one, and the same nested.
+        format!("{entry_union}  begin\n    c.nope\n  rescue TypeError\n    c = [2]\n    retry\n  rescue ArgumentError\n    retry\n  end\nend\n"),
+        format!("{entry_union}  begin\n    begin\n      c.nope\n    rescue TypeError\n      c = [2]\n      retry\n    end\n  rescue\n    retry\n  end\nend\n"),
+    ] {
+        assert_eq!(snap(src.as_bytes(), "nope"), None, "{src}");
+    }
 }
 
 /// `depth` nested `begin … rescue; <arm>; retry; end` levels around
@@ -540,21 +545,20 @@ fn nested_retry_src(depth: usize, arm: &str) -> Vec<u8> {
 /// re-walking `main_body` — one walk per level, not two (rigor-rs#969: the
 /// re-walk doubled per nesting level, and 40 levels never finished). The
 /// snaps match the shallow shapes above: an unchanged arm keeps the carrier
-/// at both sites; an arm rebind still re-walks and joins the site carrier.
+/// at both sites; an arm rebind still re-walks and declines the site.
 #[test]
 fn coll_nested_retry_is_not_exponential() {
     let src = nested_retry_src(40, "");
     assert_eq!(snap(&src, "nope"), Some("Array"));
-    assert!(!snap_carrier_is_union(&src, "nope"));
     assert_eq!(snap(&src, "zark"), Some("Array"));
     // An arm write the entry lacks (`e = 1`): the first visit of each level
     // re-walks, every later visit enters with `e` already bound.
     let src = nested_retry_src(40, "  e = 1\n");
     assert_eq!(snap(&src, "nope"), Some("Array"));
-    // A rebinding arm re-walks once per level and joins the re-run carrier.
+    // A rebinding arm re-walks once per level; the disagreeing passes
+    // decline the site.
     let src = nested_retry_src(40, "  c = [2]\n");
-    assert_eq!(snap(&src, "nope"), Some("Array"));
-    assert!(snap_carrier_is_union(&src, "nope"));
+    assert_eq!(snap(&src, "nope"), None);
 }
 
 /// A mutation AFTER the rescued `begin` widens the joined union memberwise
