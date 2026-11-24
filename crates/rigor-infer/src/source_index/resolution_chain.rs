@@ -761,19 +761,14 @@ impl SourceIndex {
     }
 
     /// `project?` for the `:constants` flavor: `discovered_classes` covers
-    /// the declared, synthesized and meta-new names; a written include edge
-    /// self-declares its owner (`discovered_includes.key?`), and a recorded
-    /// superclass makes its holder a namespace
-    /// (`discovered_superclasses.key?`). `prepend`-only owners do NOT
-    /// qualify — the check is `discovered_includes`, never
-    /// `discovered_prepends`.
+    /// the declared, synthesized and meta-new names; a written mixin edge
+    /// self-declares its owner (`discovered_includes.key?` —
+    /// `mixin_names_for` projects `prepends ++ includes`, so a
+    /// prepend-only owner keys the table too), and a recorded superclass
+    /// makes its holder a namespace (`discovered_superclasses.key?`).
     fn known_project_namespace(&self, name: &str) -> bool {
         self.knows_discovered_class(name)
-            || self
-                .ancestry
-                .written
-                .get(name)
-                .is_some_and(|edges| edges.iter().any(|(prepend, _)| !*prepend))
+            || self.ancestry.written.contains_key(name)
             || self.discovered_superclass(name).is_some()
     }
 

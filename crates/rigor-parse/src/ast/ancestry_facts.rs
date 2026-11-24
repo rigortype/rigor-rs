@@ -1153,13 +1153,19 @@ struct Census<'pr> {
     /// each registered body, extended one body per question.
     class_body_calls: std::collections::HashMap<(usize, usize), PrismNode<'pr>>,
     class_bodies_read: usize,
-    /// The DECL-LEVEL lexical prefix — one entry per enclosing
+    /// The DECL-LEVEL scan prefix — one entry per enclosing
     /// `class`/`module` keyword (`class M::Sub` contributes `"M::Sub"`), as
-    /// `qualified_prefix`/`lexical_nesting_for_prefix` model it. Where
+    /// the declared-name walk's `qualified_prefix` threads it. Where
     /// [`Census::prefix`] is segment-split for `self.candidates`, this is
-    /// the chain `eval_constant_receiver_prefix` and the declared-name scan
+    /// the chain `collect_declared_constant_names` and its write arms
     /// read. A `K = Class.new {}` rvalue block enters under `K`.
     decl_prefix: Vec<String>,
+    /// The MIXIN walk's `qualified_prefix` — pushed identically to
+    /// [`Census::decl_prefix`] but NEVER swapped by a write's rvalue cref:
+    /// `Module.nesting` does not rebind in a block, so
+    /// `eval_constant_receiver_prefix`'s candidates inside
+    /// `K = Class.new {}` still run through the lexical nesting.
+    lex_prefix: Vec<String>,
     /// Enclosing unnameable crefs — `class <<` bodies and anonymous
     /// factory blocks — where bare/`self::` declarations name nothing.
     unnameable: usize,
@@ -1246,24 +1252,35 @@ impl<'pr> Census<'pr> {
     }
 
     /// `eval_constant_receiver_prefix`'s owner candidates for a receiver
-    /// written `raw`: the DECL-level nesting entries (`decl_prefix`,
+    /// written `raw`: the DECL-level nesting entries (`lex_prefix`,
     /// innermost first), then the bare spelling. A `::`-rooted or
     /// top-level receiver stands alone, and `lexical_prefix.last ==
     /// rendered` — `X.include(M)` inside `class X` — answers the class's
     /// own qualified name.
     fn decl_candidates(&self, raw: &str) -> Vec<String> {
-        if self.decl_prefix.is_empty() {
+        if self.lex_prefix.is_empty() {
             return vec![raw.to_string()];
         }
-        if self.decl_prefix.last().is_some_and(|l| l.as_str() == raw) {
-            return vec![self.decl_prefix.join("::")];
+        if self.lex_prefix.last().is_some_and(|l| l.as_str() == raw) {
+            return vec![self.lex_prefix.join("::")];
         }
-        let mut out: Vec<String> = (1..=self.decl_prefix.len())
+        let mut out: Vec<String> = (1..=self.lex_prefix.len())
             .rev()
-            .map(|i| format!("{}::{}", self.decl_prefix[..i].join("::"), raw))
+            .map(|i| format!("{}::{}", self.lex_prefix[..i].join("::"), raw))
             .collect();
         out.push(raw.to_string());
         out
+    }
+
+    /// `qualified_prefix.join("::") + name` for the declared-name scan —
+    /// [`Census::decl_prefix`], which a write's rvalue cref swaps, rather
+    /// than the segment-split [`Census::prefix`].
+    fn decl_qualify(&self, name: &str) -> String {
+        if self.decl_prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}::{}", self.decl_prefix.join("::"), name)
+        }
     }
 
     /// `add_declared_name` — `qualified` joins [`AncestryFacts::declared_names`]
@@ -1286,7 +1303,7 @@ impl<'pr> Census<'pr> {
         if self.in_def > 0 || self.unnameable > 0 || name.is_empty() {
             return;
         }
-        let q = self.qualify(name);
+        let q = self.decl_qualify(name);
         self.add_declared(&q);
     }
 
@@ -1310,7 +1327,7 @@ impl<'pr> Census<'pr> {
             }
             let tail = constant_path_string(target);
             if !tail.is_empty() {
-                let q = self.qualify(&tail);
+                let q = self.decl_qualify(&tail);
                 self.add_declared(&q);
             }
             return;
@@ -1418,6 +1435,17 @@ impl<'pr> Census<'pr> {
             self.decl_prefix.push(name.clone());
             Some(None)
         };
+        // The mixin walk's `qualified_prefix` gets the same entry — a
+        // `K = Class.new {}` rvalue block swaps `decl_prefix` later without
+        // touching it.
+        let saved_lex_prefix: Option<Option<Vec<String>>> = if declines {
+            None
+        } else if rooted {
+            Some(Some(std::mem::replace(&mut self.lex_prefix, vec![name])))
+        } else {
+            self.lex_prefix.push(name);
+            Some(None)
+        };
         if !declines && self.in_def == 0 {
             let joined = self.decl_prefix.join("::");
             self.add_declared(&joined);
@@ -1451,6 +1479,13 @@ impl<'pr> Census<'pr> {
             Some(Some(s)) => self.decl_prefix = s,
             Some(None) => {
                 self.decl_prefix.pop();
+            }
+            None => {}
+        }
+        match saved_lex_prefix {
+            Some(Some(s)) => self.lex_prefix = s,
+            Some(None) => {
+                self.lex_prefix.pop();
             }
             None => {}
         }
@@ -2203,6 +2238,17 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             self.record_macro_names(node);
         }
 
+        // A write rvalue's written cref belongs to THIS call's block —
+        // capture it before the receiver/argument walk can hand the slot
+        // to a write nested in the arguments.
+        let rvalue_cref = if meta_new_call(node)
+            && node.block().is_some_and(|b| b.as_block_node().is_some())
+        {
+            self.rvalue_cref.take()
+        } else {
+            None
+        };
+
         // An eval block on an object the walk cannot name: in a hook, or
         // holding a mixin call, it reshapes the enclosing class.
         let block = node.block().and_then(|b| b.as_block_node());
@@ -2302,7 +2348,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         // (`K = Class.new { class Y }` → `K::Y`); an anonymous factory block's
         // cref is unnameable — bare decls inside name nothing.
         let saved_decl = if meta_new {
-            match self.rvalue_cref.take() {
+            match rvalue_cref {
                 Some(cref) => Some(Some(std::mem::replace(&mut self.decl_prefix, cref))),
                 None => {
                     self.unnameable += 1;
@@ -2431,6 +2477,7 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
         recorded_arg_defs: HashSet::new(),
         in_def: 0,
         decl_prefix: Vec::new(),
+        lex_prefix: Vec::new(),
         unnameable: 0,
         rvalue_cref: None,
         hook_params: Vec::new(),
