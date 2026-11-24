@@ -422,7 +422,6 @@ impl SourceIndex {
             idx.ancestry.ingest(
                 ast.ancestry_facts(),
                 h.override_classes.iter().map(|oc| oc.qualified.as_str()),
-                ast.const_writes(),
             );
         }
 

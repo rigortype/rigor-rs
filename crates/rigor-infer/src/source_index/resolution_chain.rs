@@ -29,7 +29,7 @@
 use std::collections::{HashMap, HashSet};
 
 use rigor_index::CoreIndex;
-use rigor_parse::{AncestryFacts, ConstWrite, MixinSide, MIXIN_UNNAMED, MIXIN_WILDCARD};
+use rigor_parse::{AncestryFacts, MixinSide, MIXIN_UNNAMED, MIXIN_WILDCARD};
 
 /// `?` ([`MIXIN_UNNAMED`]) rides beside `*` ([`MIXIN_WILDCARD`]) in every list
 /// the census writes — `UNNAMED_LIST` is `["*", "?"]` — so a name-reader that
@@ -40,7 +40,7 @@ fn mixin_marker(n: &str) -> bool {
     n == MIXIN_WILDCARD || n == MIXIN_UNNAMED
 }
 
-use super::{qualify, DefKind, SourceIndex};
+use super::{DefKind, SourceIndex};
 
 /// `ResolutionChain::LIMIT` — the project entries a chain may hold.
 const CHAIN_LIMIT: usize = 100;
@@ -87,8 +87,9 @@ pub(crate) struct AncestryIndex {
     /// Per owner, EVERY recorded instance mixin edge in write order —
     /// [`AncestryFacts::written_mixins`]'s fold: positioned statements,
     /// unpositioned named edges and receiver-form edges interleaved, the
-    /// `MixinAccumulator` list `discovered_includes` freezes.
-    written: HashMap<String, Vec<WrittenEdge>>,
+    /// `MixinAccumulator` list `discovered_includes` freezes. `(prepend?,
+    /// names)`.
+    written: HashMap<String, Vec<(bool, Vec<String>)>>,
     decl_files: HashMap<String, usize>,
     def_owners: HashSet<String>,
     /// Upstream v0.4.2 (#1706): every file's top-level `include` names
@@ -115,33 +116,6 @@ pub(crate) struct AncestryIndex {
     extend_hook_owners: HashSet<String>,
 }
 
-/// One [`AncestryIndex::written`] edge, filed under each of its owner
-/// candidates at ingest. `owners` survives the fold so the query can still
-/// resolve an eval-owner edge (`X.class_eval { include M }`): its
-/// `resolved_write_namespace` oracle asks the project's known namespaces,
-/// which ingest does not yet see whole. An already-resolved edge — a
-/// declaration-frame `self` owner or a receiver-form call the ingest
-/// anchored — carries one name.
-struct WrittenEdge {
-    owners: Vec<String>,
-    prepend: bool,
-    names: Vec<String>,
-}
-
-/// `add_declared_name` — every enclosing prefix of a declared name joins the
-/// oracle: a file declaring `S::A::B` necessarily has `S` and `S::A` to
-/// declare it under.
-fn expand_declared_name(set: &mut HashSet<String>, name: &str) {
-    let mut prefix = String::new();
-    for seg in name.split("::") {
-        if !prefix.is_empty() {
-            prefix.push_str("::");
-        }
-        prefix.push_str(seg);
-        set.insert(prefix.clone());
-    }
-}
-
 /// The `entry::head` probe `eval_constant_receiver_prefix` makes of the
 /// file's declared names: `candidate` minus the receiver path's `tail`
 /// segments — `NS::A::B` for `A::B.include(M)` probes `NS::A`.
@@ -158,7 +132,6 @@ impl AncestryIndex {
         &mut self,
         facts: &AncestryFacts,
         declared: impl Iterator<Item = &'a str>,
-        writes: &[ConstWrite],
     ) {
         for u in &facts.unpositioned {
             let table = match u.side {
@@ -210,50 +183,31 @@ impl AncestryIndex {
         for (owner, prepend, names) in &facts.direct_mixins {
             self.groups.entry(owner.clone()).or_default().push((*prepend, names.clone()));
         }
-        // `eval_file_declared_names` — the oracle `eval_constant_receiver_prefix`
-        // resolves a receiver-form owner against: every class/module
-        // declaration plus constant write THE FILE contains, expanded to
-        // every enclosing prefix. `declared_constant_write_prefix` files a
-        // path write as written (`S2::C = 2` inside `class S` keys `S2::C`)
-        // and a bare write under its lexical prefix.
-        let mut file_declared: HashSet<String> = HashSet::new();
-        let declared: Vec<&str> = declared.collect();
-        for q in &declared {
-            expand_declared_name(&mut file_declared, q);
-        }
-        for w in writes {
-            let key = if w.is_path {
-                w.name.clone()
-            } else {
-                qualify(&w.prefix, &w.name)
-            };
-            expand_declared_name(&mut file_declared, &key);
-        }
         for m in &facts.written_mixins {
             if m.receiver_form {
                 // `eval_constant_receiver_prefix`: the receiver resolves to
-                // the first lexical candidate this FILE declares — the probe
-                // is `entry::head` (the path's head segment only) — else the
-                // bare spelling.
+                // the first decl-level nesting candidate whose `entry::head`
+                // probe hits the FILE's declared names
+                // ([`AncestryFacts::declared_names`]), else the bare
+                // spelling.
                 let bare = m.owners.last().expect("receiver candidates");
                 let tail = bare.split("::").count() - 1;
                 let resolved = m
                     .owners
                     .iter()
-                    .find(|o| file_declared.contains(head_probe(o, tail)))
-                    .unwrap_or(bare);
-                self.written.entry(resolved.clone()).or_default().push(WrittenEdge {
-                    owners: vec![resolved.clone()],
-                    prepend: m.prepend,
-                    names: m.names.clone(),
-                });
+                    .find(|o| facts.declared_names.contains(head_probe(o, tail)))
+                    .unwrap_or(bare)
+                    .clone();
+                self.written
+                    .entry(resolved)
+                    .or_default()
+                    .push((m.prepend, m.names.clone()));
             } else {
                 for o in &m.owners {
-                    self.written.entry(o.clone()).or_default().push(WrittenEdge {
-                        owners: m.owners.clone(),
-                        prepend: m.prepend,
-                        names: m.names.clone(),
-                    });
+                    self.written
+                        .entry(o.clone())
+                        .or_default()
+                        .push((m.prepend, m.names.clone()));
                 }
             }
         }
@@ -781,26 +735,8 @@ impl SourceIndex {
     fn constant_mixin_edges(&self, class: &str) -> Vec<String> {
         let mut prepends: Vec<String> = Vec::new();
         let mut includes: Vec<String> = Vec::new();
-        for edge in self.ancestry.written.get(class).into_iter().flatten() {
-            // An eval-owner edge (`X.class_eval { include M }`) still carries
-            // its lexical candidates; `resolved_write_namespace` answers ONE
-            // owner — the first candidate `known_namespace?` knows (read as
-            // [`Self::knows_discovered_class`], whose `discovered_classes`
-            // covers the RBS-known half only through a project singleton), or
-            // the bare spelling — and the edge belongs to that name alone. An
-            // already-resolved edge holds one owner and matches the key it
-            // filed under.
-            let resolved = edge
-                .owners
-                .iter()
-                .find(|o| self.knows_discovered_class(o))
-                .or_else(|| edge.owners.last())
-                .expect("owners");
-            if resolved.as_str() != class {
-                continue;
-            }
-            let (prepend, names) = (edge.prepend, &edge.names);
-            if prepend {
+        for (prepend, names) in self.ancestry.written.get(class).into_iter().flatten() {
+            if *prepend {
                 // `write_mixin_targets`: a prepend statement's group
                 // unshifts whole, repeats kept.
                 prepends.splice(0..0, names.iter().cloned());
@@ -824,12 +760,27 @@ impl SourceIndex {
         out
     }
 
+    /// `project?` for the `:constants` flavor: `discovered_classes` covers
+    /// the declared, synthesized and meta-new names; a written include edge
+    /// self-declares its owner (`discovered_includes.key?`), and a recorded
+    /// superclass makes its holder a namespace
+    /// (`discovered_superclasses.key?`). `prepend`-only owners do NOT
+    /// qualify — the check is `discovered_includes`, never
+    /// `discovered_prepends`.
+    fn known_project_namespace(&self, name: &str) -> bool {
+        self.knows_discovered_class(name)
+            || self
+                .ancestry
+                .written
+                .get(name)
+                .is_some_and(|edges| edges.iter().any(|(prepend, _)| !*prepend))
+            || self.discovered_superclass(name).is_some()
+    }
+
     /// rigor-rs#905 — the `:constants` flavor's `Resolver#resolve_one`: the
     /// first lexical candidate of `raw` written from `owner` that the
-    /// project knows as a namespace — `known_project_namespace?`, read as
-    /// [`Self::knows_discovered_class`] (whose `discovered_classes` covers
-    /// the synthesized prefixes and meta-new writes). A `::`-rooted
-    /// spelling is anchored at the top level, as
+    /// project knows as a namespace — `known_project_namespace?`. A
+    /// `::`-rooted spelling is anchored at the top level, as
     /// `ancestor_name_candidates` anchors it.
     ///
     /// Candidates the project only WRITES are skipped — the reference's
@@ -843,7 +794,7 @@ impl SourceIndex {
     fn resolve_constant_scope(&self, owner: &str, raw: &str) -> Option<String> {
         if let Some(rooted) = raw.strip_prefix("::") {
             return self
-                .knows_discovered_class(rooted)
+                .known_project_namespace(rooted)
                 .then(|| rooted.to_string());
         }
         let segments: Vec<&str> = owner.split("::").collect();
@@ -853,7 +804,7 @@ impl SourceIndex {
             } else {
                 format!("{}::{}", segments[..i].join("::"), raw)
             };
-            if self.knows_discovered_class(&candidate) {
+            if self.known_project_namespace(&candidate) {
                 return Some(candidate);
             }
         }
