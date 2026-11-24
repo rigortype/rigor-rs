@@ -84,6 +84,11 @@ pub(crate) struct AncestryIndex {
     dirty: HashSet<String>,
     /// Per owner, its direct mixin statements in order: `(prepend?, group)`.
     groups: HashMap<String, Vec<(bool, Vec<String>)>>,
+    /// Per owner, EVERY recorded instance mixin edge in write order —
+    /// [`AncestryFacts::written_mixins`]'s fold: positioned statements,
+    /// unpositioned named edges and receiver-form edges interleaved, the
+    /// `MixinAccumulator` list `discovered_includes` freezes.
+    written: HashMap<String, Vec<(bool, Vec<String>)>>,
     decl_files: HashMap<String, usize>,
     def_owners: HashSet<String>,
     /// Upstream v0.4.2 (#1706): every file's top-level `include` names
@@ -165,6 +170,14 @@ impl AncestryIndex {
         }
         for (owner, prepend, names) in &facts.direct_mixins {
             self.groups.entry(owner.clone()).or_default().push((*prepend, names.clone()));
+        }
+        for (owners, prepend, names) in &facts.written_mixins {
+            for o in owners {
+                self.written
+                    .entry(o.clone())
+                    .or_default()
+                    .push((*prepend, names.clone()));
+            }
         }
         let mut seen: HashSet<&str> = HashSet::new();
         for q in declared {
@@ -311,19 +324,31 @@ impl Builder<'_> {
         for raw in &includes {
             let mut sub = self.sub_lin(name, raw);
             if Self::forks(&entries, &sub) {
-                // The one fork the reference settles: an include-side skip
-                // on the LAST entry of the sub-chain being inserted (#1570:
-                // the module already sits further down the chain).
-                let present: Vec<usize> = sub
+                // The one fork the reference's `include_all` settles: an
+                // include-side skip on the LAST entry of the sub-chain being
+                // inserted, its earlier occurrence sitting AT OR AFTER the
+                // class itself — `found >= origin && index == sub.size - 1`
+                // (#1570). A duplicate inside the prepend region
+                // (`found < origin`) is a fork the retro world cannot
+                // repeat: the chain settles to master.
+                let last = sub.len() - 1;
+                let present: Vec<(usize, usize)> = sub
                     .iter()
                     .enumerate()
-                    .filter(|(_, (e, _))| {
-                        matches!(e, ChainEntry::Project(_)) && entries.iter().any(|(x, _)| x == e)
+                    .filter_map(|(i, (e, _))| {
+                        if matches!(e, ChainEntry::Project(_)) {
+                            entries.iter().position(|(x, _)| x == e).map(|p| (i, p))
+                        } else {
+                            None
+                        }
                     })
-                    .map(|(i, _)| i)
                     .collect();
-                let last = sub.len() - 1;
-                if self.forks == 0 && present == [last] && !sub.iter().any(|(_, t)| *t) {
+                if self.forks == 0
+                    && present.len() == 1
+                    && present[0].0 == last
+                    && present[0].1 >= origin
+                    && !sub.iter().any(|(_, t)| *t)
+                {
                     self.forks = 1;
                     sub[last].1 = true;
                 } else {
@@ -659,38 +684,46 @@ impl SourceIndex {
             .collect()
     }
 
-    /// `discovered_includes`'s order for `class` (upstream #1173): each
-    /// kind's statements replayed the way `write_mixin_targets` accumulates
-    /// them — a statement's argument GROUP lands ahead of the earlier
-    /// statements' as one unit (`include A, B` searches `A` first), a name
-    /// already carried keeping its first position — and the prepend list
-    /// sits ahead of the include list, where Ruby puts it. This is
-    /// ANCESTOR (nearest-first) order, not written order: `include N;
-    /// include M` lists `[M, N]`.
+    /// `DiscoveryIndex#discovered_includes`'s order for `class` (upstream
+    /// #1173): `freeze_mixin_lists` answers `prepends ++ includes`, uniq'd
+    /// (first occurrence wins), and each bucket keeps every edge
+    /// `write_mixin_targets` recorded — a DIRECT statement, a conditional
+    /// or `def`- or block-written `include`, and the receiver form
+    /// `C.include(M)` alike — in search order: each edge's argument group
+    /// unshifts as one unit (`include A, B` searches `A` first), a repeated
+    /// include target keeps its first position, and a re-`prepend` is kept
+    /// (the `uniq` takes its earlier position). This is ANCESTOR
+    /// (nearest-first) order, not written order: `include N; include M`
+    /// lists `[M, N]`.
     ///
     /// A name appearing in both kinds (`include M; prepend M`) is a body
     /// the tables cannot represent and is tainted — the chain carrying it
     /// is marked and settles to master, so the list below never orders
     /// such a node.
     fn constant_mixin_edges(&self, class: &str) -> Vec<String> {
-        let mut out: Vec<String> = Vec::new();
-        let Some(groups) = self.ancestry.groups.get(class) else {
-            return out;
-        };
-        for want_prepend in [true, false] {
-            let mut list: Vec<String> = Vec::new();
-            for (prepend, names) in groups {
-                if *prepend != want_prepend {
-                    continue;
-                }
+        let mut prepends: Vec<String> = Vec::new();
+        let mut includes: Vec<String> = Vec::new();
+        for (prepend, names) in self.ancestry.written.get(class).into_iter().flatten() {
+            if *prepend {
+                // `write_mixin_targets`: a prepend statement's group
+                // unshifts whole, repeats kept.
+                prepends.splice(0..0, names.iter().cloned());
+            } else {
+                // A repeated include target keeps its first position —
+                // only names the bucket does not already carry unshift.
                 let fresh: Vec<String> = names
                     .iter()
-                    .filter(|n| !list.contains(*n))
+                    .filter(|n| !includes.contains(*n))
                     .cloned()
                     .collect();
-                list.splice(0..0, fresh);
+                includes.splice(0..0, fresh);
             }
-            out.extend(list);
+        }
+        let mut out: Vec<String> = Vec::new();
+        for name in prepends.into_iter().chain(includes) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
         }
         out
     }

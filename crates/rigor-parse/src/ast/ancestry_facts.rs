@@ -92,6 +92,16 @@ pub struct AncestryFacts {
     pub contested_visibilities: Vec<(String, String)>,
     pub dirty_owners: Vec<String>,
     pub direct_mixins: Vec<(String, bool, Vec<String>)>,
+    /// rigor-rs#905 — every instance-side `include`/`prepend` edge the
+    /// census records, in write order: `direct_mixins`, the named half of
+    /// [`AncestryFacts::unpositioned`], and [`AncestryFacts::receiver_mixins`]
+    /// interleaved as written. The reference's `MixinAccumulator` writes all
+    /// three into ONE per-owner list (`#write_mixin_targets`), and master's
+    /// `discovered_includes` reads that merged order — the three separate
+    /// tables above each keep their own order and lose the interleave.
+    /// `(owner candidates, prepend?, names)`; `names` holds only the
+    /// constant targets — no [`WILDCARD`] / [`UNNAMED`] markers.
+    pub written_mixins: Vec<(Vec<String>, bool, Vec<String>)>,
     /// Owners with any `def` in their body (instance or singleton, recorded or
     /// not) — the reference's `known_user_class?` reads a `def` of either
     /// kind as making a name a project class.
@@ -1390,8 +1400,18 @@ impl<'pr> Census<'pr> {
                         self.wildcard(owner.clone(), MixinSide::Include);
                     }
                     self.out.direct_mixins.push((key.clone(), kind == "prepend", names.clone()));
+                    self.out
+                        .written_mixins
+                        .push((vec![key], kind == "prepend", names.clone()));
                 }
             } else {
+                if side == MixinSide::Include {
+                    self.out.written_mixins.push((
+                        owner.clone(),
+                        kind == "prepend",
+                        names.clone(),
+                    ));
+                }
                 self.unpositioned(owner.clone(), side, names);
             }
             if !complete {
@@ -1447,6 +1467,11 @@ impl<'pr> Census<'pr> {
                         listed.push(UNNAMED.to_string());
                     }
                 }
+                self.out.written_mixins.push((
+                    owners.clone(),
+                    kind == "prepend",
+                    names.clone(),
+                ));
                 self.out.receiver_mixins.push((owners.clone(), listed));
             }
             if set_unknown {

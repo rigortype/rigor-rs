@@ -2513,3 +2513,60 @@ fn constant_scopes_rooted_superclass() {
     let (scopes, _, _) = worlds(&idx, "Sub");
     assert_eq!(scopes, vec!["Base".to_string()]);
 }
+
+#[test]
+fn constant_scopes_prepend_region_duplicate_masters() {
+    // #941 review: `prepend P; include A` where A's chain and P's chain both
+    // carry M — the include-side duplicate sits inside the PREPEND region
+    // (`found < origin`), a fork the retro world cannot repeat ⇒ master,
+    // never a settled chain.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule A\n  include M\nend\nmodule P\n  include M\nend\nclass C\n  prepend P\n  include A\nend\n",
+        &core,
+    );
+    let (scopes, retro, master) = worlds(&idx, "C");
+    assert!(master);
+    assert!(retro.is_none());
+    // Master's order: the prepend P is nearest, then A, then M.
+    assert_eq!(
+        scopes,
+        vec!["P".to_string(), "A".to_string(), "M".to_string()]
+    );
+}
+
+#[test]
+fn constant_scopes_master_carries_unpositioned_edges_in_write_order() {
+    // #941 review: `discovered_includes` holds EVERY recorded edge — the
+    // conditional `include W` (unpositioned) interleaves with the direct
+    // `include M` by write order, so master's list is [W, M], not [M].
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule W; end\nclass Sub\n  include M\n  if $x\n    include W\n  end\nend\n",
+        &core,
+    );
+    let (scopes, _, master) = worlds(&idx, "Sub");
+    assert!(master);
+    assert_eq!(scopes, vec!["W".to_string(), "M".to_string()]);
+}
+
+#[test]
+fn constant_scopes_master_carries_receiver_form_edges() {
+    // `C.include(M)` outside the body records the same edge the
+    // declaration form does — master's BFS consults it.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(b"module M; end\nSub.include(M)\nclass Sub; end\n", &core);
+    assert_eq!(idx.master_constant_scopes("Sub"), vec!["M".to_string()]);
+}
+
+#[test]
+fn constant_scopes_master_unpositioned_repeated_target_keeps_first_position() {
+    // `include M; if $x; include M; end` — the unpositioned repeat of M
+    // keeps its earlier position: the list is still [M].
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nclass Sub\n  include M\n  if $x\n    include M\n  end\nend\n",
+        &core,
+    );
+    assert_eq!(idx.master_constant_scopes("Sub"), vec!["M".to_string()]);
+}
