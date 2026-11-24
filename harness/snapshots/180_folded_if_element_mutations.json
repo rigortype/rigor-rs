@@ -1,0 +1,138 @@
+{
+  "fixture": "harness/corpus/180_folded_if_element_mutations.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 28,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for non-empty-string"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 37,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"e\" | String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 44,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"e\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 53,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for 1"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 61,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for Hash[Dynamic[top] | Symbol, Dynamic[top] | Integer]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 68,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for { a: Array[Dynamic[top] | Integer] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 75,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 83,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for { a: [] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 90,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 94,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 99,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for { a: String }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 104,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for [Array[1 | Dynamic[top] | Integer], [2]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 115,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"abc\" | String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 125,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"a\" | String"
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 112,
+      "column": 4,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `c`. If a project file defines `c` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 121,
+      "column": 6,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `c`. If a project file defines `c` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "call.unresolved-toplevel",
+      "line": 129,
+      "column": 4,
+      "severity": "warning",
+      "message": "unresolved toplevel call to `c`. If a project file defines `c` via a toplevel `def` or a monkey-patch on Object/Kernel, list that file in `.rigor.yml`'s `pre_eval:` (ADR-17) so the analyzer sees it."
+    },
+    {
+      "rule": "flow.unreachable-branch",
+      "line": 73,
+      "column": 3,
+      "severity": "warning",
+      "message": "unreachable branch: literal predicate is always falsey"
+    }
+  ]
+}

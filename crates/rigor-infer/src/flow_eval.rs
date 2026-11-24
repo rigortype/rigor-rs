@@ -730,9 +730,21 @@ impl<'i> Typer<'i> {
                 Some((_, None)) => v_ty,
                 None => untyped,
             },
-            // `a <binop>= v` ⇒ `a = a.<binop>(v)`: only a literal-by-literal
+            // `a <binop>= v` ⇒ `a = a.<binop>(v)`: a literal-by-literal
             // fold is exact; every other dispatch declines.
             OpWriteKind::Operator(opname) => {
+                // `local_variable_operator_write` expands to the entry's own
+                // binary call, which the reference dispatches through the
+                // String projections a plain `s + "e"` takes
+                // (`dispatch_string_binary_from_arg` /
+                // `empty_string_binary`, rigor-rs#774): a mutated `s <<
+                // "d"` leaves `s` a `String`, and `s += "e"` then answers
+                // `non-empty-string`.
+                if opname == "+" {
+                    if let Some(ty) = self.string_op_write_projection(entry, v_ty, interner) {
+                        return ty;
+                    }
+                }
                 // Memberwise over a union of constants so a loop fixpoint can
                 // see `x |= 1` stabilize at `0 | 1` instead of declining the
                 // second pass to `Dynamic` (rigor-rs#638) — the port's
@@ -3385,13 +3397,20 @@ impl<'i> Typer<'i> {
             if m.span.0 >= span.0
                 && m.span.1 <= span.1
                 && flow.dead.write_reaches(m.span, site)
-                // A slot mutation inside a block body's `break` argument
+                // (rigor-rs#407): a slot mutation inside a block body's `break` argument
                 // is a scope effect on a locals-only join — its widening
-                // lands nowhere, not even inside the argument
-                // (rigor-rs#407).
+                // lands nowhere, not even inside the argument.
                 && !ast.in_block_break_locals_only_carrier(m.span)
             {
-                self.apply_slot_mutation(ast, &flow.indexed, id, m, env, interner);
+                // The binding half stays OFF on the read-site replay: the
+                // boundary snapshots this env replays from already carry
+                // the arm-level landings' answers (the #443 join's entry
+                // binding for a conditional arm, the slot floor a loop /
+                // `&&` / rescue body takes), and a conditional container's
+                // contained effects land RECORD-only here, byte-identical
+                // to the pre-#774 replay (`if c; h[:a] << "b"; end; h.w`
+                // keeps the entry shape through the arm join).
+                self.apply_slot_mutation(ast, &flow.indexed, id, m, false, false, env, interner);
             }
         }
         // Upstream #2677 — mutations the named tables filter out (a
@@ -3865,12 +3884,15 @@ impl<'i> Typer<'i> {
     /// as the mutator widens it, or drops the record when the widening
     /// declines. A call that may not have evaluated drops the record
     /// instead — the reference's join diverges the narrowing away.
+    #[allow(clippy::too_many_arguments)]
     fn apply_slot_mutation(
         &self,
         ast: &LoweredAst,
         indexed: &IndexedFlow,
         root: NodeId,
         m: &crate::flow_writes::SlotMutation,
+        live: bool,
+        slot_floor: bool,
         env: &mut TypeEnv,
         interner: &mut Interner,
     ) {
@@ -3889,20 +3911,52 @@ impl<'i> Typer<'i> {
         // `f = [[1]]; g = f; f[0] << 2` stales `g` although `f[0]`
         // recorded nothing.
         self.floor_alias_linked(ast, indexed, &m.name, &m.method, m.span, true, env, interner);
-        let Some(recorded) = recorded else {
-            return;
-        };
         // Element mutators live in ordinary expression positions (argument
         // lists, splats), so the lenient operand path — not the strict
         // carrier mint — decides whether the call ran.
-        if !self
+        let evaluated = self
             .path_marks(ast, root)
             .operand(m.span)
-            .unwrap_or_else(|| self.path_operand_evaluated(ast, root, m.span))
-        {
+            .unwrap_or_else(|| self.path_operand_evaluated(ast, root, m.span));
+        // `ElementReadWidening.widen_element_read` (element_read_widening.rb,
+        // upstream #2395 / #643): a call that DID run also widens the
+        // element's pin ONE STEP INSIDE the receiver local's own binding —
+        // `h = {a: []}; h[:a] << 1` keeps the record shape and answers `{ a:
+        // Array[Dynamic[top] | Integer] }`, where the port's element-rebind
+        // floor alone would lose the whole carrier to `untyped`. The rebuild
+        // runs through the port's own `widen_mutated_binding` on the element
+        // at the key, so a decline leaves the binding standing exactly as
+        // the reference's `widen_through_path` nil does (`a = [1]; a[0] <<
+        // 2` keeps `[1]` — `Integer#<<` mutates nothing). `live` gates the
+        // arm-liveness the rebind tables apply (#362): a terminated arm's
+        // scope dies before the join, so its mutation rebuilds nothing.
+        // The PREDICATE is the exception — it evaluates before any arm,
+        // so its rebuild stays live in every arm.
+        if evaluated && live {
+            self.rebuild_element_carrier(ast, indexed, m, env, interner);
+        }
+        if !evaluated {
+            // The element rebind this landing replaces (upstream #2395's
+            // port-side widen): a call that may not have run FLOORS the
+            // receiver binding where its scope reaches the join — the
+            // oracle's loop-body / `&&`-operand / rescue joins answer
+            // `Dynamic` and stay silent (`while c; h[:a] << "b"; end`)
+            // — and leaves it standing where the dead set proves the
+            // scope dies first (a terminated arm: `if c; h[:a] << "b";
+            // raise; end` keeps the literal shape on the oracle too).
+            // `slot_floor` carries the CALLING arm's binding treatment:
+            // the unfold `if` arm JOINS instead of flooring, so it passes
+            // `false` and only its predicate's rebuild (evaluated above)
+            // lands.
+            if live && slot_floor {
+                env.insert(Rc::from(m.name.as_str()), interner.untyped());
+            }
             env.remove(lookup.as_str());
             return;
         }
+        let Some(recorded) = recorded else {
+            return;
+        };
         let widened = self
             .widen_mutated_binding(recorded, &m.method, &[], interner)
             .or_else(|| self.string_slot_floor(recorded, &m.method, interner));
@@ -3913,6 +3967,137 @@ impl<'i> Typer<'i> {
             None => {
                 env.remove(lookup.as_str());
             }
+        }
+    }
+
+    /// `ElementReadWidening.widen_element_read` (element_read_widening.rb,
+    /// upstream #2395 / #643) — the binding half of a slot mutation: rebuild
+    /// `m`'s receiver local with the element at `m`'s key widened by the
+    /// mutator, so `h = {a: []}; h[:a] << 1` rebinds `h` to `{ a:
+    /// Array[Dynamic[top] | Integer] }` and `h = {a: "s"}; h[:a] << "b"`
+    /// rebinds it to `{ a: String }` — the record SHAPE survives with only
+    /// the touched element widened, where the port's element-rebind floor
+    /// answers `untyped` and the diagnostic disappears.
+    ///
+    /// `element_read_path` rebuilds through element-READ chains only: the
+    /// mutator's receiver must be the single-argument `[]` read the slot
+    /// table's key came from. A compound index write's value (`(h[k] ||= [])
+    /// << x`) and a literal `send`'s receiver are no such read — the
+    /// reference widens the RECORDED slot alone there, and so does the port.
+    fn rebuild_element_carrier(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        m: &crate::flow_writes::SlotMutation,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        let read = match ast.get(m.id) {
+            Node::Call { receiver: Some(r), .. } => *r,
+            _ => return,
+        };
+        match ast.get(read) {
+            Node::Call { method, args, block_body, .. }
+                if method == "[]" && args.len() == 1 && block_body.is_empty() => {}
+            _ => return,
+        }
+        let Some(&binding) = env.get(m.name.as_str()) else {
+            return;
+        };
+        // `mutator_arg_types` — the same typed arguments the name-mutation
+        // landing joins its content from, read off the env the call saw.
+        let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
+        if let Some(rebuilt) = self.widen_element_at(binding, &m.key, &m.method, &arg_types, interner) {
+            env.insert(Rc::from(m.name.as_str()), rebuilt);
+        }
+    }
+
+    /// `ElementReadWidening.widen_through_path` for the ONE step a slot
+    /// mutation's literal key selects — the reference's own step semantics
+    /// (`tuple_positions` / `hash_shape_keys`): a Symbol or String key
+    /// names one pair of a `HashShape` and, against a `Tuple`, no
+    /// statically known position (every slot widens); an Integer key names
+    /// a `Tuple` position — negative counts from the end, out of range
+    /// selects nothing — and no hash key at all. `None` — the binding
+    /// stands — when the carrier is no shape, the key selects nothing, or
+    /// the element's own widening declines (`a = [1]; a[0] << 2` keeps
+    /// `[1]`: `Integer#<<` mutates nothing, exactly the reference's nil).
+    fn widen_element_at(
+        &self,
+        binding: TypeId,
+        key: &ShapeKey,
+        method: &str,
+        arg_types: &[Option<TypeId>],
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        match interner.get(binding).clone() {
+            Type::Tuple(elements) => {
+                let size = elements.len();
+                let positions: Vec<usize> = match key {
+                    ShapeKey::Int(i) => {
+                        // Out-of-range selects nothing: the widening is not
+                        // justified for any position of THIS tuple.
+                        let pos = if *i < 0 { i.checked_add(size as i64)? } else { *i };
+                        if !(0..size as i64).contains(&pos) {
+                            return None;
+                        }
+                        vec![pos as usize]
+                    }
+                    // A literal key that is not an index selects no
+                    // statically known Tuple position — every one widens,
+                    // as a non-literal index does.
+                    _ => (0..size).collect(),
+                };
+                let mut out = elements.clone();
+                let mut widened_any = false;
+                for pos in positions {
+                    if let Some(inner) =
+                        self.widen_mutated_binding(out[pos], method, arg_types, interner)
+                    {
+                        out[pos] = inner;
+                        widened_any = true;
+                    }
+                }
+                if !widened_any {
+                    return None;
+                }
+                Some(interner.intern(Type::Tuple(out)))
+            }
+            Type::HashShape(members) => {
+                // An Integer (or float / bool / nil) step names no key of a
+                // `HashShape` — `hash_shape_keys`'s `else` row: it is a
+                // position, which a hash has none of.
+                let key_matches = |k: &ShapeKey| {
+                    matches!(key, ShapeKey::Sym(_) | ShapeKey::Str(_))
+                        && k == key
+                };
+                let idx = members.iter().position(|mem| key_matches(&mem.key))?;
+                let value = members[idx].value;
+                let widened = self.widen_mutated_binding(value, method, arg_types, interner)?;
+                let mut out = members.clone();
+                out[idx].value = widened;
+                Some(interner.intern(Type::HashShape(out)))
+            }
+            // `widen_union_path`: a union seed widens memberwise, each
+            // declining member surviving whole.
+            Type::Union(members) => {
+                let mut out: Vec<TypeId> = Vec::with_capacity(members.len());
+                let mut widened_any = false;
+                for member in members {
+                    match self.widen_element_at(member, key, method, arg_types, interner) {
+                        Some(w) => {
+                            widened_any = true;
+                            out.push(w);
+                        }
+                        None => out.push(member),
+                    }
+                }
+                if !widened_any {
+                    return None;
+                }
+                Some(rigor_types::Algebra::union(interner, &out))
+            }
+            _ => None,
         }
     }
 
@@ -4477,7 +4662,7 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(effects.rebinds_within(vspan), vspan, env, interner);
                 self.drop_indexed_rebinds(effects.rebinds_within(vspan), vspan, indexed, env);
                 self.widen_mutated_locals(
-                    ast, effects.mutations_within(vspan), indexed, *value, vspan, env, interner,
+                    ast, effects.mutations_within(vspan), indexed, dead, true, *value, vspan, env, interner,
                 );
                 // The write's value is a Logical: its LEFT operand always
                 // runs, so a write directly in it binds — `x = (v = 1) || 2`
@@ -4500,7 +4685,7 @@ impl<'i> Typer<'i> {
                 if let Node::MultiWrite { targets, .. } = ast.get(id) {
                     for (_, tspan, _) in targets.index_writes() {
                         self.widen_mutated_locals(
-                            ast, effects.mutations_within(tspan), indexed, id, tspan, env, interner,
+                            ast, effects.mutations_within(tspan), indexed, dead, true, id, tspan, env, interner,
                         );
                     }
                 }
@@ -4572,26 +4757,76 @@ impl<'i> Typer<'i> {
                         // rigor-rs#694 review).
                         let before = env.clone();
                         let mut replay = env.clone();
-                        for s in &live {
-                            let sspan = ast.get(*s).span();
-                            self.widen_mutated_locals(
-                                ast,
-                                live_mutations.iter(),
-                                indexed,
-                                id,
-                                sspan,
-                                &mut replay,
-                                interner,
-                            );
-                            self.bind_live_arm_stmts(
-                                ast, std::slice::from_ref(s), &mut replay, effects, indexed, dead, interner,
-                            );
+                        // The predicate evaluates BEFORE the fold decision —
+                        // its mutations are the one `Uncond` descent from the
+                        // `if` and land rooted there, ahead of the body
+                        // statements on both envs (`if (s << "d"); t = s;
+                        // end` widens `s` before the body binds `t`).
+                        let pspan = ast.get(*predicate).span();
+                        self.widen_mutated_locals(
+                            ast, live_mutations.iter(), indexed, dead, true, id, pspan, &mut replay, interner,
+                        );
+                        // rigor-rs#362's folded twin: a TERMINATED live arm's
+                        // scope dies at the join, so its mutations contribute
+                        // nothing to the post-`if` binding (`s = "abc"; if
+                        // true; s << "d"; raise; end` keeps `"abc"` on the
+                        // oracle) — the per-statement landing below skips the
+                        // whole arm, exactly as the dead filter already
+                        // dropped its rebinds. The predicate above still
+                        // lands: it evaluated before the arm did (`if (s <<
+                        // "d"); raise; end` widens `s` on the oracle too).
+                        let arm_terminates =
+                            !live.is_empty() && crate::class_narrowing::branch_terminates(ast, &live);
+                        if !arm_terminates {
+                            for s in &live {
+                                let sspan = ast.get(*s).span();
+                                self.widen_mutated_locals(
+                                    ast,
+                                    live_mutations.iter(),
+                                    indexed, dead, true,
+                                    // Rooted at the LIVE STATEMENT, not the `if`:
+                                    // a certainty-folded arm runs unconditionally,
+                                    // so each of its statements is straight-line
+                                    // code to the path marks and a mutator call in
+                                    // one lands the nominal (`s << "d"` mints
+                                    // `String`) exactly as it would outside the
+                                    // `if`. Rooted at the `if` the statement rides
+                                    // a `Cond` edge and the mutation floors to
+                                    // `untyped`, where the reference's
+                                    // `live_branch_for_if` evaluation answers the
+                                    // nominal (rigor-rs#774).
+                                    *s,
+                                    sspan,
+                                    &mut replay,
+                                    interner,
+                                );
+                                self.bind_live_arm_stmts(
+                                    ast, std::slice::from_ref(s), &mut replay, effects, indexed, dead, interner,
+                                );
+                            }
                         }
                         widen_flow_writes(live_rebinds.iter(), span, env, interner);
                         self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
+                        // The env-side landing keeps the per-statement
+                        // rooting: it exists for the scope effects the
+                        // replay's env clone cannot carry back (the
+                        // indexed-record drops, the `||=` stored slot), and
+                        // a mutation whose widening DECLINES must not floor
+                        // the binding the overlay then leaves standing
+                        // (`x, y = 1, "s"; x << "b"` keeps `1` on the
+                        // oracle, rigor-rs#774). The predicate lands first,
+                        // exactly as it does on the replay.
                         self.widen_mutated_locals(
-                            ast, live_mutations.iter(), indexed, id, span, env, interner,
+                            ast, live_mutations.iter(), indexed, dead, true, id, pspan, env, interner,
                         );
+                        if !arm_terminates {
+                            for s in &live {
+                                let sspan = ast.get(*s).span();
+                                self.widen_mutated_locals(
+                                    ast, live_mutations.iter(), indexed, dead, true, *s, sspan, env, interner,
+                                );
+                            }
+                        }
                         for s in &live {
                             self.bind_live_arm_stmts(
                                 ast, std::slice::from_ref(s), env, effects, indexed, dead, interner,
@@ -4724,8 +4959,15 @@ impl<'i> Typer<'i> {
                             env.insert(Rc::from(name.as_str()), j);
                         }
                         self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
+                        // `slot_floor: false` — this arm's binding treatment
+                        // is the #443 JOIN above, not a floor: a name an
+                        // arm only MUTATES (never writes) joins back to its
+                        // entry binding (`c = [1].empty?; h = {a: "s"}; if c;
+                        // h[:a] << "b"; end; h.w` fires `for { a: "s" }` on
+                        // the oracle — the join leaves `h` alone, and so
+                        // must the slot landing (rigor-rs#774).
                         self.widen_mutated_locals(
-                            ast, live_mutations, indexed, id, span, env, interner,
+                            ast, live_mutations, indexed, dead, false, id, span, env, interner,
                         );
                     }
                 }
@@ -4747,7 +4989,7 @@ impl<'i> Typer<'i> {
                 });
                 widen_flow_writes(live_rebinds.iter(), span, env, interner);
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
-                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+                self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
             }
             Node::Loop { predicate, body, kind, .. } => {
                 use crate::def_local_marks::ExitKind as K;
@@ -4788,7 +5030,7 @@ impl<'i> Typer<'i> {
                 });
                 widen_flow_writes(live_rebinds.iter(), span, env, interner);
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
-                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+                self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
                 match cont {
                     Some(LoopContinuation::Fixpoint(bindings)) => {
                         for (n, ty) in bindings {
@@ -4828,7 +5070,7 @@ impl<'i> Typer<'i> {
                 self.widen_mutated_locals(
                     ast,
                     effects.mutations_within(vspan),
-                    indexed,
+                    indexed, dead, true,
                     id,
                     vspan,
                     env,
@@ -4855,7 +5097,7 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(effects.rebinds_within(vspan), vspan, env, interner);
                 self.drop_indexed_rebinds(effects.rebinds_within(vspan), vspan, indexed, env);
                 self.widen_mutated_locals(
-                    ast, effects.mutations_within(vspan), indexed, *value, vspan, env, interner,
+                    ast, effects.mutations_within(vspan), indexed, dead, true, *value, vspan, env, interner,
                 );
                 self.bind_statement(ast, id, env, interner);
             }
@@ -4877,7 +5119,7 @@ impl<'i> Typer<'i> {
                 });
                 widen_flow_writes(live_rebinds.iter(), span, env, interner);
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
-                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+                self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
                 self.bind_statement(ast, *left, env, interner);
             }
             other => {
@@ -4898,7 +5140,7 @@ impl<'i> Typer<'i> {
                 });
                 widen_flow_writes(live_rebinds.iter(), span, env, interner);
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
-                self.widen_mutated_locals(ast, live_mutations, indexed, id, span, env, interner);
+                self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
             }
         }
     }
@@ -4981,6 +5223,8 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         mutations: impl Iterator<Item = &'m (rigor_parse::Span, String, String, Option<ShapeKey>)>,
         indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
+        slot_floor: bool,
         root: NodeId,
         span: rigor_parse::Span,
         env: &mut TypeEnv,
@@ -5011,7 +5255,14 @@ impl<'i> Typer<'i> {
                 && m.span.1 <= span.1
                 && !ast.in_block_break_locals_only_carrier(m.span)
             {
-                self.apply_slot_mutation(ast, indexed, root, m, env, interner);
+                // The same liveness the rebind tables apply (#362): a
+                // slot mutation in a position whose scope reaches the
+                // join point (`dead.write_reaches`) may floor the
+                // binding when the call may not have run; one in a
+                // scope that dies first (a terminated arm) leaves the
+                // binding standing, exactly as its writes were dropped.
+                let live = dead.write_reaches(m.span, (span.1, span.1));
+                self.apply_slot_mutation(ast, indexed, root, m, live, slot_floor, env, interner);
             }
         }
         // Upstream #2677 — the unfiltered `alias_mutations` covers the
@@ -5147,11 +5398,19 @@ impl<'i> Typer<'i> {
                     if !ast.in_block_break_locals_only_carrier(
                         indexed.slot_mutations[i].span,
                     ) {
+                        // `replay_one`'s events replay one statement's
+                        // scope effects; the binding half stays OFF here
+                        // (the def-local env's element widening is a
+                        // separate slice — master's replay never touched
+                        // the binding, and an undecided arm's join is not
+                        // modelled), so the record half alone lands.
                         self.apply_slot_mutation(
                             ast,
                             indexed,
                             root,
                             &indexed.slot_mutations[i],
+                            false,
+                            false,
                             env,
                             interner,
                         );
