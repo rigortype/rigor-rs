@@ -18,8 +18,6 @@ paren/`&.` residuals #838–#847; mutation seams →#777–#785;
   `branch_terminates?` — `class_narrowing::stmt_terminates`,
   `dead::stmt_exits`/`stmt_bot`, `collection_shape::coll_arm_terminates`.
   A fix in one leaves the others diverging; change all, or consolidate.
-- **Merge queue**: `gh pr merge N --merge` errors ("Auto merge is not
-  allowed"); enqueue with GraphQL `enqueuePullRequest` (worked for #967).
 - **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-22, `v0.4.8`): **174 fixtures / 0 unregistered**; sweep

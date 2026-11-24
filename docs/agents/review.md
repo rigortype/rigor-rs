@@ -96,7 +96,7 @@ the implementer.
 ## Self-merge
 
 An `Approved` PR is merged by the agent that owns it; a reviewer never merges.
-Every condition below holds at the moment of `gh pr merge N --merge`, or the PR
+Every condition below holds at the moment of enqueue, or the PR
 waits for a human:
 
 - **Verdict.** `Verdict: Approved` from a read-only reviewer other than the
@@ -122,18 +122,20 @@ waits for a human:
   when deciding whether required checks passed.
 - **Enqueue, do not wait for the previous merge's master CI.** Two PRs
   that are each green can break master together: #517 and #522 did on
-  2026-11-08, and master went red until #565. Once the master merge
-  queue is enabled (repo ruleset, applied separately), enqueue with
-  `gh pr merge N --merge` and stop waiting on `gh run list --branch
-  master` for an earlier merge — the queue's `merge_group` run is the
-  combination check. The approved SHA remains pinned: if the queue
-  reports the head moved other than a queue rebase / merge of
-  `origin/master`, go back for a fix-confirmation review. Until that
-  ruleset is active, keep the previous one-at-a-time rule: before the
-  next self-merge, `gh run list --branch master` shows CI passing on
-  the previous merge commit; PRs whose changed files do not overlap may
-  go out of order. `gh pr view N --json mergeStateStatus` should be
-  `CLEAN` (or `STABLE` / in-queue once the ruleset is on).
+  2026-11-08, and master went red until #565. The master merge
+  queue is enabled (repo ruleset). Do not use `gh pr merge N --merge`:
+  auto-merge is disabled on the repo, so that command fails with
+  "Auto merge is not allowed". Enqueue with GraphQL
+  `enqueuePullRequest`:
+
+      gh api graphql -f query='mutation($id:ID!){enqueuePullRequest(input:{pullRequestId:$id}){mergeQueueEntry{position}}}' -f id=$(gh pr view N --json id -q .id)
+
+  and stop waiting on `gh run list --branch master` for an earlier
+  merge — the queue's `merge_group` run is the combination check.
+  The approved SHA remains pinned: if the queue reports the head
+  moved other than a queue rebase / merge of `origin/master`, go
+  back for a fix-confirmation review. `gh pr view N --json
+  mergeStateStatus` should be `CLEAN` (or `STABLE` / in-queue).
 - **Stacks.** Merge (or enqueue) the parent first, then
   `gh pr edit N --base master`, wait for `CLEAN`, and treat a conflict
   as a needed rebase, not a merge.
