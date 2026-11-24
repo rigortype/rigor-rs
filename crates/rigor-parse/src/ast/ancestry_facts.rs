@@ -2041,6 +2041,15 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         );
         let frame = if meta_new {
             Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None })
+        } else if name == "define_method" {
+            // Upstream `rebound_block_self` (`OPAQUE_SELF_BLOCK_CALLS`): a
+            // `define_method` block is a METHOD body — its `self` is the
+            // future instance, unnameable on ANY receiver — so an
+            // `include` written in it records under nothing (no edge, no
+            // taint), exactly as `self_owner()` answering `None` drops it.
+            // The block's other arguments (a `->` lambda) keep the
+            // enclosing `self`, as the reference's walk keeps them.
+            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None })
         } else if eval {
             let instance_side = name == "instance_eval" || name == "instance_exec";
             let owner = match (&recv, &recv_const) {
