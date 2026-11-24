@@ -1130,6 +1130,13 @@ struct Frame {
     /// anonymous or opaque block — where a `self::` path renders
     /// lexically and the cref flag decides its fate.
     self_base: Option<String>,
+    /// `singleton_self` for the `self::` RECEIVER arm — `unnameable_self`
+    /// in `walk_mixin_call_children`: the block's `self` is opaque
+    /// (`define_method`, an anonymous factory, a `self::` receiver under
+    /// an opaque rebound), so a `self::` eval receiver inside answers
+    /// `OPAQUE_SELF` rather than anchoring. `class <<`/declined bodies
+    /// cover the same through `unnameable > 0` with a nil `self_base`.
+    opaque: bool,
 }
 
 struct Census<'pr> {
@@ -1370,9 +1377,40 @@ impl<'pr> Census<'pr> {
         &mut self,
         written_prefix: Vec<String>,
         self_owner: Option<String>,
+        written_name: Option<String>,
         value: &PrismNode<'pr>,
     ) {
-        if let Some(call) = value.as_call_node() {
+        // `meta_new_rvalue`: `Const = Const || <rvalue>` unwraps the guard
+        // (only when the guarded name IS the constant written), and a
+        // `.freeze` tail unwraps to its receiver — repeatedly.
+        let mut v: PrismNode<'pr> = node_copy(value);
+        if let Some(or) = v.as_or_node() {
+            let right = or.right();
+            let guarded = written_name.as_deref().is_some_and(|w| {
+                strict_constant_path_string(&or.left()).as_deref() == Some(w)
+            });
+            if guarded {
+                v = right;
+            }
+        }
+        loop {
+            let receiver = v.as_call_node().and_then(|call| {
+                if constant_string(call.name().as_slice()) == "freeze"
+                    && !call.is_safe_navigation()
+                    && call.arguments().is_none()
+                    && call.block().is_none()
+                {
+                    call.receiver()
+                } else {
+                    None
+                }
+            });
+            match receiver {
+                Some(r) => v = r,
+                None => break,
+            }
+        }
+        if let Some(call) = v.as_call_node() {
             if meta_new_call(&call) && call.block().is_some_and(|b| b.as_block_node().is_some()) {
                 self.rvalue_cref = Some((written_prefix, self_owner));
             }
@@ -1414,18 +1452,26 @@ impl<'pr> Census<'pr> {
 
     /// `meta_new_mixin_owner` for a BARE `W =` write — under an
     /// unnameable cref (`singleton_cref`) `meta_new_path_target_nameable?`
-    /// refuses it, leaving the block's `self` anonymous.
-    fn bare_write_self_owner(&self, written: &[String]) -> Option<String> {
-        (self.unnameable == 0).then(|| written.join("::"))
+    /// refuses it, leaving the block's `self` anonymous. `meta_new_child_
+    /// prefix` qualifies under the WALK's `qualified_prefix` — the lexical
+    /// nesting, which a meta-new rvalue block never rebinds.
+    fn bare_write_self_owner(&self, name: &str) -> Option<String> {
+        if self.unnameable > 0 {
+            return None;
+        }
+        let mut v = self.lex_prefix.clone();
+        v.push(name.to_string());
+        Some(v.join("::"))
     }
 
     /// `meta_new_mixin_owner` / `meta_new_child_prefix` for a `Path::W =`
     /// write — the name the block's `self` answers to. A `self::` target
     /// anchors its tail on the enclosing frame's rebound `self_base`
     /// (nil under an unnameable cref); `::`-rooted targets reset; every
-    /// other constant base re-anchors under the enclosing
-    /// `qualified_prefix` (`declaration_prefix`); a dynamic base names
-    /// nothing.
+    /// other constant base re-anchors under the enclosing `qualified_`
+    /// `prefix` — again the LEXICAL one (`declaration_prefix`), so
+    /// `NS::W` inside `Outer = Class.new {}` is `Outer`-sibling, not
+    /// `Outer::NS::W`; a dynamic base names nothing.
     fn meta_new_self_owner(&self, target: &PrismNode<'_>, written: &[String]) -> Option<String> {
         let tail = constant_path_string(target);
         if self_anchored_constant_path(target) {
@@ -1436,34 +1482,51 @@ impl<'pr> Census<'pr> {
             };
         }
         let render = strict_constant_path_string(target)?;
-        if rooted_constant_path(target) || self.decl_prefix.is_empty() {
+        if rooted_constant_path(target) || self.lex_prefix.is_empty() {
             Some(render)
         } else {
-            Some(format!("{}::{render}", self.decl_prefix.join("::")))
+            Some(format!("{}::{render}", self.lex_prefix.join("::")))
         }
     }
 
     /// The shared body of the bare-write visitors (`W =`, `||=`, `&&=`,
     /// `+=`): the scan records the write under the enclosing cref and its
-    /// rvalue walks under the written prefix.
-    fn bare_write_visit(&mut self, name: String, value: &PrismNode<'pr>) {
+    /// rvalue walks under the written prefix. `meta` marks the
+    /// `META_CONSTANT_WRITE_NODES` spellings (`=`/`||=`) — `&&=`/`+=`
+    /// keep the scan's written prefix but hand the block neither
+    /// `meta_new_mixin_owner` nor `meta_constant_write_name`.
+    fn bare_write_visit(&mut self, name: String, meta: bool, value: &PrismNode<'pr>) {
+        let owner = if meta {
+            self.bare_write_self_owner(&name)
+        } else {
+            None
+        };
         self.declared_bare_write(&name);
         let mut cref = self.decl_prefix.clone();
-        cref.push(name);
-        let owner = self.bare_write_self_owner(&cref);
-        self.write_rvalue(cref, owner, value);
+        cref.push(name.clone());
+        self.write_rvalue(cref, owner, meta.then_some(name), value);
     }
 
     /// The shared body of the path-write visitors (`N::W =` and friends):
     /// the write records as written and its rvalue walks under the
-    /// written prefix (`prefix || qualified_prefix`).
-    fn path_write_visit(&mut self, target: &PrismNode<'pr>, value: &PrismNode<'pr>) {
+    /// written prefix (`prefix || qualified_prefix`). `meta` marks the
+    /// `META_CONSTANT_WRITE_NODES` spellings (`=`/`||=`).
+    fn path_write_visit(&mut self, target: &PrismNode<'pr>, meta: bool, value: &PrismNode<'pr>) {
         self.declared_path_write(target);
         let written = self
             .path_write_cref(target)
             .unwrap_or_else(|| self.decl_prefix.clone());
-        let owner = self.meta_new_self_owner(target, &written);
-        self.write_rvalue(written, owner, value);
+        let owner = if meta {
+            self.meta_new_self_owner(target, &written)
+        } else {
+            None
+        };
+        self.write_rvalue(
+            written,
+            owner,
+            meta.then(|| strict_constant_path_string(target)).flatten(),
+            value,
+        );
     }
 
     fn hook_receiver(&self, recv: &PrismNode<'_>) -> bool {
@@ -1492,7 +1555,7 @@ impl<'pr> Census<'pr> {
         let direct = self.is_direct(n);
         if name.is_empty() {
             // An unnameable declaration owns nothing the port can hold.
-            let f = Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None };
+            let f = Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None, opaque: false };
             self.frames.push(f);
             if let Some(b) = &body {
                 self.visit(b);
@@ -1597,17 +1660,26 @@ impl<'pr> Census<'pr> {
         );
         let saved_def = std::mem::replace(&mut self.in_def, 0);
         let saved_hooks = std::mem::take(&mut self.hook_params);
+        // `walk_includes_declaration?` hands the body `singleton_cref:
+        // child_cref` — the flag is `unnameable_decl?` itself: a NAMEABLE
+        // header (`class N::Z`, `class ::N`, `class self::Y` under a
+        // rebound self) RESETS it, so bare decls and `self::` receivers
+        // inside name nothing only under a genuinely declined enclosure.
+        let saved_unnameable =
+            std::mem::replace(&mut self.unnameable, if declines { 1 } else { 0 });
         self.frames.push(Frame {
             owner: if declines { None } else { Some(vec![qualified.clone()]) },
             singleton: false,
             uncertain: false,
             eval_owner: None,
             self_base: if declines { None } else { Some(qualified) },
+            opaque: false,
         });
         if let Some(b) = &body {
             self.visit(b);
         }
         self.frames.pop();
+        self.unnameable = saved_unnameable;
         self.hook_params = saved_hooks;
         self.in_def = saved_def;
         self.prefix = saved_prefix;
@@ -2190,7 +2262,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                 self.class_bodies.push(node_copy(&b));
             }
         }
-        self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner, self_base: None });
+        self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner, self_base: None, opaque: false });
         // `collect_declared_constant_names` — a `class <<` body's cref is the
         // unnameable singleton: bare and `self::` declarations inside name
         // nothing while explicit-base paths still re-anchor lexically. The
@@ -2449,9 +2521,14 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             // class: `self_base` is the write's resolved owner
             // (`K = Class.new { class self::Y }` → `K::Y`), nil where the
             // write names nothing or the factory is anonymous (`self`
-            // names nothing, so `self::` headers render lexically).
+            // names nothing, so `self::` headers render lexically). The
+            // block is that class's body for the mixin tables too —
+            // `walk_includes_meta_new?` walks it with `current_class` =
+            // `meta_owner`, so `include` inside files the written name.
             let self_base = rvalue_cref.as_ref().and_then(|(_, s)| s.clone());
-            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base })
+            let opaque = self_base.is_none();
+            let owner = self_base.clone().map(|b| vec![b]);
+            Some(Frame { owner, singleton: false, uncertain: false, eval_owner: None, self_base, opaque })
         } else if name == "define_method" {
             // Upstream `rebound_block_self` (`OPAQUE_SELF_BLOCK_CALLS`): a
             // `define_method` block is a METHOD body — its `self` is the
@@ -2460,35 +2537,76 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             // taint), exactly as `self_owner()` answering `None` drops it.
             // The block's other arguments (a `->` lambda) keep the
             // enclosing `self`, as the reference's walk keeps them.
-            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None })
+            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None, opaque: true })
         } else if eval {
             let instance_side = name == "instance_eval" || name == "instance_exec";
-            let owner = match (&recv, &recv_const) {
-                (None, _) => self.owner(),
-                (Some(r), _) if r.as_self_node().is_some() => self.owner(),
-                (Some(_), Some(raw)) => Some(self.candidates(raw)),
-                _ => None,
-            };
-            // A bare / `self` receiver keeps the enclosing self, an
-            // `instance_eval` frame's included.
-            let eval_owner = match (&recv, &recv_const) {
-                (None, _) => self.self_owner(),
-                (Some(r), _) if r.as_self_node().is_some() => self.self_owner(),
-                _ => owner.clone(),
-            };
-            // `self_base` rides the rebound self too: a constant eval
-            // receiver's AS-WRITTEN name, the enclosing frame's name for a
-            // bare/`self` receiver, nil where the rebound is opaque.
-            let self_base = match (&recv, &recv_const) {
-                (None, _) => self.frame().self_base.clone(),
-                (Some(r), _) if r.as_self_node().is_some() => {
-                    self.frame().self_base.clone()
+            let self_anchored_recv = recv
+                .as_ref()
+                .is_some_and(|r| self_anchored_constant_path(r));
+            // `unnameable_self`: under an opaque rebound (`singleton_self`,
+            // or an ownerless body under an unnameable cref) a `self::`
+            // receiver answers OPAQUE_SELF rather than anchoring.
+            let self_opaque = self.frame().opaque
+                || (self.unnameable > 0 && self.frame().self_base.is_none());
+            // `eval_receiver_self`'s `self::` arm: `prefix = self_prefix ||
+            // qualified_prefix` — the rebound self's segments, else the
+            // lexical prefix — plus the tail, a leading `Object` collapsed.
+            let self_recv = if self_anchored_recv && !self_opaque {
+                let tail = constant_path_string(recv.as_ref().unwrap());
+                let mut segs: Vec<String> = self
+                    .frame()
+                    .self_base
+                    .clone()
+                    .map(|b| b.split("::").map(str::to_string).collect())
+                    .unwrap_or_else(|| self.lex_prefix.clone());
+                segs.extend(tail.split("::").map(str::to_string));
+                if segs.first().is_some_and(|s| s == "Object") {
+                    segs.remove(0);
                 }
-                (Some(_), Some(raw)) => Some(raw.clone()),
-                _ => None,
+                Some(segs.join("::"))
+            } else {
+                None
+            };
+            let (owner, eval_owner, self_base, opaque) = if self_anchored_recv {
+                // `rebound` is the anchored name, or OPAQUE under an
+                // opaque rebound — either way `include` inside attributes
+                // to the named class or to nothing.
+                let name = self_recv.clone().map(|n| vec![n]);
+                (name.clone(), name, self_recv.clone(), self_recv.is_none())
+            } else {
+                let owner = match (&recv, &recv_const) {
+                    (None, _) => self.owner(),
+                    (Some(r), _) if r.as_self_node().is_some() => self.owner(),
+                    (Some(_), Some(raw)) => Some(self.candidates(raw)),
+                    _ => None,
+                };
+                // A bare / `self` receiver keeps the enclosing self, an
+                // `instance_eval` frame's included.
+                let eval_owner = match (&recv, &recv_const) {
+                    (None, _) => self.self_owner(),
+                    (Some(r), _) if r.as_self_node().is_some() => self.self_owner(),
+                    _ => owner.clone(),
+                };
+                // `self_base` rides the rebound self too: a constant eval
+                // receiver's AS-WRITTEN name, the enclosing frame's name
+                // for a bare/`self` receiver, nil where the rebound is
+                // opaque (a non-constant receiver — `child_unnameable`).
+                let self_base = match (&recv, &recv_const) {
+                    (None, _) => self.frame().self_base.clone(),
+                    (Some(r), _) if r.as_self_node().is_some() => {
+                        self.frame().self_base.clone()
+                    }
+                    (Some(_), Some(raw)) => Some(raw.clone()),
+                    _ => None,
+                };
+                let opaque = matches!(
+                    (&recv, &recv_const),
+                    (Some(r), None) if r.as_self_node().is_none()
+                );
+                (owner, eval_owner, self_base, opaque)
             };
             let owner = if instance_side { None } else { owner };
-            Some(Frame { owner, singleton: false, uncertain: false, eval_owner, self_base })
+            Some(Frame { owner, singleton: false, uncertain: false, eval_owner, self_base, opaque })
         } else {
             None
         };
@@ -2535,22 +2653,22 @@ impl<'pr> Visit<'pr> for Census<'pr> {
     // ([`Census::write_rvalue`]).
 
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
-        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), true, &node.value());
     }
 
     fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
-        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), true, &node.value());
     }
 
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
-        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), false, &node.value());
     }
 
     fn visit_constant_operator_write_node(
         &mut self,
         node: &ruby_prism::ConstantOperatorWriteNode<'pr>,
     ) {
-        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), false, &node.value());
     }
 
     fn visit_constant_path_write_node(
@@ -2558,7 +2676,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.path_write_visit(&target.as_node(), &node.value());
+        self.path_write_visit(&target.as_node(), true, &node.value());
     }
 
     fn visit_constant_path_or_write_node(
@@ -2566,7 +2684,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathOrWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.path_write_visit(&target.as_node(), &node.value());
+        self.path_write_visit(&target.as_node(), true, &node.value());
     }
 
     fn visit_constant_path_and_write_node(
@@ -2574,7 +2692,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathAndWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.path_write_visit(&target.as_node(), &node.value());
+        self.path_write_visit(&target.as_node(), false, &node.value());
     }
 
     fn visit_constant_path_operator_write_node(
@@ -2582,7 +2700,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.path_write_visit(&target.as_node(), &node.value());
+        self.path_write_visit(&target.as_node(), false, &node.value());
     }
 
     /// `ConstantTargetNode` — a bare `X` among `X, Y = 1, 2`'s targets.
@@ -2627,13 +2745,18 @@ fn struct_member_args(call: &ruby_prism::CallNode<'_>) -> bool {
     {
         positional.pop();
     }
+    // `return false if positional.nil? || positional.empty?` runs BEFORE
+    // the leading-String drop: a lone `"Named"` still makes it meta.
+    if positional.is_empty() {
+        return false;
+    }
     if positional
         .first()
         .is_some_and(|a| a.as_string_node().is_some())
     {
         positional.remove(0);
     }
-    !positional.is_empty() && positional.iter().all(member_arg)
+    positional.iter().all(member_arg)
 }
 
 /// `data_define_call?` argument shape: every argument a `Symbol`/`Splat`
@@ -2649,7 +2772,7 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
     let mut c = Census {
         out: AncestryFacts::default(),
         prefix: Vec::new(),
-        frames: vec![Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None }],
+        frames: vec![Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None, opaque: false }],
         direct: HashSet::new(),
         recorded_arg_defs: HashSet::new(),
         in_def: 0,
