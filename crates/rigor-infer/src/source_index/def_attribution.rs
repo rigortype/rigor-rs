@@ -1355,7 +1355,7 @@ pub(crate) fn file_orphan_defs(
 /// children for the variants that do not get a dedicated arm. Mirrors the
 /// reference's `node.compact_child_nodes.each` fallback: anything it does not
 /// explicitly context-shift keeps the enclosing context.
-fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
+pub(super) fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
     match node {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             out.extend_from_slice(body);
@@ -1440,19 +1440,12 @@ fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
             }
             out.extend_from_slice(body);
         }
-        Node::BeginRescue {
-            body,
-            ensure_body,
-            clauses,
-            ..
-        } => {
-            out.extend_from_slice(body);
-            out.extend_from_slice(ensure_body);
-            for c in clauses {
-                out.extend_from_slice(&c.exceptions);
-                out.extend_from_slice(&c.body);
-            }
-        }
+        // `body` is the flat superset: the protected statements
+        // (`main_body`), every rescue clause's exceptions and statements,
+        // the `else` and the `ensure` all ride it. Descending the views as
+        // well visited each section twice — ×2 per nesting level
+        // (rigor-rs#963).
+        Node::BeginRescue { body, .. } => out.extend_from_slice(body),
         Node::Lambda { body, .. } | Node::Return { values: body, .. } => {
             out.extend_from_slice(body);
         }

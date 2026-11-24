@@ -696,7 +696,7 @@ fn qualify_ctx(prefix: &[String], name: &str) -> String {
 /// `refine` sites: the wildcard row then never records and the port FIRES
 /// where the reference declines — so this list is deliberately exhaustive
 /// over [`Node`]'s `NodeId` fields.
-fn child_ids(n: &Node, out: &mut Vec<NodeId>) {
+pub(super) fn child_ids(n: &Node, out: &mut Vec<NodeId>) {
     match n {
         Node::Program { body, .. }
         | Node::Statements { body, .. }
@@ -776,21 +776,12 @@ fn child_ids(n: &Node, out: &mut Vec<NodeId>) {
             out.extend(predicate.iter().copied());
             out.extend_from_slice(body);
         }
-        Node::BeginRescue {
-            body,
-            main_body,
-            ensure_body,
-            clauses,
-            ..
-        } => {
-            out.extend_from_slice(body);
-            out.extend_from_slice(main_body);
-            out.extend_from_slice(ensure_body);
-            for clause in clauses {
-                out.extend_from_slice(&clause.exceptions);
-                out.extend_from_slice(&clause.body);
-            }
-        }
+        // `body` is the flat superset: the protected statements
+        // (`main_body`), every rescue clause's exceptions and statements,
+        // the `else` and the `ensure` all ride it. Descending the views as
+        // well visited each section twice — ×2 per nesting level
+        // (rigor-rs#963).
+        Node::BeginRescue { body, .. } => out.extend_from_slice(body),
         Node::Logical { left, right, .. } => {
             out.push(*left);
             out.push(*right);
