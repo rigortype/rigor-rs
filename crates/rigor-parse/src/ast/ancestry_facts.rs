@@ -1121,6 +1121,15 @@ struct Frame {
     /// exactly as `class_eval`, so `X.instance_eval { extend M }` files `M`
     /// on `X`'s singleton side. Read only by [`Census::self_owner`].
     eval_owner: Option<Vec<String>>,
+    /// The walk's `current_class` as ONE string — `self_base` in
+    /// `self_anchored_decl_prefix`/`meta_new_child_prefix`: the name a
+    /// `self::` header or write target anchors its tail on. Set where the
+    /// reference's `current_class` is set — a declaration's qualified name,
+    /// an eval receiver's as-written name, a meta-new block's written
+    /// cref. `None` (a nil `self_base`) means `self` names no class — an
+    /// anonymous or opaque block — where a `self::` path renders
+    /// lexically and the cref flag decides its fate.
+    self_base: Option<String>,
 }
 
 struct Census<'pr> {
@@ -1166,12 +1175,24 @@ struct Census<'pr> {
     /// `eval_constant_receiver_prefix`'s candidates inside
     /// `K = Class.new {}` still run through the lexical nesting.
     lex_prefix: Vec<String>,
-    /// Enclosing unnameable crefs — `class <<` bodies and anonymous
-    /// factory blocks — where bare/`self::` declarations name nothing.
+    /// The MIXIN walk's `singleton_cref` — `class <<` bodies and the
+    /// bodies of declarations they declined — where bare/`self::`
+    /// declarations name nothing. Blocks propagate it unchanged: an
+    /// anonymous factory's body keeps the ENCLOSING cref flag (a
+    /// `class Y` inside `foo(Class.new {})` still names `Y`).
     unnameable: usize,
-    /// The decl prefix a write's direct meta-new rvalue hands its block
-    /// ([`Census::write_rvalue`]); `visit_call_node` swaps it in.
-    rvalue_cref: Option<Vec<String>>,
+    /// The declared-name scan's `unnameable_cref` — `class <<` bodies,
+    /// declined bodies, AND anonymous factory blocks (`collect_declared_
+    /// anonymous_factory?` marks its block's cref unnameable for the scan
+    /// even though the mixin walk keeps it nameable).
+    scan_unnameable: usize,
+    /// The pair a write's direct meta-new rvalue hands its block — the
+    /// scan's `written_prefix` (which [`Census::decl_prefix`] swaps in)
+    /// and `meta_new_mixin_owner`, the name the block's `self` answers
+    /// ([`Frame::self_base`]). A bare or `self::` write under an
+    /// unnameable cref keeps the written prefix but loses the owner;
+    /// `visit_call_node` consumes the slot.
+    rvalue_cref: Option<(Vec<String>, Option<String>)>,
 }
 
 impl<'pr> Census<'pr> {
@@ -1300,7 +1321,7 @@ impl<'pr> Census<'pr> {
     /// lands on the enclosing cref; an unnameable one declines it. `def`
     /// bodies declare nothing the scan reads.
     fn declared_bare_write(&mut self, name: &str) {
-        if self.in_def > 0 || self.unnameable > 0 || name.is_empty() {
+        if self.in_def > 0 || self.scan_unnameable > 0 || name.is_empty() {
             return;
         }
         let q = self.decl_qualify(name);
@@ -1322,7 +1343,7 @@ impl<'pr> Census<'pr> {
             return;
         }
         if self_anchored_constant_path(target) {
-            if self.unnameable > 0 {
+            if self.scan_unnameable > 0 {
                 return;
             }
             let tail = constant_path_string(target);
@@ -1340,13 +1361,20 @@ impl<'pr> Census<'pr> {
     /// `collect_rvalue_declared_names` — the rvalue of a constant write
     /// walks its `K = Class.new { }` block under the WRITTEN prefix while
     /// every other rvalue keeps the enclosing context. `written_prefix` is
-    /// the resolved write prefix (`qp + [K]` for `K =`, the as-written
-    /// absolute segments for `N::K =`, `qp + tail` for `self::N::K =`, the
-    /// enclosing prefix for a declined write).
-    fn write_rvalue(&mut self, written_prefix: Vec<String>, value: &PrismNode<'pr>) {
+    /// the resolved write prefix (`qp + [K]` for `K =` even under an
+    /// unnameable cref, the as-written absolute segments for `N::K =`,
+    /// `qp + tail` for `self::N::K =`, the enclosing prefix for a declined
+    /// or dynamic target); `self_owner` is `meta_new_mixin_owner`, nil
+    /// where the block's `self` names nothing the tables hold.
+    fn write_rvalue(
+        &mut self,
+        written_prefix: Vec<String>,
+        self_owner: Option<String>,
+        value: &PrismNode<'pr>,
+    ) {
         if let Some(call) = value.as_call_node() {
             if meta_new_call(&call) && call.block().is_some_and(|b| b.as_block_node().is_some()) {
-                self.rvalue_cref = Some(written_prefix);
+                self.rvalue_cref = Some((written_prefix, self_owner));
             }
         }
         self.visit(value);
@@ -1358,26 +1386,84 @@ impl<'pr> Census<'pr> {
     /// The decl prefix a path write's meta-new rvalue block enters under:
     /// `declared_constant_write_prefix` — `::`-rooted and constant bases
     /// give the as-written absolute segments, a `self::` tail re-anchors
-    /// under the enclosing prefix, and a declined or unnameable write keeps
-    /// the enclosing context.
-    fn path_write_cref(&self, target: &PrismNode<'_>) -> Vec<String> {
+    /// under the enclosing prefix (and under an unnameable cref the write
+    /// names nothing), a dynamic base keeps the enclosing context.
+    fn path_write_cref(&self, target: &PrismNode<'_>) -> Option<Vec<String>> {
         if rooted_constant_path(target) {
-            return strict_constant_path_string(target)
-                .map(|n| n.split("::").map(str::to_string).collect())
-                .unwrap_or_else(|| self.decl_prefix.clone());
+            return Some(
+                strict_constant_path_string(target)
+                    .map(|n| n.split("::").map(str::to_string).collect())
+                    .unwrap_or_else(|| self.decl_prefix.clone()),
+            );
         }
         if self_anchored_constant_path(target) {
-            let mut cref = self.decl_prefix.clone();
-            if self.unnameable > 0 {
-                return cref;
+            if self.scan_unnameable > 0 {
+                return None;
             }
             let tail = constant_path_string(target);
+            let mut cref = self.decl_prefix.clone();
             cref.extend(tail.split("::").map(str::to_string));
-            return cref;
+            return Some(cref);
         }
-        strict_constant_path_string(target)
-            .map(|n| n.split("::").map(str::to_string).collect())
-            .unwrap_or_else(|| self.decl_prefix.clone())
+        Some(
+            strict_constant_path_string(target)
+                .map(|n| n.split("::").map(str::to_string).collect())
+                .unwrap_or_else(|| self.decl_prefix.clone()),
+        )
+    }
+
+    /// `meta_new_mixin_owner` for a BARE `W =` write — under an
+    /// unnameable cref (`singleton_cref`) `meta_new_path_target_nameable?`
+    /// refuses it, leaving the block's `self` anonymous.
+    fn bare_write_self_owner(&self, written: &[String]) -> Option<String> {
+        (self.unnameable == 0).then(|| written.join("::"))
+    }
+
+    /// `meta_new_mixin_owner` / `meta_new_child_prefix` for a `Path::W =`
+    /// write — the name the block's `self` answers to. A `self::` target
+    /// anchors its tail on the enclosing frame's rebound `self_base`
+    /// (nil under an unnameable cref); `::`-rooted targets reset; every
+    /// other constant base re-anchors under the enclosing
+    /// `qualified_prefix` (`declaration_prefix`); a dynamic base names
+    /// nothing.
+    fn meta_new_self_owner(&self, target: &PrismNode<'_>, written: &[String]) -> Option<String> {
+        let tail = constant_path_string(target);
+        if self_anchored_constant_path(target) {
+            return match &self.frame().self_base {
+                Some(base) => Some(format!("{base}::{tail}")),
+                None if self.unnameable > 0 => None,
+                None => Some(written.join("::")),
+            };
+        }
+        let render = strict_constant_path_string(target)?;
+        if rooted_constant_path(target) || self.decl_prefix.is_empty() {
+            Some(render)
+        } else {
+            Some(format!("{}::{render}", self.decl_prefix.join("::")))
+        }
+    }
+
+    /// The shared body of the bare-write visitors (`W =`, `||=`, `&&=`,
+    /// `+=`): the scan records the write under the enclosing cref and its
+    /// rvalue walks under the written prefix.
+    fn bare_write_visit(&mut self, name: String, value: &PrismNode<'pr>) {
+        self.declared_bare_write(&name);
+        let mut cref = self.decl_prefix.clone();
+        cref.push(name);
+        let owner = self.bare_write_self_owner(&cref);
+        self.write_rvalue(cref, owner, value);
+    }
+
+    /// The shared body of the path-write visitors (`N::W =` and friends):
+    /// the write records as written and its rvalue walks under the
+    /// written prefix (`prefix || qualified_prefix`).
+    fn path_write_visit(&mut self, target: &PrismNode<'pr>, value: &PrismNode<'pr>) {
+        self.declared_path_write(target);
+        let written = self
+            .path_write_cref(target)
+            .unwrap_or_else(|| self.decl_prefix.clone());
+        let owner = self.meta_new_self_owner(target, &written);
+        self.write_rvalue(written, owner, value);
     }
 
     fn hook_receiver(&self, recv: &PrismNode<'_>) -> bool {
@@ -1406,7 +1492,7 @@ impl<'pr> Census<'pr> {
         let direct = self.is_direct(n);
         if name.is_empty() {
             // An unnameable declaration owns nothing the port can hold.
-            let f = Frame { owner: None, singleton: false, uncertain: false, eval_owner: None };
+            let f = Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None };
             self.frames.push(f);
             if let Some(b) = &body {
                 self.visit(b);
@@ -1419,37 +1505,82 @@ impl<'pr> Census<'pr> {
         if let Some(b) = &body {
             self.class_bodies.push(node_copy(b));
         }
-        let qualified = self.qualify(&name);
-        // `declared_constant_path_prefix`: a `::`-rooted header re-anchors
-        // at the top level; a bare or `self::` header under an unnameable
-        // cref (`class <<`, an anonymous factory block) names NOTHING and
-        // its body keeps the enclosing prefix; every other path qualifies
-        // lexically — the decl-level entry is the path as written.
-        let declines =
-            !rooted && self.unnameable > 0 && (self_anchored || !name.contains("::"));
-        let saved_decl_prefix: Option<Option<Vec<String>>> = if declines {
+        // `self_anchored_decl_prefix`: a `self::` header anchors its tail
+        // on `self_base` — the walk's `current_class` (a declaration's
+        // qualified name, an eval receiver's as-written name, a meta-new
+        // block's written cref) — as ONE prefix element. A nil `self_base`
+        // leaves the header to `declaration_prefix`'s lexical render.
+        let self_decl: Option<Vec<String>> = if self_anchored {
+            self.frame().self_base.clone().map(|base| {
+                let mut v = vec![base];
+                v.extend(name.split("::").map(str::to_string));
+                v
+            })
+        } else {
             None
+        };
+        // `unnameable_decl?` (the MIXIN walk's `singleton_cref`): an EMPTY
+        // `self_decl` names nothing; a non-empty one re-anchors at a real
+        // cref even below an unnameable enclosure; a `::`-rooted header
+        // re-anchors at the top level; a bare or `self::` header under an
+        // unnameable cref names NOTHING; every other path qualifies
+        // lexically.
+        let declines = match &self_decl {
+            Some(sd) => sd.is_empty(),
+            None => {
+                !rooted && self.unnameable > 0 && (self_anchored || !name.contains("::"))
+            }
+        };
+        // `declared_constant_path_prefix` (the scan's `unnameable_cref` —
+        // set ALSO inside anonymous factory blocks): a bare or `self::`
+        // header declines for the scan even where the mixin walk
+        // re-anchors it; every other path pushes its as-written decl
+        // entry, `self::` threading `qualified_prefix + tail`, `::` reset.
+        let declines_scan =
+            !rooted && self.scan_unnameable > 0 && (self_anchored || !name.contains("::"));
+        let saved_decl_prefix: Option<Option<Vec<String>>> = if declines_scan {
+            None
+        } else if self_anchored {
+            let mut next = self.decl_prefix.clone();
+            next.extend(name.split("::").map(str::to_string));
+            Some(Some(std::mem::replace(&mut self.decl_prefix, next)))
         } else if rooted {
             Some(Some(std::mem::replace(&mut self.decl_prefix, vec![name.clone()])))
         } else {
             self.decl_prefix.push(name.clone());
             Some(None)
         };
-        // The mixin walk's `qualified_prefix` gets the same entry — a
-        // `K = Class.new {}` rvalue block swaps `decl_prefix` later without
-        // touching it.
+        // `decl_body_context`'s `child_prefix` — the MIXIN walk's
+        // `qualified_prefix` — gets `self_decl` where the header anchored a
+        // rebound self, `declaration_prefix` otherwise, and a declined
+        // body walks under `[]` (`walk_includes_declaration?`): `include`
+        // sites inside record nothing and `X.include` resolves against the
+        // empty nesting.
         let saved_lex_prefix: Option<Option<Vec<String>>> = if declines {
-            None
+            Some(Some(std::mem::take(&mut self.lex_prefix)))
+        } else if let Some(sd) = &self_decl {
+            Some(Some(std::mem::replace(&mut self.lex_prefix, sd.clone())))
         } else if rooted {
-            Some(Some(std::mem::replace(&mut self.lex_prefix, vec![name])))
+            Some(Some(std::mem::replace(&mut self.lex_prefix, vec![name.clone()])))
         } else {
-            self.lex_prefix.push(name);
+            self.lex_prefix.push(name.clone());
             Some(None)
         };
-        if !declines && self.in_def == 0 {
+        if !declines_scan && self.in_def == 0 {
             let joined = self.decl_prefix.join("::");
             self.add_declared(&joined);
         }
+        // `child_prefix.join("::")` — the cref the body walks as the
+        // reference's `current_class`: `self_decl` where the header
+        // anchored a rebound self, the rooted header's own name, the
+        // lexical qualification otherwise.
+        let qualified = if let Some(sd) = &self_decl {
+            sd.join("::")
+        } else if rooted {
+            name.clone()
+        } else {
+            self.qualify(&name)
+        };
         // A declaration that is not itself direct (`class C … end if X`) marks
         // no statement of its body direct: its edges are listed unpositioned
         // and its defs read `possible`, as the reference reads them.
@@ -1458,15 +1589,20 @@ impl<'pr> Census<'pr> {
         }
         let saved_prefix = std::mem::replace(
             &mut self.prefix,
-            qualified.split("::").map(str::to_string).collect(),
+            if declines {
+                Vec::new()
+            } else {
+                qualified.split("::").map(str::to_string).collect()
+            },
         );
         let saved_def = std::mem::replace(&mut self.in_def, 0);
         let saved_hooks = std::mem::take(&mut self.hook_params);
         self.frames.push(Frame {
-            owner: Some(vec![qualified]),
+            owner: if declines { None } else { Some(vec![qualified.clone()]) },
             singleton: false,
             uncertain: false,
             eval_owner: None,
+            self_base: if declines { None } else { Some(qualified) },
         });
         if let Some(b) = &body {
             self.visit(b);
@@ -2054,15 +2190,19 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                 self.class_bodies.push(node_copy(&b));
             }
         }
-        self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner });
+        self.frames.push(Frame { owner, singleton: true, uncertain: false, eval_owner, self_base: None });
         // `collect_declared_constant_names` — a `class <<` body's cref is the
         // unnameable singleton: bare and `self::` declarations inside name
-        // nothing while explicit-base paths still re-anchor lexically.
+        // nothing while explicit-base paths still re-anchor lexically. The
+        // mixin walk's `singleton_cref` and the scan's `unnameable_cref`
+        // both set it.
         self.unnameable += 1;
+        self.scan_unnameable += 1;
         if let Some(b) = node.body() {
             self.visit(&b);
         }
         self.unnameable -= 1;
+        self.scan_unnameable -= 1;
         self.frames.pop();
     }
 
@@ -2303,13 +2443,15 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         };
         // Which owner the block's `self` is.
         let recv_const = recv.as_ref().and_then(strict_constant_path_string);
-        let meta_new = matches!(
-            (recv_const.as_deref(), name.as_str()),
-            (Some("Class" | "::Class" | "Module" | "::Module" | "Struct" | "::Struct"), "new")
-                | (Some("Data" | "::Data"), "define")
-        );
+        let meta_new = meta_new_call(node);
         let frame = if meta_new {
-            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None })
+            // `meta_new_mixin_owner` — the block's `self` IS the written
+            // class: `self_base` is the write's resolved owner
+            // (`K = Class.new { class self::Y }` → `K::Y`), nil where the
+            // write names nothing or the factory is anonymous (`self`
+            // names nothing, so `self::` headers render lexically).
+            let self_base = rvalue_cref.as_ref().and_then(|(_, s)| s.clone());
+            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base })
         } else if name == "define_method" {
             // Upstream `rebound_block_self` (`OPAQUE_SELF_BLOCK_CALLS`): a
             // `define_method` block is a METHOD body — its `self` is the
@@ -2318,7 +2460,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
             // taint), exactly as `self_owner()` answering `None` drops it.
             // The block's other arguments (a `->` lambda) keep the
             // enclosing `self`, as the reference's walk keeps them.
-            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None })
+            Some(Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None })
         } else if eval {
             let instance_side = name == "instance_eval" || name == "instance_exec";
             let owner = match (&recv, &recv_const) {
@@ -2334,8 +2476,19 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                 (Some(r), _) if r.as_self_node().is_some() => self.self_owner(),
                 _ => owner.clone(),
             };
+            // `self_base` rides the rebound self too: a constant eval
+            // receiver's AS-WRITTEN name, the enclosing frame's name for a
+            // bare/`self` receiver, nil where the rebound is opaque.
+            let self_base = match (&recv, &recv_const) {
+                (None, _) => self.frame().self_base.clone(),
+                (Some(r), _) if r.as_self_node().is_some() => {
+                    self.frame().self_base.clone()
+                }
+                (Some(_), Some(raw)) => Some(raw.clone()),
+                _ => None,
+            };
             let owner = if instance_side { None } else { owner };
-            Some(Frame { owner, singleton: false, uncertain: false, eval_owner })
+            Some(Frame { owner, singleton: false, uncertain: false, eval_owner, self_base })
         } else {
             None
         };
@@ -2345,13 +2498,18 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         }
         // `collect_rvalue_declared_names` / `collect_declared_anonymous_factory?`:
         // a meta-new rvalue's block declares under the WRITTEN class
-        // (`K = Class.new { class Y }` → `K::Y`); an anonymous factory block's
-        // cref is unnameable — bare decls inside name nothing.
+        // (`K = Class.new { class Y }` → `K::Y`); an anonymous factory
+        // block's cref is unnameable FOR THE SCAN (`unnameable_cref`) —
+        // while the mixin walk's cref flag passes through unchanged and a
+        // `class Y` inside still names `Y` (`walk_includes_meta_new?`'s
+        // `body_cref = singleton_cref`).
         let saved_decl = if meta_new {
             match rvalue_cref {
-                Some(cref) => Some(Some(std::mem::replace(&mut self.decl_prefix, cref))),
+                Some((cref, _)) => {
+                    Some(Some(std::mem::replace(&mut self.decl_prefix, cref)))
+                }
                 None => {
-                    self.unnameable += 1;
+                    self.scan_unnameable += 1;
                     Some(None)
                 }
             }
@@ -2362,7 +2520,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         match saved_decl {
             Some(Some(s)) => self.decl_prefix = s,
             Some(None) => {
-                self.unnameable -= 1;
+                self.scan_unnameable -= 1;
             }
             None => {}
         }
@@ -2377,38 +2535,22 @@ impl<'pr> Visit<'pr> for Census<'pr> {
     // ([`Census::write_rvalue`]).
 
     fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
-        let name = constant_string(node.name().as_slice());
-        self.declared_bare_write(&name);
-        let mut cref = self.decl_prefix.clone();
-        cref.push(name);
-        self.write_rvalue(cref, &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
     }
 
     fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
-        let name = constant_string(node.name().as_slice());
-        self.declared_bare_write(&name);
-        let mut cref = self.decl_prefix.clone();
-        cref.push(name);
-        self.write_rvalue(cref, &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
     }
 
     fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
-        let name = constant_string(node.name().as_slice());
-        self.declared_bare_write(&name);
-        let mut cref = self.decl_prefix.clone();
-        cref.push(name);
-        self.write_rvalue(cref, &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
     }
 
     fn visit_constant_operator_write_node(
         &mut self,
         node: &ruby_prism::ConstantOperatorWriteNode<'pr>,
     ) {
-        let name = constant_string(node.name().as_slice());
-        self.declared_bare_write(&name);
-        let mut cref = self.decl_prefix.clone();
-        cref.push(name);
-        self.write_rvalue(cref, &node.value());
+        self.bare_write_visit(constant_string(node.name().as_slice()), &node.value());
     }
 
     fn visit_constant_path_write_node(
@@ -2416,8 +2558,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.declared_path_write(&target.as_node());
-        self.write_rvalue(self.path_write_cref(&target.as_node()), &node.value());
+        self.path_write_visit(&target.as_node(), &node.value());
     }
 
     fn visit_constant_path_or_write_node(
@@ -2425,8 +2566,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathOrWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.declared_path_write(&target.as_node());
-        self.write_rvalue(self.path_write_cref(&target.as_node()), &node.value());
+        self.path_write_visit(&target.as_node(), &node.value());
     }
 
     fn visit_constant_path_and_write_node(
@@ -2434,8 +2574,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathAndWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.declared_path_write(&target.as_node());
-        self.write_rvalue(self.path_write_cref(&target.as_node()), &node.value());
+        self.path_write_visit(&target.as_node(), &node.value());
     }
 
     fn visit_constant_path_operator_write_node(
@@ -2443,8 +2582,7 @@ impl<'pr> Visit<'pr> for Census<'pr> {
         node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>,
     ) {
         let target = node.target();
-        self.declared_path_write(&target.as_node());
-        self.write_rvalue(self.path_write_cref(&target.as_node()), &node.value());
+        self.path_write_visit(&target.as_node(), &node.value());
     }
 
     /// `ConstantTargetNode` — a bare `X` among `X, Y = 1, 2`'s targets.
@@ -2460,11 +2598,50 @@ fn meta_new_call(call: &ruby_prism::CallNode<'_>) -> bool {
     let recv_const = call
         .receiver()
         .and_then(|r| strict_constant_path_string(&r));
-    matches!(
-        (recv_const.as_deref(), name.as_str()),
-        (Some("Class" | "::Class" | "Module" | "::Module" | "Struct" | "::Struct"), "new")
-            | (Some("Data" | "::Data"), "define")
-    )
+    match (recv_const.as_deref(), name.as_str()) {
+        (Some("Class" | "::Class" | "Module" | "::Module"), "new") => true,
+        (Some("Struct" | "::Struct"), "new") => struct_member_args(call),
+        (Some("Data" | "::Data"), "define") => data_member_args(call),
+        _ => false,
+    }
+}
+
+/// `meta_member_argument?`: a member-list entry is a `Symbol` or a `Splat`.
+fn member_arg(node: &PrismNode<'_>) -> bool {
+    node.as_symbol_node().is_some() || node.as_splat_node().is_some()
+}
+
+/// `struct_new_call?` argument shape: a non-empty positional list of
+/// `Symbol`/`Splat` members after dropping an optional leading `String`
+/// class-name argument and a trailing `KeywordHash` (`keyword_init:`).
+/// `Struct.new()`, `Struct.new(1)` and friends are NOT meta-new — their
+/// blocks walk generically.
+fn struct_member_args(call: &ruby_prism::CallNode<'_>) -> bool {
+    let Some(args) = call.arguments() else {
+        return false;
+    };
+    let mut positional: Vec<PrismNode<'_>> = args.arguments().iter().collect();
+    if positional
+        .last()
+        .is_some_and(|a| a.as_keyword_hash_node().is_some())
+    {
+        positional.pop();
+    }
+    if positional
+        .first()
+        .is_some_and(|a| a.as_string_node().is_some())
+    {
+        positional.remove(0);
+    }
+    !positional.is_empty() && positional.iter().all(member_arg)
+}
+
+/// `data_define_call?` argument shape: every argument a `Symbol`/`Splat`
+/// member (`Data.define()`'s empty list satisfies `all?`).
+fn data_member_args(call: &ruby_prism::CallNode<'_>) -> bool {
+    call.arguments()
+        .map(|a| a.arguments().iter().all(|n| member_arg(&n)))
+        .unwrap_or(true)
 }
 
 /// Collect the [`AncestryFacts`] of one file.
@@ -2472,13 +2649,14 @@ pub(crate) fn collect_ancestry_facts(root: &PrismNode<'_>) -> AncestryFacts {
     let mut c = Census {
         out: AncestryFacts::default(),
         prefix: Vec::new(),
-        frames: vec![Frame { owner: None, singleton: false, uncertain: false, eval_owner: None }],
+        frames: vec![Frame { owner: None, singleton: false, uncertain: false, eval_owner: None, self_base: None }],
         direct: HashSet::new(),
         recorded_arg_defs: HashSet::new(),
         in_def: 0,
         decl_prefix: Vec::new(),
         lex_prefix: Vec::new(),
         unnameable: 0,
+        scan_unnameable: 0,
         rvalue_cref: None,
         hook_params: Vec::new(),
         direct_includes: std::collections::HashMap::new(),
