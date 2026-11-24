@@ -1472,13 +1472,18 @@ impl<'pr> Census<'pr> {
     /// `prefix` — again the LEXICAL one (`declaration_prefix`), so
     /// `NS::W` inside `Outer = Class.new {}` is `Outer`-sibling, not
     /// `Outer::NS::W`; a dynamic base names nothing.
-    fn meta_new_self_owner(&self, target: &PrismNode<'_>, written: &[String]) -> Option<String> {
+    fn meta_new_self_owner(&self, target: &PrismNode<'_>) -> Option<String> {
         let tail = constant_path_string(target);
         if self_anchored_constant_path(target) {
+            // A nil `self_base` leaves `meta_new_child_prefix` to
+            // `declaration_prefix(qualified_prefix, target)` — the LEXICAL
+            // prefix plus the tail, never the scan's rvalue-swapped
+            // written prefix.
             return match &self.frame().self_base {
                 Some(base) => Some(format!("{base}::{tail}")),
                 None if self.unnameable > 0 => None,
-                None => Some(written.join("::")),
+                None if self.lex_prefix.is_empty() => Some(tail),
+                None => Some(format!("{}::{tail}", self.lex_prefix.join("::"))),
             };
         }
         let render = strict_constant_path_string(target)?;
@@ -1517,7 +1522,7 @@ impl<'pr> Census<'pr> {
             .path_write_cref(target)
             .unwrap_or_else(|| self.decl_prefix.clone());
         let owner = if meta {
-            self.meta_new_self_owner(target, &written)
+            self.meta_new_self_owner(target)
         } else {
             None
         };
@@ -2599,10 +2604,14 @@ impl<'pr> Visit<'pr> for Census<'pr> {
                     (Some(_), Some(raw)) => Some(raw.clone()),
                     _ => None,
                 };
-                let opaque = matches!(
-                    (&recv, &recv_const),
-                    (Some(r), None) if r.as_self_node().is_none()
-                );
+                // A bare / `self` receiver does not rebind: the block keeps
+                // the enclosing `unnameable_self` (`child_unnameable`).
+                let opaque = match (&recv, &recv_const) {
+                    (None, _) => self.frame().opaque,
+                    (Some(r), _) if r.as_self_node().is_some() => self.frame().opaque,
+                    (Some(_), None) => true,
+                    (Some(_), Some(_)) => false,
+                };
                 (owner, eval_owner, self_base, opaque)
             };
             let owner = if instance_side { None } else { owner };
