@@ -274,6 +274,11 @@ impl<'i> Typer<'i> {
                 let mark = ctx.dirty.borrow().len();
                 let mut exit = tenv.clone();
                 self.coll_flow_scope(ast, &main_body, &mut exit, ctx, interner, out, stmt_position);
+                // The protected body's own post-scope, before the `else`
+                // clause: a retry arm that leaves the entry scope unchanged
+                // replays `main_body` over exactly the entry the primary walk
+                // started from, so its re-run IS this scope (rigor-rs#969).
+                let after_main = exit.clone();
                 self.coll_flow_scope(ast, &else_body, &mut exit, ctx, interner, out, stmt_position);
                 for cl in &clauses {
                     // Exception designators evaluate in the entry bindings and
@@ -334,16 +339,31 @@ impl<'i> Typer<'i> {
                         // retry` carries the ARM's widening back in and joins
                         // against the unmutated primary — silent, exactly as
                         // the reference.
-                        let mut rerun = arm;
-                        self.coll_flow_scope(
-                            ast,
-                            &main_body,
-                            &mut rerun,
-                            ctx,
-                            interner,
-                            out,
-                            stmt_position,
-                        );
+                        //
+                        // An arm whose post-scope equals the entry scope
+                        // (`rescue; retry`, or a write the entry already
+                        // holds) replays the primary walk verbatim: same env
+                        // in, so the same env out, the same carriers recorded
+                        // (re-merging an identical carrier is a no-op) and the
+                        // same `dirty` keys, already pushed past every
+                        // enclosing mark. Re-walking it anyway doubled the
+                        // work per nested `begin … rescue; retry` level
+                        // (rigor-rs#969).
+                        let rerun = if arm == *tenv {
+                            after_main.clone()
+                        } else {
+                            let mut rerun = arm;
+                            self.coll_flow_scope(
+                                ast,
+                                &main_body,
+                                &mut rerun,
+                                ctx,
+                                interner,
+                                out,
+                                stmt_position,
+                            );
+                            rerun
+                        };
                         exit = {
                             let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
                             self.coll_join_envs_delta(&exit, &rerun, &changed, interner)

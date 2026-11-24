@@ -520,6 +520,43 @@ fn coll_rescue_retry_rebind_joins_site_carrier() {
     );
 }
 
+/// `depth` nested `begin … rescue; <arm>; retry; end` levels around
+/// `c.nope`, then `c.zark` after them.
+fn nested_retry_src(depth: usize, arm: &str) -> Vec<u8> {
+    let mut s = String::from("def f\n  c = [1]\n");
+    s.push_str(&"  begin\n".repeat(depth));
+    s.push_str("  c.nope\n");
+    for _ in 0..depth {
+        s.push_str("  rescue\n");
+        s.push_str(arm);
+        s.push_str("  retry\n  end\n");
+    }
+    s.push_str("  c.zark\nend\n");
+    s.into_bytes()
+}
+
+/// A retry arm that leaves the entry scope unchanged replays the primary
+/// walk verbatim, so the walker reuses the primary's scope instead of
+/// re-walking `main_body` — one walk per level, not two (rigor-rs#969: the
+/// re-walk doubled per nesting level, and 40 levels never finished). The
+/// snaps match the shallow shapes above: an unchanged arm keeps the carrier
+/// at both sites; an arm rebind still re-walks and joins the site carrier.
+#[test]
+fn coll_nested_retry_is_not_exponential() {
+    let src = nested_retry_src(40, "");
+    assert_eq!(snap(&src, "nope"), Some("Array"));
+    assert!(!snap_carrier_is_union(&src, "nope"));
+    assert_eq!(snap(&src, "zark"), Some("Array"));
+    // An arm write the entry lacks (`e = 1`): the first visit of each level
+    // re-walks, every later visit enters with `e` already bound.
+    let src = nested_retry_src(40, "  e = 1\n");
+    assert_eq!(snap(&src, "nope"), Some("Array"));
+    // A rebinding arm re-walks once per level and joins the re-run carrier.
+    let src = nested_retry_src(40, "  c = [2]\n");
+    assert_eq!(snap(&src, "nope"), Some("Array"));
+    assert!(snap_carrier_is_union(&src, "nope"));
+}
+
 /// A mutation AFTER the rescued `begin` widens the joined union memberwise
 /// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
 /// same nominal the mutated arm holds, the union collapses, and the use
