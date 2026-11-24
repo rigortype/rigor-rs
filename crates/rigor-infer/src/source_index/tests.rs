@@ -2298,3 +2298,48 @@ fn discovered_classes_records_nested_decls_and_block_self() {
         assert!(idx.knows_discovered_class(name), "{name}");
     }
 }
+
+/// rigor-rs#963: `BeginRescue`'s flat `body` already holds `main_body`,
+/// every rescue clause's exceptions and statements, the `else` and the
+/// `ensure`. A child table that also pushed the views visited each section
+/// twice — ×2 per nesting level, so a few dozen nested `begin`s (or `if`/
+/// `else` arms, whose `else` is a carrier with `main_body == body`) never
+/// finished. Every child table must list each child once.
+#[test]
+fn child_tables_list_each_begin_rescue_child_once() {
+    let ast = lower_src(
+        b"begin\n  a = 1\n  begin; b; rescue ArgumentError => e; c; ensure; d; end\n\
+          rescue TypeError, NameError\n  f\nelse\n  g\nensure\n  h\nend\n\
+          if x\n  1\nelse\n  y; z\nend\n\
+          case q\nin Integer then r; s\nend\n\
+          (t; u)\n",
+    );
+    let mut begins = 0;
+    for (_, node) in ast.iter() {
+        if matches!(node, rigor_parse::Node::BeginRescue { .. }) {
+            begins += 1;
+        }
+        for (table, kids) in [
+            ("refine_walk::child_ids", {
+                let mut v = Vec::new();
+                super::refine_walk::child_ids(node, &mut v);
+                v
+            }),
+            ("def_attribution::def_walk_children", {
+                let mut v = Vec::new();
+                super::def_attribution::def_walk_children(node, &mut v);
+                v
+            }),
+            ("flow_writes::node_child_ids", {
+                let mut v = Vec::new();
+                crate::flow_writes::node_child_ids(node, &mut v);
+                v
+            }),
+        ] {
+            let unique: std::collections::HashSet<_> = kids.iter().collect();
+            assert_eq!(unique.len(), kids.len(), "{table} repeats a child of {node:?}");
+        }
+    }
+    // The real `begin`s, the `else` carrier, the `in` carrier, the parens.
+    assert!(begins >= 5, "expected the BeginRescue shapes, saw {begins}");
+}

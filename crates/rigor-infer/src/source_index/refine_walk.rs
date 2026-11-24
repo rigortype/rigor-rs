@@ -696,7 +696,7 @@ fn qualify_ctx(prefix: &[String], name: &str) -> String {
 /// `refine` sites: the wildcard row then never records and the port FIRES
 /// where the reference declines — so this list is deliberately exhaustive
 /// over [`Node`]'s `NodeId` fields.
-fn child_ids(n: &Node, out: &mut Vec<NodeId>) {
+pub(super) fn child_ids(n: &Node, out: &mut Vec<NodeId>) {
     match n {
         Node::Program { body, .. }
         | Node::Statements { body, .. }

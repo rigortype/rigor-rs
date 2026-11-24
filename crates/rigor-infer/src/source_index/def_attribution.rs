@@ -1355,7 +1355,7 @@ pub(crate) fn file_orphan_defs(
 /// children for the variants that do not get a dedicated arm. Mirrors the
 /// reference's `node.compact_child_nodes.each` fallback: anything it does not
 /// explicitly context-shift keeps the enclosing context.
-fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
+pub(super) fn def_walk_children(node: &Node, out: &mut Vec<NodeId>) {
     match node {
         Node::Program { body, .. } | Node::Statements { body, .. } => {
             out.extend_from_slice(body);
