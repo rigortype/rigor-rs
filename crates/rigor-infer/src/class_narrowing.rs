@@ -3247,10 +3247,46 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         {
             true
         }
-        Node::BeginRescue { body, ensure_body, clauses, .. }
-            if clauses.is_empty() && ensure_body.is_empty() =>
+        // A clause-less `BeginRescue` is a reused carrier (a parenthesised
+        // group, an `else` clause, a `case`/`in` arm — `main_body == body`
+        // there) OR a real `begin … end`, which can carry ONLY an `ensure`
+        // beside it (a bare `else` without `rescue` is a syntax error). For
+        // the real begin the flat `body`'s tail is the ENSURE's last
+        // statement, but `ensure` contributes no value path — the begin
+        // exits iff its PROTECTED body does: `begin; raise; ensure; nil;
+        // end` terminates on the oracle while `begin; 1; ensure; raise;
+        // end` does not (rigor-rs#956).
+        Node::BeginRescue { main_body, clauses, .. }
+            if clauses.is_empty() =>
         {
-            branch_terminates(ast, body)
+            branch_terminates(ast, main_body)
+        }
+        // `branch_terminates?`'s Bot half for the plain-write family: a
+        // write's type IS its value's, so a write terminates exactly when
+        // the value does (`x = raise`, `@q = raise`, `@@q = raise`, `$q =
+        // raise`, `Q = raise`, `q, r = raise`, `x = begin; raise; ensure;
+        // nil; end` — all `bot` on the oracle). OPERATOR/logical writes
+        // are excluded: `x += raise`, `x ||= raise`, `x &&= raise` all keep
+        // the arm live on the oracle (the `||=`/`&&=` read edge completes
+        // and the dispatched op types non-bot).
+        Node::LocalVariableWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. }
+        | Node::MultiWrite { value, .. } => stmt_terminates(ast, *value),
+        // The write-call spelling of the same rule: `h[:k] = raise` and
+        // `o.attr = raise` type `bot` on the oracle because the assigned
+        // VALUE — the call's LAST argument — does. Other argument
+        // positions do not count (`h[raise] = 1` keeps the arm live, like
+        // `foo(raise)`), and neither does a safe-nav setter — `o&.attr =
+        // raise` skips the store on a `nil` receiver. The `=`-suffixed
+        // comparison operators are excluded by spelling.
+        Node::Call { method, args, safe_nav, .. }
+            if !*safe_nav
+                && method.ends_with('=')
+                && !matches!(method.as_str(), "==" | "!=" | "<=" | ">=" | "===") =>
+        {
+            args.last().is_some_and(|&v| stmt_terminates(ast, v))
         }
         // `branch_unconditionally_exits?` recurses into `if`/`unless` only
         // when BOTH arms exit — an `if` with no else falls through on the
