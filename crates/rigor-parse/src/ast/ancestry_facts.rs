@@ -84,6 +84,27 @@ pub struct UnpositionedMixin {
     pub names: Vec<String>,
 }
 
+/// One written-order instance-side mixin edge. `owners` is the edge's owner
+/// resolution input: a resolved `[qualified]` for declaration-frame and
+/// receiver-form edges the census could anchor to one name, or the lexical
+/// candidates an eval-owner (`X.class_eval { include M }`) resolves at query
+/// time against the project's known namespaces. `names` holds only the
+/// constant targets — no [`WILDCARD`] / [`UNNAMED`] markers.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WrittenMixin {
+    pub owners: Vec<String>,
+    pub prepend: bool,
+    pub names: Vec<String>,
+    /// `true` for a `Self::<constant>` receiver-form call (`X.include(M)`):
+    /// `prepend_call_receiver` resolves the receiver against the FILE's
+    /// declared names (`eval_constant_receiver_prefix`), not the project
+    /// index — the ingest resolves `owners` to one name with that oracle.
+    /// `false` entries resolve via `resolved_write_namespace` /
+    /// `known_namespace?` — first project-known candidate else the bare
+    /// spelling — which the query side performs on `owners`.
+    pub receiver_form: bool,
+}
+
 /// See the module docs.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AncestryFacts {
@@ -99,9 +120,7 @@ pub struct AncestryFacts {
     /// three into ONE per-owner list (`#write_mixin_targets`), and master's
     /// `discovered_includes` reads that merged order — the three separate
     /// tables above each keep their own order and lose the interleave.
-    /// `(owner candidates, prepend?, names)`; `names` holds only the
-    /// constant targets — no [`WILDCARD`] / [`UNNAMED`] markers.
-    pub written_mixins: Vec<(Vec<String>, bool, Vec<String>)>,
+    pub written_mixins: Vec<WrittenMixin>,
     /// Owners with any `def` in their body (instance or singleton, recorded or
     /// not) — the reference's `known_user_class?` reads a `def` of either
     /// kind as making a name a project class.
@@ -1400,17 +1419,21 @@ impl<'pr> Census<'pr> {
                         self.wildcard(owner.clone(), MixinSide::Include);
                     }
                     self.out.direct_mixins.push((key.clone(), kind == "prepend", names.clone()));
-                    self.out
-                        .written_mixins
-                        .push((vec![key], kind == "prepend", names.clone()));
+                    self.out.written_mixins.push(WrittenMixin {
+                        owners: vec![key],
+                        prepend: kind == "prepend",
+                        names: names.clone(),
+                        receiver_form: false,
+                    });
                 }
             } else {
                 if side == MixinSide::Include {
-                    self.out.written_mixins.push((
-                        owner.clone(),
-                        kind == "prepend",
-                        names.clone(),
-                    ));
+                    self.out.written_mixins.push(WrittenMixin {
+                        owners: owner.clone(),
+                        prepend: kind == "prepend",
+                        names: names.clone(),
+                        receiver_form: false,
+                    });
                 }
                 self.unpositioned(owner.clone(), side, names);
             }
@@ -1467,11 +1490,12 @@ impl<'pr> Census<'pr> {
                         listed.push(UNNAMED.to_string());
                     }
                 }
-                self.out.written_mixins.push((
-                    owners.clone(),
-                    kind == "prepend",
-                    names.clone(),
-                ));
+                self.out.written_mixins.push(WrittenMixin {
+                    owners: owners.clone(),
+                    prepend: kind == "prepend",
+                    names: names.clone(),
+                    receiver_form: true,
+                });
                 self.out.receiver_mixins.push((owners.clone(), listed));
             }
             if set_unknown {
