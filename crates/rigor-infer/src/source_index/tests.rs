@@ -2343,3 +2343,173 @@ fn child_tables_list_each_begin_rescue_child_once() {
     // The real `begin`s, the `else` carrier, the `in` carrier, the parens.
     assert!(begins >= 5, "expected the BeginRescue shapes, saw {begins}");
 }
+
+// --- rigor-rs#905 — the constants-flavor resolution chain ----------------
+
+/// The scope names `constant_scope_worlds` answers in chain order, or the
+/// master (BFS) list when the chain cannot settle.
+fn worlds(idx: &SourceIndex, class: &str) -> (Vec<String>, Option<Vec<String>>, bool) {
+    match idx.constant_scope_worlds(class) {
+        ConstantScopeWorlds::Settled { scopes, retro } => (scopes, retro, false),
+        ConstantScopeWorlds::Master(scopes) => (scopes, None, true),
+    }
+}
+
+#[test]
+fn constant_scopes_includes_latest_statement_nearest() {
+    // `include M; include Q` ⇒ [Q, M]: Ruby puts the LAST include nearest.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule Q; end\nclass Sub\n  include M\n  include Q\nend\n",
+        &core,
+    );
+    let (scopes, retro, master) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["Q".to_string(), "M".to_string()]);
+    assert!(retro.is_none());
+    assert!(!master);
+}
+
+#[test]
+fn constant_scopes_prepend_region_ahead_of_includes() {
+    // `include M; prepend Q` ⇒ [Q, M]: the prepend region sits ahead of the
+    // class's includes even when its statement is written later.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule Q; end\nclass Sub\n  include M\n  prepend Q\nend\n",
+        &core,
+    );
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["Q".to_string(), "M".to_string()]);
+}
+
+#[test]
+fn constant_scopes_include_group_keeps_argument_order() {
+    // `include M, Q` ⇒ [M, Q]: one group's arguments land as a unit, first
+    // argument nearest.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule Q; end\nclass Sub\n  include M, Q\nend\n",
+        &core,
+    );
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["M".to_string(), "Q".to_string()]);
+}
+
+#[test]
+fn constant_scopes_two_prepends_latest_nearest() {
+    // `prepend P1; prepend P2` ⇒ [P2, P1]: each prepend lands ahead of the
+    // earlier one.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module P1; end\nmodule P2; end\nclass Sub\n  prepend P1\n  prepend P2\nend\n",
+        &core,
+    );
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["P2".to_string(), "P1".to_string()]);
+}
+
+#[test]
+fn constant_scopes_depth_first_before_superclass() {
+    // `class Sub < Base; include A` with A including M ⇒ [A, M, Base]: the
+    // included module's own chain expands depth-first BEFORE the superclass.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule A\n  include M\nend\nclass Base; end\nclass Sub < Base\n  include A\nend\n",
+        &core,
+    );
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["A".to_string(), "M".to_string(), "Base".to_string()]);
+}
+
+#[test]
+fn constant_scopes_declared_class_wins_over_written_constant() {
+    // `class Base; Base = 1` — the resolver's `project?` is blind to writes:
+    // `Sub < Base` consults `Base` (the declared class), not nothing.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"class Base; end\nBase = 1\nclass Sub < Base\nend\n",
+        &core,
+    );
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["Base".to_string()]);
+}
+
+#[test]
+fn constant_scopes_written_only_spelling_yields_nothing() {
+    // `Base = 1` with NO declaration: the spelling binds a written constant,
+    // contributes no scope — `Sub`'s ancestor rung is empty.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(b"Base = 1\nclass Sub < Base\nend\n", &core);
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert!(scopes.is_empty());
+}
+
+#[test]
+fn constant_scopes_include_skip_fork_carries_retro() {
+    // `class C < B; include M` where B already includes M: Ruby skips the
+    // include (the module is already on the chain) — the port's one
+    // settle-able fork, so the retro world rides along.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nclass B\n  include M\nend\nclass C < B\n  include M\nend\n",
+        &core,
+    );
+    let (scopes, retro, master) = worlds(&idx, "C");
+    assert!(!master);
+    assert!(retro.is_some());
+    // Chain world: the forked M lands at its include position; retro drops
+    // it and M stays at its superclass position.
+    assert_eq!(scopes, vec!["M".to_string(), "B".to_string()]);
+    assert_eq!(retro.unwrap(), vec!["B".to_string(), "M".to_string()]);
+}
+
+#[test]
+fn constant_scopes_master_order_is_nearest_first() {
+    // Master's BFS reads `discovered_includes` — NEAREST-FIRST (the
+    // unshift order), not written order: `include N; include M` queues M
+    // before N.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule N; end\nclass Sub\n  include N\n  include M\nend\n",
+        &core,
+    );
+    assert_eq!(
+        idx.master_constant_scopes("Sub"),
+        vec!["M".to_string(), "N".to_string()]
+    );
+}
+
+#[test]
+fn constant_scopes_master_after_order_mark() {
+    // An unpositioned mixin edge (a conditional `include`) marks the class:
+    // the chain cannot settle, so the worlds answer master's order.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule Q; end\nclass Sub\n  include M\n  if $x\n    include W\n  end\n  include Q\nend\n",
+        &core,
+    );
+    let (scopes, _, master) = worlds(&idx, "Sub");
+    assert!(master);
+    assert_eq!(scopes, vec!["Q".to_string(), "M".to_string()]);
+}
+
+#[test]
+fn constant_scopes_module_ancestors() {
+    // Modules mix in too: `module Sub; include M` consults M.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(
+        b"module M; end\nmodule Sub\n  include M\nend\n",
+        &core,
+    );
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["M".to_string()]);
+}
+
+#[test]
+fn constant_scopes_rooted_superclass() {
+    // `class Sub < ::Base` resolves the rooted name at the top level.
+    let core = CoreIndex::new();
+    let (_a, idx) = build_one(b"class Base; end\nclass Sub < ::Base\nend\n", &core);
+    let (scopes, _, _) = worlds(&idx, "Sub");
+    assert_eq!(scopes, vec!["Base".to_string()]);
+}
