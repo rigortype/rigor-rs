@@ -4741,7 +4741,7 @@ impl<'i> Typer<'i> {
                         // (`if true; x = "s"; raise; else; y = 1; end`
                         // answers `for "s"`).
                         let arm_terminates = else_body.is_empty()
-                            && crate::class_narrowing::branch_terminates(ast, then_body);
+                            && crate::class_narrowing::branch_terminates(self, ast, then_body);
                         // The dropped arm's own writes and mutations
                         // contribute nothing to the post-`if` env — its
                         // scope never reaches the join (`x = "a"; if
@@ -4961,18 +4961,25 @@ impl<'i> Typer<'i> {
                             let f_ty = f_write.unwrap_or(entry_ty);
                             let (body_ty, else_ty) =
                                 if *is_unless { (f_ty, t_ty) } else { (t_ty, f_ty) };
+                            // The else arm is an `ElseNode`/elsif
+                            // `subsequent`, which only its TYPE can
+                            // terminate (rigor-rs#966).
                             let j = if else_body.is_empty()
                                 && !then_body.is_empty()
-                                && crate::class_narrowing::branch_terminates(ast, then_body)
+                                && crate::class_narrowing::branch_terminates(self, ast, then_body)
                             {
                                 entry_ty
                             } else if !then_body.is_empty()
                                 && !else_body.is_empty()
-                                && crate::class_narrowing::branch_terminates(ast, else_body)
+                                && crate::class_narrowing::value_branch_terminates(
+                                    self, ast, else_body,
+                                )
                             {
                                 body_ty
                             } else if !else_body.is_empty()
-                                && crate::class_narrowing::branch_certainly_exits(ast, then_body)
+                                && crate::class_narrowing::branch_certainly_exits(
+                                    self, ast, then_body,
+                                )
                             {
                                 else_ty
                             } else {

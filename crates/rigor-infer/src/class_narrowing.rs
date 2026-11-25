@@ -1550,8 +1550,16 @@ impl<'i> Typer<'i> {
         // subject joins below and by `propagate_widened` (`return if
         // h.is_a?(Array)` leaves `h` unreachable on `[1, 2]` — oracle-silent,
         // rigor-rs#451 review).
-        let truthy_terminates = !truthy.is_empty() && branch_terminates(ast, truthy);
-        let falsey_terminates = !falsey.is_empty() && branch_terminates(ast, falsey);
+        // The body arm takes the syntactic test, the else arm its type
+        // alone (rigor-rs#966) — physically, whichever edge runs them.
+        let then_terminates = !then_body.is_empty() && branch_terminates(self, ast, &then_body);
+        let else_terminates =
+            !else_body.is_empty() && value_branch_terminates(self, ast, &else_body);
+        let (truthy_terminates, falsey_terminates) = if is_unless {
+            (else_terminates, then_terminates)
+        } else {
+            (then_terminates, else_terminates)
+        };
         // Post-`if` TYPE join for the locals the arms wrote: the reference
         // unions the arm values (`v = nil if p` on `v = nil` keeps `nil`,
         // and `v.zz` fires `for nil` — rigor-rs#443), so each written name
@@ -3107,7 +3115,7 @@ impl<'i> Typer<'i> {
             // expression-position clause narrows nothing (probe x1).
             self.class_flow_scope(ast, &body, &mut t, &mut c, coarse, writes, interner, out, stmt_position);
             edges.push(c);
-            edge_terminates.push(!body.is_empty() && branch_terminates(ast, &body));
+            edge_terminates.push(!body.is_empty() && value_branch_terminates(self, ast, &body));
         }
         // The `else` — a real one, or a `case`/`when`'s implicit no-match arm
         // (`eval_case_else` hands it the final `falsey_scope` either way).
@@ -3121,7 +3129,9 @@ impl<'i> Typer<'i> {
                 ast, &else_body, &mut t, &mut c, coarse, writes, interner, out, stmt_position,
             );
             edges.push(c);
-            edge_terminates.push(!else_body.is_empty() && branch_terminates(ast, &else_body));
+            edge_terminates.push(
+                !else_body.is_empty() && value_branch_terminates(self, ast, &else_body),
+            );
         }
         let case_in_no_else = saw_in && !saw_when && else_body.is_empty();
         widen_flow_writes(writes_within(writes, case_span).iter(), case_span, tenv, interner);
@@ -3204,14 +3214,35 @@ impl<'i> Typer<'i> {
 /// the lowered `else`-clause / parenthesized-group shape; a real
 /// `begin`/`rescue` declines, its tail `return` may be skipped by a raise
 /// before it).
-pub(crate) fn branch_terminates(ast: &LoweredAst, body: &[NodeId]) -> bool {
+///
+/// `body` must be an arm the reference hands `branch_terminates?` as a
+/// STATEMENTS node — an `if`/`unless` body (`node.statements`) — so the
+/// syntactic test applies to its tail. An `else`/elsif arm or a `case` arm
+/// takes [`value_branch_terminates`] instead.
+pub(crate) fn branch_terminates(t: &Typer<'_>, ast: &LoweredAst, body: &[NodeId]) -> bool {
+    arm_terminates(t, ast, body, true)
+}
+
+/// [`branch_terminates`] for an arm `branch_unconditionally_exits?` has no
+/// case for — an `if`'s `ElseNode` or elsif `subsequent`, a `case`'s
+/// `WhenNode`/`InNode`/`ElseNode` (`join_case_branch_scopes`) — so only the
+/// arm's TYPE decides: a receiverless `raise` that a project toplevel `def
+/// raise; end` answers types `nil` and keeps the arm live (rigor-rs#966).
+pub(crate) fn value_branch_terminates(t: &Typer<'_>, ast: &LoweredAst, body: &[NodeId]) -> bool {
+    arm_terminates(t, ast, body, false)
+}
+
+fn arm_terminates(t: &Typer<'_>, ast: &LoweredAst, body: &[NodeId], syntactic: bool) -> bool {
     match body.last() {
-        Some(&last) => stmt_terminates(ast, last),
+        Some(&last) => stmt_terminates(t, ast, last, syntactic),
         None => false,
     }
 }
 
-fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
+/// `syntactic` is set while the walk stands where the reference's
+/// `branch_unconditionally_exits?` itself recurses — the arm's statement
+/// list and a `(…)` body. Everywhere else only the `Bot` half speaks.
+fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool) -> bool {
     match ast.get(id) {
         Node::Return { .. } => true,
         // An argument-less `next`/`break` (`Node::Other`'s `jump` tag). The
@@ -3235,17 +3266,19 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
             matches!(kind, JumpKind::Next | JumpKind::Break)
         }
         // `EXIT_CALL_NAMES` (`raise throw exit abort fail`,
-        // statement_evaluator.rb:9666) plus `exit!`: it is absent from the
-        // syntactic set but its Kernel signature returns `bot`, so
-        // `branch_terminates?` catches it through the type half — the same
-        // shape the `If`/`Case`/`BeginRescue` arms below approximate.
+        // statement_evaluator.rb:9666) in a syntactic position, else the
+        // type half: Kernel's signature returns `bot` unless a project
+        // toplevel `def` of the name binds the call (`def raise; end` types
+        // it `nil` — rigor-rs#966), which [`Typer::kernel_call_terminates`]
+        // answers. `exit!` is absent from the syntactic set, so only its
+        // type ever speaks.
         Node::Call { receiver: None, method, .. }
             if matches!(
                 method.as_str(),
                 "raise" | "throw" | "exit" | "exit!" | "abort" | "fail"
             ) =>
         {
-            true
+            (syntactic && method != "exit!") || t.kernel_call_terminates(ast, id)
         }
         // A clause-less `BeginRescue` is a reused carrier (a parenthesised
         // group, an `else` clause, a `case`/`in` arm — `main_body == body`
@@ -3259,7 +3292,7 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         Node::BeginRescue { main_body, clauses, .. }
             if clauses.is_empty() =>
         {
-            branch_terminates(ast, main_body)
+            arm_terminates(t, ast, main_body, syntactic && ast.is_paren_carrier(id))
         }
         // `branch_terminates?`'s Bot half for the plain-write family: a
         // write's type IS its value's, so a write terminates exactly when
@@ -3273,7 +3306,7 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         | Node::InstanceVariableWrite { value, .. }
         | Node::VariableWrite { value, .. }
         | Node::ConstantWrite { value, .. }
-        | Node::MultiWrite { value, .. } => stmt_terminates(ast, *value),
+        | Node::MultiWrite { value, .. } => stmt_terminates(t, ast, *value, false),
         // The write-call spelling of the same rule: `h[:k] = raise` and
         // `o.attr = raise` type `bot` on the oracle because the assigned
         // VALUE — the call's LAST argument — does. Other argument
@@ -3286,7 +3319,7 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
                 && method.ends_with('=')
                 && !matches!(method.as_str(), "==" | "!=" | "<=" | ">=" | "===") =>
         {
-            args.last().is_some_and(|&v| stmt_terminates(ast, v))
+            args.last().is_some_and(|&v| stmt_terminates(t, ast, v, false))
         }
         // `branch_unconditionally_exits?` recurses into `if`/`unless` only
         // when BOTH arms exit — an `if` with no else falls through on the
@@ -3297,8 +3330,8 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
         // answered `for "a"` on the oracle — rigor-rs#942 review).
         Node::If { then_body, else_body, .. } => {
             !else_body.is_empty()
-                && branch_terminates(ast, then_body)
-                && branch_terminates(ast, else_body)
+                && value_branch_terminates(t, ast, then_body)
+                && value_branch_terminates(t, ast, else_body)
         }
         // `branch_terminates?`'s Bot half, approximated syntactically: a
         // `case`/`case…in` whose every arm exits types `Bot`. The else
@@ -3314,12 +3347,12 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
                     .all(|&b| matches!(ast.get(b), Node::BeginRescue { .. }));
             let falls_through = else_body.is_empty() && !all_in_branches;
             !falls_through
-                && (else_body.is_empty() || branch_terminates(ast, else_body))
-                && branches.iter().all(|&b| stmt_terminates(ast, b))
+                && (else_body.is_empty() || value_branch_terminates(t, ast, else_body))
+                && branches.iter().all(|&b| stmt_terminates(t, ast, b, false))
         }
         // A `when` clause's exit is its body's — its conditions only pick
         // WHICH body runs, they cannot complete the branch themselves.
-        Node::When { body, .. } => branch_terminates(ast, body),
+        Node::When { body, .. } => value_branch_terminates(t, ast, body),
         // A `begin … rescue … end` exits only when every live VALUE path
         // exits: every rescue clause, plus the normally-completing path —
         // which is the protected body's own statements with no `else`,
@@ -3347,19 +3380,21 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
                         .map(|c| c.exceptions.len() + c.body.len())
                         .sum::<usize>();
                 let else_end = body.len().saturating_sub(ensure_body.len());
-                branch_terminates(ast, body.get(else_start..else_end).unwrap_or(&[]))
+                value_branch_terminates(t, ast, body.get(else_start..else_end).unwrap_or(&[]))
             } else {
-                branch_terminates(ast, main_body)
+                value_branch_terminates(t, ast, main_body)
             };
             normal_path_exits
                 && clauses
                     .iter()
-                    .all(|c| branch_terminates(ast, &c.body))
+                    .all(|c| value_branch_terminates(t, ast, &c.body))
         }
         // A recovery carrier's children are flattened out of expression
         // structure (`raise X rescue nil` recovers the `raise` call), so only a
         // real sequence ends where its last child does.
-        Node::Statements { body, kind: StatementsKind::Sequence, .. } => branch_terminates(ast, body),
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            arm_terminates(t, ast, body, syntactic)
+        }
         _ => false,
     }
 }
@@ -3367,22 +3402,21 @@ fn stmt_terminates(ast: &LoweredAst, id: NodeId) -> bool {
 /// `branch_certainly_exits?` (statement_evaluator.rb:9712) — the STRICT,
 /// syntactic-only exit test `if_join` applies to the body arm beside an
 /// `else`: a `return`/`next`/`break`, a receiverless `raise`/`fail`/`exit`/
-/// `exit!`/`abort`/`throw` call (the reference additionally checks
-/// `!scope.project_method_name?` — a decline-side gap the flat index
-/// cannot see here), a statement list or else/paren carrier whose last
+/// `exit!`/`abort`/`throw` call no project `def` names
+/// (`!scope.project_method_name?`), a statement list or else/paren carrier whose last
 /// statement exits, an `if`/`unless` whose BOTH arms certainly exit, and
 /// a `case`/`case…in` with a present else whose every branch body
 /// certainly exits (`case_certainly_exits?`). A `begin`/`rescue` is
 /// deliberately NOT recognised — it is absent from the reference's case
 /// list — and neither is the `Bot` half [`branch_terminates`] adds.
-pub(crate) fn branch_certainly_exits(ast: &LoweredAst, body: &[NodeId]) -> bool {
+pub(crate) fn branch_certainly_exits(t: &Typer<'_>, ast: &LoweredAst, body: &[NodeId]) -> bool {
     match body.last() {
-        Some(&last) => stmt_certainly_exits(ast, last),
+        Some(&last) => stmt_certainly_exits(t, ast, last),
         None => false,
     }
 }
 
-fn stmt_certainly_exits(ast: &LoweredAst, id: NodeId) -> bool {
+fn stmt_certainly_exits(t: &Typer<'_>, ast: &LoweredAst, id: NodeId) -> bool {
     match ast.get(id) {
         Node::Return { .. } => true,
         Node::Other { jump: Some(_), .. } => true,
@@ -3392,16 +3426,20 @@ fn stmt_certainly_exits(ast: &LoweredAst, id: NodeId) -> bool {
         // `CERTAIN_EXIT_NAMES` — `exit!` is here and NOT in the looser
         // `EXIT_CALL_NAMES` [`stmt_terminates`] mirrors
         // (statement_evaluator.rb:9666 vs :9743).
+        // `certain_exit_call?`'s `!scope.project_method_name?` veto: ANY
+        // project `def` of the name — on any class or module, either side
+        // — disqualifies it (rigor-rs#966; `class C; def raise; end; end;
+        // if c; raise; else; x = "s"; end` joins both arms on the oracle).
         Node::Call { receiver: None, method, .. }
             if matches!(
                 method.as_str(),
                 "raise" | "fail" | "exit" | "exit!" | "abort" | "throw"
             ) =>
         {
-            true
+            !t.project_defines_anywhere(method)
         }
         Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
-            branch_certainly_exits(ast, body)
+            branch_certainly_exits(t, ast, body)
         }
         // The carriers `branch_certainly_exits?` DOES unwrap — an
         // `ElseNode`'s statements and a `ParenthesesNode`'s body. A real
@@ -3410,12 +3448,12 @@ fn stmt_certainly_exits(ast: &LoweredAst, id: NodeId) -> bool {
         Node::BeginRescue { body, .. }
             if ast.is_else_carrier(id) || ast.is_paren_carrier(id) =>
         {
-            branch_certainly_exits(ast, body)
+            branch_certainly_exits(t, ast, body)
         }
         Node::If { then_body, else_body, .. } => {
             !else_body.is_empty()
-                && branch_certainly_exits(ast, then_body)
-                && branch_certainly_exits(ast, else_body)
+                && branch_certainly_exits(t, ast, then_body)
+                && branch_certainly_exits(t, ast, else_body)
         }
         // `case_certainly_exits?` — an else clause must be PRESENT for
         // either case kind (`!node.else_clause.nil?`,
@@ -3423,10 +3461,10 @@ fn stmt_certainly_exits(ast: &LoweredAst, id: NodeId) -> bool {
         // recognised even though it cannot match-fall-through.
         Node::Case { branches, else_body, .. } => {
             !else_body.is_empty()
-                && branch_certainly_exits(ast, else_body)
+                && branch_certainly_exits(t, ast, else_body)
                 && branches.iter().all(|&b| match ast.get(b) {
-                    Node::When { body, .. } => branch_certainly_exits(ast, body),
-                    Node::BeginRescue { body, .. } => branch_certainly_exits(ast, body),
+                    Node::When { body, .. } => branch_certainly_exits(t, ast, body),
+                    Node::BeginRescue { body, .. } => branch_certainly_exits(t, ast, body),
                     _ => false,
                 })
         }

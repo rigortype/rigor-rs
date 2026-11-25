@@ -270,11 +270,18 @@ impl Walk<'_, '_> {
                     if is_unless { (&else_body, &then_body) } else { (&then_body, &else_body) };
                 let t_out = self.list(truthy, t_in);
                 let f_out = self.list(falsey, f_in);
+                // The body arm takes the syntactic test, the else arm its
+                // type alone (rigor-rs#966).
+                let then_exits = crate::class_narrowing::branch_terminates(self.typer, ast, &then_body);
+                let else_exits =
+                    crate::class_narrowing::value_branch_terminates(self.typer, ast, &else_body);
+                let (t_exits, f_exits) =
+                    if is_unless { (else_exits, then_exits) } else { (then_exits, else_exits) };
                 let mut live = Vec::new();
-                if !crate::class_narrowing::branch_terminates(ast, truthy) {
+                if !t_exits {
                     live.push(t_out);
                 }
-                if !crate::class_narrowing::branch_terminates(ast, falsey) {
+                if !f_exits {
                     live.push(f_out);
                 }
                 Sup::join(live, &sup)

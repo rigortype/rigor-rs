@@ -53,6 +53,11 @@ pub struct ParamShape {
     pub has_kwrest: bool,
     /// A block param `&blk` is present (→ `?{ (?) -> void }`).
     pub has_block: bool,
+    /// Number of post positionals (`def f(*a, z)`'s `z`). The stub renderer
+    /// drops them; the call-arity test of the toplevel-def `bot` proof reads
+    /// them (the reference's `bindable_param_shape?` declines a def with
+    /// any — rigor-rs#966).
+    pub posts: usize,
 }
 
 impl ParamShape {
@@ -518,6 +523,7 @@ pub(crate) fn param_shape_of(params: Option<&ruby_prism::ParametersNode<'_>>) ->
         keywords,
         has_kwrest: p.keyword_rest().is_some(),
         has_block: p.block().is_some(),
+        posts: p.posts().iter().count(),
     }
 }
 

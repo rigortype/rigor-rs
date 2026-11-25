@@ -458,6 +458,68 @@ pub(crate) fn body_hull(ast: &LoweredAst, body: &[NodeId]) -> Option<Span> {
 }
 
 impl<'i> Typer<'i> {
+    /// The lowering's join-dropped arms ([`LoweredAst::discarded_spans`])
+    /// re-judged against the project. The parse-time judge reads a
+    /// receiverless `raise`/`fail`/`exit`/`abort`/`throw` as an exit
+    /// wherever it sits, but the reference reads it SYNTACTICALLY only at
+    /// an arm's own tail (`branch_unconditionally_exits?`); elsewhere — an
+    /// `else` arm, a `case` arm, a nested `if`'s arms, a write's value —
+    /// the arm terminates only when it types `bot`, and a project toplevel
+    /// `def raise; end` types the call `nil` (rigor-rs#966: `def raise;
+    /// end; begin …; rescue; x = "e"; if c; raise; else; raise; end; end`
+    /// keeps the clause live on the oracle). An arm the project-aware
+    /// judges ([`crate::class_narrowing::branch_terminates`] and its value
+    /// twin) find live is no longer dropped — its writes reach the join,
+    /// the decline side. Without a project toplevel `def` of an exit name
+    /// nothing changes, so the walk is skipped.
+    fn typed_discarded_spans(&self, ast: &LoweredAst) -> Vec<Span> {
+        use crate::class_narrowing::{branch_terminates, value_branch_terminates};
+        let spans = ast.discarded_spans();
+        if spans.is_empty() || !EXIT_CALLS.iter().any(|m| self.source.is_project_toplevel_def(m)) {
+            return spans.to_vec();
+        }
+        let body_span = |body: &[NodeId]| match (body.first(), body.last()) {
+            (Some(&f), Some(&l)) => Some((ast.get(f).span().0, ast.get(l).span().1)),
+            _ => None,
+        };
+        let mut live: Vec<Span> = Vec::new();
+        let mut judge = |span: Option<Span>, exits: &dyn Fn() -> bool| {
+            if let Some(sp) = span {
+                if spans.contains(&sp) && !exits() {
+                    live.push(sp);
+                }
+            }
+        };
+        for (_, n) in ast.iter() {
+            match n {
+                Node::If { then_body, else_body, .. } => {
+                    judge(body_span(then_body), &|| branch_terminates(self, ast, then_body));
+                    judge(body_span(else_body), &|| value_branch_terminates(self, ast, else_body));
+                }
+                Node::BeginRescue { clauses, .. } => {
+                    for c in clauses {
+                        let exits = !c.body.is_empty() && branch_terminates(self, ast, &c.body);
+                        judge(body_span(&c.body), &|| exits);
+                        for &e in &c.exceptions {
+                            judge(Some(ast.get(e).span()), &|| exits);
+                        }
+                    }
+                }
+                Node::Case { branches, else_body, .. } => {
+                    for &b in branches {
+                        judge(Some(ast.get(b).span()), &|| value_branch_terminates(self, ast, &[b]));
+                    }
+                    judge(body_span(else_body), &|| value_branch_terminates(self, ast, else_body));
+                }
+                Node::Logical { right, .. } => {
+                    judge(Some(ast.get(*right).span()), &|| branch_terminates(self, ast, &[*right]));
+                }
+                _ => {}
+            }
+        }
+        spans.iter().copied().filter(|sp| !live.contains(sp)).collect()
+    }
+
     /// Compute the file's [`DeadPositions`], memoized on the [`Typer`] per
     /// `ast` identity. `seen` is the shared `expr_scalar` recursion cap.
     ///
@@ -490,7 +552,7 @@ impl<'i> Typer<'i> {
             return self.dead_partial.borrow().clone();
         }
         let mut dead = DeadPositions {
-            dropped: ast.discarded_spans().to_vec(),
+            dropped: self.typed_discarded_spans(ast),
             iterated: ast.iterated_body_spans().to_vec(),
             bare: ast.bare_locals_only_spans().to_vec(),
             locals_only: ast.locals_only_spans().to_vec(),
@@ -1537,7 +1599,32 @@ impl<'i> Typer<'i> {
         body: &[NodeId],
         seen: &mut Vec<String>,
     ) -> bool {
-        body.last().is_some_and(|&l| self.stmt_exits(ast, l, seen))
+        self.arm_exits_at(ast, body, seen, true)
+    }
+
+    /// [`Self::arm_exits`] for an arm the reference hands
+    /// `branch_terminates?` as a node `branch_unconditionally_exits?` has no
+    /// case for — an `if`'s `ElseNode`/elsif `subsequent`, a `case` arm —
+    /// so only the arm's TYPE decides (rigor-rs#966): a receiverless
+    /// `raise` a project toplevel `def raise; end` answers types `nil`
+    /// there and the arm stays live.
+    pub(crate) fn value_arm_exits(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        seen: &mut Vec<String>,
+    ) -> bool {
+        self.arm_exits_at(ast, body, seen, false)
+    }
+
+    fn arm_exits_at(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        seen: &mut Vec<String>,
+        syntactic: bool,
+    ) -> bool {
+        body.last().is_some_and(|&l| self.stmt_exits_at(ast, l, seen, syntactic))
     }
 
     /// `branch_unconditionally_exits?` (`statement_evaluator.rb:5027`): `return`,
@@ -1546,11 +1633,32 @@ impl<'i> Typer<'i> {
     /// `if`/`unless` whose live arm exits (folded predicate) or whose BOTH
     /// arms exit, and — the `branch_terminates?`/`Bot` half the port can see —
     /// a write or call whose evaluated value exits.
+    ///
+    /// The receiverless exit-name arm is `branch_unconditionally_exits?`'s
+    /// SYNTACTIC test, which the reference applies only where it is handed
+    /// the node itself: an arm's statement list and its tail, a `(…)` body
+    /// (`syntactic`). Everywhere else — a write's value, a call operand, a
+    /// nested `if`'s arms, a `begin` body — only the `Bot` half speaks, and
+    /// a receiverless `raise` is `bot` there only when no project toplevel
+    /// `def raise` binds the call ([`Self::kernel_call_terminates`],
+    /// [`Self::def_exits`]; rigor-rs#966: `def raise; end; … rescue; x =
+    /// "e"; @q = raise` keeps the arm live on the oracle while `…; x = "e";
+    /// raise` still exits).
     pub(crate) fn stmt_exits(
         &self,
         ast: &LoweredAst,
         id: NodeId,
         seen: &mut Vec<String>,
+    ) -> bool {
+        self.stmt_exits_at(ast, id, seen, true)
+    }
+
+    fn stmt_exits_at(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        seen: &mut Vec<String>,
+        syntactic: bool,
     ) -> bool {
         match ast.get(id) {
             Node::Return { .. } => true,
@@ -1566,7 +1674,7 @@ impl<'i> Typer<'i> {
                 receiver: None,
                 method,
                 ..
-            } if EXIT_CALLS.contains(&method.as_str()) => true,
+            } if syntactic && EXIT_CALLS.contains(&method.as_str()) => true,
             // `next x` / `break x` still exit — the value is the jump's
             // payload, not a fall-through (`NextNode`/`BreakNode` count
             // unconditionally on the oracle). `redo`/`retry` re-enter, so
@@ -1579,7 +1687,7 @@ impl<'i> Typer<'i> {
                 // Only a straight-line sequence's tail exits; `Recovered` /
                 // `Inert` / `Jump` carriers do not run their tail in order.
                 matches!(kind, StatementsKind::Sequence)
-                    && self.arm_exits(ast, body, seen)
+                    && self.arm_exits_at(ast, body, seen, syntactic)
             }
             Node::If {
                 predicate,
@@ -1596,11 +1704,11 @@ impl<'i> Typer<'i> {
                     } else {
                         else_body
                     };
-                    self.arm_exits(ast, live, seen)
+                    self.value_arm_exits(ast, live, seen)
                 }
                 None => {
-                    self.arm_exits(ast, then_body, seen)
-                        && self.arm_exits(ast, else_body, seen)
+                    self.value_arm_exits(ast, then_body, seen)
+                        && self.value_arm_exits(ast, else_body, seen)
                 }
             },
             // A clause-less `begin` is a parenthesised / else-only carrier
@@ -1608,14 +1716,20 @@ impl<'i> Typer<'i> {
             // flat `body`'s tail is then the ENSURE's last statement, but
             // `ensure` contributes no value path, so the begin exits iff
             // its protected body does (rigor-rs#956).
+            // Only a `(…)` body keeps the syntactic test
+            // (`ParenthesesNode`); an `else` carrier or a real `begin` is
+            // typed (rigor-rs#966).
             Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
-                self.arm_exits(ast, main_body, seen)
+                let syntactic = syntactic && ast.is_paren_carrier(id);
+                self.arm_exits_at(ast, main_body, seen, syntactic)
             }
             // A write whose value position exits types the write `Bot`
             // (`x = raise`); a call with an exit in an evaluated operand the
             // same (`f(raise)`). A receiver call's exit is already covered
             // by `receiver`'s own check.
-            Node::LocalVariableWrite { value, .. } => self.stmt_exits(ast, *value, seen),
+            Node::LocalVariableWrite { value, .. } => {
+                self.stmt_exits_at(ast, *value, seen, false)
+            }
             // The other plain writes (`@q = raise`, `$q`/`@@q`/`Q = raise`,
             // `q, r = raise` — rigor-rs#956) take the STRICT value test: a
             // call value counts only when the call itself types `bot`, not
@@ -1634,8 +1748,8 @@ impl<'i> Typer<'i> {
                 span,
                 ..
             } => {
-                receiver.is_some_and(|r| self.stmt_exits(ast, r, seen))
-                    || args.iter().any(|&a| self.stmt_exits(ast, a, seen))
+                receiver.is_some_and(|r| self.stmt_exits_at(ast, r, seen, false))
+                    || args.iter().any(|&a| self.stmt_exits_at(ast, a, seen, false))
                     // `branch_terminates?`'s OTHER half — a `Bot`-typed call
                     // terminates too (`statement_evaluator.rb:4997`): the
                     // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
@@ -1649,7 +1763,7 @@ impl<'i> Typer<'i> {
                     || self.kernel_call_terminates(ast, id)
                     || (receiver.is_none()
                         && !self.self_answers(ast, *span, method)
-                        && self.def_exits(ast, method, seen))
+                        && self.def_exits(ast, id, seen))
             }
             _ => false,
         }
@@ -1712,7 +1826,17 @@ impl<'i> Typer<'i> {
     /// cannot answer this call; a cross-file def's body is not in this AST.
     /// Every miss declines — the arm stays live, which only ever loses a
     /// diagnostic.
-    fn def_exits(&self, ast: &LoweredAst, method: &str, seen: &mut Vec<String>) -> bool {
+    ///
+    /// The call must also BIND the def's parameters, or the reference
+    /// never re-types its body: `bind_params_from_call_types` returns nil
+    /// on an arity mismatch and `try_local_def_dispatch` answers
+    /// `Dynamic[Top]`, so `def die; raise; end` does not make `die(1)`
+    /// `bot` (rigor-rs#966). [`call_binds_def_params`] is a strict subset
+    /// of that binder.
+    fn def_exits(&self, ast: &LoweredAst, call: NodeId, seen: &mut Vec<String>) -> bool {
+        let Node::Call { method, .. } = ast.get(call) else {
+            return false;
+        };
         let key = format!("bot-def:{method}");
         if self.seen_contains(seen, &key) || seen.len() >= 6 {
             return false;
@@ -1728,7 +1852,9 @@ impl<'i> Typer<'i> {
         // per name (rigor-rs#422).
         let last = self.reach_index(ast).last_toplevel_def(method);
         let exits = last.is_some_and(|id| match ast.get(id) {
-            Node::Definition { body, .. } => self.arm_bot(ast, body, seen),
+            Node::Definition { body, .. } => {
+                call_binds_def_params(ast, call, id) && self.arm_bot(ast, body, seen)
+            }
             _ => false,
         });
         seen.pop();
@@ -1770,14 +1896,13 @@ impl<'i> Typer<'i> {
                 span,
                 ..
             } => {
-                (receiver.is_none() && EXIT_CALLS.contains(&method.as_str()))
-                    || self.kernel_call_terminates(ast, value)
+                self.kernel_call_terminates(ast, value)
                     || (receiver.is_none()
                         && !self.self_answers(ast, *span, method)
-                        && self.def_exits(ast, method, seen))
+                        && self.def_exits(ast, value, seen))
             }
             _ if bot => self.stmt_bot(ast, value, seen),
-            _ => self.stmt_exits(ast, value, seen),
+            _ => self.stmt_exits_at(ast, value, seen, false),
         }
     }
 
@@ -1799,11 +1924,10 @@ impl<'i> Typer<'i> {
             Node::Statements { body, kind, .. } => {
                 matches!(kind, StatementsKind::Sequence) && self.arm_bot(ast, body, seen)
             }
-            Node::Call {
-                receiver: None,
-                method,
-                ..
-            } if EXIT_CALLS.contains(&method.as_str()) => true,
+            // A receiverless `raise`/`exit`/… is the generic call arm's
+            // question below: `bot` unless a project toplevel `def` binds
+            // it (`def raise; end` makes `def die; raise; end` return
+            // `nil` — rigor-rs#966).
             Node::If {
                 predicate,
                 then_body,
@@ -1853,11 +1977,40 @@ impl<'i> Typer<'i> {
                     || self.kernel_call_terminates(ast, id)
                     || (receiver.is_none()
                         && !self.self_answers(ast, *span, method)
-                        && self.def_exits(ast, method, seen))
+                        && self.def_exits(ast, id, seen))
             }
             _ => false,
         }
     }
+}
+
+/// Whether the call `call` binds the parameters of the toplevel `def` `def`
+/// on the reference (`bind_params_from_call_types`,
+/// `expression_typer.rb:5159`) — a strict subset, every unsure shape
+/// declining (rigor-rs#966). The call passes plain positionals only (a
+/// splat, a bare keyword hash or `...` changes the correspondence); the def
+/// takes no post positionals (`bindable_param_shape?` declines posts
+/// outright), and the positional count fits its required, optional and
+/// rest slots. Keyword parameters bind leniently — a missing one, required
+/// or not, binds `Dynamic` (probed) — but a def that takes keywords pops a
+/// trailing `Hash`-typed positional as the keyword hash, so the count must
+/// fit with and without that last argument. A `**rest` is indistinguishable
+/// from `...` here, which the reference treats as a positional rest; both
+/// keep the strict count. A block or `&blk` never enters `arguments()`, so
+/// it does not count.
+fn call_binds_def_params(ast: &LoweredAst, call: NodeId, def: NodeId) -> bool {
+    let (Node::Call { args, args_plain_positional, .. }, Node::Definition { param_shape: p, .. }) =
+        (ast.get(call), ast.get(def))
+    else {
+        return false;
+    };
+    let fits = |n: usize| p.required <= n && (p.has_rest || n <= p.required + p.optional);
+    let takes_keywords = !p.keywords.is_empty() || p.has_kwrest;
+    let argc = args.len();
+    *args_plain_positional
+        && p.posts == 0
+        && fits(argc)
+        && (!takes_keywords || argc == 0 || fits(argc - 1))
 }
 
 impl<'i> Typer<'i> {
