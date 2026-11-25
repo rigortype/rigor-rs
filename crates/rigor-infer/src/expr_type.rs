@@ -2069,6 +2069,44 @@ impl<'i> Typer<'i> {
             "-" | "difference" => self
                 .tuple_set_operation(&elems, args, ast, env, interner, set_difference)
                 .map(|r| interner.intern(Type::Tuple(r))),
+            // `tuple_concat`: `t + other` on a `Tuple` argument is the
+            // element-wise concatenation, pinned or not (`[x] + [2]` is
+            // `[Float, 2]` on the oracle) — any other argument declines to
+            // the RBS tier (rigor-rs#944). The reference's `tuple_concat` is
+            // uncapped, so `a += a` doubling 26 times materialises a
+            // 67M-element Tuple (65s on the oracle); the port declines past
+            // `MAX_TUPLE_CONCAT_SIZE` elements instead — master's RBS
+            // `Array` answer, a coverage loss, never a blow-up.
+            "+" if args.len() == 1 => {
+                const MAX_TUPLE_CONCAT_SIZE: usize = 1024;
+                let arg_ty = self.type_of(ast, args[0], env, interner);
+                let Type::Tuple(other) = interner.get(arg_ty) else {
+                    return None;
+                };
+                if elems.len() + other.len() > MAX_TUPLE_CONCAT_SIZE {
+                    return None;
+                }
+                let joined: Vec<TypeId> = elems.iter().chain(other.iter()).copied().collect();
+                Some(interner.intern(Type::Tuple(joined)))
+            }
+            // `tuple_star`'s repetition half: `t * n` on a `Constant`
+            // Integer `n` repeats the elements — `n == 0` is `[]`, a
+            // negative `n` (an `ArgumentError`) or a result past
+            // `MAX_SET_OPERATION_SIZE` (64) declines. The `t * ","` join
+            // alias is not ported and declines with every other argument.
+            "*" if args.len() == 1 => {
+                let arg_ty = self.type_of(ast, args[0], env, interner);
+                let Type::Constant(Scalar::Int(n)) = interner.get(arg_ty) else {
+                    return None;
+                };
+                let n = usize::try_from(*n).ok()?;
+                if elems.len().checked_mul(n)? > 64 {
+                    return None;
+                }
+                let repeated: Vec<TypeId> =
+                    std::iter::repeat_n(elems.iter().copied(), n).flatten().collect();
+                Some(interner.intern(Type::Tuple(repeated)))
+            }
             // The predicate form of `&`. Folds to a pinned bool, so it can prove
             // a condition constant (`if %w[a].intersect?(%w[b])` is falsey).
             "intersect?" => {

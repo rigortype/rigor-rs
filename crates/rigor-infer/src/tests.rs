@@ -969,6 +969,62 @@ fn element_read_mutations_rebuild_the_carrier() {
     assert_eq!(env.get("a"), Some(&tup));
 }
 
+/// rigor-rs#944: an operator write the constant fold cannot answer
+/// dispatches `a.<op>(v)` on the entry (`dispatch_operator`) on the rows the
+/// reference cannot fold, and keeps the decline everywhere else. Every
+/// expected value is the oracle's own answer.
+#[test]
+fn op_write_dispatch_rebinds_the_reference_answer() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let show = |src: &[u8], name: &str| -> String {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = *env.get(name).expect("bound");
+        match i.get(ty) {
+            Type::Dynamic(_) => "untyped".to_string(),
+            _ => rigor_types::describe_named(&i, ty, &|c| {
+                index.class_name_for_id(c).map(str::to_string)
+            }),
+        }
+    };
+    for (src, want) in [
+        // A raising operand falls to the RBS answer.
+        (&b"s = \"abc\"\ns += nil\n"[..], "String"),
+        (b"s = \"abc\"\ns += 2\n", "String"),
+        (b"s = \"abc\"\ns *= nil\n", "String"),
+        (b"x = 1\nx <<= nil\n", "Integer"),
+        // `String#+` answers `String` for an untyped operand.
+        (b"s = \"abc\"\ns += unresolved\n", "String"),
+        // A plain nominal entry has no literal to fold.
+        (b"s = \"abc\"\ns << \"d\"\ns *= 2\n", "String"),
+        (b"s = \"abc\"\ns << \"d\"\ns *= 0\n", "\"\""),
+        (b"x = rand\nx %= 1\n", "Float"),
+        // The Tuple shape folds.
+        (b"a = [1]\na += [2]\n", "[1, 2]"),
+        (b"a = [1]\na *= 2\n", "[1, 1]"),
+        (b"a = [1]\na -= [1]\n", "[]"),
+        // Declines: the reference folds what the port cannot (`1 << 2.0`
+        // is `4`, `"abc" * 2.0` is `"abcabc"`), a union entry never takes
+        // the plain call's non-nil retry, `String#<<` turns on literalness,
+        // and an erased `Array` would drop the reference's type arguments.
+        (b"x = 1\nx <<= 2.0\n", "untyped"),
+        (b"s = \"abc\"\ns *= 2.0\n", "untyped"),
+        (b"s = \"abc\"\ns %= [2]\n", "untyped"),
+        (b"x = nil\nx = 1 if c\nx += 1\n", "untyped"),
+        (b"s = \"abc\"\ns <<= 1.5.to_s\n", "untyped"),
+        (b"a = [1]\na += unresolved\n", "untyped"),
+        (b"a = [1]\na <<= 2\n", "untyped"),
+        // `tuple_concat` past 1,024 elements declines rather than
+        // materialising a doubling chain (2^11 elements here).
+        (b"a = [1]\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\n", "untyped"),
+    ] {
+        let name = if src.starts_with(b"a") { "a" } else if src.starts_with(b"x") { "x" } else { "s" };
+        assert_eq!(show(src, name), want, "{}", String::from_utf8_lossy(src));
+    }
+}
+
 /// rigor-rs#774: a certainty-folded `if`'s LIVE arm is straight-line code
 /// to the check env, so a content mutation inside it lands the reference's
 /// own widening — a nominal (`String`, `Hash[…]`) or a keep — where the

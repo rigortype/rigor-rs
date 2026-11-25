@@ -582,7 +582,7 @@ impl<'i> Typer<'i> {
                 let (name, value, op) = (name.clone(), *value, op.clone());
                 let v_ty = self.type_of(ast, value, env, interner);
                 let new_ty = match env.get(name.as_str()).copied() {
-                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    Some(entry) => self.op_write_result(ast, stmt, entry, &op, value, v_ty, env, interner),
                     None => interner.untyped(),
                 };
                 drop_indexed_narrowings(env, &name);
@@ -702,17 +702,28 @@ impl<'i> Typer<'i> {
     }
 
     /// The new binding of `a` after `a <op>= v`, from `a`'s entry binding and
-    /// `v`'s type (`untyped` declines).
-    fn op_write_result(
+    /// `v`'s type (`untyped` declines). `site` is the op-write node and
+    /// `value` its operand: an operator write the constant fold cannot
+    /// answer dispatches `a.<op>(v)` the way the reference's
+    /// `dispatch_operator` does (rigor-rs#944).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn op_write_result(
         &self,
+        ast: &LoweredAst,
+        site: NodeId,
         entry: TypeId,
         op: &rigor_parse::OpWriteKind,
+        value: NodeId,
         v_ty: TypeId,
+        env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
         use rigor_parse::OpWriteKind;
         let untyped = interner.untyped();
-        if matches!(interner.get(entry), Type::Dynamic(_)) || matches!(interner.get(v_ty), Type::Dynamic(_)) {
+        if matches!(interner.get(entry), Type::Dynamic(_)) {
+            return untyped;
+        }
+        if matches!(interner.get(v_ty), Type::Dynamic(_)) && !matches!(op, OpWriteKind::Operator(_)) {
             return untyped;
         }
         match op {
@@ -730,8 +741,9 @@ impl<'i> Typer<'i> {
                 Some((_, None)) => v_ty,
                 None => untyped,
             },
-            // `a <binop>= v` ⇒ `a = a.<binop>(v)`: a literal-by-literal
-            // fold is exact; every other dispatch declines.
+            // `a <binop>= v` ⇒ `a = a.<binop>(v)` (`compound_result_type` →
+            // `dispatch_operator`): the literal-by-literal fold first, then
+            // the plain-call dispatch on the entry type.
             OpWriteKind::Operator(opname) => {
                 // `local_variable_operator_write` expands to the entry's own
                 // binary call, which the reference dispatches through the
@@ -745,72 +757,253 @@ impl<'i> Typer<'i> {
                         return ty;
                     }
                 }
-                // Memberwise over a union of constants so a loop fixpoint can
-                // see `x |= 1` stabilize at `0 | 1` instead of declining the
-                // second pass to `Dynamic` (rigor-rs#638) — the port's
-                // answer to the reference's `ConstantFolding
-                // .try_fold_binary_set`, including its caps
-                // (`UNION_FOLD_INPUT_LIMIT` = 32 input members × arg sets,
-                // `UNION_FOLD_OUTPUT_LIMIT` = 8 deduped results): past them
-                // the reference widens or declines, and so does this. A
-                // non-constant member declines the whole write.
-                const UNION_FOLD_INPUT_LIMIT: usize = 32;
-                const UNION_FOLD_OUTPUT_LIMIT: usize = 8;
-                let v_scalar = match interner.get(v_ty) {
-                    Type::Constant(a) => a.clone(),
-                    _ => return untyped,
-                };
-                let members: Vec<TypeId> = match interner.get(entry) {
-                    Type::Union(ms) => ms.clone(),
-                    _ => vec![entry],
-                };
-                if members.len() > UNION_FOLD_INPUT_LIMIT {
-                    return untyped;
+                if let Some(ty) = self.op_write_constant_fold(entry, opname, v_ty, interner) {
+                    return ty;
                 }
-                let mut folded: Vec<Scalar> = Vec::new();
-                let mut acc: Option<TypeId> = None;
-                for m in members {
-                    let r = match interner.get(m) {
-                        Type::Constant(r) => r.clone(),
-                        _ => return untyped,
-                    };
-                    match crate::folding::fold_outcome(&r, opname, std::slice::from_ref(&v_scalar)) {
-                        crate::folding::FoldOutcome::Value(sc) => {
-                            if !folded.contains(&sc) {
-                                if folded.len() >= UNION_FOLD_OUTPUT_LIMIT {
-                                    return untyped;
-                                }
-                                folded.push(sc.clone());
-                            }
-                            let f = interner.intern(Type::Constant(sc));
-                            acc = Some(match acc {
-                                None => f,
-                                Some(a) => rigor_types::Algebra::join(interner, a, f),
-                            });
+                self.op_write_dispatch(ast, site, entry, opname, value, v_ty, env, interner)
+            }
+        }
+    }
+
+    /// The constant half of an operator write: `a`'s entry (a `Constant` or a
+    /// union of them) folded against a `Constant` operand. `None` when the
+    /// fold cannot answer — the caller then dispatches.
+    fn op_write_constant_fold(
+        &self,
+        entry: TypeId,
+        opname: &str,
+        v_ty: TypeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        // Memberwise over a union of constants so a loop fixpoint can
+        // see `x |= 1` stabilize at `0 | 1` instead of declining the
+        // second pass to `Dynamic` (rigor-rs#638) — the port's
+        // answer to the reference's `ConstantFolding
+        // .try_fold_binary_set`, including its caps
+        // (`UNION_FOLD_INPUT_LIMIT` = 32 input members × arg sets,
+        // `UNION_FOLD_OUTPUT_LIMIT` = 8 deduped results): past them
+        // the reference widens or declines, and so does this. A
+        // non-constant member declines the whole write.
+        const UNION_FOLD_INPUT_LIMIT: usize = 32;
+        const UNION_FOLD_OUTPUT_LIMIT: usize = 8;
+        let v_scalar = match interner.get(v_ty) {
+            Type::Constant(a) => a.clone(),
+            _ => return None,
+        };
+        let members: Vec<TypeId> = match interner.get(entry) {
+            Type::Union(ms) => ms.clone(),
+            _ => vec![entry],
+        };
+        if members.len() > UNION_FOLD_INPUT_LIMIT {
+            return None;
+        }
+        let mut folded: Vec<Scalar> = Vec::new();
+        let mut acc: Option<TypeId> = None;
+        for m in members {
+            let r = match interner.get(m) {
+                Type::Constant(r) => r.clone(),
+                _ => return None,
+            };
+            match crate::folding::fold_outcome(&r, opname, std::slice::from_ref(&v_scalar)) {
+                crate::folding::FoldOutcome::Value(sc) => {
+                    if !folded.contains(&sc) {
+                        if folded.len() >= UNION_FOLD_OUTPUT_LIMIT {
+                            return None;
                         }
-                        // `build_constant_type`'s `WidenedResult` partition:
-                        // a member fold past `INTEGER_FOLD_BIT_LIMIT` joins
-                        // its `Nominal[cls]` into the union, it does not
-                        // count toward the output cap and it does not
-                        // decline the whole write (rigor-rs#694) —
-                        // `x = c ? 1 : 2; x <<= 13605` answers
-                        // `<literal> | Integer` on the oracle.
-                        crate::folding::FoldOutcome::Widened(class) => {
-                            let n = self.nominal_or_untyped(class, interner);
-                            acc = Some(match acc {
-                                None => n,
-                                Some(a) => rigor_types::Algebra::join(interner, a, n),
-                            });
-                        }
-                        // An op-write (`x /= y`) never asks for a Tuple
-                        // or an unrepresentable carrier — treat either as
-                        // a decline, same as `invoke`'s nil.
-                        crate::folding::FoldOutcome::Tuple(_)
-                        | crate::folding::FoldOutcome::Unrepresentable
-                        | crate::folding::FoldOutcome::Declined => return untyped,
+                        folded.push(sc.clone());
                     }
+                    let f = interner.intern(Type::Constant(sc));
+                    acc = Some(match acc {
+                        None => f,
+                        Some(a) => rigor_types::Algebra::join(interner, a, f),
+                    });
                 }
-                acc.unwrap_or(untyped)
+                // `build_constant_type`'s `WidenedResult` partition:
+                // a member fold past `INTEGER_FOLD_BIT_LIMIT` joins
+                // its `Nominal[cls]` into the union, it does not
+                // count toward the output cap and it does not
+                // decline the whole write (rigor-rs#694) —
+                // `x = c ? 1 : 2; x <<= 13605` answers
+                // `<literal> | Integer` on the oracle.
+                crate::folding::FoldOutcome::Widened(class) => {
+                    let n = self.nominal_or_untyped(class, interner);
+                    acc = Some(match acc {
+                        None => n,
+                        Some(a) => rigor_types::Algebra::join(interner, a, n),
+                    });
+                }
+                // An op-write (`x /= y`) never asks for a Tuple
+                // or an unrepresentable carrier — treat either as
+                // a decline, same as `invoke`'s nil.
+                crate::folding::FoldOutcome::Tuple(_)
+                | crate::folding::FoldOutcome::Unrepresentable
+                | crate::folding::FoldOutcome::Declined => return None,
+            }
+        }
+        acc
+    }
+
+    /// `dispatch_operator` (`statement_evaluator.rb`): an operator write the
+    /// constant fold cannot answer types as the call `entry.<op>(value)` —
+    /// `MethodDispatcher.dispatch` on the entry type, the dispatch a plain
+    /// `s + v` reaches (`s = "abc"; s += nil` is `String`, `a = [1]; a +=
+    /// [2]` the concatenated `[1, 2]`, rigor-rs#944). The port answers it
+    /// through the plain-call cascade with the entry as the receiver
+    /// override, but only on the rows [`Self::op_write_dispatch_admits`]
+    /// lists — where the reference cannot fold whatever the operands'
+    /// precision, so the RBS answer the cascade gives is the reference's
+    /// too. Beyond them:
+    ///
+    /// - a `Union` entry declines: the port's union dispatch is the
+    ///   ExpressionTyper's `try_non_nil_receiver_retry`, which the
+    ///   statement evaluator's direct dispatch never runs (`x = nil; x = 1
+    ///   if c; x += 1` stays silent on the oracle where `(x + 1)` answers
+    ///   `2`);
+    /// - a bare `Array`/`Hash`/`Set`/`Range` answer declines: the reference
+    ///   carries the RBS type arguments the port's erased nominal drops
+    ///   (`a += unresolved` is `Array[1 | Dynamic[top]]`), so a witness on it
+    ///   would drift its message;
+    /// - sig-gen's def-local replay (`def_scope`) keeps the old decline: its
+    ///   byte-identity bar needs the reference's fold tables, which the
+    ///   plain-call `decline_fold_gap` guard only approximates.
+    #[allow(clippy::too_many_arguments)]
+    fn op_write_dispatch(
+        &self,
+        ast: &LoweredAst,
+        site: NodeId,
+        entry: TypeId,
+        opname: &str,
+        value: NodeId,
+        v_ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let untyped = interner.untyped();
+        if self.def_scope.get().is_some() || !self.op_write_dispatch_admits(entry, opname, v_ty, interner) {
+            return untyped;
+        }
+        let ty = self.type_call_declines(
+            ast,
+            site,
+            opname,
+            std::slice::from_ref(&value),
+            true,
+            env,
+            interner,
+            true,
+            Some(entry),
+        );
+        match interner.get(ty) {
+            // The `Tuple` rows answer only through the shape folds.
+            _ if matches!(interner.get(entry), Type::Tuple(_)) && !matches!(interner.get(ty), Type::Tuple(_)) => {
+                untyped
+            }
+            Type::Nominal { class, args }
+                if args.is_empty()
+                    && matches!(
+                        self.index.class_name_for_id(*class),
+                        Some("Array" | "Hash" | "Set" | "Range")
+                    ) =>
+            {
+                untyped
+            }
+            _ => ty,
+        }
+    }
+
+    /// The operator-write rows [`Self::op_write_dispatch`] answers. The
+    /// hazard is precision: a port carrier is often coarser than the
+    /// reference's (`1.5.to_s` is the port's `non-empty-string` but the
+    /// oracle's `"1.5"`; `1r` is the port's `Dynamic`), and where the
+    /// reference can still FOLD the call the RBS answer drifts its message
+    /// (`1 <<= 2.0` is `4`, `"abc" %= [2]` is `"abc"`) or fires where the
+    /// literal-string tier is silent (`"abc" <<= 1.5.to_s`). So the rows are
+    /// the ones the reference cannot fold whatever the operands' precision:
+    ///
+    /// - a `TypeError` operand on a `String` / `Integer` / `Float` entry
+    ///   (`Constant` or plain `Nominal`): a pinned `nil` / `true` / `false`
+    ///   / Symbol, a `Tuple` / `HashShape`, a String on a numeric entry, a
+    ///   non-String on `String#+`, a String or negative count on
+    ///   `String#*` — `invoke_binary` rescues the raise to `nil` and the RBS
+    ///   tier answers;
+    /// - `String#+` on an untyped operand (`s += unresolved` is `String`:
+    ///   the one overload answers `String` for any argument);
+    /// - a plain `Nominal` entry (no literal to fold): `String * n` for a
+    ///   pinned `n >= 0`, and numeric arithmetic on a pinned or plain
+    ///   numeric operand;
+    /// - a `Tuple` entry on a `Tuple` / pinned-Integer operand (the
+    ///   `tuple_concat` / `tuple_star` / set-operation shape folds).
+    ///
+    /// `String#<<` is never admitted: its literal-string answer turns on
+    /// operand literalness the port's carriers lose.
+    ///
+    /// This is a heuristic, not an exact subset of the reference's
+    /// no-fold rows: a plain-`Nominal` entry the oracle still holds as a
+    /// literal (`"1".to_i`, `"abc".chomp`) answers the RBS class where the
+    /// oracle folds (message drift), and an operand the port types
+    /// `Dynamic` but the oracle types as a literal string (`"x" "y"`) is
+    /// admitted on `String#+` (PR #978 review, F2/F4 follow-ups).
+    fn op_write_dispatch_admits(
+        &self,
+        entry: TypeId,
+        opname: &str,
+        v_ty: TypeId,
+        interner: &Interner,
+    ) -> bool {
+        let plain_nominal = |ty: TypeId| match interner.get(ty) {
+            Type::Nominal { class, args } if args.is_empty() => self
+                .index
+                .class_name_for_id(*class)
+                .filter(|n| matches!(*n, "String" | "Integer" | "Float")),
+            _ => None,
+        };
+        let (entry_class, entry_pinned) = match interner.get(entry) {
+            Type::Constant(Scalar::Str(_)) => ("String", true),
+            Type::Constant(Scalar::Int(_) | Scalar::BigInt(_)) => ("Integer", true),
+            Type::Constant(Scalar::Float(_)) => ("Float", true),
+            Type::Tuple(_) => ("Array", false),
+            _ => match plain_nominal(entry) {
+                Some(n) => (n, false),
+                None => return false,
+            },
+        };
+        let v = interner.get(v_ty);
+        let collection = matches!(v, Type::Tuple(_) | Type::HashShape(_));
+        let non_coercible = matches!(
+            v,
+            Type::Constant(Scalar::Nil | Scalar::Bool(_) | Scalar::Sym(_))
+        );
+        let pinned_str = matches!(v, Type::Constant(Scalar::Str(_)));
+        let pinned_numeric = matches!(
+            v,
+            Type::Constant(Scalar::Int(_) | Scalar::BigInt(_) | Scalar::Float(_))
+        );
+        match entry_class {
+            "Array" => {
+                matches!(v, Type::Tuple(_) | Type::Constant(Scalar::Int(_)))
+                    && matches!(opname, "+" | "-" | "*" | "&" | "|")
+            }
+            "String" => match opname {
+                "+" => {
+                    ((non_coercible || pinned_numeric || collection) && !pinned_str)
+                        || matches!(v, Type::Dynamic(_))
+                }
+                "*" => {
+                    non_coercible
+                        || pinned_str
+                        || collection
+                        || matches!(v, Type::Constant(Scalar::Int(n)) if *n < 0 || !entry_pinned)
+                }
+                _ => false,
+            },
+            _ => {
+                if non_coercible || pinned_str || collection {
+                    return true;
+                }
+                !entry_pinned
+                    && matches!(opname, "+" | "-" | "*" | "/" | "%" | "**")
+                    && (pinned_numeric
+                        || matches!(plain_nominal(v_ty), Some("Integer" | "Float")))
             }
         }
     }
@@ -4907,7 +5100,7 @@ impl<'i> Typer<'i> {
                                             if n2 == name =>
                                         {
                                             let v_ty = this.type_of(ast, *value, env, interner);
-                                            let ty = this.op_write_result(entry, op, v_ty, interner);
+                                            let ty = this.op_write_result(ast, n, entry, op, *value, v_ty, env, interner);
                                             consider(wspan, ty);
                                         }
                                         Node::MultiWrite { targets, value, .. } => {
@@ -5108,7 +5301,7 @@ impl<'i> Typer<'i> {
                 );
                 let v_ty = self.type_of(ast, value, env, interner);
                 let new_ty = match entry_ty {
-                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    Some(entry) => self.op_write_result(ast, id, entry, &op, value, v_ty, env, interner),
                     None => interner.untyped(),
                 };
                 drop_indexed_narrowings(env, &name);
@@ -6066,7 +6259,7 @@ impl<'i> Typer<'i> {
                 let (name, value, op) = (name.clone(), *value, op.clone());
                 let v_ty = self.type_of(ast, value, env, interner);
                 let new_ty = match env.get(name.as_str()).copied() {
-                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    Some(entry) => self.op_write_result(ast, id, entry, &op, value, v_ty, env, interner),
                     None => interner.untyped(),
                 };
                 drop_indexed_narrowings(env, &name);
@@ -6587,7 +6780,7 @@ impl<'i> Typer<'i> {
                 let (name, value, op) = (name.clone(), *value, op.clone());
                 let v_ty = self.type_of(ast, value, env, interner);
                 let new_ty = match env.get(name.as_str()).copied() {
-                    Some(entry) => self.op_write_result(entry, &op, v_ty, interner),
+                    Some(entry) => self.op_write_result(ast, id, entry, &op, value, v_ty, env, interner),
                     None => interner.untyped(),
                 };
                 drop_indexed_narrowings(env, &name);
