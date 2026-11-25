@@ -6005,3 +6005,59 @@ fn straight_line_sigilled_writes_bind_the_check_env() {
     // An unbound sigilled read stays `untyped` (never guess).
     assert_eq!(undefined_891("@y.zzz\n"), Vec::<String>::new());
 }
+
+/// rigor-rs#972 — a receiver read inside a top-level retrying `begin` reads
+/// the retry edge's widened entry on the reference (`eval_retried_begin`): a
+/// write the body makes later, a retrying clause's write, or one on an
+/// exclusive sibling path reaches it, and the port declines it. Each row is
+/// reference-silent; master fired `undefined-method` on the entry carrier.
+#[test]
+fn retry_edge_writes_decline_reads_inside_the_begin() {
+    let undefined = |src: &str| -> Vec<String> {
+        run(src.as_bytes())
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for src in [
+        "h = {a: 1}; begin; h.zark; rescue; h[:b] = 2; retry; end\n",
+        "h = {a: 1}; begin; h.zark; rescue; h = {b: 2}; retry; end\n",
+        "c = [1]; begin; c.nope; rescue; c << 2; retry; end\n",
+        "c = [1]; begin; begin; c.nope; rescue; c = [2]; retry; end; rescue; c = [3]; retry; end\n",
+        "c = [1]; begin; c.nope; c = [2]; rescue; retry; end\n",
+        "c = [1]; begin; c.nope; c << 2; rescue; retry; end\n",
+        "c = [1]; begin; raise; rescue; c.nope; c << 2; retry; end\n",
+        "c = [1]; begin; raise; rescue; c = [2]; retry; else; c.nope; end\n",
+        "c = [1]; begin; c.nope; rescue ArgumentError; c << 2; retry; rescue; c = [5]; end\n",
+        "c = [1]; begin; if rand > 0; c.nope; end; rescue; c = [2]; retry; end\n",
+        "c = [1]; [1].each { begin; c.nope; rescue; c << 2; retry; end }\n",
+        "c = [1]; f = -> { begin; c.nope; rescue; c << 2; retry; end }\n",
+        "c = [1]; while rand > 0; begin; c.nope; rescue; c << 2; retry; end; end\n",
+        "c = [1]; begin; c.nope; rescue; c << 2; retry if rand > 0; end\n",
+        "h = {a: \"s\"}; begin; h[:a].zork; rescue; h[:a] = 1; retry; end\n",
+    ] {
+        assert_eq!(undefined(src), Vec::<String>::new(), "{src:?}");
+    }
+    // Controls the reference still fires: no edge write to the local, a
+    // non-retrying clause's write, a fresh rebind earlier in the same
+    // sequence, and a body mutation that runs before the read.
+    for (src, msg) in [
+        ("c = [1]; begin; c.nope; rescue; retry; end\n", "for [1]"),
+        ("c = [1]; begin; c.nope; rescue => e; retry; end\n", "for [1]"),
+        ("c = [1]; d = [1]; begin; c.nope; rescue; d << 2; retry; end\n", "for [1]"),
+        ("c = [1]; begin; c.nope; rescue ArgumentError; retry; rescue; c = [5]; end\n", "for [1]"),
+        ("c = [1]; begin; c.nope; rescue; c << 2; end\n", "for [1]"),
+        ("c = [1]; begin; c = [2]; c.nope; rescue; c = [3]; retry; end\n", "for [2]"),
+        ("c = [1]; begin; raise; rescue; c = [2]; c.nope; retry; end\n", "for [2]"),
+        ("c = [1]; [1].each { begin; c = [2]; c.nope; rescue; retry; end }\n", "for [2]"),
+        (
+            "c = [1]; begin; c << 2; c.nope; rescue; retry; end\n",
+            "for Array[1 | Dynamic[top] | Integer]",
+        ),
+    ] {
+        let got = undefined(src);
+        assert_eq!(got.len(), 1, "{src:?}: {got:?}");
+        assert!(got[0].ends_with(msg), "{src:?}: {got:?}");
+    }
+}

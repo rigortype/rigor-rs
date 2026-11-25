@@ -637,6 +637,35 @@ fn coll_nested_retry_walk_budget_declines() {
     assert_eq!(snap(&src, "zark"), None);
 }
 
+/// rigor-rs#972 — a site inside a retrying `begin` that the retry edge
+/// reaches with a write the walk saw out of order declines: the body's own
+/// later write (`raise_scopes`), a retrying clause's later write, and the
+/// `else` after a retrying clause's write are all reference-silent. A write
+/// that runs before the site in the same sequence keeps the snap, and so do
+/// the sites after the `begin` (the walk's exit scope is unchanged).
+#[test]
+fn coll_retry_edge_reads_decline_inside_the_begin() {
+    for src in [
+        "def f\n  c = [1]\n  begin\n    c.nope\n    c = [2]\n  rescue\n    retry\n  end\nend\n",
+        "def f\n  c = [1]\n  begin\n    c.nope\n    c << 2\n  rescue\n    retry\n  end\nend\n",
+        "def f\n  c = [1]\n  begin\n    raise\n  rescue\n    c.nope\n    c << 2\n    retry\n  end\nend\n",
+        "def f\n  c = [1]\n  begin\n    raise\n  rescue\n    c = [2]\n    retry\n  else\n    c.nope\n  end\nend\n",
+        "def f\n  c = [1]\n  begin\n    c.nope\n  rescue\n    c << 2\n    retry if rand > 0\n  end\nend\n",
+    ] {
+        assert_eq!(snap(src.as_bytes(), "nope"), None, "{src}");
+    }
+    for src in [
+        "def f\n  c = [1]\n  begin\n    c = [2]\n    c.nope\n  rescue\n    c = [3]\n    retry\n  end\nend\n",
+        "def f\n  c = [1]\n  begin\n    c << 2\n    c.nope\n  rescue\n    retry\n  end\nend\n",
+        "def f\n  c = [1]\n  begin\n    c.nope\n  rescue ArgumentError\n    retry\n  rescue\n    c = [5]\n  end\nend\n",
+    ] {
+        assert_eq!(snap(src.as_bytes(), "nope"), Some("Array"), "{src}");
+    }
+    let after = "def f\n  c = [1]\n  begin\n    c << 1\n    c.nope\n  rescue\n    c << 2\n    retry\n  end\n  c.zark\nend\n";
+    assert_eq!(snap(after.as_bytes(), "nope"), None);
+    assert_eq!(snap(after.as_bytes(), "zark"), Some("Array"));
+}
+
 /// A mutation AFTER the rescued `begin` widens the joined union memberwise
 /// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
 /// same nominal the mutated arm holds, the union collapses, and the use
