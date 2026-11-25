@@ -1822,9 +1822,21 @@ impl<'i> Typer<'i> {
     /// the walks that already carry one (`stmt_exits_at`, `stmt_bot`,
     /// `write_value_bot`).
     fn exit_call_bot_seen(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> bool {
-        let Node::Call { receiver, method, span, .. } = ast.get(id) else {
+        let Node::Call { receiver, method, span, block_span, .. } = ast.get(id) else {
             return false;
         };
+        // A literal block carrying a block-level `break` joins the break's
+        // value into the call's type — `<call> { break }` types `nil`, not
+        // `bot`, whatever the call resolves to (`Kernel.exit { break }`,
+        // `loop { break }`, `exec("ls") { break }`, `Process.exit { break }`,
+        // `die { break }` all keep the arm live on the oracle). Receiverless
+        // `raise`/`throw`/`exit`/`abort`/`fail` never reach this from a
+        // SYNTACTIC position — `stmt_exits_at`'s `EXIT_CALLS` arm (and
+        // `stmt_terminates`'s `syntactic` half) answers them first, matching
+        // `branch_unconditionally_exits?`, which does not look at the block.
+        if block_span.is_some_and(|bs| self.block_level_break(ast, bs)) {
+            return false;
+        }
         // `def_exits` first: without a same-file toplevel def it is an
         // index miss, while `self_answers` walks the call's containers.
         self.kernel_call_terminates(ast, id)
@@ -1846,14 +1858,14 @@ impl<'i> Typer<'i> {
     ///   too); a literal `nil` picks the `?nil` overload back to `bot`.
     /// - `loop` — `() { () -> void } -> bot` when the literal block can
     ///   provably not end the call: `loop_may_complete?` (rigor#1107),
-    ///   ported as [`stop_iteration_free`] over the body, plus the
-    ///   block-level `break` the oracle joins into the return (`loop {
-    ///   break }` types `nil`, `loop { break 5 }` `Integer` —
-    ///   [`Self::block_level_break`]). A `&expr` pass has no body to prove
-    ///   (`loop(&e)` → `Dynamic`), a declared parameter's default may raise
-    ///   (`loop { |x| }` → `Dynamic`), and `next`/`redo`/`return` keep
-    ///   `bot` (`loop { return }` is `bot` — it escapes the method, not
-    ///   the call).
+    ///   ported as [`stop_iteration_free`] over the body. A `&expr` pass
+    ///   has no body to prove (`loop(&e)` → `Dynamic`), a declared
+    ///   parameter CLAUSE declines even when empty (`loop { || }` —
+    ///   `block.parameters` may carry a raising default), and a
+    ///   block-level `break` joins its value into the call's type
+    ///   upstream in [`Self::exit_call_bot_seen`]. `next`/`redo`/`return`
+    ///   keep `bot` (`loop { return }` is `bot` — it escapes the method,
+    ///   not the call).
     ///
     /// The dispatch gate is [`Self::toplevel_def_binds`]'s: an explicit
     /// `Kernel.`/`::Kernel.` always reaches Kernel's singleton; an
@@ -1868,7 +1880,7 @@ impl<'i> Typer<'i> {
             args,
             block_body,
             block_span,
-            block_params,
+            block_param_clause,
             args_plain_positional,
             span,
             ..
@@ -1895,11 +1907,10 @@ impl<'i> Typer<'i> {
             "loop" => {
                 kernel_reached
                     && block_span.is_some()
-                    && block_params.is_empty()
+                    && !*block_param_clause
                     && block_body
                         .iter()
                         .all(|&b| stop_iteration_free(ast, b))
-                    && !self.block_level_break(ast, block_span.unwrap())
             }
             _ => false,
         }
@@ -1938,7 +1949,11 @@ impl<'i> Typer<'i> {
         let Node::ConstantRead { name, dynamic_base, span, .. } = ast.get(*r) else {
             return false;
         };
-        if *dynamic_base || name.is_empty() || name.contains("::") {
+        // The `Kernel` spellings themselves stay with
+        // [`Self::kernel_call_terminates`] / [`Self::kernel_sig_bot`], which
+        // carry the receiver vetoes (`Kernel.loop { break }` declines
+        // through the StopIteration whitelist this arm would bypass).
+        if *dynamic_base || name.is_empty() || name.contains("::") || name.as_str() == "Kernel" {
             return false;
         }
         let prefix = self.enclosing_prefix_in(ast, *span);

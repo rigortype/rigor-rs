@@ -338,6 +338,7 @@ fn kernel_loop_bot_needs_a_stop_iteration_free_block() {
         "loop { next x = 1 }",
         "String.loop { foo }",
         "String.loop(&e)",
+        "Kernel.loop { nil }",
         "::Kernel.loop { nil }",
     ] {
         assert!(rescue_arm_exits(&[&top("", call)], 0), "{call}");
@@ -347,6 +348,8 @@ fn kernel_loop_bot_needs_a_stop_iteration_free_block() {
         ("", "loop { break 5 }"),
         ("", "loop { break if rand > 0 }"),
         ("", "loop { |x| nil }"),
+        ("", "loop { || nil }"),
+        ("", "loop { |;q| nil }"),
         ("", "loop(&e)"),
         ("", "loop { foo }"),
         ("", "loop { raise }"),
@@ -361,6 +364,17 @@ fn kernel_loop_bot_needs_a_stop_iteration_free_block() {
         ("", "loop"),
         ("", "String.loop"),
         ("def loop; nil; end", "loop {}"),
+        // The `Kernel.` spellings ride the same StopIteration whitelist
+        // through `kernel_sig_bot` — they do not bypass it (rigor-rs#1023
+        // review).
+        ("", "Kernel.loop { break }"),
+        ("", "::Kernel.loop { break }"),
+        ("", "Kernel.loop { foo }"),
+        ("", "Kernel.loop { |x| nil }"),
+        ("", "Kernel.loop { || nil }"),
+        ("", "Kernel.loop(&e)"),
+        ("", "String.loop { break }"),
+        ("", "Object.loop { break }"),
     ] {
         assert!(!rescue_arm_exits(&[&top(prelude, call)], 0), "{prelude} / {call}");
     }
@@ -369,6 +383,45 @@ fn kernel_loop_bot_needs_a_stop_iteration_free_block() {
     // oracle's `loop {}` in `def m` of `class C; def loop` still types
     // `bot`).
     assert!(rescue_arm_exits(&[&in_def("class C; def loop; nil; end; end", "loop {}")], 0));
+}
+
+/// rigor-rs#1023 review — a literal block carrying a block-level `break`
+/// joins the break's value into the CALL's type: `<call> { break }` types
+/// `nil`, not `bot`, whatever the call resolves to. Every `bot` path
+/// declines it on the unfolded walk; the receiverless `EXIT_CALLS` names
+/// keep answering the SYNTACTIC arm (`raise("x") { break }` still exits a
+/// rescue clause — `branch_unconditionally_exits?` does not look at the
+/// block).
+#[test]
+fn block_level_break_union_keeps_every_bot_call_live() {
+    for (prelude, call) in [
+        ("", "Kernel.exit { break }"),
+        ("", "Kernel.raise { break }"),
+        ("", "Kernel.exec { break }"),
+        ("", "Kernel.sleep { break }"),
+        ("", "Process.exit { break }"),
+        ("", "String.exec(\"x\") { break }"),
+        ("", "exit! { break }"),
+        ("", "exec(\"ls\") { break }"),
+        ("", "sleep { break }"),
+        ("", "die { break }"),
+        ("def die; raise; end", "die { break }"),
+    ] {
+        // Unfolded walk (the rescue template): the arm is LIVE.
+        assert!(!rescue_arm_exits(&[&top(prelude, call)], 0), "{prelude} / {call}");
+    }
+    // … except the receiverless syntactic names — `raise`/`throw`/`exit`/
+    // `abort`/`fail` exit the unfolded arm regardless of the block
+    // (`branch_unconditionally_exits?` never looks at one).
+    for call in [
+        "raise(\"x\") { break }",
+        "exit { break }",
+        "abort { break }",
+        "fail { break }",
+        "throw(:x) { break }",
+    ] {
+        assert!(rescue_arm_exits(&[&top("", call)], 0), "{call} (syntactic)");
+    }
 }
 
 /// rigor-rs#1011 — the folded `if` arms reach the same predicate:
