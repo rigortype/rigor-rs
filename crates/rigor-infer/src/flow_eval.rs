@@ -4288,9 +4288,7 @@ impl<'i> Typer<'i> {
             return;
         }
         let rebuild = |env: &TypeEnv, interner: &mut Interner| {
-            let binding = *env.get(m.name.as_str())?;
-            let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
-            self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner)
+            self.element_read_rebuild(ast, indexed, m, env, interner)
         };
         // The slot landing's binding treatment (`apply_slot_mutation`): a
         // rebuild that ran lands, one that may not have run floors where
@@ -4305,6 +4303,21 @@ impl<'i> Typer<'i> {
         {
             env.insert(Rc::from(m.name.as_str()), interner.untyped());
         }
+    }
+
+    /// `m`'s root binding rebuilt through its whole chain
+    /// ([`Self::widen_through_path`]), or `None` when nothing widened.
+    fn element_read_rebuild(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        m: &crate::flow_writes::ElementReadMutation,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let binding = *env.get(m.name.as_str())?;
+        let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
+        self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner)
     }
 
     /// Whether `name` is bound to a carrier [`Self::widen_through_path`]
@@ -5694,11 +5707,20 @@ impl<'i> Typer<'i> {
                     Ok(i) => &indexed.slot_mutations[i].name,
                     Err(i) => &indexed.element_reads[i].name,
                 };
-                let shaped = env
-                    .get(name.as_str())
-                    .is_some_and(|&ty| literal_shape_root(interner, ty));
-                if live && slot_floor && shaped {
-                    env.insert(Rc::from(name.as_str()), interner.untyped());
+                if live && slot_floor && self.literal_shape_bound(env, name, interner) {
+                    // `widen_through_path`'s nil leaves the binding standing
+                    // on the reference too (`h = {a: 1}; [1].each { break
+                    // h[:a] << 2 }` keeps `{ a: 1 }`: `Integer#<<` mutates
+                    // nothing — rigor-rs#407's row).
+                    let changes = match which {
+                        Ok(i) => self
+                            .rebuild_element_carrier(ast, indexed, &indexed.slot_mutations[i], env, interner)
+                            .is_some(),
+                        Err(i) => self.element_read_rebuild(ast, indexed, &indexed.element_reads[i], env, interner).is_some(),
+                    };
+                    if changes {
+                        env.insert(Rc::from(name.as_str()), interner.untyped());
+                    }
                 }
                 continue;
             }

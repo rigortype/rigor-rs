@@ -147,6 +147,27 @@ fn element_read_root<'pr>(
     Some((read, calls.into_iter().rev().flatten().collect()))
 }
 
+/// Upstream `AliasMutationFloor.literal_send_target` (#2335):
+/// `send` / `public_send` / `__send__` with no block whose first argument
+/// is a Symbol or String literal naming a shape mutator IS that mutator
+/// (`a[0].send(:<<, 2)` is `a[0] << 2` to `widen_mutated_receivers`).
+fn literal_send_mutator(node: &crate::ruby_prism::CallNode<'_>) -> bool {
+    if !matches!(node.name().as_slice(), b"send" | b"public_send" | b"__send__") || node.block().is_some() {
+        return false;
+    }
+    let Some(first) = node.arguments().and_then(|a| a.arguments().iter().next()) else {
+        return false;
+    };
+    let target = if let Some(sym) = first.as_symbol_node() {
+        sym.unescaped().to_vec()
+    } else if let Some(s) = first.as_string_node() {
+        s.unescaped().to_vec()
+    } else {
+        return false;
+    };
+    std::str::from_utf8(&target).is_ok_and(is_shape_mutator)
+}
+
 fn span_of(n: &PrismNode<'_>) -> Span {
     let l = n.location();
     (l.start_offset(), l.end_offset())
@@ -358,7 +379,7 @@ impl<'pr> Visit<'pr> for Walk {
         // `c[0] << 2`) changes an element that local's binding carries.
         // Keyed by the mutator call's own span, so the enclosing block call
         // or loop widens the local, as a straight-line statement does.
-        if is_shape_mutator(&constant_string(node.name().as_slice())) {
+        if is_shape_mutator(&constant_string(node.name().as_slice())) || literal_send_mutator(node) {
             if let Some((read, steps)) = element_read_root(node.receiver()) {
                 let name = constant_string(read.name().as_slice());
                 let local = read.depth() > 0 || self.closures == 0;

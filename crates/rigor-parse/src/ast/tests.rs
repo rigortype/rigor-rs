@@ -2150,6 +2150,23 @@ fn element_read_path_records_the_chain_steps() {
     assert_eq!(path("b = 1\nb[100000000000000000000] << 2\n"), b(vec![S::Index(None)]));
     // A block mutator still counts — the block is on the MUTATOR.
     assert_eq!(path("b = 1\nb[0].map! { |x| x }\n"), b(vec![S::Index(Some(0))]));
+    // A literal-target `send` is the mutator it names
+    // (`AliasMutationFloor.literal_send_target`).
+    let send_path = |src: &str| {
+        let ast = lower(&crate::parse(src.as_bytes()));
+        let span = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Call { method, span, .. } if method.contains("send") => Some(*span),
+                _ => None,
+            })
+            .last()?;
+        ast.element_read_path(span).map(|(root, steps)| (root.to_string(), steps.to_vec()))
+    };
+    assert_eq!(send_path("b = 1\nb[0].send(:<<, 2)\n"), b(vec![S::Index(Some(0))]));
+    assert_eq!(send_path("b = 1\nb.first.__send__(\"push\", 2)\n"), b(vec![S::Index(Some(0))]));
+    assert_eq!(send_path("b = 1\nb[0].send(:size)\n"), None);
+    assert_eq!(send_path("b = 1\nb[0].send(:<<, 2) { }\n"), None);
     // Not element reads: a block on a read step, `first(n)` / `last(n)`
     // (a sub-array), a bare `dig`, a multi-index slice, a parenthesised
     // step, a non-local root, and a block-local root.

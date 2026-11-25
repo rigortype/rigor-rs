@@ -1010,6 +1010,9 @@ fn element_read_paths_rebuild_through_the_chain() {
         ("a = [[1]]\na[10000000000000000000000] << 2\n", "[[1]]"),
         // The block is on the mutator, not on a read step.
         ("a = [[1]]\na[0].map! { |i| i.to_s }\n", "[Array[Dynamic[top]]]"),
+        // A literal-target `send` mutates as the call it names.
+        ("b = [[[]]]\nb[0][0].send(:<<, 1)\n", "[[Array[Dynamic[top] | Integer]]]"),
+        ("a = [[1]]\na.first.public_send(:push, 2)\n", "[Array[1 | Dynamic[top] | Integer]]"),
         // Two mutators of one carrier compose in source order, slot table
         // and chain table alike.
         ("h = {a: [[]]}\nh[:a][0] << 2\nh[:a] << 1\n", "{ a: Array[Array[Dynamic[top] | Integer] | Dynamic[top]] }"),
@@ -1023,6 +1026,9 @@ fn element_read_paths_rebuild_through_the_chain() {
         ("b = [[[]]]\nif rand > 0\n  b[0][0] << 1\nend\n", "untyped"),
         ("h = {a: \"s\"}\nif rand > 0\n  h[:a] << \"b\"\nend\n", "untyped"),
         ("b = [[[]]]\n[1].each { break b[0][0] << 1 }\n", "untyped"),
+        // …unless the rebuild declines: `Integer#<<` mutates nothing, so
+        // the reference keeps the shape (rigor-rs#407's row).
+        ("h = {a: 1}\n[1].each { break h[:a] << 2 }\n", "{ a: 1 }"),
         // …but a splat evaluates its operand, and an undecided arm's
         // declined rebuild leaves the entry standing (`Integer#<<`).
         ("b = [[[]]]\np(*(b[0][0] << 1))\n", "[[Array[Dynamic[top] | Integer]]]"),
