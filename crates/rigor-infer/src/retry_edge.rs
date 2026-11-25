@@ -46,6 +46,13 @@
 //! before it (`d = c; d = [0]; d.nope` keeps firing) or past the read's
 //! holder element (`x ? (d = c) : (d.nope)` fires — the `d = c` arm never
 //! runs on the read's path).
+//!
+//! rigor-rs#1001 — the derived writes and the kills cover cvar/gvar targets
+//! (`$g = c`, `@@c = v`): the second pass binds a sigilled name from the
+//! widened entry exactly like a local, and a fresh sigilled write kills the
+//! edge for it the same way (`$g = c; $g = [0]; $g.nope` fires `for [0]` on
+//! the oracle). A candidate's value also reads sigilled names — `d = $g`
+//! derives once `$g` does.
 
 use std::collections::{HashMap, HashSet};
 
@@ -303,7 +310,8 @@ impl RetryBegin {
             let (targets, value) = match node {
                 Node::LocalVariableWrite { name, value, .. }
                 | Node::LocalVariableOpWrite { name, value, .. }
-                | Node::InstanceVariableWrite { name, value, .. } => (vec![name.clone()], *value),
+                | Node::InstanceVariableWrite { name, value, .. }
+                | Node::VariableWrite { name, value, .. } => (vec![name.clone()], *value),
                 Node::MultiWrite { targets, value, .. } => {
                     let mut bound = Vec::new();
                     targets.collect_bound_names(&mut bound);
@@ -315,7 +323,9 @@ impl RetryBegin {
                 .nodes_within(ast, ast.get(value).span())
                 .filter_map(|r| match ast.get(r) {
                     Node::LocalVariableRead { name, span } => Some((name.clone(), *span)),
-                    Node::VariableRead { name, span } if crate::def_local_marks::is_ivar(name) => {
+                    Node::VariableRead { name, span }
+                        if crate::def_local_marks::is_sigilled(name) =>
+                    {
                         Some((name.clone(), *span))
                     }
                     _ => None,
@@ -595,15 +605,21 @@ fn index_write_local(ast: &LoweredAst, id: NodeId) -> Option<&str> {
     }
 }
 
-/// The local the statement `id` rebinds to a fresh value: `x = v` whose `v`
-/// reads no `x`.
+/// The local or sigilled name the statement `id` rebinds to a fresh value:
+/// `x = v` / `@x = v` / `$g = v` whose `v` reads no `x` / `@x` / `$g`
+/// (rigor-rs#1001 — a sigilled write kills the edge for its name the same
+/// way the local's does).
 fn kills(ast: &LoweredAst, idx: &crate::reach_index::ReachIndex, id: NodeId) -> Option<String> {
-    let Node::LocalVariableWrite { name, value, .. } = ast.get(id) else {
-        return None;
+    let (name, value) = match ast.get(id) {
+        Node::LocalVariableWrite { name, value, .. }
+        | Node::InstanceVariableWrite { name, value, .. }
+        | Node::VariableWrite { name, value, .. } => (name, value),
+        _ => return None,
     };
     let vspan = ast.get(*value).span();
-    let reads = idx
-        .nodes_within(ast, vspan)
-        .any(|n| matches!(ast.get(n), Node::LocalVariableRead { name: r, .. } if r == name));
+    let reads = idx.nodes_within(ast, vspan).any(|n| match ast.get(n) {
+        Node::LocalVariableRead { name: r, .. } | Node::VariableRead { name: r, .. } => r == name,
+        _ => false,
+    });
     (!reads).then(|| name.clone())
 }
