@@ -443,20 +443,31 @@ fn stable_key_node(node: &PrismNode<'_>) -> Option<IndexTargetKey> {
 }
 
 /// What a `for` index target writes: `(bound local names, index-target receiver
-/// locals)` — the reference's `bind_for_index` set (`statement_evaluator.rb`).
-/// A `LocalVariableTargetNode` binds a name; a `MultiTargetNode` decomposes as
-/// the multi-assign binder reads it (`*rest` slot included); an
-/// `IndexTargetNode` — the whole index (`for h[:k] in xs`), a multi-target slot
-/// (`for w, h[:k] in pairs`) or a bare splat index (`for *h[:k] in xs`, which
-/// Prism gives as a `SplatNode`, not a `MultiTargetNode`) — stores the element
-/// through `[]=` on its receiver, so its receiver's locals widen (rigor-rs#134).
-/// A non-local index (`@a`, `A`, `a.b`) binds no local and yields nothing, and
-/// so does a bare `for *w in xs`, which the reference leaves unbound.
-pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, IndexWrites) {
+/// locals, bindable target tree)` — the reference's `bind_for_index` set
+/// (`statement_evaluator.rb`). A `LocalVariableTargetNode` binds a name; a
+/// `MultiTargetNode` decomposes as the multi-assign binder reads it (`*rest`
+/// slot included); a bare `for *w in xs` (which Prism gives as a `SplatNode`,
+/// not a `MultiTargetNode`) binds `w` to the element's rest decomposition
+/// (`bind_for_splat_index`, rigor-rs#998); an `IndexTargetNode` — the whole
+/// index (`for h[:k] in xs`), a multi-target slot (`for w, h[:k] in pairs`)
+/// or a bare splat index (`for *h[:k] in xs`) — stores the element through
+/// `[]=` on its receiver, so its receiver's locals widen (rigor-rs#134). A
+/// non-local index (`@a`, `A`, `a.b`) binds no local and yields no target.
+pub(crate) fn for_index_writes(
+    index: &PrismNode<'_>,
+) -> (Vec<(String, Span)>, IndexWrites, Option<MultiTarget>) {
     if let Some(t) = index.as_local_variable_target_node() {
+        let name_span = span_of(&t.location());
         return (
-            vec![(constant_string(t.name().as_slice()), span_of(&t.location()))],
+            vec![(constant_string(t.name().as_slice()), name_span)],
             Vec::new(),
+            // A lone local binds the element itself — `bind_for_index`'s
+            // `LocalVariableTargetNode` arm (`scope.with_local`), NOT a
+            // decompose.
+            Some(MultiTarget::Local {
+                name: constant_string(t.name().as_slice()),
+                name_span,
+            }),
         );
     }
     if let Some(t) = index.as_multi_target_node() {
@@ -472,7 +483,8 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
             &mut ignored,
             false,
         );
-        return (targets.bound_names(), targets.index_writes());
+        let (names, writes) = (targets.bound_names(), targets.index_writes());
+        return (names, writes, Some(MultiTarget::Nested(targets)));
     }
     if let Some(t) = index.as_index_target_node() {
         let key = index_target_key(&t);
@@ -482,6 +494,7 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
                 .into_iter()
                 .map(|r| (r, span_of(&t.location()), key.clone()))
                 .collect(),
+            None,
         );
     }
     if let Some(s) = index.as_splat_node() {
@@ -495,10 +508,30 @@ pub(crate) fn for_index_writes(index: &PrismNode<'_>) -> (Vec<(String, Span)>, I
                     .into_iter()
                     .map(|r| (r, span_of(&t.location()), key.clone()))
                     .collect(),
+                None,
             );
         }
+        // `for *w in xs` — a rest-only target tree: the local binds the
+        // element's REST decomposition, `bind_for_splat_index`'s
+        // `decompose_slots(rest_present: true)` (`for *w in [[1, "p"]]`
+        // binds `w` to `[1, "p"]`).
+        if let Some(e) = s.expression() {
+            let mut ignored = Vec::new();
+            let rest = lower_multi_target(&e, &mut ignored, false);
+            if !matches!(rest, MultiTarget::Ignored { .. }) {
+                let span = span_of(&s.location());
+                let targets = MultiTargets {
+                    lefts: Vec::new(),
+                    rest: Some(Box::new(rest)),
+                    rights: Vec::new(),
+                    span,
+                };
+                let (names, writes) = (targets.bound_names(), targets.index_writes());
+                return (names, writes, Some(MultiTarget::Nested(targets)));
+            }
+        }
     }
-    (Vec::new(), Vec::new())
+    (Vec::new(), Vec::new(), None)
 }
 
 /// The local-variable reads an in-place mutation of a `rescue =>` reference
