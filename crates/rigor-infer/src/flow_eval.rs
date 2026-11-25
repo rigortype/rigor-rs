@@ -5568,6 +5568,13 @@ impl<'i> Typer<'i> {
                     cur = Some(match truthy {
                         Some(truthy) => {
                             let live = if truthy != *is_unless { then_body } else { else_body };
+                            // The folded-arm drop twin of the top-level
+                            // `arm_terminates` gate above
+                            // (`eval_if`/`eval_unless`'s
+                            // `branch_terminates? && subsequent.nil?`,
+                            // statement_evaluator.rb:2302/:2336) — a
+                            // refinement to it (rigor-rs#966 shape) must
+                            // move both sites.
                             if else_body.is_empty()
                                 && crate::class_narrowing::branch_terminates(self, ast, then_body)
                             {
