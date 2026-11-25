@@ -2103,3 +2103,84 @@ fn if_else_both_return_still_lowers_both_arms() {
         _ => unreachable!(),
     }
 }
+
+/// rigor-rs#943 — `ElementReadWidening.element_read_path` /
+/// `positional_steps` / `index_step`: the steps a mutator's element-read
+/// receiver chain selects, outermost first, keyed by the mutator's span.
+#[test]
+fn element_read_path_records_the_chain_steps() {
+    use ElementReadStep as S;
+    let path = |src: &str| -> Option<(String, Vec<ElementReadStep>)> {
+        let ast = lower(&crate::parse(src.as_bytes()));
+        // The mutator call is the statement after `b = …`.
+        let span = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Call { method, span, .. } if crate::mutators::is_shape_mutator(method) => {
+                    Some(*span)
+                }
+                _ => None,
+            })
+            .last()?;
+        ast.element_read_path(span)
+            .map(|(root, steps)| (root.to_string(), steps.to_vec()))
+    };
+    let b = |steps: Vec<ElementReadStep>| Some(("b".to_string(), steps));
+    assert_eq!(path("b = 1\nb[0][1] << 2\n"), b(vec![S::Index(Some(0)), S::Index(Some(1))]));
+    assert_eq!(path("b = 1\nb.first << 2\n"), b(vec![S::Index(Some(0))]));
+    assert_eq!(path("b = 1\nb.last << 2\n"), b(vec![S::Index(Some(-1))]));
+    assert_eq!(path("b = 1\nb[-2] << 2\n"), b(vec![S::Index(Some(-2))]));
+    assert_eq!(
+        path("b = 1\nb.dig(:a, \"k\", 0) << 2\n"),
+        b(vec![S::Sym("a".into()), S::Str("k".into()), S::Index(Some(0))])
+    );
+    assert_eq!(path("b = 1\nb[:a].last << 2\n"), b(vec![S::Sym("a".into()), S::Index(Some(-1))]));
+    // `index_step`'s `else` row: anything but an Integer/Symbol/String
+    // literal is `:all`; a Bignum is a position no Tuple has.
+    for src in [
+        "b = 1\nk = 0\nb[k] << 2\n",
+        "b = 1\nb[true] << 2\n",
+        "b = 1\nb[0.0] << 2\n",
+        "b = 1\nb[nil] << 2\n",
+        "b = 1\nb[:\"a#{1}\"] << 2\n",
+        "b = 1\nb[*[0]] << 2\n",
+    ] {
+        assert_eq!(path(src), b(vec![S::All]), "{src}");
+    }
+    assert_eq!(path("b = 1\nb[100000000000000000000] << 2\n"), b(vec![S::Index(None)]));
+    // A block mutator still counts — the block is on the MUTATOR.
+    assert_eq!(path("b = 1\nb[0].map! { |x| x }\n"), b(vec![S::Index(Some(0))]));
+    // A literal-target `send` is the mutator it names
+    // (`AliasMutationFloor.literal_send_target`).
+    let send_path = |src: &str| {
+        let ast = lower(&crate::parse(src.as_bytes()));
+        let span = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::Call { method, span, .. } if method.contains("send") => Some(*span),
+                _ => None,
+            })
+            .last()?;
+        ast.element_read_path(span).map(|(root, steps)| (root.to_string(), steps.to_vec()))
+    };
+    assert_eq!(send_path("b = 1\nb[0].send(:<<, 2)\n"), b(vec![S::Index(Some(0))]));
+    assert_eq!(send_path("b = 1\nb.first.__send__(\"push\", 2)\n"), b(vec![S::Index(Some(0))]));
+    assert_eq!(send_path("b = 1\nb[0].send(:size)\n"), None);
+    assert_eq!(send_path("b = 1\nb[0].send(:<<, 2) { }\n"), None);
+    // Not element reads: a block on a read step, `first(n)` / `last(n)`
+    // (a sub-array), a bare `dig`, a multi-index slice, a parenthesised
+    // step, a non-local root, and a block-local root.
+    for src in [
+        "b = 1\nb.first { 1 } << 2\n",
+        "b = 1\nb.first(1) << 2\n",
+        "b = 1\nb.dig << 2\n",
+        "b = 1\nb[0, 1] << 2\n",
+        "b = 1\n(b[0])[0] << 2\n",
+        "b = 1\n(b)[0] << 2\n",
+        "@b = 1\n@b[0] << 2\n",
+        "b = 1\nb << 2\n",
+        "[1].each { |b| b[0] << 2 }\n",
+    ] {
+        assert_eq!(path(src), None, "{src}");
+    }
+}

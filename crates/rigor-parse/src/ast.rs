@@ -59,6 +59,7 @@ pub(crate) use ancestry_facts::collect_ancestry_facts;
 pub use singleton_locals::SingletonLocals;
 pub use rebind_sites::{RebindDef, RebindFacts, RebindReceiver, RebindRow, RebindSite, METHOD_OBJECT_CALLS as REBIND_METHOD_OBJECT_CALLS};
 pub(crate) use constants::*;
+pub use element_mutation::ElementReadStep;
 pub use lowered_ast::{lower, lower_with_key, FileKey, LoweredAst};
 pub use node::{Compound, IvarWrite, JumpKind, LoopKind, Node, OpWriteKind, RescueClause, StatementsKind};
 pub(crate) use builder::*;

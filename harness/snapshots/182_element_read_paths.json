@@ -1,0 +1,75 @@
+{
+  "fixture": "harness/corpus/182_element_read_paths.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 10,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for [[Array[Dynamic[top] | Integer]]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 14,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for { a: [Array[1 | Dynamic[top] | Integer]] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for [[1], Array[2 | Dynamic[top] | Integer]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for [Array[1 | Dynamic[top] | Integer]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for { a: [Array[Dynamic[top] | Integer]] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 33,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for { a: Array[Dynamic[top] | Integer], b: String }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 38,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for [Array[Dynamic[top]]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 42,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `<<' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 43,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for { a: [] }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 73,
+      "column": 4,
+      "severity": "error",
+      "message": "undefined method `w' for [Array[[]]]"
+    }
+  ]
+}

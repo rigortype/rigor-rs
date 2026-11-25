@@ -103,6 +103,10 @@ pub struct LoweredAst {
     /// an element in place, with the locals its receiver may read. See
     /// [`LoweredAst::element_mutations`].
     element_mutations: Vec<(Span, Vec<String>)>,
+    /// Upstream v0.4.7 (#2395) — the element-read mutators among
+    /// `element_mutations`, sorted by span, with their read chain. See
+    /// [`LoweredAst::element_read_path`].
+    element_read_paths: Box<[super::element_mutation::ElementReadPath]>,
     /// Sorted start offsets of every `LocalVariableRead`, so
     /// [`LoweredAst::reads_local_within`] is a binary search, not an arena scan.
     local_read_starts: Vec<usize>,
@@ -300,6 +304,21 @@ impl LoweredAst {
     /// `a.each(&:strip!)`). The flow passes widen those locals there.
     pub fn element_mutations(&self) -> &[(Span, Vec<String>)] {
         &self.element_mutations
+    }
+
+    /// Upstream v0.4.7 (#2395, `ElementReadWidening.element_read_path`):
+    /// for the shape-mutator call at `span` whose receiver is an element-read
+    /// chain (`a[0][1]`, `a.first`, `h.dig(:k, 0)`, blockless reads, `[]`
+    /// with one argument) rooted at a local that is not block-local, that
+    /// local and the chain's steps outermost-first. Every such call also
+    /// has its `(span, [local])` entry in [`Self::element_mutations`].
+    pub fn element_read_path(&self, span: Span) -> Option<(&str, &[super::ElementReadStep])> {
+        let paths = &self.element_read_paths;
+        let i = paths.partition_point(|(s, ..)| *s < span);
+        paths
+            .get(i)
+            .filter(|(s, ..)| *s == span)
+            .map(|(_, root, steps)| (root.as_str(), steps.as_slice()))
     }
 
     /// Whether some `LocalVariableRead` starts inside `span`. A read is a leaf,
@@ -539,6 +558,17 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// Whether `span` sits inside a `rescue` MODIFIER carrier
+    /// ([`Self::is_rescue_modifier`]) that itself lies within `within` —
+    /// either operand: the expression may raise before `span` runs, and
+    /// the rescue expression runs only when it does. O(rescue modifiers).
+    pub fn in_rescue_modifier_within(&self, span: Span, within: Span) -> bool {
+        self.carrier_spans.rescue_modifier_ids.iter().any(|&id| {
+            let s = self.nodes[id as usize].span();
+            within.0 <= s.0 && s.1 <= within.1 && s.0 <= span.0 && span.1 <= s.1 && s != span
+        })
+    }
+
     /// Whether `id` is the `BeginRescue` carrier an `else` clause lowered
     /// to. `ReceiverAlias.candidates` unwraps an `ElseNode` to its
     /// statements' last statement; a real `begin`/`rescue` on the same
@@ -667,7 +697,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         mutations: collect_const_mutations(&root_prism),
         writes: collect_const_writes(&root_prism),
     });
-    let element_mutations = super::element_mutation::collect(&root_prism);
+    let (element_mutations, element_read_paths) = super::element_mutation::collect(&root_prism);
     let mut ancestry_facts = Box::new(collect_ancestry_facts(&root_prism));
     ancestry_facts.required_features = super::ancestry_facts::required_vendored_features(source);
     ancestry_facts.rebind = super::rebind_sites::collect(&root_prism);
@@ -724,6 +754,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         file_key,
         const_tables,
         element_mutations,
+        element_read_paths: element_read_paths.into_boxed_slice(),
         local_read_starts,
         carrier_spans,
         paren_unwrapped,

@@ -28,14 +28,18 @@ type Span = (usize, usize);
 
 /// `(span of the block call or the `for` node, locals its receiver or
 /// collection may evaluate to)`, one entry per mutating construct.
-pub(crate) fn collect(root: &PrismNode<'_>) -> Vec<(Span, Vec<String>)> {
-    let mut w = Walk { out: Vec::new(), closures: 0, params: Vec::new() };
+pub(crate) fn collect(root: &PrismNode<'_>) -> (Vec<(Span, Vec<String>)>, Vec<ElementReadPath>) {
+    let mut w = Walk { out: Vec::new(), paths: Vec::new(), closures: 0, params: Vec::new() };
     w.visit(root);
-    w.out
+    w.paths.sort_by_key(|(span, ..)| *span);
+    (w.out, w.paths)
 }
 
 struct Walk {
     out: Vec<(Span, Vec<String>)>,
+    /// The element-read subset of `out`'s mutator entries, with the
+    /// chain's steps (`ElementReadWidening.element_read_path`).
+    paths: Vec<ElementReadPath>,
     /// How many blocks / lambdas of the current local scope enclose the
     /// visit: a depth-0 local read inside one is block-local.
     closures: u32,
@@ -72,34 +76,96 @@ fn element_sources<'pr>(receiver: Option<PrismNode<'pr>>) -> Option<PrismNode<'p
     Some(node)
 }
 
+/// One step of an element-read chain — upstream v0.4.7 (#2395,
+/// `ElementReadWidening.index_step` / `positional_steps`): the position an
+/// `[]` / `first` / `last` / `dig` read selects inside its receiver.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ElementReadStep {
+    /// An Integer literal position (`a[0]`, `first` → `0`, `last` → `-1`;
+    /// negative counts from the end). `None` is a Bignum literal: a
+    /// position no Tuple has, so it selects nothing.
+    Index(Option<i64>),
+    /// A literal Symbol key (`h[:a]`) — `KeyStep`.
+    Sym(String),
+    /// A literal String key (`h["a"]`) — `KeyStep`.
+    Str(String),
+    /// Any other index expression — `:all`, a position not statically
+    /// known (a local, a `true`, a splat, an interpolated string).
+    All,
+}
+
+/// `(mutator call span, root local, steps)` — a mutator whose receiver is
+/// an element-read chain rooted at a local that is not block-local. See
+/// [`super::LoweredAst::element_read_path`].
+pub(crate) type ElementReadPath = (Span, String, Vec<ElementReadStep>);
+
+/// `index_step`: an `IntegerNode` is its value, a `SymbolNode` /
+/// `StringNode` a key (decoded as the lowering decodes it, so the key
+/// matches a `HashShape` built from the same literal), anything else `:all`.
+fn index_step(node: &PrismNode<'_>) -> ElementReadStep {
+    if let Some(int) = node.as_integer_node() {
+        ElementReadStep::Index(super::builder::integer_value(&int.value()))
+    } else if let Some(sym) = node.as_symbol_node() {
+        ElementReadStep::Sym(String::from_utf8_lossy(sym.unescaped()).into_owned())
+    } else if let Some(s) = node.as_string_node() {
+        ElementReadStep::Str(String::from_utf8_lossy(s.unescaped()).into_owned())
+    } else {
+        ElementReadStep::All
+    }
+}
+
 /// Upstream v0.4.7 (#2395, `ElementReadWidening.element_read_path`): the
 /// local read an element-read chain (`a[i]`, `a.first`, `a.last`,
-/// `a.dig(…)`, blockless, `[]` with one argument) is rooted at, or `None`
-/// when `node` is no such chain.
-fn element_read_root<'pr>(node: Option<PrismNode<'pr>>) -> Option<crate::ruby_prism::LocalVariableReadNode<'pr>> {
+/// `a.dig(…)`, blockless, `[]` with one argument) is rooted at, with the
+/// chain's steps outermost-first, or `None` when `node` is no such chain.
+fn element_read_root<'pr>(
+    node: Option<PrismNode<'pr>>,
+) -> Option<(crate::ruby_prism::LocalVariableReadNode<'pr>, Vec<ElementReadStep>)> {
     let mut cursor = node?;
-    let mut steps = 0;
+    // Collected innermost-last, one Vec per call, reversed at the end
+    // (`steps.unshift(*step)`).
+    let mut calls: Vec<Vec<ElementReadStep>> = Vec::new();
     while let Some(c) = cursor.as_call_node() {
         if c.block().is_some() {
             return None;
         }
-        let argc = c.arguments().map_or(0, |a| a.arguments().iter().count());
-        let ok = match constant_string(c.name().as_slice()).as_str() {
-            "[]" => argc == 1,
-            "first" | "last" => argc == 0,
-            "dig" => argc > 0,
-            _ => false,
+        let args: Vec<PrismNode<'pr>> = c.arguments().map_or_else(Vec::new, |a| a.arguments().iter().collect());
+        let step = match constant_string(c.name().as_slice()).as_str() {
+            "[]" if args.len() == 1 => vec![index_step(&args[0])],
+            "first" if args.is_empty() => vec![ElementReadStep::Index(Some(0))],
+            "last" if args.is_empty() => vec![ElementReadStep::Index(Some(-1))],
+            "dig" if !args.is_empty() => args.iter().map(index_step).collect(),
+            _ => return None,
         };
-        if !ok {
-            return None;
-        }
-        steps += 1;
+        calls.push(step);
         cursor = c.receiver()?;
     }
-    if steps == 0 {
+    if calls.is_empty() {
         return None;
     }
-    cursor.as_local_variable_read_node()
+    let read = cursor.as_local_variable_read_node()?;
+    Some((read, calls.into_iter().rev().flatten().collect()))
+}
+
+/// Upstream `AliasMutationFloor.literal_send_target` (#2335):
+/// `send` / `public_send` / `__send__` with no block whose first argument
+/// is a Symbol or String literal naming a shape mutator IS that mutator
+/// (`a[0].send(:<<, 2)` is `a[0] << 2` to `widen_mutated_receivers`).
+fn literal_send_mutator(node: &crate::ruby_prism::CallNode<'_>) -> bool {
+    if !matches!(node.name().as_slice(), b"send" | b"public_send" | b"__send__") || node.block().is_some() {
+        return false;
+    }
+    let Some(first) = node.arguments().and_then(|a| a.arguments().iter().next()) else {
+        return false;
+    };
+    let target = if let Some(sym) = first.as_symbol_node() {
+        sym.unescaped().to_vec()
+    } else if let Some(s) = first.as_string_node() {
+        s.unescaped().to_vec()
+    } else {
+        return false;
+    };
+    std::str::from_utf8(&target).is_ok_and(is_shape_mutator)
 }
 
 fn span_of(n: &PrismNode<'_>) -> Span {
@@ -313,13 +379,15 @@ impl<'pr> Visit<'pr> for Walk {
         // `c[0] << 2`) changes an element that local's binding carries.
         // Keyed by the mutator call's own span, so the enclosing block call
         // or loop widens the local, as a straight-line statement does.
-        if is_shape_mutator(&constant_string(node.name().as_slice())) {
-            if let Some(read) = element_read_root(node.receiver()) {
+        if is_shape_mutator(&constant_string(node.name().as_slice())) || literal_send_mutator(node) {
+            if let Some((read, steps)) = element_read_root(node.receiver()) {
                 let name = constant_string(read.name().as_slice());
                 let local = read.depth() > 0 || self.closures == 0;
                 let untyped_param = read.depth() == self.closures && self.params.contains(&name);
                 if local && !untyped_param {
-                    self.out.push((span_of(&node.as_node()), vec![name]));
+                    let span = span_of(&node.as_node());
+                    self.out.push((span, vec![name.clone()]));
+                    self.paths.push((span, name, steps));
                 }
             }
         }

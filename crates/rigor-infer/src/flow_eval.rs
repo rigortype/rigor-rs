@@ -8,7 +8,7 @@ use std::borrow::Cow;
 use std::rc::Rc;
 use std::collections::HashMap;
 
-use rigor_parse::{LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{ElementReadStep, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
@@ -23,6 +23,32 @@ use crate::flow_writes::{
     is_content_mutator, literal_send_target, node_child_ids, IndexedFlow, MUTATOR_METHODS,
     STRING_MUTATORS,
 };
+
+/// A slot mutation's literal key as the one element-read step it is
+/// (`ElementReadWidening.index_step`): an Integer a position, a Symbol or
+/// String a key, anything else (never recorded by `stable_index_key`
+/// today) `:all`.
+fn key_step(key: &ShapeKey) -> ElementReadStep {
+    match key {
+        ShapeKey::Int(i) => ElementReadStep::Index(Some(*i)),
+        ShapeKey::Sym(s) => ElementReadStep::Sym(s.clone()),
+        ShapeKey::Str(s) => ElementReadStep::Str(s.clone()),
+        _ => ElementReadStep::All,
+    }
+}
+
+/// Whether `ty` is a root `ElementReadWidening.widen_through_path` can
+/// rebuild — a `Tuple` or `HashShape`, or a union with one such member.
+/// Any other root declines at the first step.
+fn literal_shape_root(interner: &Interner, ty: TypeId) -> bool {
+    match interner.get(ty) {
+        Type::Tuple(_) | Type::HashShape(_) => true,
+        Type::Union(members) => members
+            .iter()
+            .any(|&m| matches!(interner.get(m), Type::Tuple(_) | Type::HashShape(_))),
+        _ => false,
+    }
+}
 
 /// What a `while`/`until` loop's tracked locals converge to —
 /// [`Typer::loop_continuation`]'s answer, applied by the caller over its
@@ -3644,6 +3670,16 @@ impl<'i> Typer<'i> {
                 self.apply_slot_mutation(ast, &flow.indexed, id, m, false, false, env, interner);
             }
         }
+        // An element-read chain's landing replays its record half alone,
+        // as a slot mutation's does: the narrowings rooted at its local
+        // drop, as the rebind it replaced dropped them.
+        for (_, m) in flow.indexed.element_reads_within(span) {
+            if flow.dead.write_reaches(m.span, site)
+                && !ast.in_block_break_locals_only_carrier(m.span)
+            {
+                drop_indexed_narrowings(env, &m.name);
+            }
+        }
         // Upstream #2677 — mutations the named tables filter out (a
         // block-local `b << "s"` whose `b` was bound to `a`'s object, a
         // `def`-internal mutator) still reach the shared object: floor
@@ -4163,8 +4199,31 @@ impl<'i> Typer<'i> {
         // scope dies before the join, so its mutation rebuilds nothing.
         // The PREDICATE is the exception — it evaluates before any arm,
         // so its rebuild stays live in every arm.
-        if evaluated && live {
-            self.rebuild_element_carrier(ast, indexed, m, env, interner);
+        //
+        // The binding half asks the STRICT position (`element_read_ran`):
+        // a `rescue` modifier's body (`h[:a] << 1 rescue nil`) evaluates
+        // under the lenient operand rule, but the reference joins its
+        // rescue path's floored scope and stays silent, so the binding
+        // floors exactly as a call that may not have run does.
+        //
+        // An undecided `if` arm (`slot_floor` off) JOINS its bindings
+        // rather than flooring them, but a mutation the arm may have run
+        // that DOES rebuild the carrier leaves the join with no answer the
+        // flat env can express — the reference's join is silent (`a =
+        // [[1]]; if c; a[0] << 2; end; a.w`) — so that binding floors too.
+        // One the rebuild declines on stands (`a = [1]; if c; a[0] << 2;
+        // end; a.w` fires `for [1]` on both: `Integer#<<` mutates nothing).
+        if live {
+            if evaluated && self.element_read_ran(ast, root, m.span) {
+                if let Some(ty) = self.rebuild_element_carrier(ast, indexed, m, env, interner) {
+                    env.insert(Rc::from(m.name.as_str()), ty);
+                }
+            } else if slot_floor
+                || (self.literal_shape_bound(env, &m.name, interner)
+                    && self.rebuild_element_carrier(ast, indexed, m, env, interner).is_some())
+            {
+                env.insert(Rc::from(m.name.as_str()), interner.untyped());
+            }
         }
         if !evaluated {
             // The element rebind this landing replaces (upstream #2395's
@@ -4179,9 +4238,6 @@ impl<'i> Typer<'i> {
             // the unfold `if` arm JOINS instead of flooring, so it passes
             // `false` and only its predicate's rebuild (evaluated above)
             // lands.
-            if live && slot_floor {
-                env.insert(Rc::from(m.name.as_str()), interner.untyped());
-            }
             env.remove(lookup.as_str());
             return;
         }
@@ -4220,102 +4276,201 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         indexed: &IndexedFlow,
         m: &crate::flow_writes::SlotMutation,
-        env: &mut TypeEnv,
+        env: &TypeEnv,
         interner: &mut Interner,
-    ) {
+    ) -> Option<TypeId> {
         let read = match ast.get(m.id) {
             Node::Call { receiver: Some(r), .. } => *r,
-            _ => return,
+            _ => return None,
         };
         match ast.get(read) {
             Node::Call { method, args, block_body, .. }
                 if method == "[]" && args.len() == 1 && block_body.is_empty() => {}
-            _ => return,
+            _ => return None,
         }
-        let Some(&binding) = env.get(m.name.as_str()) else {
-            return;
-        };
+        let binding = *env.get(m.name.as_str())?;
         // `mutator_arg_types` — the same typed arguments the name-mutation
         // landing joins its content from, read off the env the call saw.
         let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
-        if let Some(rebuilt) = self.widen_element_at(binding, &m.key, &m.method, &arg_types, interner) {
-            env.insert(Rc::from(m.name.as_str()), rebuilt);
+        let step = [key_step(&m.key)];
+        self.widen_through_path(binding, &step, &m.method, &arg_types, interner)
+    }
+
+    /// `ElementReadWidening.widen_element_read` for a chain the slot table
+    /// cannot express — `b[0][0] << 1`, `a.first << 1`, `h.dig(:a, 0) <<
+    /// 1`, `h[k] << 1`, `a[0].map! { … }` ([`ElementReadMutation`]): the
+    /// binding half of [`Self::apply_slot_mutation`] over the whole chain.
+    /// A call that DID run (and whose scope reaches the join, `live`)
+    /// rebuilds the root local through every step; one that may not have
+    /// run floors it where `slot_floor` asks, as the rebind this landing
+    /// replaces did. No slot record names a chain, so the record half is
+    /// the rebind's own: every narrowing rooted at the local drops (the
+    /// reference keeps them — `element_address` names no chain — and
+    /// forgetting a record only ever declines).
+    ///
+    /// [`ElementReadMutation`]: crate::flow_writes::ElementReadMutation
+    #[allow(clippy::too_many_arguments)]
+    fn apply_element_read(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        root: NodeId,
+        m: &crate::flow_writes::ElementReadMutation,
+        live: bool,
+        slot_floor: bool,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        drop_indexed_narrowings(env, &m.name);
+        if !live {
+            return;
+        }
+        let rebuild = |env: &TypeEnv, interner: &mut Interner| {
+            self.element_read_rebuild(ast, indexed, m, env, interner)
+        };
+        // The slot landing's binding treatment (`apply_slot_mutation`): a
+        // rebuild that ran lands, one that may not have run floors where
+        // the calling arm floors, and in an undecided arm too when the
+        // rebuild would change the carrier.
+        if self.element_read_ran(ast, root, m.span) {
+            if let Some(ty) = rebuild(env, interner) {
+                env.insert(Rc::from(m.name.as_str()), ty);
+            }
+        } else if slot_floor
+            || (self.literal_shape_bound(env, &m.name, interner) && rebuild(env, interner).is_some())
+        {
+            env.insert(Rc::from(m.name.as_str()), interner.untyped());
         }
     }
 
-    /// `ElementReadWidening.widen_through_path` for the ONE step a slot
-    /// mutation's literal key selects — the reference's own step semantics
-    /// (`tuple_positions` / `hash_shape_keys`): a Symbol or String key
-    /// names one pair of a `HashShape` and, against a `Tuple`, no
-    /// statically known position (every slot widens); an Integer key names
-    /// a `Tuple` position — negative counts from the end, out of range
-    /// selects nothing — and no hash key at all. `None` — the binding
-    /// stands — when the carrier is no shape, the key selects nothing, or
-    /// the element's own widening declines (`a = [1]; a[0] << 2` keeps
-    /// `[1]`: `Integer#<<` mutates nothing, exactly the reference's nil).
-    fn widen_element_at(
+    /// `m`'s root binding rebuilt through its whole chain
+    /// ([`Self::widen_through_path`]), or `None` when nothing widened.
+    fn element_read_rebuild(
+        &self,
+        ast: &LoweredAst,
+        indexed: &IndexedFlow,
+        m: &crate::flow_writes::ElementReadMutation,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let binding = *env.get(m.name.as_str())?;
+        let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
+        self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner)
+    }
+
+    /// Whether `name` is bound to a carrier [`Self::widen_through_path`]
+    /// can rebuild ([`literal_shape_root`]) — the cheap gate in front of
+    /// an undecided arm's would-it-change rebuild, so a binding already
+    /// floored skips the argument typing.
+    fn literal_shape_bound(&self, env: &TypeEnv, name: &str, interner: &Interner) -> bool {
+        env.get(name).is_some_and(|&ty| literal_shape_root(interner, ty))
+    }
+
+    /// Whether the element-read mutator at `span` certainly ran by the end
+    /// of `root`, for the binding half of its landing: the lenient operand
+    /// rule (an argument list or a splat evaluates its children), minus
+    /// either operand of a `rescue` modifier — `b[0][0] << 1 rescue nil`
+    /// may raise before the mutation, and the reference's rescue-path join
+    /// stays silent there. The strict [`Self::path_unconditional`] answer
+    /// settles most positions; only a `Recovered` / `Jump` carrier on the
+    /// path (where the two rules part) pays the modifier scan.
+    fn element_read_ran(&self, ast: &LoweredAst, root: NodeId, span: rigor_parse::Span) -> bool {
+        let marks = self.path_marks(ast, root);
+        if marks.uncond(span).unwrap_or_else(|| self.path_unconditional(ast, root, span)) {
+            return true;
+        }
+        marks
+            .operand(span)
+            .unwrap_or_else(|| self.path_operand_evaluated(ast, root, span))
+            && !marks
+                .rescued(span)
+                .unwrap_or_else(|| ast.in_rescue_modifier_within(span, ast.get(root).span()))
+    }
+
+    /// `ElementReadWidening.widen_through_path` (element_read_widening.rb):
+    /// rebuild `binding` with the element `steps` selects widened by the
+    /// mutator, or `None` — the binding stands — when nothing along the
+    /// path widened. The reference's own step semantics (`tuple_positions`
+    /// / `hash_shape_keys`): an Integer step names one `Tuple` position —
+    /// negative counts from the end, out of range (a Bignum included)
+    /// selects nothing — and no `HashShape` key; a Symbol or String key
+    /// names one pair of a `HashShape` (nothing when the shape lacks it)
+    /// and, against a `Tuple`, no statically known position, so every one
+    /// widens; an `All` step (a non-literal index) selects every position
+    /// and every key. A union widens memberwise, each declining member
+    /// surviving whole; any other carrier declines. At the path's end the
+    /// element takes the port's `widen_mutated_binding`, whose decline is
+    /// the reference's nil (`a = [1]; a[0] << 2` keeps `[1]`:
+    /// `Integer#<<` mutates nothing).
+    fn widen_through_path(
         &self,
         binding: TypeId,
-        key: &ShapeKey,
+        steps: &[ElementReadStep],
         method: &str,
         arg_types: &[Option<TypeId>],
         interner: &mut Interner,
     ) -> Option<TypeId> {
+        let Some((step, rest)) = steps.split_first() else {
+            return self.widen_mutated_binding(binding, method, arg_types, interner);
+        };
         match interner.get(binding).clone() {
             Type::Tuple(elements) => {
                 let size = elements.len();
-                let positions: Vec<usize> = match key {
-                    ShapeKey::Int(i) => {
-                        // Out-of-range selects nothing: the widening is not
-                        // justified for any position of THIS tuple.
-                        let pos = if *i < 0 { i.checked_add(size as i64)? } else { *i };
-                        if !(0..size as i64).contains(&pos) {
-                            return None;
+                let positions: Vec<usize> = match step {
+                    ElementReadStep::Index(i) => {
+                        let pos = i.and_then(|i| if i < 0 { i.checked_add(size as i64) } else { Some(i) });
+                        match pos {
+                            Some(p) if (0..size as i64).contains(&p) => vec![p as usize],
+                            _ => return None,
                         }
-                        vec![pos as usize]
                     }
-                    // A literal key that is not an index selects no
-                    // statically known Tuple position — every one widens,
-                    // as a non-literal index does.
-                    _ => (0..size).collect(),
+                    ElementReadStep::Sym(_) | ElementReadStep::Str(_) | ElementReadStep::All => {
+                        (0..size).collect()
+                    }
                 };
                 let mut out = elements.clone();
                 let mut widened_any = false;
                 for pos in positions {
-                    if let Some(inner) =
-                        self.widen_mutated_binding(out[pos], method, arg_types, interner)
-                    {
+                    if let Some(inner) = self.widen_through_path(out[pos], rest, method, arg_types, interner) {
                         out[pos] = inner;
                         widened_any = true;
                     }
                 }
-                if !widened_any {
-                    return None;
-                }
-                Some(interner.intern(Type::Tuple(out)))
+                widened_any.then(|| interner.intern(Type::Tuple(out)))
             }
             Type::HashShape(members) => {
-                // An Integer (or float / bool / nil) step names no key of a
-                // `HashShape` — `hash_shape_keys`'s `else` row: it is a
-                // position, which a hash has none of.
-                let key_matches = |k: &ShapeKey| {
-                    matches!(key, ShapeKey::Sym(_) | ShapeKey::Str(_))
-                        && k == key
+                let selected: Vec<usize> = match step {
+                    ElementReadStep::All => (0..members.len()).collect(),
+                    ElementReadStep::Sym(k) => members
+                        .iter()
+                        .position(|mem| matches!(&mem.key, ShapeKey::Sym(s) if s == k))
+                        .into_iter()
+                        .collect(),
+                    ElementReadStep::Str(k) => members
+                        .iter()
+                        .position(|mem| matches!(&mem.key, ShapeKey::Str(s) if s == k))
+                        .into_iter()
+                        .collect(),
+                    // A position names no key of a `HashShape` —
+                    // `hash_shape_keys`'s `else` row.
+                    ElementReadStep::Index(_) => Vec::new(),
                 };
-                let idx = members.iter().position(|mem| key_matches(&mem.key))?;
-                let value = members[idx].value;
-                let widened = self.widen_mutated_binding(value, method, arg_types, interner)?;
                 let mut out = members.clone();
-                out[idx].value = widened;
-                Some(interner.intern(Type::HashShape(out)))
+                let mut widened_any = false;
+                for idx in selected {
+                    if let Some(inner) = self.widen_through_path(out[idx].value, rest, method, arg_types, interner) {
+                        out[idx].value = inner;
+                        widened_any = true;
+                    }
+                }
+                widened_any.then(|| interner.intern(Type::HashShape(out)))
             }
-            // `widen_union_path`: a union seed widens memberwise, each
-            // declining member surviving whole.
+            // `widen_union_path`.
             Type::Union(members) => {
                 let mut out: Vec<TypeId> = Vec::with_capacity(members.len());
                 let mut widened_any = false;
                 for member in members {
-                    match self.widen_element_at(member, key, method, arg_types, interner) {
+                    match self.widen_through_path(member, steps, method, arg_types, interner) {
                         Some(w) => {
                             widened_any = true;
                             out.push(w);
@@ -4323,10 +4478,7 @@ impl<'i> Typer<'i> {
                         None => out.push(member),
                     }
                 }
-                if !widened_any {
-                    return None;
-                }
-                Some(rigor_types::Algebra::union(interner, &out))
+                widened_any.then(|| rigor_types::Algebra::union(interner, &out))
             }
             _ => None,
         }
@@ -4361,7 +4513,7 @@ impl<'i> Typer<'i> {
         // drop the mutation where the recursion minted `for Integer`).
         let mut stack = vec![(
             root,
-            PathFlags { uncond: true, operand: true, writeback: false },
+            PathFlags { uncond: true, operand: true, writeback: false, rescued: false },
             ast.get(root).span(),
         )];
         while let Some((id, flags, window)) = stack.pop() {
@@ -4412,6 +4564,7 @@ impl<'i> Typer<'i> {
                         uncond: flags.uncond && edge == FlowEdge::Uncond,
                         operand: flags.operand && (edge == FlowEdge::Uncond || lenient),
                         writeback,
+                        rescued: flags.rescued || (lenient && ast.is_rescue_modifier(id)),
                     },
                     child_window,
                 ));
@@ -5556,22 +5709,66 @@ impl<'i> Typer<'i> {
                 interner,
             );
         }
-        for m in &indexed.slot_mutations {
+        // The slot table and the other element-read chains land in ONE
+        // source order — both rebuild the root local's binding, and two
+        // mutators of one carrier compose in the order they ran.
+        let in_span = |s: rigor_parse::Span| span.0 <= s.0 && s.1 <= span.1;
+        let mut landings: Vec<(rigor_parse::Span, Result<usize, usize>)> = indexed
+            .slot_mutations
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| in_span(m.span))
+            .map(|(i, m)| (m.span, Ok(i)))
+            .chain(indexed.element_reads_within(span).map(|(i, m)| (m.span, Err(i))))
+            .collect();
+        landings.sort_by_key(|(s, _)| s.0);
+        for (mspan, which) in landings {
+            // The same liveness the rebind tables apply (#362): a
+            // slot mutation in a position whose scope reaches the
+            // join point (`dead.write_reaches`) may floor the
+            // binding when the call may not have run; one in a
+            // scope that dies first (a terminated arm) leaves the
+            // binding standing, exactly as its writes were dropped.
+            let live = dead.write_reaches(mspan, (span.1, span.1));
             // A slot mutation inside a block body's `break` argument
-            // widens nothing anywhere — `join_block_break_bindings`
-            // drops every scope effect (rigor-rs#407).
-            if span.0 <= m.span.0
-                && m.span.1 <= span.1
-                && !ast.in_block_break_locals_only_carrier(m.span)
-            {
-                // The same liveness the rebind tables apply (#362): a
-                // slot mutation in a position whose scope reaches the
-                // join point (`dead.write_reaches`) may floor the
-                // binding when the call may not have run; one in a
-                // scope that dies first (a terminated arm) leaves the
-                // binding standing, exactly as its writes were dropped.
-                let live = dead.write_reaches(m.span, (span.1, span.1));
-                self.apply_slot_mutation(ast, indexed, root, m, live, slot_floor, env, interner);
+            // widens no RECORD anywhere — `join_block_break_bindings`
+            // drops every scope effect but the locals (rigor-rs#407).
+            // The local itself still changed: the reference's block-level
+            // `widen_outer_element_read` widens it with no argument types
+            // (`[1].each { break b[0] << 1 }` answers `[Array[[]]]`), which
+            // the port does not model — it floors a literal-shape binding
+            // (the only root `widen_through_path` rebuilds), as the rebind
+            // this landing replaced did, never keeping the stale literal. A
+            // nominal root (`h = {}; h[:a] ||= "s"`) stands on both sides.
+            if ast.in_block_break_locals_only_carrier(mspan) {
+                let name = match which {
+                    Ok(i) => &indexed.slot_mutations[i].name,
+                    Err(i) => &indexed.element_reads[i].name,
+                };
+                if live && slot_floor && self.literal_shape_bound(env, name, interner) {
+                    // `widen_through_path`'s nil leaves the binding standing
+                    // on the reference too (`h = {a: 1}; [1].each { break
+                    // h[:a] << 2 }` keeps `{ a: 1 }`: `Integer#<<` mutates
+                    // nothing — rigor-rs#407's row).
+                    let changes = match which {
+                        Ok(i) => self
+                            .rebuild_element_carrier(ast, indexed, &indexed.slot_mutations[i], env, interner)
+                            .is_some(),
+                        Err(i) => self.element_read_rebuild(ast, indexed, &indexed.element_reads[i], env, interner).is_some(),
+                    };
+                    if changes {
+                        env.insert(Rc::from(name.as_str()), interner.untyped());
+                    }
+                }
+                continue;
+            }
+            match which {
+                Ok(i) => self.apply_slot_mutation(
+                    ast, indexed, root, &indexed.slot_mutations[i], live, slot_floor, env, interner,
+                ),
+                Err(i) => self.apply_element_read(
+                    ast, indexed, root, &indexed.element_reads[i], live, slot_floor, env, interner,
+                ),
             }
         }
         // Upstream #2677 — the unfiltered `alias_mutations` covers the
@@ -5652,6 +5849,14 @@ impl<'i> Typer<'i> {
         interner: &mut Interner,
     ) {
         self.drop_indexed_rebinds(rebinds.iter(), span, indexed, env);
+        // The element-read chains' record half — the rebind drop they
+        // replaced (`apply_element_read`).
+        for (_, m) in indexed.element_reads_within(span) {
+            if !ast.in_block_break_locals_only_carrier(m.span)
+            {
+                drop_indexed_narrowings(env, &m.name);
+            }
+        }
         // Merge the three event lists by span start; kind order on a tie is
         // drop < insert < slot-widen (a `h[k] = v` after the `||=` still
         // drops the record the `||=` just wrote).
@@ -6999,6 +7204,9 @@ struct PathFlags {
     /// [`Typer::path_content_writeback`]: some edge on the path a content
     /// write-back boundary (`Barrier`, or a `while`/`until` body child).
     writeback: bool,
+    /// rigor-rs#943 — some node on the path above (the root included) is a
+    /// `rescue` MODIFIER carrier ([`LoweredAst::is_rescue_modifier`]).
+    rescued: bool,
 }
 
 /// rigor-rs#658 — one DFS's worth of `path_*` answers for a replay `root`,
@@ -7028,6 +7236,12 @@ impl PathMarks {
     /// [`Typer::path_content_writeback`]'s answer, like [`Self::uncond`].
     fn writeback(&self, wspan: rigor_parse::Span) -> Option<bool> {
         self.by_span.get(&wspan).map(|f| f.writeback)
+    }
+
+    /// Whether `wspan` sits under a `rescue` modifier carrier on the path
+    /// from the root, like [`Self::uncond`].
+    fn rescued(&self, wspan: rigor_parse::Span) -> Option<bool> {
+        self.by_span.get(&wspan).map(|f| f.rescued)
     }
 }
 
