@@ -3733,7 +3733,7 @@ fn arm_join_drops_indexed_narrowing_record_an_arm_rebind_killed() {
     let entry = typer.build_toplevel_check_env(&entry_ast, &mut i);
     let key = crate::flow_writes::indexed_narrowing_key("h", &ShapeKey::Sym("a".into()));
     assert!(
-        entry.get(key.as_str()).is_some(),
+        entry.contains_key(key.as_str()),
         "the check env records the operand `||=` slot"
     );
 
@@ -3744,9 +3744,9 @@ fn arm_join_drops_indexed_narrowing_record_an_arm_rebind_killed() {
     let Node::Program { body, .. } = ast.get(ast.root()) else {
         panic!("program body")
     };
-    let joined = typer.bind_statements_into(&ast, &entry, &body, &mut i);
+    let joined = typer.bind_statements_into(&ast, &entry, body, &mut i);
     assert!(
-        joined.get(key.as_str()).is_none(),
+        !joined.contains_key(key.as_str()),
         "a record one arm dropped must not survive the join"
     );
 }
