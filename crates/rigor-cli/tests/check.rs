@@ -1199,6 +1199,13 @@ fn ensure_begin_and_write_tail_termination_matrix() {
         &b"x = \"a\"; if rand > 0; x = \"s\"; else; q = r = raise; end; x.w\n"[..],
         &b"x = \"a\"; if rand > 0; x = \"s\"; else; q, r = raise; end; x.w\n"[..],
         &b"x = \"a\"; if rand > 0; x = \"s\"; else; h = {}; h[:k] = raise; end; x.w\n"[..],
+        // The attribute-write spellings, keyed on Prism's
+        // `attribute_write?` like the oracle's `attribute_write_value`
+        // (rigor-rs#964): `s.default = raise` and the explicit
+        // `s.default=(raise)` both type `bot` on the oracle. A bound
+        // Hash receiver keeps the row free of extra diagnostics.
+        &b"s = {}; x = \"a\"; if rand > 0; x = \"s\"; else; s.default = raise; end; x.w\n"[..],
+        &b"s = {}; x = \"a\"; if rand > 0; x = \"s\"; else; s.default=(raise); end; x.w\n"[..],
         // The same begin / write tails drop a rescue arm on the oracle
         // (`live_rescue_results`) — the post-`begin` scope keeps the
         // entry binding `for "a"`.
@@ -1231,6 +1238,16 @@ fn ensure_begin_and_write_tail_termination_matrix() {
         (&b"x = \"a\"; if rand > 0; x = \"s\"; else; h = {}; h[raise] = 1; end; x.w\n"[..], "\"a\" | \"s\""),
         (&b"x = \"a\"; if rand > 0; x = \"s\"; else; foo(raise); end; x.w\n"[..], "\"a\" | \"s\""),
         (&b"x = \"a\"; if rand > 0; x = \"s\"; else; [raise]; end; x.w\n"[..], "\"a\" | \"s\""),
+        // The explicit `.[]=(…)` call spelling is NOT an attribute
+        // write (Prism leaves `is_attribute_write` false for it), so the
+        // oracle types it by the `[]=` dispatch and keeps the arm live
+        // (rigor-rs#964).
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; [1].[]=(0, raise); end; x.w\n"[..], "\"a\" | \"s\""),
+        (&b"x = \"a\"; if rand > 0; x = \"s\"; else; h = {}; h.[]=(1, raise); end; x.w\n"[..], "\"a\" | \"s\""),
+        // A splat RHS is not the write's value either —
+        // `attribute_write_value` keeps the dispatch result when the
+        // last argument is a `SplatNode`.
+        (&b"s = {}; x = \"a\"; if rand > 0; x = \"s\"; else; s.attr = *a; end; x.w\n"[..], "\"a\" | \"s\""),
         // A safe-nav setter skips the store on a nil receiver.
         (&b"x = \"a\"; if rand > 0; x = \"s\"; else; o = nil; o&.attr = raise; end; x.w\n"[..], "\"a\" | \"s\""),
     ] {

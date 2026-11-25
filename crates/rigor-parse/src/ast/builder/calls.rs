@@ -393,6 +393,12 @@ impl<'src> Builder<'src> {
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so
                 // `call.possible-nil-receiver` can faithfully suppress on `&.`.
                 safe_nav: call.is_safe_navigation(),
+                // `o.attr = v` / `h[k] = v` ⇒ attribute write (also the
+                // explicit `o.attr=(v)` and `o&.attr = v` spellings); the
+                // explicit `h.[]=(k, v)` call is NOT one — the reference's
+                // `attribute_write_value` keys the RHS-value typing on this
+                // flag (rigor-rs#964).
+                attribute_write: call.is_attribute_write(),
                 first_arg_nonplain,
                 args_plain_positional,
                 args_all_plain,
