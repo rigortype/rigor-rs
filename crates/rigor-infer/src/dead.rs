@@ -1816,10 +1816,12 @@ impl<'i> Typer<'i> {
         let Node::Call { receiver, method, span, .. } = ast.get(id) else {
             return false;
         };
+        // `def_exits` first: without a same-file toplevel def it is an
+        // index miss, while `self_answers` walks the call's containers.
         self.kernel_call_terminates(ast, id)
             || (receiver.is_none()
-                && !self.self_answers(ast, *span, method)
-                && self.def_exits(ast, id, &mut Vec::new()))
+                && self.def_exits(ast, id, &mut Vec::new())
+                && !self.self_answers(ast, *span, method))
     }
 
     /// Whether an implicit-self `method` call at `site` binds a project
