@@ -608,27 +608,22 @@ fn collect_rebind_entries(ast: &LoweredAst) -> Vec<(NodeId, rigor_parse::Span, S
             for (s, names) in element_mutations {
                 if *s == span {
                     // Upstream v0.4.7 (#2395, `ElementReadWidening.
-                    // widen_element_read`): a BLOCKLESS mutator call keyed by
-                    // its own span whose receiver is a single-literal-key
-                    // `[]` read rooted at one of `names` rebuilds the
-                    // receiver's binding through that key at the slot landing
-                    // (`apply_slot_mutation`) — it is NOT a rebind. Keeping
-                    // the rebind here would floor the binding to `untyped`
-                    // before the rebuild reads it (`h = {a: []}; h[:a] << 1`
-                    // would lose the whole record shape); a rebuild that
-                    // declines leaves the binding standing, the reference's
-                    // own nil (`a = [1]; a[0] << 2` keeps `[1]`). A block call
-                    // (a `Loop`, or a `Call` with a block) and every element
-                    // path the slot table cannot express — a chained read, a
-                    // `first`/`last`/`dig` step, a non-literal key — keeps
-                    // its rebind.
-                    let slot_covered = matches!(n, Node::Call { receiver: Some(r), block_body, .. }
-                        if block_body.is_empty()
-                            && matches!(ast.get(*r),
-                                Node::Call { method, args, block_body: read_block, .. }
-                                    if method == "[]" && args.len() == 1 && read_block.is_empty())
-                            && element_slot(ast, *r).is_some());
-                    if slot_covered {
+                    // widen_element_read`): a mutator call keyed by its own
+                    // span whose receiver is an element-read chain rooted at
+                    // a local (`h[:a] << 1`, `b[0][0] << 1`, `a.first << 1`,
+                    // `h.dig(:a, 0) << 1`, `a[i] << 1`, `a[0].map! { … }`)
+                    // rebuilds the receiver's binding through that chain at
+                    // the slot landing (`apply_slot_mutation` for a
+                    // single-literal-key `[]` read the slot table records,
+                    // `apply_element_read` for every other chain) — it is
+                    // NOT a rebind. Keeping the rebind here would floor the
+                    // binding to `untyped` before the rebuild reads it (`h =
+                    // {a: []}; h[:a] << 1` would lose the whole record
+                    // shape); a rebuild that declines leaves the binding
+                    // standing, the reference's own nil (`a = [1]; a[0] <<
+                    // 2` keeps `[1]`). A block call (a `Loop`, or a block
+                    // call whose BODY mutates an element) keeps its rebind.
+                    if matches!(n, Node::Call { .. }) && ast.element_read_path(span).is_some() {
                         continue;
                     }
                     out.extend(names.iter().map(|name| (id, span, name.clone())));
@@ -2318,6 +2313,23 @@ pub(crate) struct SlotMutation {
     pub method: String,
 }
 
+/// A mutator call whose receiver is an element-read chain the slot table
+/// cannot express — a chained read (`b[0][0] << 1`), a `first` / `last` /
+/// `dig` step, a non-literal key (`h[k] << 1`) — upstream v0.4.7's
+/// `ElementReadWidening.widen_element_read`: the mutator widens the element
+/// the chain selects inside the root local's literal-shape carrier.
+#[derive(Clone, Debug)]
+pub(crate) struct ElementReadMutation {
+    /// The call's whole span.
+    pub span: rigor_parse::Span,
+    /// The chain's root local (`b`).
+    pub name: String,
+    /// The chain's steps, outermost first.
+    pub steps: Vec<rigor_parse::ElementReadStep>,
+    /// The mutator method (`<<`, `[]=`, `map!`, …).
+    pub method: String,
+}
+
 /// Calls whose result is their receiver — upstream #2677
 /// `AliasMutationFloor::SELF_RETURNERS` (`CalleeWriteCensus`'s reading).
 const ALIAS_SELF_RETURNERS: &[&str] = &["tap", "itself", "freeze", "to_a", "to_h", "to_s"];
@@ -2817,6 +2829,8 @@ pub(crate) struct IndexedFlow {
     pub operand_spans: HashSet<rigor_parse::Span>,
     /// Element-mutator calls on a recorded slot.
     pub slot_mutations: Vec<SlotMutation>,
+    /// Element-mutator calls through every other element-read chain.
+    pub element_reads: Vec<ElementReadMutation>,
     /// The span of every `def` / `class` / `module` / `class <<` node — the
     /// reference's `SCOPE_BODY_NODES`, whose writes are another scope's
     /// ([`widen_clause_entry`], upstream #1837).
@@ -2996,6 +3010,19 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
                         span: *span,
                         name,
                         key,
+                        method: effective.clone(),
+                    });
+                } else if let Some((name, steps)) = ast.element_read_path(*span) {
+                    // A chain the slot table cannot express (`b[0][0] <<
+                    // 1`, `a.first << 1`, `h[k] << 1`): the binding half
+                    // alone (`ElementReadWidening.widen_element_read`).
+                    if shadowed(id, name) {
+                        continue;
+                    }
+                    flow.element_reads.push(ElementReadMutation {
+                        span: *span,
+                        name: name.to_string(),
+                        steps: steps.to_vec(),
                         method: effective.clone(),
                     });
                 }
