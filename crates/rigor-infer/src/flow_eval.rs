@@ -4150,8 +4150,18 @@ impl<'i> Typer<'i> {
         // scope dies before the join, so its mutation rebuilds nothing.
         // The PREDICATE is the exception — it evaluates before any arm,
         // so its rebuild stays live in every arm.
-        if evaluated && live {
-            self.rebuild_element_carrier(ast, indexed, m, env, interner);
+        //
+        // The binding half asks the STRICT position (`element_read_ran`):
+        // a `rescue` modifier's body (`h[:a] << 1 rescue nil`) evaluates
+        // under the lenient operand rule, but the reference joins its
+        // rescue path's floored scope and stays silent, so the binding
+        // floors exactly as a call that may not have run does.
+        if live {
+            if evaluated && self.element_read_ran(ast, root, m.span) {
+                self.rebuild_element_carrier(ast, indexed, m, env, interner);
+            } else if evaluated && slot_floor {
+                env.insert(Rc::from(m.name.as_str()), interner.untyped());
+            }
         }
         if !evaluated {
             // The element rebind this landing replaces (upstream #2395's
@@ -4260,11 +4270,7 @@ impl<'i> Typer<'i> {
         if !live {
             return;
         }
-        let evaluated = self
-            .path_marks(ast, root)
-            .operand(m.span)
-            .unwrap_or_else(|| self.path_operand_evaluated(ast, root, m.span));
-        if !evaluated {
+        if !self.element_read_ran(ast, root, m.span) {
             if slot_floor {
                 env.insert(Rc::from(m.name.as_str()), interner.untyped());
             }
@@ -4277,6 +4283,25 @@ impl<'i> Typer<'i> {
         if let Some(rebuilt) = self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner) {
             env.insert(Rc::from(m.name.as_str()), rebuilt);
         }
+    }
+
+    /// Whether the element-read mutator at `span` certainly ran by the end
+    /// of `root`, for the binding half of its landing: the lenient operand
+    /// rule (an argument list or a splat evaluates its children), minus
+    /// either operand of a `rescue` modifier — `b[0][0] << 1 rescue nil`
+    /// may raise before the mutation, and the reference's rescue-path join
+    /// stays silent there. The strict [`Self::path_unconditional`] answer
+    /// settles most positions; only a `Recovered` / `Jump` carrier on the
+    /// path (where the two rules part) pays the modifier scan.
+    fn element_read_ran(&self, ast: &LoweredAst, root: NodeId, span: rigor_parse::Span) -> bool {
+        let marks = self.path_marks(ast, root);
+        if marks.uncond(span).unwrap_or_else(|| self.path_unconditional(ast, root, span)) {
+            return true;
+        }
+        marks
+            .operand(span)
+            .unwrap_or_else(|| self.path_operand_evaluated(ast, root, span))
+            && !ast.in_rescue_modifier_within(span, ast.get(root).span())
     }
 
     /// `ElementReadWidening.widen_through_path` (element_read_widening.rb):
@@ -5621,12 +5646,6 @@ impl<'i> Typer<'i> {
             .collect();
         landings.sort_by_key(|(s, _)| s.0);
         for (mspan, which) in landings {
-            // A slot mutation inside a block body's `break` argument
-            // widens nothing anywhere — `join_block_break_bindings`
-            // drops every scope effect (rigor-rs#407).
-            if ast.in_block_break_locals_only_carrier(mspan) {
-                continue;
-            }
             // The same liveness the rebind tables apply (#362): a
             // slot mutation in a position whose scope reaches the
             // join point (`dead.write_reaches`) may floor the
@@ -5634,6 +5653,25 @@ impl<'i> Typer<'i> {
             // scope that dies first (a terminated arm) leaves the
             // binding standing, exactly as its writes were dropped.
             let live = dead.write_reaches(mspan, (span.1, span.1));
+            // A slot mutation inside a block body's `break` argument
+            // widens no RECORD anywhere — `join_block_break_bindings`
+            // drops every scope effect but the locals (rigor-rs#407).
+            // The local itself still changed: the reference's block-level
+            // `widen_outer_element_read` widens it with no argument types
+            // (`[1].each { break b[0] << 1 }` answers `[Array[[]]]`), which
+            // the port does not model — it floors the binding, as the
+            // rebind this landing replaced did, never keeping the stale
+            // literal.
+            if ast.in_block_break_locals_only_carrier(mspan) {
+                if live && slot_floor {
+                    let name = match which {
+                        Ok(i) => &indexed.slot_mutations[i].name,
+                        Err(i) => &indexed.element_reads[i].name,
+                    };
+                    env.insert(Rc::from(name.as_str()), interner.untyped());
+                }
+                continue;
+            }
             match which {
                 Ok(i) => self.apply_slot_mutation(
                     ast, indexed, root, &indexed.slot_mutations[i], live, slot_floor, env, interner,

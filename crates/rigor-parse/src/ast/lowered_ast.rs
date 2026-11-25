@@ -558,6 +558,17 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// Whether `span` sits inside a `rescue` MODIFIER carrier
+    /// ([`Self::is_rescue_modifier`]) that itself lies within `within` —
+    /// either operand: the expression may raise before `span` runs, and
+    /// the rescue expression runs only when it does. O(rescue modifiers).
+    pub fn in_rescue_modifier_within(&self, span: Span, within: Span) -> bool {
+        self.carrier_spans.rescue_modifier_ids.iter().any(|&id| {
+            let s = self.nodes[id as usize].span();
+            within.0 <= s.0 && s.1 <= within.1 && s.0 <= span.0 && span.1 <= s.1 && s != span
+        })
+    }
+
     /// Whether `id` is the `BeginRescue` carrier an `else` clause lowered
     /// to. `ReceiverAlias.candidates` unwraps an `ElseNode` to its
     /// statements' last statement; a real `begin`/`rescue` on the same
