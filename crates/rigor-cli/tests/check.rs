@@ -652,6 +652,55 @@ fn retry_edge_without_write_keeps_indexed_narrowing() {
     }
 }
 
+/// rigor-rs#1000 — a kill holds only until the next derived write to the
+/// same local: `d = [0]` kills the retry edge for the reads after it, but
+/// `d = c` rebinds `d` from the widened entry on the second pass, so a read
+/// past it still declines. Rows are top-level; every silent row is silent
+/// on the oracle and every firing row fires the same text.
+#[test]
+fn retry_edge_kill_holds_only_until_next_derived_write() {
+    for src in [
+        // The issue row, and a derived write in an arm of an element
+        // before the read.
+        &b"x = nil\nc = [1]\nbegin\n  d = [0]\n  d = c\n  d.nope\nrescue\n  c << 2\n  retry\nend\n"[..],
+        &b"x = ENV[\"K\"]\nc = [1]\nbegin\n  d = [0]\n  if x\n    d = c\n  end\n  d.nope\nrescue\n  c << 2\n  retry\nend\n"[..],
+        // The last kill-shaped write is derived: `d = [0]` protects
+        // nothing past `d = c`.
+        &b"x = nil\nc = [1]\nbegin\n  d = c\n  d = [0]\n  d = c\n  d.nope\nrescue\n  c << 2\n  retry\nend\n"[..],
+    ] {
+        let diags = check(src);
+        assert!(diags.is_empty(), "expected silence for {src:?}, got {diags:?}");
+    }
+    // Every derived write before the kill, a fresh rebind after it, a read
+    // before the derived write, and a derived write in the holder's
+    // sibling arm keep the kill's cover — the oracle fires.
+    for (src, expected) in [
+        (
+            &b"x = nil\nc = [1]\nbegin\n  d = c\n  d = [0]\n  d.nope\nrescue\n  c << 2\n  retry\nend\n"[..],
+            "for [0]",
+        ),
+        (
+            &b"x = nil\nc = [1]\nbegin\n  d = [0]\n  d = c\n  d = [2]\n  d.nope\nrescue\n  c << 2\n  retry\nend\n"[..],
+            "for [2]",
+        ),
+        (
+            &b"x = nil\nc = [1]\nbegin\n  d = [0]\n  d.nope\n  d = c\n  d.nope2\nrescue\n  c << 2\n  retry\nend\n"[..],
+            "for [0]",
+        ),
+        (
+            &b"x = ENV[\"K\"]\nc = [1]\nbegin\n  d = [0]\n  x ? (d.nope) : (d = c)\nrescue\n  c << 2\n  retry\nend\n"[..],
+            "for [0]",
+        ),
+    ] {
+        let diags = check(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic for {src:?}, got {diags:?}");
+        assert!(
+            diags[0].message.contains(expected),
+            "expected {expected} for {src:?}, got {diags:?}"
+        );
+    }
+}
+
 /// rigor-rs#382: `call.argument-type-mismatch`'s class-level rejection is the
 /// reference's `class_subtype_result`, which resolves BOTH names via
 /// `const_get` on the host process (acceptance.rb `resolve_class`). An arg

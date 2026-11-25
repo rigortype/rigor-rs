@@ -700,6 +700,50 @@ fn coll_retry_edge_derived_and_index_writes_decline() {
     }
 }
 
+/// rigor-rs#1000 — a kill holds only until the next derived write to the
+/// same local: `d = [0]` kills the edge, but the second pass binds `d` from
+/// the widened entry again at `d = c`, so a read after it still declines.
+/// The kill keeps its cover when every derived write runs before it, or
+/// sits in a holder-element arm the read's path never takes.
+#[test]
+fn coll_retry_edge_kill_holds_only_until_next_derived_write() {
+    let wrap = |body: &str| format!("def f\n{}\nend\n", body.replace("; ", "\n"));
+    // Silent on the oracle: a derived write between the kill and the read.
+    for (body, method) in [
+        // The issue row: `d = [0]` stays a kill, but `d = c` rebinds `d`
+        // from the widened entry on the second pass.
+        ("c = [1]; begin; d = [0]; d = c; d.nope; rescue; c << 2; retry; end", "nope"),
+        // The derived write in an arm of an element before the read.
+        ("x = ENV[\"K\"]; c = [1]; begin; d = [0]; if x; d = c; end; d.nope; rescue; c << 2; retry; end", "nope"),
+        // …a derived masgn between kill and read counts too.
+        ("c = [1]; begin; d = [0]; d, e = c, 1; d.nope; rescue; c << 2; retry; end", "nope"),
+        // The LAST kill-shaped write is derived: kill, derived, read.
+        ("c = [1]; begin; d = c; d = [0]; d = c; d.nope; rescue; c << 2; retry; end", "nope"),
+    ] {
+        let src = wrap(body);
+        assert_eq!(snap(src.as_bytes(), method), None, "{src}");
+    }
+    // A derived OP-write (`d += c` is not kill-shaped) breaks the kill the
+    // same way; the oracle renders `Array[0 | Dynamic[top]]`, a shape the
+    // port cannot produce, so it declines.
+    let src = wrap("c = [1]; begin; d = [0]; d += c; d.nope; rescue; c << 2; retry; end");
+    assert_eq!(snap(src.as_bytes(), "nope"), None, "{src}");
+    // The oracle still fires: every derived write is before the kill, or a
+    // fresh rebind lands between the derived write and the read.
+    for (body, method) in [
+        ("c = [1]; begin; d = c; d = [0]; d.nope; rescue; c << 2; retry; end", "nope"),
+        ("c = [1]; begin; d = [0]; d = c; d = [2]; d.nope; rescue; c << 2; retry; end", "nope"),
+        // A read before the derived write keeps the kill's binding…
+        ("c = [1]; begin; d = [0]; d.nope; d = c; rescue; c << 2; retry; end", "nope"),
+        // …and a derived write in a sibling arm of the read's holder never
+        // runs on the read's path.
+        ("x = ENV[\"K\"]; c = [1]; begin; d = [0]; x ? (d.nope) : (d = c); rescue; c << 2; retry; end", "nope"),
+    ] {
+        let src = wrap(body);
+        assert_eq!(snap(src.as_bytes(), method), Some("Array"), "{src}");
+    }
+}
+
 /// A mutation AFTER the rescued `begin` widens the joined union memberwise
 /// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
 /// same nominal the mutated arm holds, the union collapses, and the use
