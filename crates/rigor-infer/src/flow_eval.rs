@@ -6061,10 +6061,13 @@ impl<'i> Typer<'i> {
     ///
     /// Each arm replays as effective live statements on its own entry
     /// clone — a rescue arm's reads of names the protected body changed
-    /// come back `untyped` (upstream #1837, `widen_clause_entry`; the same
-    /// `stale` slice `replay_one`'s `BeginRescue` arm uses) and its
-    /// `=> e` reference binds inside it only (`rescue_binding`; past the
-    /// construct `e` nil-injects and stays silent). A `retry` re-entering
+    /// come back `untyped` only when the arm mentions the name or the
+    /// body writes it more than once (upstream #1837, `ClauseWidening`),
+    /// and its `=> e` reference binds inside it only (`rescue_binding`,
+    /// falling back to `untyped` when the exception type is not known
+    /// exactly — `bind_rescue_reference` binds `Dynamic[top]` regardless;
+    /// past the construct `e` nil-injects and stays silent). A `retry`
+    /// re-entering
     /// the `begin` routes the exit scope through the retry edge —
     /// unmodelled here — so the names the `begin` writes decline, the
     /// same side `replay_one`'s `has_else || retry` arm takes (an
@@ -6132,49 +6135,16 @@ impl<'i> Typer<'i> {
         // exit binds); a name written once and never mentioned leaves the
         // arm at its entry binding, which the join then pairs with the
         // body's exit binding (`begin; x = "b"; rescue; nil; end` reads
-        // `"a" | "b"`). `writes` below counts per name; the rebind table
-        // supplies the write forms its nodes cannot reach (a `for` index,
-        // a `rescue => e` reference, a pattern bind) — over-counting only
-        // widens, never over-reports.
-        let mspan = crate::def_local_marks::body_span(ast, main_body)
-            .unwrap_or(bspan);
-        let mut write_counts: HashMap<String, usize> = HashMap::new();
-        // `(write span, name)` pairs the node scan already counted — the
-        // rebind table carries the SAME writes plus the forms its nodes
-        // cannot reach (`for` index, `rescue => e`, pattern binds), so it
-        // supplies only what the scan lacks.
-        let mut counted: std::collections::HashSet<(rigor_parse::Span, String)> =
-            std::collections::HashSet::new();
-        let count = |span: rigor_parse::Span,
-                        name: &str,
-                        write_counts: &mut HashMap<String, usize>,
-                        counted: &mut std::collections::HashSet<(rigor_parse::Span, String)>| {
-            counted.insert((span, name.to_string()));
-            *write_counts.entry(name.to_string()).or_insert(0) += 1;
-        };
-        for n in self.reach_index(ast).nodes_within(ast, mspan) {
-            match ast.get(n) {
-                Node::LocalVariableWrite { name, span, .. }
-                | Node::LocalVariableOpWrite { name, span, .. }
-                | Node::InstanceVariableWrite { name, span, .. } => {
-                    count(*span, name, &mut write_counts, &mut counted)
-                }
-                Node::MultiWrite { targets, span, .. } => {
-                    for (name, _) in targets.bound_names() {
-                        count(*span, &name, &mut write_counts, &mut counted);
-                    }
-                }
-                Node::UnmodeledWrite { names, ivar_write, span, .. } => {
-                    for name in names.iter().chain(ivar_write.iter().map(|w| &w.name)) {
-                        count(*span, name, &mut write_counts, &mut counted);
-                    }
-                }
-                _ => {}
-            }
-        }
-        for (wspan, name) in effects.rebinds_within(mspan) {
-            if !counted.contains(&(*wspan, name.clone())) {
-                *write_counts.entry(name.clone()).or_insert(0) += 1;
+        // `"a" | "b"`). The per-name census is the marks write table — its
+        // `all_writes` covers `for` indices, `rescue => e` references,
+        // masgn and sigilled-op targets the reference's
+        // `LOCAL_WRITE_NODES | InstanceVariable*Node` set walks, and
+        // `write_positions_outside` already drops the `def`/`class`/
+        // `module` nested scopes the reference's `SCOPE_BODY_NODES` skips.
+        let mut write_counts: HashMap<&str, usize> = HashMap::new();
+        if let Some(mspan) = crate::def_local_marks::body_span(ast, main_body) {
+            for (_, name) in marks.write_positions_outside(mspan, &[], None) {
+                *write_counts.entry(name).or_insert(0) += 1;
             }
         }
         for clause in clauses {
@@ -6193,16 +6163,27 @@ impl<'i> Typer<'i> {
             let reads = marks.reads_within(cspan);
             let changed = marks.changed_within(cspan);
             let mentioned = |name: &str| {
-                reads.iter().any(|r| *r == name) || changed.iter().any(|c| c == name)
+                reads.contains(&name) || changed.iter().any(|c| c.as_str() == name)
             };
             let untyped = interner.untyped();
             for (name, n) in &write_counts {
-                if (*n > 1 || mentioned(name)) && e.contains_key(name.as_str()) {
-                    e.insert(Rc::from(name.as_str()), untyped);
+                if (*n > 1 || mentioned(name)) && e.contains_key(*name) {
+                    e.insert(Rc::from(*name), untyped);
                 }
             }
+            // `bind_rescue_reference` binds `e` inside the arm even when
+            // its exception type is not known exactly — the reference
+            // binds `Dynamic[top]` there, so an unresolvable list must not
+            // leave `e` at its entry binding.
+            let mut bound_e = false;
             for (name, ty) in self.rescue_binding(ast, clause, interner) {
+                bound_e = true;
                 e.insert(Rc::from(name.as_str()), ty);
+            }
+            if !bound_e {
+                if let Some(name) = &clause.bound_name {
+                    e.insert(Rc::from(name.as_str()), untyped);
+                }
             }
             self.bind_live_arm_stmts(
                 ast, &clause.body, mutations, &mut e, effects, indexed, dead, interner,
