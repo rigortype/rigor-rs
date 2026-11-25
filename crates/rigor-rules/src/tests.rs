@@ -6115,3 +6115,34 @@ fn retry_edge_derived_and_index_writes_decline() {
         assert!(got[0].ends_with(msg), "{src:?}: {got:?}");
     }
 }
+
+/// rigor-rs#1003 — the paths `declined_names`' dedup and the `kill_free`
+/// precompute serve: nested retrying `begin`s decline the same local once,
+/// a fresh rebind still kills the edge for the reads after it, and an
+/// indexed-narrowing read declines with its carrier.
+#[test]
+fn retry_edge_nested_begins_and_kill_controls() {
+    let undefined = |src: &str| -> Vec<String> {
+        run(src.as_bytes())
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for src in [
+        // Both `begin`s hold `v.nope` and both decline `v` — the dedup set
+        // keeps one entry (oracle: silent).
+        "c = [1]; begin; begin; v = c; v.nope; rescue; c << 2; retry; end; rescue; c << 3; retry; end\n",
+        // An `h[k]` read mints a narrowing key; the edge's `h[k] =` write
+        // declines the reads the key fed (oracle: silent).
+        "h = {a: 1}; begin; x = h[:a]; x.nope; rescue; h[:a] = 9; retry; end\n",
+    ] {
+        assert_eq!(undefined(src), Vec::<String>::new(), "{src:?}");
+    }
+    // `v = [5]` is a real (non-derived) kill: the edge write reaches
+    // `v.nope` before it but not `v.nada` after it (oracle: `for [5]`).
+    let src = "c = [1]; begin; v = c; v.nope; v = [5]; v.nada; rescue; c << 2; retry; end\n";
+    let got = undefined(src);
+    assert_eq!(got.len(), 1, "{src:?}: {got:?}");
+    assert!(got[0].ends_with("for [5]"), "{src:?}: {got:?}");
+}

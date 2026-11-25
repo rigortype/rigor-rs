@@ -19,7 +19,8 @@ use crate::{
 };
 use crate::dead::DeadOp;
 use crate::flow_writes::{
-    collect_indexed_flow, drop_indexed_narrowings, indexed_narrowing_key, owns_deferred_body,
+    collect_indexed_flow, drop_indexed_narrowings, drop_indexed_narrowings_for,
+    indexed_narrowing_key, owns_deferred_body,
     is_content_mutator, literal_send_target, node_child_ids, IndexedFlow, MUTATOR_METHODS,
     STRING_MUTATORS,
 };
@@ -2896,11 +2897,22 @@ impl<'i> Typer<'i> {
         // `Dynamic[top]` ([`crate::retry_edge`]).
         if !flow.retry_edges.is_empty() {
             let u = interner.untyped();
-            for name in flow.retry_edges.declined_names(site) {
-                if base.get(name).is_some_and(|&t| t != u) {
-                    let env = base.to_mut();
-                    env.insert(Rc::from(name), u);
-                    drop_indexed_narrowings(env, name);
+            let mut applied: Vec<&str> = Vec::new();
+            {
+                let env = base.to_mut();
+                for name in flow.retry_edges.declined_names(site) {
+                    if let Some(t) = env.get_mut(name) {
+                        if *t != u {
+                            *t = u;
+                            applied.push(name);
+                        }
+                    }
+                }
+                // One env pass drops every applied local's slot records — a
+                // `retain` per name was quadratic on a `begin` with many
+                // derived writes (rigor-rs#1003).
+                if !applied.is_empty() {
+                    drop_indexed_narrowings_for(env, &applied);
                 }
             }
         }

@@ -2231,6 +2231,18 @@ pub fn drop_indexed_narrowings(env: &mut TypeEnv, name: &str) {
     env.retain(|k, _| !k.starts_with(prefix.as_str()));
 }
 
+/// [`drop_indexed_narrowings`] for several roots in ONE `env` pass — a
+/// `retain` per name scans the whole env each time, which is quadratic
+/// when a retry edge declines hundreds of locals at one site
+/// (rigor-rs#1003).
+pub fn drop_indexed_narrowings_for(env: &mut TypeEnv, names: &[&str]) {
+    let roots: HashSet<&str> = names.iter().copied().collect();
+    env.retain(|k, _| match k.find('\u{1f}') {
+        Some(i) => !roots.contains(&k[..i]),
+        None => true,
+    });
+}
+
 /// `IndexedNarrowing.stable_key` (`indexed_narrowing.rb:63`): the literal
 /// `ShapeKey` an index argument names — Symbol / String / Integer literals
 /// only (`STABLE_KEY_NODES`); a variable, splat or interpolated key
