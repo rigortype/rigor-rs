@@ -74,19 +74,16 @@ struct EdgeWrites {
 struct StmtList {
     /// Element spans, in source order.
     elems: Vec<Span>,
-    /// The elements that kill a local, in index order: a plain `x = v`
+    /// Per local, the elements that kill it, in index order: a plain `x = v`
     /// statement whose value does not read `x` ([`kills`]), with its span.
-    kills: Vec<(String, usize, Span)>,
+    kills: HashMap<String, Vec<(usize, Span)>>,
 }
 
 impl StmtList {
     /// The index of the first element that kills `name`, skipping the
     /// derived writes.
     fn first_kill(&self, name: &str, derived: &HashSet<Span>) -> Option<usize> {
-        self.kills
-            .iter()
-            .find(|(n, _, s)| n == name && !derived.contains(s))
-            .map(|&(_, i, _)| i)
+        self.kills.get(name)?.iter().find(|(_, s)| !derived.contains(s)).map(|&(i, _)| i)
     }
 }
 
@@ -266,32 +263,62 @@ impl RetryBegin {
                 cands.push((w, targets, reads));
             }
         }
-        loop {
-            let (hit, rest): (Vec<_>, Vec<_>) = cands
-                .into_iter()
-                .partition(|(_, _, reads)| reads.iter().any(|(n, s)| self.declines(*s, n)));
-            cands = rest;
-            if hit.is_empty() {
-                return;
-            }
-            for (w, targets, _) in hit {
-                self.derived.insert(w);
-                for t in targets {
-                    let i = match self.writes.binary_search_by(|(n, _)| n.as_str().cmp(&t)) {
-                        Ok(i) => i,
-                        Err(i) => {
-                            self.writes.insert(i, (t, EdgeWrites { starts: Vec::new(), rebind: false }));
-                            i
-                        }
-                    };
-                    let e = &mut self.writes[i].1;
-                    if let Err(k) = e.starts.binary_search(&w.0) {
-                        e.starts.insert(k, w.0);
-                    }
-                    e.rebind = true;
+        // A worklist over names: deriving a write changes only its targets'
+        // edge writes and kills, so only the candidates reading a changed
+        // name need another look. A full re-scan per round was quadratic in
+        // a chain `v1 = v0; v2 = v1; …` (a 2000-link chain took 25s).
+        let mut readers: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, (_, _, reads)) in cands.iter().enumerate() {
+            for (n, _) in reads {
+                let list = readers.entry(n.as_str()).or_default();
+                if list.last() != Some(&i) {
+                    list.push(i);
                 }
             }
         }
+        let mut done = vec![false; cands.len()];
+        // Each item is a candidate and the one name whose reads to look at
+        // (`None`: all of them, the first look).
+        let mut work: Vec<(usize, Option<&str>)> = (0..cands.len()).rev().map(|i| (i, None)).collect();
+        while let Some((i, only)) = work.pop() {
+            if done[i] {
+                continue;
+            }
+            let (w, targets, reads) = &cands[i];
+            let hit = reads
+                .iter()
+                .filter(|(n, _)| only.is_none_or(|o| o == n))
+                .any(|(n, s)| self.declines(*s, n));
+            if !hit {
+                continue;
+            }
+            done[i] = true;
+            self.derived.insert(*w);
+            for t in targets {
+                self.add_reaching_write(t, w.0);
+                if let Some((name, list)) = readers.get_key_value(t.as_str()) {
+                    work.extend(list.iter().filter(|&&j| !done[j]).map(|&j| (j, Some(*name))));
+                }
+            }
+        }
+    }
+
+    /// Record a write of `name` at `start` that reaches every read in any
+    /// order ([`EdgeWrites::rebind`]).
+    fn add_reaching_write(&mut self, name: &str, start: usize) {
+        let i = match self.writes.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+            Ok(i) => i,
+            Err(i) => {
+                let fresh = EdgeWrites { starts: Vec::new(), rebind: false };
+                self.writes.insert(i, (name.to_string(), fresh));
+                i
+            }
+        };
+        let e = &mut self.writes[i].1;
+        if let Err(k) = e.starts.binary_search(&start) {
+            e.starts.insert(k, start);
+        }
+        e.rebind = true;
     }
 
     /// Per statement list holding `site`, the list and the index of the
@@ -400,11 +427,12 @@ fn lists_within(
     raw.into_iter()
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let kills = l
-                .iter()
-                .enumerate()
-                .filter_map(|(i, &s)| kills(ast, idx, s).map(|n| (n, i, ast.get(s).span())))
-                .collect();
+            let mut kills: HashMap<String, Vec<(usize, Span)>> = HashMap::new();
+            for (i, &s) in l.iter().enumerate() {
+                if let Some(name) = self::kills(ast, idx, s) {
+                    kills.entry(name).or_default().push((i, ast.get(s).span()));
+                }
+            }
             StmtList { elems: l.iter().map(|&s| ast.get(s).span()).collect(), kills }
         })
         .collect()
