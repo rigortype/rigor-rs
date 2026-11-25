@@ -5706,7 +5706,13 @@ impl<'i> Typer<'i> {
                 let body_ty = self
                     .arm_scope_ty(ast, env, body, name, body_entry, interner)
                     .unwrap_or(body_entry);
-                Some(rigor_types::Algebra::join(interner, at, body_ty))
+                // The zero-iteration edge is the POST-COLLECTION scope: the
+                // collection evaluates unconditionally, so a write inside it
+                // precedes the iteration decision on every edge — `for y in
+                // (x = [1])` answers `… | [1]`, never the pre-`for` binding
+                // (`coll_scope` IS `at` whenever the collection wrote
+                // nothing — rigor-rs#998 review).
+                Some(rigor_types::Algebra::join(interner, coll_scope, body_ty))
             }
             _ => self.last_write_ty(ast, env, ast.get(id).span(), name, at, interner),
         }

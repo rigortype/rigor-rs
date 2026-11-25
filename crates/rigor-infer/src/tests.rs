@@ -1371,6 +1371,12 @@ fn arm_scope_join_reads_operands_index_and_post_pred() {
         // `describe` spells the `[k, v]` pair `Tuple[:k, 1]` (the probe's
         // `]` strip leaves `Tuple[:k, 1`).
         ("x = \"a\"; if rand > 0; for x in { k: 1 }; end; end; x.w", r#""a" | Tuple[:k, 1"#),
+        // The zero-iteration edge is the POST-COLLECTION scope: a write
+        // inside the collection precedes the iteration decision on every
+        // edge, so the pre-`for` binding never resurrects (rigor-rs#998
+        // review).
+        ("x = \"a\"; if rand > 0; x = \"s\"; for y in (x = [1]); end; end; x.w", r#""a" | Tuple[1"#),
+        ("x = \"a\"; if rand > 0; x = \"s\"; for x in (x = [1]); end; end; x.w", r#""a" | 1 | Tuple[1"#),
         // A nested `if` whose predicate writes the name joins its arms
         // from the post-predicate binding.
         ("x = \"a\"; if rand > 0; if (x = rand) > 0; x = \"s\"; else; x = \"t\"; end; end; x.w", r#""a" | "s" | "t""#),
