@@ -1296,6 +1296,44 @@ fn terminating_arm_drops_recognise_nested_exits() {
     assert_eq!(env.get("x"), Some(&s));
 }
 
+/// rigor-rs#951 — the undecided `if_join` joins each arm's EXIT scope: an
+/// elsif chain or a nested `if` contributes its own arm join, not the
+/// lexically-last write in the span, and an op-write folds from the
+/// binding the arm built so far. Every expected value is the oracle's own
+/// answer (`undefined method 'w' for …`).
+#[test]
+fn undecided_if_join_reads_each_arm_exit_scope() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let x_of = |src: &str| {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        // `describe` spells `Constant["s"]`; the message spells `"s"`.
+        rigor_types::describe(&i, *env.get("x").expect(src))
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+    for (src, want) in [
+        ("x = \"a\"; if rand > 1; x = \"s\"; elsif rand > 2; x = \"t\"; else; x = \"u\"; end; x.w", r#""s" | "t" | "u""#),
+        ("x = \"a\"; if rand > 1; x = \"s\"; elsif rand > 2; x = \"t\"; end; x.w", r#""a" | "s" | "t""#),
+        ("x = \"a\"; if rand > 0; if rand > 1; x = \"s\"; elsif rand > 2; x = \"t\"; else; x = \"u\"; end; end; x.w", r#""a" | "s" | "t" | "u""#),
+        ("x = \"a\"; if rand > 0; x = \"q\"; if rand > 1; x = \"s\"; end; end; x.w", r#""a" | "q" | "s""#),
+        ("x = \"a\"; if rand > 0; unless rand > 1; x = \"s\"; else; x = \"t\"; end; end; x.w", r#""a" | "s" | "t""#),
+        ("x = \"a\"; if rand > 1; x = \"s\"; else; if rand > 2; x = \"t\"; end; end; x.w", r#""a" | "s" | "t""#),
+        ("x = \"a\"; if rand > 1; rand > 2 ? (x = \"s\") : (x = \"t\"); end; x.w", r#""a" | "s" | "t""#),
+        // A folded nested `if` contributes its live arm alone.
+        ("x = \"a\"; if rand > 0; if true; x = \"s\"; else; x = \"t\"; end; end; x.w", r#""a" | "s""#),
+        // The termination drops apply at every level of the chain.
+        ("x = \"a\"; if rand > 1; x = \"s\"; elsif rand > 2; x = \"t\"; raise; end; x.w", r#""a" | "s""#),
+        ("x = \"a\"; if rand > 1; raise; elsif rand > 2; x = \"t\"; else; x = \"u\"; end; x.w", r#""t" | "u""#),
+        ("x = 1; if rand > 0; x = 2; x += 3; end; x.w", "1 | 5"),
+        ("x = 1; if rand > 0; if rand > 1; x += 3; else; x = 7; end; end; x.w", "1 | 4 | 7"),
+    ] {
+        assert_eq!(x_of(src), want, "{src}");
+    }
+}
+
 /// rigor-rs#952 — the `else` clause of a `begin`/`rescue` joins its type
 /// unconditionally: a non-exiting `else` (even unreachable behind an
 /// exiting body, and even an EMPTY `else; end` — `nil` either way) keeps
