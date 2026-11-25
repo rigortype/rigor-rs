@@ -321,7 +321,7 @@ fn kernel_signature_bot_calls() {
 /// rigor-rs#1011 (rigor#1107) — `loop`'s `bot` stands while the literal
 /// block provably cannot raise `StopIteration` AND carries no block-level
 /// `break`: `STOP_ITERATION_FREE_NODES` ported as
-/// `Typer::stop_iteration_free` (any call — even `raise` — declines: the
+/// `stop_iteration_free` (any call — even `raise` — declines: the
 /// receiver/argument could iterate), plus `Typer::block_level_break` for
 /// `break`'s value join. A `&expr` pass has no body to prove, and a
 /// declared parameter's default may raise.

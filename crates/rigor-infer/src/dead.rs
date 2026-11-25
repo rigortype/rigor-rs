@@ -1846,7 +1846,7 @@ impl<'i> Typer<'i> {
     ///   too); a literal `nil` picks the `?nil` overload back to `bot`.
     /// - `loop` — `() { () -> void } -> bot` when the literal block can
     ///   provably not end the call: `loop_may_complete?` (rigor#1107),
-    ///   ported as [`Self::stop_iteration_free`] over the body, plus the
+    ///   ported as [`stop_iteration_free`] over the body, plus the
     ///   block-level `break` the oracle joins into the return (`loop {
     ///   break }` types `nil`, `loop { break 5 }` `Integer` —
     ///   [`Self::block_level_break`]). A `&expr` pass has no body to prove
@@ -1898,7 +1898,7 @@ impl<'i> Typer<'i> {
                     && block_params.is_empty()
                     && block_body
                         .iter()
-                        .all(|&b| self.stop_iteration_free(ast, b))
+                        .all(|&b| stop_iteration_free(ast, b))
                     && !self.block_level_break(ast, block_span.unwrap())
             }
             _ => false,
@@ -1963,81 +1963,7 @@ impl<'i> Typer<'i> {
                 })
     }
 
-    /// `BlockCallTiming::STOP_ITERATION_FREE_NODES` on the lowered arena —
-    /// the shapes a `loop` body may consist of while provably unable to
-    /// raise `StopIteration` (`may_raise_stop_iteration?`): a call,
-    /// `yield`, `super`, interpolation, a splat, a constant read
-    /// (`const_missing`), a `rescue`, a loop/`def`/class/lambda, a
-    /// gvar/cvar access, or any unlisted shape all decline. Whitelisted
-    /// carriers descend their children — a `break e.next` declines through
-    /// the `e.next` call.
-    fn stop_iteration_free(&self, ast: &LoweredAst, id: NodeId) -> bool {
-        match ast.get(id) {
-            Node::Statements { body, kind, .. } => match kind {
-                StatementsKind::Sequence => {
-                    body.iter().all(|&b| self.stop_iteration_free(ast, b))
-                }
-                // `BreakNode`/`NextNode`/`RedoNode` whitelist the jump;
-                // `retry` re-runs a `begin` (`RetryNode` is not one) and
-                // the recovery carriers flatten their children out of
-                // shape.
-                StatementsKind::Jump(JumpKind::Break | JumpKind::Next | JumpKind::Redo) => {
-                    body.iter().all(|&b| self.stop_iteration_free(ast, b))
-                }
-                _ => false,
-            },
-            Node::Other { jump, .. } => matches!(
-                jump,
-                Some(JumpKind::Break | JumpKind::Next | JumpKind::Redo)
-            ),
-            Node::Return { values, .. } => {
-                values.iter().all(|&v| self.stop_iteration_free(ast, v))
-            }
-            // `ParenthesesNode` — a clause-less `begin` is a real
-            // `begin…end` or an `else`/carrier (`BeginNode` is not
-            // whitelisted), so only the paren carrier descends.
-            Node::BeginRescue { main_body, clauses, .. } => {
-                clauses.is_empty()
-                    && ast.is_paren_carrier(id)
-                    && main_body.iter().all(|&b| self.stop_iteration_free(ast, b))
-            }
-            Node::IntegerLit { .. }
-            | Node::FloatLit { .. }
-            | Node::RationalLit { .. }
-            | Node::ImaginaryLit { .. }
-            | Node::StringLit { .. }
-            | Node::SymbolLit { .. }
-            | Node::NilLit { .. }
-            | Node::TrueLit { .. }
-            | Node::FalseLit { .. }
-            | Node::SelfExpr { .. }
-            | Node::LocalVariableRead { .. } => true,
-            // `InstanceVariableReadNode` lowers to `VariableRead` — ivar
-            // sigils only (`@@c` / `$g` are not whitelisted).
-            Node::VariableRead { name, .. } => is_ivar(name),
-            Node::LocalVariableWrite { value, .. }
-            | Node::InstanceVariableWrite { value, .. } => {
-                self.stop_iteration_free(ast, *value)
-            }
-            Node::If {
-                predicate,
-                then_body,
-                else_body,
-                ..
-            } => {
-                self.stop_iteration_free(ast, *predicate)
-                    && then_body.iter().all(|&b| self.stop_iteration_free(ast, b))
-                    && else_body.iter().all(|&b| self.stop_iteration_free(ast, b))
-            }
-            Node::Logical { left, right, .. } => {
-                self.stop_iteration_free(ast, *left) && self.stop_iteration_free(ast, *right)
-            }
-            Node::ArrayLit { elements, .. } => {
-                elements.iter().all(|&e| self.stop_iteration_free(ast, e))
-            }
-            _ => false,
-        }
-    }
+
 
     /// Whether an implicit-self `method` call at `site` binds a project
     /// TOPLEVEL `def` on the reference: the project's `<toplevel>` table
@@ -2279,6 +2205,76 @@ fn never_hash_shape(ast: &LoweredAst, arg: NodeId) -> bool {
             | Node::Range { .. }
             | Node::Lambda { .. }
     )
+}
+
+/// `BlockCallTiming::STOP_ITERATION_FREE_NODES` on the lowered arena —
+/// the shapes a `loop` body may consist of while provably unable to
+/// raise `StopIteration` (`may_raise_stop_iteration?`): a call,
+/// `yield`, `super`, interpolation, a splat, a constant read
+/// (`const_missing`), a `rescue`, a loop/`def`/class/lambda, a
+/// gvar/cvar access, or any unlisted shape all decline. Whitelisted
+/// carriers descend their children — a `break e.next` declines through
+/// the `e.next` call.
+fn stop_iteration_free(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::Statements { body, kind, .. } => match kind {
+            StatementsKind::Sequence => body.iter().all(|&b| stop_iteration_free(ast, b)),
+            // `BreakNode`/`NextNode`/`RedoNode` whitelist the jump;
+            // `retry` re-runs a `begin` (`RetryNode` is not one) and
+            // the recovery carriers flatten their children out of
+            // shape.
+            StatementsKind::Jump(JumpKind::Break | JumpKind::Next | JumpKind::Redo) => {
+                body.iter().all(|&b| stop_iteration_free(ast, b))
+            }
+            _ => false,
+        },
+        Node::Other { jump, .. } => {
+            matches!(jump, Some(JumpKind::Break | JumpKind::Next | JumpKind::Redo))
+        }
+        Node::Return { values, .. } => values.iter().all(|&v| stop_iteration_free(ast, v)),
+        // `ParenthesesNode` — a clause-less `begin` is a real
+        // `begin…end` or an `else`/carrier (`BeginNode` is not
+        // whitelisted), so only the paren carrier descends.
+        Node::BeginRescue { main_body, clauses, .. } => {
+            clauses.is_empty()
+                && ast.is_paren_carrier(id)
+                && main_body.iter().all(|&b| stop_iteration_free(ast, b))
+        }
+        Node::IntegerLit { .. }
+        | Node::FloatLit { .. }
+        | Node::RationalLit { .. }
+        | Node::ImaginaryLit { .. }
+        | Node::StringLit { .. }
+        | Node::SymbolLit { .. }
+        | Node::NilLit { .. }
+        | Node::TrueLit { .. }
+        | Node::FalseLit { .. }
+        | Node::SelfExpr { .. }
+        | Node::LocalVariableRead { .. } => true,
+        // `InstanceVariableReadNode` lowers to `VariableRead` — ivar
+        // sigils only (`@@c` / `$g` are not whitelisted).
+        Node::VariableRead { name, .. } => is_ivar(name),
+        Node::LocalVariableWrite { value, .. } | Node::InstanceVariableWrite { value, .. } => {
+            stop_iteration_free(ast, *value)
+        }
+        Node::If {
+            predicate,
+            then_body,
+            else_body,
+            ..
+        } => {
+            stop_iteration_free(ast, *predicate)
+                && then_body.iter().all(|&b| stop_iteration_free(ast, b))
+                && else_body.iter().all(|&b| stop_iteration_free(ast, b))
+        }
+        Node::Logical { left, right, .. } => {
+            stop_iteration_free(ast, *left) && stop_iteration_free(ast, *right)
+        }
+        Node::ArrayLit { elements, .. } => {
+            elements.iter().all(|&e| stop_iteration_free(ast, e))
+        }
+        _ => false,
+    }
 }
 
 impl<'i> Typer<'i> {
