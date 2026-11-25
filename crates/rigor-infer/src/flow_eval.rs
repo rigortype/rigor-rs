@@ -1202,6 +1202,20 @@ impl<'i> Typer<'i> {
             }
         }
         for name in bound {
+            // A `\u{1f}`-keyed synthetic record — an indexed narrowing —
+            // intersects on PRESENCE like the reference's `join_bindings`:
+            // an arm that dropped it (a carrier rebind invalidates its slots
+            // — `bind_statement`'s `drop_indexed_narrowings`) leaves the slot
+            // un-narrowed in that arm's scope, so the joined scope drops the
+            // record outright — never resurrect `entry`'s through the
+            // absent-arm fallback, never nil-inject it (rigor-rs#1013). The
+            // same rule [`Self::join_arm_envs`] gives the folded-arm join.
+            if name.contains('\u{1f}')
+                && arm_envs.iter().any(|ae| ae.get(name.as_str()).is_none())
+            {
+                env.remove(name.as_str());
+                continue;
+            }
             // Only names an arm actually CHANGED need the join; a name no arm
             // rebinds keeps its entry binding.
             if arm_envs.iter().all(|ae| ae.get(name.as_str()) == entry.get(name.as_str())) {

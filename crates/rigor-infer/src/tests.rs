@@ -3717,3 +3717,37 @@ fn nested_alternating_logical_guard_is_linear() {
     );
 }
 
+/// rigor-rs#1013 — `join_arm_writes_bound`'s memberwise join must intersect a
+/// `\u{1f}`-keyed indexed-narrowing record on PRESENCE, not nil-inject or
+/// resurrect it: an arm whose `h = {}` rebind invalidates the slot
+/// (`bind_statement`'s `drop_indexed_narrowings`) leaves the record absent in
+/// that arm's scope, and the reference's `join_bindings` keeps a record only
+/// when EVERY joined scope binds it. The replay envs the check surface hands
+/// `bind_statements_into` (`branch_value_type`'s arm envs) do carry the record.
+#[test]
+fn arm_join_drops_indexed_narrowing_record_an_arm_rebind_killed() {
+    let entry_ast = lower_src(b"h = {}\nh[:a] ||= \"s\"\n");
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let mut i = Interner::new();
+    let entry = typer.build_toplevel_check_env(&entry_ast, &mut i);
+    let key = crate::flow_writes::indexed_narrowing_key("h", &ShapeKey::Sym("a".into()));
+    assert!(
+        entry.contains_key(key.as_str()),
+        "the check env records the operand `||=` slot"
+    );
+
+    // `if $c; h = {}; end` — the then-arm rebinds `h`, dropping its slot
+    // records; the empty else arm leaves `entry` untouched. The joined env
+    // must not keep `entry`'s record through the absent-arm fallback.
+    let ast = lower_src(b"if $c\n  h = {}\nend\n");
+    let Node::Program { body, .. } = ast.get(ast.root()) else {
+        panic!("program body")
+    };
+    let joined = typer.bind_statements_into(&ast, &entry, body, &mut i);
+    assert!(
+        !joined.contains_key(key.as_str()),
+        "a record one arm dropped must not survive the join"
+    );
+}
+
