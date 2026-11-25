@@ -231,7 +231,7 @@ impl RetryBegin {
     /// the `nested` scope bodies, whose value reads a local or ivar. It is
     /// derived once one of those reads declines.
     fn derive(&mut self, ast: &LoweredAst, idx: &crate::reach_index::ReachIndex, nested: &[Span]) {
-        let mut cands: Vec<(Span, Vec<String>, Vec<(String, Span)>)> = Vec::new();
+        let mut cands: Vec<Derivable> = Vec::new();
         for n in idx.nodes_within(ast, self.span) {
             let node = ast.get(n);
             let w = node.span();
@@ -260,7 +260,7 @@ impl RetryBegin {
                 })
                 .collect();
             if !targets.is_empty() && !reads.is_empty() {
-                cands.push((w, targets, reads));
+                cands.push(Derivable { span: w, targets, reads });
             }
         }
         // A worklist over names: deriving a write changes only its targets'
@@ -268,8 +268,8 @@ impl RetryBegin {
         // name need another look. A full re-scan per round was quadratic in
         // a chain `v1 = v0; v2 = v1; …` (a 2000-link chain took 25s).
         let mut readers: HashMap<&str, Vec<usize>> = HashMap::new();
-        for (i, (_, _, reads)) in cands.iter().enumerate() {
-            for (n, _) in reads {
+        for (i, c) in cands.iter().enumerate() {
+            for (n, _) in &c.reads {
                 let list = readers.entry(n.as_str()).or_default();
                 if list.last() != Some(&i) {
                     list.push(i);
@@ -284,7 +284,7 @@ impl RetryBegin {
             if done[i] {
                 continue;
             }
-            let (w, targets, reads) = &cands[i];
+            let Derivable { span: w, targets, reads } = &cands[i];
             let hit = reads
                 .iter()
                 .filter(|(n, _)| only.is_none_or(|o| o == n))
@@ -335,6 +335,14 @@ impl RetryBegin {
             .collect();
         Chain { links }
     }
+}
+
+/// A candidate derived write ([`RetryBegin::derive`]): its span, the names
+/// it writes and the local/ivar reads in its value.
+struct Derivable {
+    span: Span,
+    targets: Vec<String>,
+    reads: Vec<(String, Span)>,
 }
 
 /// [`RetryBegin::chain`].
