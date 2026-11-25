@@ -5233,7 +5233,7 @@ impl<'i> Typer<'i> {
                         // still evaluates but its scope dies at the join:
                         // its writes must not widen the post-`if` env.
                         // Same in-span slice as the folded arm above —
-                        // `widen_*`/`drop_*`/`arm_write_ty` only ever read
+                        // `widen_*`/`drop_*`/`if_scope_join_ty` only ever read
                         // the inside-`span` entries (rigor-rs#424).
                         let live_rebinds: Vec<_> = effects
                             .rebinds_within(span)
@@ -5251,63 +5251,9 @@ impl<'i> Typer<'i> {
                         // and `v.zz` fires `for nil` on the oracle; a write
                         // whose value disagrees with the entry (`v = "s"`)
                         // unions into a decline-side type. Each arm
-                        // contributes the LAST write of the name inside its
-                        // span, or the entry binding when it wrote nothing.
-                        // The LAST write of `name` in an arm, typed from its
-                        // node kind: a plain `v = e` yields `type_of(e)`, an
-                        // `op=` yields `op_write_result(entry, op, e)` (`v +=
-                        // 2` on `v = 1` is `3`, unioning to `1 | 3` — the
-                        // oracle's own answer), and a `v, w = rhs` yields the
-                        // destructure's bound type for `name` (`"a" | 1` on
-                        // `v, w = "a", "b"` — rigor-rs#443 review).
-                        #[allow(clippy::too_many_arguments)]
-                        fn arm_write_ty(
-                            this: &Typer<'_>,
-                            ast: &LoweredAst,
-                            env: &TypeEnv,
-                            body: &[NodeId],
-                            name: &str,
-                            entry: TypeId,
-                            interner: &mut Interner,
-                        ) -> Option<TypeId> {
-                            let idx = this.reach_index(ast);
-                            let mut last: Option<(rigor_parse::Span, TypeId)> = None;
-                            let mut consider = |wspan: rigor_parse::Span, ty: TypeId| {
-                                if last.is_none_or(|(ls, _)| ls.0 < wspan.0) {
-                                    last = Some((wspan, ty));
-                                }
-                            };
-                            for s in body {
-                                for n in idx.nodes_within(ast, ast.get(*s).span()) {
-                                    let wspan = ast.get(n).span();
-                                    match ast.get(n) {
-                                        Node::LocalVariableWrite { name: n2, value, .. }
-                                            if n2 == name =>
-                                        {
-                                            let ty = this.type_of(ast, *value, env, interner);
-                                            consider(wspan, ty);
-                                        }
-                                        Node::LocalVariableOpWrite { name: n2, value, op, .. }
-                                            if n2 == name =>
-                                        {
-                                            let v_ty = this.type_of(ast, *value, env, interner);
-                                            let ty = this.op_write_result(ast, n, entry, op, *value, v_ty, env, interner);
-                                            consider(wspan, ty);
-                                        }
-                                        Node::MultiWrite { targets, value, .. } => {
-                                            let rhs = this.type_of(ast, *value, env, interner);
-                                            for (n2, ty) in crate::multi_target_binder::bind(targets, rhs, interner) {
-                                                if n2 == name {
-                                                    consider(wspan, ty);
-                                                }
-                                            }
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                            }
-                            last.map(|(_, ty)| ty)
-                        }
+                        // contributes its exit binding of the name, or the
+                        // entry binding when it wrote nothing
+                        // ([`Self::if_scope_join_ty`]).
                         let mut seen_names = Vec::new();
                         for (wspan, name) in &live_rebinds {
                             if !(span.0 <= wspan.0 && wspan.1 <= span.1) {
@@ -5317,58 +5263,15 @@ impl<'i> Typer<'i> {
                                 continue;
                             }
                             seen_names.push(name.clone());
-                            let (truthy_body, falsey_body) = if *is_unless {
-                                (else_body, then_body)
-                            } else {
-                                (then_body, else_body)
-                            };
-                            let entry_for_write = env.get(name.as_str()).copied().unwrap_or_else(|| interner.untyped());
-                            let t_write = arm_write_ty(self, ast, env, truthy_body, name, entry_for_write, interner);
-                            let f_write = arm_write_ty(self, ast, env, falsey_body, name, entry_for_write, interner);
-                            // rigor-rs#942 — `eval_if`/`eval_unless`'s
-                            // undecided-arm drops are PHYSICAL
-                            // (`node.statements` is the port's `then_body`
-                            // under both keywords; `subsequent`/`else_clause`
-                            // is `else_body`): the body arm terminating
-                            // beside NO else returns the other edge's scope —
-                            // per name the ENTRY binding (its writes never
-                            // reach the join — rigor-rs#451 review); an else
-                            // arm terminating beside a body returns the
-                            // body's scope alone; and `if_join` returns the
-                            // else's scope only for a body arm
-                            // `branch_certainly_exits?` — the strict test,
-                            // so a `begin`/`rescue` or a `Bot`-typed arm
-                            // still joins. Anything else joins both scopes.
+                            // rigor-rs#951 — the join of BOTH arms' exit
+                            // scopes, each arm read in statement order with
+                            // a nested `if`/elsif contributing its own arm
+                            // join, not the lexically-last write.
                             let u = interner.untyped();
                             let entry_ty = env.get(name.as_str()).copied().unwrap_or(u);
-                            let t_ty = t_write.unwrap_or(entry_ty);
-                            let f_ty = f_write.unwrap_or(entry_ty);
-                            let (body_ty, else_ty) =
-                                if *is_unless { (f_ty, t_ty) } else { (t_ty, f_ty) };
-                            // The else arm is an `ElseNode`/elsif
-                            // `subsequent`, which only its TYPE can
-                            // terminate (rigor-rs#966).
-                            let j = if else_body.is_empty()
-                                && !then_body.is_empty()
-                                && crate::class_narrowing::branch_terminates(self, ast, then_body)
-                            {
-                                entry_ty
-                            } else if !then_body.is_empty()
-                                && !else_body.is_empty()
-                                && crate::class_narrowing::value_branch_terminates(
-                                    self, ast, else_body,
-                                )
-                            {
-                                body_ty
-                            } else if !else_body.is_empty()
-                                && crate::class_narrowing::branch_certainly_exits(
-                                    self, ast, then_body,
-                                )
-                            {
-                                else_ty
-                            } else {
-                                rigor_types::Algebra::join(interner, t_ty, f_ty)
-                            };
+                            let j = self.if_scope_join_ty(
+                                ast, env, *is_unless, then_body, else_body, name, entry_ty, interner,
+                            );
                             drop_indexed_narrowings(env, name);
                             env.insert(Rc::from(name.as_str()), j);
                         }
@@ -5557,6 +5460,201 @@ impl<'i> Typer<'i> {
                 self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
             }
         }
+    }
+
+    /// The post-`if` binding of `name` for an undecided `if`/`unless`
+    /// (rigor-rs#443, #942, #951): `eval_if`/`eval_unless` evaluate both
+    /// arms from the entry scope and `if_join` joins the two exit scopes.
+    /// Each arm's exit binding is [`Self::arm_scope_ty`]; `entry` stands in
+    /// for an arm that wrote nothing.
+    ///
+    /// The drops are PHYSICAL (`node.statements` is the port's `then_body`
+    /// under both keywords; `subsequent`/`else_clause` is `else_body`): the
+    /// body arm terminating beside NO else returns the other edge's scope —
+    /// the ENTRY binding (its writes never reach the join — rigor-rs#451
+    /// review); an else arm terminating beside a body returns the body's
+    /// scope alone (the else is an `ElseNode`/elsif `subsequent`, which only
+    /// its TYPE can terminate — rigor-rs#966); and `if_join` returns the
+    /// else's scope only for a body arm `branch_certainly_exits?` — the
+    /// strict test, so a `begin`/`rescue` or a `Bot`-typed arm still joins.
+    /// Anything else joins both scopes.
+    #[allow(clippy::too_many_arguments)]
+    fn if_scope_join_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        is_unless: bool,
+        then_body: &[NodeId],
+        else_body: &[NodeId],
+        name: &str,
+        entry: TypeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let then_ty = self.arm_scope_ty(ast, env, then_body, name, entry, interner).unwrap_or(entry);
+        let else_ty = self.arm_scope_ty(ast, env, else_body, name, entry, interner).unwrap_or(entry);
+        if else_body.is_empty()
+            && !then_body.is_empty()
+            && crate::class_narrowing::branch_terminates(self, ast, then_body)
+        {
+            entry
+        } else if !then_body.is_empty()
+            && !else_body.is_empty()
+            && crate::class_narrowing::value_branch_terminates(self, ast, else_body)
+        {
+            then_ty
+        } else if !else_body.is_empty()
+            && crate::class_narrowing::branch_certainly_exits(self, ast, then_body)
+        {
+            else_ty
+        } else if is_unless {
+            rigor_types::Algebra::join(interner, else_ty, then_ty)
+        } else {
+            rigor_types::Algebra::join(interner, then_ty, else_ty)
+        }
+    }
+
+    /// The exit binding of `name` after one arm of an undecided `if`, read
+    /// statement by statement from `entry`, or `None` when the arm never
+    /// writes it. A statement that is itself an `if`/`unless`/elsif
+    /// contributes its own scope join from the binding so far (rigor-rs#951
+    /// — `if a; x = "s"; elsif b; x = "t"; else; x = "u"; end` answers
+    /// `"s" | "t" | "u"`, not the lexically-last write's `"s" | "u"`); a
+    /// certainty-folded one contributes its live arm alone, as
+    /// `live_branch_for_if` evaluates it. Any other statement contributes
+    /// the LAST write of `name` inside it, typed from its node kind: a plain
+    /// `v = e` yields `type_of(e)`, an `op=` yields `op_write_result(binding
+    /// so far, op, e)` (`v = 2; v += 3` is `5`), and a `v, w = rhs` yields
+    /// the destructure's bound type for `name` (`"a" | 1` on `v, w = "a",
+    /// "b"` — rigor-rs#443 review). A nested `if` whose predicate writes
+    /// `name` keeps that last-write reading: its arms see the predicate's
+    /// narrowing, which this flat join does not model.
+    fn arm_scope_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        body: &[NodeId],
+        name: &str,
+        entry: TypeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let mut cur: Option<TypeId> = None;
+        for &s in body {
+            let at = cur.unwrap_or(entry);
+            if !self.writes_name_within(ast, ast.get(s).span(), name, interner) {
+                continue;
+            }
+            // A straight-line carrier — an `else` clause, a parenthesized
+            // group, a rescue-less `begin` — runs its statements in order.
+            let seq = match ast.get(s) {
+                Node::BeginRescue { body, clauses, ensure_body, has_else: false, .. }
+                    if clauses.is_empty() && ensure_body.is_empty() =>
+                {
+                    Some(body.clone())
+                }
+                Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
+                    Some(body.clone())
+                }
+                _ => None,
+            };
+            if let Some(seq) = seq {
+                cur = Some(self.arm_scope_ty(ast, env, &seq, name, at, interner).unwrap_or(at));
+                continue;
+            }
+            if let Node::If { predicate, then_body, else_body, is_unless, .. } = ast.get(s) {
+                let pspan = ast.get(*predicate).span();
+                if !self.writes_name_within(ast, pspan, name, interner) {
+                    let truthy = crate::version_guard::guard_truthiness(ast, *predicate)
+                        .or_else(|| self.expr_truthiness(ast, *predicate, &mut Vec::new()));
+                    cur = Some(match truthy {
+                        Some(truthy) => {
+                            let live = if truthy != *is_unless { then_body } else { else_body };
+                            if else_body.is_empty()
+                                && crate::class_narrowing::branch_terminates(self, ast, then_body)
+                            {
+                                at
+                            } else {
+                                self.arm_scope_ty(ast, env, live, name, at, interner).unwrap_or(at)
+                            }
+                        }
+                        None => self.if_scope_join_ty(
+                            ast, env, *is_unless, then_body, else_body, name, at, interner,
+                        ),
+                    });
+                    continue;
+                }
+            }
+            if let Some(ty) = self.last_write_ty(ast, env, ast.get(s).span(), name, at, interner) {
+                cur = Some(ty);
+            }
+        }
+        cur
+    }
+
+    /// Whether a write node for `name` (`v = e`, `v op= e`, `v, w = rhs`)
+    /// lies inside `span`.
+    fn writes_name_within(
+        &self,
+        ast: &LoweredAst,
+        span: rigor_parse::Span,
+        name: &str,
+        interner: &mut Interner,
+    ) -> bool {
+        let idx = self.reach_index(ast);
+        let u = interner.untyped();
+        idx.nodes_within(ast, span).any(|n| match ast.get(n) {
+            Node::LocalVariableWrite { name: n2, .. } | Node::LocalVariableOpWrite { name: n2, .. } => {
+                n2 == name
+            }
+            Node::MultiWrite { targets, .. } => {
+                crate::multi_target_binder::bind(targets, u, interner).iter().any(|(t, _)| t == name)
+            }
+            _ => false,
+        })
+    }
+
+    /// The value the LAST write of `name` inside `span` binds, typed from its
+    /// node kind ([`Self::arm_scope_ty`]); `entry` is the op-write's left
+    /// operand.
+    fn last_write_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        span: rigor_parse::Span,
+        name: &str,
+        entry: TypeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let idx = self.reach_index(ast);
+        let mut last: Option<(rigor_parse::Span, TypeId)> = None;
+        let mut consider = |wspan: rigor_parse::Span, ty: TypeId| {
+            if last.is_none_or(|(ls, _)| ls.0 < wspan.0) {
+                last = Some((wspan, ty));
+            }
+        };
+        for n in idx.nodes_within(ast, span) {
+            let wspan = ast.get(n).span();
+            match ast.get(n) {
+                Node::LocalVariableWrite { name: n2, value, .. } if n2 == name => {
+                    let ty = self.type_of(ast, *value, env, interner);
+                    consider(wspan, ty);
+                }
+                Node::LocalVariableOpWrite { name: n2, value, op, .. } if n2 == name => {
+                    let v_ty = self.type_of(ast, *value, env, interner);
+                    let ty = self.op_write_result(ast, n, entry, op, *value, v_ty, env, interner);
+                    consider(wspan, ty);
+                }
+                Node::MultiWrite { targets, value, .. } => {
+                    let rhs = self.type_of(ast, *value, env, interner);
+                    for (n2, ty) in crate::multi_target_binder::bind(targets, rhs, interner) {
+                        if n2 == name {
+                            consider(wspan, ty);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        last.map(|(_, ty)| ty)
     }
 
     /// Bind the statements of a certainty-folded `if`'s LIVE arm — the port
@@ -7281,7 +7379,7 @@ impl FlowEffects {
     /// The positions of `table`'s span-keyed entries whose START falls in
     /// `span`, IN `table` ORDER — the table's arena order is post-order
     /// (children lower before parents), and consumers like
-    /// `apply_mutation_effects`/`arm_write_ty` sequence effects by it, so
+    /// `apply_mutation_effects` sequences effects by it, so
     /// the slice's indices are sorted back into table order rather than
     /// yielded start-sorted (an outer mutator must not run before the
     /// `h[k] ||= v` nested inside it). The `w.1 <= span.1` half of
