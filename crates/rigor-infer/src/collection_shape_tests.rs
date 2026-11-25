@@ -561,6 +561,82 @@ fn coll_nested_retry_is_not_exponential() {
     assert_eq!(snap(&src, "nope"), None);
 }
 
+/// `depth` nested `begin … <body>` levels whose level-`i` rescue clauses are
+/// `arms(i)` (each a full `rescue …` clause, `retry` included), then
+/// `c.zark` after them.
+fn nested_retry_levels_src(
+    depth: usize,
+    body: &str,
+    arms: impl Fn(usize) -> String,
+) -> Vec<u8> {
+    let mut s = String::from("def f\n  c = [1]\n");
+    s.push_str(&"  begin\n".repeat(depth));
+    s.push_str(body);
+    for i in 0..depth {
+        s.push_str(&arms(i));
+        s.push_str("  end\n");
+    }
+    s.push_str("  c.zark\nend\n");
+    s.into_bytes()
+}
+
+/// Arms that change the scope DIFFERENTLY per level still re-walk the
+/// protected body, but a repeated `(begin, entry env)` pair reuses its
+/// memoised walk (rigor-rs#973): `c = [i]` per level leaves O(depth)
+/// distinct entries per level, not 2^depth walks of the innermost body.
+/// Master took 37s at depth 20 for the `c = [i]` row. The snaps match the
+/// shallow shapes: the disagreeing passes decline both sites.
+#[test]
+fn coll_nested_retry_distinct_arms_memoise() {
+    let one = |i: usize| format!("  rescue\n  c = [{}]\n  retry\n", i + 2);
+    for depth in [3, 30] {
+        let src = nested_retry_levels_src(depth, "  c.nope\n", one);
+        assert_eq!(snap(&src, "nope"), None, "depth {depth}");
+        assert_eq!(snap(&src, "zark"), None, "depth {depth}");
+    }
+    let two = |i: usize| {
+        format!(
+            "  rescue ArgumentError\n  c = [{}]\n  retry\n  rescue\n  c = [{}]\n  retry\n",
+            i + 2,
+            i + 100
+        )
+    };
+    let src = nested_retry_levels_src(20, "  c.nope\n", two);
+    assert_eq!(snap(&src, "nope"), None);
+    // Per-level mutations that converge on one nominal keep firing.
+    let push = |_: usize| "  rescue\n  c << 2\n  retry\n".to_string();
+    let src = nested_retry_levels_src(30, "  c << 1\n  c.nope\n", push);
+    assert_eq!(snap(&src, "zark"), Some("Array"));
+}
+
+/// A level that binds a NEW local per nesting doubles the distinct entries
+/// of the level below it, so memoising alone stays exponential. Past
+/// `BEGIN_WALK_BUDGET` distinct entries a `begin` declines (rigor-rs#973):
+/// the sites inside it drop out of the snapshot, and the locals it writes
+/// widen. A local it does not write keeps its carrier after it.
+#[test]
+fn coll_nested_retry_walk_budget_declines() {
+    let fresh = |i: usize| format!("  rescue\n  v{i} = [{i}]\n  retry\n");
+    // Under the budget: every walk runs, the inner site fires.
+    let src = nested_retry_levels_src(4, "  c.nope\n", fresh);
+    assert_eq!(snap(&src, "nope"), Some("Array"));
+    assert_eq!(snap(&src, "zark"), Some("Array"));
+    // Past it: the inner site declines; `c` is written nowhere inside, so
+    // the site after the `begin`s still fires.
+    let src = nested_retry_levels_src(40, "  c.nope\n", fresh);
+    assert_eq!(snap(&src, "nope"), None);
+    assert_eq!(snap(&src, "zark"), Some("Array"));
+    // A local the declined `begin` mutates widens after it.
+    let src = nested_retry_levels_src(4, "  c << 1\n", fresh);
+    assert_eq!(snap(&src, "zark"), Some("Array"));
+    let src = nested_retry_levels_src(40, "  c << 1\n", fresh);
+    assert_eq!(snap(&src, "zark"), None);
+    // So does a name a declined `rescue => c` binds.
+    let bind = |i: usize| format!("  rescue => c\n  v{i} = [{i}]\n  retry\n");
+    let src = nested_retry_levels_src(40, "", bind);
+    assert_eq!(snap(&src, "zark"), None);
+}
+
 /// A mutation AFTER the rescued `begin` widens the joined union memberwise
 /// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
 /// same nominal the mutated arm holds, the union collapses, and the use

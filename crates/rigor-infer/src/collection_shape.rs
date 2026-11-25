@@ -108,10 +108,21 @@ impl<'i> Typer<'i> {
             writes: &writes,
             rebinds: &rebinds,
             dirty: std::cell::RefCell::new(Vec::new()),
+            begin_memo: std::cell::RefCell::new(HashMap::new()),
+            bailed: std::cell::RefCell::new(Vec::new()),
         };
         let mut tenv = TypeEnv::new();
         self.coll_flow_scope(ast, &body, &mut tenv, &ctx, interner, &mut out, true);
         out.retain(|_, snap| snap.class != DECLINED);
+        // A `begin` past its walk budget left its sites' joins incomplete
+        // (`coll_flow_begin_memo`): decline every site inside one.
+        let bailed = ctx.bailed.into_inner();
+        if !bailed.is_empty() {
+            out.retain(|&id, _| {
+                let s = ast.get(id).span();
+                !bailed.iter().any(|b| b.0 <= s.0 && s.1 <= b.1)
+            });
+        }
         out
     }
 
@@ -256,136 +267,13 @@ impl<'i> Typer<'i> {
             // unmutated binding instead of landing unconditionally, and
             // `receiver_descriptor`'s missing `Type::Union` arm silences the
             // call that follows.
-            Node::BeginRescue { body, main_body, ensure_body, clauses, span, .. } => {
-                let (body, main_body, ensure_body, clauses, begin_span) =
-                    (body.clone(), main_body.clone(), ensure_body.clone(), clauses.clone(), *span);
-                if clauses.is_empty() {
-                    self.coll_flow_scope(ast, &main_body, tenv, ctx, interner, out, stmt_position);
-                    self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
-                    return;
-                }
-                // The primary path: the protected body, then the `else` clause,
-                // which runs only when the body completes but on the body's own
-                // post-scope (`eval_begin_primary_under`). `body` is flat —
-                // main + per-clause exceptions and bodies + else + ensure — so
-                // the else statements are the ids nothing else claims.
-                let mut covered: std::collections::HashSet<NodeId> =
-                    main_body.iter().copied().collect();
-                covered.extend(ensure_body.iter().copied());
-                for cl in &clauses {
-                    covered.extend(cl.exceptions.iter().copied());
-                    covered.extend(cl.body.iter().copied());
-                }
-                let else_body: Vec<NodeId> =
-                    body.iter().copied().filter(|s| !covered.contains(s)).collect();
-                let mark = ctx.dirty.borrow().len();
-                let mut exit = tenv.clone();
-                self.coll_flow_scope(ast, &main_body, &mut exit, ctx, interner, out, stmt_position);
-                // The protected body's own post-scope, before the `else`
-                // clause: a retry arm that leaves the entry scope unchanged
-                // replays `main_body` over exactly the entry the primary walk
-                // started from, so its re-run IS this scope (rigor-rs#969).
-                let after_main = exit.clone();
-                self.coll_flow_scope(ast, &else_body, &mut exit, ctx, interner, out, stmt_position);
-                for cl in &clauses {
-                    // Exception designators evaluate in the entry bindings and
-                    // the scope they return is discarded (`bind_rescue_reference`
-                    // keeps only the type) — a throwaway env, uses still record.
-                    let mut thrown = tenv.clone();
-                    for &exc in &cl.exceptions {
-                        self.coll_flow_expr(ast, exc, &mut thrown, ctx, interner, out, false);
-                    }
-                    let mut arm = tenv.clone();
-                    // `rescue => e` binds the exception instance in the arm —
-                    // the reference's `rescue_exception_type` (`bind_rescue_
-                    // reference`): `StandardError` for a bare `rescue`, the
-                    // union of the named classes otherwise, `Dynamic[top]`
-                    // whenever a designator does not resolve. The binding
-                    // replaces any collection carrier the same local held on
-                    // entry (so the arm can't witness `e` as the entry's
-                    // Array/Hash); the `for StandardError` use the reference
-                    // fires is outside this pass's Array/Hash envelope, a
-                    // coverage residual not a witness.
-                    if let Some(name) = &cl.bound_name {
-                        coll_env_insert(
-                            ctx,
-                            &mut arm,
-                            name,
-                            self.coll_rescue_exception_ty(ast, cl, interner),
-                        );
-                    }
-                    // `rescue => h[:k]` stores the exception through `[]=` on
-                    // `h` (`widen_index_target`), widening its carrier in the
-                    // arm's entry scope exactly as `h[:k] = e` would.
-                    for (name, _, _) in &cl.index_writes {
-                        let cls = arm
-                            .get(name.as_str())
-                            .and_then(|&ty| self.coll_widen_for_mutator(interner, ty, "[]="));
-                        if let Some(cls) = cls {
-                            if let Some(ty) = self.coll_nominal(interner, cls) {
-                                coll_env_insert(ctx, &mut arm, name, ty);
-                            }
-                        }
-                    }
-                    self.coll_flow_scope(ast, &cl.body, &mut arm, ctx, interner, out, stmt_position);
-                    // Arms that never fall through (`live_rescue_results` —
-                    // `branch_terminates?`) contribute no scope to the exit
-                    // join; with no live arm the primary scope IS the exit
-                    // scope, so `begin; a << 1; rescue; return; end` keeps
-                    // firing.
-                    if Self::coll_arm_retries(ast, &cl.body) {
-                        // `eval_retried_begin` answers a `retry` arm with the
-                        // SECOND pass's protected-body scope (`eval_begin_
-                        // paths`) — `main_body` re-evaluated on an entry that
-                        // absorbed the arm's retry-edge writes (`widen_entry_
-                        // for_retry`). The arm's own post-scope is the closest
-                        // holder of those writes, so the contribution is
-                        // `main_body` replayed over it: `rescue; retry` keeps
-                        // the body's own mutation (`…; rescue; retry; end;
-                        // b.frobnicate` fires), while `rescue; b.unshift("s");
-                        // retry` carries the ARM's widening back in and joins
-                        // against the unmutated primary — silent, exactly as
-                        // the reference.
-                        //
-                        // An arm whose post-scope equals the entry scope
-                        // (`rescue; retry`, or a write the entry already
-                        // holds) replays the primary walk verbatim: same env
-                        // in, so the same env out, the same carriers recorded
-                        // (re-merging an identical carrier is a no-op) and the
-                        // same `dirty` keys, already pushed past every
-                        // enclosing mark. Re-walking it anyway doubled the
-                        // work per nested `begin … rescue; retry` level
-                        // (rigor-rs#969).
-                        let rerun = if arm == *tenv {
-                            after_main.clone()
-                        } else {
-                            let mut rerun = arm;
-                            self.coll_flow_scope(
-                                ast,
-                                &main_body,
-                                &mut rerun,
-                                ctx,
-                                interner,
-                                out,
-                                stmt_position,
-                            );
-                            rerun
-                        };
-                        exit = {
-                            let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
-                            self.coll_join_envs_delta(&exit, &rerun, &changed, interner)
-                        };
-                    } else if !Self::coll_arm_terminates(ast, &cl.body) {
-                        exit = {
-                            let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
-                            self.coll_join_envs_delta(&exit, &arm, &changed, interner)
-                        };
-                    }
-                }
-                *tenv = exit;
-                // `ensure` runs on the joined exit scope and its effects apply
-                // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).
+            Node::BeginRescue { main_body, ensure_body, clauses, .. } if clauses.is_empty() => {
+                let (main_body, ensure_body) = (main_body.clone(), ensure_body.clone());
+                self.coll_flow_scope(ast, &main_body, tenv, ctx, interner, out, stmt_position);
                 self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
+            }
+            Node::BeginRescue { .. } => {
+                self.coll_flow_begin_memo(ast, id, tenv, ctx, interner, out, stmt_position);
             }
             // `while`/`until`/`for`: unmodeled like the arm below — widen
             // every local it writes, do NOT descend — plus the exit edge
@@ -404,6 +292,234 @@ impl<'i> Typer<'i> {
                 self.widen_loop_exits_within(ast, span, tenv, interner);
             }
         }
+    }
+
+    /// [`Typer::coll_flow_begin_rescue`], memoised on `(begin, entry env)`
+    /// (rigor-rs#973). A retry re-run replays the protected body, so a `begin`
+    /// nested in it is walked once per enclosing retry path: 2^d (or k^d)
+    /// walks at depth d. The walk is a pure function of the node, the entry
+    /// env and `stmt_position`, so a repeated entry reuses the stored exit env
+    /// and replays the stored `dirty` keys. It skips the `out` records: the
+    /// earlier walk already made them, and [`Typer::record_coll_snap`] joins
+    /// a set, so re-recording a carrier that is already part of a site's join
+    /// changes nothing.
+    ///
+    /// Entries that differ still walk: a level that binds a new local per
+    /// nesting doubles the distinct entries per level. Past
+    /// [`BEGIN_WALK_BUDGET`] distinct entries the `begin` declines like an
+    /// unmodeled statement: every local it writes (and every `rescue => e`
+    /// name in it) widens, its loop-exit locals widen, and every site inside
+    /// it is dropped from the snapshot at the end of the walk, because its
+    /// join over the unwalked entries is unknown.
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_begin_memo(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, CollSnap>,
+        stmt_position: bool,
+    ) {
+        let (hit, walked) = {
+            let memo = ctx.begin_memo.borrow();
+            let seen = memo.get(&id).map_or(&[][..], Vec::as_slice);
+            let hit = seen
+                .iter()
+                .find(|m| m.stmt_position == stmt_position && m.entry == *tenv)
+                .map(|m| (m.exit.clone(), m.dirty.clone()));
+            (hit, seen.len())
+        };
+        if let Some((exit, dirty)) = hit {
+            *tenv = exit;
+            ctx.dirty.borrow_mut().extend(dirty);
+            return;
+        }
+        if walked >= BEGIN_WALK_BUDGET {
+            let span = ast.get(id).span();
+            ctx.bailed.borrow_mut().push(span);
+            widen_flow_writes(writes_within(ctx.writes, span).iter(), span, tenv, interner);
+            self.widen_loop_exits_within(ast, span, tenv, interner);
+            let u = interner.untyped();
+            let idx = self.reach_index(ast);
+            let names: Vec<Rc<str>> = idx
+                .nodes_within(ast, span)
+                .filter_map(|n| match ast.get(n) {
+                    Node::BeginRescue { clauses, .. } => Some(clauses),
+                    _ => None,
+                })
+                .flat_map(|clauses| {
+                    clauses.iter().filter_map(|c| c.bound_name.as_deref()).map(Rc::from)
+                })
+                .collect();
+            for name in names {
+                coll_env_insert(ctx, tenv, &name, u);
+            }
+            return;
+        }
+        let entry = tenv.clone();
+        let mark = ctx.dirty.borrow().len();
+        self.coll_flow_begin_rescue(ast, id, tenv, ctx, interner, out, stmt_position);
+        // `dirty` is read as a set (`coll_join_changed`): dedup this walk's
+        // keys so a memo replay pushes each once. Without it every nesting
+        // level would push twice its child's keys, exponential in the depth
+        // even with every walk a memo hit.
+        let dirty: Vec<Rc<str>> = {
+            let mut d = ctx.dirty.borrow_mut();
+            let mut seen = std::collections::HashSet::new();
+            let keys: Vec<Rc<str>> = d.drain(mark..).filter(|k| seen.insert(k.clone())).collect();
+            d.extend(keys.iter().cloned());
+            keys
+        };
+        ctx.begin_memo.borrow_mut().entry(id).or_default().push(BeginMemo {
+            entry,
+            stmt_position,
+            exit: tenv.clone(),
+            dirty,
+        });
+    }
+
+    /// The `begin`/`rescue` walk of [`Typer::coll_flow_stmt_inner`] (a `begin`
+    /// with at least one `rescue` clause; see the arm's comment there).
+    #[allow(clippy::too_many_arguments)]
+    fn coll_flow_begin_rescue(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        tenv: &mut TypeEnv,
+        ctx: &CollCtx<'_>,
+        interner: &mut Interner,
+        out: &mut HashMap<NodeId, CollSnap>,
+        stmt_position: bool,
+    ) {
+        let Node::BeginRescue { body, main_body, ensure_body, clauses, span, .. } = ast.get(id) else {
+            unreachable!("coll_flow_begin_rescue on a non-BeginRescue node");
+        };
+        let (body, main_body, ensure_body, clauses, begin_span) =
+            (body.clone(), main_body.clone(), ensure_body.clone(), clauses.clone(), *span);
+        // The primary path: the protected body, then the `else` clause,
+        // which runs only when the body completes but on the body's own
+        // post-scope (`eval_begin_primary_under`). `body` is flat —
+        // main + per-clause exceptions and bodies + else + ensure — so
+        // the else statements are the ids nothing else claims.
+        let mut covered: std::collections::HashSet<NodeId> =
+            main_body.iter().copied().collect();
+        covered.extend(ensure_body.iter().copied());
+        for cl in &clauses {
+            covered.extend(cl.exceptions.iter().copied());
+            covered.extend(cl.body.iter().copied());
+        }
+        let else_body: Vec<NodeId> =
+            body.iter().copied().filter(|s| !covered.contains(s)).collect();
+        let mark = ctx.dirty.borrow().len();
+        let mut exit = tenv.clone();
+        self.coll_flow_scope(ast, &main_body, &mut exit, ctx, interner, out, stmt_position);
+        // The protected body's own post-scope, before the `else`
+        // clause: a retry arm that leaves the entry scope unchanged
+        // replays `main_body` over exactly the entry the primary walk
+        // started from, so its re-run IS this scope (rigor-rs#969).
+        let after_main = exit.clone();
+        self.coll_flow_scope(ast, &else_body, &mut exit, ctx, interner, out, stmt_position);
+        for cl in &clauses {
+            // Exception designators evaluate in the entry bindings and
+            // the scope they return is discarded (`bind_rescue_reference`
+            // keeps only the type) — a throwaway env, uses still record.
+            let mut thrown = tenv.clone();
+            for &exc in &cl.exceptions {
+                self.coll_flow_expr(ast, exc, &mut thrown, ctx, interner, out, false);
+            }
+            let mut arm = tenv.clone();
+            // `rescue => e` binds the exception instance in the arm —
+            // the reference's `rescue_exception_type` (`bind_rescue_
+            // reference`): `StandardError` for a bare `rescue`, the
+            // union of the named classes otherwise, `Dynamic[top]`
+            // whenever a designator does not resolve. The binding
+            // replaces any collection carrier the same local held on
+            // entry (so the arm can't witness `e` as the entry's
+            // Array/Hash); the `for StandardError` use the reference
+            // fires is outside this pass's Array/Hash envelope, a
+            // coverage residual not a witness.
+            if let Some(name) = &cl.bound_name {
+                coll_env_insert(
+                    ctx,
+                    &mut arm,
+                    name,
+                    self.coll_rescue_exception_ty(ast, cl, interner),
+                );
+            }
+            // `rescue => h[:k]` stores the exception through `[]=` on
+            // `h` (`widen_index_target`), widening its carrier in the
+            // arm's entry scope exactly as `h[:k] = e` would.
+            for (name, _, _) in &cl.index_writes {
+                let cls = arm
+                    .get(name.as_str())
+                    .and_then(|&ty| self.coll_widen_for_mutator(interner, ty, "[]="));
+                if let Some(cls) = cls {
+                    if let Some(ty) = self.coll_nominal(interner, cls) {
+                        coll_env_insert(ctx, &mut arm, name, ty);
+                    }
+                }
+            }
+            self.coll_flow_scope(ast, &cl.body, &mut arm, ctx, interner, out, stmt_position);
+            // Arms that never fall through (`live_rescue_results` —
+            // `branch_terminates?`) contribute no scope to the exit
+            // join; with no live arm the primary scope IS the exit
+            // scope, so `begin; a << 1; rescue; return; end` keeps
+            // firing.
+            if Self::coll_arm_retries(ast, &cl.body) {
+                // `eval_retried_begin` answers a `retry` arm with the
+                // SECOND pass's protected-body scope (`eval_begin_
+                // paths`) — `main_body` re-evaluated on an entry that
+                // absorbed the arm's retry-edge writes (`widen_entry_
+                // for_retry`). The arm's own post-scope is the closest
+                // holder of those writes, so the contribution is
+                // `main_body` replayed over it: `rescue; retry` keeps
+                // the body's own mutation (`…; rescue; retry; end;
+                // b.frobnicate` fires), while `rescue; b.unshift("s");
+                // retry` carries the ARM's widening back in and joins
+                // against the unmutated primary — silent, exactly as
+                // the reference.
+                //
+                // An arm whose post-scope equals the entry scope
+                // (`rescue; retry`, or a write the entry already
+                // holds) replays the primary walk verbatim: same env
+                // in, so the same env out, the same carriers recorded
+                // (re-merging an identical carrier is a no-op) and the
+                // same `dirty` keys, already pushed past every
+                // enclosing mark. Re-walking it anyway doubled the
+                // work per nested `begin … rescue; retry` level
+                // (rigor-rs#969).
+                let rerun = if arm == *tenv {
+                    after_main.clone()
+                } else {
+                    let mut rerun = arm;
+                    self.coll_flow_scope(
+                        ast,
+                        &main_body,
+                        &mut rerun,
+                        ctx,
+                        interner,
+                        out,
+                        stmt_position,
+                    );
+                    rerun
+                };
+                exit = {
+                    let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
+                    self.coll_join_envs_delta(&exit, &rerun, &changed, interner)
+                };
+            } else if !Self::coll_arm_terminates(ast, &cl.body) {
+                exit = {
+                    let changed = self.coll_join_changed(ast, ctx, begin_span, mark);
+                    self.coll_join_envs_delta(&exit, &arm, &changed, interner)
+                };
+            }
+        }
+        *tenv = exit;
+        // `ensure` runs on the joined exit scope and its effects apply
+        // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).
+        self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
     }
 
     /// Evaluate an expression: record collection-typed receiver uses, thread
@@ -1936,6 +2052,26 @@ struct CollCtx<'a> {
     /// block-local `args << u` mutation is out of `writes` AND out of the
     /// local-write nodes).
     dirty: std::cell::RefCell<Vec<Rc<str>>>,
+    /// Every walk of a `begin`/`rescue`, per node (rigor-rs#973,
+    /// [`Typer::coll_flow_begin_memo`]).
+    begin_memo: std::cell::RefCell<HashMap<NodeId, Vec<BeginMemo>>>,
+    /// The spans of the `begin`s that ran past [`BEGIN_WALK_BUDGET`].
+    bailed: std::cell::RefCell<Vec<rigor_parse::Span>>,
+}
+
+/// The distinct entry envs one `begin`/`rescue` is walked over before it
+/// declines (rigor-rs#973). Only a retry re-run walks a `begin` more than
+/// once: one level that binds a new local per nesting doubles the entries
+/// of the level below it.
+const BEGIN_WALK_BUDGET: usize = 64;
+
+/// One memoised walk of a `begin`/`rescue`: the entry env and position it
+/// ran on, the exit env it produced and the deduped `dirty` keys it pushed.
+struct BeginMemo {
+    entry: TypeEnv,
+    stmt_position: bool,
+    exit: TypeEnv,
+    dirty: Vec<Rc<str>>,
 }
 
 /// `env.insert` that also records the key for [`coll_join_changed`]'s
