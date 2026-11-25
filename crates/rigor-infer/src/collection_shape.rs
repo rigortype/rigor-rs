@@ -123,6 +123,33 @@ impl<'i> Typer<'i> {
                 !bailed.iter().any(|b| b.0 <= s.0 && s.1 <= b.1)
             });
         }
+        // rigor-rs#972 — a receiver read inside a retrying `begin` that the
+        // retry edge reaches with a write this walk saw out of order, or not
+        // at all: the retry re-run (`coll_flow_begin_rescue`) replays the
+        // body over the retrying arm's post-scope only, so it misses the
+        // body's own later writes (`raise_scopes`), and a clause or `else`
+        // is walked once over the plain entry. The reference reads the
+        // join of the entry and every scope on the edge; the site declines
+        // ([`crate::retry_edge`]). Sites after the `begin` keep the walk's
+        // exit scope.
+        let edges = crate::retry_edge::RetryEdges::build(
+            self,
+            ast,
+            writes.iter().map(|(w, n)| (*w, n.as_str())),
+            &rebinds,
+            |_| true,
+        );
+        if !edges.is_empty() {
+            out.retain(|&id, _| {
+                let Node::Call { receiver: Some(r), .. } = ast.get(id) else {
+                    return true;
+                };
+                match ast.get(*r) {
+                    Node::LocalVariableRead { name, span } => !edges.declines(*span, name),
+                    _ => true,
+                }
+            });
+        }
         out
     }
 

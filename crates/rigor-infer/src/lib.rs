@@ -66,6 +66,7 @@ mod reach;
 mod record_guards;
 mod reach_index;
 mod reach_memo;
+mod retry_edge;
 mod typer;
 
 use std::collections::HashMap;
