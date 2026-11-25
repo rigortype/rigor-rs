@@ -6185,6 +6185,27 @@ impl<'i> Typer<'i> {
                     e.insert(Rc::from(name.as_str()), untyped);
                 }
             }
+            // `rescue => h[:e]` stores the exception through `[]=` on the
+            // receiver as the clause ENTERS (`bind_rescue_reference`,
+            // rigor-rs#134): the `index_writes` mark sits in the clause's
+            // pre-body region — exceptions and the `=>` reference —
+            // which no replayed statement's span covers. Rooted at the
+            // `begin` the conditional path floors it, the same widen
+            // the flat `_` arm gave it.
+            let body_start = clause
+                .body
+                .first()
+                .map(|&b| ast.get(b).span().0)
+                .unwrap_or(clause.span.1);
+            self.widen_mutated_locals(
+                ast,
+                mutations.iter(),
+                indexed, dead, true,
+                id,
+                (clause.span.0, body_start),
+                &mut e,
+                interner,
+            );
             self.bind_live_arm_stmts(
                 ast, &clause.body, mutations, &mut e, effects, indexed, dead, interner,
             );
