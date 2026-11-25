@@ -5461,6 +5461,25 @@ impl<'i> Typer<'i> {
                 self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
                 self.bind_statement(ast, *left, env, interner);
             }
+            // rigor-rs#954 — `eval_case`'s scope join
+            // (`join_case_branch_scopes`) applies to a `case` at ANY
+            // statement position, not only inside a folded arm: every
+            // live branch's exit scope joins with nil-injection. The
+            // arm-replay helper does the whole-span decline itself, so
+            // the `other` arm's treatment is folded into it.
+            Node::Case { .. } => {
+                let span = ast.get(id).span();
+                let live_mutations: Vec<_> = effects
+                    .mutations_within(span)
+                    .filter(|(w, _, m, _)| {
+                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                    })
+                    .cloned()
+                    .collect();
+                self.bind_live_arm_case(
+                    ast, id, &live_mutations, env, effects, indexed, dead, interner,
+                );
+            }
             other => {
                 let span = other.span();
                 // rigor-rs#362 — the `if`/`begin` arms above already filter
@@ -6016,7 +6035,20 @@ impl<'i> Typer<'i> {
                         interner,
                     );
                 }
-                Node::If { .. } => {
+                // rigor-rs#954 — `eval_case`/`eval_case_match`: a `case`
+                // inside a folded live arm still joins every LIVE branch's
+                // exit scope (`join_case_branch_scopes`), the predicate
+                // having run unconditionally before all of them.
+                Node::Case { .. } => {
+                    self.bind_live_arm_case(ast, s, mutations, env, effects, indexed, dead, interner);
+                }
+                // A `while`/`until`/`for` delegates whole like the `if`
+                // — `bind_check_statement_effects`'s Loop arm joins the
+                // body's fixpoint writes the same way an undecided
+                // statement does (`x = "a"; case rand; when Integer;
+                // while c; x = "s"; end; end` reads `"a" | "s"` in that
+                // arm's scope on the oracle, rigor-rs#954).
+                Node::If { .. } | Node::Loop { .. } => {
                     self.bind_check_statement_effects(ast, s, env, effects, indexed, dead, interner);
                 }
                 _ => {
@@ -6106,7 +6138,6 @@ impl<'i> Typer<'i> {
             return;
         }
         let entry = env.clone();
-        let nil = interner.nil();
         let mut arm_envs: Vec<TypeEnv> = Vec::with_capacity(clauses.len() + 1);
         // The primary path: the protected body's exit scope, replaced by
         // the `else` clause's when one exists (the flat `body` merges it
@@ -6215,45 +6246,7 @@ impl<'i> Typer<'i> {
         // suspect-arm decline: the primary path contributes its exit
         // scope unconditionally, and a leaving rescue arm was dropped
         // above rather than declining every written name.
-        let mut bound: Vec<String> = Vec::new();
-        for ae in &arm_envs {
-            for (name, _) in ae.iter() {
-                if !bound.iter().any(|b| b.as_str() == &**name) {
-                    bound.push(name.to_string());
-                }
-            }
-        }
-        for name in bound {
-            // Only names an arm actually CHANGED need the join; a name no
-            // arm rebinds keeps its entry binding.
-            if arm_envs
-                .iter()
-                .all(|ae| ae.get(name.as_str()) == entry.get(name.as_str()))
-            {
-                continue;
-            }
-            let absent = if crate::def_local_marks::is_sigilled(&name) {
-                interner.untyped()
-            } else {
-                nil
-            };
-            let mut members: Vec<TypeId> = Vec::new();
-            for ae in &arm_envs {
-                let ty = ae
-                    .get(name.as_str())
-                    .or_else(|| entry.get(name.as_str()))
-                    .copied()
-                    .unwrap_or(absent);
-                if !members.contains(&ty) {
-                    members.push(ty);
-                }
-            }
-            let joined = members
-                .iter()
-                .skip(1)
-                .fold(members[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m));
-            env.insert(Rc::from(name.as_str()), joined);
-        }
+        self.join_arm_envs(&entry, &arm_envs, &[], env, interner);
         if !ensure_body.is_empty() {
             // `eval_begin_ensure` — the clause runs on the JOINED scope,
             // reading every name the construct before it changed as
@@ -6273,6 +6266,296 @@ impl<'i> Typer<'i> {
                 }
             }
         }
+    }
+
+    /// The `join_with_nil_injection` memberwise join over ALREADY-REPLAYED
+    /// arm envs (a folded `begin`/`rescue`'s arm envs,
+    /// [`Self::bind_live_arm_case`]'s branch envs): every name an arm binds
+    /// gets the union of the type each arm leaves it at — the entry binding
+    /// on an arm that does not rebind it, `nil` when it was unbound both
+    /// there and at entry (`reduce_scopes_with_nil_injection` nil-injects
+    /// locals), `untyped` for a sigilled name — the reference's arm join
+    /// DROPS a binding one arm holds (locals alone are nil-injected), so
+    /// the flat env declines it (rigor-rs#891). A name in `skip` keeps
+    /// `env`'s current binding — [`Self::bind_live_arm_case`] uses it to
+    /// decline a name a `when` condition or `in` pattern may write, a
+    /// write the arm replay cannot see (rigor-rs#954).
+    fn join_arm_envs(
+        &self,
+        entry: &TypeEnv,
+        arm_envs: &[TypeEnv],
+        skip: &[String],
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        let nil = interner.nil();
+        let mut bound: Vec<String> = Vec::new();
+        for ae in arm_envs {
+            for (name, _) in ae.iter() {
+                if !bound.iter().any(|b| b.as_str() == &**name) {
+                    bound.push(name.to_string());
+                }
+            }
+        }
+        for name in bound {
+            if skip.iter().any(|s| s.as_str() == name) {
+                continue;
+            }
+            // A `\u{1f}`-keyed synthetic record — an indexed narrowing
+            // or a match-global slot — takes the sigilled side of the
+            // join, not nil-injection: a scope that lacks the record is
+            // a scope where the slot is UN-NARROWED, so the joined
+            // scope drops it outright (the reference's arm join drops a
+            // binding an arm lacks; locals alone are nil-injected).
+            // Keeping `env`'s stale record would answer a union no
+            // joined scope held — `h[:a] ||= "s"; case c; when 1;
+            // h.default ||= 0; end` kills the `h[:a]` record on its
+            // live arm AND on the oracle's join (rigor-rs#954).
+            if name.contains('\u{1f}')
+                && arm_envs.iter().any(|ae| ae.get(name.as_str()).is_none())
+            {
+                env.remove(name.as_str());
+                continue;
+            }
+            // Only names an arm actually CHANGED need the join; a name no
+            // arm rebinds keeps its entry binding.
+            if arm_envs
+                .iter()
+                .all(|ae| ae.get(name.as_str()) == entry.get(name.as_str()))
+            {
+                continue;
+            }
+            let absent = if crate::def_local_marks::is_sigilled(&name) {
+                interner.untyped()
+            } else {
+                nil
+            };
+            let mut members: Vec<TypeId> = Vec::new();
+            for ae in arm_envs {
+                let ty = ae
+                    .get(name.as_str())
+                    .or_else(|| entry.get(name.as_str()))
+                    .copied()
+                    .unwrap_or(absent);
+                if !members.contains(&ty) {
+                    members.push(ty);
+                }
+            }
+            let joined = members
+                .iter()
+                .skip(1)
+                .fold(members[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m));
+            env.insert(Rc::from(name.as_str()), joined);
+        }
+    }
+
+    /// The live-arm replay of a `case`/`case…in` statement (rigor-rs#954) —
+    /// `eval_case`'s `join_case_branch_scopes` shape on
+    /// [`Self::bind_live_arm_stmts`]'s folded path: the subject predicate
+    /// runs unconditionally, each branch body is replayed on the
+    /// POST-PREDICATE entry as effective live statements, and the live
+    /// arms' exit scopes join with nil-injection. A branch
+    /// `branch_terminates?` proves exits contributes no scope — for a
+    /// `WhenNode`/`InNode`/`ElseNode` only the Bot-type half of
+    /// `branch_terminates?` speaks, which
+    /// [`crate::class_narrowing::value_branch_terminates`] ports; when every
+    /// branch exits the reference still joins them all (its
+    /// `live.empty?` fallback). A `case`/`when` with no `else` contributes
+    /// the entry scope as its no-match arm; a `case`/`in` raises on no
+    /// match, so its absent `else` contributes nothing
+    /// (`pattern_case_matches_every_path?`).
+    ///
+    /// Two positions the per-branch replay cannot model stay declined:
+    /// a `when` CONDITION or `in` PATTERN that writes a name binds it on
+    /// the oracle (`run_when_test` / `apply_in_pattern_bindings`) —
+    /// joining the arm envs memberwise without it could answer a member
+    /// the reference's scope never held (`when (x = "s"); else; x = "t"`
+    /// is `"s" | "t"` there, not `"a" | "t"`), so every name the
+    /// pre-body region writes keeps `env`'s widened binding. A MUTATION
+    /// in the same region ran before the body on every path that reaches
+    /// it, so it floors the name in the arm envs the path threads
+    /// (clause `i`'s tests run on the paths of clause `i`'s body and of
+    /// every later clause, and on the `else` path).
+    #[allow(clippy::too_many_arguments)]
+    fn bind_live_arm_case(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        env: &mut TypeEnv,
+        effects: &FlowEffects,
+        indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
+        interner: &mut Interner,
+    ) {
+        let Node::Case {
+            predicate,
+            branches,
+            else_body,
+            ..
+        } = ast.get(id)
+        else {
+            return;
+        };
+        let (predicate, branches, else_body) =
+            (*predicate, branches.clone(), else_body.clone());
+        let cspan = ast.get(id).span();
+        // `seed` freezes the env BEFORE the decline widens: the arm envs
+        // replay from it (the `when Integer; x = "s"` no-else arm's
+        // no-match sibling contributes the ENTRY binding — `"a" | "s"`,
+        // not `"s" | Dynamic`), and the join's unchanged check reads it.
+        let seed = env.clone();
+        // The same blanket decline `bind_check_statement_effects`'s
+        // `other` arm gives every statement: a write or mutation the arm
+        // replay below cannot bind (a `when` condition, an `in` pattern,
+        // a `for`/`while` body inside an arm, a terminated arm) keeps
+        // this widened binding. Idempotent on the folded path —
+        // `widen_flow_writes`/`widen_mutated_locals` already declined
+        // the same positions — and required on the plain-statement
+        // path, where `env` still holds the pre-`case` binding.
+        let live_rebinds: Vec<_> = effects
+            .rebinds_within(cspan)
+            .filter(|(w, _)| dead.write_reaches(*w, (cspan.1, cspan.1)))
+            .cloned()
+            .collect();
+        widen_flow_writes(live_rebinds.iter(), cspan, env, interner);
+        self.drop_indexed_rebinds(live_rebinds.iter(), cspan, indexed, env);
+        self.widen_mutated_locals(
+            ast, mutations.iter(), indexed, dead, true, id, cspan, env, interner,
+        );
+        // The predicate evaluates unconditionally before every branch
+        // (`sub_eval(node.predicate, scope)` → `post_pred`): its own
+        // writes bind and its own mutations land the nominal — on `env`
+        // AND on `seed`, since every arm's entry IS the post-predicate
+        // scope.
+        let mut seed = seed;
+        if let Some(p) = predicate {
+            let pspan = ast.get(p).span();
+            self.widen_mutated_locals(
+                ast, mutations.iter(), indexed, dead, true, id, pspan, env, interner,
+            );
+            self.bind_statement(ast, p, env, interner);
+            self.widen_mutated_locals(
+                ast, mutations.iter(), indexed, dead, true, id, pspan, &mut seed, interner,
+            );
+            self.bind_statement(ast, p, &mut seed, interner);
+        }
+        let marks = self.def_local_marks(ast);
+        // Each branch's replayable body and the pre-body region its tests
+        // occupy (a `when`'s conditions, an `in` clause's lowered pattern —
+        // the `BeginRescue` carrier's `body[0]`).
+        let mut bodies: Vec<&[NodeId]> = Vec::with_capacity(branches.len() + 1);
+        let mut test_regions: Vec<Option<rigor_parse::Span>> =
+            Vec::with_capacity(branches.len());
+        let mut test_names: Vec<String> = Vec::new();
+        let sigilled = self.sigilled_writes(ast);
+        for &b in &branches {
+            let bspan = ast.get(b).span();
+            let body = match ast.get(b) {
+                Node::When { body, .. } => body.as_slice(),
+                // An `in` clause's carrier holds [pattern, *statements] —
+                // the replay covers the statements; the pattern's
+                // writes (the `UnmodeledWrite`'s names at the clause's
+                // own span) stay declined: `bind_statement` cannot
+                // elaborate a pattern.
+                Node::BeginRescue { body, .. } => body.get(1..).unwrap_or(&[]),
+                _ => &[][..],
+            };
+            bodies.push(body);
+            // The pre-body TEST region — a `when`'s conditions, an `in`
+            // clause's pattern, and the `UnmodeledWrite` node a pattern
+            // lowering planted at the clause's own span — holds writes
+            // the arm replay cannot bind: every position under it is
+            // `blocked` at lowering (rigor-rs#362 — `case_when_scopes`
+            // shape-narrows the tests rather than `sub_eval`-ing them,
+            // and whether the reference then lands the write is
+            // context-dependent — rigor-rs#357 shows it dropped under a
+            // `rescue` modifier). The names keep `env`'s widened
+            // binding through the join's `skip` list.
+            let body_start = body
+                .first()
+                .map(|&f| ast.get(f).span().0)
+                .unwrap_or(bspan.1);
+            let test = (bspan.0 < body_start).then_some((bspan.0, body_start));
+            test_regions.push(test);
+            if let Some(tspan) = test {
+                for n in marks.written_within(tspan) {
+                    if !test_names.iter().any(|t| t.as_str() == n) {
+                        test_names.push(n);
+                    }
+                }
+                for (wspan, n) in sigilled.iter() {
+                    if tspan.0 <= wspan.0
+                        && wspan.1 <= tspan.1
+                        && !test_names.iter().any(|t| t.as_str() == n)
+                    {
+                        test_names.push(n.clone());
+                    }
+                }
+            }
+        }
+        let all_when = branches
+            .iter()
+            .all(|&b| matches!(ast.get(b), Node::When { .. }));
+        let has_else = !else_body.is_empty();
+        if has_else {
+            bodies.push(else_body.as_slice());
+        }
+        // (body, how many leading test regions ran on this arm's path);
+        // a `case`/`when` without `else` adds the no-match arm — every
+        // test ran on it, and its scope is the entry unchanged.
+        let mut live: Vec<(&[NodeId], usize)> = Vec::with_capacity(bodies.len() + 1);
+        for (i, arm) in bodies.iter().enumerate() {
+            if !crate::class_narrowing::value_branch_terminates(self, ast, arm) {
+                live.push((*arm, (i + 1).min(test_regions.len())));
+            }
+        }
+        if !has_else && all_when {
+            live.push((&[], test_regions.len()));
+        }
+        // `join_case_branch_scopes` falls back to the FULL join when every
+        // branch exits (the merge is unreachable but the continuation
+        // scope stays well-formed).
+        if live.is_empty() {
+            for (i, arm) in bodies.iter().enumerate() {
+                live.push((*arm, (i + 1).min(test_regions.len())));
+            }
+            if !has_else && all_when {
+                live.push((&[], test_regions.len()));
+            }
+        }
+        let mut arm_envs: Vec<TypeEnv> = Vec::with_capacity(live.len());
+        for &(arm, tests) in &live {
+            let mut e = seed.clone();
+            for tspan in test_regions.iter().take(tests).flatten() {
+                self.widen_mutated_locals(
+                    ast, mutations.iter(), indexed, dead, true, id, *tspan, &mut e, interner,
+                );
+            }
+            self.bind_live_arm_stmts(
+                ast, arm, mutations, &mut e, effects, indexed, dead, interner,
+            );
+            // A name the arm CHANGES but the replay could not rebind — a
+            // `for`/`while` body's write the loop arm declined, a
+            // mutation in a position `widen_mutated_locals` floors
+            // without landing — still holds the SEED binding. The
+            // oracle's arm scope holds whatever the unreachable write
+            // left there instead, so joining the stale entry member
+            // answers a union the reference never produces (`for i in
+            // [1]; x = "s"` in one arm gave `"a" | "t"` for an
+            // `"a" | "s" | "t"` oracle) — decline it, the same side
+            // `arm_suspect`'s whole-arm fallback takes.
+            if let Some(aspan) = crate::def_local_marks::body_span(ast, arm) {
+                let untyped = interner.untyped();
+                for name in marks.changed_within(aspan) {
+                    if e.get(name.as_str()) == seed.get(name.as_str()) {
+                        e.insert(Rc::from(name.as_str()), untyped);
+                    }
+                }
+            }
+            arm_envs.push(e);
+        }
+        self.join_arm_envs(&seed, &arm_envs, &test_names, env, interner);
     }
 
     /// Apply the `local.<mutator>(…)` entries inside `span` to `env` — the
