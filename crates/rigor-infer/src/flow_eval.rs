@@ -3635,10 +3635,8 @@ impl<'i> Typer<'i> {
         // An element-read chain's landing replays its record half alone,
         // as a slot mutation's does: the narrowings rooted at its local
         // drop, as the rebind it replaced dropped them.
-        for m in &flow.indexed.element_reads {
-            if m.span.0 >= span.0
-                && m.span.1 <= span.1
-                && flow.dead.write_reaches(m.span, site)
+        for (_, m) in flow.indexed.element_reads_within(span) {
+            if flow.dead.write_reaches(m.span, site)
                 && !ast.in_block_break_locals_only_carrier(m.span)
             {
                 drop_indexed_narrowings(env, &m.name);
@@ -4178,19 +4176,15 @@ impl<'i> Typer<'i> {
         // One the rebuild declines on stands (`a = [1]; if c; a[0] << 2;
         // end; a.w` fires `for [1]` on both: `Integer#<<` mutates nothing).
         if live {
-            let ran = evaluated && self.element_read_ran(ast, root, m.span);
-            let rebuilt = self.rebuild_element_carrier(ast, indexed, m, env, interner);
-            match rebuilt {
-                Some(ty) if ran => {
+            if evaluated && self.element_read_ran(ast, root, m.span) {
+                if let Some(ty) = self.rebuild_element_carrier(ast, indexed, m, env, interner) {
                     env.insert(Rc::from(m.name.as_str()), ty);
                 }
-                Some(_) => {
-                    env.insert(Rc::from(m.name.as_str()), interner.untyped());
-                }
-                None if !ran && slot_floor => {
-                    env.insert(Rc::from(m.name.as_str()), interner.untyped());
-                }
-                None => {}
+            } else if slot_floor
+                || (self.literal_shape_bound(env, &m.name, interner)
+                    && self.rebuild_element_carrier(ast, indexed, m, env, interner).is_some())
+            {
+                env.insert(Rc::from(m.name.as_str()), interner.untyped());
             }
         }
         if !evaluated {
@@ -4293,27 +4287,32 @@ impl<'i> Typer<'i> {
         if !live {
             return;
         }
-        let ran = self.element_read_ran(ast, root, m.span);
-        let rebuilt = env.get(m.name.as_str()).copied().and_then(|binding| {
+        let rebuild = |env: &TypeEnv, interner: &mut Interner| {
+            let binding = *env.get(m.name.as_str())?;
             let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
             self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner)
-        });
+        };
         // The slot landing's binding treatment (`apply_slot_mutation`): a
-        // rebuild that ran lands, one that may not have run floors (in an
-        // undecided arm too), a declined rebuild floors only where the
-        // calling arm floors.
-        match rebuilt {
-            Some(ty) if ran => {
+        // rebuild that ran lands, one that may not have run floors where
+        // the calling arm floors, and in an undecided arm too when the
+        // rebuild would change the carrier.
+        if self.element_read_ran(ast, root, m.span) {
+            if let Some(ty) = rebuild(env, interner) {
                 env.insert(Rc::from(m.name.as_str()), ty);
             }
-            Some(_) => {
-                env.insert(Rc::from(m.name.as_str()), interner.untyped());
-            }
-            None if !ran && slot_floor => {
-                env.insert(Rc::from(m.name.as_str()), interner.untyped());
-            }
-            None => {}
+        } else if slot_floor
+            || (self.literal_shape_bound(env, &m.name, interner) && rebuild(env, interner).is_some())
+        {
+            env.insert(Rc::from(m.name.as_str()), interner.untyped());
         }
+    }
+
+    /// Whether `name` is bound to a carrier [`Self::widen_through_path`]
+    /// can rebuild ([`literal_shape_root`]) — the cheap gate in front of
+    /// an undecided arm's would-it-change rebuild, so a binding already
+    /// floored skips the argument typing.
+    fn literal_shape_bound(&self, env: &TypeEnv, name: &str, interner: &Interner) -> bool {
+        env.get(name).is_some_and(|&ty| literal_shape_root(interner, ty))
     }
 
     /// Whether the element-read mutator at `span` certainly ran by the end
@@ -4332,7 +4331,9 @@ impl<'i> Typer<'i> {
         marks
             .operand(span)
             .unwrap_or_else(|| self.path_operand_evaluated(ast, root, span))
-            && !ast.in_rescue_modifier_within(span, ast.get(root).span())
+            && !marks
+                .rescued(span)
+                .unwrap_or_else(|| ast.in_rescue_modifier_within(span, ast.get(root).span()))
     }
 
     /// `ElementReadWidening.widen_through_path` (element_read_widening.rb):
@@ -4461,7 +4462,7 @@ impl<'i> Typer<'i> {
         // drop the mutation where the recursion minted `for Integer`).
         let mut stack = vec![(
             root,
-            PathFlags { uncond: true, operand: true, writeback: false },
+            PathFlags { uncond: true, operand: true, writeback: false, rescued: false },
             ast.get(root).span(),
         )];
         while let Some((id, flags, window)) = stack.pop() {
@@ -4512,6 +4513,7 @@ impl<'i> Typer<'i> {
                         uncond: flags.uncond && edge == FlowEdge::Uncond,
                         operand: flags.operand && (edge == FlowEdge::Uncond || lenient),
                         writeback,
+                        rescued: flags.rescued || (lenient && ast.is_rescue_modifier(id)),
                     },
                     child_window,
                 ));
@@ -5666,14 +5668,7 @@ impl<'i> Typer<'i> {
             .enumerate()
             .filter(|(_, m)| in_span(m.span))
             .map(|(i, m)| (m.span, Ok(i)))
-            .chain(
-                indexed
-                    .element_reads
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, m)| in_span(m.span))
-                    .map(|(i, m)| (m.span, Err(i))),
-            )
+            .chain(indexed.element_reads_within(span).map(|(i, m)| (m.span, Err(i))))
             .collect();
         landings.sort_by_key(|(s, _)| s.0);
         for (mspan, which) in landings {
@@ -5796,10 +5791,8 @@ impl<'i> Typer<'i> {
         self.drop_indexed_rebinds(rebinds.iter(), span, indexed, env);
         // The element-read chains' record half — the rebind drop they
         // replaced (`apply_element_read`).
-        for m in &indexed.element_reads {
-            if m.span.0 >= span.0
-                && m.span.1 <= span.1
-                && !ast.in_block_break_locals_only_carrier(m.span)
+        for (_, m) in indexed.element_reads_within(span) {
+            if !ast.in_block_break_locals_only_carrier(m.span)
             {
                 drop_indexed_narrowings(env, &m.name);
             }
@@ -7151,6 +7144,9 @@ struct PathFlags {
     /// [`Typer::path_content_writeback`]: some edge on the path a content
     /// write-back boundary (`Barrier`, or a `while`/`until` body child).
     writeback: bool,
+    /// rigor-rs#943 — some node on the path above (the root included) is a
+    /// `rescue` MODIFIER carrier ([`LoweredAst::is_rescue_modifier`]).
+    rescued: bool,
 }
 
 /// rigor-rs#658 — one DFS's worth of `path_*` answers for a replay `root`,
@@ -7180,6 +7176,12 @@ impl PathMarks {
     /// [`Typer::path_content_writeback`]'s answer, like [`Self::uncond`].
     fn writeback(&self, wspan: rigor_parse::Span) -> Option<bool> {
         self.by_span.get(&wspan).map(|f| f.writeback)
+    }
+
+    /// Whether `wspan` sits under a `rescue` modifier carrier on the path
+    /// from the root, like [`Self::uncond`].
+    fn rescued(&self, wspan: rigor_parse::Span) -> Option<bool> {
+        self.by_span.get(&wspan).map(|f| f.rescued)
     }
 }
 

@@ -2829,7 +2829,8 @@ pub(crate) struct IndexedFlow {
     pub operand_spans: HashSet<rigor_parse::Span>,
     /// Element-mutator calls on a recorded slot.
     pub slot_mutations: Vec<SlotMutation>,
-    /// Element-mutator calls through every other element-read chain.
+    /// Element-mutator calls through every other element-read chain,
+    /// sorted by span start.
     pub element_reads: Vec<ElementReadMutation>,
     /// The span of every `def` / `class` / `module` / `class <<` node — the
     /// reference's `SCOPE_BODY_NODES`, whose writes are another scope's
@@ -2870,6 +2871,23 @@ pub(crate) struct IndexedFlow {
     /// its call arguments / index arguments + rvalue from. Keyed by the
     /// whole-node span the `mutations` table carries.
     pub arg_sites: std::collections::HashMap<rigor_parse::Span, NodeId>,
+}
+
+impl IndexedFlow {
+    /// The [`Self::element_reads`] entries inside `span`, by binary search
+    /// on the start-sorted table.
+    pub(crate) fn element_reads_within(
+        &self,
+        span: rigor_parse::Span,
+    ) -> impl Iterator<Item = (usize, &ElementReadMutation)> {
+        let lo = self.element_reads.partition_point(|m| m.span.0 < span.0);
+        self.element_reads[lo..]
+            .iter()
+            .enumerate()
+            .take_while(move |(_, m)| m.span.0 < span.1)
+            .filter(move |(_, m)| m.span.1 <= span.1)
+            .map(move |(i, m)| (lo + i, m))
+    }
 }
 
 /// Collect the file's [`IndexedFlow`]. Mirrors `collect_flow_writes`'s
@@ -3033,6 +3051,10 @@ pub(crate) fn collect_indexed_flow(ast: &LoweredAst) -> IndexedFlow {
             _ => {}
         }
     }
+    // Sorted by span start so a landing slices its in-span entries
+    // ([`IndexedFlow::element_reads_within`]) instead of scanning the
+    // file's every chain per replayed statement.
+    flow.element_reads.sort_by_key(|m| m.span);
     flow.alias_links = toplevel_alias_links(ast);
     flow
 }

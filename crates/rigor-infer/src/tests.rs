@@ -969,6 +969,71 @@ fn element_read_mutations_rebuild_the_carrier() {
     assert_eq!(env.get("a"), Some(&tup));
 }
 
+/// rigor-rs#943: `ElementReadWidening.widen_through_path` over every
+/// element-read chain — chained reads, `first`/`last`/`dig` steps,
+/// non-literal keys, block mutators — rebuilds the root local's carrier
+/// (each expected type is the oracle's own `x.w` message); a chain that may
+/// not have run floors the binding instead of keeping the stale literal.
+#[test]
+fn element_read_paths_rebuild_through_the_chain() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let show = |src: &str, name: &str| -> String {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = *env.get(name).expect("bound");
+        match i.get(ty) {
+            Type::Dynamic(_) => "untyped".to_string(),
+            _ => rigor_types::describe_named(&i, ty, &|c| {
+                index.class_name_for_id(c).map(str::to_string)
+            }),
+        }
+    };
+    for (src, want) in [
+        ("b = [[[]]]\nb[0][0] << 1\n", "[[Array[Dynamic[top] | Integer]]]"),
+        ("h = {a: [[1]]}\nh[:a][0] << 2\n", "{ a: [Array[1 | Dynamic[top] | Integer]] }"),
+        ("h = {a: [1]}\nh[:a][0] << 2\n", "{ a: [1] }"),
+        ("a = [[1]]\na.first << 1\n", "[Array[1 | Dynamic[top] | Integer]]"),
+        ("a = [[1], [2]]\na.last << 3\n", "[[1], Array[2 | Dynamic[top] | Integer]]"),
+        ("h = {a: [[]]}\nh.dig(:a, 0) << 1\n", "{ a: [Array[Dynamic[top] | Integer]] }"),
+        ("h = {a: {b: []}}\nh[:a][:b] << 1\n", "{ a: { b: Array[Dynamic[top] | Integer] } }"),
+        // `:all` — a non-literal key widens every position / pair.
+        ("h = {a: [], b: \"s\"}\nk = :a\nh[k] << 1\n", "{ a: Array[Dynamic[top] | Integer], b: String }"),
+        ("h = {a: []}\nh[true] << 1\n", "{ a: Array[Dynamic[top] | Integer] }"),
+        (
+            "a = [[1], [2]]\ni = 0\na[i] << 3\n",
+            "[Array[1 | Dynamic[top] | Integer], Array[2 | Dynamic[top] | Integer]]",
+        ),
+        // A position names no hash key; a Bignum names no tuple position.
+        ("h = {a: []}\nh[1] << 1\n", "{ a: [] }"),
+        ("a = [[1]]\na[10000000000000000000000] << 2\n", "[[1]]"),
+        // The block is on the mutator, not on a read step.
+        ("a = [[1]]\na[0].map! { |i| i.to_s }\n", "[Array[Dynamic[top]]]"),
+        // Two mutators of one carrier compose in source order, slot table
+        // and chain table alike.
+        ("h = {a: [[]]}\nh[:a][0] << 2\nh[:a] << 1\n", "{ a: Array[Array[Dynamic[top] | Integer] | Dynamic[top]] }"),
+        ("h = {a: [[]]}\nh[:a] << 1\nh[:a][0] << 2\n", "{ a: Array[Dynamic[top] | []] }"),
+        // Positions the mutation may not have reached floor the binding:
+        // a `rescue` modifier (the reference's rescue join is silent), an
+        // undecided arm whose rebuild would change the carrier, a block
+        // body's `break` argument.
+        ("b = [[[]]]\nb[0][0] << 1 rescue nil\n", "untyped"),
+        ("h = {a: []}\nh[:a] << 1 rescue nil\n", "untyped"),
+        ("b = [[[]]]\nif rand > 0\n  b[0][0] << 1\nend\n", "untyped"),
+        ("h = {a: \"s\"}\nif rand > 0\n  h[:a] << \"b\"\nend\n", "untyped"),
+        ("b = [[[]]]\n[1].each { break b[0][0] << 1 }\n", "untyped"),
+        // …but a splat evaluates its operand, and an undecided arm's
+        // declined rebuild leaves the entry standing (`Integer#<<`).
+        ("b = [[[]]]\np(*(b[0][0] << 1))\n", "[[Array[Dynamic[top] | Integer]]]"),
+        ("a = [1]\nif rand > 0\n  a.first << 2\nend\n", "[1]"),
+        // A nominal root under a block `break` stands on both sides.
+        ("h = {}\nh[:a] ||= \"s\"\n[1].each { break h[:a] << \"t\" }\n", "Hash[Dynamic[top] | Symbol, Dynamic[top] | String]"),
+    ] {
+        assert_eq!(show(src, src.split(' ').next().unwrap()), want, "{src:?}");
+    }
+}
+
 /// rigor-rs#944: an operator write the constant fold cannot answer
 /// dispatches `a.<op>(v)` on the entry (`dispatch_operator`) on the rows the
 /// reference cannot fold, and keeps the decline everywhere else. Every
