@@ -760,7 +760,7 @@ impl<'i> Typer<'i> {
                 if let Some(ty) = self.op_write_constant_fold(entry, opname, v_ty, interner) {
                     return ty;
                 }
-                self.op_write_dispatch(ast, site, entry, opname, value, env, interner)
+                self.op_write_dispatch(ast, site, entry, opname, value, v_ty, env, interner)
             }
         }
     }
@@ -847,9 +847,12 @@ impl<'i> Typer<'i> {
     /// constant fold cannot answer types as the call `entry.<op>(value)` —
     /// `MethodDispatcher.dispatch` on the entry type, the dispatch a plain
     /// `s + v` reaches (`s = "abc"; s += nil` is `String`, `a = [1]; a +=
-    /// [2]` the concatenated `[1, 2]`, rigor-rs#944). The port's plain-call
-    /// cascade answers it with the entry as the receiver override, except
-    /// where the two differ:
+    /// [2]` the concatenated `[1, 2]`, rigor-rs#944). The port answers it
+    /// through the plain-call cascade with the entry as the receiver
+    /// override, but only on the rows [`Self::op_write_dispatch_admits`]
+    /// lists — where the reference cannot fold whatever the operands'
+    /// precision, so the RBS answer the cascade gives is the reference's
+    /// too. Beyond them:
     ///
     /// - a `Union` entry declines: the port's union dispatch is the
     ///   ExpressionTyper's `try_non_nil_receiver_retry`, which the
@@ -871,11 +874,12 @@ impl<'i> Typer<'i> {
         entry: TypeId,
         opname: &str,
         value: NodeId,
+        v_ty: TypeId,
         env: &TypeEnv,
         interner: &mut Interner,
     ) -> TypeId {
         let untyped = interner.untyped();
-        if self.def_scope.get().is_some() || matches!(interner.get(entry), Type::Union(_)) {
+        if self.def_scope.get().is_some() || !self.op_write_dispatch_admits(entry, opname, v_ty, interner) {
             return untyped;
         }
         let ty = self.type_call_declines(
@@ -889,17 +893,112 @@ impl<'i> Typer<'i> {
             true,
             Some(entry),
         );
-        if let Type::Nominal { class, args } = interner.get(ty) {
-            if args.is_empty()
-                && matches!(
-                    self.index.class_name_for_id(*class),
-                    Some("Array" | "Hash" | "Set" | "Range")
-                )
+        match interner.get(ty) {
+            // The `Tuple` rows answer only through the shape folds.
+            _ if matches!(interner.get(entry), Type::Tuple(_)) && !matches!(interner.get(ty), Type::Tuple(_)) => {
+                untyped
+            }
+            Type::Nominal { class, args }
+                if args.is_empty()
+                    && matches!(
+                        self.index.class_name_for_id(*class),
+                        Some("Array" | "Hash" | "Set" | "Range")
+                    ) =>
             {
-                return untyped;
+                untyped
+            }
+            _ => ty,
+        }
+    }
+
+    /// The operator-write rows [`Self::op_write_dispatch`] answers. The
+    /// hazard is precision: a port carrier is often coarser than the
+    /// reference's (`1.5.to_s` is the port's `non-empty-string` but the
+    /// oracle's `"1.5"`; `1r` is the port's `Dynamic`), and where the
+    /// reference can still FOLD the call the RBS answer drifts its message
+    /// (`1 <<= 2.0` is `4`, `"abc" %= [2]` is `"abc"`) or fires where the
+    /// literal-string tier is silent (`"abc" <<= 1.5.to_s`). So the rows are
+    /// the ones the reference cannot fold whatever the operands' precision:
+    ///
+    /// - a `TypeError` operand on a `String` / `Integer` / `Float` entry
+    ///   (`Constant` or plain `Nominal`): a pinned `nil` / `true` / `false`
+    ///   / Symbol, a `Tuple` / `HashShape`, a String on a numeric entry, a
+    ///   non-String on `String#+`, a String or negative count on
+    ///   `String#*` — `invoke_binary` rescues the raise to `nil` and the RBS
+    ///   tier answers;
+    /// - `String#+` on an untyped operand (`s += unresolved` is `String`:
+    ///   the one overload answers `String` for any argument);
+    /// - a plain `Nominal` entry (no literal to fold): `String * n` for a
+    ///   pinned `n >= 0`, and numeric arithmetic on a pinned or plain
+    ///   numeric operand;
+    /// - a `Tuple` entry on a `Tuple` / pinned-Integer operand (the
+    ///   `tuple_concat` / `tuple_star` / set-operation shape folds).
+    ///
+    /// `String#<<` is never admitted: its literal-string answer turns on
+    /// operand literalness the port's carriers lose.
+    fn op_write_dispatch_admits(
+        &self,
+        entry: TypeId,
+        opname: &str,
+        v_ty: TypeId,
+        interner: &Interner,
+    ) -> bool {
+        let plain_nominal = |ty: TypeId| match interner.get(ty) {
+            Type::Nominal { class, args } if args.is_empty() => self
+                .index
+                .class_name_for_id(*class)
+                .filter(|n| matches!(*n, "String" | "Integer" | "Float")),
+            _ => None,
+        };
+        let (entry_class, entry_pinned) = match interner.get(entry) {
+            Type::Constant(Scalar::Str(_)) => ("String", true),
+            Type::Constant(Scalar::Int(_) | Scalar::BigInt(_)) => ("Integer", true),
+            Type::Constant(Scalar::Float(_)) => ("Float", true),
+            Type::Tuple(_) => ("Array", false),
+            _ => match plain_nominal(entry) {
+                Some(n) => (n, false),
+                None => return false,
+            },
+        };
+        let v = interner.get(v_ty);
+        let collection = matches!(v, Type::Tuple(_) | Type::HashShape(_));
+        let non_coercible = matches!(
+            v,
+            Type::Constant(Scalar::Nil | Scalar::Bool(_) | Scalar::Sym(_))
+        );
+        let pinned_str = matches!(v, Type::Constant(Scalar::Str(_)));
+        let pinned_numeric = matches!(
+            v,
+            Type::Constant(Scalar::Int(_) | Scalar::BigInt(_) | Scalar::Float(_))
+        );
+        match entry_class {
+            "Array" => {
+                matches!(v, Type::Tuple(_) | Type::Constant(Scalar::Int(_)))
+                    && matches!(opname, "+" | "-" | "*" | "&" | "|")
+            }
+            "String" => match opname {
+                "+" => {
+                    ((non_coercible || pinned_numeric || collection) && !pinned_str)
+                        || matches!(v, Type::Dynamic(_))
+                }
+                "*" => {
+                    non_coercible
+                        || pinned_str
+                        || collection
+                        || matches!(v, Type::Constant(Scalar::Int(n)) if *n < 0 || !entry_pinned)
+                }
+                _ => false,
+            },
+            _ => {
+                if non_coercible || pinned_str || collection {
+                    return true;
+                }
+                !entry_pinned
+                    && matches!(opname, "+" | "-" | "*" | "/" | "%" | "**")
+                    && (pinned_numeric
+                        || matches!(plain_nominal(v_ty), Some("Integer" | "Float")))
             }
         }
-        ty
     }
 
     /// Split `ty` into its `(truthy, falsy)` parts, each the join of the
