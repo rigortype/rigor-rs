@@ -3307,18 +3307,28 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
         | Node::VariableWrite { value, .. }
         | Node::ConstantWrite { value, .. }
         | Node::MultiWrite { value, .. } => stmt_terminates(t, ast, *value, false),
-        // The write-call spelling of the same rule: `h[:k] = raise` and
-        // `o.attr = raise` type `bot` on the oracle because the assigned
-        // VALUE — the call's LAST argument — does. Other argument
-        // positions do not count (`h[raise] = 1` keeps the arm live, like
-        // `foo(raise)`), and neither does a safe-nav setter — `o&.attr =
-        // raise` skips the store on a `nil` receiver. The `=`-suffixed
-        // comparison operators are excluded by spelling.
-        Node::Call { method, args, safe_nav, .. }
-            if !*safe_nav
-                && method.ends_with('=')
-                && !matches!(method.as_str(), "==" | "!=" | "<=" | ">=" | "===") =>
-        {
+        // The write-call spelling of the same rule, keyed on Prism's
+        // `attribute_write?` like the oracle's `attribute_write_value`
+        // (expression_typer.rb:2026): `h[:k] = raise` and `o.attr = raise`
+        // (and the explicit `o.attr=(raise)`) type `bot` on the oracle
+        // because the assigned VALUE — the call's LAST argument — does.
+        // Other argument positions do not count (`h[raise] = 1` keeps the
+        // arm live, like `foo(raise)`), the explicit `h.[]=(k, raise)`
+        // spelling is NOT an attribute write (`CallNode::is_attribute_write`
+        // is false — the oracle types it by the `[]=` dispatch and keeps the
+        // arm live; rigor-rs#964), and neither is a safe-nav setter —
+        // `o&.attr = raise` skips the store on a `nil` receiver (the oracle
+        // still terminates it when the receiver proves non-nil; until the
+        // walk can prove that, the decline side — rigor-rs#964). A splat
+        // RHS (`o.attr = *a`) needs no explicit check: the splat lowers to
+        // a recovery carrier that never terminates, matching the oracle's
+        // `return result if rhs.is_a?(SplatNode)`.
+        Node::Call {
+            args,
+            safe_nav,
+            attribute_write,
+            ..
+        } if *attribute_write && !*safe_nav => {
             args.last().is_some_and(|&v| stmt_terminates(t, ast, v, false))
         }
         // `branch_unconditionally_exits?` recurses into `if`/`unless` only

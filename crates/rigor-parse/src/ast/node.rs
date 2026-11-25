@@ -330,6 +330,19 @@ pub enum Node {
         /// safe-nav suppression clause): a `&.` call short-circuits on a nil
         /// receiver at runtime, so a nil-bearing receiver is not a bug there.
         safe_nav: bool,
+        /// `true` when Prism parsed the call as an attribute/index WRITE —
+        /// `CallNode::is_attribute_write()`: `o.attr = v`, `o&.attr = v`,
+        /// `self.attr = v`, `C.attr = v`, `@a.b = v`, `h[k] = v` and the
+        /// explicit `o.attr=(v)` spelling all set it; the explicit
+        /// `h.[]=(k, v)` spelling and the comparison/match operators do not,
+        /// and the compound writes (`o.attr ||= v`, `h[k] &&= v`, …) are
+        /// [`Node::AttrWrite`]/[`Node::IndexWrite`], not `Call` at all. The
+        /// reference's `attribute_write_value` (expression_typer.rb:2026)
+        /// keys the setter-call's RHS-value typing on this flag — the call
+        /// types as its last non-splat argument — so `stmt_terminates`'
+        /// setter arm gates on it rather than a `foo=`-spelling test
+        /// (rigor-rs#964).
+        attribute_write: bool,
         /// `true` when the FIRST positional argument is a non-plain shape — a
         /// splat (`*a`), a bare keyword-hash (`a: 1`, Prism's `KeywordHashNode`),
         /// or forwarded arguments (`...`). The lowered arg subtree does not
