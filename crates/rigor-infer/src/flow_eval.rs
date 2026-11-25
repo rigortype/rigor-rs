@@ -2407,6 +2407,7 @@ impl<'i> Typer<'i> {
                     loops: Vec::new(),
                     ifs: Vec::new(),
                     record_guards: Vec::new(),
+                    retry_edges: crate::retry_edge::RetryEdges::default(),
                 }
             }
         };
@@ -2449,6 +2450,21 @@ impl<'i> Typer<'i> {
                 || (is_content_mutator(&am.method) && dead.inside_iterated(am.span))
         });
         indexed.retry_drops = self.retry_edge_index_drops(ast, &rebinds, &mutations, &indexed);
+        // rigor-rs#972 — the top-level retrying `begin`s' edge writes, the
+        // same write set `retry_drops` keys on.
+        let retry_edges = if indexed.retry_drops.is_empty() {
+            crate::retry_edge::RetryEdges::default()
+        } else {
+            let writes = rebinds
+                .iter()
+                .map(|(w, n)| (*w, n.as_str()))
+                .chain(mutations.iter().map(|(w, n, ..)| (*w, n.as_str())))
+                .chain(indexed.slot_writes.iter().map(|w| (w.span, w.name.as_str())));
+            let scope_spans = &indexed.scope_spans;
+            crate::retry_edge::RetryEdges::build(self, ast, writes, &rebinds, |s| {
+                !scope_spans.iter().any(|&b| within_span(s, b))
+            })
+        };
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
         // (its own bindings + `=> e` reach only through replay — rigor-rs#368);
@@ -2457,6 +2473,7 @@ impl<'i> Typer<'i> {
         // body can observe (rigor-rs#366), but it still requires the
         // boundary + replay path to reach the site at all.
         let record = !(rebinds.is_empty() && mutations.is_empty() && closure_muts.is_empty())
+            || !retry_edges.is_empty()
             || dead.has_folded()
             || dead.has_rescue();
         // A boundary env per statement is a full clone of a growing map —
@@ -2506,6 +2523,7 @@ impl<'i> Typer<'i> {
             loops: self.collect_loop_edges(ast),
             ifs: self.collect_if_edges(ast),
             record_guards,
+            retry_edges,
         }
     }
 
@@ -2804,7 +2822,8 @@ impl<'i> Typer<'i> {
                     .closure_mutations
                     .iter()
                     .any(|(_, w, _)| w.0 >= stmt_span.0)
-                || flow.dead.in_rescue(site);
+                || flow.dead.in_rescue(site)
+                || flow.retry_edges.holds(site);
             if !later {
                 break 'env Cow::Borrowed(&flow.env);
             }
@@ -2840,6 +2859,23 @@ impl<'i> Typer<'i> {
         // site the boundary descent cannot reach (buried under a `Loop` /
         // `Case` — `apply_subtree_effects` is flat there).
         let mut base = base;
+        // rigor-rs#972 — a read inside a retrying `begin` that the retry
+        // edge can reach with a write the descent above replayed out of
+        // order, or not at all (a later statement, a retrying clause, an
+        // exclusive sibling path): the reference reads the join of the
+        // entry and every scope on the edge (`eval_retried_begin`). The
+        // join's convergence is not modelled, so the local declines to
+        // `Dynamic[top]` ([`crate::retry_edge`]).
+        if !flow.retry_edges.is_empty() {
+            let u = interner.untyped();
+            for name in flow.retry_edges.declined_names(site) {
+                if base.get(name).is_some_and(|&t| t != u) {
+                    let env = base.to_mut();
+                    env.insert(Rc::from(name), u);
+                    drop_indexed_narrowings(env, name);
+                }
+            }
+        }
         self.loop_edge_overlay(ast, flow, site, &mut base, interner);
         self.if_edge_overlay(ast, flow, site, &mut base, interner);
         // rigor-rs#405 — a class guard's rebind drops the records rooted at
@@ -3057,15 +3093,6 @@ impl<'i> Typer<'i> {
                 // index keeps that last visit): a record rooted at a local
                 // the edge rebinds is gone there too.
                 drop_retry_edge_records(&flow.indexed, *span, true, env);
-                // rigor-rs#972 — the widened entry rebinds the local itself,
-                // not only its records: a receiver read anywhere in the
-                // `begin` (body, clause, `else`) sees the join of the entry
-                // and every scope on the edge (`c = [1]; begin; c.nope;
-                // rescue; c << 2; retry; end` is silent on the oracle). The
-                // join's literal/envelope convergence is not modelled here,
-                // so the local declines to `Dynamic[top]`. A write earlier in
-                // the body than the site still replays over it.
-                widen_retry_edge_locals(&flow.indexed, *span, env, interner);
                 if main_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
@@ -6899,24 +6926,6 @@ fn drop_retry_edge_records(
     }
 }
 
-/// rigor-rs#972 — read every local the retrying `begin` at exactly `span`
-/// carries across its retry edge ([`IndexedFlow::retry_drops`]: a rebind or
-/// mutation in the protected body or a retrying clause) as `Dynamic[top]`,
-/// the decline side of the reference's `widen_entry_for_retry` join. A name
-/// the env does not bind stays unbound.
-fn widen_retry_edge_locals(
-    indexed: &IndexedFlow,
-    span: rigor_parse::Span,
-    env: &mut TypeEnv,
-    interner: &mut Interner,
-) {
-    for (begin, name) in &indexed.retry_drops {
-        if *begin == span && env.contains_key(name.as_str()) {
-            env.insert(Rc::from(name.as_str()), interner.untyped());
-        }
-    }
-}
-
 /// A loop body's live write site, for [`Typer::loop_cap_widening`]. `value`
 /// is the RHS node — a `None` site is a write the port cannot read the value
 /// of (pattern binds, `for` indices), which can never prove convergence.
@@ -7150,6 +7159,9 @@ pub struct CheckFlow {
     /// rigor-rs#405 — every class guard whose local holds an indexed
     /// record, for [`Typer::record_guard_overlay`].
     record_guards: Vec<crate::record_guards::RecordGuard>,
+    /// rigor-rs#972 — the top-level retrying `begin`s, for the reads their
+    /// retry edge reaches ([`crate::retry_edge`]).
+    retry_edges: crate::retry_edge::RetryEdges,
 }
 
 /// One span-escaped node for [`Typer::check_env_at`] (rigor-rs#492).

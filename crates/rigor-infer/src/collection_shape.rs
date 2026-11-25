@@ -123,6 +123,33 @@ impl<'i> Typer<'i> {
                 !bailed.iter().any(|b| b.0 <= s.0 && s.1 <= b.1)
             });
         }
+        // rigor-rs#972 — a receiver read inside a retrying `begin` that the
+        // retry edge reaches with a write this walk saw out of order, or not
+        // at all: the re-run below (`coll_flow_begin_rescue`) replays the
+        // body over the retrying arm's post-scope only, so it misses the
+        // body's own later writes (`raise_scopes`), and a clause or `else`
+        // is walked once over the plain entry. The reference reads the
+        // join of the entry and every scope on the edge; the site declines
+        // ([`crate::retry_edge`]). Sites after the `begin` keep the walk's
+        // exit scope.
+        let edges = crate::retry_edge::RetryEdges::build(
+            self,
+            ast,
+            writes.iter().map(|(w, n)| (*w, n.as_str())),
+            &rebinds,
+            |_| true,
+        );
+        if !edges.is_empty() {
+            out.retain(|&id, _| {
+                let Node::Call { receiver: Some(r), .. } = ast.get(id) else {
+                    return true;
+                };
+                match ast.get(*r) {
+                    Node::LocalVariableRead { name, span } => !edges.declines(*span, name),
+                    _ => true,
+                }
+            });
+        }
         out
     }
 
@@ -398,7 +425,6 @@ impl<'i> Typer<'i> {
         };
         let (body, main_body, ensure_body, clauses, begin_span) =
             (body.clone(), main_body.clone(), ensure_body.clone(), clauses.clone(), *span);
-        self.coll_widen_retry_entry(ast, &main_body, &clauses, tenv, ctx, interner);
         // The primary path: the protected body, then the `else` clause,
         // which runs only when the body completes but on the body's own
         // post-scope (`eval_begin_primary_under`). `body` is flat —
@@ -521,59 +547,6 @@ impl<'i> Typer<'i> {
         // `ensure` runs on the joined exit scope and its effects apply
         // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).
         self.coll_flow_scope(ast, &ensure_body, tenv, ctx, interner, out, stmt_position);
-    }
-
-    /// rigor-rs#972 — the entry a retrying `begin` is walked over. The
-    /// reference re-evaluates the protected body, the clauses and the `else`
-    /// under `widen_entry_for_retry`'s entry: the original one joined with
-    /// every scope on the retry edge, i.e. each statement boundary of the
-    /// body (`raise_scopes`) and each `retry`'s scope. A receiver read
-    /// anywhere in the `begin` therefore sees what the body or a retrying
-    /// clause writes later (`begin; c.nope; c << 2; rescue; retry; end` and
-    /// `rescue; c.nope; c = [2]; retry` are silent on the oracle). The
-    /// re-run in [`Self::coll_flow_begin_rescue`] replays the body over the
-    /// arm's post-scope only, so it misses both. This walk does not model
-    /// the join's literal/envelope convergence: every local the body or a
-    /// retrying clause rebinds or mutates, and that the entry binds, enters
-    /// as `Dynamic[top]`, and a site reading it records a decline. A rebind
-    /// earlier in the same sequence still binds over it (`begin; c = [2];
-    /// c.nope` keeps `for [2]`).
-    fn coll_widen_retry_entry(
-        &self,
-        ast: &LoweredAst,
-        main_body: &[NodeId],
-        clauses: &[rigor_parse::RescueClause],
-        tenv: &mut TypeEnv,
-        ctx: &CollCtx<'_>,
-        interner: &mut Interner,
-    ) {
-        let idx = self.reach_index(ast);
-        let mut regions: Vec<rigor_parse::Span> = clauses
-            .iter()
-            .filter(|c| idx.clause_retries(self, ast, c.span))
-            .map(|c| c.span)
-            .collect();
-        if regions.is_empty() {
-            return;
-        }
-        if let (Some(&f), Some(&l)) = (main_body.first(), main_body.last()) {
-            regions.push((ast.get(f).span().0, ast.get(l).span().1));
-        }
-        let names: Vec<String> = regions
-            .iter()
-            .flat_map(|&r| {
-                writes_within(ctx.writes, r)
-                    .iter()
-                    .filter(move |(w, _)| r.0 <= w.0 && w.1 <= r.1)
-                    .map(|(_, n)| n.clone())
-            })
-            .collect();
-        let u = interner.untyped();
-        for name in names {
-            if tenv.get(name.as_str()).is_some_and(|&t| t != u) {
-                coll_env_insert(ctx, tenv, &name, u);
-            }
-        }
     }
 
     /// Evaluate an expression: record collection-typed receiver uses, thread
