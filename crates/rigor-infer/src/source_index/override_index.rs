@@ -192,45 +192,6 @@ impl SourceIndex {
             .collect()
     }
 
-    /// rigor-rs#878 review — `Reflection.ancestor_constant_scopes`: the names
-    /// `constant_type_at` consults for `K` inside `class` AFTER the lexical
-    /// nesting rungs and BEFORE the top level — each written ancestor
-    /// (`include`/`prepend`, then superclass) resolved to the first lexical
-    /// candidate the PROJECT knows as a namespace
-    /// (`known_project_namespace?` = `discovered_classes.key?`, which includes
-    /// the synthesized prefixes — `class Float::Sub` makes `Float` project
-    /// knowledge, so `Sub < Float` consults `Float::K`). A candidate the
-    /// project only WRITES (`Foo = …` — `project_written_candidate?`) stops
-    /// that spelling's walk: Ruby binds the written constant, whose own
-    /// constants nothing here describes. An unresolved spelling — a purely
-    /// external mixin (`include Math` is silent on the oracle) — yields
-    /// nothing; superclass edges never yield an external owner at all.
-    /// [`override_ancestor_names`] differs: it resolves to a project CLASS
-    /// entry (override table), missing synthesized prefixes.
-    pub(crate) fn ancestor_constant_scopes(&self, class: &str) -> Vec<String> {
-        let segments: Vec<&str> = class.split("::").collect();
-        let mut out: Vec<String> = Vec::new();
-        for raw in self.written_ancestor_names(class) {
-            for i in (0..segments.len()).rev() {
-                let candidate = if i == 0 {
-                    raw.clone()
-                } else {
-                    format!("{}::{}", segments[..i].join("::"), raw)
-                };
-                if self.constant_write_candidates_contains(&candidate) {
-                    break;
-                }
-                if self.knows_discovered_class(&candidate) {
-                    if !out.contains(&candidate) {
-                        out.push(candidate);
-                    }
-                    break;
-                }
-            }
-        }
-        out
-    }
-
     /// The WRITTEN `superclass` of `class` resolved to a project class, or
     /// `None` — the `mixins: false` ancestor edge the reference's
     /// `singleton_def_through_ancestors` follows: a subclass inherits its

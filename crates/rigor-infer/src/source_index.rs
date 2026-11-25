@@ -52,7 +52,7 @@ mod refine_walk;
 mod resolution_chain;
 mod ruby_library_roots;
 mod pre_eval;
-pub(crate) use resolution_chain::AncestryIndex;
+pub(crate) use resolution_chain::{AncestryIndex, ConstantScopeWorlds};
 mod harvest;
 
 use std::collections::{HashMap, HashSet};

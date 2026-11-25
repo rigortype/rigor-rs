@@ -1610,56 +1610,55 @@ impl<'i> Typer<'i> {
             // consults BEFORE the top level: `class Sub < Base; K` reaches
             // `Base::K`, so a `Base::K` write must stop the `K` rungs below
             // (the `ARGV = $x` in `class Base` FP — rigor-rs#878 review).
-            // [`SourceIndex::ancestor_constant_scopes`] resolves each written
-            // ancestor to the project-known namespace the reference's
-            // `known_project_namespace?` admits — an RBS-only superclass
-            // contributes no name (`class Sub < Float; DIG` is silent on the
-            // oracle unless the project itself discovers `Float`).
+            // rigor-rs#905 — the scope order is `agreed_ancestor_hit`'s:
+            // the resolution chain's RUBY order (a class's prepend region,
+            // its include region latest-statement-nearest, then the
+            // superclass — each module's own chain spliced in where its
+            // statement lands, so `class Sub < Base; include A` with `A`
+            // including `M` consults `M` BEFORE `Base`) where the port can
+            // vouch for it, `MasterOrder.breadth_first`'s order where it
+            // cannot. [`SourceIndex::constant_scope_worlds`] packages the
+            // two plus the retro world `chain.settle` compares the one
+            // settle-able fork against.
             let innermost = prefix.join("::");
             if !innermost.is_empty() {
-                let mut queue: std::collections::VecDeque<String> =
-                    self.source.ancestor_constant_scopes(&innermost).into_iter().collect();
-                let mut seen = std::collections::HashSet::new();
-                seen.insert(innermost.clone());
-                let mut steps = 0usize;
-                while let Some(ancestor) = queue.pop_front() {
-                    if !seen.insert(ancestor.clone()) {
-                        continue;
-                    }
-                    steps += 1;
-                    if steps > crate::source_index::OVERRIDE_ANCESTOR_WALK_LIMIT {
-                        break; // cap: stop consulting ancestors, fall to bare name
-                    }
-                    let candidate = format!("{ancestor}::{name}");
-                    // `constant_type_at`'s in-source rung first: a same-file
-                    // literal write on the ancestor answers `for <lit>`
-                    // (`Base::K = 5` + `class Sub < Base; K` → `for 5`).
-                    if let Some(lit) = self.source.literal_constant_at(&candidate, file) {
-                        return Some(self.intern_const_lit(lit, interner));
-                    }
-                    // rigor-rs#910 — and the typed half of the same
-                    // in-source rung (`Base::X = Object.new` ⇒ `for
-                    // Object`): above the write-stop below, but only when
-                    // no decl rung binds the candidate — `constant_type_at`
-                    // orders singleton/discovered ABOVE `in_source_constants`.
-                    if !bound(&candidate) {
-                        if let Some(ty) =
-                            self.typed_constant_at(ast, &candidate, file, interner)
-                        {
-                            return Some(ty);
+                use crate::source_index::ConstantScopeWorlds;
+                let hit = match self.source.constant_scope_worlds(&innermost) {
+                    ConstantScopeWorlds::Settled { scopes, retro } => {
+                        let hit =
+                            self.first_ancestor_hit(ast, &scopes, name, file, interner);
+                        // `chain.settle` with one fork: the chain's answer
+                        // stands only where the retro world (the skip made)
+                        // answers through the same owner; otherwise the
+                        // reader takes master's breadth-first order.
+                        let stands = match &retro {
+                            None => true,
+                            Some(retro) => {
+                                self.first_ancestor_hit(
+                                    ast, retro, name, file, interner,
+                                )
+                                .map(|(owner, _)| owner)
+                                    == hit.as_ref().map(|(owner, _)| owner.clone())
+                            }
+                        };
+                        if stands {
+                            hit
+                        } else {
+                            let master = self.source.master_constant_scopes(&innermost);
+                            self.first_ancestor_hit(ast, &master, name, file, interner)
                         }
                     }
-                    if self.source.constant_write_candidates_contains(&candidate)
-                        || bound(&candidate)
-                    {
-                        return None;
+                    ConstantScopeWorlds::Master(scopes) => {
+                        self.first_ancestor_hit(ast, &scopes, name, file, interner)
                     }
-                    if let Some(ty) = self.constant_type_for(&candidate, interner) {
-                        return Some(ty);
-                    }
-                    for next in self.source.ancestor_constant_scopes(&ancestor) {
-                        queue.push_back(next);
-                    }
+                };
+                match hit {
+                    Some((_, AncestorHit::Answer(ty))) => return Some(ty),
+                    // The census stop is a HIT whose answer is silence: the
+                    // candidate binds, so no lower rung — and not the
+                    // top-level step 3 — may answer for it.
+                    Some((_, AncestorHit::Stop)) => return None,
+                    None => {}
                 }
             }
         }
@@ -1667,6 +1666,62 @@ impl<'i> Typer<'i> {
             return None;
         }
         self.constant_type_for(name, interner)
+    }
+
+    /// rigor-rs#905 — `first_ancestor_hit`: the first scope name whose
+    /// `<scope>::<name>` candidate any source binds, walking `scopes` in
+    /// order, paired with what the candidate answered. The rung order per
+    /// candidate is the one step 2 already used: the same-file literal
+    /// write first (`Base::K = 5` + `class Sub < Base; K` → `for 5`), then
+    /// rigor-rs#910's typed half (`Base::X = Object.new` ⇒ `for Object`,
+    /// only while no decl rung binds the candidate), the census write/decl
+    /// STOP, then `constant_type_for`'s folded and RBS constant tables.
+    ///
+    /// [`AncestorHit::Stop`] is a HIT for settle purposes — the reference's
+    /// `constant_type_at` answers `WRITTEN_CANDIDATE` there, truthy — so
+    /// its owner is what the retro-world comparison reads, and the caller
+    /// renders it as silence (the rung declines, `Dynamic[top]`).
+    fn first_ancestor_hit(
+        &self,
+        ast: &LoweredAst,
+        scopes: &[String],
+        name: &str,
+        file: &FileKey,
+        interner: &mut Interner,
+    ) -> Option<(String, AncestorHit)> {
+        let bound = |candidate: &str| -> bool {
+            self.source.project_declares_constant(candidate)
+                || self.index.knows_qualified_class(candidate)
+        };
+        for ancestor in scopes {
+            let candidate = format!("{ancestor}::{name}");
+            // `constant_type_at`'s in-source rung first: a same-file literal
+            // write on the ancestor answers `for <lit>`.
+            if let Some(lit) = self.source.literal_constant_at(&candidate, file) {
+                return Some((
+                    ancestor.clone(),
+                    AncestorHit::Answer(self.intern_const_lit(lit, interner)),
+                ));
+            }
+            // rigor-rs#910 — and the typed half of the same in-source rung:
+            // above the write-stop below, but only when no decl rung binds
+            // the candidate — `constant_type_at` orders singleton/discovered
+            // ABOVE `in_source_constants`.
+            if !bound(&candidate) {
+                if let Some(ty) = self.typed_constant_at(ast, &candidate, file, interner) {
+                    return Some((ancestor.clone(), AncestorHit::Answer(ty)));
+                }
+            }
+            if self.source.constant_write_candidates_contains(&candidate)
+                || bound(&candidate)
+            {
+                return Some((ancestor.clone(), AncestorHit::Stop));
+            }
+            if let Some(ty) = self.constant_type_for(&candidate, interner) {
+                return Some((ancestor.clone(), AncestorHit::Answer(ty)));
+            }
+        }
+        None
     }
 
     /// One candidate through the rung's three sources, in the reference's
@@ -2808,6 +2863,17 @@ impl<'i> Typer<'i> {
 /// every MRI build (C's `M_PI` / `M_E`, the four IEEE-754 binary64
 /// magnitudes), which is the upstream admission criterion; `Float::NAN` is
 /// deliberately NOT folded upstream and neither here.
+/// What one ancestor-scope candidate answered — rigor-rs#905's half of the
+/// reference's truthy-hit/`WRITTEN_CANDIDATE` distinction: `constant_type_at`
+/// answers a TYPE for some candidates and the write/decl STOP for the rest,
+/// and both are hits on the walk (the stop's owner still settles the retro
+/// comparison). The caller renders [`Self::Stop`] as silence — the rung
+/// declines, exactly the `return None` the pre-rigor-rs#905 walk ran.
+enum AncestorHit {
+    Answer(TypeId),
+    Stop,
+}
+
 fn folded_float_constant(name: &str) -> Option<f64> {
     Some(match name {
         "Math::PI" => std::f64::consts::PI,
