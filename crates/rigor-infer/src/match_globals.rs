@@ -148,9 +148,14 @@ impl<'i> Typer<'i> {
                 };
                 let (match_is_truthy, groups) =
                     self.regex_match_edge(ast, *predicate, tenv, interner)?;
-                (match_is_truthy == falls_through_truthy
-                    && self.arm_exits(ast, exit_arm, &mut Vec::new()))
-                .then_some(groups)
+                // An else arm only terminates through its type
+                // (rigor-rs#966).
+                let exits = if else_body.is_empty() {
+                    self.arm_exits(ast, exit_arm, &mut Vec::new())
+                } else {
+                    self.value_arm_exits(ast, exit_arm, &mut Vec::new())
+                };
+                (match_is_truthy == falls_through_truthy && exits).then_some(groups)
             }
             Node::Logical { left, right, is_and, .. } => {
                 // `P or exit` falls through on P's truthy edge.

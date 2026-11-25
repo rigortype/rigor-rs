@@ -1268,7 +1268,7 @@ impl<'i> Typer<'i> {
     /// `project_defines_anywhere?` — deliberately coarse, like the reference:
     /// ANY project `def` of the name, on any class or module and either side,
     /// disables the non-returning-call proof.
-    fn project_defines_anywhere(&self, method: &str) -> bool {
+    pub(crate) fn project_defines_anywhere(&self, method: &str) -> bool {
         self.source.is_toplevel_def(self.file_key, method)
             || self.source.project_defines_method_name(method)
             || self.source.pre_eval_defines_name(method)
