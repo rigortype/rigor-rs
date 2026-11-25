@@ -84,6 +84,12 @@ pub(crate) struct AncestryIndex {
     dirty: HashSet<String>,
     /// Per owner, its direct mixin statements in order: `(prepend?, group)`.
     groups: HashMap<String, Vec<(bool, Vec<String>)>>,
+    /// Per owner, EVERY recorded instance mixin edge in write order —
+    /// [`AncestryFacts::written_mixins`]'s fold: positioned statements,
+    /// unpositioned named edges and receiver-form edges interleaved, the
+    /// `MixinAccumulator` list `discovered_includes` freezes. `(prepend?,
+    /// names)`.
+    written: HashMap<String, Vec<(bool, Vec<String>)>>,
     decl_files: HashMap<String, usize>,
     def_owners: HashSet<String>,
     /// Upstream v0.4.2 (#1706): every file's top-level `include` names
@@ -108,6 +114,17 @@ pub(crate) struct AncestryIndex {
     /// ([`AncestryFacts::extend_hook_owners`]) — `extend_reshapes_instance?`'s
     /// `defines_any?` half.
     extend_hook_owners: HashSet<String>,
+}
+
+/// The `entry::head` probe `eval_constant_receiver_prefix` makes of the
+/// file's declared names: `candidate` minus the receiver path's `tail`
+/// segments — `NS::A::B` for `A::B.include(M)` probes `NS::A`.
+fn head_probe(candidate: &str, tail: usize) -> &str {
+    let mut s = candidate;
+    for _ in 0..tail {
+        s = s.rsplit_once("::").map(|(p, _)| p).unwrap_or(s);
+    }
+    s
 }
 
 impl AncestryIndex {
@@ -166,6 +183,34 @@ impl AncestryIndex {
         for (owner, prepend, names) in &facts.direct_mixins {
             self.groups.entry(owner.clone()).or_default().push((*prepend, names.clone()));
         }
+        for m in &facts.written_mixins {
+            if m.receiver_form {
+                // `eval_constant_receiver_prefix`: the receiver resolves to
+                // the first decl-level nesting candidate whose `entry::head`
+                // probe hits the FILE's declared names
+                // ([`AncestryFacts::declared_names`]), else the bare
+                // spelling.
+                let bare = m.owners.last().expect("receiver candidates");
+                let tail = bare.split("::").count() - 1;
+                let resolved = m
+                    .owners
+                    .iter()
+                    .find(|o| facts.declared_names.contains(head_probe(o, tail)))
+                    .unwrap_or(bare)
+                    .clone();
+                self.written
+                    .entry(resolved)
+                    .or_default()
+                    .push((m.prepend, m.names.clone()));
+            } else {
+                for o in &m.owners {
+                    self.written
+                        .entry(o.clone())
+                        .or_default()
+                        .push((m.prepend, m.names.clone()));
+                }
+            }
+        }
         let mut seen: HashSet<&str> = HashSet::new();
         for q in declared {
             if seen.insert(q) {
@@ -218,6 +263,12 @@ struct Builder<'a> {
     stack: Vec<String>,
     failed: bool,
     forks: usize,
+    /// The chain's flavor: `false` is the methods walks' `:methods` (project
+    /// entries are `known_user` classes); `true` is the constant ladder's
+    /// `:constants` (project entries are the namespaces
+    /// [`SourceIndex::resolve_constant_scope`] resolves — the reference's
+    /// `known_project_namespace?`).
+    constants: bool,
 }
 
 impl Builder<'_> {
@@ -282,10 +333,15 @@ impl Builder<'_> {
             // superclass's chain carries it (`[W, C, B, W]`): only the module
             // already in this class's prepend region, or another entry of its
             // own chain the chain already carries, is a fork.
-            let module = self
-                .idx
-                .resolve_override_ancestor(name, raw)
-                .map(ChainEntry::Project);
+            let module = if self.constants {
+                self.idx
+                    .resolve_constant_scope(name, raw)
+                    .map(ChainEntry::Project)
+            } else {
+                self.idx
+                    .resolve_override_ancestor(name, raw)
+                    .map(ChainEntry::Project)
+            };
             let in_region = module
                 .as_ref()
                 .is_some_and(|m| entries[..origin].iter().any(|(x, _)| x == m));
@@ -300,19 +356,31 @@ impl Builder<'_> {
         for raw in &includes {
             let mut sub = self.sub_lin(name, raw);
             if Self::forks(&entries, &sub) {
-                // The one fork the reference settles: an include-side skip
-                // on the LAST entry of the sub-chain being inserted (#1570:
-                // the module already sits further down the chain).
-                let present: Vec<usize> = sub
+                // The one fork the reference's `include_all` settles: an
+                // include-side skip on the LAST entry of the sub-chain being
+                // inserted, its earlier occurrence sitting AT OR AFTER the
+                // class itself — `found >= origin && index == sub.size - 1`
+                // (#1570). A duplicate inside the prepend region
+                // (`found < origin`) is a fork the retro world cannot
+                // repeat: the chain settles to master.
+                let last = sub.len() - 1;
+                let present: Vec<(usize, usize)> = sub
                     .iter()
                     .enumerate()
-                    .filter(|(_, (e, _))| {
-                        matches!(e, ChainEntry::Project(_)) && entries.iter().any(|(x, _)| x == e)
+                    .filter_map(|(i, (e, _))| {
+                        if matches!(e, ChainEntry::Project(_)) {
+                            entries.iter().position(|(x, _)| x == e).map(|p| (i, p))
+                        } else {
+                            None
+                        }
                     })
-                    .map(|(i, _)| i)
                     .collect();
-                let last = sub.len() - 1;
-                if self.forks == 0 && present == [last] && !sub.iter().any(|(_, t)| *t) {
+                if self.forks == 0
+                    && present.len() == 1
+                    && present[0].0 == last
+                    && present[0].1 >= origin
+                    && !sub.iter().any(|(_, t)| *t)
+                {
                     self.forks = 1;
                     sub[last].1 = true;
                 } else {
@@ -335,9 +403,16 @@ impl Builder<'_> {
     }
 
     fn sub_lin(&mut self, owner: &str, raw: &str) -> Vec<Tagged> {
-        match self.idx.resolve_override_ancestor(owner, raw) {
-            Some(p) if self.idx.known_user(&p) => self.lin(&p),
-            _ => vec![(
+        let resolved = if self.constants {
+            self.idx.resolve_constant_scope(owner, raw)
+        } else {
+            self.idx
+                .resolve_override_ancestor(owner, raw)
+                .filter(|p| self.idx.known_user(p))
+        };
+        match resolved {
+            Some(p) => self.lin(&p),
+            None => vec![(
                 ChainEntry::External {
                     raw: raw.strip_prefix("::").unwrap_or(raw).to_string(),
                     from: owner.to_string(),
@@ -371,8 +446,14 @@ impl SourceIndex {
         if !self.override_classes.contains_key(class) {
             return None;
         }
-        let mut b =
-            Builder { idx: self, nodes: Vec::new(), stack: Vec::new(), failed: false, forks: 0 };
+        let mut b = Builder {
+            idx: self,
+            nodes: Vec::new(),
+            stack: Vec::new(),
+            failed: false,
+            forks: 0,
+            constants: false,
+        };
         let tagged = b.lin(class);
         if b.failed {
             return None;
@@ -472,10 +553,257 @@ impl SourceIndex {
             // receiver-form edges wrote (`X.include(*M)` on a sig-only class).
             return self.mark_of(class).into_iter().collect();
         }
-        let mut b =
-            Builder { idx: self, nodes: Vec::new(), stack: Vec::new(), failed: false, forks: 0 };
+        let mut b = Builder {
+            idx: self,
+            nodes: Vec::new(),
+            stack: Vec::new(),
+            failed: false,
+            forks: 0,
+            constants: false,
+        };
         let _ = b.lin(class);
         b.nodes.iter().filter_map(|n| self.mark_of(n)).collect()
+    }
+
+    /// rigor-rs#905 — the instance-side chain under the `:constants` flavor
+    /// ([`Builder::constants`]), paired with whether the chain carries an
+    /// ORDER mark, or `None` where the port cannot vouch for Ruby's order.
+    /// Unlike [`Self::instance_chain`] the ROOT need not be a `known_user`
+    /// class: `constant_for_name`'s step 2 builds it for the innermost
+    /// lexical scope of a constant read, which the project may hold only as
+    /// a `module` whose own edges all resolve elsewhere (or not at all —
+    /// [`Builder::lin`] on an undiscovered name contributes the name alone,
+    /// which [`Self::constant_scope_names`] drops as `class` itself).
+    fn constant_chain(&self, class: &str) -> Option<(Chain, bool)> {
+        let mut b = Builder {
+            idx: self,
+            nodes: Vec::new(),
+            stack: Vec::new(),
+            failed: false,
+            forks: 0,
+            constants: true,
+        };
+        let tagged = b.lin(class);
+        if b.failed {
+            return None;
+        }
+        let retro = (b.forks == 1).then(|| {
+            tagged.iter().filter(|(_, t)| !t).map(|(e, _)| e.clone()).collect()
+        });
+        let entries = tagged.into_iter().map(|(e, _)| e).collect();
+        // `order_marks` — the marks a constants reader settles on. Only the
+        // include-kind marks count: the `extend_hook` taint [`Self::mark_of`]
+        // also folds in is a HOOK_MARK_KIND the reference's `order_marks`
+        // rejects, and reading it as unsettled would settle a chain the
+        // reference stands to master's different order.
+        let order_marked = b.nodes.iter().any(|n| self.constant_order_mark(n));
+        Some((Chain { entries, retro, marks: Vec::new() }, order_marked))
+    }
+
+    /// `ResolutionChain`'s `:include`-kind order mark on `node`
+    /// (`mark_unsettled`): an unpositioned include-side mixin edge (a
+    /// conditional-, method-, block- or hook-written `include`, or one no
+    /// table records, `"*"`/`"?"` among the listed), or a mixin edge set of
+    /// two or more on a class declared in several files, whose order across
+    /// the files is load order. The `extend_hook` mark kind is deliberately
+    /// NOT here — `order_marks` excludes it, so a hook-tainted node still
+    /// settles its constants chain.
+    fn constant_order_mark(&self, node: &str) -> bool {
+        self.ancestry
+            .include_listed
+            .get(node)
+            .is_some_and(|l| !l.is_empty())
+            || (self
+                .override_classes
+                .get(node)
+                .map_or(0, |e| e.includes.len())
+                >= 2
+                && self.ancestry.decl_files.get(node).copied().unwrap_or(0) >= 2)
+    }
+
+    /// `constant_scopes_of`: the chain's project entries in Ruby's order,
+    /// each once, without `class` itself (the step-1 rungs cover it). An
+    /// external entry — a mixin the project does not declare — yields no
+    /// name here: the reference's `external_constant_owner` RBS arm
+    /// (`include AcLibraryRb` putting `AcLibraryRb::Segtree` on the walk,
+    /// upstream #1698) is a residual, and its `project_written_candidate?`
+    /// stop lands for free since a written-only spelling resolves to no
+    /// project entry and contributes nothing either way.
+    fn constant_scope_names(entries: &[ChainEntry], class: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for entry in entries {
+            let ChainEntry::Project(name) = entry else {
+                continue;
+            };
+            if name != class && !out.contains(name) {
+                out.push(name.clone());
+            }
+        }
+        out
+    }
+
+    /// rigor-rs#905 — the worlds `constant_for_name`'s ancestor rung
+    /// consults, `agreed_ancestor_hit`'s shape: the CHAIN's scope order
+    /// where the port can vouch for it (no order mark — an unpositioned
+    /// mixin edge, a multi-file edge set — and no failed fork/cycle/cut),
+    /// plus the retro world's scopes when the chain's one include-side
+    /// skip needs settling; [`ConstantScopeWorlds::Master`] —
+    /// `MasterOrder.breadth_first`'s order — everywhere else, exactly as
+    /// `chain.settle` answers `:master` there.
+    pub(crate) fn constant_scope_worlds(&self, class: &str) -> ConstantScopeWorlds {
+        match self.constant_chain(class) {
+            Some((chain, order_marked)) if !order_marked => {
+                ConstantScopeWorlds::Settled {
+                    scopes: Self::constant_scope_names(&chain.entries, class),
+                    retro: chain
+                        .retro
+                        .map(|entries| Self::constant_scope_names(&entries, class)),
+                }
+            }
+            _ => ConstantScopeWorlds::Master(self.master_constant_scopes(class)),
+        }
+    }
+
+    /// `MasterOrder.breadth_first` under `:constants`: every resolved
+    /// project ancestor of `class`, nearer first — each class's mixin
+    /// spellings (WRITTEN order) and superclass queued ahead of the
+    /// expanded node's own edges. The order `agreed_ancestor_hit` falls
+    /// back to when the chain cannot settle — and the pre-rigor-rs#905
+    /// walk's one order.
+    pub(crate) fn master_constant_scopes(&self, class: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = [class.to_string()].into_iter().collect();
+        let mut queue: std::collections::VecDeque<String> =
+            self.constant_direct_edges(class).into_iter().collect();
+        while let Some(current) = queue.pop_front() {
+            if !seen.insert(current.clone()) {
+                continue;
+            }
+            out.push(current.clone());
+            if out.len() > CHAIN_LIMIT {
+                break;
+            }
+            queue.extend(self.constant_direct_edges(&current));
+        }
+        out
+    }
+
+    /// `MasterOrder.direct_edges` under `:constants`: the class's
+    /// `discovered_includes` — the mixin spellings in ancestor
+    /// (nearest-first) order, prepends ahead of includes — then its
+    /// superclass, each resolved to the project namespace it names.
+    fn constant_direct_edges(&self, class: &str) -> Vec<String> {
+        let mut raws = self.constant_mixin_edges(class);
+        let entry = self.override_classes.get(class);
+        // `discovered_includes` also carries edges [`Self::constant_mixin_edges`]
+        // cannot order — ones the statement census did not see (an `include`
+        // attributed from outside the body). They ride last, in written
+        // order: the master walk is what a class with such an edge settles
+        // to anyway, and a name Ruby may place nearer still answers, just
+        // later — the declining side.
+        if let Some(entry) = entry {
+            for raw in &entry.includes {
+                if !raws.contains(raw) {
+                    raws.push(raw.clone());
+                }
+            }
+            if let Some(sup) = &entry.superclass {
+                raws.push(sup.clone());
+            }
+        }
+        raws.into_iter()
+            .filter_map(|raw| self.resolve_constant_scope(class, &raw))
+            .collect()
+    }
+
+    /// `DiscoveryIndex#discovered_includes`'s order for `class` (upstream
+    /// #1173): `freeze_mixin_lists` answers `prepends ++ includes`, uniq'd
+    /// (first occurrence wins), and each bucket keeps every edge
+    /// `write_mixin_targets` recorded — a DIRECT statement, a conditional
+    /// or `def`- or block-written `include`, and the receiver form
+    /// `C.include(M)` alike — in search order: each edge's argument group
+    /// unshifts as one unit (`include A, B` searches `A` first), a repeated
+    /// include target keeps its first position, and a re-`prepend` is kept
+    /// (the `uniq` takes its earlier position). This is ANCESTOR
+    /// (nearest-first) order, not written order: `include N; include M`
+    /// lists `[M, N]`.
+    ///
+    /// A name appearing in both kinds (`include M; prepend M`) is a body
+    /// the tables cannot represent and is tainted — the chain carrying it
+    /// is marked and settles to master, so the list below never orders
+    /// such a node.
+    fn constant_mixin_edges(&self, class: &str) -> Vec<String> {
+        let mut prepends: Vec<String> = Vec::new();
+        let mut includes: Vec<String> = Vec::new();
+        for (prepend, names) in self.ancestry.written.get(class).into_iter().flatten() {
+            if *prepend {
+                // `write_mixin_targets`: a prepend statement's group
+                // unshifts whole, repeats kept.
+                prepends.splice(0..0, names.iter().cloned());
+            } else {
+                // A repeated include target keeps its first position —
+                // only names the bucket does not already carry unshift.
+                let fresh: Vec<String> = names
+                    .iter()
+                    .filter(|n| !includes.contains(*n))
+                    .cloned()
+                    .collect();
+                includes.splice(0..0, fresh);
+            }
+        }
+        let mut out: Vec<String> = Vec::new();
+        for name in prepends.into_iter().chain(includes) {
+            if !out.contains(&name) {
+                out.push(name);
+            }
+        }
+        out
+    }
+
+    /// `project?` for the `:constants` flavor: `discovered_classes` covers
+    /// the declared, synthesized and meta-new names; a written mixin edge
+    /// self-declares its owner (`discovered_includes.key?` —
+    /// `mixin_names_for` projects `prepends ++ includes`, so a
+    /// prepend-only owner keys the table too), and a recorded superclass
+    /// makes its holder a namespace (`discovered_superclasses.key?`).
+    fn known_project_namespace(&self, name: &str) -> bool {
+        self.knows_discovered_class(name)
+            || self.ancestry.written.contains_key(name)
+            || self.discovered_superclass(name).is_some()
+    }
+
+    /// rigor-rs#905 — the `:constants` flavor's `Resolver#resolve_one`: the
+    /// first lexical candidate of `raw` written from `owner` that the
+    /// project knows as a namespace — `known_project_namespace?`. A
+    /// `::`-rooted spelling is anchored at the top level, as
+    /// `ancestor_name_candidates` anchors it.
+    ///
+    /// Candidates the project only WRITES are skipped — the reference's
+    /// resolver asks `project?` alone and is blind to constant writes — so
+    /// a `class Base` + `Base = 1` pair resolves `Base` to the DECLARED
+    /// class and `class Sub < Base; K` reads `Base::K` (the declared name
+    /// wins over the write, rigor-rs#905's `Base = 1` edge). A spelling
+    /// with no declared candidate resolves to no project entry: whether a
+    /// written constant binds it or nobody does, `constant_scopes_of`
+    /// contributes no name for it under the port.
+    fn resolve_constant_scope(&self, owner: &str, raw: &str) -> Option<String> {
+        if let Some(rooted) = raw.strip_prefix("::") {
+            return self
+                .known_project_namespace(rooted)
+                .then(|| rooted.to_string());
+        }
+        let segments: Vec<&str> = owner.split("::").collect();
+        for i in (0..segments.len()).rev() {
+            let candidate = if i == 0 {
+                raw.to_string()
+            } else {
+                format!("{}::{}", segments[..i].join("::"), raw)
+            };
+            if self.known_project_namespace(&candidate) {
+                return Some(candidate);
+            }
+        }
+        None
     }
 
     /// `Relevance.discharged?` — a mark does not move the first definer of
@@ -936,6 +1264,21 @@ fn external_lacks(core: &CoreIndex, from: &str, raw: &str, method: &str) -> bool
         }
     }
     false
+}
+
+/// rigor-rs#905 — the ancestor-scope worlds [`SourceIndex::constant_scope_worlds`]
+/// hands `constant_for_name`'s step 2: the chain's order where the port
+/// can vouch for it, its retro world when the chain's one settle-able
+/// fork needs the comparison, or the master (breadth-first) order.
+pub(crate) enum ConstantScopeWorlds {
+    /// `agreed_ancestor_hit`'s chain world plus its retro world when the
+    /// build tagged one include-side skip (`Some` ⇒ the caller must
+    /// compare the first answering OWNER across the two before the
+    /// chain's answer may stand).
+    Settled { scopes: Vec<String>, retro: Option<Vec<String>> },
+    /// `MasterOrder.breadth_first` — the fallback `chain.settle` answers
+    /// for an order mark, a multi-fork or a chain the build cannot place.
+    Master(Vec<String>),
 }
 
 /// `RbsReceiverSurface::MISSING_HOOK`.
