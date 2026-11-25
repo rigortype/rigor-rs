@@ -6061,3 +6061,57 @@ fn retry_edge_writes_decline_reads_inside_the_begin() {
         assert!(got[0].ends_with(msg), "{src:?}: {got:?}");
     }
 }
+
+/// rigor-rs#987 — inside a retrying `begin`, a local or ivar derived from a
+/// local the edge reaches (`d = c`, `@iv = c`, `d = c.first`, `e = d`) reads
+/// the widened entry on the oracle, and so does a local or ivar an index write
+/// stores through on the edge (`d[0] = 9`): the re-run pushes the entry to the
+/// envelope pass. Both decline, and the index-written local also widens past
+/// the `begin`.
+#[test]
+fn retry_edge_derived_and_index_writes_decline() {
+    let undefined = |src: &str| -> Vec<String> {
+        run(src.as_bytes())
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for src in [
+        "c = [1]; begin; d = c; d.nope; rescue; c << 2; retry; end\n",
+        "c = [1]; begin; @iv = c; @iv.nope; rescue; c << 2; retry; end\n",
+        "d = [1]; begin; c = d; c.nope; rescue; d << 2; retry; end\n",
+        "c = [1]; begin; d = c; e = d; e.nope; rescue; c << 2; retry; end\n",
+        "c = [1]; begin; d = c.first; d.nope; rescue; c << 2; retry; end\n",
+        "c = [1]; begin; d = c.dup; d.nope; rescue; c << 2; retry; end\n",
+        "c = [1]; begin; foo; rescue; c << 2; retry; else; d = c; d.nope; end\n",
+        "d = [\"a\"]; begin; d[0] = 9; d.zork; rescue; retry; end\n",
+        "d = [\"a\"]; begin; raise; rescue; d[0] = 9; d.zork; retry; end\n",
+        "d = [\"a\"]; begin; d.[]=(0, 9); d.zork; rescue; retry; end\n",
+        "d = [\"a\"]; begin; d[0] ||= 9; d.zork; rescue; retry; end\n",
+        "h = {a: 1}; begin; h[:b] = \"s\"; h.zork; rescue; retry; end\n",
+        "h = {a: 1}; begin; h.store(:b, \"s\"); h.zork; rescue; retry; end\n",
+        "@d = [\"a\"]; begin; @d[0] = 9; @d.zork; rescue; retry; end\n",
+        "d = [\"a\"]; begin; d[0] = 9; rescue; retry; end; d.zork\n",
+        "h = {a: 1}; begin; h[:b] = \"s\"; rescue; retry; end; h.zork\n",
+    ] {
+        assert_eq!(undefined(src), Vec::<String>::new(), "{src:?}");
+    }
+    // Controls the reference still fires: no edge write to the derived
+    // local's source, a fresh rebind after the derived write, in-order
+    // derivation from a mutation that ran first, and a rebind past the
+    // index-written `begin`.
+    for (src, msg) in [
+        ("c = [1]; begin; d = c; d.nope; rescue; retry; end\n", "for [1]"),
+        ("c = [1]; begin; d = c; d = [7]; d.nope; rescue; c << 2; retry; end\n", "for [7]"),
+        (
+            "c = [1]; begin; c << 2; d = c; d.nope; rescue; retry; end\n",
+            "for Array[1 | Dynamic[top] | Integer]",
+        ),
+        ("d = [\"a\"]; begin; d[0] = 9; rescue; retry; end; d = [5]; d.zork\n", "for [5]"),
+    ] {
+        let got = undefined(src);
+        assert_eq!(got.len(), 1, "{src:?}: {got:?}");
+        assert!(got[0].ends_with(msg), "{src:?}: {got:?}");
+    }
+}

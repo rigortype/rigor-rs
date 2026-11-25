@@ -666,6 +666,40 @@ fn coll_retry_edge_reads_decline_inside_the_begin() {
     assert_eq!(snap(after.as_bytes(), "zark"), Some("Array"));
 }
 
+/// rigor-rs#987 — a derived local (`d = c`) of a local the retry edge
+/// reaches, and a local an index write stores through on the edge, decline
+/// inside the `begin`; the index-written one also widens past it. Each row is
+/// silent on the oracle.
+#[test]
+fn coll_retry_edge_derived_and_index_writes_decline() {
+    let wrap = |body: &str| format!("def f\n{}\nend\n", body.replace("; ", "\n"));
+    for (body, method) in [
+        ("c = [1]; begin; d = c; d.nope; rescue; c << 2; retry; end", "nope"),
+        ("d = [1]; begin; c = d; c.nope; rescue; d << 2; retry; end", "nope"),
+        ("c = [1]; begin; d = c; e = d; e.nope; rescue; c << 2; retry; end", "nope"),
+        ("d = [\"a\"]; begin; d[0] = 9; d.zork; rescue; retry; end", "zork"),
+        ("d = [\"a\"]; begin; raise; rescue; d[0] = 9; d.zork; retry; end", "zork"),
+        ("h = {a: 1}; begin; h.store(:b, \"s\"); h.zork; rescue; retry; end", "zork"),
+        ("d = [\"a\"]; begin; d[0] ||= 9; rescue; retry; end; d.zork", "zork"),
+        ("d = [\"a\"]; begin; d[0] = 9; rescue; retry; end; d.zork", "zork"),
+    ] {
+        let src = wrap(body);
+        assert_eq!(snap(src.as_bytes(), method), None, "{src}");
+    }
+    // Controls the reference still fires: a derived local with no edge write
+    // to its source, a fresh rebind after the derived one, an in-order
+    // mutation, and a rebind past the index-written `begin`.
+    for (body, method) in [
+        ("c = [1]; begin; d = c; d.nope; rescue; retry; end", "nope"),
+        ("c = [1]; begin; d = c; d = [7]; d.nope; rescue; c << 2; retry; end", "nope"),
+        ("c = [1]; begin; c << 2; c.nope; rescue; retry; end", "nope"),
+        ("d = [\"a\"]; begin; d[0] = 9; rescue; retry; end; d = [5]; d.zork", "zork"),
+    ] {
+        let src = wrap(body);
+        assert_eq!(snap(src.as_bytes(), method), Some("Array"), "{src}");
+    }
+}
+
 /// A mutation AFTER the rescued `begin` widens the joined union memberwise
 /// (`widen_union`, mutation_widening.rb:316): the literal arm grows to the
 /// same nominal the mutated arm holds, the union collapses, and the use

@@ -543,6 +543,14 @@ impl<'i> Typer<'i> {
                 };
             }
         }
+        // rigor-rs#987 — a local the retry edge stores through an index
+        // write leaves the `begin` bound to the retry passes' join, which
+        // this walk does not model (`d = ["a"]; begin; d[0] = 9; rescue;
+        // retry; end; d.zork` is silent on the oracle): it widens.
+        let u = interner.untyped();
+        for name in crate::retry_edge::edge_index_write_locals(self, ast, id) {
+            coll_env_insert(ctx, &mut exit, &name, u);
+        }
         *tenv = exit;
         // `ensure` runs on the joined exit scope and its effects apply
         // unconditionally (eval_begin's `sub_eval(ensure, exit_scope)`).

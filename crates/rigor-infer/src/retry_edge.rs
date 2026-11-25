@@ -22,6 +22,21 @@
 //! something other than a fresh value (`c = c + [1]`, `c += [1]`): the
 //! widened entry flows through it. A plain rebind that does not read the
 //! local (`c = [2]`) kills the edge for the reads after it.
+//!
+//! rigor-rs#987 — two more shapes reach a read in any order:
+//!
+//! - An index write (`d[0] = v`, `d.[]=(0, v)`, `d[0] ||= v`, `h.store(k,
+//!   v)`). The second pass re-runs it over the widened entry, and when its
+//!   value's class is not the carrier's element class the re-run widens the
+//!   entry again, so the reference falls through to the envelope pass
+//!   (`d = ["a"]; begin; d[0] = 9; d.zork; rescue; retry; end` is silent).
+//!   The port does not model which re-runs converge, so it treats every one
+//!   as reaching.
+//! - A derived write: a write whose value reads a local or ivar the edge
+//!   reaches at that read (`d = c`, `@iv = c`, `d = c.first`). The second
+//!   pass binds it from the widened entry. It counts as an edge write of its
+//!   target that reaches in any order, and it kills nothing. Derivation is a
+//!   fixpoint, so `e = d` after `d = c` is derived too.
 
 use std::collections::{HashMap, HashSet};
 
@@ -42,13 +57,16 @@ struct RetryBegin {
     /// `def`/`class`/`module` body is another scope's and is left out.
     writes: Vec<(String, EdgeWrites)>,
     lists: Vec<StmtList>,
+    /// The derived writes' spans (the module doc): they kill nothing.
+    derived: HashSet<Span>,
 }
 
 /// One local's edge writes in a [`RetryBegin`].
 struct EdgeWrites {
     /// Start offsets, ascending.
     starts: Vec<usize>,
-    /// Whether any of them is a rebind (not a mutation).
+    /// Whether one of them reaches every read in any order: a rebind (not a
+    /// mutation), an index write or a derived write (the module doc).
     rebind: bool,
 }
 
@@ -56,9 +74,17 @@ struct EdgeWrites {
 struct StmtList {
     /// Element spans, in source order.
     elems: Vec<Span>,
-    /// Per local, the index of the first element that kills it: a plain
-    /// `x = v` statement whose value does not read `x`.
-    first_kill: HashMap<String, usize>,
+    /// Per local, the elements that kill it, in index order: a plain `x = v`
+    /// statement whose value does not read `x` ([`kills`]), with its span.
+    kills: HashMap<String, Vec<(usize, Span)>>,
+}
+
+impl StmtList {
+    /// The index of the first element that kills `name`, skipping the
+    /// derived writes.
+    fn first_kill(&self, name: &str, derived: &HashSet<Span>) -> Option<usize> {
+        self.kills.get(name)?.iter().find(|(_, s)| !derived.contains(s)).map(|&(i, _)| i)
+    }
 }
 
 /// The file's retrying `begin`s ([`RetryBegin`]).
@@ -116,6 +142,19 @@ impl RetryEdges {
                 .collect();
             let mut seen: HashSet<(Span, &str)> = HashSet::new();
             let mut by_name: HashMap<&str, EdgeWrites> = HashMap::new();
+            // rigor-rs#987 — an index write on the edge reaches in any order.
+            for n in idx.nodes_within(ast, *span) {
+                let w = ast.get(n).span();
+                if let Some(name) = index_write_local(ast, n) {
+                    if regions.iter().any(|&r| within(w, r)) && !nested.iter().any(|&s| within(w, s)) {
+                        let e = by_name
+                            .entry(name)
+                            .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false });
+                        e.starts.push(w.0);
+                        e.rebind = true;
+                    }
+                }
+            }
             for (w, name) in writes.clone() {
                 if regions.iter().any(|&r| within(w, r))
                     && !nested.iter().any(|&s| within(w, s))
@@ -140,7 +179,9 @@ impl RetryEdges {
                 .collect();
             writes.sort_by(|a, b| a.0.cmp(&b.0));
             let lists = lists_within(ast, &idx, id, *span);
-            begins.push(RetryBegin { span: *span, writes, lists });
+            let mut begin = RetryBegin { span: *span, writes, lists, derived: HashSet::new() };
+            begin.derive(ast, &idx, &nested);
+            begins.push(begin);
         }
         RetryEdges { begins }
     }
@@ -160,7 +201,7 @@ impl RetryEdges {
         for b in self.begins.iter().filter(|b| within(site, b.span)) {
             let chain = b.chain(site);
             for (name, w) in &b.writes {
-                if !out.contains(&name.as_str()) && chain.reaches(site, name, w) {
+                if !out.contains(&name.as_str()) && chain.reaches(site, name, w, &b.derived) {
                     out.push(name);
                 }
             }
@@ -172,16 +213,114 @@ impl RetryEdges {
     /// edge can carry a write of `name` that the read's own walk does not see
     /// in order (the module doc).
     pub(crate) fn declines(&self, site: Span, name: &str) -> bool {
-        self.begins.iter().filter(|b| within(site, b.span)).any(|b| {
-            let Ok(i) = b.writes.binary_search_by(|(n, _)| n.as_str().cmp(name)) else {
-                return false;
-            };
-            b.chain(site).reaches(site, name, &b.writes[i].1)
-        })
+        self.begins.iter().filter(|b| within(site, b.span)).any(|b| b.declines(site, name))
     }
 }
 
 impl RetryBegin {
+    /// [`RetryEdges::declines`] for this `begin`.
+    fn declines(&self, site: Span, name: &str) -> bool {
+        let Ok(i) = self.writes.binary_search_by(|(n, _)| n.as_str().cmp(name)) else {
+            return false;
+        };
+        self.chain(site).reaches(site, name, &self.writes[i].1, &self.derived)
+    }
+
+    /// rigor-rs#987 — add the derived writes (the module doc) to the edge
+    /// writes, to a fixpoint. A candidate is a write in the `begin`, outside
+    /// the `nested` scope bodies, whose value reads a local or ivar. It is
+    /// derived once one of those reads declines.
+    fn derive(&mut self, ast: &LoweredAst, idx: &crate::reach_index::ReachIndex, nested: &[Span]) {
+        let mut cands: Vec<Derivable> = Vec::new();
+        for n in idx.nodes_within(ast, self.span) {
+            let node = ast.get(n);
+            let w = node.span();
+            if nested.iter().any(|&s| within(w, s)) {
+                continue;
+            }
+            let (targets, value) = match node {
+                Node::LocalVariableWrite { name, value, .. }
+                | Node::LocalVariableOpWrite { name, value, .. }
+                | Node::InstanceVariableWrite { name, value, .. } => (vec![name.clone()], *value),
+                Node::MultiWrite { targets, value, .. } => {
+                    let mut bound = Vec::new();
+                    targets.collect_bound_names(&mut bound);
+                    (bound.into_iter().map(|(n, _)| n).collect(), *value)
+                }
+                _ => continue,
+            };
+            let reads: Vec<(String, Span)> = idx
+                .nodes_within(ast, ast.get(value).span())
+                .filter_map(|r| match ast.get(r) {
+                    Node::LocalVariableRead { name, span } => Some((name.clone(), *span)),
+                    Node::VariableRead { name, span } if crate::def_local_marks::is_ivar(name) => {
+                        Some((name.clone(), *span))
+                    }
+                    _ => None,
+                })
+                .collect();
+            if !targets.is_empty() && !reads.is_empty() {
+                cands.push(Derivable { span: w, targets, reads });
+            }
+        }
+        // A worklist over names: deriving a write changes only its targets'
+        // edge writes and kills, so only the candidates reading a changed
+        // name need another look. A full re-scan per round was quadratic in
+        // a chain `v1 = v0; v2 = v1; …` (a 2000-link chain took 25s).
+        let mut readers: HashMap<&str, Vec<usize>> = HashMap::new();
+        for (i, c) in cands.iter().enumerate() {
+            for (n, _) in &c.reads {
+                let list = readers.entry(n.as_str()).or_default();
+                if list.last() != Some(&i) {
+                    list.push(i);
+                }
+            }
+        }
+        let mut done = vec![false; cands.len()];
+        // Each item is a candidate and the one name whose reads to look at
+        // (`None`: all of them, the first look).
+        let mut work: Vec<(usize, Option<&str>)> = (0..cands.len()).rev().map(|i| (i, None)).collect();
+        while let Some((i, only)) = work.pop() {
+            if done[i] {
+                continue;
+            }
+            let Derivable { span: w, targets, reads } = &cands[i];
+            let hit = reads
+                .iter()
+                .filter(|(n, _)| only.is_none_or(|o| o == n))
+                .any(|(n, s)| self.declines(*s, n));
+            if !hit {
+                continue;
+            }
+            done[i] = true;
+            self.derived.insert(*w);
+            for t in targets {
+                self.add_reaching_write(t, w.0);
+                if let Some((name, list)) = readers.get_key_value(t.as_str()) {
+                    work.extend(list.iter().filter(|&&j| !done[j]).map(|&j| (j, Some(*name))));
+                }
+            }
+        }
+    }
+
+    /// Record a write of `name` at `start` that reaches every read in any
+    /// order ([`EdgeWrites::rebind`]).
+    fn add_reaching_write(&mut self, name: &str, start: usize) {
+        let i = match self.writes.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
+            Ok(i) => i,
+            Err(i) => {
+                let fresh = EdgeWrites { starts: Vec::new(), rebind: false };
+                self.writes.insert(i, (name.to_string(), fresh));
+                i
+            }
+        };
+        let e = &mut self.writes[i].1;
+        if let Err(k) = e.starts.binary_search(&start) {
+            e.starts.insert(k, start);
+        }
+        e.rebind = true;
+    }
+
     /// Per statement list holding `site`, the list and the index of the
     /// element holding it: the lists along the chain from the `begin` down
     /// to `site`.
@@ -198,6 +337,14 @@ impl RetryBegin {
     }
 }
 
+/// A candidate derived write ([`RetryBegin::derive`]): its span, the names
+/// it writes and the local/ivar reads in its value.
+struct Derivable {
+    span: Span,
+    targets: Vec<String>,
+    reads: Vec<(String, Span)>,
+}
+
 /// [`RetryBegin::chain`].
 struct Chain<'a> {
     links: Vec<(&'a StmtList, usize)>,
@@ -207,11 +354,11 @@ impl Chain<'_> {
     /// Whether an edge write of `name` reaches the read at `site`: no
     /// element before the read's kills `name`, and some write is a rebind,
     /// or lies in no element before the read's in a list of the chain.
-    fn reaches(&self, site: Span, name: &str, w: &EdgeWrites) -> bool {
+    fn reaches(&self, site: Span, name: &str, w: &EdgeWrites, derived: &HashSet<Span>) -> bool {
         let killed = self
             .links
             .iter()
-            .any(|(l, j)| l.first_kill.get(name).is_some_and(|&k| k < *j));
+            .any(|(l, j)| l.first_kill(name, derived).is_some_and(|k| k < *j));
         if killed {
             return false;
         }
@@ -288,15 +435,76 @@ fn lists_within(
     raw.into_iter()
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let mut first_kill = HashMap::new();
+            let mut kills: HashMap<String, Vec<(usize, Span)>> = HashMap::new();
             for (i, &s) in l.iter().enumerate() {
-                if let Some(name) = kills(ast, idx, s) {
-                    first_kill.entry(name).or_insert(i);
+                if let Some(name) = self::kills(ast, idx, s) {
+                    kills.entry(name).or_default().push((i, ast.get(s).span()));
                 }
             }
-            StmtList { elems: l.iter().map(|&s| ast.get(s).span()).collect(), first_kill }
+            StmtList { elems: l.iter().map(|&s| ast.get(s).span()).collect(), kills }
         })
         .collect()
+}
+
+/// rigor-rs#987 — the locals (not ivars: the collection walk never types
+/// one) the retrying `begin` `id` stores through an index write on its edge
+/// ([`index_write_local`]), sorted and deduplicated.
+/// The reference's binding past the `begin` is the join of the retry passes,
+/// and a re-run index write can push it to the envelope pass (the module
+/// doc). The port does not model that, so the walkers widen these locals past
+/// the `begin`. The result is empty for a `begin` with no retrying clause.
+pub(crate) fn edge_index_write_locals(typer: &Typer<'_>, ast: &LoweredAst, id: NodeId) -> Vec<String> {
+    let Node::BeginRescue { span, main_body, ensure_body, clauses, .. } = ast.get(id) else {
+        return Vec::new();
+    };
+    let idx = typer.reach_index(ast);
+    let mut regions: Vec<Span> = clauses
+        .iter()
+        .filter(|c| idx.clause_retries(typer, ast, c.span))
+        .map(|c| c.span)
+        .collect();
+    if regions.is_empty() {
+        return Vec::new();
+    }
+    regions.extend(hull(ast, main_body));
+    regions.extend(hull(ast, ensure_body));
+    let nested: Vec<Span> = idx
+        .nodes_within(ast, *span)
+        .filter_map(|n| match ast.get(n) {
+            Node::Definition { span: s, .. }
+            | Node::ClassDef { span: s, .. }
+            | Node::ModuleDef { span: s, .. } => Some(*s),
+            _ => None,
+        })
+        .collect();
+    let mut out: Vec<String> = idx
+        .nodes_within(ast, *span)
+        .filter_map(|n| {
+            let w = ast.get(n).span();
+            let name = index_write_local(ast, n).filter(|n| !crate::def_local_marks::is_ivar(n))?;
+            (regions.iter().any(|&r| within(w, r)) && !nested.iter().any(|&s| within(w, s)))
+                .then(|| name.to_string())
+        })
+        .collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// The local or ivar an index write `id` stores through: `[]=` or `store`
+/// called on a bare local or ivar (`d[0] = v`, `d.[]=(0, v)`, `h.store(k,
+/// v)`, `@d[0] = v`), or a compound index write on one (`d[0] ||= v`).
+fn index_write_local(ast: &LoweredAst, id: NodeId) -> Option<&str> {
+    let receiver = match ast.get(id) {
+        Node::Call { receiver: Some(r), method, .. } if method == "[]=" || method == "store" => *r,
+        Node::IndexWrite { receiver: Some(r), .. } => *r,
+        _ => return None,
+    };
+    match ast.get(receiver) {
+        Node::LocalVariableRead { name, .. } => Some(name),
+        Node::VariableRead { name, .. } if crate::def_local_marks::is_ivar(name) => Some(name),
+        _ => None,
+    }
 }
 
 /// The local the statement `id` rebinds to a fresh value: `x = v` whose `v`
