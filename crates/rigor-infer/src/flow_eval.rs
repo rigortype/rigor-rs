@@ -3057,6 +3057,15 @@ impl<'i> Typer<'i> {
                 // index keeps that last visit): a record rooted at a local
                 // the edge rebinds is gone there too.
                 drop_retry_edge_records(&flow.indexed, *span, true, env);
+                // rigor-rs#972 — the widened entry rebinds the local itself,
+                // not only its records: a receiver read anywhere in the
+                // `begin` (body, clause, `else`) sees the join of the entry
+                // and every scope on the edge (`c = [1]; begin; c.nope;
+                // rescue; c << 2; retry; end` is silent on the oracle). The
+                // join's literal/envelope convergence is not modelled here,
+                // so the local declines to `Dynamic[top]`. A write earlier in
+                // the body than the site still replays over it.
+                widen_retry_edge_locals(&flow.indexed, *span, env, interner);
                 if main_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
@@ -6886,6 +6895,24 @@ fn drop_retry_edge_records(
         let hit = if exact { *begin == span } else { within_span(*begin, span) };
         if hit {
             drop_indexed_narrowings(env, name);
+        }
+    }
+}
+
+/// rigor-rs#972 — read every local the retrying `begin` at exactly `span`
+/// carries across its retry edge ([`IndexedFlow::retry_drops`]: a rebind or
+/// mutation in the protected body or a retrying clause) as `Dynamic[top]`,
+/// the decline side of the reference's `widen_entry_for_retry` join. A name
+/// the env does not bind stays unbound.
+fn widen_retry_edge_locals(
+    indexed: &IndexedFlow,
+    span: rigor_parse::Span,
+    env: &mut TypeEnv,
+    interner: &mut Interner,
+) {
+    for (begin, name) in &indexed.retry_drops {
+        if *begin == span && env.contains_key(name.as_str()) {
+            env.insert(Rc::from(name.as_str()), interner.untyped());
         }
     }
 }
