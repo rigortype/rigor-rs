@@ -37,6 +37,19 @@ fn key_step(key: &ShapeKey) -> ElementReadStep {
     }
 }
 
+/// Whether `ty` is a root `ElementReadWidening.widen_through_path` can
+/// rebuild — a `Tuple` or `HashShape`, or a union with one such member.
+/// Any other root declines at the first step.
+fn literal_shape_root(interner: &Interner, ty: TypeId) -> bool {
+    match interner.get(ty) {
+        Type::Tuple(_) | Type::HashShape(_) => true,
+        Type::Union(members) => members
+            .iter()
+            .any(|&m| matches!(interner.get(m), Type::Tuple(_) | Type::HashShape(_))),
+        _ => false,
+    }
+}
+
 /// What a `while`/`until` loop's tracked locals converge to —
 /// [`Typer::loop_continuation`]'s answer, applied by the caller over its
 /// post-join / post-widen env.
@@ -4156,11 +4169,28 @@ impl<'i> Typer<'i> {
         // under the lenient operand rule, but the reference joins its
         // rescue path's floored scope and stays silent, so the binding
         // floors exactly as a call that may not have run does.
+        //
+        // An undecided `if` arm (`slot_floor` off) JOINS its bindings
+        // rather than flooring them, but a mutation the arm may have run
+        // that DOES rebuild the carrier leaves the join with no answer the
+        // flat env can express — the reference's join is silent (`a =
+        // [[1]]; if c; a[0] << 2; end; a.w`) — so that binding floors too.
+        // One the rebuild declines on stands (`a = [1]; if c; a[0] << 2;
+        // end; a.w` fires `for [1]` on both: `Integer#<<` mutates nothing).
         if live {
-            if evaluated && self.element_read_ran(ast, root, m.span) {
-                self.rebuild_element_carrier(ast, indexed, m, env, interner);
-            } else if evaluated && slot_floor {
-                env.insert(Rc::from(m.name.as_str()), interner.untyped());
+            let ran = evaluated && self.element_read_ran(ast, root, m.span);
+            let rebuilt = self.rebuild_element_carrier(ast, indexed, m, env, interner);
+            match rebuilt {
+                Some(ty) if ran => {
+                    env.insert(Rc::from(m.name.as_str()), ty);
+                }
+                Some(_) => {
+                    env.insert(Rc::from(m.name.as_str()), interner.untyped());
+                }
+                None if !ran && slot_floor => {
+                    env.insert(Rc::from(m.name.as_str()), interner.untyped());
+                }
+                None => {}
             }
         }
         if !evaluated {
@@ -4176,9 +4206,6 @@ impl<'i> Typer<'i> {
             // the unfold `if` arm JOINS instead of flooring, so it passes
             // `false` and only its predicate's rebuild (evaluated above)
             // lands.
-            if live && slot_floor {
-                env.insert(Rc::from(m.name.as_str()), interner.untyped());
-            }
             env.remove(lookup.as_str());
             return;
         }
@@ -4217,28 +4244,24 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         indexed: &IndexedFlow,
         m: &crate::flow_writes::SlotMutation,
-        env: &mut TypeEnv,
+        env: &TypeEnv,
         interner: &mut Interner,
-    ) {
+    ) -> Option<TypeId> {
         let read = match ast.get(m.id) {
             Node::Call { receiver: Some(r), .. } => *r,
-            _ => return,
+            _ => return None,
         };
         match ast.get(read) {
             Node::Call { method, args, block_body, .. }
                 if method == "[]" && args.len() == 1 && block_body.is_empty() => {}
-            _ => return,
+            _ => return None,
         }
-        let Some(&binding) = env.get(m.name.as_str()) else {
-            return;
-        };
+        let binding = *env.get(m.name.as_str())?;
         // `mutator_arg_types` — the same typed arguments the name-mutation
         // landing joins its content from, read off the env the call saw.
         let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
         let step = [key_step(&m.key)];
-        if let Some(rebuilt) = self.widen_through_path(binding, &step, &m.method, &arg_types, interner) {
-            env.insert(Rc::from(m.name.as_str()), rebuilt);
-        }
+        self.widen_through_path(binding, &step, &m.method, &arg_types, interner)
     }
 
     /// `ElementReadWidening.widen_element_read` for a chain the slot table
@@ -4270,18 +4293,26 @@ impl<'i> Typer<'i> {
         if !live {
             return;
         }
-        if !self.element_read_ran(ast, root, m.span) {
-            if slot_floor {
+        let ran = self.element_read_ran(ast, root, m.span);
+        let rebuilt = env.get(m.name.as_str()).copied().and_then(|binding| {
+            let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
+            self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner)
+        });
+        // The slot landing's binding treatment (`apply_slot_mutation`): a
+        // rebuild that ran lands, one that may not have run floors (in an
+        // undecided arm too), a declined rebuild floors only where the
+        // calling arm floors.
+        match rebuilt {
+            Some(ty) if ran => {
+                env.insert(Rc::from(m.name.as_str()), ty);
+            }
+            Some(_) => {
                 env.insert(Rc::from(m.name.as_str()), interner.untyped());
             }
-            return;
-        }
-        let Some(&binding) = env.get(m.name.as_str()) else {
-            return;
-        };
-        let arg_types = self.mutation_arg_types(ast, indexed, m.span, &m.method, env, interner);
-        if let Some(rebuilt) = self.widen_through_path(binding, &m.steps, &m.method, &arg_types, interner) {
-            env.insert(Rc::from(m.name.as_str()), rebuilt);
+            None if !ran && slot_floor => {
+                env.insert(Rc::from(m.name.as_str()), interner.untyped());
+            }
+            None => {}
         }
     }
 
@@ -5659,15 +5690,19 @@ impl<'i> Typer<'i> {
             // The local itself still changed: the reference's block-level
             // `widen_outer_element_read` widens it with no argument types
             // (`[1].each { break b[0] << 1 }` answers `[Array[[]]]`), which
-            // the port does not model — it floors the binding, as the
-            // rebind this landing replaced did, never keeping the stale
-            // literal.
+            // the port does not model — it floors a literal-shape binding
+            // (the only root `widen_through_path` rebuilds), as the rebind
+            // this landing replaced did, never keeping the stale literal. A
+            // nominal root (`h = {}; h[:a] ||= "s"`) stands on both sides.
             if ast.in_block_break_locals_only_carrier(mspan) {
-                if live && slot_floor {
-                    let name = match which {
-                        Ok(i) => &indexed.slot_mutations[i].name,
-                        Err(i) => &indexed.element_reads[i].name,
-                    };
+                let name = match which {
+                    Ok(i) => &indexed.slot_mutations[i].name,
+                    Err(i) => &indexed.element_reads[i].name,
+                };
+                let shaped = env
+                    .get(name.as_str())
+                    .is_some_and(|&ty| literal_shape_root(interner, ty));
+                if live && slot_floor && shaped {
                     env.insert(Rc::from(name.as_str()), interner.untyped());
                 }
                 continue;
