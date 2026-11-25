@@ -68,6 +68,11 @@ struct EdgeWrites {
     /// Whether one of them reaches every read in any order: a rebind (not a
     /// mutation), an index write or a derived write (the module doc).
     rebind: bool,
+    /// No statement list in the `begin` holds a non-derived kill of this
+    /// local, so [`Chain::reaches`] can skip the kill scan. Computed once
+    /// [`RetryBegin::derive`] has found every derived write; `false` until
+    /// then, which takes the checked path.
+    kill_free: bool,
 }
 
 /// A statement list inside a [`RetryBegin`].
@@ -149,7 +154,7 @@ impl RetryEdges {
                     if regions.iter().any(|&r| within(w, r)) && !nested.iter().any(|&s| within(w, s)) {
                         let e = by_name
                             .entry(name)
-                            .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false });
+                            .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false, kill_free: false });
                         e.starts.push(w.0);
                         e.rebind = true;
                     }
@@ -162,7 +167,7 @@ impl RetryEdges {
                 {
                     let e = by_name
                         .entry(name)
-                        .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false });
+                        .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false, kill_free: false });
                     e.starts.push(w.0);
                     e.rebind |= rebind_set.contains(&(w, name));
                 }
@@ -181,6 +186,17 @@ impl RetryEdges {
             let lists = lists_within(ast, &idx, id, *span);
             let mut begin = RetryBegin { span: *span, writes, lists, derived: HashSet::new() };
             begin.derive(ast, &idx, &nested);
+            // With `derived` final, a local whose every kill is derived can
+            // never be killed ([`StmtList::first_kill`] skips derived
+            // spans): mark it so `reaches` answers without the kill scan
+            // (rigor-rs#1003).
+            for (name, w) in &mut begin.writes {
+                w.kill_free = begin.lists.iter().all(|l| {
+                    l.kills.get(name.as_str()).is_none_or(|ks| {
+                        ks.iter().all(|(_, s)| begin.derived.contains(s))
+                    })
+                });
+            }
             begins.push(begin);
         }
         RetryEdges { begins }
@@ -197,11 +213,31 @@ impl RetryEdges {
 
     /// The locals [`Self::declines`] declines at `site`.
     pub(crate) fn declined_names(&self, site: Span) -> Vec<&str> {
+        // One `begin` holding the site is the common case, and its `writes`
+        // are already unique — skip the dedup set entirely. A nested
+        // retrying `begin` can name the same local, so several holders dedup
+        // through `seen` (a linear `out.contains` scan was quadratic on a
+        // `begin` with hundreds of edge writes — rigor-rs#1003).
+        let mut holders = self.begins.iter().filter(|b| within(site, b.span));
+        let Some(first) = holders.next() else {
+            return Vec::new();
+        };
+        if holders.next().is_none() {
+            let chain = first.chain(site);
+            return first
+                .writes
+                .iter()
+                .filter(|(name, w)| chain.reaches(site, name, w, &first.derived))
+                .map(|(name, _)| name.as_str())
+                .collect();
+        }
         let mut out: Vec<&str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
         for b in self.begins.iter().filter(|b| within(site, b.span)) {
             let chain = b.chain(site);
             for (name, w) in &b.writes {
-                if !out.contains(&name.as_str()) && chain.reaches(site, name, w, &b.derived) {
+                if !seen.contains(name.as_str()) && chain.reaches(site, name, w, &b.derived) {
+                    seen.insert(name.as_str());
                     out.push(name);
                 }
             }
@@ -309,7 +345,7 @@ impl RetryBegin {
         let i = match self.writes.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
             Ok(i) => i,
             Err(i) => {
-                let fresh = EdgeWrites { starts: Vec::new(), rebind: false };
+                let fresh = EdgeWrites { starts: Vec::new(), rebind: false, kill_free: false };
                 self.writes.insert(i, (name.to_string(), fresh));
                 i
             }
@@ -355,12 +391,14 @@ impl Chain<'_> {
     /// element before the read's kills `name`, and some write is a rebind,
     /// or lies in no element before the read's in a list of the chain.
     fn reaches(&self, site: Span, name: &str, w: &EdgeWrites, derived: &HashSet<Span>) -> bool {
-        let killed = self
-            .links
-            .iter()
-            .any(|(l, j)| l.first_kill(name, derived).is_some_and(|k| k < *j));
-        if killed {
-            return false;
+        if !w.kill_free {
+            let killed = self
+                .links
+                .iter()
+                .any(|(l, j)| l.first_kill(name, derived).is_some_and(|k| k < *j));
+            if killed {
+                return false;
+            }
         }
         if w.rebind || w.starts.last().is_some_and(|&s| s >= site.0) {
             return true;
