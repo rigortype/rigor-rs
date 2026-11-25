@@ -1016,6 +1016,9 @@ fn op_write_dispatch_rebinds_the_reference_answer() {
         (b"s = \"abc\"\ns <<= 1.5.to_s\n", "untyped"),
         (b"a = [1]\na += unresolved\n", "untyped"),
         (b"a = [1]\na <<= 2\n", "untyped"),
+        // `tuple_concat` past 1,024 elements declines rather than
+        // materialising a doubling chain (2^11 elements here).
+        (b"a = [1]\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\na += a\n", "untyped"),
     ] {
         let name = if src.starts_with(b"a") { "a" } else if src.starts_with(b"x") { "x" } else { "s" };
         assert_eq!(show(src, name), want, "{}", String::from_utf8_lossy(src));

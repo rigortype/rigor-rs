@@ -936,6 +936,13 @@ impl<'i> Typer<'i> {
     ///
     /// `String#<<` is never admitted: its literal-string answer turns on
     /// operand literalness the port's carriers lose.
+    ///
+    /// This is a heuristic, not an exact subset of the reference's
+    /// no-fold rows: a plain-`Nominal` entry the oracle still holds as a
+    /// literal (`"1".to_i`, `"abc".chomp`) answers the RBS class where the
+    /// oracle folds (message drift), and an operand the port types
+    /// `Dynamic` but the oracle types as a literal string (`"x" "y"`) is
+    /// admitted on `String#+` (PR #978 review, F2/F4 follow-ups).
     fn op_write_dispatch_admits(
         &self,
         entry: TypeId,
