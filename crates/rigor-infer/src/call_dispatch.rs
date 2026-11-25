@@ -137,7 +137,7 @@ impl<'i> Typer<'i> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn type_call_declines(
+    pub(crate) fn type_call_declines(
         &self,
         ast: &LoweredAst,
         receiver: NodeId,
