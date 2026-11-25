@@ -5978,6 +5978,44 @@ impl<'i> Typer<'i> {
                         ast, &body, mutations, env, effects, indexed, dead, interner,
                     );
                 }
+                // rigor-rs#953 — a REAL `begin`/`rescue` is an effective
+                // live statement too: `eval_begin`'s exit scope joins the
+                // primary path's (the protected body's, or the `else`
+                // clause's which replaces it — `eval_begin_primary_under`)
+                // with every LIVE rescue arm's (`live_rescue_results`
+                // drops one that unconditionally exits), nil-injecting a
+                // name an arm does not bind.
+                Node::BeginRescue {
+                    body,
+                    main_body,
+                    clauses,
+                    ensure_body,
+                    has_else,
+                    ..
+                } if !clauses.is_empty() => {
+                    let (body, main_body, clauses, ensure_body, has_else) = (
+                        body.clone(),
+                        main_body.clone(),
+                        clauses.clone(),
+                        ensure_body.clone(),
+                        *has_else,
+                    );
+                    self.bind_live_begin_rescue(
+                        ast,
+                        s,
+                        &body,
+                        &main_body,
+                        &clauses,
+                        &ensure_body,
+                        has_else,
+                        mutations,
+                        env,
+                        effects,
+                        indexed,
+                        dead,
+                        interner,
+                    );
+                }
                 Node::If { .. } => {
                     self.bind_check_statement_effects(ast, s, env, effects, indexed, dead, interner);
                 }
@@ -6004,6 +6042,234 @@ impl<'i> Typer<'i> {
                         interner,
                     );
                     self.bind_statement(ast, s, env, interner);
+                }
+            }
+        }
+    }
+
+    /// The live-arm replay of a real `begin`/`rescue` statement
+    /// (rigor-rs#953). The reference's `eval_begin` exits with
+    /// `reduce_scopes_with_nil_injection([primary_scope, *live_rescues])`:
+    /// the protected body's exit scope — or the `else` clause's, which
+    /// replaces it (`eval_begin_primary_under` evaluates `else` from
+    /// `body_scope`) — joined with every LIVE rescue arm's exit scope
+    /// (`live_rescue_results` drops an arm `branch_terminates?`
+    /// proves exits: `rescue; x = "t"; raise` contributes nothing),
+    /// nil-injecting a name an arm does not bind. The primary path ALWAYS
+    /// contributes — even a body ending in `raise` (`begin; x = "b";
+    /// raise; rescue; x = "t"; end` reads `"b" | "t"`).
+    ///
+    /// Each arm replays as effective live statements on its own entry
+    /// clone — a rescue arm's reads of names the protected body changed
+    /// come back `untyped` only when the arm mentions the name or the
+    /// body writes it more than once (upstream #1837, `ClauseWidening`),
+    /// and its `=> e` reference binds inside it only (`rescue_binding`,
+    /// falling back to `untyped` when the exception type is not known
+    /// exactly — `bind_rescue_reference` binds `Dynamic[top]` regardless;
+    /// past the construct `e` nil-injects and stays silent). A `retry`
+    /// re-entering
+    /// the `begin` routes the exit scope through the retry edge —
+    /// unmodelled here — so the names the `begin` writes decline, the
+    /// same side `replay_one`'s `has_else || retry` arm takes (an
+    /// `else`, though, IS modelled: it replaces the primary path).
+    ///
+    /// `ensure` runs on the joined exit scope (`eval_begin_ensure`): its
+    /// statements read every name the construct changed as `untyped`,
+    /// and only the names it changes land back on `env` — a name the
+    /// join produced and the clause did not touch keeps the join
+    /// (`begin; x = "b"; rescue; x = "t"; ensure; y = "n"; end`
+    /// reads `x : "b" | "t"`, `y : "n"`).
+    #[allow(clippy::too_many_arguments)]
+    fn bind_live_begin_rescue(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        body: &[NodeId],
+        main_body: &[NodeId],
+        clauses: &[rigor_parse::RescueClause],
+        ensure_body: &[NodeId],
+        has_else: bool,
+        mutations: &[(rigor_parse::Span, String, String, Option<ShapeKey>)],
+        env: &mut TypeEnv,
+        effects: &FlowEffects,
+        indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
+        interner: &mut Interner,
+    ) {
+        let bspan = ast.get(id).span();
+        let marks = self.def_local_marks(ast);
+        // A `retry` inside the construct re-enters it: the edge's widening
+        // (`eval_retried_begin`) is unmodelled — decline the names it
+        // writes rather than leak the pre-`begin` binding.
+        if marks.has_exit_within(bspan, &[crate::def_local_marks::ExitKind::Retry]) {
+            Self::widen_names(env, &marks.written_within(bspan), interner);
+            return;
+        }
+        let entry = env.clone();
+        let nil = interner.nil();
+        let mut arm_envs: Vec<TypeEnv> = Vec::with_capacity(clauses.len() + 1);
+        // The primary path: the protected body's exit scope, replaced by
+        // the `else` clause's when one exists (the flat `body` merges it
+        // after the clause children and before `ensure_body`).
+        let mut primary = entry.clone();
+        self.bind_live_arm_stmts(
+            ast, main_body, mutations, &mut primary, effects, indexed, dead, interner,
+        );
+        if has_else {
+            let clause_ids: usize = clauses
+                .iter()
+                .map(|c| c.exceptions.len() + c.body.len())
+                .sum();
+            let else_stmts =
+                &body[main_body.len() + clause_ids..body.len() - ensure_body.len()];
+            self.bind_live_arm_stmts(
+                ast, else_stmts, mutations, &mut primary, effects, indexed, dead, interner,
+            );
+        }
+        arm_envs.push(primary);
+        // A rescue arm runs after the body raised from any point in it.
+        // `ClauseWidening` (upstream #1837/#1839) does NOT widen every name
+        // the body wrote — only one the arm MENTIONS (reads or writes:
+        // `rescue; y = x` reads `x` untyped) or one the body writes MORE
+        // THAN ONCE (it can hold a value neither the entry nor the body's
+        // exit binds); a name written once and never mentioned leaves the
+        // arm at its entry binding, which the join then pairs with the
+        // body's exit binding (`begin; x = "b"; rescue; nil; end` reads
+        // `"a" | "b"`). The per-name census is the marks write table — its
+        // `all_writes` covers `for` indices, `rescue => e` references,
+        // masgn and sigilled-op targets the reference's
+        // `LOCAL_WRITE_NODES | InstanceVariable*Node` set walks, and
+        // `write_positions_outside` already drops the `def`/`class`/
+        // `module` nested scopes the reference's `SCOPE_BODY_NODES` skips.
+        let mut write_counts: HashMap<&str, usize> = HashMap::new();
+        if let Some(mspan) = crate::def_local_marks::body_span(ast, main_body) {
+            for (_, name) in marks.write_positions_outside(mspan, &[], None) {
+                *write_counts.entry(name).or_insert(0) += 1;
+            }
+        }
+        for clause in clauses {
+            // `live_rescue_results` — an arm that unconditionally exits
+            // leaves through the `begin` and contributes no scope.
+            if crate::class_narrowing::branch_terminates(self, ast, &clause.body) {
+                continue;
+            }
+            let mut e = entry.clone();
+            // The arm's entry (`rescue_entry_scope`) IS the `begin`'s
+            // entry — body writes never flow in — with the
+            // `ClauseWidening` names rebound to `untyped` where the entry
+            // already binds them (`widen` skips an unbound name).
+            let cspan = crate::def_local_marks::body_span(ast, &clause.body)
+                .unwrap_or(clause.span);
+            let reads = marks.reads_within(cspan);
+            let changed = marks.changed_within(cspan);
+            let mentioned = |name: &str| {
+                reads.contains(&name) || changed.iter().any(|c| c.as_str() == name)
+            };
+            let untyped = interner.untyped();
+            for (name, n) in &write_counts {
+                if (*n > 1 || mentioned(name)) && e.contains_key(*name) {
+                    e.insert(Rc::from(*name), untyped);
+                }
+            }
+            // `bind_rescue_reference` binds `e` inside the arm even when
+            // its exception type is not known exactly — the reference
+            // binds `Dynamic[top]` there, so an unresolvable list must not
+            // leave `e` at its entry binding.
+            let mut bound_e = false;
+            for (name, ty) in self.rescue_binding(ast, clause, interner) {
+                bound_e = true;
+                e.insert(Rc::from(name.as_str()), ty);
+            }
+            if !bound_e {
+                if let Some(name) = &clause.bound_name {
+                    e.insert(Rc::from(name.as_str()), untyped);
+                }
+            }
+            // `rescue => h[:e]` stores the exception through `[]=` on the
+            // receiver as the clause ENTERS (`bind_rescue_reference`,
+            // rigor-rs#134): the `index_writes` mark sits in the clause's
+            // pre-body region — exceptions and the `=>` reference —
+            // which no replayed statement's span covers. Rooted at the
+            // `begin` the conditional path floors it, the same widen
+            // the flat `_` arm gave it.
+            let body_start = clause
+                .body
+                .first()
+                .map(|&b| ast.get(b).span().0)
+                .unwrap_or(clause.span.1);
+            self.widen_mutated_locals(
+                ast,
+                mutations.iter(),
+                indexed, dead, true,
+                id,
+                (clause.span.0, body_start),
+                &mut e,
+                interner,
+            );
+            self.bind_live_arm_stmts(
+                ast, &clause.body, mutations, &mut e, effects, indexed, dead, interner,
+            );
+            arm_envs.push(e);
+        }
+        // The `join_arm_writes_bound` memberwise join, minus its
+        // suspect-arm decline: the primary path contributes its exit
+        // scope unconditionally, and a leaving rescue arm was dropped
+        // above rather than declining every written name.
+        let mut bound: Vec<String> = Vec::new();
+        for ae in &arm_envs {
+            for (name, _) in ae.iter() {
+                if !bound.iter().any(|b| b.as_str() == &**name) {
+                    bound.push(name.to_string());
+                }
+            }
+        }
+        for name in bound {
+            // Only names an arm actually CHANGED need the join; a name no
+            // arm rebinds keeps its entry binding.
+            if arm_envs
+                .iter()
+                .all(|ae| ae.get(name.as_str()) == entry.get(name.as_str()))
+            {
+                continue;
+            }
+            let absent = if crate::def_local_marks::is_sigilled(&name) {
+                interner.untyped()
+            } else {
+                nil
+            };
+            let mut members: Vec<TypeId> = Vec::new();
+            for ae in &arm_envs {
+                let ty = ae
+                    .get(name.as_str())
+                    .or_else(|| entry.get(name.as_str()))
+                    .copied()
+                    .unwrap_or(absent);
+                if !members.contains(&ty) {
+                    members.push(ty);
+                }
+            }
+            let joined = members
+                .iter()
+                .skip(1)
+                .fold(members[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m));
+            env.insert(Rc::from(name.as_str()), joined);
+        }
+        if !ensure_body.is_empty() {
+            // `eval_begin_ensure` — the clause runs on the JOINED scope,
+            // reading every name the construct before it changed as
+            // `untyped`; only the names it changes land back.
+            let espan = crate::def_local_marks::body_span(ast, ensure_body)
+                .unwrap_or(bspan);
+            let stale = marks.changed_within((bspan.0, espan.0));
+            let changed = marks.changed_within(espan);
+            let mut eenv = env.clone();
+            Self::widen_names(&mut eenv, &stale, interner);
+            self.bind_live_arm_stmts(
+                ast, ensure_body, mutations, &mut eenv, effects, indexed, dead, interner,
+            );
+            for name in changed {
+                if let Some(&ty) = eenv.get(name.as_str()) {
+                    env.insert(Rc::from(name.as_str()), ty);
                 }
             }
         }
