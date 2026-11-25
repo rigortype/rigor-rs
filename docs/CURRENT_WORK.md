@@ -20,6 +20,9 @@ paren/`&.` residuals #838–#847; mutation seams →#777–#785;
   A fix in one leaves the others diverging; change all, or consolidate.
   #966 (user `def raise` veto, syntactic-vs-type position) reached the first
   two only; `coll_arm_terminates` still reads exit names unvetoed.
+- **Retry-edge residuals** #988/#999–#1002 all touch `retry_edge.rs`:
+  the decline path itself is cheap now (#1005); the remaining fan-out
+  cost is the entry-descend replay quadratic, NOT `declined_names`.
 - **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-22, `v0.4.8`): **174 fixtures / 0 unregistered**; sweep
