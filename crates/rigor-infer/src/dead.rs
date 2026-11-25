@@ -2005,30 +2005,82 @@ impl<'i> Typer<'i> {
 /// Whether the call `call` binds the parameters of the toplevel `def` `def`
 /// on the reference (`bind_params_from_call_types`,
 /// `expression_typer.rb:5159`) — a strict subset, every unsure shape
-/// declining (rigor-rs#966). The call passes plain positionals only (a
-/// splat, a bare keyword hash or `...` changes the correspondence); the def
-/// takes no post positionals (`bindable_param_shape?` declines posts
-/// outright), and the positional count fits its required, optional and
-/// rest slots. Keyword parameters bind leniently — a missing one, required
-/// or not, binds `Dynamic` (probed) — but a def that takes keywords pops a
-/// trailing `Hash`-typed positional as the keyword hash, so the count must
-/// fit with and without that last argument. A `**rest` is indistinguishable
-/// from `...` here, which the reference treats as a positional rest; both
-/// keep the strict count. A block or `&blk` never enters `arguments()`, so
-/// it does not count.
+/// declining (rigor-rs#966). The def takes no post positionals
+/// (`bindable_param_shape?` declines posts outright), and the positional
+/// count fits its required, optional and rest slots; a `(...)` slot is a
+/// positional rest (`forwarding_params?`). Keyword parameters bind leniently
+/// — a missing one, required or not, binds `Dynamic` (probed) — but a def
+/// that takes keywords (`**rest` and `...` included) pops a trailing
+/// `HashShape`-typed argument as the keyword hash before counting.
+///
+/// The call passes plain positionals, optionally followed by a bare keyword
+/// hash of static-keyed pairs (`Node::Call`'s `args_static_kwhash_tail`),
+/// which always types a `HashShape` and so is popped exactly when the def
+/// takes keywords (rigor-rs#979). A splat, a `**h`, a dynamic key or `...`
+/// changes the correspondence and declines. For a plain trailing positional
+/// the pop depends on its type: a literal that can never type a `HashShape`
+/// ([`never_hash_shape`]) is never popped; any other must fit with and
+/// without the pop. A block or `&blk` never enters `arguments()`, so it does
+/// not count.
 fn call_binds_def_params(ast: &LoweredAst, call: NodeId, def: NodeId) -> bool {
-    let (Node::Call { args, args_plain_positional, .. }, Node::Definition { param_shape: p, .. }) =
-        (ast.get(call), ast.get(def))
+    let (
+        Node::Call {
+            args,
+            args_plain_positional,
+            args_static_kwhash_tail,
+            ..
+        },
+        Node::Definition { param_shape: p, .. },
+    ) = (ast.get(call), ast.get(def))
     else {
         return false;
     };
-    let fits = |n: usize| p.required <= n && (p.has_rest || n <= p.required + p.optional);
+    if p.posts != 0 {
+        return false;
+    }
+    let fits =
+        |n: usize| p.required <= n && (p.has_rest || p.forwarding || n <= p.required + p.optional);
     let takes_keywords = !p.keywords.is_empty() || p.has_kwrest;
     let argc = args.len();
-    *args_plain_positional
-        && p.posts == 0
-        && fits(argc)
-        && (!takes_keywords || argc == 0 || fits(argc - 1))
+    if *args_static_kwhash_tail {
+        return fits(if takes_keywords { argc - 1 } else { argc });
+    }
+    if !*args_plain_positional {
+        return false;
+    }
+    match args.last() {
+        Some(&last) if takes_keywords && !never_hash_shape(ast, last) => {
+            fits(argc) && fits(argc - 1)
+        }
+        _ => fits(argc),
+    }
+}
+
+/// Whether the argument `arg` is a literal the reference never types as a
+/// `HashShape` — a scalar, string, symbol, array, regexp or range literal or a `->`
+/// lambda — so
+/// `bind_params_from_call_types` keeps it positional (rigor-rs#979). A hash
+/// literal, a local, a call and every other shape may type one, and answer
+/// `false`.
+fn never_hash_shape(ast: &LoweredAst, arg: NodeId) -> bool {
+    matches!(
+        ast.get(arg),
+        Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::RationalLit { .. }
+            | Node::ImaginaryLit { .. }
+            | Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::SymbolLit { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::RegexpLit { .. }
+            | Node::NilLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::Range { .. }
+            | Node::Lambda { .. }
+    )
 }
 
 impl<'i> Typer<'i> {

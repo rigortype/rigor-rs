@@ -167,11 +167,32 @@ fn def_exits_requires_a_fitting_arity() {
         ("def die(*a, z); raise; end", "@q = die(1, 2, 3)", false),
         ("def die(k: 1); raise; end", "@q = die", true),
         ("def die(k:); raise; end", "@q = die", true),
-        // The oracle binds this one (`bot`); the port cannot tell whether
-        // the trailing argument is a keyword `Hash`, so it declines.
-        ("def die(a, k: 1); raise; end", "@q = die(1)", false),
         ("def die(&b); raise; end", "@q = die", true),
         ("def die; raise; end", "@q = die(*[])", false),
+        // rigor-rs#979 — a trailing literal that never types a `HashShape`
+        // is never popped as the keyword hash.
+        ("def die(a, k: 1); raise; end", "@q = die(1)", true),
+        ("def die(a, k: 1); raise; end", "@q = die(nil)", true),
+        ("def die(a, k: 1); raise; end", "@q = die(1, nil)", false),
+        // An untyped trailing argument may be one: both counts must fit
+        // (the oracle binds `die(q)` with `q = 1`; the port declines).
+        ("def die(a, k: 1); raise; end", "@q = die(q)", false),
+        ("def die(a, k: 1); raise; end", "@q = die({k: 1})", false),
+        // A static-keyed call-site keyword hash is the keyword argument of
+        // a keyword-taking def, and a positional of any other.
+        ("def die(a, k:); raise; end", "@q = die(1, k: 1)", true),
+        ("def die(a, k: 1); raise; end", "@q = die(1, \"a\" => 1)", true),
+        ("def die(a, k: 1); raise; end", "@q = die(k: 1)", false),
+        ("def die(a, b); raise; end", "@q = die(1, a: 1)", true),
+        ("def die(a); raise; end", "@q = die(k: 1)", true),
+        // A dynamic key or a `**` declines (the oracle binds `die(1, **{})`:
+        // it drops a literal empty double splat, which the port does not model).
+        ("def die(a, k: 1); raise; end", "@q = die(1, q => 1)", false),
+        ("def die(a, k: 1); raise; end", "@q = die(1, **{})", false),
+        // `(...)` is a positional rest that takes keywords.
+        ("def die(...); raise; end", "@q = die(1)", true),
+        ("def die(a, ...); raise; end", "@q = die(1, 2)", true),
+        ("def die(a, b, ...); raise; end", "@q = die(1)", false),
     ];
     for &(prelude, tail, exits) in cases {
         assert_eq!(rescue_arm_exits(&[&top(prelude, tail)], 0), exits, "{prelude} / {tail}");
