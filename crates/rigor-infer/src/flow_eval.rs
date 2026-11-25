@@ -5269,8 +5269,18 @@ impl<'i> Typer<'i> {
                             // join, not the lexically-last write.
                             let u = interner.untyped();
                             let entry_ty = env.get(name.as_str()).copied().unwrap_or(u);
+                            // rigor-rs#998 — the arms evaluate from the
+                            // POST-PREDICATE binding: a write inside the
+                            // predicate (`if (x = rand) > 0`) is the scope
+                            // both arms start from (`eval_if`'s
+                            // `eval_with_edges`), so the pre-`if` binding
+                            // stands in only for a predicate that never
+                            // wrote the name.
+                            let arm_entry = self
+                                .node_scope_ty(ast, env, *predicate, name, entry_ty, interner)
+                                .unwrap_or(entry_ty);
                             let j = self.if_scope_join_ty(
-                                ast, env, *is_unless, then_body, else_body, name, entry_ty, interner,
+                                ast, env, *is_unless, then_body, else_body, name, arm_entry, interner,
                             );
                             drop_indexed_narrowings(env, name);
                             env.insert(Rc::from(name.as_str()), j);
@@ -5465,8 +5475,10 @@ impl<'i> Typer<'i> {
     /// The post-`if` binding of `name` for an undecided `if`/`unless`
     /// (rigor-rs#443, #942, #951): `eval_if`/`eval_unless` evaluate both
     /// arms from the entry scope and `if_join` joins the two exit scopes.
-    /// Each arm's exit binding is [`Self::arm_scope_ty`]; `entry` stands in
-    /// for an arm that wrote nothing.
+    /// Each arm's exit binding is [`Self::arm_scope_ty`]; `entry` is the
+    /// binding the arms START from — the post-predicate binding a caller
+    /// computes via [`Self::node_scope_ty`] (`eval_if`'s `eval_with_edges`,
+    /// rigor-rs#998) — standing in for an arm that wrote nothing.
     ///
     /// The drops are PHYSICAL (`node.statements` is the port's `then_body`
     /// under both keywords; `subsequent`/`else_clause` is `else_body`): the
@@ -5525,9 +5537,10 @@ impl<'i> Typer<'i> {
     /// `v = e` yields `type_of(e)`, an `op=` yields `op_write_result(binding
     /// so far, op, e)` (`v = 2; v += 3` is `5`), and a `v, w = rhs` yields
     /// the destructure's bound type for `name` (`"a" | 1` on `v, w = "a",
-    /// "b"` — rigor-rs#443 review). A nested `if` whose predicate writes
-    /// `name` keeps that last-write reading: its arms see the predicate's
-    /// narrowing, which this flat join does not model.
+    /// "b"` — rigor-rs#443 review). Every other statement shape — a `for`,
+    /// an `&&`/`||`, a nested `if` whose predicate writes `name` — answers
+    /// through [`Self::node_scope_ty`] (rigor-rs#998); only the narrowing
+    /// the reference's edge scopes carry stays unmodelled here.
     fn arm_scope_ty(
         &self,
         ast: &LoweredAst,
@@ -5543,62 +5556,280 @@ impl<'i> Typer<'i> {
             if !self.writes_name_within(ast, ast.get(s).span(), name, interner) {
                 continue;
             }
-            // A straight-line carrier — an `else` clause, a parenthesized
-            // group, a rescue-less `begin` — runs its statements in order.
-            let seq = match ast.get(s) {
-                Node::BeginRescue { body, clauses, ensure_body, has_else: false, .. }
-                    if clauses.is_empty() && ensure_body.is_empty() =>
-                {
-                    Some(body.clone())
-                }
-                Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
-                    Some(body.clone())
-                }
-                _ => None,
-            };
-            if let Some(seq) = seq {
-                cur = Some(self.arm_scope_ty(ast, env, &seq, name, at, interner).unwrap_or(at));
-                continue;
-            }
-            if let Node::If { predicate, then_body, else_body, is_unless, .. } = ast.get(s) {
-                let pspan = ast.get(*predicate).span();
-                if !self.writes_name_within(ast, pspan, name, interner) {
-                    let truthy = crate::version_guard::guard_truthiness(ast, *predicate)
-                        .or_else(|| self.expr_truthiness(ast, *predicate, &mut Vec::new()));
-                    cur = Some(match truthy {
-                        Some(truthy) => {
-                            let live = if truthy != *is_unless { then_body } else { else_body };
-                            // The folded-arm drop twin of the top-level
-                            // `arm_terminates` gate above
-                            // (`eval_if`/`eval_unless`'s
-                            // `branch_terminates? && subsequent.nil?`,
-                            // statement_evaluator.rb:2302/:2336) — a
-                            // refinement to it (rigor-rs#966 shape) must
-                            // move both sites.
-                            if else_body.is_empty()
-                                && crate::class_narrowing::branch_terminates(self, ast, then_body)
-                            {
-                                at
-                            } else {
-                                self.arm_scope_ty(ast, env, live, name, at, interner).unwrap_or(at)
-                            }
-                        }
-                        None => self.if_scope_join_ty(
-                            ast, env, *is_unless, then_body, else_body, name, at, interner,
-                        ),
-                    });
-                    continue;
-                }
-            }
-            if let Some(ty) = self.last_write_ty(ast, env, ast.get(s).span(), name, at, interner) {
-                cur = Some(ty);
-            }
+            cur = Some(
+                self.node_scope_ty(ast, env, s, name, at, interner)
+                    .unwrap_or(at),
+            );
         }
         cur
     }
 
-    /// Whether a write node for `name` (`v = e`, `v op= e`, `v, w = rhs`)
-    /// lies inside `span`.
+    /// The binding `name` holds after node `id` evaluates — the
+    /// [`Self::arm_scope_ty`] statement walk's per-node half, shared so an
+    /// `if` PREDICATE (`post_pred`), a `&&`/`||` OPERAND or a `for`
+    /// collection reads its sub-expressions the same way an arm reads its
+    /// statements (rigor-rs#998):
+    ///
+    /// * an `if`/`unless` contributes its own [`Self::if_scope_join_ty`] (or
+    ///   the certainty-folded live arm) computed from the POST-PREDICATE
+    ///   binding — the reference evaluates the predicate before either arm
+    ///   (`eval_if` → `eval_with_edges`), so a write inside the predicate
+    ///   (`if (x = rand) > 0`) is the binding both arms start from, not the
+    ///   last write of the whole span;
+    /// * an `&&`/`||` node is a conditional: the post-scope joins the right
+    ///   operand's exit with the left-skipped edge (`eval_and_or`), so
+    ///   `(x = "s") && (x = "t")` contributes `"s" | "t"`, not the
+    ///   lexically-last write alone;
+    /// * a `for` joins the pre-loop binding with the body's exit (the body
+    ///   may run zero times), the body entered with the index bound to the
+    ///   collection's element type (`bind_for_index` — `for x in [1]` binds
+    ///   `x` to `1`);
+    /// * a clause-less `BeginRescue` carrier or a `Sequence` statement list
+    ///   runs its statements in order;
+    /// * anything else contributes the last write inside its span
+    ///   ([`Self::last_write_ty`]).
+    fn node_scope_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        id: NodeId,
+        name: &str,
+        at: TypeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        match ast.get(id) {
+            // A straight-line carrier — an `else` clause, a parenthesized
+            // group, a rescue-less `begin` — runs its statements in order.
+            Node::BeginRescue { body, clauses, ensure_body, has_else: false, .. }
+                if clauses.is_empty() && ensure_body.is_empty() =>
+            {
+                self.arm_scope_ty(ast, env, body, name, at, interner)
+            }
+            Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
+                self.arm_scope_ty(ast, env, body, name, at, interner)
+            }
+            Node::If { predicate, then_body, else_body, is_unless, .. } => {
+                let post_pred = self
+                    .node_scope_ty(ast, env, *predicate, name, at, interner)
+                    .unwrap_or(at);
+                let truthy = crate::version_guard::guard_truthiness(ast, *predicate)
+                    .or_else(|| self.expr_truthiness(ast, *predicate, &mut Vec::new()))
+                    .or_else(|| {
+                        // The reference's `branch_certainty` —
+                        // `Narrowing.predicate_certainty(pred_type)`: a
+                        // masgn predicate (`if (x, y = rand, "p")` — the
+                        // value is an array, always truthy) or a literal
+                        // comparison (`if (x = 1) > 0`) decides the arm
+                        // where the scalar fold declined on the writes.
+                        let ty = self.type_of(ast, *predicate, env, interner);
+                        self.predicate_certainty(ty, interner)
+                    });
+                Some(match truthy {
+                    Some(truthy) => {
+                        let live = if truthy != *is_unless { then_body } else { else_body };
+                        // The folded-arm drop twin of the top-level
+                        // `arm_terminates` gate
+                        // (`eval_if`/`eval_unless`'s
+                        // `branch_terminates? && subsequent.nil?`,
+                        // statement_evaluator.rb:2302/:2336) — a
+                        // refinement to it (rigor-rs#966 shape) must
+                        // move both sites. The surviving edge is the
+                        // predicate's skipped-edge scope — POST-predicate,
+                        // not the pre-`if` `at`.
+                        if else_body.is_empty()
+                            && crate::class_narrowing::branch_terminates(self, ast, then_body)
+                        {
+                            post_pred
+                        } else {
+                            self.arm_scope_ty(ast, env, live, name, post_pred, interner)
+                                .unwrap_or(post_pred)
+                        }
+                    }
+                    None => self.if_scope_join_ty(
+                        ast, env, *is_unless, then_body, else_body, name, post_pred, interner,
+                    ),
+                })
+            }
+            Node::Logical { left, right, .. } => {
+                // `a && b` / `a || b` — the left always runs, the right runs
+                // on one edge; the post-scope joins the right's post-scope
+                // with the left-skipped edge (`eval_and_or`). The right's
+                // entry is the left's exit — `l` precedes `r` — and a right
+                // operand that unconditionally exits was lowered DISCARDED
+                // (rigor-rs#362), leaving the left's scope alone to bind
+                // (`x or (x = "t"; raise)`).
+                let left_ty = self
+                    .node_scope_ty(ast, env, *left, name, at, interner)
+                    .unwrap_or(at);
+                let right_ty = self
+                    .node_scope_ty(ast, env, *right, name, left_ty, interner)
+                    .unwrap_or(left_ty);
+                Some(rigor_types::Algebra::join(interner, left_ty, right_ty))
+            }
+            Node::Loop {
+                kind: rigor_parse::LoopKind::For,
+                predicate,
+                body,
+                index_target,
+                ..
+            } => {
+                // `for t in coll` — the collection evaluates unconditionally,
+                // the body zero or more times (`bind_for_index` →
+                // `for_body_entry` → the loop's join). The exit binding joins
+                // the pre-loop `at` with the body's exit, the body entered
+                // with the index bound to the collection's element type. A
+                // multi-target index decomposes the element exactly as a
+                // masgn RHS does, a splat index as its rest slot
+                // (`bind_for_splat_index`).
+                let coll_scope = predicate
+                    .and_then(|c| self.node_scope_ty(ast, env, c, name, at, interner))
+                    .unwrap_or(at);
+                let index_ty = index_target.as_ref().and_then(|t| {
+                    let element = match predicate {
+                        Some(c) => self.for_element_ty(ast, env, *c, interner),
+                        None => interner.untyped(),
+                    };
+                    match t {
+                        rigor_parse::MultiTarget::Local { name: n2, .. } if n2 == name => {
+                            Some(element)
+                        }
+                        rigor_parse::MultiTarget::Nested(targets) => {
+                            crate::multi_target_binder::bind(targets, element, interner)
+                                .into_iter()
+                                .find(|(n2, _)| n2 == name)
+                                .map(|(_, ty)| ty)
+                        }
+                        _ => None,
+                    }
+                });
+                let body_entry = index_ty.unwrap_or(coll_scope);
+                let body_ty = self
+                    .arm_scope_ty(ast, env, body, name, body_entry, interner)
+                    .unwrap_or(body_entry);
+                Some(rigor_types::Algebra::join(interner, at, body_ty))
+            }
+            _ => self.last_write_ty(ast, env, ast.get(id).span(), name, at, interner),
+        }
+    }
+
+    /// The per-iteration element type a `for` index binds
+    /// (`for_iteration_element_type` → `collection_element_type`,
+    /// statement_evaluator.rb): the collection's literal shape — a `Tuple`
+    /// / `Array` carrier joins its elements, a `Hash` carrier its `[k, v]`
+    /// pair tuple, a literal range its first endpoint's class — and
+    /// `Dynamic[top]` for anything unresolved. The untyped answer is
+    /// load-bearing, not a decline: `for x in coll` on an unresolvable
+    /// `coll` binds `x` to `Dynamic[top]` on the oracle, which is what
+    /// keeps a later `x.m` SILENT there (rigor-rs#998).
+    fn for_element_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        coll: NodeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        // `for x in a..b` — the reference's `constant_element_type` reads
+        // the literal range's `first.class`; the port types a literal range
+        // to `Nominal[Range]` with no args, so the endpoint class must come
+        // off the AST (`1..3` → `Integer`, `"a".."z"` → `String`).
+        if let Node::Range { left, .. } = ast.get(coll) {
+            return left
+                .and_then(|l| crate::reach::literal_scalar(ast, l))
+                .map(|s| self.nominal_or_untyped(crate::folding::scalar_class(&s), interner))
+                .unwrap_or_else(|| interner.untyped());
+        }
+        let ty = self.type_of(ast, coll, env, interner);
+        self.collection_element_ty(ty, interner)
+    }
+
+    /// `collection_element_type` (statement_evaluator.rb): the element a
+    /// `for`/`each` yields from a carrier — a `Tuple` joins its elements, an
+    /// `Array` / `Range` / `Set` / `Enumerator` nominal its first type arg,
+    /// a `Hash` nominal or `HashShape` its `[k, v]` pair (`for x in {k: 1}`
+    /// binds `[:k, 1]` on the oracle), an `IntegerRange` `Integer`;
+    /// anything else declines to `Dynamic[top]`.
+    fn collection_element_ty(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+        match interner.get(ty) {
+            Type::Tuple(elements) => {
+                let elements = elements.clone();
+                if elements.is_empty() {
+                    interner.untyped()
+                } else {
+                    rigor_types::Algebra::union(interner, &elements)
+                }
+            }
+            Type::HashShape(members) => {
+                let members = members.clone();
+                let keys: Vec<TypeId> = members
+                    .iter()
+                    .map(|m| self.for_shape_key_ty(interner, &m.key))
+                    .collect();
+                let values: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                let k = if keys.is_empty() {
+                    interner.untyped()
+                } else {
+                    rigor_types::Algebra::union(interner, &keys)
+                };
+                let v = if values.is_empty() {
+                    interner.untyped()
+                } else {
+                    rigor_types::Algebra::union(interner, &values)
+                };
+                interner.intern(Type::Tuple(vec![k, v]))
+            }
+            Type::Nominal { class, args } => {
+                let args = args.clone();
+                match self.index.class_name_for_id(*class) {
+                    Some("Array" | "Range" | "Set" | "Enumerator") => args
+                        .first()
+                        .copied()
+                        .unwrap_or_else(|| interner.untyped()),
+                    Some("Hash") => {
+                        let k = args.first().copied().unwrap_or_else(|| interner.untyped());
+                        let v = args.get(1).copied().unwrap_or_else(|| interner.untyped());
+                        interner.intern(Type::Tuple(vec![k, v]))
+                    }
+                    _ => interner.untyped(),
+                }
+            }
+            Type::IntegerRange { .. } => self.nominal_or_untyped("Integer", interner),
+            Type::Union(members) => {
+                let members = members.clone();
+                let elements: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.collection_element_ty(m, interner))
+                    .collect();
+                rigor_types::Algebra::union(interner, &elements)
+            }
+            Type::Difference { base, .. } => {
+                let base = *base;
+                self.collection_element_ty(base, interner)
+            }
+            _ => interner.untyped(),
+        }
+    }
+
+    /// One hash-literal key as the pinned carrier it contributes to a
+    /// `for`'s `[k, v]` element pair — `ShapeKey::Sym("k")` stays
+    /// `Constant[:k]` (`for x in {k: 1}` binds `[:k, 1]` on the oracle),
+    /// not the `Symbol` nominal [`Typer::key_union_for`] widens to for
+    /// content evidence. `Other` declines to `Dynamic[top]`.
+    fn for_shape_key_ty(&self, interner: &mut Interner, key: &ShapeKey) -> TypeId {
+        match key {
+            ShapeKey::Sym(s) => interner.intern(Type::Constant(Scalar::Sym(s.clone()))),
+            ShapeKey::Str(s) => interner.intern(Type::Constant(Scalar::Str(s.clone()))),
+            ShapeKey::Int(i) => interner.intern(Type::Constant(Scalar::Int(*i))),
+            ShapeKey::Float(bits) => {
+                interner.intern(Type::Constant(Scalar::Float(f64::from_bits(*bits))))
+            }
+            ShapeKey::Bool(b) => interner.intern(Type::Constant(Scalar::Bool(*b))),
+            ShapeKey::Nil => interner.intern(Type::Constant(Scalar::Nil)),
+            ShapeKey::Other => interner.untyped(),
+        }
+    }
+
+    /// Whether a write for `name` (`v = e`, `v op= e`, `v, w = rhs`, a `for`
+    /// index binding it) lies inside `span`.
     fn writes_name_within(
         &self,
         ast: &LoweredAst,
@@ -5614,6 +5845,11 @@ impl<'i> Typer<'i> {
             }
             Node::MultiWrite { targets, .. } => {
                 crate::multi_target_binder::bind(targets, u, interner).iter().any(|(t, _)| t == name)
+            }
+            // A `for` index binds its names per iteration (`bind_for_index`)
+            // — `for x in [1]` rebinds `x` although no write NODE does.
+            Node::Loop { kind: rigor_parse::LoopKind::For, index, .. } => {
+                index.iter().any(|(n2, _)| n2 == name)
             }
             _ => false,
         })

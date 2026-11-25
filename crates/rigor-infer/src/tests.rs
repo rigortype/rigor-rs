@@ -1334,6 +1334,58 @@ fn undecided_if_join_reads_each_arm_exit_scope() {
     }
 }
 
+/// rigor-rs#998 — an arm's `&&`/`||` statement joins its two operand
+/// scopes per name, a `for` contributes its index's element binding
+/// joined with the body's exit (and the zero-iteration edge), and a
+/// nested `if` whose PREDICATE writes the name joins its arms from the
+/// post-predicate binding rather than keeping the span's last write.
+/// Every expected value is the oracle's own answer.
+#[test]
+fn arm_scope_join_reads_operands_index_and_post_pred() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let x_of = |src: &str| {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        // `describe` spells `Constant["s"]`; the message spells `"s"`.
+        rigor_types::describe(&i, *env.get("x").expect(src))
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+    for (src, want) in [
+        // `&&` / `||` statements join their operand scopes.
+        ("x = \"a\"; if rand > 0; (x = \"s\") && (x = \"t\"); end; x.w", r#""a" | "s" | "t""#),
+        ("x = \"a\"; if rand > 0; (x = \"s\") || (x = \"t\"); end; x.w", r#""a" | "s" | "t""#),
+        ("x = \"a\"; if rand > 0; (x = \"s\") && (x = \"m\") || (x = \"t\"); end; x.w", r#""a" | "m" | "s" | "t""#),
+        ("x = \"a\"; if rand > 0; x && (x = \"t\"); end; x.w", r#""a" | "t""#),
+        // `for` binds the index to the collection's element, joined with
+        // the pre-loop binding (the zero-iteration edge) and read by the
+        // body's own arm-scope walk.
+        ("x = \"a\"; if rand > 0; for x in [1]; end; end; x.w", r#""a" | 1"#),
+        ("x = \"a\"; if rand > 0; x = \"b\"; for x in [1]; end; end; x.w", r#""a" | "b" | 1"#),
+        ("x = \"a\"; if rand > 0; for x in [1]; x = \"f\"; end; end; x.w", r#""a" | "f""#),
+        ("x = \"a\"; if rand > 0; for x in [1]; if rand > 1; x = \"f\"; end; end; end; x.w", r#""a" | "f" | 1"#),
+        // `describe` renders the Integer nominal by class id (`Class<1>`).
+        ("x = \"a\"; if rand > 0; for x in 1..3; end; end; x.w", r#"Class<1> | "a""#),
+        // `describe` spells the `[k, v]` pair `Tuple[:k, 1]` (the probe's
+        // `]` strip leaves `Tuple[:k, 1`).
+        ("x = \"a\"; if rand > 0; for x in { k: 1 }; end; end; x.w", r#""a" | Tuple[:k, 1"#),
+        // A nested `if` whose predicate writes the name joins its arms
+        // from the post-predicate binding.
+        ("x = \"a\"; if rand > 0; if (x = rand) > 0; x = \"s\"; else; x = \"t\"; end; end; x.w", r#""a" | "s" | "t""#),
+        // The `rand` Float nominal describes as `Class<2>`.
+        ("x = \"a\"; if rand > 0; if (x = rand) > 0; x = \"s\"; end; end; x.w", r#"Class<2> | "a" | "s""#),
+        ("x = \"a\"; if rand > 0; if (x = 1) > 0; x = \"s\"; else; x = \"t\"; end; end; x.w", r#""a" | "s""#),
+        ("x = \"a\"; y = \"b\"; if rand > 0; if (x, y = rand, \"p\"); x = \"s\"; else; x = \"t\"; end; end; x.w", r#""a" | "s""#),
+        // The same post-predicate entry applies to a top-level undecided
+        // `if`, not only an arm's nested one.
+        ("x = \"a\"; if (x = rand) > 0; x = \"s\"; end; x.w", r#"Class<2> | "s""#),
+    ] {
+        assert_eq!(x_of(src), want, "{src}");
+    }
+}
+
 /// rigor-rs#952 — the `else` clause of a `begin`/`rescue` joins its type
 /// unconditionally: a non-exiting `else` (even unreachable behind an
 /// exiting body, and even an EMPTY `else; end` — `nil` either way) keeps

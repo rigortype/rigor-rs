@@ -364,6 +364,7 @@ impl<'src> Builder<'src> {
                 body,
                 index: Vec::new(),
                 index_writes: Vec::new(),
+                index_target: None,
                 kind: LoopKind::While { begin_modifier: while_node.is_begin_modifier() },
                 span: span_of(&while_node.location()),
             });
@@ -395,6 +396,7 @@ impl<'src> Builder<'src> {
                 body,
                 index: Vec::new(),
                 index_writes: Vec::new(),
+                index_target: None,
                 kind: LoopKind::Until { begin_modifier: until_node.is_begin_modifier() },
                 span: span_of(&until_node.location()),
             });
@@ -439,12 +441,14 @@ impl<'src> Builder<'src> {
             self.recovery_next_sink -= 1;
             self.lexical_loop -= 1;
             self.unmasked_loop -= 1;
-            let (index, index_writes) = for_index_writes(&for_node.index());
+            let (index, index_writes, index_target) =
+                for_index_writes(&for_node.index());
             return self.push(Node::Loop {
                 predicate,
                 body,
                 index,
                 index_writes,
+                index_target,
                 kind: LoopKind::For,
                 span: span_of(&for_node.location()),
             });

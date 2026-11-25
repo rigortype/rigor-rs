@@ -2,8 +2,8 @@
 //! `StatementsKind` / `JumpKind` / `RescueClause` payloads.
 
 use super::{
-    BlockParamKind, ConstName, HashKey, IndexWrites, MethodBody, MultiTargets, NodeId, ParamShape,
-    Span, Visibility,
+    BlockParamKind, ConstName, HashKey, IndexWrites, MethodBody, MultiTarget, MultiTargets, NodeId,
+    ParamShape, Span, Visibility,
 };
 
 /// One `rescue` clause of a `begin`/`def` rescue chain, in chain order — the
@@ -653,6 +653,17 @@ pub enum Node {
         body: Vec<NodeId>,
         index: Vec<(String, Span)>,
         index_writes: IndexWrites,
+        /// The `for` index TARGET tree (`for x in xs`, `for a, (b, *c) in
+        /// xs`, `for *w in xs`), kept so a scope reader can decompose the
+        /// per-iteration element type against it exactly as
+        /// `MultiTargetBinder` does (`bind_for_index`, rigor-rs#998): a
+        /// [`MultiTarget::Local`] binds the element itself, a
+        /// [`MultiTarget::Nested`] decomposes it like a masgn RHS. `None`
+        /// for `while`/`until` and for a `for` index binding no local
+        /// (`for @a in xs`, `for h[:k] in xs`, an anonymous `for * in xs`)
+        /// — the `[]=` stores an index-target index performs stay in
+        /// `index_writes`.
+        index_target: Option<MultiTarget>,
         /// `while` / `until` / `for`, and whether a `while`/`until` is the
         /// `begin … end while` form whose body runs once before the predicate
         /// is first tested (upstream #1359's loop-entry edge, `eval_loop`).
