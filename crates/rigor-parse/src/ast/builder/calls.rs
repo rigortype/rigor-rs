@@ -374,6 +374,14 @@ impl<'src> Builder<'src> {
                 .and_then(|b| b.as_block_node())
                 .map(|bn| block_param_names(&bn))
                 .unwrap_or_default();
+            // `{ || }` / `{ |;l| }` still declare a parameters node — the
+            // clause's presence, not its names, is what
+            // `STOP_ITERATION_FREE_NODES`'s `block.parameters` veto reads
+            // (rigor-rs#1011).
+            let block_param_clause = call
+                .block()
+                .and_then(|b| b.as_block_node())
+                .is_some_and(|bn| bn.parameters().is_some());
             // The message_loc is the method-name token; fall back to the whole
             // call span if Prism elides it (e.g. operator-ish forms).
             let message_span = call
@@ -388,6 +396,7 @@ impl<'src> Builder<'src> {
                 block_span,
                 block_locals,
                 block_params,
+                block_param_clause,
                 explicit_arg_list: call.arguments().is_some(),
                 message_span,
                 // `x&.foo` ⇒ safe-nav; `x.foo` ⇒ plain dot. Threaded so

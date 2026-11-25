@@ -37,6 +37,7 @@ use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, Span, StatementsKind};
 use rigor_types::Scalar;
 
 use crate::block_call::NON_RETURNING_KERNEL_CALLS;
+use crate::def_local_marks::is_ivar;
 use crate::source_index::DefKind;
 use crate::Typer;
 
@@ -1742,28 +1743,22 @@ impl<'i> Typer<'i> {
             | Node::ConstantWrite { value, .. }
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, false),
             Node::Call {
-                receiver,
-                method,
-                args,
-                span,
-                ..
+                receiver, args, ..
             } => {
                 receiver.is_some_and(|r| self.stmt_exits_at(ast, r, seen, false))
                     || args.iter().any(|&a| self.stmt_exits_at(ast, a, seen, false))
                     // `branch_terminates?`'s OTHER half — a `Bot`-typed call
                     // terminates too (`statement_evaluator.rb:4997`): the
                     // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
-                    // `::Kernel.abort`, [`Self::kernel_call_terminates`]) and
-                    // an implicit-self call a same-file toplevel `def`
-                    // answers with a provably-bot body (`begin 1 rescue q =
-                    // 1; die end`, rigor-rs#386). The `self_type_answers?`
-                    // veto gates the toplevel-def half: `die` inside `class
-                    // C; def die` dispatches to C's own method, not the
-                    // private `Object` one.
-                    || self.kernel_call_terminates(ast, id)
-                    || (receiver.is_none()
-                        && !self.self_answers(ast, *span, method)
-                        && self.def_exits(ast, id, seen))
+                    // `::Kernel.abort`), an implicit-self call a same-file
+                    // toplevel `def` answers with a provably-bot body
+                    // (`begin 1 rescue q = 1; die end`, rigor-rs#386), the
+                    // `bot`-returning Kernel functions
+                    // [`Self::kernel_sig_bot`] holds (`exec`, `sleep`,
+                    // `loop`), and a resolvable constant receiver's
+                    // all-`bot` member ([`Self::const_receiver_call_bot`]
+                    // — `Process.exit`, rigor-rs#1011).
+                    || self.exit_call_bot_seen(ast, id, seen)
             }
             _ => false,
         }
@@ -1806,23 +1801,184 @@ impl<'i> Typer<'i> {
         receiver.is_some() || !self.toplevel_def_binds(ast, *span, method)
     }
 
-    /// The `Bot` half for a receiverless exit-name call in a value position
-    /// (rigor-rs#966): Kernel's `bot` unless a project toplevel `def` binds
-    /// the call ([`Self::kernel_call_terminates`]), and then the bound def's
-    /// own `bot` body ([`Self::def_exits`] — `def raise; Kernel.raise; end`
-    /// keeps the call `bot`). For the walks with no `seen` stack of their
-    /// own (`class_narrowing`'s exit tests).
+    /// The `Bot` half for a call in a value position (rigor-rs#966,
+    /// rigor-rs#1011): Kernel's `bot` unless a project toplevel `def` binds
+    /// the call ([`Self::kernel_call_terminates`]), the bound def's own
+    /// `bot` body ([`Self::def_exits`] — `def raise; Kernel.raise; end`
+    /// keeps the call `bot`, and `def_exits` is name-agnostic, so `def die;
+    /// raise; end` answers for ANY receiverless name), the other
+    /// `bot`-returning Kernel functions [`Self::kernel_sig_bot`] covers
+    /// (`exec`, `sleep` off its arity-1 overload, `loop` with a
+    /// StopIteration-free block), and a resolvable constant receiver's
+    /// all-`bot` member ([`Self::const_receiver_call_bot`] —
+    /// `Process.exit`/`Kernel.exit`, which `kernel_call_terminates` also
+    /// answers but for the `Kernel` spelling alone). For the walks with no
+    /// `seen` stack of their own (`class_narrowing`'s exit tests).
     pub(crate) fn exit_call_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
-        let Node::Call { receiver, method, span, .. } = ast.get(id) else {
+        self.exit_call_bot_seen(ast, id, &mut Vec::new())
+    }
+
+    /// [`Self::exit_call_bot`] threading a `def_exits` recursion budget —
+    /// the walks that already carry one (`stmt_exits_at`, `stmt_bot`,
+    /// `write_value_bot`).
+    fn exit_call_bot_seen(&self, ast: &LoweredAst, id: NodeId, seen: &mut Vec<String>) -> bool {
+        let Node::Call { receiver, method, span, block_span, .. } = ast.get(id) else {
             return false;
         };
+        // A literal block carrying a block-level `break` joins the break's
+        // value into the call's type — `<call> { break }` types `nil`, not
+        // `bot`, whatever the call resolves to (`Kernel.exit { break }`,
+        // `loop { break }`, `exec("ls") { break }`, `Process.exit { break }`,
+        // `die { break }` all keep the arm live on the oracle). Receiverless
+        // `raise`/`throw`/`exit`/`abort`/`fail` never reach this from a
+        // SYNTACTIC position — `stmt_exits_at`'s `EXIT_CALLS` arm (and
+        // `stmt_terminates`'s `syntactic` half) answers them first, matching
+        // `branch_unconditionally_exits?`, which does not look at the block.
+        if block_span.is_some_and(|bs| self.block_level_break(ast, bs)) {
+            return false;
+        }
         // `def_exits` first: without a same-file toplevel def it is an
         // index miss, while `self_answers` walks the call's containers.
         self.kernel_call_terminates(ast, id)
             || (receiver.is_none()
-                && self.def_exits(ast, id, &mut Vec::new())
+                && self.def_exits(ast, id, seen)
                 && !self.self_answers(ast, *span, method))
+            || self.kernel_sig_bot(ast, id)
+            || self.const_receiver_call_bot(ast, id)
     }
+
+    /// `branch_terminates?`'s Bot half for the Kernel functions
+    /// [`Self::kernel_call_terminates`]'s name table does not hold
+    /// (rigor-rs#1011):
+    ///
+    /// - `exec` — every overload returns `bot` (`Kernel#exec`).
+    /// - `sleep` — `bot` off the arity-1 `(_Timeout) -> Integer` overload:
+    ///   `sleep` and `sleep(1, 2)` type `bot`, `sleep(1)` types `Integer`.
+    ///   The arg itself does not select (`sleep("x")` answers `Integer`
+    ///   too); a literal `nil` picks the `?nil` overload back to `bot`.
+    /// - `loop` — `() { () -> void } -> bot` when the literal block can
+    ///   provably not end the call: `loop_may_complete?` (rigor#1107),
+    ///   ported as [`stop_iteration_free`] over the body. A `&expr` pass
+    ///   has no body to prove (`loop(&e)` → `Dynamic`), a declared
+    ///   parameter CLAUSE declines even when empty (`loop { || }` —
+    ///   `block.parameters` may carry a raising default), and a
+    ///   block-level `break` joins its value into the call's type
+    ///   upstream in [`Self::exit_call_bot_seen`]. `next`/`redo`/`return`
+    ///   keep `bot` (`loop { return }` is `bot` — it escapes the method,
+    ///   not the call).
+    ///
+    /// The dispatch gate is [`Self::toplevel_def_binds`]'s: an explicit
+    /// `Kernel.`/`::Kernel.` always reaches Kernel's singleton; an
+    /// implicit-self call binds a project TOPLEVEL `def` instead (probed:
+    /// `def loop; nil; end` + `loop {}` types `nil` — the def's own
+    /// return), while a `def` on an unrelated or own class does not veto
+    /// (same rows as `def exit!`).
+    fn kernel_sig_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        let Node::Call {
+            receiver,
+            method,
+            args,
+            block_body,
+            block_span,
+            block_param_clause,
+            args_plain_positional,
+            span,
+            ..
+        } = ast.get(id)
+        else {
+            return false;
+        };
+        if !self.kernel_spelled_receiver(ast, *receiver) {
+            return false;
+        }
+        let kernel_reached =
+            receiver.is_some() || !self.toplevel_def_binds(ast, *span, method);
+        match method.as_str() {
+            "exec" => kernel_reached,
+            "sleep" => {
+                kernel_reached
+                    && *args_plain_positional
+                    && match args.as_slice() {
+                        [] | [_, _, ..] => true,
+                        // `sleep(nil)` re-picks the `(?nil) -> bot` overload.
+                        [arg] => matches!(ast.get(*arg), Node::NilLit { .. }),
+                    }
+            }
+            "loop" => {
+                kernel_reached
+                    && block_span.is_some()
+                    && !*block_param_clause
+                    && block_body
+                        .iter()
+                        .all(|&b| stop_iteration_free(ast, b))
+            }
+            _ => false,
+        }
+    }
+
+    /// `branch_terminates?`'s Bot half for a `<Const>.m` call (rigor-rs#1011):
+    /// on the oracle `Process.exit`, `String.exit`, `Object.exit` — any
+    /// resolvable constant that does not declare `exit` itself — resolve
+    /// the method on the class object's singleton surface, where
+    /// `Kernel#exit`/`Kernel#exec` wait through `Object`. [`CoreData::
+    /// singleton_member_bot_definer`] walks that surface; `Kernel#loop`
+    /// (`String.loop {}` is `bot` — the StopIteration veto is the
+    /// KERNEL-SPELLED spellings' alone, `String.loop { foo }` stays `bot`)
+    /// and `Kernel#sleep` ride their own rules.
+    ///
+    /// Every miss declines to the arm-live side: a dynamic base
+    /// (`x::Kernel.exit`), a `::`-qualified path (unported), a shadowed or
+    /// project-only constant (`Foo.exit` types `Dynamic` even beside
+    /// `class Foo; end` — a project class is not on the RBS surface, and a
+    /// project `def self.exit` on `module Bar` binds `Bar.exit` to `nil`),
+    /// and a member the surface does not declare (`String.die` →
+    /// `Dynamic`).
+    fn const_receiver_call_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        let Node::Call {
+            receiver: Some(r),
+            method,
+            args,
+            block_body,
+            block_span,
+            args_plain_positional,
+            ..
+        } = ast.get(id)
+        else {
+            return false;
+        };
+        let Node::ConstantRead { name, dynamic_base, span, .. } = ast.get(*r) else {
+            return false;
+        };
+        // The `Kernel` spellings themselves stay with
+        // [`Self::kernel_call_terminates`] / [`Self::kernel_sig_bot`], which
+        // carry the receiver vetoes (`Kernel.loop { break }` declines
+        // through the StopIteration whitelist this arm would bypass).
+        if *dynamic_base || name.is_empty() || name.contains("::") || name.as_str() == "Kernel" {
+            return false;
+        }
+        let prefix = self.enclosing_prefix_in(ast, *span);
+        if !self.index.knows_toplevel_class(name) || self.source.constant_shadowed(name, &prefix)
+        {
+            return false;
+        }
+        let Some((definer, all_bot)) = self.index.singleton_member_bot_definer(name, method)
+        else {
+            return false;
+        };
+        all_bot
+            || (definer == "Kernel"
+                && method == "loop"
+                && (block_span.is_some() || !block_body.is_empty()))
+            || (definer == "Kernel"
+                && method == "sleep"
+                && *args_plain_positional
+                && match args.as_slice() {
+                    [] | [_, _, ..] => true,
+                    [arg] => matches!(ast.get(*arg), Node::NilLit { .. }),
+                })
+    }
+
+
 
     /// Whether an implicit-self `method` call at `site` binds a project
     /// TOPLEVEL `def` on the reference: the project's `<toplevel>` table
@@ -1908,17 +2064,7 @@ impl<'i> Typer<'i> {
         bot: bool,
     ) -> bool {
         match ast.get(value) {
-            Node::Call {
-                receiver,
-                method,
-                span,
-                ..
-            } => {
-                self.kernel_call_terminates(ast, value)
-                    || (receiver.is_none()
-                        && !self.self_answers(ast, *span, method)
-                        && self.def_exits(ast, value, seen))
-            }
+            Node::Call { .. } => self.exit_call_bot_seen(ast, value, seen),
             _ if bot => self.stmt_bot(ast, value, seen),
             _ => self.stmt_exits_at(ast, value, seen, false),
         }
@@ -1984,18 +2130,11 @@ impl<'i> Typer<'i> {
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, true),
             Node::Logical { left, .. } => self.stmt_bot(ast, *left, seen),
             Node::Call {
-                receiver,
-                method,
-                args,
-                span,
-                ..
+                receiver, args, ..
             } => {
                 receiver.is_some_and(|r| self.stmt_bot(ast, r, seen))
                     || args.iter().any(|&a| self.stmt_bot(ast, a, seen))
-                    || self.kernel_call_terminates(ast, id)
-                    || (receiver.is_none()
-                        && !self.self_answers(ast, *span, method)
-                        && self.def_exits(ast, id, seen))
+                    || self.exit_call_bot_seen(ast, id, seen)
             }
             _ => false,
         }
@@ -2081,6 +2220,76 @@ fn never_hash_shape(ast: &LoweredAst, arg: NodeId) -> bool {
             | Node::Range { .. }
             | Node::Lambda { .. }
     )
+}
+
+/// `BlockCallTiming::STOP_ITERATION_FREE_NODES` on the lowered arena —
+/// the shapes a `loop` body may consist of while provably unable to
+/// raise `StopIteration` (`may_raise_stop_iteration?`): a call,
+/// `yield`, `super`, interpolation, a splat, a constant read
+/// (`const_missing`), a `rescue`, a loop/`def`/class/lambda, a
+/// gvar/cvar access, or any unlisted shape all decline. Whitelisted
+/// carriers descend their children — a `break e.next` declines through
+/// the `e.next` call.
+fn stop_iteration_free(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        Node::Statements { body, kind, .. } => match kind {
+            StatementsKind::Sequence => body.iter().all(|&b| stop_iteration_free(ast, b)),
+            // `BreakNode`/`NextNode`/`RedoNode` whitelist the jump;
+            // `retry` re-runs a `begin` (`RetryNode` is not one) and
+            // the recovery carriers flatten their children out of
+            // shape.
+            StatementsKind::Jump(JumpKind::Break | JumpKind::Next | JumpKind::Redo) => {
+                body.iter().all(|&b| stop_iteration_free(ast, b))
+            }
+            _ => false,
+        },
+        Node::Other { jump, .. } => {
+            matches!(jump, Some(JumpKind::Break | JumpKind::Next | JumpKind::Redo))
+        }
+        Node::Return { values, .. } => values.iter().all(|&v| stop_iteration_free(ast, v)),
+        // `ParenthesesNode` — a clause-less `begin` is a real
+        // `begin…end` or an `else`/carrier (`BeginNode` is not
+        // whitelisted), so only the paren carrier descends.
+        Node::BeginRescue { main_body, clauses, .. } => {
+            clauses.is_empty()
+                && ast.is_paren_carrier(id)
+                && main_body.iter().all(|&b| stop_iteration_free(ast, b))
+        }
+        Node::IntegerLit { .. }
+        | Node::FloatLit { .. }
+        | Node::RationalLit { .. }
+        | Node::ImaginaryLit { .. }
+        | Node::StringLit { .. }
+        | Node::SymbolLit { .. }
+        | Node::NilLit { .. }
+        | Node::TrueLit { .. }
+        | Node::FalseLit { .. }
+        | Node::SelfExpr { .. }
+        | Node::LocalVariableRead { .. } => true,
+        // `InstanceVariableReadNode` lowers to `VariableRead` — ivar
+        // sigils only (`@@c` / `$g` are not whitelisted).
+        Node::VariableRead { name, .. } => is_ivar(name),
+        Node::LocalVariableWrite { value, .. } | Node::InstanceVariableWrite { value, .. } => {
+            stop_iteration_free(ast, *value)
+        }
+        Node::If {
+            predicate,
+            then_body,
+            else_body,
+            ..
+        } => {
+            stop_iteration_free(ast, *predicate)
+                && then_body.iter().all(|&b| stop_iteration_free(ast, b))
+                && else_body.iter().all(|&b| stop_iteration_free(ast, b))
+        }
+        Node::Logical { left, right, .. } => {
+            stop_iteration_free(ast, *left) && stop_iteration_free(ast, *right)
+        }
+        Node::ArrayLit { elements, .. } => {
+            elements.iter().all(|&e| stop_iteration_free(ast, e))
+        }
+        _ => false,
+    }
 }
 
 impl<'i> Typer<'i> {

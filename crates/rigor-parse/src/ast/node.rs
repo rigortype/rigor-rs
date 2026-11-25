@@ -409,6 +409,15 @@ pub enum Node {
         /// env must NOT read an outer local through one of these names —
         /// `{ |v| break v }` reads the parameter, not an outer `v`.
         block_params: Vec<(String, BlockParamKind)>,
+        /// Whether the attached literal block declares a parameter CLAUSE —
+        /// Prism `BlockNode#parameters` — even an empty or locals-only one
+        /// (`{ || }`, `{ |;l| }`), a destructured target, or numbered
+        /// `_1.._9` parameters. `Kernel#loop`'s `bot` return stands only
+        /// when no clause is present: a declared parameter's default
+        /// expression may raise, the `block.parameters` veto of
+        /// `STOP_ITERATION_FREE_NODES` (rigor-rs#1011). `false` with no
+        /// literal block and for a `&expr` pass.
+        block_param_clause: bool,
         /// Span of the whole call expression.
         span: Span,
     },
