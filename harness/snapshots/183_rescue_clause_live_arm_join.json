@@ -1,0 +1,96 @@
+{
+  "fixture": "harness/corpus/183_rescue_clause_live_arm_join.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 29,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"s\" | \"t\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 41,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"b\" | \"t\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 52,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"b\" | \"t\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 67,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"e\" | \"t\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 81,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"b\" | \"t\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 82,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"n\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 94,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"a\" | String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 111,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"b\" | \"u\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 125,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"s\" | \"t\" | \"u\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 138,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"a\" | \"b\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 199,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"a\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 214,
+      "column": 3,
+      "severity": "error",
+      "message": "undefined method `w' for \"a\""
+    },
+    {
+      "rule": "flow.shadowed-rescue-clause",
+      "line": 107,
+      "column": 3,
+      "severity": "warning",
+      "message": "shadowed `rescue': every exception class it names is already caught by the earlier `rescue' (line 104) clause, so this clause can never run"
+    }
+  ]
+}
