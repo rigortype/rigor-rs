@@ -2472,8 +2472,10 @@ impl<'i> Typer<'i> {
         // in-closure attribute write is an effect only a site inside that
         // body can observe (rigor-rs#366), but it still requires the
         // boundary + replay path to reach the site at all.
-        let record = !(rebinds.is_empty() && mutations.is_empty() && closure_muts.is_empty())
-            || !retry_edges.is_empty()
+        let record = !(rebinds.is_empty()
+            && mutations.is_empty()
+            && closure_muts.is_empty()
+            && retry_edges.is_empty())
             || dead.has_folded()
             || dead.has_rescue();
         // A boundary env per statement is a full clone of a growing map —
