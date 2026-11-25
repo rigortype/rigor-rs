@@ -37,6 +37,15 @@
 //!   pass binds it from the widened entry. It counts as an edge write of its
 //!   target that reaches in any order, and it kills nothing. Derivation is a
 //!   fixpoint, so `e = d` after `d = c` is derived too.
+//!
+//! rigor-rs#1000 — a kill protects the reads after it only until the next
+//! derived write to the same local: `begin; d = [0]; d = c; d.nope; rescue;
+//! c << 2; retry; end` re-binds `d` from the widened entry at `d = c` on the
+//! second pass, so `d.nope` declines even though `d = [0]` killed the edge
+//! for it. A kill still holds when every derived write to the local runs
+//! before it (`d = c; d = [0]; d.nope` keeps firing) or past the read's
+//! holder element (`x ? (d = c) : (d.nope)` fires — the `d = c` arm never
+//! runs on the read's path).
 
 use std::collections::{HashMap, HashSet};
 
@@ -73,6 +82,12 @@ struct EdgeWrites {
     /// [`RetryBegin::derive`] has found every derived write; `false` until
     /// then, which takes the checked path.
     kill_free: bool,
+    /// rigor-rs#1000 — the start offsets of this local's derived writes (the
+    /// module doc), in discovery order. A kill of this local protects the
+    /// reads after it only until the next derived write: the second pass
+    /// binds the derived write's target from the widened entry, so the edge
+    /// reaches a read the earlier kill once covered.
+    derived_starts: Vec<usize>,
 }
 
 /// A statement list inside a [`RetryBegin`].
@@ -85,10 +100,15 @@ struct StmtList {
 }
 
 impl StmtList {
-    /// The index of the first element that kills `name`, skipping the
-    /// derived writes.
-    fn first_kill(&self, name: &str, derived: &HashSet<Span>) -> Option<usize> {
-        self.kills.get(name)?.iter().find(|(_, s)| !derived.contains(s)).map(|&(i, _)| i)
+    /// The span of the last element before `holder` that kills `name`,
+    /// skipping the derived writes.
+    fn last_kill_before(&self, name: &str, holder: usize, derived: &HashSet<Span>) -> Option<Span> {
+        self.kills
+            .get(name)?
+            .iter()
+            .rev()
+            .find(|(i, s)| *i < holder && !derived.contains(s))
+            .map(|&(_, s)| s)
     }
 }
 
@@ -152,9 +172,12 @@ impl RetryEdges {
                 let w = ast.get(n).span();
                 if let Some(name) = index_write_local(ast, n) {
                     if regions.iter().any(|&r| within(w, r)) && !nested.iter().any(|&s| within(w, s)) {
-                        let e = by_name
-                            .entry(name)
-                            .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false, kill_free: false });
+                        let e = by_name.entry(name).or_insert_with(|| EdgeWrites {
+                            starts: Vec::new(),
+                            rebind: false,
+                            kill_free: false,
+                            derived_starts: Vec::new(),
+                        });
                         e.starts.push(w.0);
                         e.rebind = true;
                     }
@@ -165,9 +188,12 @@ impl RetryEdges {
                     && !nested.iter().any(|&s| within(w, s))
                     && seen.insert((w, name))
                 {
-                    let e = by_name
-                        .entry(name)
-                        .or_insert_with(|| EdgeWrites { starts: Vec::new(), rebind: false, kill_free: false });
+                    let e = by_name.entry(name).or_insert_with(|| EdgeWrites {
+                        starts: Vec::new(),
+                        rebind: false,
+                        kill_free: false,
+                        derived_starts: Vec::new(),
+                    });
                     e.starts.push(w.0);
                     e.rebind |= rebind_set.contains(&(w, name));
                 }
@@ -187,7 +213,7 @@ impl RetryEdges {
             let mut begin = RetryBegin { span: *span, writes, lists, derived: HashSet::new() };
             begin.derive(ast, &idx, &nested);
             // With `derived` final, a local whose every kill is derived can
-            // never be killed ([`StmtList::first_kill`] skips derived
+            // never be killed ([`StmtList::last_kill_before`] skips derived
             // spans): mark it so `reaches` answers without the kill scan
             // (rigor-rs#1003).
             for (name, w) in &mut begin.writes {
@@ -339,13 +365,18 @@ impl RetryBegin {
         }
     }
 
-    /// Record a write of `name` at `start` that reaches every read in any
-    /// order ([`EdgeWrites::rebind`]).
+    /// Record a derived write of `name` at `start` that reaches every read
+    /// in any order ([`EdgeWrites::rebind`]).
     fn add_reaching_write(&mut self, name: &str, start: usize) {
         let i = match self.writes.binary_search_by(|(n, _)| n.as_str().cmp(name)) {
             Ok(i) => i,
             Err(i) => {
-                let fresh = EdgeWrites { starts: Vec::new(), rebind: false, kill_free: false };
+                let fresh = EdgeWrites {
+                    starts: Vec::new(),
+                    rebind: false,
+                    kill_free: false,
+                    derived_starts: Vec::new(),
+                };
                 self.writes.insert(i, (name.to_string(), fresh));
                 i
             }
@@ -354,6 +385,7 @@ impl RetryBegin {
         if let Err(k) = e.starts.binary_search(&start) {
             e.starts.insert(k, start);
         }
+        e.derived_starts.push(start);
         e.rebind = true;
     }
 
@@ -392,10 +424,17 @@ impl Chain<'_> {
     /// or lies in no element before the read's in a list of the chain.
     fn reaches(&self, site: Span, name: &str, w: &EdgeWrites, derived: &HashSet<Span>) -> bool {
         if !w.kill_free {
-            let killed = self
-                .links
-                .iter()
-                .any(|(l, j)| l.first_kill(name, derived).is_some_and(|k| k < *j));
+            let killed = self.links.iter().any(|(l, j)| {
+                let Some(kill) = l.last_kill_before(name, *j, derived) else {
+                    return false;
+                };
+                // rigor-rs#1000 — the kill holds only until a derived write
+                // of `name` runs between it and the read: the second pass
+                // binds that write's target from the widened entry, so the
+                // edge reaches after all. `begin; d = [0]; d = c; d.nope;
+                // rescue; c << 2; retry; end` is silent on the oracle.
+                !w.derived_starts.iter().any(|&d| d >= kill.1 && self.before_holder(d))
+            });
             if killed {
                 return false;
             }
@@ -418,6 +457,17 @@ impl Chain<'_> {
             .map(|(l, j)| count(l.elems[0].0, l.elems[j - 1].1))
             .sum();
         ordered < w.starts.len()
+    }
+
+    /// Whether `start` lies inside an element strictly before the holder of
+    /// a chain link — a statement every path to the read runs before it.
+    /// Writes inside the holder element itself are not covered: a derived
+    /// write in a sibling arm (`x ? (d = c) : (d.nope)`) does not run on the
+    /// read's path (rigor-rs#1000).
+    fn before_holder(&self, start: usize) -> bool {
+        self.links
+            .iter()
+            .any(|(l, j)| *j > 0 && l.elems[0].0 <= start && start <= l.elems[j - 1].1)
     }
 }
 
