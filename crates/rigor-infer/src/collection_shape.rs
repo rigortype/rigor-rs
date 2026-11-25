@@ -125,7 +125,7 @@ impl<'i> Typer<'i> {
         }
         // rigor-rs#972 — a receiver read inside a retrying `begin` that the
         // retry edge reaches with a write this walk saw out of order, or not
-        // at all: the re-run below (`coll_flow_begin_rescue`) replays the
+        // at all: the retry re-run (`coll_flow_begin_rescue`) replays the
         // body over the retrying arm's post-scope only, so it misses the
         // body's own later writes (`raise_scopes`), and a clause or `else`
         // is walked once over the plain entry. The reference reads the
