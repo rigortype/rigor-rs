@@ -1329,6 +1329,24 @@ impl<'i> Typer<'i> {
         jumps
     }
 
+    /// Whether the literal block at `block_span` carries a block-level
+    /// `break` — one retargeted onto the yielding call, not into a nested
+    /// boundary. `Kernel#loop`'s declared `bot` stands down when one is
+    /// present: the loop returns the `break`'s value (`loop { break }`
+    /// types `nil` on the oracle, `loop { break 5 }` `Integer`).
+    /// `next`/`redo` re-enter the loop and a `return` escapes the method —
+    /// neither completes the call (`loop { next }` / `loop { return }`
+    /// stay `bot`).
+    pub(crate) fn block_level_break(
+        &self,
+        ast: &LoweredAst,
+        block_span: rigor_parse::Span,
+    ) -> bool {
+        self.block_level_jumps(ast, block_span)
+            .iter()
+            .any(|j| matches!(j.kind, JumpKind::Break))
+    }
+
     /// `call_break_arm_types` — the types the block-level `break`s carry out of
     /// the call, in source order. A bare `break` carries `nil`. A `break` on a
     /// branch the analysis proved dead contributes nothing (the reference's

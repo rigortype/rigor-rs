@@ -3265,20 +3265,18 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
         Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
             matches!(kind, JumpKind::Next | JumpKind::Break)
         }
+
         // `EXIT_CALL_NAMES` (`raise throw exit abort fail`,
         // statement_evaluator.rb:9666) in a syntactic position, else the
         // type half: Kernel's signature returns `bot` unless a project
         // toplevel `def` of the name binds the call (`def raise; end` types
         // it `nil` — rigor-rs#966), which [`Typer::exit_call_bot`]
-        // answers. `exit!` is absent from the syntactic set, so only its
-        // type ever speaks.
+        // answers. `exit!` is absent from the syntactic set — its type
+        // speaks through the general call arm below.
         Node::Call { receiver: None, method, .. }
-            if matches!(
-                method.as_str(),
-                "raise" | "throw" | "exit" | "exit!" | "abort" | "fail"
-            ) =>
+            if matches!(method.as_str(), "raise" | "throw" | "exit" | "abort" | "fail") =>
         {
-            (syntactic && method != "exit!") || t.exit_call_bot(ast, id)
+            syntactic || t.exit_call_bot(ast, id)
         }
         // A clause-less `BeginRescue` is a reused carrier (a parenthesised
         // group, an `else` clause, a `case`/`in` arm — `main_body == body`
@@ -3331,6 +3329,17 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
         } if *attribute_write && !*safe_nav => {
             args.last().is_some_and(|&v| stmt_terminates(t, ast, v, false))
         }
+        // `branch_terminates?`'s Bot half for every other call shape
+        // (rigor-rs#1011 — placed AFTER the attribute-write arm so a
+        // setter's `=` name never reaches it): `exit!` and any other
+        // receiverless name a same-file toplevel `def` answers with a
+        // `bot` body (`def die; raise; end` — `def_exits` is
+        // name-agnostic), the `bot`-returning Kernel functions
+        // (`exec`, `sleep` off its arity-1 overload, `loop` with a
+        // StopIteration-free block — `rescue; x = "t"; loop do nil end`),
+        // and a resolvable constant receiver's all-`bot` member
+        // (`Kernel.raise`, `::Kernel.exit`, `Process.exit`).
+        Node::Call { .. } => t.exit_call_bot(ast, id),
         // `branch_unconditionally_exits?` recurses into `if`/`unless` only
         // when BOTH arms exit — an `if` with no else falls through on the
         // falsey edge, so it never qualifies

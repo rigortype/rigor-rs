@@ -244,3 +244,150 @@ fn if_frame_exit_tests_follow_the_oracle() {
         (false, false, false)
     );
 }
+
+/// rigor-rs#1011 — `branch_terminates?`'s Bot half for the call shapes the
+/// non-returning name table does not reach. `def_exits` is name-agnostic
+/// (`def die; raise; end` answers for `die`), `exec`/`sleep`/`loop` ride
+/// their own `bot` overloads, and a resolvable constant receiver's
+/// all-`bot` member covers `Kernel.exit`, `::Kernel.exit`, `Process.exit`
+/// (and `String.exit` — every class object inherits `Kernel#exit`). Every
+/// expectation below is the oracle's answer on the `rescue q = 1; <call>`
+/// arm template.
+#[test]
+fn arbitrary_bot_call_terminates() {
+    // A receiverless name a toplevel `def` answers with a `bot` body.
+    assert!(rescue_arm_exits(&[&top("def die; raise; end", "die")], 0));
+    assert!(rescue_arm_exits(&[&in_def("def die; raise; end", "die")], 0));
+    // A non-exiting body — or `self` answering the name first — keeps it
+    // live.
+    assert!(!rescue_arm_exits(&[&top("def die; nil; end", "die")], 0));
+    assert!(!rescue_arm_exits(
+        &[&in_def("def die; raise; end\nclass C; def die; end; end", "die")],
+        0
+    ));
+    // The explicit-receiver Kernel exits — `Kernel.` and `::Kernel.` reach
+    // the member directly, and every class object inherits `Kernel#exit`
+    // through the class object's own ancestry (`Process`, `String`,
+    // `Object`).
+    for call in ["Kernel.exit", "::Kernel.exit", "Kernel.raise", "Process.exit", "String.exit", "Object.exit"] {
+        assert!(rescue_arm_exits(&[&top("", call)], 0), "{call}");
+    }
+    // `Thread.exit` — Thread's own `def self.exit: untyped` shadows
+    // `Kernel#exit` on the surface.
+    assert!(!rescue_arm_exits(&[&top("", "Thread.exit")], 0));
+    // The decline side: an unknown constant, a project class (not on the
+    // RBS surface), a module's own `def self.exit`, a member nobody
+    // declares, and a receiver the walk cannot resolve to a constant.
+    for (prelude, call) in [
+        ("", "UndefinedConst.exit"),
+        ("class Foo; end", "Foo.exit"),
+        ("module Bar; def self.exit; nil; end; end", "Bar.exit"),
+        ("def die; raise; end", "String.die"),
+        ("", "self.exit"),
+        ("", "1.exit"),
+        ("", "obj.exit"),
+        ("", "String.loop"),
+        ("", "catch"),
+    ] {
+        assert!(!rescue_arm_exits(&[&top(prelude, call)], 0), "{prelude} / {call}");
+    }
+}
+
+/// rigor-rs#1011 — `Kernel#exec`, `Kernel#sleep` and `Kernel#loop` carry
+/// `bot` signatures that are not in the non-returning name table. `exec`
+/// is `bot` on every overload; `sleep` only off its arity-1 `(_Timeout)
+/// -> Integer` overload (`sleep(1)` types `Integer` — a `bot | Integer`
+/// disagreement that must not mark the member all-`bot`); `loop` is `bot`
+/// only while its literal block cannot end the call.
+#[test]
+fn kernel_signature_bot_calls() {
+    for call in ["exec", "Kernel.exec", "Process.exec", "sleep", "sleep(1, 2)", "sleep(nil)", "Kernel.sleep", "String.sleep", "String.sleep(1, 2)"] {
+        assert!(rescue_arm_exits(&[&top("", call)], 0), "{call}");
+    }
+    for (prelude, call) in [
+        ("", "sleep(1)"),
+        ("", "String.sleep(1)"),
+        ("", "sleep *a"),
+        ("def exec; nil; end", "exec"),
+        ("def sleep; nil; end", "sleep"),
+    ] {
+        assert!(!rescue_arm_exits(&[&top(prelude, call)], 0), "{prelude} / {call}");
+    }
+    // `class C; def exec` does not veto a toplevel or in-def `exec` — only
+    // a TOPLEVEL def binds the implicit call.
+    assert!(rescue_arm_exits(&[&in_def("class C; def exec; end; end", "exec")], 0));
+}
+
+/// rigor-rs#1011 (rigor#1107) — `loop`'s `bot` stands while the literal
+/// block provably cannot raise `StopIteration` AND carries no block-level
+/// `break`: `STOP_ITERATION_FREE_NODES` ported as
+/// `Typer::stop_iteration_free` (any call — even `raise` — declines: the
+/// receiver/argument could iterate), plus `Typer::block_level_break` for
+/// `break`'s value join. A `&expr` pass has no body to prove, and a
+/// declared parameter's default may raise.
+#[test]
+fn kernel_loop_bot_needs_a_stop_iteration_free_block() {
+    for call in [
+        "loop do nil end",
+        "loop { nil; nil }",
+        "loop { next }",
+        "loop { redo }",
+        "loop { return }",
+        "loop { x = 1 }",
+        "loop { @i = 1 }",
+        "loop { next x = 1 }",
+        "String.loop { foo }",
+        "String.loop(&e)",
+        "::Kernel.loop { nil }",
+    ] {
+        assert!(rescue_arm_exits(&[&top("", call)], 0), "{call}");
+    }
+    for (prelude, call) in [
+        ("", "loop { break }"),
+        ("", "loop { break 5 }"),
+        ("", "loop { break if rand > 0 }"),
+        ("", "loop { |x| nil }"),
+        ("", "loop(&e)"),
+        ("", "loop { foo }"),
+        ("", "loop { raise }"),
+        ("", "loop { exit }"),
+        ("", "loop { 1 + 1 }"),
+        ("", "loop { x.nope }"),
+        ("", "loop { while true; end }"),
+        ("", "loop { [1].each { break } }"),
+        ("", "loop { @i += 1 }"),
+        ("", "loop { Foo }"),
+        ("", "loop { $g }"),
+        ("", "loop"),
+        ("", "String.loop"),
+        ("def loop; nil; end", "loop {}"),
+    ] {
+        assert!(!rescue_arm_exits(&[&top(prelude, call)], 0), "{prelude} / {call}");
+    }
+    // A `def` on an unrelated or own class does not bind the implicit
+    // `loop` — `C#loop` is not the receiver's answer here either (the
+    // oracle's `loop {}` in `def m` of `class C; def loop` still types
+    // `bot`).
+    assert!(rescue_arm_exits(&[&in_def("class C; def loop; nil; end; end", "loop {}")], 0));
+}
+
+/// rigor-rs#1011 — the folded `if` arms reach the same predicate:
+/// `branch_terminates?` (syntactic) and `value_branch_terminates?` (typed)
+/// both see a `bot` call's termination.
+#[test]
+fn folded_if_arms_see_the_extended_bot_calls() {
+    let (then_t, else_t, _) = if_arms("if rand > 0\n  Kernel.exit\nelse\n  x = \"t\"\n  Kernel.exit\nend\n");
+    assert!(then_t);
+    assert!(else_t);
+    let (then_t, else_t, _) = if_arms("if rand > 0\n  Process.exit\nelse\n  x = \"t\"\n  loop do nil end\nend\n");
+    assert!(then_t);
+    assert!(else_t);
+    let (then_t, else_t, _) =
+        if_arms("def die; raise; end\nif rand > 0\n  die\nelse\n  x = \"t\"\n  die\nend\n");
+    assert!(then_t);
+    assert!(else_t);
+    // The decline side in the same frame.
+    let (then_t, else_t, _) = if_arms("if rand > 0\n  Thread.exit\nelse\n  x = \"t\"\n  loop { break }\nend\n");
+    assert!(!then_t);
+    assert!(!else_t);
+}

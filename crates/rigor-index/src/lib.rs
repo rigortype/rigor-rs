@@ -357,6 +357,19 @@ impl CoreIndex {
         self.data.is_module(class_name)
     }
 
+    /// The first declarer of `method` on `class_name`'s singleton surface,
+    /// and whether it returns `bot` on every overload — the
+    /// `branch_terminates?` Bot half for a `<Const>.m` tail
+    /// (`Process.exit` ⇒ `Kernel#exit`, rigor-rs#1011). See
+    /// [`rbs::CoreData::singleton_member_bot_definer`].
+    pub fn singleton_member_bot_definer(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        self.data.singleton_member_bot_definer(class_name, method)
+    }
+
     /// Whether `qname` (spelled as the QUALIFIED registry files it) was declared
     /// as an RBS `module` — the faithful shape of the reference
     /// `Environment#rbs_module?`, which looks the parsed name up exactly. See

@@ -176,6 +176,7 @@ fn blank_unbuildable(entry: &mut ClassEntry, instance: bool, singleton: bool) {
         entry.block_returns.clear();
         entry.block_free_returns.clear();
         entry.void_methods.clear();
+        entry.bot_methods.clear();
         entry.aliases.clear();
     }
     if singleton {
@@ -186,6 +187,7 @@ fn blank_unbuildable(entry: &mut ClassEntry, instance: bool, singleton: bool) {
         entry.overloading_singleton_overloads.clear();
         entry.singleton_block_free_returns.clear();
         entry.void_singleton_methods.clear();
+        entry.bot_singleton_methods.clear();
         entry.nilable_singleton_methods.clear();
         entry.singleton_aliases.clear();
     }
@@ -257,32 +259,37 @@ struct MethodMemo {
 /// before the first-write-wins merge and folded in after it.
 struct OverloadMerge {
     /// `(name, singleton?, reopen slot, reopen void?)`.
-    reopens: Vec<(&'static str, bool, MethodSlot, bool)>,
-    /// `(name, singleton?, original slot, original void?, original
-    /// private?)` for a key the target slot holds only a reopen for.
-    late: Vec<(&'static str, bool, MethodSlot, bool, bool)>,
+    reopens: Vec<(&'static str, bool, MethodSlot, bool, bool)>,
+    /// `(name, singleton?, original slot, original void?, original bot?,
+    /// original private?)` for a key the target slot holds only a reopen
+    /// for.
+    late: Vec<(&'static str, bool, MethodSlot, bool, bool, bool)>,
 }
 
 impl OverloadMerge {
     fn take(slot: Option<&ClassEntry>, entry: &mut ClassEntry) -> Self {
         let mut reopens = Vec::new();
-        for (k, v, void) in std::mem::take(&mut entry.overloading_methods) {
-            reopens.push((k, false, v, void));
+        for (k, v, void, bot) in std::mem::take(&mut entry.overloading_methods) {
+            reopens.push((k, false, v, void, bot));
         }
-        for (k, v, void) in std::mem::take(&mut entry.overloading_singletons) {
-            reopens.push((k, true, v, void));
+        for (k, v, void, bot) in std::mem::take(&mut entry.overloading_singletons) {
+            reopens.push((k, true, v, void, bot));
         }
         let mut late = Vec::new();
         if let Some(slot) = slot {
             for &(k, single) in slot.overload_pending.keys() {
-                let (map, voids) = if single {
-                    (&entry.singleton_methods, &entry.void_singleton_methods)
+                let (map, voids, bots) = if single {
+                    (
+                        &entry.singleton_methods,
+                        &entry.void_singleton_methods,
+                        &entry.bot_singleton_methods,
+                    )
                 } else {
-                    (&entry.methods, &entry.void_methods)
+                    (&entry.methods, &entry.void_methods, &entry.bot_methods)
                 };
                 if let Some(&v) = map.get(k) {
                     let private = !single && entry.private_methods.contains(k);
-                    late.push((k, single, v, voids.contains(k), private));
+                    late.push((k, single, v, voids.contains(k), bots.contains(k), private));
                 }
             }
         }
@@ -291,13 +298,22 @@ impl OverloadMerge {
 
     /// Drop the side slots the flat slot alone cannot pick between once a
     /// reopen's overloads join a method's: its tuple, block and block-free
-    /// returns (and `void` unless both sides are `void`).
-    fn clear_side_slots(slot: &mut ClassEntry, k: &'static str, single: bool, void: bool) {
+    /// returns (and `void` / `bot` unless both sides carry the flag).
+    fn clear_side_slots(
+        slot: &mut ClassEntry,
+        k: &'static str,
+        single: bool,
+        void: bool,
+        bot: bool,
+    ) {
         if single {
             slot.singleton_tuple_returns.remove(k);
             slot.singleton_block_free_returns.remove(k);
             if !void {
                 slot.void_singleton_methods.remove(k);
+            }
+            if !bot {
+                slot.bot_singleton_methods.remove(k);
             }
         } else {
             slot.tuple_returns.remove(k);
@@ -306,18 +322,28 @@ impl OverloadMerge {
             if !void {
                 slot.void_methods.remove(k);
             }
+            if !bot {
+                slot.bot_methods.remove(k);
+            }
         }
     }
 
     fn apply(self, slot: &mut ClassEntry) {
-        for (k, single, orig, orig_void, private) in self.late {
-            let Some(reopen_void) = slot.overload_pending.remove(&(k, single)) else {
+        for (k, single, orig, orig_void, orig_bot, private) in self.late {
+            let Some((reopen_void, reopen_bot)) = slot.overload_pending.remove(&(k, single))
+            else {
                 continue;
             };
             let map = if single { &mut slot.singleton_methods } else { &mut slot.methods };
             let Some(&reopen) = map.get(k) else { continue };
             map.insert(k, combine_overloading(orig, reopen));
-            Self::clear_side_slots(slot, k, single, orig_void && reopen_void);
+            Self::clear_side_slots(
+                slot,
+                k,
+                single,
+                orig_void && reopen_void,
+                orig_bot && reopen_bot,
+            );
             if orig_void && reopen_void {
                 if single {
                     slot.void_singleton_methods.insert(k);
@@ -325,11 +351,18 @@ impl OverloadMerge {
                     slot.void_methods.insert(k);
                 }
             }
+            if orig_bot && reopen_bot {
+                if single {
+                    slot.bot_singleton_methods.insert(k);
+                } else {
+                    slot.bot_methods.insert(k);
+                }
+            }
             if private {
                 slot.private_methods.insert(k);
             }
         }
-        for (k, single, reopen, reopen_void) in self.reopens {
+        for (k, single, reopen, reopen_void, reopen_bot) in self.reopens {
             let has_other = if single {
                 slot.singleton_attr_methods.contains(k) || slot.singleton_aliases.contains_key(k)
             } else {
@@ -341,8 +374,17 @@ impl OverloadMerge {
                     map.insert(k, combine_overloading(prev, reopen));
                     match slot.overload_pending.get_mut(&(k, single)) {
                         // A second reopen over a still-missing original.
-                        Some(pv) => *pv &= reopen_void,
-                        None => Self::clear_side_slots(slot, k, single, reopen_void),
+                        Some(pv) => {
+                            pv.0 &= reopen_void;
+                            pv.1 &= reopen_bot;
+                        }
+                        None => Self::clear_side_slots(
+                            slot,
+                            k,
+                            single,
+                            reopen_void,
+                            reopen_bot,
+                        ),
                     }
                 }
                 // An attribute or alias original: existence only.
@@ -353,7 +395,9 @@ impl OverloadMerge {
                 // (or, after the project phase, an unbuildable class).
                 None => {
                     map.insert(k, reopen);
-                    slot.overload_pending.insert((k, single), reopen_void);
+                    slot
+                        .overload_pending
+                        .insert((k, single), (reopen_void, reopen_bot));
                 }
             }
         }
@@ -790,6 +834,18 @@ struct ClassEntry {
     void_methods: HashSet<&'static str>,
     /// The singleton twin of `void_methods` (`def self.x: () -> void`).
     void_singleton_methods: HashSet<&'static str>,
+    /// Instance methods whose EVERY overload declares a `bot` return
+    /// (`Kernel#exit`, `Kernel#exec` — `Kernel#sleep`'s mixed overloads and
+    /// `Kernel#loop`'s block-free overload do not qualify). Same
+    /// first-write-wins reopen discipline as `void_methods`; an overloading
+    /// (`...`) reopen keeps the mark only when both sides are all-bot. Read
+    /// by [`CoreData::singleton_member_bot_definer`]'s bases walk — the
+    /// `branch_terminates?` Bot half for a `<Const>.exit` arm tail
+    /// (rigor-rs#1011).
+    bot_methods: HashSet<&'static str>,
+    /// The singleton twin of `bot_methods` (`def self.x: () -> bot`, and the
+    /// singleton half of `def self?.x`).
+    bot_singleton_methods: HashSet<&'static str>,
     /// rigor-rs#450: singleton methods whose flat return class came from an
     /// `Optional` (`def self.x: () -> String?` ⇒ `String`, nilable) — the nil
     /// bit the instance side keeps in its slot's flag, which the singleton
@@ -834,6 +890,7 @@ struct ClassEntry {
     /// silence. The key `*` stands for an `attr_*` whose `(@ivar)` the port
     /// does not resolve (it types an ivar the port cannot name).
     ivar_types: HashMap<&'static str, RetainedParamType>,
+
     /// `method name -> per-overload positional shapes`, the ATM substrate
     /// (Slice 1). ADDITIVE alongside `methods`: the merged arity/return path
     /// above is untouched; this retains the per-overload, per-parameter detail
@@ -861,20 +918,21 @@ struct ClassEntry {
     /// The singleton twin of `overloading_method_overloads`.
     overloading_singleton_overloads: Vec<(&'static str, Vec<OverloadSignature>)>,
     /// rigor-rs#482 — an overloading reopen's own flat signature (`def
-    /// camelize: () -> Integer | ...`), with its `void` bit. Kept aside like
-    /// `overloading_method_overloads`: the reopen's overloads are prepended
-    /// to the original's, so the merged method's flat slot is the two
-    /// signatures COMBINED ([`combine_overloading`]) — the arity envelopes
-    /// unioned, the return kept only where both agree. The first-write-wins
-    /// `methods` merge used to drop it, typing the original's return alone.
-    overloading_methods: Vec<(&'static str, MethodSlot, bool)>,
+    /// camelize: () -> Integer | ...`), with its `void` and `bot` bits. Kept
+    /// aside like `overloading_method_overloads`: the reopen's overloads are
+    /// prepended to the original's, so the merged method's flat slot is the
+    /// two signatures COMBINED ([`combine_overloading`]) — the arity
+    /// envelopes unioned, the return kept only where both agree. The
+    /// first-write-wins `methods` merge used to drop it, typing the
+    /// original's return alone.
+    overloading_methods: Vec<(&'static str, MethodSlot, bool, bool)>,
     /// The singleton twin of `overloading_methods`.
-    overloading_singletons: Vec<(&'static str, MethodSlot, bool)>,
+    overloading_singletons: Vec<(&'static str, MethodSlot, bool, bool)>,
     /// `(name, singleton?)` keys whose flat slot holds ONLY an overloading
     /// reopen's signature, because no original was merged yet. An original
     /// merged later combines with it instead of losing to it.
-    /// The value is the reopen's `void` bit.
-    overload_pending: HashMap<(&'static str, bool), bool>,
+    /// The value is the reopen's `(void, bot)` bits.
+    overload_pending: HashMap<(&'static str, bool), (bool, bool)>,
     /// `method name -> block-overload return class name`, populated ONLY for
     /// methods that declare a block-bearing overload whose return is a
     /// resolvable concrete class (a `ClassInstanceType` like `Hash#filter { }
@@ -4685,6 +4743,91 @@ impl CoreData {
         (None, false, loaded)
     }
 
+    /// The first declarer of `method` on `class_name`'s SINGLETON surface,
+    /// and whether its declaration returns `bot` on every overload — the
+    /// member half of `branch_terminates?`'s Bot arm for a `<Const>.m` call
+    /// (`Process.exit` hands `exit` to `Kernel#exit` through the class
+    /// object's own ancestry, rigor-rs#1011).
+    ///
+    /// The surface order mirrors [`Self::declared_singleton_return`]'s
+    /// walk: `def self.x` on the own superclass chain first, then an
+    /// `extend`ed module's instance member, then the five base classes'
+    /// instance surface ([`Self::singleton_bases_return`]'s `Class` /
+    /// `Module` / `Object` / `Kernel` / `BasicObject` — `Kernel#exit`
+    /// answers for any class that does not declare `exit` itself). An
+    /// alias hit declares the name but cannot carry the flag
+    /// (`(alias, false)` — decline, the reference may still resolve the
+    /// target). `None` ⇒ nothing on the surface declares `method`, or a
+    /// chain is incomplete — the caller declines either way, never a wrong
+    /// answer.
+    pub fn singleton_member_bot_definer(
+        &self,
+        class_name: &str,
+        method: &str,
+    ) -> Option<(&'static str, bool)> {
+        let mut chain: Vec<&'static str> = Vec::new();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut cur = Some(class_name);
+        while let Some(name) = cur {
+            let (&key, entry) = self.classes.get_key_value(name)?;
+            if !seen.insert(key) {
+                break;
+            }
+            chain.push(key);
+            cur = entry.superclass;
+        }
+        // (1) a direct `def self.x` on any class in the chain.
+        for &anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                if entry.singleton_methods.contains_key(method) {
+                    return Some((anc, entry.bot_singleton_methods.contains(method)));
+                }
+                if entry.singleton_aliases.contains_key(method) {
+                    return Some((anc, false));
+                }
+            }
+        }
+        // (2) an `extend`ed module's instance member, on the same chain.
+        for &anc in &chain {
+            if let Some(entry) = self.classes.get(anc) {
+                for &module in &entry.extends {
+                    if let Some(me) = self.classes.get(module) {
+                        if me.methods.contains_key(method) {
+                            return Some((module, me.bot_methods.contains(method)));
+                        }
+                        if me.aliases.contains_key(method) {
+                            return Some((module, false));
+                        }
+                    }
+                }
+            }
+        }
+        // (3) the class object's own ancestry — the first base whose
+        //     ancestor chain declares `method` (`Kernel#exit` sits inside
+        //     `Class`'s chain already).
+        const BASES: [&str; 5] = ["Class", "Module", "Object", "Kernel", "BasicObject"];
+        for base in BASES {
+            if !self.classes.contains_key(base) {
+                return None;
+            }
+            let (chain, complete) = self.ancestors(base);
+            if !complete {
+                return None;
+            }
+            for anc in chain {
+                if let Some(entry) = self.classes.get(anc) {
+                    if entry.methods.contains_key(method) {
+                        return Some((anc, entry.bot_methods.contains(method)));
+                    }
+                    if entry.aliases.contains_key(method) {
+                        return Some((anc, false));
+                    }
+                }
+            }
+        }
+        None
+    }
+
     /// Find `method`'s `(return, arity)` on the flattened ancestor chain,
     /// resolving instance `alias`es. The first ancestor that defines `method`
     /// directly wins; otherwise, if some ancestor aliases `method -> old`, the
@@ -4837,6 +4980,9 @@ impl CoreData {
                     // The stub declares no `-> void` returns.
                     void_methods: HashSet::new(),
                     void_singleton_methods: HashSet::new(),
+                    // Nor `-> bot` returns.
+                    bot_methods: HashSet::new(),
+                    bot_singleton_methods: HashSet::new(),
                     nilable_singleton_methods: HashSet::new(),
                     // The stub declares everything public.
                     private_methods: HashSet::new(),
@@ -6218,7 +6364,7 @@ impl Builder {
             match member {
                 Node::MethodDefinition(md) => {
                     let mname = intern(md.name().as_str());
-                    let (ret, arity, nilable, ret_instance, ret_self, ret_void) =
+                    let (ret, arity, nilable, ret_instance, ret_self, ret_void, ret_bot) =
                         method_signature(&md, ctx);
                     let block_ret = block_overload_return(&md, ctx);
                     // Collection-shape stage 2a/2c: the return the BLOCK-FREE
@@ -6297,6 +6443,9 @@ impl Builder {
                         if ret_void && !overloading && !entry.methods.contains_key(mname) {
                             entry.void_methods.insert(mname);
                         }
+                        if ret_bot && !overloading && !entry.methods.contains_key(mname) {
+                            entry.bot_methods.insert(mname);
+                        }
                         // Visibility rides the same first-write-wins gate as
                         // `void_methods`: it belongs to the definition being
                         // recorded, so a later reopen must not restate it.
@@ -6319,7 +6468,7 @@ impl Builder {
                             ret
                         };
                         if overloading {
-                            entry.overloading_methods.push((mname, (instance_ret, arity, nilable), ret_void));
+                            entry.overloading_methods.push((mname, (instance_ret, arity, nilable), ret_void, ret_bot));
                         } else {
                             entry.methods.entry(mname).or_insert((instance_ret, arity, nilable));
                             if let Some(br) = block_ret {
@@ -6358,10 +6507,13 @@ impl Builder {
                             entry.nilable_singleton_methods.insert(mname);
                         }
                         if overloading {
-                            entry.overloading_singletons.push((mname, (ret, arity, ret_instance), ret_void));
+                            entry.overloading_singletons.push((mname, (ret, arity, ret_instance), ret_void, ret_bot));
                         } else {
                             if ret_void && !entry.singleton_methods.contains_key(mname) {
                                 entry.void_singleton_methods.insert(mname);
+                            }
+                            if ret_bot && !entry.singleton_methods.contains_key(mname) {
+                                entry.bot_singleton_methods.insert(mname);
                             }
                             if let Some(shapes) = tuple_ret.clone() {
                                 entry.singleton_tuple_returns.entry(mname).or_insert(shapes);
@@ -6612,6 +6764,9 @@ impl Builder {
             if newly && entry.void_methods.contains(k) {
                 slot.void_methods.insert(k);
             }
+            if newly && entry.bot_methods.contains(k) {
+                slot.bot_methods.insert(k);
+            }
             if newly && entry.private_methods.contains(k) {
                 slot.private_methods.insert(k);
             }
@@ -6662,6 +6817,9 @@ impl Builder {
             slot.singleton_methods.entry(k).or_insert(v);
             if newly && entry.void_singleton_methods.contains(k) {
                 slot.void_singleton_methods.insert(k);
+            }
+            if newly && entry.bot_singleton_methods.contains(k) {
+                slot.bot_singleton_methods.insert(k);
             }
         }
         slot.nilable_singleton_methods.extend(entry.nilable_singleton_methods);
@@ -6801,6 +6959,9 @@ impl Builder {
             if newly && entry.void_methods.contains(k) {
                 slot.void_methods.insert(k);
             }
+            if newly && entry.bot_methods.contains(k) {
+                slot.bot_methods.insert(k);
+            }
             if newly && entry.private_methods.contains(k) {
                 slot.private_methods.insert(k);
             }
@@ -6844,6 +7005,9 @@ impl Builder {
             slot.singleton_methods.entry(k).or_insert(v);
             if newly && entry.void_singleton_methods.contains(k) {
                 slot.void_singleton_methods.insert(k);
+            }
+            if newly && entry.bot_singleton_methods.contains(k) {
+                slot.bot_singleton_methods.insert(k);
             }
         }
         slot.nilable_singleton_methods.extend(entry.nilable_singleton_methods);
@@ -7779,7 +7943,7 @@ fn qualified_name(enclosing: &[&'static str], tn: &ruby_rbs::node::TypeNameNode)
 fn method_signature(
     md: &ruby_rbs::node::MethodDefinitionNode,
     ctx: Option<&FileSigCtx>,
-) -> (Option<&'static str>, ArityEnvelope, bool, bool, bool, bool) {
+) -> (Option<&'static str>, ArityEnvelope, bool, bool, bool, bool, bool) {
     let mut min: Option<usize> = None;
     let mut max: Option<usize> = Some(0);
     let mut variadic = false;
@@ -7794,6 +7958,13 @@ fn method_signature(
     let mut ret_instance = false;
     let mut ret_self = false;
     let mut ret_void = false;
+    // `ret_bot` rides the same all-overloads-agree discipline as `ret_void`:
+    // `true` iff EVERY overload declares a `bot` return (`Kernel#exit`,
+    // `Kernel#exec`) — `Kernel#sleep` (`-> bot | (_Timeout) -> Integer`)
+    // and `Kernel#loop` (block-free `-> Enumerator`) disagree and stay
+    // `false`, which is exactly what `branch_terminates?`'s member half
+    // needs (rigor-rs#1011).
+    let mut ret_bot = false;
     let mut ret_seen = false;
 
     for overload in md.overloads().iter() {
@@ -7847,6 +8018,7 @@ fn method_signature(
         // knows). Across overloads, only adopt a return if ALL resolvable
         // overloads agree on class, nil bit AND instance-ness; any
         // disagreement ⇒ leave None (never guess).
+        let this_bot = matches!(ft.return_type(), Node::BottomType(_));
         let (this_ret, this_nilable, this_instance, this_self, this_void) = match ft.return_type() {
             Node::ClassInstanceType(ci) => (member_name(ctx, &ci.name()), false, false, false, false),
             // `-> instance` (M2-GO slice 4): the receiver-class instance.
@@ -7878,21 +8050,24 @@ fn method_signature(
             ret_instance = this_instance;
             ret_self = this_self;
             ret_void = this_void;
+            ret_bot = this_bot;
             ret_seen = true;
         } else if ret != this_ret
             || ret_nilable != this_nilable
             || ret_instance != this_instance
             || ret_self != this_self
             || ret_void != this_void
+            || ret_bot != this_bot
         {
-            // Disagreement on class, nilability, instance-ness or void-ness ⇒
-            // drop the return entirely (and with it every flag), the
-            // conservative choice.
+            // Disagreement on class, nilability, instance-ness, void-ness or
+            // bot-ness ⇒ drop the return entirely (and with it every flag),
+            // the conservative choice.
             ret = None;
             ret_nilable = false;
             ret_instance = false;
             ret_self = false;
             ret_void = false;
+            ret_bot = false;
         }
     }
 
@@ -7908,7 +8083,7 @@ fn method_signature(
     // the `SELF_RETURN` sentinel; the singleton path reads `ret_instance` alone
     // (a singleton `-> self` is the class OBJECT, unspellable here ⇒ declines).
     // When either is set, `ret` is None, so no other consumer changes.
-    (ret, arity, ret_nilable, ret_instance, ret_self, ret_void)
+    (ret, arity, ret_nilable, ret_instance, ret_self, ret_void, ret_bot)
 }
 
 /// The TUPLE return of a method definition, as an ordered element-shape list —
