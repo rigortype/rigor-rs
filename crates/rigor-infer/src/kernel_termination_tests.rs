@@ -118,3 +118,108 @@ fn block_timing_keeps_project_defines_veto() {
     assert!(!typer.call_declares_bot(&ast, call));
     assert!(typer.kernel_call_terminates(&ast, call));
 }
+
+/// rigor-rs#966 — a receiverless `raise` is SYNTACTIC only at the arm's
+/// own tail (`branch_unconditionally_exits?`); in a value position (a
+/// write, a call operand, a nested `if`'s arms) only its type speaks, and a
+/// project toplevel `def raise; end` types it `nil`. Oracle rows on the
+/// `x = "a"; … rescue; x = "e"; <tail>; end; x.w` template: a live arm
+/// answers `for "a" | "e"`, a terminating one `for "a"`.
+#[test]
+fn toplevel_raise_def_vetoes_value_positions_only() {
+    let user = "def raise(*); end";
+    // The arm's own tail stays syntactic: still an exit.
+    assert!(rescue_arm_exits(&[&top(user, "raise")], 0));
+    assert!(rescue_arm_exits(&[&top(user, "(raise)")], 0));
+    // Value positions read the user def's `nil`.
+    for tail in [
+        "@q = raise",
+        "y = raise",
+        "foo(raise)",
+        "if rand > 0; raise; else; raise; end",
+        "begin; raise; ensure; nil; end",
+    ] {
+        assert!(!rescue_arm_exits(&[&top(user, tail)], 0), "{tail}");
+        // Without the user def every one of them exits.
+        assert!(rescue_arm_exits(&[&top("", tail)], 0), "{tail} (no def)");
+    }
+    // A def on an unrelated class does not bind the toplevel call.
+    assert!(rescue_arm_exits(&[&top("class C; def raise(*); end; end", "@q = raise")], 0));
+    // A user def whose own body is `bot` keeps the call `bot`.
+    assert!(rescue_arm_exits(&[&top("def raise(*); Kernel.raise; end", "@q = raise")], 0));
+}
+
+/// rigor-rs#966 — `def_exits` binds the toplevel def only where the call's
+/// arity fits its parameters (`bind_params_from_call_types`); a mismatch
+/// answers `Dynamic[Top]` on the oracle, so the arm stays live.
+#[test]
+fn def_exits_requires_a_fitting_arity() {
+    let cases: &[(&str, &str, bool)] = &[
+        ("def die; raise; end", "@q = die", true),
+        ("def die; raise; end", "@q = die(1)", false),
+        ("def die; raise; end", "die(1)", false),
+        ("def die(a); raise; end", "@q = die(1)", true),
+        ("def die(a); raise; end", "@q = die", false),
+        ("def die(a, b = 1); raise; end", "@q = die(1)", true),
+        ("def die(a, b = 1); raise; end", "@q = die(1, 2)", true),
+        ("def die(a, b = 1); raise; end", "@q = die(1, 2, 3)", false),
+        ("def die(*a); raise; end", "@q = die(1, 2, 3)", true),
+        ("def die(*a, z); raise; end", "@q = die(1, 2, 3)", false),
+        ("def die(k: 1); raise; end", "@q = die", true),
+        ("def die(k:); raise; end", "@q = die", true),
+        // The oracle binds this one (`bot`); the port cannot tell whether
+        // the trailing argument is a keyword `Hash`, so it declines.
+        ("def die(a, k: 1); raise; end", "@q = die(1)", false),
+        ("def die(&b); raise; end", "@q = die", true),
+        ("def die; raise; end", "@q = die(*[])", false),
+    ];
+    for &(prelude, tail, exits) in cases {
+        assert_eq!(rescue_arm_exits(&[&top(prelude, tail)], 0), exits, "{prelude} / {tail}");
+    }
+}
+
+/// The first `if` in `src`, judged by the class-narrowing exit tests.
+fn if_arms(src: &str) -> (bool, bool, bool) {
+    let ast = lower(&parse(src.as_bytes()));
+    let index = CoreIndex::new();
+    let source = SourceIndex::build_project(&[&ast], &index);
+    let typer = Typer::with_source(&index, &source);
+    let (then_body, else_body) = ast
+        .iter()
+        .find_map(|(_, n)| match n {
+            Node::If { then_body, else_body, .. } => Some((then_body.clone(), else_body.clone())),
+            _ => None,
+        })
+        .expect("an if");
+    (
+        crate::class_narrowing::branch_terminates(&typer, &ast, &then_body),
+        crate::class_narrowing::value_branch_terminates(&typer, &ast, &else_body),
+        crate::class_narrowing::branch_certainly_exits(&typer, &ast, &then_body),
+    )
+}
+
+/// rigor-rs#966 — the `if` frame: the body arm keeps the syntactic test,
+/// the `else` arm is typed, and `branch_certainly_exits?` (then beside
+/// else) vetoes on ANY project def of the name (`project_method_name?`).
+#[test]
+fn if_frame_exit_tests_follow_the_oracle() {
+    // No project def: every test sees the exit.
+    assert_eq!(if_arms("if rand > 0\n  raise\nelse\n  raise\nend\n"), (true, true, true));
+    // A toplevel `def raise`: the body arm still exits syntactically; the
+    // else arm types `nil`; the strict then-beside-else test is vetoed.
+    assert_eq!(
+        if_arms("def raise(*); end\nif rand > 0\n  raise\nelse\n  raise\nend\n"),
+        (true, false, false)
+    );
+    // A def on a class: the else arm's implicit call is still Kernel's
+    // `bot`, but `project_method_name?` vetoes the strict test.
+    assert_eq!(
+        if_arms("class C; def raise(*); end; end\nif rand > 0\n  raise\nelse\n  raise\nend\n"),
+        (true, true, false)
+    );
+    // `exit!` is never syntactic.
+    assert_eq!(
+        if_arms("def exit!(*); end\nif rand > 0\n  exit!\nelse\n  exit!\nend\n"),
+        (false, false, false)
+    );
+}

@@ -1806,6 +1806,22 @@ impl<'i> Typer<'i> {
         receiver.is_some() || !self.toplevel_def_binds(ast, *span, method)
     }
 
+    /// The `Bot` half for a receiverless exit-name call in a value position
+    /// (rigor-rs#966): Kernel's `bot` unless a project toplevel `def` binds
+    /// the call ([`Self::kernel_call_terminates`]), and then the bound def's
+    /// own `bot` body ([`Self::def_exits`] — `def raise; Kernel.raise; end`
+    /// keeps the call `bot`). For the walks with no `seen` stack of their
+    /// own (`class_narrowing`'s exit tests).
+    pub(crate) fn exit_call_bot(&self, ast: &LoweredAst, id: NodeId) -> bool {
+        let Node::Call { receiver, method, span, .. } = ast.get(id) else {
+            return false;
+        };
+        self.kernel_call_terminates(ast, id)
+            || (receiver.is_none()
+                && !self.self_answers(ast, *span, method)
+                && self.def_exits(ast, id, &mut Vec::new()))
+    }
+
     /// Whether an implicit-self `method` call at `site` binds a project
     /// TOPLEVEL `def` on the reference: the project's `<toplevel>` table
     /// holds the name and the site's own `self` does not answer it first.

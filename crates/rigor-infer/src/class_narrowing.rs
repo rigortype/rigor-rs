@@ -3269,7 +3269,7 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
         // statement_evaluator.rb:9666) in a syntactic position, else the
         // type half: Kernel's signature returns `bot` unless a project
         // toplevel `def` of the name binds the call (`def raise; end` types
-        // it `nil` — rigor-rs#966), which [`Typer::kernel_call_terminates`]
+        // it `nil` — rigor-rs#966), which [`Typer::exit_call_bot`]
         // answers. `exit!` is absent from the syntactic set, so only its
         // type ever speaks.
         Node::Call { receiver: None, method, .. }
@@ -3278,7 +3278,7 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
                 "raise" | "throw" | "exit" | "exit!" | "abort" | "fail"
             ) =>
         {
-            (syntactic && method != "exit!") || t.kernel_call_terminates(ast, id)
+            (syntactic && method != "exit!") || t.exit_call_bot(ast, id)
         }
         // A clause-less `BeginRescue` is a reused carrier (a parenthesised
         // group, an `else` clause, a `case`/`in` arm — `main_body == body`
