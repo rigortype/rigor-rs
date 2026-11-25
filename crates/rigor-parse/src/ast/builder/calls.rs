@@ -268,6 +268,36 @@ impl<'src> Builder<'src> {
                 .map(|b| b.as_block_argument_node().is_some())
                 .unwrap_or(false);
             let args_all_plain = args_plain_positional && !block_is_pass;
+            // Plain positionals then one bare keyword hash of static-keyed
+            // pairs — `static_hash_shape_for` / `static_hash_key`
+            // (`expression_typer.rb`) type it a `HashShape` (rigor-rs#979).
+            let args_static_kwhash_tail = call.arguments().is_some_and(|a| {
+                let list: Vec<_> = a.arguments().iter().collect();
+                let Some((last, init)) = list.split_last() else {
+                    return false;
+                };
+                let plain = |x: &ruby_prism::Node<'_>| {
+                    x.as_splat_node().is_none()
+                        && x.as_keyword_hash_node().is_none()
+                        && x.as_block_argument_node().is_none()
+                        && x.as_forwarding_arguments_node().is_none()
+                };
+                init.iter().all(plain)
+                    && last.as_keyword_hash_node().is_some_and(|h| {
+                        h.elements().iter().all(|e| {
+                            e.as_assoc_node().is_some_and(|assoc| {
+                                let k = assoc.key();
+                                k.as_symbol_node().is_some_and(|s| s.value_loc().is_some())
+                                    || k.as_string_node().is_some()
+                                    || k.as_integer_node().is_some()
+                                    || k.as_float_node().is_some()
+                                    || k.as_true_node().is_some()
+                                    || k.as_false_node().is_some()
+                                    || k.as_nil_node().is_some()
+                            })
+                        })
+                    })
+            });
             // Lower an attached block so calls/reads inside it reach the walk.
             //   * a BlockNode (`{ … }` / `do…end`) — lower its body statements.
             //   * a `&expr` block-pass (BlockArgumentNode) — lower the passed
@@ -366,6 +396,7 @@ impl<'src> Builder<'src> {
                 first_arg_nonplain,
                 args_plain_positional,
                 args_all_plain,
+                args_static_kwhash_tail,
                 span: span_of(&call.location()),
             });
         }

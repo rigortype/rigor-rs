@@ -58,6 +58,12 @@ pub struct ParamShape {
     /// them (the reference's `bindable_param_shape?` declines a def with
     /// any — rigor-rs#966).
     pub posts: usize,
+    /// The trailing slot is `...` (`def m(a, ...)`), Prism's
+    /// `ForwardingParameterNode` in `keyword_rest` — so `has_kwrest` is set
+    /// too, as the reference's `takes_keywords?` reads it. The toplevel-def
+    /// `bot` proof reads it as a positional rest (`forwarding_params?`,
+    /// rigor-rs#979); the stub renderer does not read it.
+    pub forwarding: bool,
 }
 
 impl ParamShape {
@@ -524,6 +530,9 @@ pub(crate) fn param_shape_of(params: Option<&ruby_prism::ParametersNode<'_>>) ->
         has_kwrest: p.keyword_rest().is_some(),
         has_block: p.block().is_some(),
         posts: p.posts().iter().count(),
+        forwarding: p
+            .keyword_rest()
+            .is_some_and(|k| k.as_forwarding_parameter_node().is_some()),
     }
 }
 

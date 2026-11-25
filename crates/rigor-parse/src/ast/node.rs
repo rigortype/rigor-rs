@@ -354,6 +354,15 @@ pub enum Node {
         /// block (`foo(a) { }`) does not count either. Consumed by
         /// `call.wrong-arity`, which declines when this is `false`.
         args_plain_positional: bool,
+        /// `true` iff the argument list is plain positionals (the
+        /// `args_plain_positional` test) followed by ONE trailing bare
+        /// keyword hash whose every element is an `AssocNode` with a static
+        /// scalar key (`k: v`, `:k => v`, `"a" => v`, `1 => v`; no `**h`) —
+        /// the shape the reference's `static_hash_shape_for` types as a
+        /// `HashShape`, so `bind_params_from_call_types` pops it as the
+        /// keyword hash of a keyword-taking def. Read by the toplevel-def
+        /// `bot` proof (rigor-rs#979).
+        args_static_kwhash_tail: bool,
         /// `true` iff `args_plain_positional` AND the call carries no `&blk`
         /// block-pass — the same plain-positional test over all arguments
         /// (unlike `first_arg_nonplain`, which is first-only) plus Prism's
