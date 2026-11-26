@@ -22,9 +22,10 @@ paren/`&.` residuals #838–#847; mutation seams →#777–#785;
   two only; `coll_arm_terminates` still reads exit names unvetoed.
 - **Retry-edge residuals** #988/#999–#1002/#1009/#1010: the root cause is
   the span-keyed table vs the reference's literal replay — take #1031
-  (port `eval_retried_begin` wholesale) BEFORE piecemeal rows; sigilled
-  kill/ordering holes #1030. Perf: the decline path is cheap (#1005); the
-  fan-out cost is the entry-descend replay quadratic, NOT `declined_names`.
+  (port `eval_retried_begin` wholesale) BEFORE piecemeal rows; #1035 is the
+  alias/kill probe inventory left by #1033. Perf: the decline path is cheap
+  (#1005); the fan-out cost is the entry-descend replay quadratic, NOT
+  `declined_names`.
 - **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-22, `v0.4.8`): **174 fixtures / 0 unregistered**; sweep
