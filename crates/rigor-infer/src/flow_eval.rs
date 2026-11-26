@@ -6058,6 +6058,7 @@ impl<'i> Typer<'i> {
     /// an `&&`/`||`, a nested `if` whose predicate writes `name` — answers
     /// through [`Self::node_scope_ty`] (rigor-rs#998); only the narrowing
     /// the reference's edge scopes carry stays unmodelled here.
+    #[allow(clippy::too_many_arguments)]
     fn arm_scope_ty(
         &self,
         ast: &LoweredAst,
@@ -6106,6 +6107,7 @@ impl<'i> Typer<'i> {
     ///   runs its statements in order;
     /// * anything else contributes the last write inside its span
     ///   ([`Self::last_write_ty`]).
+    #[allow(clippy::too_many_arguments)]
     fn node_scope_ty(
         &self,
         ast: &LoweredAst,

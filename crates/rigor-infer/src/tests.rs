@@ -763,7 +763,7 @@ fn toplevel_check_env_widens_nested_rebinds() {
             .iter()
             .map(|&m| i.get(m).clone())
             .collect::<Vec<_>>(),
-        other => panic!("the next-terminated write joins, got {:?}", other),
+        other => panic!("the next-terminated write joins, got {other:?}"),
     };
     assert_eq!(
         w_members,
