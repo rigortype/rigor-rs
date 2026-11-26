@@ -14,18 +14,18 @@ Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md). Hard byte budget
 ▶ NEXT: ADR-127 floor coverage cost; follow-ups #493/#600/#605,
 paren/`&.` residuals #838–#847; mutation seams →#777–#785;
 #877 residuals #894–#896; #898-review residuals #899–#903.
-- **Exit-predicate family** #955/#957/#964/#965: three syntactic twins of
+- **Exit-predicate family** #955/#964/#965: three syntactic twins of
   `branch_terminates?` — `class_narrowing::stmt_terminates`,
   `dead::stmt_exits`/`stmt_bot`, `collection_shape::coll_arm_terminates`.
   A fix in one leaves the others diverging; change all, or consolidate.
-  #966 (user `def raise` veto, syntactic-vs-type position) reached the first
-  two only; `coll_arm_terminates` still reads exit names unvetoed.
-- **Retry-edge residuals** #988/#999–#1002/#1009/#1010: the root cause is
-  the span-keyed table vs the reference's literal replay — take #1031
-  (port `eval_retried_begin` wholesale) BEFORE piecemeal rows; #1035 is the
-  alias/kill probe inventory left by #1033. Perf: the decline path is cheap
-  (#1005); the fan-out cost is the entry-descend replay quadratic, NOT
-  `declined_names`.
+  #966 reached the first two only; `coll_arm_terminates` still reads exit
+  names unvetoed. #957 closed by #1023.
+- **Retry-edge residuals**: take #1031 (`eval_retried_begin` wholesale)
+  BEFORE piecemeal. Local/ivar replay now sits under the decline overlay —
+  do not drop the overlay until alias/block/`||=` are absorbed. Remaining:
+  #1009 nested kill-after-derived, sigilled ordering, #999 `n = c.dup`,
+  #1010 block-body write. #1035 is the alias/kill probe inventory. Perf:
+  decline is cheap (#1005); cost is entry-descend quadratic.
 - **Pin `v0.4.8`**. Both exception tables EMPTY — new entries are real findings (`UPSTREAM.md`; overlay/`sig/shims` trap).
 
 State (2026-11-22, `v0.4.8`): **174 fixtures / 0 unregistered**; sweep
