@@ -1296,6 +1296,50 @@ fn terminating_arm_drops_recognise_nested_exits() {
     assert_eq!(env.get("x"), Some(&s));
 }
 
+/// rigor-rs#955 — the check flow's branch joins see the same `retry`-bot
+/// termination the oracle's `live_rescue_results` / `eval_if` see: an arm
+/// ending in `retry` contributes no scope, while a conditional retry keeps
+/// the entry edge joined. Expected values are the oracle's
+/// `undefined method` witnesses.
+#[test]
+fn retry_bot_termination_reaches_the_if_scope_join() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let x_of = |src: &str| {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        rigor_types::describe(&i, *env.get("x").expect(src))
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+
+    // The issue's undecided-`else` row: the retrying rescue arm terminates
+    // the begin, so only the body arm's write reaches the continuation.
+    assert_eq!(
+        x_of("x = \"a\"; if rand > 0; x = \"s\"; else; begin; raise; rescue; retry; end; end; x.w"),
+        "\"s\""
+    );
+    // The folded-arm row: the whole live arm ends in the `bot` begin, so
+    // its writes drop and the pre-`if` binding survives.
+    assert_eq!(
+        x_of("x = 1; if true; x = \"s\"; begin; raise; rescue; retry; end; end; x.upcase"),
+        "1"
+    );
+    // `retry` nested in an all-`bot` conditional still terminates the
+    // rescue arm.
+    assert_eq!(
+        x_of("x = 1; if true; x = \"s\"; begin; raise; rescue; if rand > 0; retry; else; raise; end; end; end; x.upcase"),
+        "1"
+    );
+    // …but a conditional retry has a completing edge, so the arm stays
+    // live and the entry binding joins.
+    assert_eq!(
+        x_of("x = \"a\"; if rand > 0; x = \"s\"; else; begin; raise; rescue; retry if rand > 0; end; end; x.w"),
+        "\"a\" | \"s\""
+    );
+}
+
 /// rigor-rs#951 — the undecided `if_join` joins each arm's EXIT scope: an
 /// elsif chain or a nested `if` contributes its own arm join, not the
 /// lexically-last write in the span, and an op-write folds from the
