@@ -51,6 +51,19 @@ fn literal_shape_root(interner: &Interner, ty: TypeId) -> bool {
     }
 }
 
+/// The error-info frame a literal block enters with
+/// (`FreshFrameBlocks.entry` / `.closure_entry`).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ErrorInfoClosureEntry {
+    /// Reads the writing frame's `$!`/`$@` — an ordinary yielding block.
+    Same,
+    /// Has no enclosing exception — a lambda/stored closure or an
+    /// execution-context root block.
+    Fresh,
+    /// Reads whatever its eventual caller sees — a `define_method` body.
+    Dynamic,
+}
+
 /// What a `while`/`until` loop's tracked locals converge to —
 /// [`Typer::loop_continuation`]'s answer, applied by the caller over its
 /// post-join / post-widen env.
@@ -2576,10 +2589,8 @@ impl<'i> Typer<'i> {
         // into reads before the reader.
         let reader_spans: Vec<rigor_parse::Span> = body
             .iter()
-            .filter_map(|&stmt| {
-                self.scan_last_line_reader_setters(ast, &[stmt])
-                    .then(|| ast.get(stmt).span())
-            })
+            .filter(|&&stmt| self.scan_last_line_reader_setters(ast, &[stmt]))
+            .map(|&stmt| ast.get(stmt).span())
             .collect();
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
@@ -3304,9 +3315,10 @@ impl<'i> Typer<'i> {
             // a site inside one takes every contained effect conservatively
             // — the flat env's own decline.
             Node::BeginRescue {
-                main_body, clauses, span, ..
+                body, main_body, clauses, ensure_body, span, ..
             } => {
-                let (main_body, clauses) = (main_body.clone(), clauses.clone());
+                let (body, main_body, clauses, ensure_body) =
+                    (body.clone(), main_body.clone(), clauses.clone(), ensure_body.clone());
                 // rigor-rs#1031 — `eval_retried_begin`: start the in-order
                 // descent from the local/ivar-widened entry so later writes
                 // and retrying-clause rebinds reach earlier reads, while
@@ -3403,6 +3415,47 @@ impl<'i> Typer<'i> {
                 {
                     env.remove("$_");
                 }
+                // The flat `body` appends the else statements after every
+                // rescue exception/body and before `ensure_body`. Inside one
+                // of those clauses its own earlier statements still thread
+                // in order, so a plain reader there invalidates `$_` before
+                // a later read exactly as it does in the protected body.
+                let mut covered: std::collections::HashSet<NodeId> =
+                    main_body.iter().copied().collect();
+                covered.extend(ensure_body.iter().copied());
+                for clause in &clauses {
+                    covered.extend(clause.exceptions.iter().copied());
+                    covered.extend(clause.body.iter().copied());
+                }
+                let else_body: Vec<NodeId> = body
+                    .iter()
+                    .copied()
+                    .filter(|c| !covered.contains(c))
+                    .collect();
+                if else_body
+                    .iter()
+                    .any(|&s| within_span(site, ast.get(s).span()))
+                {
+                    self.forget_last_line_before_site(ast, &else_body, site, env, interner);
+                } else if ensure_body
+                    .iter()
+                    .any(|&s| within_span(site, ast.get(s).span()))
+                {
+                    // The check index records an ensure clause from its
+                    // widened entry with ErrorInfo forgotten
+                    // (`record_operand_clause`), even when the enclosing
+                    // rescue still has an exception in flight.
+                    env.remove("$!");
+                    env.remove("$@");
+                    // `ensure` runs after the body and after whichever
+                    // rescue/else path the begin took, so a reader on any of
+                    // those paths joins against the forgotten binding here.
+                    for clause in &clauses {
+                        self.forget_last_line_in(ast, &clause.body, env, interner);
+                    }
+                    self.forget_last_line_before_site(ast, &else_body, site, env, interner);
+                    self.forget_last_line_before_site(ast, &ensure_body, site, env, interner);
+                }
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
             }
@@ -3420,7 +3473,25 @@ impl<'i> Typer<'i> {
             // flat — `Recovered`/`Jump`/`Inert` children never evaluate on
             // the reference (`x = (each { w; r }) rescue nil` and
             // `break each { w; r }` both fire there).
-            Node::Loop { .. } | Node::Case { .. } => {
+            Node::Loop { body, .. } => {
+                self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                // Inside one iteration the body still threads in order: a
+                // read after a plain reader in an earlier body statement
+                // cannot carry the entry `$_`. The flat pass has already
+                // declined the loop's conditional writes, so only this
+                // invisible invalidation is replayed here.
+                for &s in body.clone().iter() {
+                    let sspan = ast.get(s).span();
+                    if sspan.0 <= site.0 && site.0 < sspan.1 {
+                        break;
+                    }
+                    if sspan.1 <= site.0 {
+                        self.forget_last_line_reader(ast, s, env, interner);
+                    }
+                }
+                self.entry_descend_site_child(ast, id, site, env, flow, interner);
+            }
+            Node::Case { .. } => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
             }
@@ -3435,6 +3506,9 @@ impl<'i> Typer<'i> {
                     if sspan.0 <= site.0 && site.0 < sspan.1 {
                         self.entry_descend(ast, s, site, false, preserve_env, env, flow, interner);
                         return;
+                    }
+                    if sspan.1 <= site.0 {
+                        self.forget_last_line_reader(ast, s, env, interner);
                     }
                 }
             }
@@ -3595,7 +3669,61 @@ impl<'i> Typer<'i> {
         // call (`IO.foreach`) — or whose own body may run one later in the
         // same frame — does not keep the caller's narrowed `$_`.
         self.forget_last_line_reader(ast, closure, env, interner);
+        // `ErrorInfo`/`FreshFrameBlocks`: a lambda or a block stored for a
+        // later call does not read the exception the enclosing rescue is
+        // handling; a definer body reads whatever its eventual caller sees
+        // (`Dynamic[top]`), and a thread/fiber/ractor root has an error
+        // frame of its own. An ordinary yielding block keeps the clause's
+        // binding (`each { $!.… }` stays precise).
+        match self.error_info_closure_entry(ast, closure) {
+            ErrorInfoClosureEntry::Fresh => {
+                env.remove("$!");
+                env.remove("$@");
+            }
+            ErrorInfoClosureEntry::Dynamic => {
+                let untyped = interner.untyped();
+                env.insert(Rc::from("$!"), untyped);
+                env.insert(Rc::from("$@"), untyped);
+            }
+            ErrorInfoClosureEntry::Same => {}
+        }
         self.apply_subtree_effects(ast, closure, site, false, env, flow, interner);
+    }
+
+    /// How a literal block or lambda's error-info frame relates to the
+    /// frame that wrote it (`FreshFrameBlocks.entry` / `.closure_entry`).
+    fn error_info_closure_entry(&self, ast: &LoweredAst, closure: NodeId) -> ErrorInfoClosureEntry {
+        match ast.get(closure) {
+            Node::Lambda { .. } => ErrorInfoClosureEntry::Fresh,
+            Node::Call { method, receiver, .. } => {
+                if matches!(method.as_str(), "define_method" | "define_singleton_method") {
+                    return ErrorInfoClosureEntry::Dynamic;
+                }
+                if self.last_line_root_call(ast, *receiver, method) {
+                    return ErrorInfoClosureEntry::Fresh;
+                }
+                let kernel_wrapper = matches!(method.as_str(), "lambda" | "proc")
+                    && self.kernel_spelled_receiver(ast, *receiver);
+                let stored_constructor = method == "new"
+                    && receiver.is_some_and(|r| {
+                        matches!(Self::root_constant_name(ast, r), Some("Proc" | "Enumerator" | "Hash"))
+                    });
+                if kernel_wrapper || stored_constructor {
+                    ErrorInfoClosureEntry::Fresh
+                } else {
+                    ErrorInfoClosureEntry::Same
+                }
+            }
+            _ => ErrorInfoClosureEntry::Same,
+        }
+    }
+
+    fn root_constant_name(ast: &LoweredAst, receiver: NodeId) -> Option<&str> {
+        let Node::ConstantRead { name, dynamic_base: false, self_anchored: false, .. } = ast.get(receiver)
+        else {
+            return None;
+        };
+        Some(name.trim_start_matches("::"))
     }
 
     /// After a non-descending container's flat
@@ -6761,6 +6889,47 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// Forget `$_` when any statement in `body` may run a plain reader.
+    /// The scan is syntactic, like upstream's `may_set?`; callers use it at
+    /// a join or clause-entry point where the exact reader position is not
+    /// threaded.
+    fn forget_last_line_in(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        env: &mut TypeEnv,
+        interner: &Interner,
+    ) {
+        if Self::last_line_precisely_bound(env, interner)
+            && body.iter().any(|&s| self.scan_last_line_reader_setters(ast, &[s]))
+        {
+            env.remove("$_");
+        }
+    }
+
+    /// Forget `$_` for the plain readers in the statements of `body` that
+    /// precede `site`. The statement holding the site is left to the
+    /// positional descent, which applies the reader/non-reader order inside
+    /// it.
+    fn forget_last_line_before_site(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        site: rigor_parse::Span,
+        env: &mut TypeEnv,
+        interner: &Interner,
+    ) {
+        for &s in body {
+            let sspan = ast.get(s).span();
+            if sspan.0 <= site.0 && site.0 < sspan.1 {
+                break;
+            }
+            if sspan.1 <= site.0 {
+                self.forget_last_line_reader(ast, s, env, interner);
+            }
+        }
+    }
+
     /// `true` when `wspan` is a `$!`/`$@` write inside a real rescue begin
     /// contained in `stmt_span`. Ruby restores both specials when that begin
     /// exits, however it exits, so the write is not a conditional-write
@@ -6839,7 +7008,7 @@ impl<'i> Typer<'i> {
             return Vec::new();
         }
         let exception = self.rescue_reference_type(ast, clause, interner);
-        let rescued = self.rescued_error_type(exception, interner);
+        let rescued = self.rescued_error_type(ast, exception, interner);
         let mut out = vec![("$!".to_owned(), rescued)];
         if self.error_info_backtrace_read(ast, &clause.body)
             && !self.error_info_calls_set_backtrace(ast, &clause.body)
@@ -6854,14 +7023,14 @@ impl<'i> Typer<'i> {
     /// an `Exception` instance contributes `Dynamic[top]` — a module with a
     /// custom `===`, a non-exception class, or an unresolved name may match
     /// something outside the nominal class.
-    fn rescued_error_type(&self, exception: TypeId, interner: &mut Interner) -> TypeId {
+    fn rescued_error_type(&self, ast: &LoweredAst, exception: TypeId, interner: &mut Interner) -> TypeId {
         let members: Vec<TypeId> = match interner.get(exception) {
             Type::Union(members) => members.clone(),
             _ => vec![exception],
         };
         let mut out = interner.bottom();
         for member in members {
-            let member = if self.exception_instance_type(member, interner) {
+            let member = if self.exception_instance_type(ast, member, interner) {
                 member
             } else {
                 interner.untyped()
@@ -6871,7 +7040,7 @@ impl<'i> Typer<'i> {
         out
     }
 
-    fn exception_instance_type(&self, ty: TypeId, interner: &Interner) -> bool {
+    fn exception_instance_type(&self, ast: &LoweredAst, ty: TypeId, interner: &Interner) -> bool {
         let Type::Nominal { class, .. } = interner.get(ty) else { return false };
         let Some(name) = self
             .index
@@ -6880,14 +7049,61 @@ impl<'i> Typer<'i> {
         else {
             return false;
         };
-        // `own_case_equality?`: a project `===` anywhere may make the
-        // rescued object escape the nominal class. This is deliberately
-        // coarser than upstream's per-class singleton lookup — a coverage
-        // loss, never a louder answer.
-        if self.project_defines_anywhere("===") {
+        // `own_case_equality?`: a `define_method(:===)` anywhere in the
+        // file cannot be attributed to an owner upstream, so it vetoes
+        // every class; a written singleton `===` vetoes the exception class
+        // itself or a project ancestor whose singleton method it inherits.
+        if Self::file_defines_case_equality(ast) || self.project_singleton_case_equality(name) {
             return false;
         }
         self.exception_class_name(name)
+    }
+
+    /// `ErrorInfo.defines_case_equality?`: a literal `===` passed to
+    /// `define_method`/`define_singleton_method` anywhere in this file. The
+    /// reference's discovery bit is file-wide because such a definer cannot
+    /// be attributed to its owner; it therefore vetoes every rescue class.
+    fn file_defines_case_equality(ast: &LoweredAst) -> bool {
+        ast.iter().any(|(_, node)| {
+            let Node::Call { method, args, .. } = node else { return false };
+            if !matches!(method.as_str(), "define_method" | "define_singleton_method") {
+                return false;
+            }
+            args.first().is_some_and(|&arg| match ast.get(arg) {
+                Node::SymbolLit { value, .. } | Node::StringLit { value, .. } => value == "===",
+                _ => false,
+            })
+        })
+    }
+
+    /// The project half of `ErrorInfo.own_case_equality?`: the first
+    /// singleton `===` on the class object's own table, an `extend`ed
+    /// module's instance surface, or the superclass chain. Includes do not
+    /// reach the singleton side, matching `singleton_def_through_ancestors`.
+    fn project_singleton_case_equality(&self, class_name: &str) -> bool {
+        let mut current = class_name.trim_start_matches("::").to_owned();
+        let mut seen = Vec::new();
+        loop {
+            if seen.iter().any(|n| n == &current) {
+                return false;
+            }
+            seen.push(current.clone());
+            if self.source.owner_defines(&current, "===", DefKind::Singleton) {
+                return true;
+            }
+            if self
+                .source
+                .extended_names(&current)
+                .iter()
+                .any(|ext| self.source.owner_defines(ext, "===", DefKind::Instance))
+            {
+                return true;
+            }
+            let Some(superclass) = self.source.project_superclass(&current) else {
+                return false;
+            };
+            current = superclass.trim_start_matches("::").to_owned();
+        }
     }
 
     /// Whether `name` is certainly below `Exception`, following the

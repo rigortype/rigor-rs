@@ -275,10 +275,23 @@ impl<'i> Typer<'i> {
             // rigor-rs#891); a conditional position never reaches one (the
             // replay's arm joins drop a one-arm sigilled binding, the
             // check binder's sigilled pre-step widens it stale).
-            Node::VariableRead { name, .. } => env
-                .get(name.as_str())
-                .copied()
-                .unwrap_or_else(|| interner.untyped()),
+            Node::VariableRead { name, span } => {
+                // A rescue modifier's fallback runs in its own error-info
+                // frame, not the enclosing rescue clause's. The reference's
+                // check walk leaves the modifier fallback's `$!`/`$@`
+                // unbound even when the clause around it binds them, so the
+                // outer binding must not leak through this flattened
+                // carrier (rigor-rs#1047).
+                if matches!(name.as_str(), "$!" | "$@")
+                    && ast.in_rescue_modifier_fallback(*span)
+                {
+                    interner.untyped()
+                } else {
+                    env.get(name.as_str())
+                        .copied()
+                        .unwrap_or_else(|| interner.untyped())
+                }
+            }
             // `a, b = rhs` AS AN EXPRESSION is its right-hand side (Ruby: `(a, b
             // = [1, 2])` evaluates to `[1, 2]`). The reference routes
             // `Prism::MultiWriteNode` to `type_of_assignment_write`

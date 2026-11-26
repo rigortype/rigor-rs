@@ -155,6 +155,10 @@ struct CarrierSpans {
     /// MODIFIER lowered to, sorted for a binary-search read via
     /// [`LoweredAst::is_rescue_modifier`].
     rescue_modifier_ids: Vec<u32>,
+    /// `(carrier arena id, rescue_expression span)` for each rescue
+    /// modifier, sorted by carrier id. The recovered carrier flattens both
+    /// operands; this span is the fallback half's boundary.
+    rescue_modifier_fallbacks: Vec<(u32, Span)>,
     /// Arena ids of the `BeginRescue` carriers an `else` clause lowered
     /// to, sorted for a binary-search read via
     /// [`LoweredAst::is_else_carrier`].
@@ -558,6 +562,17 @@ impl LoweredAst {
             .is_ok()
     }
 
+    /// Whether `span` sits inside the rescue_expression half of a `rescue`
+    /// modifier. The carrier's recovered children flatten both operands, so
+    /// consumers that model the fallback's separate error-info frame need
+    /// this source boundary rather than the child list.
+    pub fn in_rescue_modifier_fallback(&self, span: Span) -> bool {
+        self.carrier_spans
+            .rescue_modifier_fallbacks
+            .iter()
+            .any(|(_, fallback)| fallback.0 <= span.0 && span.1 <= fallback.1)
+    }
+
     /// Whether `span` sits inside a `rescue` MODIFIER carrier
     /// ([`Self::is_rescue_modifier`]) that itself lies within `within` —
     /// either operand: the expression may raise before `span` runs, and
@@ -668,6 +683,7 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
         paren_spans: std::collections::HashMap::new(),
         paren_carriers: Vec::new(),
         rescue_modifier_carriers: Vec::new(),
+        rescue_modifier_fallbacks: Vec::new(),
         else_carriers: Vec::new(),
         closure_bindings: Vec::new(),
         recovery_joined: 0,
@@ -721,11 +737,14 @@ pub fn lower_with_key(result: &ParseResult<'_>, file_key: FileKey) -> LoweredAst
     paren_carrier_ids.sort_unstable();
     let mut rescue_modifier_ids = builder.rescue_modifier_carriers;
     rescue_modifier_ids.sort_unstable();
+    let mut rescue_modifier_fallbacks = builder.rescue_modifier_fallbacks;
+    rescue_modifier_fallbacks.sort_unstable_by_key(|(id, _)| *id);
     let mut else_carrier_ids = builder.else_carriers;
     else_carrier_ids.sort_unstable();
     let carrier_spans = Box::new(CarrierSpans {
         paren_carrier_ids,
         rescue_modifier_ids,
+        rescue_modifier_fallbacks,
         else_carrier_ids,
         inert: inert_spans,
         scanned_inert: builder.scanned_inert_spans,
