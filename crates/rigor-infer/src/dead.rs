@@ -1725,9 +1725,10 @@ impl<'i> Typer<'i> {
                 self.arm_exits_at(ast, main_body, seen, syntactic)
             }
             // A write whose value position exits types the write `Bot`
-            // (`x = raise`); a call with an exit in an evaluated operand the
-            // same (`f(raise)`). A receiver call's exit is already covered
-            // by `receiver`'s own check.
+            // (`x = raise`). A call, however, terminates only when the
+            // call itself types `Bot` — never because one of its evaluated
+            // operands exits. The oracle types `foo(raise)` as `foo`'s
+            // return, not `bot` (rigor-rs#965).
             Node::LocalVariableWrite { value, .. } => {
                 self.stmt_exits_at(ast, *value, seen, false)
             }
@@ -1742,24 +1743,18 @@ impl<'i> Typer<'i> {
             | Node::VariableWrite { value, .. }
             | Node::ConstantWrite { value, .. }
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, false),
-            Node::Call {
-                receiver, args, ..
-            } => {
-                receiver.is_some_and(|r| self.stmt_exits_at(ast, r, seen, false))
-                    || args.iter().any(|&a| self.stmt_exits_at(ast, a, seen, false))
-                    // `branch_terminates?`'s OTHER half — a `Bot`-typed call
-                    // terminates too (`statement_evaluator.rb:4997`): the
-                    // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
-                    // `::Kernel.abort`), an implicit-self call a same-file
-                    // toplevel `def` answers with a provably-bot body
-                    // (`begin 1 rescue q = 1; die end`, rigor-rs#386), the
-                    // `bot`-returning Kernel functions
-                    // [`Self::kernel_sig_bot`] holds (`exec`, `sleep`,
-                    // `loop`), and a resolvable constant receiver's
-                    // all-`bot` member ([`Self::const_receiver_call_bot`]
-                    // — `Process.exit`, rigor-rs#1011).
-                    || self.exit_call_bot_seen(ast, id, seen)
-            }
+            // `branch_terminates?`'s OTHER half — a `Bot`-typed call
+            // terminates too (`statement_evaluator.rb:4997`): the
+            // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
+            // `::Kernel.abort`), an implicit-self call a same-file
+            // toplevel `def` answers with a provably-bot body
+            // (`begin 1 rescue q = 1; die end`, rigor-rs#386), the
+            // `bot`-returning Kernel functions
+            // [`Self::kernel_sig_bot`] holds (`exec`, `sleep`,
+            // `loop`), and a resolvable constant receiver's
+            // all-`bot` member ([`Self::const_receiver_call_bot`]
+            // — `Process.exit`, rigor-rs#1011).
+            Node::Call { .. } => self.exit_call_bot_seen(ast, id, seen),
             _ => false,
         }
     }

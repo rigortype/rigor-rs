@@ -5770,41 +5770,32 @@ impl<'i> Typer<'i> {
                     ensure_body.clone(),
                     *has_else,
                 );
-                // rigor-rs#1031 — a retrying begin's post-scope is the
-                // second walk of `eval_retried_begin`, not a flat widen.
-                if clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
-                    self.bind_live_begin_rescue(
-                        ast,
-                        id,
-                        &body,
-                        &main_body,
-                        &clauses,
-                        &ensure_body,
-                        has_else,
-                        &effects.mutations,
-                        env,
-                        effects,
-                        indexed,
-                        dead,
-                        interner,
-                    );
-                } else {
-                    let error_info = Self::error_info(env);
-                    let live_rebinds: Vec<_> = effects
-                        .rebinds_within(span)
-                        .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
-                        .cloned()
-                        .collect();
-                    let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
+                // rigor-rs#965 — the post-scope is `eval_begin`'s join of
+                // the primary path and every LIVE rescue arm, not a flat
+                // widen. The same replay carries a retrying begin's second
+                // walk (rigor-rs#1031).
+                let live_mutations: Vec<_> = effects
+                    .mutations_within(span)
+                    .filter(|(w, _, m, _)| {
                         dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                    });
-                    widen_flow_writes(live_rebinds.iter(), span, env, interner);
-                    self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
-                    self.widen_mutated_locals(
-                        ast, live_mutations, indexed, dead, true, id, span, env, interner,
-                    );
-                    Self::restore_error_info(env, error_info);
-                }
+                    })
+                    .cloned()
+                    .collect();
+                self.bind_live_begin_rescue(
+                    ast,
+                    id,
+                    &body,
+                    &main_body,
+                    &clauses,
+                    &ensure_body,
+                    has_else,
+                    &live_mutations,
+                    env,
+                    effects,
+                    indexed,
+                    dead,
+                    interner,
+                );
             }
             Node::Loop { predicate, body, kind, .. } => {
                 use crate::def_local_marks::ExitKind as K;
