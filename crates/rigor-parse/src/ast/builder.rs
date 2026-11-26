@@ -72,6 +72,11 @@ pub(crate) struct Builder<'src> {
     ///
     /// [`LoweredAst::is_rescue_modifier`]: crate::ast::LoweredAst::is_rescue_modifier
     pub(crate) rescue_modifier_carriers: Vec<u32>,
+    /// `(carrier arena id, rescue_expression span)` for each rescue
+    /// modifier. The recovered carrier flattens both operands, so the span
+    /// is the only boundary between the raising expression and the
+    /// fallback.
+    pub(crate) rescue_modifier_fallbacks: Vec<(u32, Span)>,
     /// Arena ids of the `BeginRescue` carriers an `else` clause lowered to
     /// — see [`LoweredAst::is_else_carrier`].
     ///
@@ -366,14 +371,18 @@ impl<'src> Builder<'src> {
             return self.push(Node::Other { span, jump: None });
         }
         let body: Vec<NodeId> = self.lower_recovered(recovered);
-        let is_rescue_modifier = node.as_rescue_modifier_node().is_some();
+        let rescue_modifier = node.as_rescue_modifier_node();
         let id = self.push(Node::Statements { body, span, kind: StatementsKind::Recovered });
-        if is_rescue_modifier {
+        if let Some(modifier) = rescue_modifier {
             // `x = a rescue b` — upstream `selection_branches` yields the
             // may-be locals of BOTH operands; mark the carrier so the
             // alias floor's `may_be_locals` reads its children as the two
             // operand expressions (rigor-rs#603).
             self.rescue_modifier_carriers.push(id.0);
+            self.rescue_modifier_fallbacks.push((
+                id.0,
+                span_of(&modifier.rescue_expression().location()),
+            ));
         }
         id
     }
