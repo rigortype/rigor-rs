@@ -6152,6 +6152,30 @@ fn retry_edge_mutation_of_kills_target_declines_aliased_write() {
     }
 }
 
+/// rigor-rs#1031 — `eval_retried_begin` replay under the existing decline
+/// overlay: a second in-order walk from the local/ivar-widened entry closes
+/// post-begin derived copies (#999), T-level ivar self-rebinds (#1002) and
+/// intra-holder derived writes (#1010). #1009 / sigilled ordering still ride
+/// the span-keyed table (over-decline, the safe side).
+#[test]
+fn retried_begin_replay_matches_oracle_ordering() {
+    let undefined = |src: &str| -> Vec<String> {
+        run(src.as_bytes())
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for src in [
+        "c = [1]; n = nil; begin; c[0] = \"s\"; n = c; rescue; retry; end; n.zork\n",
+        "@iv = [4]; begin; foo; rescue; @iv.nope; @iv = @iv + [1]; retry; end\n",
+        "x = nil; c = [1]; begin; d = [0]; p(d = c, d.nope); rescue; c << 2; retry; end\n",
+        "x = nil; c = [1]; begin; d = [0]; (d = c) && d.nope; rescue; c << 2; retry; end\n",
+    ] {
+        assert_eq!(undefined(src), Vec::<String>::new(), "{src:?}");
+    }
+}
+
 /// rigor-rs#1003 — the paths `declined_names`' dedup and the `kill_free`
 /// precompute serve: nested retrying `begin`s decline the same local once,
 /// a fresh rebind still kills the edge for the reads after it, and an
