@@ -6182,3 +6182,29 @@ fn retry_edge_nested_begins_and_kill_controls() {
     assert_eq!(got.len(), 1, "{src:?}: {got:?}");
     assert!(got[0].ends_with("for [5]"), "{src:?}: {got:?}");
 }
+
+/// rigor-rs#1017 — a write in a rescue clause's exception-designator list
+/// types the expression itself, but its resulting scope is discarded with
+/// the designator evaluation on the reference: it does not rebind the local
+/// in the clause body or in the post-`begin` continuation. The port used to
+/// count it as an ordinary conditional write and widened the entry binding
+/// to `Dynamic`, losing the post-`begin` witness.
+#[test]
+fn rescue_exception_designator_write_does_not_leak_to_continuation() {
+    for src in [
+        b"x = \"a\"; begin; raise; rescue (x = StandardError); end; x.w\n".as_slice(),
+        b"x = \"a\"; if true; begin; raise; rescue (x = StandardError); end; end; x.w\n".as_slice(),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].message, "undefined method `w' for \"a\"");
+    }
+
+    // The designator expression itself still evaluates in order: the write
+    // is visible to a read later in that same expression on both engines.
+    let diags = run(b"begin; raise; rescue (x = StandardError; x.w); end\n");
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `w' for singleton(StandardError)");
+}
