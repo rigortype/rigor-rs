@@ -2502,9 +2502,14 @@ impl<'i> Typer<'i> {
                 .chain(mutations.iter().map(|(w, n, ..)| (*w, n.as_str())))
                 .chain(indexed.slot_writes.iter().map(|w| (w.span, w.name.as_str())));
             let scope_spans = &indexed.scope_spans;
-            crate::retry_edge::RetryEdges::build(self, ast, writes, &rebinds, |s| {
-                !scope_spans.iter().any(|&b| within_span(s, b))
-            })
+            crate::retry_edge::RetryEdges::build(
+                self,
+                ast,
+                writes,
+                &rebinds,
+                mutations.iter().map(|(w, n, ..)| (*w, n.as_str())),
+                |s| !scope_spans.iter().any(|&b| within_span(s, b)),
+            )
         };
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
