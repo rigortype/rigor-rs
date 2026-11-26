@@ -450,6 +450,19 @@ fn retry_tail_terminates_through_the_bot_type_half() {
     let (_, else_t, _) =
         if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {conditional}\nend\n"));
     assert!(!else_t);
+    // The exact conditional shape `live_rescue_results`'s comment names:
+    // the ternary is `bot` when both arms are.
+    let ternary = "begin\n    raise\n  rescue\n    rand > 0 ? retry : raise\n  end";
+    let (_, else_t, _) =
+        if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {ternary}\nend\n"));
+    assert!(else_t);
+    // One retrying clause does not drop the begin while a second rescue
+    // clause can still complete.
+    let second_live =
+        "begin\n    raise\n  rescue ArgumentError\n    retry\n  rescue\n    nil\n  end";
+    let (_, else_t, _) =
+        if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {second_live}\nend\n"));
+    assert!(!else_t);
 
     // The begin's normal value path must terminate too: a `nil` protected
     // body or an `else` clause keeps the begin — and the outer arm — live.
