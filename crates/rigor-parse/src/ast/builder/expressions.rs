@@ -174,10 +174,17 @@ impl<'src> Builder<'src> {
         }
 
         if let Some(sym) = node.as_symbol_node() {
-            // `unescaped()` is the decoded symbol name (`:foo` -> foo).
+            // `unescaped()` is the decoded name (`:foo` -> foo) — method
+            // identity. `value_loc` is Prism's `value` (raw source bytes) —
+            // type pins (`symbol_type_for`, rigor-rs#292).
             let value = String::from_utf8_lossy(sym.unescaped()).into_owned();
+            let raw = match sym.value_loc() {
+                Some(loc) => String::from_utf8_lossy(loc.as_slice()).into_owned(),
+                None => value.clone(),
+            };
             return self.push(Node::SymbolLit {
                 value,
+                raw,
                 span: span_of(&sym.location()),
             });
         }

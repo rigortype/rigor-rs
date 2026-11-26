@@ -191,8 +191,8 @@ impl Walk<'_, '_> {
             Node::StringLit { value, .. } => {
                 self.literal_edge(ty, &rigor_types::Scalar::Str(value.clone()))
             }
-            Node::SymbolLit { value, .. } => {
-                self.literal_edge(ty, &rigor_types::Scalar::Sym(value.clone()))
+            Node::SymbolLit { raw, .. } => {
+                self.literal_edge(ty, &rigor_types::Scalar::Sym(raw.clone()))
             }
             Node::TrueLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Bool(true)),
             Node::FalseLit { .. } => self.literal_edge(ty, &rigor_types::Scalar::Bool(false)),

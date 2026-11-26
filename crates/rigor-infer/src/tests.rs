@@ -1608,6 +1608,20 @@ fn typed_literals_pin_constants() {
 }
 
 #[test]
+fn escaped_symbol_pins_raw_source_spelling() {
+    // rigor-rs#292: `symbol_type_for` pins `node.value`, not `unescaped`.
+    let ast = lower_src(b":\"a\\nb\"\n");
+    let mut i = Interner::new();
+    let env = TypeEnv::new();
+    let sym = ast
+        .iter()
+        .find_map(|(id, n)| matches!(n, Node::SymbolLit { .. }).then_some(id))
+        .unwrap();
+    let ty = type_of(&ast, sym, &env, &mut i);
+    assert_eq!(i.get(ty), &Type::Constant(Scalar::Sym("a\\nb".into())));
+}
+
+#[test]
 fn non_pinned_argument_declines_folding() {
     // `x` is never assigned -> Dynamic, so `"a" + x` can't fold; the call
     // widens to the nominal String return rather than minting a Constant.

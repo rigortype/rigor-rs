@@ -1894,7 +1894,7 @@ fn capture_fold_tail(ast: &LoweredAst, node_id: NodeId, depth: usize) -> FoldTai
         Node::StringLit { value, .. } => FoldExpr::Scalar(Scalar::Str(value.clone())),
         Node::IntegerLit { value: Some(value), .. } => FoldExpr::Scalar(Scalar::Int(*value)),
         Node::FloatLit { value, .. } => FoldExpr::Scalar(Scalar::Float(*value)),
-        Node::SymbolLit { value, .. } => FoldExpr::Scalar(Scalar::Sym(value.clone())),
+        Node::SymbolLit { raw, .. } => FoldExpr::Scalar(Scalar::Sym(raw.clone())),
         Node::NilLit { .. } => FoldExpr::Scalar(Scalar::Nil),
         Node::TrueLit { .. } => FoldExpr::Scalar(Scalar::Bool(true)),
         Node::FalseLit { .. } => FoldExpr::Scalar(Scalar::Bool(false)),

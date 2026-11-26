@@ -1027,7 +1027,7 @@ fn legacy_fold_expr(
         Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
         Node::IntegerLit { value, .. } => value.map(Scalar::Int),
         Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
-        Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+        Node::SymbolLit { raw, .. } => Some(Scalar::Sym(raw.clone())),
         Node::NilLit { .. } => Some(Scalar::Nil),
         Node::TrueLit { .. } => Some(Scalar::Bool(true)),
         Node::FalseLit { .. } => Some(Scalar::Bool(false)),

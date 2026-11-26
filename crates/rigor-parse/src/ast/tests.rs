@@ -1113,6 +1113,28 @@ fn recovered_child_under_crossed_block_records_bound_names() {
 }
 
 #[test]
+fn symbol_literals_keep_raw_source_and_unescaped() {
+    // rigor-rs#292: `value` is Prism `unescaped` (decoded); `raw` is
+    // `value_loc` source bytes (`symbol_type_for` / `node.value`).
+    let ast = lower(&crate::parse(b":\"a\\nb\"\n:\"\\x41\"\n:foo\n"));
+    let lits: Vec<(String, String)> = ast
+        .iter()
+        .filter_map(|(_, n)| match n {
+            Node::SymbolLit { value, raw, .. } => Some((value.clone(), raw.clone())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        lits,
+        [
+            ("a\nb".to_string(), "a\\nb".to_string()),
+            ("A".to_string(), "\\x41".to_string()),
+            ("foo".to_string(), "foo".to_string()),
+        ]
+    );
+}
+
+#[test]
 fn integer_literals_lower_across_i64_and_preserve_bignum_digits() {
     // Beyond `i32` used to lower to `0`; beyond `i64` `value` stays `None`
     // (never a wrong pin) while `digits` keeps the exact decimal spelling for
@@ -1213,9 +1235,9 @@ fn lowers_nil_true_false_symbol_float_literals() {
     assert!(ast.iter().any(|(_, n)| matches!(n, Node::NilLit { .. })));
     assert!(ast.iter().any(|(_, n)| matches!(n, Node::TrueLit { .. })));
     assert!(ast.iter().any(|(_, n)| matches!(n, Node::FalseLit { .. })));
-    assert!(ast
-        .iter()
-        .any(|(_, n)| matches!(n, Node::SymbolLit { value, .. } if value == "foo")));
+    assert!(ast.iter().any(|(_, n)| {
+        matches!(n, Node::SymbolLit { value, raw, .. } if value == "foo" && raw == "foo")
+    }));
     assert!(ast
         .iter()
         .any(|(_, n)| matches!(n, Node::FloatLit { value, .. } if (*value - 3.5).abs() < f64::EPSILON)));

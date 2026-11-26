@@ -2267,7 +2267,8 @@ pub fn drop_indexed_narrowings_for(env: &mut TypeEnv, names: &[&str]) {
 /// `IndexedNarrowing.stable_key` (`indexed_narrowing.rb:63`): the literal
 /// `ShapeKey` an index argument names — Symbol / String / Integer literals
 /// only (`STABLE_KEY_NODES`); a variable, splat or interpolated key
-/// declines.
+/// declines. Symbols use `unescaped` here (the reference's `node.unescaped.to_sym`);
+/// type pins and `HashShape` keys use `raw` (`symbol_type_for` / `static_hash_key`).
 pub(crate) fn stable_index_key(node: &Node) -> Option<ShapeKey> {
     match node {
         Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
