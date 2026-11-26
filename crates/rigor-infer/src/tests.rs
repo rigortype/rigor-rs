@@ -1436,6 +1436,42 @@ fn live_rescue_arm_writes_join_post_begin_scope() {
         let src = format!("x = \"a\"; begin; raise; rescue; x = \"e\"; {tail}; end; x.w");
         assert_eq!(x_of(&src), "\"a\"", "{tail}");
     }
+
+    // The same join inside an undecided `if` arm reads the begin's
+    // primary and live-rescue exit scopes, not just the lexically-last
+    // rescue write.
+    for (begin_body, want) in [
+        ("raise", "\"a\" | \"e\" | \"s\""),
+        ("x = \"b\"; raise", "\"b\" | \"e\" | \"s\""),
+    ] {
+        let src = format!(
+            "x = \"a\"; if rand > 0; begin; {begin_body}; rescue; x = \"e\"; end; else; x = \"s\"; end; x.w"
+        );
+        assert_eq!(x_of(&src), want, "{begin_body}");
+    }
+    // `rescue => x` binds inside the arm even when the arm never writes
+    // `x` again: the nested join keeps the entry, the sibling arm and the
+    // exception instance. Compare members structurally — the interned
+    // union's display order is the message renderer's concern, not the
+    // scope join's.
+    let src = "x = \"a\"; if rand > 0; begin; raise; rescue StandardError => x; end; else; x = \"s\"; end; x.w";
+    let ast = lower_src(src.as_bytes());
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    let x = *env.get("x").expect(src);
+    let a = i.intern(Type::Constant(Scalar::Str("a".into())));
+    let s = i.intern(Type::Constant(Scalar::Str("s".into())));
+    let std = index
+        .class_id("StandardError")
+        .map(|class| i.intern(Type::Nominal { class, args: vec![] }))
+        .expect("core StandardError");
+    let Type::Union(members) = i.get(x) else {
+        panic!("expected a union, got {}", rigor_types::describe(&i, x))
+    };
+    assert_eq!(members.len(), 3);
+    for want in [a, s, std] {
+        assert!(members.contains(&want), "missing {}", rigor_types::describe(&i, want));
+    }
 }
 
 /// rigor-rs#955 — the check flow's branch joins see the same `retry`-bot

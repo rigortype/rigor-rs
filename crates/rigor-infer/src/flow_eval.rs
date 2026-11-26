@@ -6130,6 +6130,104 @@ impl<'i> Typer<'i> {
         cur
     }
 
+    /// The binding `name` holds after a real `begin`/`rescue`, read with
+    /// the reference's `eval_begin` shape rather than as one last-write
+    /// span: the protected body's exit binding (then the `else` clause's,
+    /// which replaces it) joins every LIVE rescue arm's exit binding. An
+    /// arm starts from the construct entry, not the body's exit; a name
+    /// the body writes more than once, or one the arm mentions at all,
+    /// enters it as `untyped` (`ClauseWidening`). A terminating rescue arm
+    /// contributes no scope (`live_rescue_results`). `ensure` layers only
+    /// the names it writes, reading a name the construct already changed
+    /// as `untyped`.
+    ///
+    /// This is the type-only analogue of [`Self::bind_live_begin_rescue`]
+    /// for [`Self::node_scope_ty`]'s undecided-arm walk: it has no env to
+    /// nil-inject, so an unwritten arm contributes the entry type it was
+    /// already given (the decline side for a previously-unbound local).
+    #[allow(clippy::too_many_arguments)]
+    fn begin_rescue_scope_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        id: NodeId,
+        body: &[NodeId],
+        main_body: &[NodeId],
+        clauses: &[rigor_parse::RescueClause],
+        ensure_body: &[NodeId],
+        has_else: bool,
+        name: &str,
+        at: TypeId,
+        interner: &mut Interner,
+        jump_join: bool,
+    ) -> Option<TypeId> {
+        let body_exit = self
+            .arm_scope_ty(ast, env, main_body, name, at, interner, jump_join)
+            .unwrap_or(at);
+        let mut primary = body_exit;
+        if has_else {
+            let clause_ids: usize = clauses
+                .iter()
+                .map(|c| c.exceptions.len() + c.body.len())
+                .sum();
+            let else_stmts = &body[main_body.len() + clause_ids..body.len() - ensure_body.len()];
+            primary = self
+                .arm_scope_ty(ast, env, else_stmts, name, body_exit, interner, jump_join)
+                .unwrap_or(body_exit);
+        }
+
+        let marks = self.def_local_marks(ast);
+        let body_writes = crate::def_local_marks::body_span(ast, main_body)
+            .map(|mspan| {
+                marks
+                    .write_positions_outside(mspan, &[], None)
+                    .into_iter()
+                    .filter(|(_, n)| *n == name)
+                    .count()
+            })
+            .unwrap_or(0);
+        let untyped = interner.untyped();
+        let mut arm_types = vec![primary];
+        for clause in clauses {
+            if crate::class_narrowing::branch_terminates(self, ast, &clause.body) {
+                continue;
+            }
+            let cspan = crate::def_local_marks::body_span(ast, &clause.body)
+                .unwrap_or(clause.span);
+            let mentioned = marks.reads_within(cspan).contains(&name)
+                || marks.changed_within(cspan).iter().any(|n| n == name);
+            let mut arm_entry = if body_writes > 1 || mentioned { untyped } else { at };
+            if clause.bound_name.as_deref() == Some(name) {
+                arm_entry = self
+                    .rescue_binding(ast, clause, interner)
+                    .first()
+                    .map(|(_, ty)| *ty)
+                    .unwrap_or(untyped);
+            }
+            arm_types.push(
+                self.arm_scope_ty(ast, env, &clause.body, name, arm_entry, interner, jump_join)
+                    .unwrap_or(arm_entry),
+            );
+        }
+        let mut joined = arm_types
+            .iter()
+            .skip(1)
+            .fold(arm_types[0], |acc, &m| rigor_types::Algebra::join(interner, acc, m));
+
+        if !ensure_body.is_empty() {
+            let bspan = ast.get(id).span();
+            let espan = crate::def_local_marks::body_span(ast, ensure_body).unwrap_or(bspan);
+            let stale = marks.changed_within((bspan.0, espan.0)).iter().any(|n| n == name);
+            let ensure_entry = if stale { untyped } else { joined };
+            if let Some(ty) =
+                self.arm_scope_ty(ast, env, ensure_body, name, ensure_entry, interner, jump_join)
+            {
+                joined = ty;
+            }
+        }
+        Some(joined)
+    }
+
     /// The binding `name` holds after node `id` evaluates — the
     /// [`Self::arm_scope_ty`] statement walk's per-node half, shared so an
     /// `if` PREDICATE (`post_pred`), a `&&`/`||` OPERAND or a `for`
@@ -6166,6 +6264,19 @@ impl<'i> Typer<'i> {
         jump_join: bool,
     ) -> Option<TypeId> {
         match ast.get(id) {
+            // A real `begin`/`rescue` joins its primary path with every
+            // live rescue arm (`eval_begin`), the `else` replacing the
+            // protected body's value path and `ensure` layering only its
+            // own writes. The type-level arm walk needs the same shape — a
+            // rescue write is not the whole answer when the primary path
+            // or an unwritten arm keeps the entry binding (rigor-rs#965).
+            Node::BeginRescue { body, main_body, clauses, ensure_body, has_else, .. }
+                if !clauses.is_empty() =>
+            {
+                self.begin_rescue_scope_ty(
+                    ast, env, id, body, main_body, clauses, ensure_body, *has_else, name, at, interner, jump_join,
+                )
+            }
             // A straight-line carrier — an `else` clause, a parenthesized
             // group, a rescue-less `begin` — runs its statements in order.
             Node::BeginRescue { body, clauses, ensure_body, has_else: false, .. }
@@ -6945,6 +7056,12 @@ impl<'i> Typer<'i> {
             // — `for x in [1]` rebinds `x` although no write NODE does.
             Node::Loop { kind: rigor_parse::LoopKind::For, index, .. } => {
                 index.iter().any(|(n2, _)| n2 == name)
+            }
+            // `rescue => x` binds inside the clause (`bind_rescue_reference`),
+            // so the begin's type-level arm walk must run even when the
+            // clause body never writes `x` again.
+            Node::BeginRescue { clauses, .. } => {
+                clauses.iter().any(|c| c.bound_name.as_deref() == Some(name))
             }
             _ => false,
         })
