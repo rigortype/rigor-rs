@@ -751,11 +751,54 @@ fn toplevel_check_env_widens_nested_rebinds() {
     let env = Typer::new(&empty).build_toplevel_check_env(&ast, &mut i);
     let get = |name: &str, i: &Interner| env.get(name).map(|&t| i.get(t).clone());
     let untyped = i.untyped();
+    // rigor-rs#133 / #958: a terminated then-arm write (`w = 1; next`) with
+    // no else is dropped by the if-join, so the overlay keeps the floor
+    // rather than re-pinning `"s"` (that pin FPs `w.even?`). The brief's
+    // else-break shape is the `jump_loop_keeps_if_arm_join_writes` test.
     assert_eq!(env.get("w"), Some(&untyped));
     assert_eq!(env.get("n"), Some(&untyped));
     assert_eq!(get("k", &i), Some(Type::Constant(Scalar::Str("s".into()))));
     assert_eq!(get("r", &i), Some(Type::Constant(Scalar::Str("t".into()))));
     assert_eq!(get("d", &i), Some(Type::Constant(Scalar::Str("s".into()))));
+}
+
+/// rigor-rs#958: a while/until body's env floor used to drop the if-arm
+/// write the reference's `join_break_scopes` keeps. The 0-iteration entry
+/// joins the live arm; a nearby no-break while still uses the fixpoint.
+#[test]
+fn jump_loop_keeps_if_arm_join_writes() {
+    let empty = CoreIndex::new();
+    let typer = Typer::new(&empty);
+    let env_of = |src: &[u8]| {
+        let ast = lower_src(src);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        (env, i)
+    };
+    let join_as = |i: &mut Interner| {
+        let a = i.intern(Type::Constant(Scalar::Str("a".into())));
+        let s = i.intern(Type::Constant(Scalar::Str("s".into())));
+        i.intern(Type::Union(vec![a, s]))
+    };
+
+    let (env, mut i) = env_of(
+        b"x = \"a\"\nwhile rand > 0\n  if rand > 1\n    x = \"s\"\n  else\n    break 1\n  end\nend\n",
+    );
+    let want = join_as(&mut i);
+    assert_eq!(env.get("x"), Some(&want), "while else-break");
+
+    let (env, mut i) = env_of(
+        b"x = \"a\"\nuntil rand > 0\n  if rand > 1\n    x = \"s\"\n  else\n    break 1\n  end\nend\n",
+    );
+    let want = join_as(&mut i);
+    assert_eq!(env.get("x"), Some(&want), "until else-break");
+
+    // Must-still-fire control: no jump, the fixpoint path already joined.
+    let (env, mut i) = env_of(
+        b"x = \"a\"\nwhile rand > 0\n  if rand > 1\n    x = \"s\"\n  end\nend\n",
+    );
+    let want = join_as(&mut i);
+    assert_eq!(env.get("x"), Some(&want), "while no-break control");
 }
 
 /// rigor-rs#640: the loop-pass stale-write filter's env-polarity judge. A

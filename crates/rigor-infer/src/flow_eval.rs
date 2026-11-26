@@ -5526,6 +5526,42 @@ impl<'i> Typer<'i> {
                 widen_flow_writes(live_rebinds.iter(), span, env, interner);
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
+                // rigor-rs#958 — a jump-loop's floor drops the if-arm join
+                // the reference's `join_break_scopes` keeps (`x = "a"; while
+                // c; if d; x = "s"; else; break; end; end` reads `"a" | "s"`
+                // on the oracle). Overlay each rebound name's body-scope
+                // join (the same arm walk the `If` arm uses) with the
+                // 0-iteration entry, BEFORE the cap so a compounding write
+                // still sheds. An unmodelled write keeps the floor.
+                if jumps && !once && !matches!(kind, rigor_parse::LoopKind::For) {
+                    let mut seen_names: Vec<String> = Vec::new();
+                    for (_wspan, name) in &live_rebinds {
+                        if seen_names.iter().any(|n| n == name) {
+                            continue;
+                        }
+                        seen_names.push(name.clone());
+                        let u = interner.untyped();
+                        let entry_ty = entry.get(name.as_str()).copied().unwrap_or(u);
+                        if Self::type_has_decline(interner, entry_ty) {
+                            continue;
+                        }
+                        let Some(body_ty) = self.arm_scope_ty(
+                            ast, &entry, &body, name, entry_ty, interner,
+                        ) else {
+                            continue;
+                        };
+                        if Self::type_has_decline(interner, body_ty) || body_ty == entry_ty {
+                            // Equal to the entry means the arm walk dropped a
+                            // terminating write (`if c; w = 1; next; end` →
+                            // entry). Overlaying it would re-pin the pre-loop
+                            // type and FP (`w.even?` for String, rigor-rs#133).
+                            continue;
+                        }
+                        let j = rigor_types::Algebra::join(interner, entry_ty, body_ty);
+                        drop_indexed_narrowings(env, name);
+                        env.insert(Rc::from(name.as_str()), j);
+                    }
+                }
                 match cont {
                     Some(LoopContinuation::Fixpoint(bindings)) => {
                         for (n, ty) in bindings {
