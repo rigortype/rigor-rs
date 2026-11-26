@@ -424,6 +424,56 @@ fn block_level_break_union_keeps_every_bot_call_live() {
     }
 }
 
+/// rigor-rs#955 — `retry` is not in
+/// `branch_unconditionally_exits?`'s syntactic jump set, but `type_of_jump`
+/// types it `bot`, so a rescue arm ending in one terminates through
+/// `branch_terminates?`'s type half. A CONDITIONAL retry still has a
+/// completing edge, and a begin with a completing normal path (a `nil`
+/// protected body, or any `else` value) is not `bot` however its rescue
+/// arm ends.
+#[test]
+fn retry_tail_terminates_through_the_bot_type_half() {
+    let retrying_begin = "begin\n    raise\n  rescue\n    retry\n  end";
+    let (_, else_t, _) = if_arms(&format!(
+        "if rand > 0\n  x = \"s\"\nelse\n  {retrying_begin}\nend\n"
+    ));
+    assert!(else_t);
+
+    // `retry` nested under an `if` counts only when every arm of that
+    // `if` is `bot` — `if c; retry; else; raise; end` terminates,
+    // `retry if c` does not.
+    let nested = "begin\n    raise\n  rescue\n    if rand > 0\n      retry\n    else\n      raise\n    end\n  end";
+    let (_, else_t, _) =
+        if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {nested}\nend\n"));
+    assert!(else_t);
+    let conditional = "begin\n    raise\n  rescue\n    retry if rand > 0\n  end";
+    let (_, else_t, _) =
+        if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {conditional}\nend\n"));
+    assert!(!else_t);
+
+    // The begin's normal value path must terminate too: a `nil` protected
+    // body or an `else` clause keeps the begin — and the outer arm — live.
+    for begin in [
+        "begin\n    nil\n  rescue\n    retry\n  end",
+        "begin\n    raise\n  rescue\n    retry\n  else\n    nil\n  end",
+        "begin\n    raise\n  rescue\n    retry\n  else\n  end",
+    ] {
+        let (_, else_t, _) =
+            if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {begin}\nend\n"));
+        assert!(!else_t, "{begin}");
+    }
+    // …while `else; raise` replaces the normal path with a `bot` one, and
+    // `ensure` contributes no value path of its own.
+    for begin in [
+        "begin\n    nil\n  rescue\n    retry\n  else\n    raise\n  end",
+        "begin\n    raise\n  rescue\n    retry\n  ensure\n    nil\n  end",
+    ] {
+        let (_, else_t, _) =
+            if_arms(&format!("if rand > 0\n  x = \"s\"\nelse\n  {begin}\nend\n"));
+        assert!(else_t, "{begin}");
+    }
+}
+
 /// rigor-rs#1011 — the folded `if` arms reach the same predicate:
 /// `branch_terminates?` (syntactic) and `value_branch_terminates?` (typed)
 /// both see a `bot` call's termination.

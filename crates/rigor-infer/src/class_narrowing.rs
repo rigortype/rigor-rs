@@ -3260,10 +3260,12 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
         Node::Other { jump: Some(_), .. } => true,
         // A VALUED `next e` / `break e` exits the branch exactly like the
         // argument-less forms — `branch_unconditionally_exits?` does not look
-        // at `NextNode`/`BreakNode`'s arguments. `redo`/`retry` carriers stay
-        // excluded (the reference's accepted set is `next`/`break`/`return`).
+        // at `NextNode`/`BreakNode`'s arguments. `retry` is not in that
+        // syntactic set — it re-enters the `begin` rather than leaving it —
+        // but its VALUE type is `bot` (`type_of_jump`), so the
+        // `branch_terminates?` type half still drops an arm ending in one.
         Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
-            matches!(kind, JumpKind::Next | JumpKind::Break)
+            matches!(kind, JumpKind::Next | JumpKind::Break | JumpKind::Retry)
         }
 
         // `EXIT_CALL_NAMES` (`raise throw exit abort fail`,
