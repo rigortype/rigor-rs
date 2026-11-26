@@ -1,0 +1,40 @@
+{
+  "fixture": "harness/corpus/904_constant_path_literals.rb",
+  "diagnostics": [
+    {
+      "rule": "call.undefined-method",
+      "line": 3,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `bogus' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 5,
+      "column": 7,
+      "severity": "error",
+      "message": "undefined method `bogus' for 3"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 8,
+      "column": 6,
+      "severity": "error",
+      "message": "undefined method `bogus' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 9,
+      "column": 8,
+      "severity": "error",
+      "message": "undefined method `bogus' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 11,
+      "column": 10,
+      "severity": "error",
+      "message": "undefined method `bogus' for 5"
+    }
+  ]
+}
