@@ -283,6 +283,11 @@ pub(crate) fn check_call(
     index: &CoreIndex,
 ) -> Option<Diagnostic> {
     let recv_ty = typer.type_of(ast, receiver, env, interner);
+    let recv_ty = if recv_ty == interner.untyped() {
+        typer.published_constant_receiver(ast, receiver, interner).unwrap_or(recv_ty)
+    } else {
+        recv_ty
+    };
 
     // Issue #1699 (`single_class_literal_union`): a union of one class's
     // literals — alone or beside that class's plain nominal — is judged as

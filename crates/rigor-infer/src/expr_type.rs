@@ -3,7 +3,10 @@
 //! and hash-shape projection folds, implicit-self calls, and the shape-key and
 //! literal-set helpers they share.
 
-use rigor_parse::{Compound, FileKey, LoweredAst, Node, NodeId, StatementsKind};
+use rigor_parse::{
+    Compound, ConstWriteHashKey, ConstWriteLiteral, FileKey, LoweredAst, Node, NodeId,
+    StatementsKind,
+};
 use rigor_types::{Interner, Scalar, ShapeKey, ShapeMember, Type, TypeId};
 
 use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
@@ -482,6 +485,11 @@ impl<'i> Typer<'i> {
                 // the use site's lexical prefix (Ruby constant lookup), so compute
                 // it once.
                 let prefix = self.enclosing_prefix(*span);
+                match self.scalar_constant_read(ast, name, prefix, *rooted, false, interner) {
+                    ScalarConstantRead::Answer(ty) => return ty,
+                    ScalarConstantRead::Stop => return interner.untyped(),
+                    ScalarConstantRead::Miss => {}
+                }
                 // C5: a project constant with a single fully-literal assignment,
                 // visible here lexically, types to that literal value
                 // (Range -> Nominal[Range]) — consulted BEFORE the singleton gate
@@ -1556,6 +1564,175 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// Read a foreign published scalar solely for a direct undefined-method
+    /// witness. #644's `PublishedConstantGuard` withholds truthiness/flow
+    /// conclusions from those values while still letting a direct read dispatch
+    /// on them. Until that provenance is ported, do not put foreign values into
+    /// the general typer, or follow aliases to recover one here.
+    pub fn published_constant_receiver(
+        &self,
+        ast: &LoweredAst,
+        receiver: NodeId,
+        interner: &mut Interner,
+    ) -> Option<TypeId> {
+        let Node::ConstantRead { name, span, dynamic_base: false, rooted, .. } = ast.get(receiver) else {
+            return None;
+        };
+        match self.scalar_constant_read(ast, name, self.enclosing_prefix(*span), *rooted, true, interner) {
+            ScalarConstantRead::Answer(ty) => Some(ty),
+            ScalarConstantRead::Stop | ScalarConstantRead::Miss => None,
+        }
+    }
+
+    // The new literal rung reads the same candidate order as Reflection. A
+    // candidate bound by another source is a stop, not permission to find
+    // a scalar in a lower scope. That stop must be visible to the caller:
+    // falling through to C5 would revive one arm of a union the reference
+    // types together.
+    fn scalar_constant_read(
+        &self,
+        ast: &LoweredAst,
+        name: &str,
+        prefix: &[String],
+        rooted: bool,
+        foreign: bool,
+        interner: &mut Interner,
+    ) -> ScalarConstantRead {
+        if self.const_rvalue_typing.get() != 0 || !self.source.has_scalar_const_write(name, foreign) {
+            return ScalarConstantRead::Miss;
+        }
+        fn finish(hit: Option<AncestorHit>) -> ScalarConstantRead {
+            match hit {
+                Some(AncestorHit::Answer(ty)) => ScalarConstantRead::Answer(ty),
+                Some(AncestorHit::HardStop) => ScalarConstantRead::Stop,
+                // A class/RBS/predefined binding is already the lower rung's
+                // own answer. It ends the scalar walk softly; it must not
+                // suppress the existing constant typer.
+                Some(AncestorHit::Stop) => ScalarConstantRead::Miss,
+                None => ScalarConstantRead::Miss,
+            }
+        }
+        let mut candidate = |key: &str| {
+            if self.source.project_declares_constant(key)
+                || self.index.knows_qualified_class(key)
+                || self.index.knows_toplevel_class(key)
+            {
+                return Some(AncestorHit::Stop);
+            }
+            match self.source.scalar_const_write(key, ast.file_key(), foreign) {
+                crate::source_index::ScalarConstWrite::Value(write) => {
+                    let ty = self.intern_const_write_literal(write, interner);
+                    return Some(AncestorHit::Answer(ty));
+                }
+                crate::source_index::ScalarConstWrite::Stop => return Some(AncestorHit::HardStop),
+                crate::source_index::ScalarConstWrite::Miss => {}
+            }
+            if self.source.exact_path_const_write_key_contains(key) {
+                return Some(AncestorHit::HardStop);
+            }
+            if self.source.exact_const_write_key_contains(key) {
+                return Some(AncestorHit::Stop);
+            }
+            if self.constant_type_for(key, interner).is_some() {
+                return Some(AncestorHit::Stop);
+            }
+            None
+        };
+        if !rooted && !prefix.is_empty() {
+            for i in (1..=prefix.len()).rev() {
+                if let Some(hit) = candidate(&crate::source_index::qualify(&prefix[..i], name)) {
+                    return finish(Some(hit));
+                }
+            }
+            if let Some((_, hit)) = self.agreed_ancestor_hit(&prefix.join("::"), |scopes| {
+                scopes.iter().find_map(|owner| {
+                    candidate(&format!("{owner}::{name}")).map(|hit| (owner.clone(), hit))
+                })
+            }) {
+                return finish(Some(hit));
+            }
+        }
+        finish(candidate(name))
+    }
+
+    /// Type one syntactically harvested constant literal. The empty-seed
+    /// erase applies only to the write's own RHS: a nested empty literal is
+    /// still an exact empty tuple/shape/string, and a `.freeze` tail is never
+    /// an accumulator seed.
+    fn intern_const_write_literal(
+        &self,
+        write: &crate::source_index::ScalarWrite,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let ty = self.intern_const_write_literal_at(&write.literal, true, interner);
+        if write.mutated {
+            interner.intern(Type::Dynamic(ty))
+        } else {
+            ty
+        }
+    }
+
+    fn intern_const_write_literal_at(
+        &self,
+        literal: &ConstWriteLiteral,
+        top_level: bool,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let nominal = |name: &str, args: Vec<TypeId>, interner: &mut Interner| {
+            match self.index.class_id(name).or_else(|| self.source.class_id(name)) {
+                Some(class) => interner.intern(Type::Nominal { class, args }),
+                None => interner.untyped(),
+            }
+        };
+        match literal {
+            ConstWriteLiteral::Integer(v) => interner.intern(Type::Constant(Scalar::Int(*v))),
+            ConstWriteLiteral::Float(bits) => {
+                interner.intern(Type::Constant(Scalar::Float(f64::from_bits(*bits))))
+            }
+            ConstWriteLiteral::Symbol(v) => interner.intern(Type::Constant(Scalar::Sym(v.clone()))),
+            ConstWriteLiteral::Bool(v) => interner.intern(Type::Constant(Scalar::Bool(*v))),
+            ConstWriteLiteral::Nil => interner.intern(Type::Constant(Scalar::Nil)),
+            ConstWriteLiteral::Str(v) if top_level && v.is_empty() => nominal("String", vec![], interner),
+            ConstWriteLiteral::Str(v) => interner.intern(Type::Constant(Scalar::Str(v.clone()))),
+            ConstWriteLiteral::Array(elements) if top_level && elements.is_empty() => {
+                let untyped = interner.untyped();
+                nominal("Array", vec![untyped], interner)
+            }
+            ConstWriteLiteral::Array(elements) => {
+                let elements = elements
+                    .iter()
+                    .map(|element| self.intern_const_write_literal_at(element, false, interner))
+                    .collect();
+                interner.intern(Type::Tuple(elements))
+            }
+            ConstWriteLiteral::Hash(members) if top_level && members.is_empty() => {
+                let untyped = interner.untyped();
+                nominal("Hash", vec![untyped, untyped], interner)
+            }
+            ConstWriteLiteral::Hash(members) => {
+                let mut shape: Vec<ShapeMember> = Vec::with_capacity(members.len());
+                for (key, value) in members {
+                    let key = match key {
+                        ConstWriteHashKey::Integer(v) => ShapeKey::Int(*v),
+                        ConstWriteHashKey::Float(bits) => ShapeKey::Float(*bits),
+                        ConstWriteHashKey::Symbol(v) => ShapeKey::Sym(v.clone()),
+                        ConstWriteHashKey::Str(v) => ShapeKey::Str(v.clone()),
+                        ConstWriteHashKey::Bool(v) => ShapeKey::Bool(*v),
+                        ConstWriteHashKey::Nil => ShapeKey::Nil,
+                    };
+                    let value = self.intern_const_write_literal_at(value, false, interner);
+                    if let Some(member) = shape.iter_mut().find(|member| member.key == key) {
+                        member.value = value;
+                    } else {
+                        shape.push(ShapeMember { key, value, optional: false });
+                    }
+                }
+                interner.intern(Type::HashShape(shape))
+            }
+            ConstWriteLiteral::Frozen(inner) => self.intern_const_write_literal_at(inner, false, interner),
+        }
+    }
+
     /// rigor-rs#878 — `Environment#constant_for_name` (`environment.rb:838`)
     /// fused with `constant_type_at`'s per-candidate binding check
     /// (`reflection.rb`): for EACH candidate the reference's
@@ -1635,42 +1812,15 @@ impl<'i> Typer<'i> {
             // settle-able fork against.
             let innermost = prefix.join("::");
             if !innermost.is_empty() {
-                use crate::source_index::ConstantScopeWorlds;
-                let hit = match self.source.constant_scope_worlds(&innermost) {
-                    ConstantScopeWorlds::Settled { scopes, retro } => {
-                        let hit =
-                            self.first_ancestor_hit(ast, &scopes, name, file, interner);
-                        // `chain.settle` with one fork: the chain's answer
-                        // stands only where the retro world (the skip made)
-                        // answers through the same owner; otherwise the
-                        // reader takes master's breadth-first order.
-                        let stands = match &retro {
-                            None => true,
-                            Some(retro) => {
-                                self.first_ancestor_hit(
-                                    ast, retro, name, file, interner,
-                                )
-                                .map(|(owner, _)| owner)
-                                    == hit.as_ref().map(|(owner, _)| owner.clone())
-                            }
-                        };
-                        if stands {
-                            hit
-                        } else {
-                            let master = self.source.master_constant_scopes(&innermost);
-                            self.first_ancestor_hit(ast, &master, name, file, interner)
-                        }
-                    }
-                    ConstantScopeWorlds::Master(scopes) => {
-                        self.first_ancestor_hit(ast, &scopes, name, file, interner)
-                    }
-                };
+                let hit = self.agreed_ancestor_hit(&innermost, |scopes| {
+                    self.first_ancestor_hit(ast, scopes, name, file, interner)
+                });
                 match hit {
                     Some((_, AncestorHit::Answer(ty))) => return Some(ty),
                     // The census stop is a HIT whose answer is silence: the
                     // candidate binds, so no lower rung — and not the
                     // top-level step 3 — may answer for it.
-                    Some((_, AncestorHit::Stop)) => return None,
+                    Some((_, AncestorHit::Stop | AncestorHit::HardStop)) => return None,
                     None => {}
                 }
             }
@@ -1679,6 +1829,32 @@ impl<'i> Typer<'i> {
             return None;
         }
         self.constant_type_for(name, interner)
+    }
+
+    fn agreed_ancestor_hit(
+        &self,
+        innermost: &str,
+        mut first_hit: impl FnMut(&[String]) -> Option<(String, AncestorHit)>,
+    ) -> Option<(String, AncestorHit)> {
+        use crate::source_index::ConstantScopeWorlds;
+        match self.source.constant_scope_worlds(innermost) {
+            ConstantScopeWorlds::Settled { scopes, retro } => {
+                let hit = first_hit(&scopes);
+                // A single settle-able fork keeps its result only if the
+                // retro world hits the same owner; otherwise use master order.
+                let stands = match retro {
+                    None => true,
+                    Some(retro) => first_hit(&retro).as_ref().map(|(owner, _)| owner)
+                        == hit.as_ref().map(|(owner, _)| owner),
+                };
+                if stands {
+                    hit
+                } else {
+                    first_hit(&self.source.master_constant_scopes(innermost))
+                }
+            }
+            ConstantScopeWorlds::Master(scopes) => first_hit(&scopes),
+        }
     }
 
     /// rigor-rs#905 — `first_ancestor_hit`: the first scope name whose
@@ -2876,6 +3052,17 @@ impl<'i> Typer<'i> {
 /// every MRI build (C's `M_PI` / `M_E`, the four IEEE-754 binary64
 /// magnitudes), which is the upstream admission criterion; `Float::NAN` is
 /// deliberately NOT folded upstream and neither here.
+/// What the scalar constant-write rung decided. `Stop` is a hard project-write
+/// stop: the lower constant rungs must not revive one arm of a write union or
+/// a predefined value the path write shadows. `Miss` includes the soft stops
+/// (a class/RBS/predefined binding, or a bare write the #910/C5 rungs own),
+/// which end this walk but leave the ordinary constant typer to answer.
+enum ScalarConstantRead {
+    Answer(TypeId),
+    Stop,
+    Miss,
+}
+
 /// What one ancestor-scope candidate answered — rigor-rs#905's half of the
 /// reference's truthy-hit/`WRITTEN_CANDIDATE` distinction: `constant_type_at`
 /// answers a TYPE for some candidates and the write/decl STOP for the rest,
@@ -2885,6 +3072,11 @@ impl<'i> Typer<'i> {
 enum AncestorHit {
     Answer(TypeId),
     Stop,
+    /// A project PATH write the lower constant rungs cannot represent. Unlike
+    /// [`Self::Stop`], this is a hard stop for the scalar literal rung: falling
+    /// through would revive a bare write or predefined value the write union
+    /// already shadows.
+    HardStop,
 }
 
 fn folded_float_constant(name: &str) -> Option<f64> {

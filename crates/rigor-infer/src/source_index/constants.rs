@@ -3,12 +3,276 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rigor_parse::{FileKey, LoweredAst, Node, NodeId};
+use rigor_index::CoreIndex;
+use rigor_parse::{ConstWrite, ConstWriteLiteral, FileKey, LoweredAst, Node, NodeId};
 use rigor_types::{Scalar, ShapeKey};
 
 use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex, TypedConstWrite};
 
+pub(crate) struct ScalarWrite {
+    pub(crate) file: FileKey,
+    pub(crate) literal: ConstWriteLiteral,
+    pub(crate) path: bool,
+    pub(crate) mutated: bool,
+}
+
+/// The result of consulting the two constant-write tables. `Stop` is a
+/// proven write whose value this table cannot represent; it must not fall
+/// through to a lower constant source and revive one arm of the union.
+pub(crate) enum ScalarConstWrite<'a> {
+    Miss,
+    Stop,
+    Value(&'a ScalarWrite),
+}
+
+struct StaticConstWrite {
+    write: ConstWrite,
+    file: FileKey,
+}
+
+#[derive(Default)]
+struct TypedWriteGroup {
+    count: usize,
+    write: Option<ScalarWrite>,
+}
+
+/// Accumulate the two constant-write censuses the reference keeps distinct:
+/// the per-file typed table (`#690`, keyed with the write namespace resolved)
+/// and the cross-file publication census (`#644`, keyed as written). Resolution
+/// happens in `finish`, after the project class/namespace tables are complete.
+#[derive(Default)]
+pub(super) struct ScalarWrites {
+    static_writes: Vec<StaticConstWrite>,
+    mutation_sets: HashMap<FileKey, HashSet<String>>,
+    publication: HashMap<String, Option<ScalarWrite>>,
+    vetoed_leaves: HashSet<String>,
+}
+
+impl ScalarWrites {
+    pub(super) fn record(&mut self, w: &ConstWrite, file: &FileKey, mutated: &HashSet<String>) {
+        if w.dynamic || w.uncertain_bare {
+            // A dynamic target can reach any constant with this leaf, so it
+            // retracts publication. It says nothing about the per-file table's
+            // exact static writes.
+            self.vetoed_leaves.insert(constant_leaf(&w.name).to_owned());
+            return;
+        }
+
+        self.mutation_sets.entry(file.clone()).or_insert_with(|| mutated.clone());
+        self.static_writes.push(StaticConstWrite { write: w.clone(), file: file.clone() });
+
+        // The publication census keeps a path write AS WRITTEN even where the
+        // typed table resolves its namespace through the enclosing nesting.
+        let publication_name = if w.is_path { w.name.clone() } else { qualify(&w.prefix, &w.name) };
+        let publishable = w.plain
+            && w.literal.as_ref().is_some_and(|literal| {
+                matches!(
+                    literal,
+                    ConstWriteLiteral::Integer(_)
+                        | ConstWriteLiteral::Float(_)
+                        | ConstWriteLiteral::Symbol(_)
+                        | ConstWriteLiteral::Bool(_)
+                )
+            });
+        match self.publication.entry(publication_name) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(if publishable {
+                    w.literal.clone().map(|literal| ScalarWrite {
+                        file: file.clone(),
+                        mutated: false,
+                        literal,
+                        path: w.is_path,
+                    })
+                } else {
+                    None
+                });
+            }
+        }
+    }
+
+    pub(super) fn finish(self, index: &mut SourceIndex, core: &CoreIndex) {
+        // First collect the typed-table facts. Bare writes are not values in
+        // this table — #910 already owns them — but they DO contribute to the
+        // same constant's union in the reference. Since this rung cannot yet
+        // union a path write with the lowered-AST bare-write table, a same-file
+        // bare co-write poisons the path slot in either write order. The `None`
+        // is kept as a stop rather than disappearing into a lower rung.
+        let mut bare_co_writes: HashSet<(String, FileKey)> = HashSet::new();
+        let mut groups: HashMap<(String, FileKey), TypedWriteGroup> = HashMap::new();
+        for plain in self.static_writes {
+            let w = &plain.write;
+            let typed_name = if w.is_path {
+                resolved_path_write_name(w, index, core)
+            } else {
+                qualify(&w.prefix, &w.name)
+            };
+            index.exact_const_write_keys.insert(typed_name.clone());
+            if w.is_path {
+                index.exact_path_const_write_keys.insert(typed_name.clone());
+            }
+            if !w.is_path {
+                bare_co_writes.insert((typed_name, plain.file.clone()));
+                continue;
+            }
+            if !w.plain {
+                continue;
+            }
+
+            let key = (typed_name.clone(), plain.file.clone());
+            let group = groups.entry(key).or_default();
+            group.count += 1;
+            if group.count == 1 {
+                let mutated = self
+                    .mutation_sets
+                    .get(&plain.file)
+                    .is_some_and(|names| names.contains(&typed_name));
+                group.write = w.literal.clone().map(|literal| ScalarWrite {
+                    file: plain.file.clone(),
+                    mutated,
+                    literal,
+                    path: true,
+                });
+            }
+        }
+
+        for ((name, file), group) in groups {
+            let poisoned = group.count != 1 || bare_co_writes.contains(&(name.clone(), file.clone()));
+            let slot = if poisoned { None } else { group.write };
+            let leaf = constant_leaf(&name).to_owned();
+            index
+                .typed_const_path_writes
+                .entry(leaf)
+                .or_default()
+                .entry(name)
+                .or_default()
+                .insert(file, slot);
+        }
+
+        for (name, slot) in self.publication {
+            let leaf = constant_leaf(&name);
+            if self.vetoed_leaves.contains(leaf) {
+                continue;
+            }
+            if let Some(slot) = slot {
+                index
+                    .published_const_writes
+                    .entry(leaf.to_owned())
+                    .or_default()
+                    .insert(name, slot);
+            }
+        }
+    }
+}
+
+/// The typed in-source table's key for a static path write. Ruby resolves the
+/// write's namespace through the nesting first (`#690`): inside `module N`,
+/// `M::K = …` writes `N::M::K` when `N::M` is a namespace some source knows,
+/// and the as-written top-level `M::K` otherwise. The cross-file publication
+/// census deliberately keeps the as-written key; this resolved key is for the
+/// per-file value table only.
+fn resolved_path_write_name(w: &ConstWrite, index: &SourceIndex, core: &CoreIndex) -> String {
+    if w.rooted || w.prefix.is_empty() {
+        return w.name.clone();
+    }
+    let Some(pos) = w.name.rfind("::") else { return w.name.clone() };
+    let namespace = &w.name[..pos];
+    let base = &w.name[pos + 2..];
+    for i in (1..=w.prefix.len()).rev() {
+        let candidate = qualify(&w.prefix[..i], namespace);
+        if namespace_known(&candidate, index, core) {
+            return format!("{candidate}::{base}");
+        }
+    }
+    w.name.clone()
+}
+
+/// `known_namespace?` for the write census: an exact project-discovered
+/// namespace or an exact RBS class/module. In particular this must not use
+/// `project_declares_constant`'s leaf fallback — a top-level project `M` does
+/// not make `N::M` a namespace.
+fn namespace_known(name: &str, index: &SourceIndex, core: &CoreIndex) -> bool {
+    index.knows_discovered_decl(name)
+        || index.knows_discovered_meta_new(name)
+        || core.knows_qualified_class(name)
+        || (!name.contains("::") && core.knows_class(name))
+}
+
+pub(crate) fn constant_leaf(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 impl SourceIndex {
+    /// Withhold cross-file values if an unreadable or unparsed source could
+    /// have contributed another write. Per-file inference stays available.
+    pub fn mark_constant_census_incomplete(&mut self) {
+        self.incomplete_constant_census = true;
+    }
+
+    pub(crate) fn exact_path_const_write_key_contains(&self, name: &str) -> bool {
+        self.exact_path_const_write_keys.contains(name)
+    }
+
+    pub(crate) fn exact_const_write_key_contains(&self, name: &str) -> bool {
+        self.exact_const_write_keys.contains(name)
+    }
+
+    pub(crate) fn has_scalar_const_write(&self, name: &str, foreign: bool) -> bool {
+        if foreign && self.incomplete_constant_census {
+            return false;
+        }
+        let leaf = constant_leaf(name);
+        self.typed_const_path_writes.contains_key(leaf) || self.published_const_writes.contains_key(leaf)
+    }
+
+    /// The per-file typed path-write rung precedes foreign publication. A
+    /// poisoned typed slot is [`ScalarConstWrite::Stop`], never permission to
+    /// revive one lower value. Bare writes in this file still use C5/the #910
+    /// typed table; foreign values are exposed only to the direct-witness
+    /// caller that opts in with `foreign: true`.
+    pub(crate) fn scalar_const_write(
+        &self,
+        qualified: &str,
+        file: &FileKey,
+        foreign: bool,
+    ) -> ScalarConstWrite<'_> {
+        let leaf = constant_leaf(qualified);
+        if let Some(per_file) = self
+            .typed_const_path_writes
+            .get(leaf)
+            .and_then(|entries| entries.get(qualified))
+        {
+            if let Some(slot) = per_file.get(file) {
+                return match slot {
+                    Some(write) => ScalarConstWrite::Value(write),
+                    None => ScalarConstWrite::Stop,
+                };
+            }
+        }
+
+        let Some(write) = self
+            .published_const_writes
+            .get(leaf)
+            .and_then(|entries| entries.get(qualified))
+        else {
+            return ScalarConstWrite::Miss;
+        };
+        if write.file == *file {
+            // A bare publication stays out of the general same-file typer:
+            // bare writes belong to the #910 typed table. A path publication
+            // is visible here because the reference merges the seeded table
+            // into the writing file too.
+            return if write.path { ScalarConstWrite::Value(write) } else { ScalarConstWrite::Miss };
+        }
+        if foreign {
+            ScalarConstWrite::Value(write)
+        } else {
+            ScalarConstWrite::Miss
+        }
+    }
+
     /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
     /// site with lexical prefix `use_prefix`, or `None`. A recorded entry applies
     /// iff its defining namespace is visible at the use site — the JOINED
@@ -559,11 +823,12 @@ pub(crate) fn mutated_constant_names(ast: &LoweredAst) -> HashSet<String> {
         if m.receiver.is_empty() {
             continue;
         }
-        if m.receiver_is_path {
-            out.insert(m.receiver.clone());
-            continue;
-        }
-        // `constant_mutation_candidates`: `[A, B]` + `C` -> `A::B::C`, `A::C`, `C`.
+        // `constant_mutation_candidates`: `[A, B]` + `C` -> `A::B::C`,
+        // `A::C`, `C`. A path receiver contributes the same lexical ladder:
+        // its namespace resolves through the nesting for a write (`#690`), so
+        // recording only the as-written key left `N::M::H` un-widened. The
+        // census does not carry the rooted bit here; over-widening a rooted
+        // path is the safe direction because mutation only declines precision.
         for keep in 0..=m.prefix.len() {
             let prefix = &m.prefix[..m.prefix.len() - keep];
             out.insert(if prefix.is_empty() {

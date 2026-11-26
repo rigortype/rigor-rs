@@ -2237,6 +2237,20 @@ fn always_truthy_unless_false_is_falsey() {
 }
 
 #[test]
+fn always_truthy_bare_write_plus_path_write_stays_silent() {
+    // #904 review: the reference unions the bare write and the path write.
+    // The port cannot yet represent that union across the two write tables,
+    // but the bare co-write must poison the typed path slot — typing only
+    // `Config::DEBUG = true` made this ordinary feature-flag idiom a new
+    // always-truthy false positive.
+    let src = b"module Config\n  DEBUG = false\nend\nConfig::DEBUG = true if ENV['X']\nputs 'dbg' if Config::DEBUG\n";
+    assert!(
+        always_truthy(src).is_empty(),
+        "a bare/path constant-write union must not fold to the path literal"
+    );
+}
+
+#[test]
 fn always_truthy_branch_reassignment_widens_silent() {
     // THE KEYSTONE. `na = 5`, then a CONDITIONAL reassignment ⇒ `na` is
     // `5 | <recompute>` at the second `if` — the flow join widens it, so NO
@@ -5004,6 +5018,118 @@ fn project_rule_methods(files: &[&[u8]], focus: usize) -> Vec<(&'static str, Str
         .into_iter()
         .map(|d| (d.rule_id, d.method_name.unwrap_or_default()))
         .collect()
+}
+
+/// #904: foreign scalars answer direct qualified and ancestor reads. A
+/// second write, a compound/multiwrite, a dynamic target, and a non-publishable
+/// literal each decline; the publication must not drive a flow warning.
+#[test]
+fn foreign_scalar_constant_receivers_use_the_publication_census() {
+    let files: [&[u8]; 3] = [
+        b"Math::PI = 5\nclass PubBase; KEY = 5; SHADOW = 6; end\n\
+          module PubConfig\n  FLAG = true\n  TEXT = 'x'\n  DATA = [1]\n  NOTHING = nil\n\
+          REPEAT = 8\n  COMPOUND = 9\n  DESTRUCTURED = 10\n  WILDCARD = 11\nend\n",
+        b"PubConfig::REPEAT = :other\nPubConfig::COMPOUND += 1\n\
+          _unused, PubConfig::DESTRUCTURED = [1, 2]\n\
+          [PubConfig].each { |owner| owner::WILDCARD = 'x' }\n",
+        b"Math::PI.bogus\nclass PubSub < PubBase\n  SHADOW = ENV['X']\n  KEY.bogus\n  SHADOW.bogus\nend\n\
+          PubConfig::FLAG.bogus\nPubConfig::TEXT.bogus\nPubConfig::DATA.bogus\nPubConfig::NOTHING.bogus\n\
+          PubConfig::REPEAT.bogus\nPubConfig::COMPOUND.bogus\nPubConfig::DESTRUCTURED.bogus\n\
+          PubConfig::WILDCARD.bogus\nif PubConfig::FLAG; puts :yes; end\n",
+    ];
+    let asts: Vec<_> = files.iter().map(|src| lower(&parse(src))).collect();
+    let refs: Vec<_> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let rows: Vec<_> = analyze_with_source(&asts[2], &mut Interner::new(), &index, &source)
+        .into_iter()
+        .map(|d| {
+            let line = files[2][..d.start_offset].iter().filter(|&&b| b == b'\n').count() + 1;
+            (line, d.rule_id, d.message)
+        })
+        .collect();
+    assert_eq!(rows, [
+        (1, CALL_UNDEFINED_METHOD, "undefined method `bogus' for 5".into()),
+        (4, CALL_UNDEFINED_METHOD, "undefined method `bogus' for 5".into()),
+        (7, CALL_UNDEFINED_METHOD, "undefined method `bogus' for true".into()),
+    ]);
+}
+
+/// #904 review: the typed path-write table is per-FILE. Two files may write
+/// different literals to one constant; neither overwrites the other in table
+/// iteration order, and each writing file keeps its own direct witness.
+#[test]
+fn path_write_typed_table_is_file_local() {
+    let files: [&[u8]; 2] = [b"Math::PI = 5\nMath::PI.bogus\n", b"Math::PI = 6\nMath::PI.bogus\n"];
+    let asts: Vec<_> = files.iter().map(|src| lower(&parse(src))).collect();
+    let refs: Vec<_> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let mut rows = Vec::new();
+    for (file, ast) in asts.iter().enumerate() {
+        for d in analyze_with_source(ast, &mut Interner::new(), &index, &source) {
+            if d.rule_id == CALL_UNDEFINED_METHOD {
+                rows.push((file, d.message));
+            }
+        }
+    }
+    rows.sort();
+    assert_eq!(rows, [
+        (0, "undefined method `bogus' for 5".into()),
+        (1, "undefined method `bogus' for 6".into()),
+    ]);
+}
+
+/// #904 review: write-key namespace resolution knows exact raw declarations,
+/// never a prefix synthesized from another file's compact header. Here
+/// `Admin9::Holder` exists only as a prefix of `class Admin9::Holder::Inner`,
+/// so `Holder::DEFAULT` inside `module Admin9` keeps its as-written key. The
+/// in-namespace read still resolves to it through the nesting, while the
+/// fully-qualified `Admin9::Holder::DEFAULT` read does not.
+#[test]
+fn path_write_namespace_resolution_uses_raw_declarations_only() {
+    let a: &[u8] = b"module Admin9\n  Holder::DEFAULT = 5\n  Holder::DEFAULT.bogus\nend\nAdmin9::Holder::DEFAULT.bogus\nHolder::DEFAULT.bogus\n";
+    let b: &[u8] = b"class Admin9::Holder::Inner; end\n";
+    let asts: Vec<_> = [a, b].iter().map(|src| lower(&parse(src))).collect();
+    let refs: Vec<_> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let rows: Vec<_> = analyze_with_source(&asts[0], &mut Interner::new(), &index, &source)
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| (line_col(a, d.start_offset), d.message))
+        .collect();
+    assert_eq!(rows, [
+        ((3, 19), "undefined method `bogus' for 5".into()),
+        ((6, 17), "undefined method `bogus' for 5".into()),
+    ]);
+
+    // A real top-level declaration IS exact namespace knowledge: `M12::K`
+    // inside `module N12` writes the top-level `M12::K`, not `N12::M12::K`.
+    let src = b"module M12; end\nmodule N12\n  M12::K = 5\n  M12::K.bogus\nend\nM12::K.bogus\nN12::M12::K.bogus\n";
+    let rows: Vec<_> = run(src)
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| (line_col(src, d.start_offset), d.message))
+        .collect();
+    assert_eq!(rows, [
+        ((4, 10), "undefined method `bogus' for 5".into()),
+        ((6, 8), "undefined method `bogus' for 5".into()),
+    ]);
+}
+
+/// #904 review: path-receiver mutations widen through the same lexical
+/// candidate ladder as the write key. Without that, `M::H` inside `N904`
+/// stayed exact while the write had resolved to `N904::M::H`.
+#[test]
+fn path_receiver_mutation_widens_the_resolved_write_key() {
+    let src = b"module N904\n  module M; end\n  M::K = [1]\n  M::K << 2\n  M::K.bogus\n  M::H = { a: 1 }\n  M::H[:b] = 2\n  M::H.bogus\n  M::H[:b].bogus\nend\n";
+    let rows: Vec<_> = run(src)
+        .into_iter()
+        .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+        .map(|d| d.message)
+        .collect();
+    assert!(rows.is_empty(), "mutated containers must stay gradual, got {rows:?}");
 }
 
 /// Upstream v0.4.2 (#1706 / issue #1697), oracle-measured on a two-file
