@@ -6,7 +6,7 @@
 
 use std::borrow::Cow;
 use std::rc::Rc;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rigor_parse::{ElementReadStep, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
@@ -24,6 +24,84 @@ use crate::flow_writes::{
     is_content_mutator, literal_send_target, node_child_ids, IndexedFlow, MUTATOR_METHODS,
     STRING_MUTATORS,
 };
+
+/// The syntactic write/mention census `ClauseWidening` walks
+/// (`clause_widening.rb`): every local/ivar write under the statements,
+/// nested blocks included and nested `def`/`class`/`module` scopes excluded.
+/// This must be STRUCTURAL, not span-keyed: a heredoc interpolation's bytes
+/// can sit after the enclosing `end` while its write still belongs to the
+/// construct (`rigor-rs#965`; rigor-rs#1017's regression row). The second
+/// returned set is the mention census — reads plus writes, since a write
+/// mentions its target upstream.
+fn clause_write_census(
+    ast: &LoweredAst,
+    stmts: &[NodeId],
+) -> (HashMap<String, usize>, HashSet<String>) {
+    fn walk(
+        ast: &LoweredAst,
+        id: NodeId,
+        writes: &mut HashMap<String, usize>,
+        mentions: &mut HashSet<String>,
+    ) {
+        let node = ast.get(id);
+        if matches!(node, Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. }) {
+            return;
+        }
+        let mut mark_write = |name: &str| {
+            *writes.entry(name.to_string()).or_insert(0) += 1;
+            mentions.insert(name.to_string());
+        };
+        match node {
+            Node::LocalVariableRead { name, .. } => {
+                mentions.insert(name.clone());
+            }
+            Node::VariableRead { name, .. } if crate::def_local_marks::is_ivar(name) => {
+                mentions.insert(name.clone());
+            }
+            Node::LocalVariableWrite { name, .. }
+            | Node::LocalVariableOpWrite { name, .. }
+            | Node::InstanceVariableWrite { name, .. } => mark_write(name),
+            Node::MultiWrite { targets, .. } => {
+                for (name, _) in targets.bound_names() {
+                    mark_write(&name);
+                }
+            }
+            Node::UnmodeledWrite { names, ivar_write, .. } => {
+                for name in names {
+                    mark_write(name);
+                }
+                if let Some(w) = ivar_write {
+                    mark_write(&w.name);
+                }
+            }
+            Node::Loop { index, .. } => {
+                for (name, _) in index {
+                    mark_write(name);
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                for clause in clauses {
+                    if let Some(name) = &clause.bound_name {
+                        mark_write(name);
+                    }
+                }
+            }
+            _ => {}
+        }
+        let mut children = Vec::new();
+        node_child_ids(node, &mut children);
+        for child in children {
+            walk(ast, child, writes, mentions);
+        }
+    }
+
+    let mut writes = HashMap::new();
+    let mut mentions = HashSet::new();
+    for &s in stmts {
+        walk(ast, s, &mut writes, &mut mentions);
+    }
+    (writes, mentions)
+}
 
 /// A slot mutation's literal key as the one element-read step it is
 /// (`ElementReadWidening.index_step`): an Integer a position, a Symbol or
@@ -6121,25 +6199,16 @@ impl<'i> Typer<'i> {
         }
 
         let marks = self.def_local_marks(ast);
-        let body_writes = crate::def_local_marks::body_span(ast, main_body)
-            .map(|mspan| {
-                marks
-                    .write_positions_outside(mspan, &[], None)
-                    .into_iter()
-                    .filter(|(_, n)| *n == name)
-                    .count()
-            })
-            .unwrap_or(0);
+        let (body_write_counts, _) = clause_write_census(ast, main_body);
+        let body_writes = body_write_counts.get(name).copied().unwrap_or(0);
         let untyped = interner.untyped();
         let mut arm_types = vec![primary];
         for clause in clauses {
             if crate::class_narrowing::branch_terminates(self, ast, &clause.body) {
                 continue;
             }
-            let cspan = crate::def_local_marks::body_span(ast, &clause.body)
-                .unwrap_or(clause.span);
-            let mentioned = marks.reads_within(cspan).contains(&name)
-                || marks.changed_within(cspan).iter().any(|n| n == name);
+            let (_, mentions) = clause_write_census(ast, &clause.body);
+            let mentioned = mentions.contains(name);
             let mut arm_entry = if body_writes > 1 || mentioned { untyped } else { at };
             if clause.bound_name.as_deref() == Some(name) {
                 arm_entry = self
@@ -7447,12 +7516,7 @@ impl<'i> Typer<'i> {
         // `LOCAL_WRITE_NODES | InstanceVariable*Node` set walks, and
         // `write_positions_outside` already drops the `def`/`class`/
         // `module` nested scopes the reference's `SCOPE_BODY_NODES` skips.
-        let mut write_counts: HashMap<&str, usize> = HashMap::new();
-        if let Some(mspan) = crate::def_local_marks::body_span(ast, main_body) {
-            for (_, name) in marks.write_positions_outside(mspan, &[], None) {
-                *write_counts.entry(name).or_insert(0) += 1;
-            }
-        }
+        let (write_counts, _) = clause_write_census(ast, main_body);
         let forgotten = self.rescue_entry_forgets(ast, id, &entry, interner);
         for clause in clauses {
             // `live_rescue_results` — an arm that unconditionally exits
@@ -7468,17 +7532,11 @@ impl<'i> Typer<'i> {
             }
             // Body writes never flow in as values. `ClauseWidening`'s
             // names read as `untyped` where the entry already binds them.
-            let cspan = crate::def_local_marks::body_span(ast, &clause.body)
-                .unwrap_or(clause.span);
-            let reads = marks.reads_within(cspan);
-            let changed = marks.changed_within(cspan);
-            let mentioned = |name: &str| {
-                reads.contains(&name) || changed.iter().any(|c| c.as_str() == name)
-            };
+            let (_, mentions) = clause_write_census(ast, &clause.body);
             let untyped = interner.untyped();
             for (name, n) in &write_counts {
-                if (*n > 1 || mentioned(name)) && e.contains_key(*name) {
-                    e.insert(Rc::from(*name), untyped);
+                if (*n > 1 || mentions.contains(name)) && e.contains_key(name.as_str()) {
+                    e.insert(Rc::from(name.as_str()), untyped);
                 }
             }
             // `bind_rescue_reference` binds `e` inside the arm even when

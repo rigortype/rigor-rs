@@ -1449,6 +1449,24 @@ fn live_rescue_arm_writes_join_post_begin_scope() {
         );
         assert_eq!(x_of(&src), want, "{begin_body}");
     }
+    // A same-file toplevel def propagates `bot` only through a direct
+    // value dependency on the parameter the `raise` argument binds. The
+    // rescue arm then terminates and the pre-begin binding survives; a
+    // method call on the parameter is an ordinary value and keeps the arm
+    // live.
+    for (defn, want) in [
+        ("def g(a) = a; ", "\"a\""),
+        ("def g(a); z = a; z; end; ", "\"a\""),
+        ("def g(a); if rand > 0; a; else; a; end; end; ", "\"a\""),
+        ("def g(a); a.upcase; end; ", "\"a\" | \"e\""),
+        ("def g(a); z = a; z.upcase; end; ", "\"a\" | \"e\""),
+    ] {
+        let src = format!(
+            "{defn}x = \"a\"; begin; raise; rescue; x = \"e\"; g(raise); end; x.w"
+        );
+        assert_eq!(x_of(&src), want, "{defn}");
+    }
+
     // `rescue => x` binds inside the arm even when the arm never writes
     // `x` again: the nested join keeps the entry, the sibling arm and the
     // exception instance. Compare members structurally — the interned
