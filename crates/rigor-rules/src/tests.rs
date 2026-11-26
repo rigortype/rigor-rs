@@ -6182,3 +6182,67 @@ fn retry_edge_nested_begins_and_kill_controls() {
     assert_eq!(got.len(), 1, "{src:?}: {got:?}");
     assert!(got[0].ends_with("for [5]"), "{src:?}: {got:?}");
 }
+
+/// rigor-rs#1017 — a write in a rescue clause's exception-designator list
+/// types the expression itself, but its resulting scope is discarded with
+/// the designator evaluation on the reference: it does not rebind the local
+/// in the clause body or in the post-`begin` continuation. The port used to
+/// count it as an ordinary conditional write and widened the entry binding
+/// to `Dynamic`, losing the post-`begin` witness.
+#[test]
+fn rescue_exception_designator_write_does_not_leak_to_continuation() {
+    for src in [
+        b"x = \"a\"; begin; raise; rescue (x = StandardError); end; x.w\n".as_slice(),
+        b"x = \"a\"; if true; begin; raise; rescue (x = StandardError); end; end; x.w\n".as_slice(),
+        b"x = \"a\"; begin; raise; rescue x = StandardError; end; x.w\n".as_slice(),
+        b"x = \"a\"; begin; raise; rescue ArgumentError, (x = StandardError); end; x.w\n".as_slice(),
+        // The ensure mentions the name, so `ClauseWidening` still hides the
+        // in-ensure call. Only the call after the begin should be reported.
+        b"x = \"a\"; begin; raise; rescue (x = StandardError); ensure; x.w; end; x.w\n".as_slice(),
+        // With no assignment in the rescue list, the ensure call still fires.
+        b"x = \"a\"; begin; raise; rescue StandardError; ensure; x.w; end\n".as_slice(),
+    ] {
+        let diags = run(src);
+        assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+        assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+        assert_eq!(diags[0].message, "undefined method `w' for \"a\"");
+        assert_eq!(diags[0].start_offset, src.iter().rposition(|&b| b == b'w').unwrap());
+    }
+
+    // A real rescue-body rebind is not a discarded designator effect.
+    assert!(run(b"x = \"a\"; begin; raise; rescue; x = StandardError; end; x.w\n").is_empty());
+    assert!(run(b"x = \"a\"; begin; raise; rescue (x = StandardError); end; x.upcase\n").is_empty());
+
+    // ClauseWidening reads the protected body syntactically. It counts the
+    // two dead writes, and it counts a nested begin's designator write for an
+    // outer rescue that mentions the name. Neither continuation can pin x.
+    let diags = run(b"x = \"a\"; begin; if false; x = 1; x = 2; end; raise; rescue (x = StandardError); end; x.w\n");
+    assert_eq!(diags.len(), 1, "expected only the dead-branch warning, got {diags:?}");
+    assert_eq!(diags[0].rule_id, "flow.unreachable-branch");
+    assert!(run(b"x = \"a\"; begin; begin; raise; rescue (x = StandardError); end; rescue; x.upcase; end; x.w\n").is_empty());
+
+    // A heredoc interpolation is a structural child of the construct even
+    // when its bytes sit after `end`. Filtering the designator must not
+    // restore the pre-begin pin over that write.
+    assert!(run(
+        b"x = \"a\"\nbegin\n  raise <<~TXT; rescue (x = StandardError); x.to_s; end\n    #{x = 1}\n  TXT\nx.w\n"
+    )
+    .is_empty());
+    assert!(run(
+        b"x = \"a\"\nbegin\n  raise\nrescue (x = StandardError)\nensure\n  puts <<~TXT; end\n    #{x = 1}\n  TXT\nx.odd?\n"
+    )
+    .is_empty());
+    let diags = run(
+        b"x = \"a\"\nbegin\n  raise <<~TXT; rescue (x = StandardError); x.to_s; end\n    no write\n  TXT\nx.w\n",
+    );
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `w' for \"a\"");
+
+    // The designator expression itself still evaluates in order: the write
+    // is visible to a read later in that same expression on both engines.
+    let diags = run(b"begin; raise; rescue (x = StandardError; x.w); end\n");
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `w' for singleton(StandardError)");
+}

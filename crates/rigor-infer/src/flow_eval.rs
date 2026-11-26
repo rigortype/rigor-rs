@@ -2440,7 +2440,7 @@ impl<'i> Typer<'i> {
                     boundaries: Vec::new(),
                     boundary_stmts: Vec::new(),
                     boundary_stride: 1,
-                    effects: FlowEffects::new(Vec::new(), Vec::new()),
+                    effects: FlowEffects::new(Vec::new(), Vec::new(), Default::default()),
                     closure_mutations: Vec::new(),
                     escaped: Vec::new(),
                     indexed: IndexedFlow::default(),
@@ -2533,7 +2533,8 @@ impl<'i> Typer<'i> {
         let stride = (body.len() as f64).sqrt().ceil().max(1.0) as usize;
         let mut boundaries = Vec::new();
         let mut boundary_stmts = Vec::with_capacity(body.len());
-        let effects = FlowEffects::new(rebinds, mutations);
+        let designator_rebinds = self.discarded_rescue_designator_rebinds(ast, &body);
+        let effects = FlowEffects::new(rebinds, mutations, designator_rebinds);
         for (i, &stmt) in body.iter().enumerate() {
             if record {
                 boundary_stmts.push((stmt, ast.get(stmt).span()));
@@ -2573,6 +2574,87 @@ impl<'i> Typer<'i> {
             record_guards,
             retry_edges,
         }
+    }
+
+    /// Plain local assignments that are themselves exception designators
+    /// (single-expression parentheses lower to the assignment). The reference
+    /// keeps `sub_eval(exception, scope).first`, not the resulting scope.
+    /// This slice handles statement and `if`-arm begins, not a begin nested
+    /// in another rescue's protected body, where the outer `ClauseWidening`
+    /// can still count the designator as a protected-body write.
+    fn discarded_rescue_designator_rebinds(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+    ) -> std::collections::HashSet<rigor_parse::Span> {
+        let mut discarded = std::collections::HashSet::new();
+        let mut stack = body.to_vec();
+        while let Some(id) = stack.pop() {
+            match ast.get(id) {
+                Node::If { then_body, else_body, .. } => {
+                    stack.extend(then_body);
+                    stack.extend(else_body);
+                }
+                Node::Statements { body, kind: StatementsKind::Sequence, .. } => stack.extend(body),
+                Node::BeginRescue { body, .. } if ast.is_else_carrier(id) => stack.extend(body),
+                Node::BeginRescue { clauses, .. } => {
+                    // `ClauseWidening` walks children, not source spans, so a
+                    // heredoc interpolation that sits after `end` still counts
+                    // as a write of the construct. Span containment missed
+                    // those and restoring the pre-begin pin was an FP.
+                    let skip: std::collections::HashSet<_> =
+                        clauses.iter().flat_map(|c| c.exceptions.iter().copied()).collect();
+                    let written = Self::construct_local_writes(ast, id, &skip);
+                    for &ex in clauses.iter().flat_map(|c| &c.exceptions) {
+                        let Node::LocalVariableWrite { name, span, .. } = ast.get(ex) else {
+                            continue;
+                        };
+                        if !written.contains(name) {
+                            discarded.insert(*span);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        discarded
+    }
+
+    /// Local names a `begin` construct writes, walking structural children so
+    /// a heredoc interpolation that escapes the node's source span still
+    /// counts. `skip` is the rescue exception-list (the discarded designator
+    /// assignments themselves). Nested `def`/`class`/`module` bodies are
+    /// another scope, matching `ClauseWidening`.
+    fn construct_local_writes(
+        ast: &LoweredAst,
+        root: NodeId,
+        skip: &std::collections::HashSet<NodeId>,
+    ) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        let mut stack = Vec::new();
+        node_child_ids(ast.get(root), &mut stack);
+        while let Some(id) = stack.pop() {
+            match ast.get(id) {
+                Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                    continue;
+                }
+                Node::LocalVariableWrite { name, .. } if !skip.contains(&id) => {
+                    names.insert(name.clone());
+                }
+                Node::LocalVariableOpWrite { name, .. } => {
+                    names.insert(name.clone());
+                }
+                Node::MultiWrite { targets, .. } => {
+                    names.extend(targets.bound_names().into_iter().map(|(n, _)| n));
+                }
+                Node::UnmodeledWrite { names: writes, .. } => {
+                    names.extend(writes.iter().cloned());
+                }
+                _ => {}
+            }
+            node_child_ids(ast.get(id), &mut stack);
+        }
+        names
     }
 
     /// [`CheckFlow::loops`]: every `while`/`until` loop with a predicate
@@ -8186,6 +8268,10 @@ pub(crate) struct FlowEffects {
     /// [`toplevel_mutations`]: every `local.<mutator>` call
     /// `(call span, name, method, drop_key)`.
     pub(crate) mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    /// Discarded designator rebinds for statement-exit replay only. The raw
+    /// table still feeds read-site replay, including `ClauseWidening` for
+    /// `ensure`, which counts writes syntactically.
+    designator_rebinds: std::collections::HashSet<rigor_parse::Span>,
     /// Positions into `rebinds`, sorted by span start (stable — the
     /// tables' own order inside an equal start).
     rebind_starts: Vec<u32>,
@@ -8197,12 +8283,13 @@ impl FlowEffects {
     pub(crate) fn new(
         rebinds: Vec<(rigor_parse::Span, String)>,
         mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+        designator_rebinds: std::collections::HashSet<rigor_parse::Span>,
     ) -> Self {
         let mut rebind_starts: Vec<u32> = (0..rebinds.len() as u32).collect();
         rebind_starts.sort_by_key(|&i| rebinds[i as usize].0 .0);
         let mut mutation_starts: Vec<u32> = (0..mutations.len() as u32).collect();
         mutation_starts.sort_by_key(|&i| mutations[i as usize].0 .0);
-        FlowEffects { rebinds, mutations, rebind_starts, mutation_starts }
+        FlowEffects { rebinds, mutations, designator_rebinds, rebind_starts, mutation_starts }
     }
 
     /// The positions of `table`'s span-keyed entries whose START falls in
@@ -8228,12 +8315,14 @@ impl FlowEffects {
     }
 
     /// `rebinds` entries starting inside `span` (`w.0 <= span.1` — the end
-    /// check is the caller's).
+    /// check is the caller's), excluding a designator assignment's rebind
+    /// when replaying the continuation of an enclosing statement.
     pub(crate) fn rebinds_within(
         &self,
         span: rigor_parse::Span,
     ) -> impl Iterator<Item = &(rigor_parse::Span, String)> {
         Self::within(&self.rebinds, &self.rebind_starts, span, |r| r.0)
+            .filter(move |(w, _)| *w == span || !self.designator_rebinds.contains(w))
     }
 
     /// `mutations` entries starting inside `span`, same rule.
