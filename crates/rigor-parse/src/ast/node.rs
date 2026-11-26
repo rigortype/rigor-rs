@@ -31,6 +31,8 @@ pub struct RescueClause {
     /// `String → C` drift. Populated only from a real `BeginNode` rescue chain
     /// (empty for the reused carriers).
     pub bound_name: Option<String>,
+    /// `rescue => $_` sets the frame's last-line global.
+    pub sets_last_line: bool,
     /// The `[]=` stores an index-target reference performs — `rescue => h[:e]`
     /// stores the rescued exception through `[]=` on `h`
     /// (`statement_evaluator.rb` `bind_rescue_reference`, rigor-rs#134). Each

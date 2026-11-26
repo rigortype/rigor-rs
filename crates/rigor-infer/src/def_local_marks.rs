@@ -745,6 +745,16 @@ impl DefLocalMarks {
         out
     }
 
+    /// Whether a write to `name` is recorded at this token's start. Some
+    /// sigilled compound writes keep their name only on an orphan arena node.
+    pub(crate) fn writes_name_at(&self, start: usize, name: &str) -> bool {
+        let i = self.writes.partition_point(|w| w.0 < start);
+        self.writes[i..]
+            .iter()
+            .take_while(|w| w.0 == start)
+            .any(|w| w.1 == name)
+    }
+
     /// [`Self::written_outside`] with each write's start position attached —
     /// [`Typer::widen_shell`]'s dead-arm filter needs positions, not just
     /// names (rigor-rs#437).
