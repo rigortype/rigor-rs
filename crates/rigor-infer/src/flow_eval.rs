@@ -3252,6 +3252,12 @@ impl<'i> Typer<'i> {
                     return;
                 }
                 self.apply_subtree_effects(ast, predicate, site, uncond, env, flow, interner);
+                // A reader in the predicate at least disproves the entry
+                // binding on every branch edge. The reference keeps a
+                // nil/String edge for a direct `gets`; until that narrowing
+                // is ported, forgetting is the non-inventing side and avoids
+                // the stale `for 1` positive.
+                self.forget_last_line_reader(ast, predicate, env, interner);
                 let (branch, edge) = if then_body
                     .iter()
                     .any(|&s| within_span(site, ast.get(s).span()))
@@ -3473,8 +3479,16 @@ impl<'i> Typer<'i> {
             // flat — `Recovered`/`Jump`/`Inert` children never evaluate on
             // the reference (`x = (each { w; r }) rescue nil` and
             // `break each { w; r }` both fire there).
-            Node::Loop { body, .. } => {
+            Node::Loop { predicate, body, .. } => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                // The collection/predicate runs before the body it controls
+                // (`for x in gets` is a plain reader; a direct reader
+                // condition proves nothing about the pre-loop binding either,
+                // even where the reference keeps a nil/String edge we do not
+                // model). Do not carry the stale entry binding into the body.
+                if let Some(predicate) = predicate {
+                    self.forget_last_line_reader(ast, *predicate, env, interner);
+                }
                 // Inside one iteration the body still threads in order: a
                 // read after a plain reader in an earlier body statement
                 // cannot carry the entry `$_`. The flat pass has already
@@ -3491,16 +3505,22 @@ impl<'i> Typer<'i> {
                 }
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
             }
-            Node::Case { .. } => {
+            Node::Case { predicate, .. } => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                if let Some(predicate) = predicate {
+                    self.forget_last_line_reader(ast, *predicate, env, interner);
+                }
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
             }
             // A `when`/`in` arm descends into its BODY only: the oracle
             // keeps a condition-position block's writes out of the in-body
             // read's scope (`when [1].each { h.default ||= 0; h[:a].m }`
             // fires there), so `conditions` stays flat.
-            Node::When { body, .. } => {
+            Node::When { conditions, body, .. } => {
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
+                for &condition in conditions.clone().iter() {
+                    self.forget_last_line_reader(ast, condition, env, interner);
+                }
                 for &s in body.clone().iter() {
                     let sspan = ast.get(s).span();
                     if sspan.0 <= site.0 && site.0 < sspan.1 {

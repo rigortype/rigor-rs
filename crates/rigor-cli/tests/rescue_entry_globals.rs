@@ -117,6 +117,13 @@ fn plain_reader_unbinds_last_line_on_the_primary_path() {
         b"$_ = 1\nIO.foreach(\"x\") { |line| nil }\n$_.chomp\n".as_slice(),
         b"$_ = 1\ncase rand\nwhen 1\n  gets\n  $_.chomp\nend\n".as_slice(),
         b"$_ = 1\nwhile rand > 0\n  gets\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nfor x in gets\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nif gets\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nwhile gets\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\ncase rand\nwhen gets\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\ncase gets\nwhen String\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nbegin\n  0\nrescue\n  nil\nelse\n  gets\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nbegin\n  0\nrescue\n  nil\nensure\n  gets\n  $_.chomp\nend\n".as_slice(),
     ] {
         assert!(undefined_methods(source).is_empty(), "{}", String::from_utf8_lossy(source));
     }
