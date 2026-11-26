@@ -435,7 +435,7 @@ impl SourceIndex {
         for (_, ast) in files {
             let mutated_constants = mutated_constant_names(ast);
             for w in ast.const_writes() {
-                scalars.record(w, ast.file_key(), &mutated_constants, &idx, core);
+                scalars.record(w, ast.file_key(), &mutated_constants);
                 if !w.plain || w.dynamic {
                     continue;
                 }
@@ -452,8 +452,6 @@ impl SourceIndex {
                 }
             }
         }
-
-        scalars.finish(&mut idx);
 
         // Upstream v0.4.6 (#1817 / #2183): the rebinding-callee census,
         // joined project-wide — a slot two files (or two arms) define is one
@@ -565,7 +563,14 @@ impl SourceIndex {
             // The DECL-only half — no prefix synthesis: `class A::M` must
             // not shadow a bare `::M` operand.
             idx.discovered_decls.extend(h.discovered_decls.iter().cloned());
+            idx.discovered_meta_new.extend(h.discovered_names.iter().cloned());
         }
+        // #904's write tables resolve namespaces against the RAW declaration
+        // seed (`discovered_decls` + meta-new writes), which the loop above has
+        // now completed. Finish before the downstream typing passes so they see
+        // the same constant facts the early census used to install.
+        scalars.finish(&mut idx, core);
+
         // Materialize the trie into `discovered_classes`: node i's string is
         // its parent's + `::` + its segment — the segment alone under the
         // root, exactly the `segs.join("::")` the per-name loop built —

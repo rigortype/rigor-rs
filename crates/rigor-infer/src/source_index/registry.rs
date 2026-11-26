@@ -204,6 +204,15 @@ impl SourceIndex {
         self.discovered_decls.contains(name)
     }
 
+    /// Whether a meta-new constant write (`Foo = Class.new` / `Struct.new` /
+    /// `Module.new` / `Data.define`) names `name`. Together with
+    /// [`Self::knows_discovered_decl`] this is the reference's raw
+    /// cross-file `collect_class_decls` namespace knowledge, before compact
+    /// header prefix synthesis.
+    pub(crate) fn knows_discovered_meta_new(&self, name: &str) -> bool {
+        self.discovered_meta_new.contains(name)
+    }
+
     /// The DISCOVERED written superclass (last path component) of a source class,
     /// or `None` when the name is unknown OR is a source class/module WITHOUT a
     /// `class Foo < Bar` superclass (a bare `class Foo`/`module Foo` — the two are

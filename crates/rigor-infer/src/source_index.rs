@@ -644,9 +644,30 @@ pub struct SourceIndex {
     /// `name` is the whole path and therefore misses the bare-name map.
     /// Backs [`Self::qualified_literal_constant`].
     qualified_literal_constants: HashMap<String, HarvestedConst>,
-    /// #904: exact scalar candidates from the raw constant-write census.
-    /// Keyed by last segment first so unrelated reads skip the extra lookup.
-    scalar_const_writes: HashMap<String, HashMap<String, constants::ScalarWrite>>,
+    /// #904: exact same-file literal candidates for static constant-path
+    /// writes. Keyed by last segment first so unrelated reads skip the extra
+    /// lookup, then by resolved qualified write name and assigning file. A
+    /// `None` slot is a proven write whose value this table cannot represent
+    /// (a repeat, a non-literal, or a same-file bare co-write); it is a stop,
+    /// not absence.
+    typed_const_path_writes:
+        HashMap<String, HashMap<String, HashMap<FileKey, Option<constants::ScalarWrite>>>>,
+    /// #644: cross-file scalar publications, keyed by last segment and then
+    /// by the AS-WRITTEN qualified name. Kept separate from the typed table:
+    /// the reference keys those two censuses differently and a file collision
+    /// must never choose a winner in HashMap iteration order.
+    published_const_writes: HashMap<String, HashMap<String, constants::ScalarWrite>>,
+    /// Static constant-PATH-write keys after the same namespace resolution
+    /// the typed table uses. Unlike `constant_write_candidates` — deliberately
+    /// a lexical over-approximation for the shadow gate — this is the exact
+    /// path-binding set the scalar rung may stop on. Bare writes stay with
+    /// the #910/C5 tables, so they are deliberately absent here.
+    exact_path_const_write_keys: HashSet<String>,
+    /// Exact keys of every static constant write, path and bare. The scalar
+    /// walk uses a bare hit only as a SOFT stop — the #910/C5 tables own the
+    /// answer — so an ancestor or top-level publication cannot leapfrog a
+    /// same-file bare write while the scalar rung is walking candidates.
+    exact_const_write_keys: HashSet<String>,
     incomplete_constant_census: bool,
     /// Collection-shape stage 2b: the BARE name of every `CONST = …` write the
     /// project makes in a class/module/program body — INCLUDING the ones C5
@@ -686,6 +707,12 @@ pub struct SourceIndex {
     /// `resolved_static_constant`'s rooted shadow-decline
     /// (rigor-rs#672 round 6).
     discovered_decls: HashSet<String>,
+    /// The meta-new constant-write half of the reference's raw
+    /// `collect_class_decls` seed (`Foo = Class.new` / `Struct.new` / …),
+    /// without `synthesize_namespace_prefixes`. Kept separate from
+    /// `discovered_decls`, whose existing consumers deliberately want class
+    /// and module declarations only.
+    discovered_meta_new: HashSet<String>,
     /// C1 (constant-shadow gate): for a constant the project defines NESTED, the
     /// containing-namespace segment vectors keyed by the constant's last segment
     /// (`module Gitlab; module Database; module Partitioning; module Time` keys

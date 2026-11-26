@@ -472,8 +472,10 @@ impl<'i> Typer<'i> {
                 // the use site's lexical prefix (Ruby constant lookup), so compute
                 // it once.
                 let prefix = self.enclosing_prefix(*span);
-                if let Some(ty) = self.scalar_constant_read(ast, name, prefix, *rooted, false, interner) {
-                    return ty;
+                match self.scalar_constant_read(ast, name, prefix, *rooted, false, interner) {
+                    ScalarConstantRead::Answer(ty) => return ty,
+                    ScalarConstantRead::Stop => return interner.untyped(),
+                    ScalarConstantRead::Miss => {}
                 }
                 // C5: a project constant with a single fully-literal assignment,
                 // visible here lexically, types to that literal value
@@ -1563,12 +1565,17 @@ impl<'i> Typer<'i> {
         let Node::ConstantRead { name, span, dynamic_base: false, rooted, .. } = ast.get(receiver) else {
             return None;
         };
-        self.scalar_constant_read(ast, name, self.enclosing_prefix(*span), *rooted, true, interner)
+        match self.scalar_constant_read(ast, name, self.enclosing_prefix(*span), *rooted, true, interner) {
+            ScalarConstantRead::Answer(ty) => Some(ty),
+            ScalarConstantRead::Stop | ScalarConstantRead::Miss => None,
+        }
     }
 
     // The new literal rung reads the same candidate order as Reflection. A
     // candidate bound by another source is a stop, not permission to find
-    // a scalar in a lower scope. Leave those answers to the existing typer.
+    // a scalar in a lower scope. That stop must be visible to the caller:
+    // falling through to C5 would revive one arm of a union the reference
+    // types together.
     fn scalar_constant_read(
         &self,
         ast: &LoweredAst,
@@ -1577,9 +1584,20 @@ impl<'i> Typer<'i> {
         rooted: bool,
         foreign: bool,
         interner: &mut Interner,
-    ) -> Option<TypeId> {
+    ) -> ScalarConstantRead {
         if self.const_rvalue_typing.get() != 0 || !self.source.has_scalar_const_write(name, foreign) {
-            return None;
+            return ScalarConstantRead::Miss;
+        }
+        fn finish(hit: Option<AncestorHit>) -> ScalarConstantRead {
+            match hit {
+                Some(AncestorHit::Answer(ty)) => ScalarConstantRead::Answer(ty),
+                Some(AncestorHit::HardStop) => ScalarConstantRead::Stop,
+                // A class/RBS/predefined binding is already the lower rung's
+                // own answer. It ends the scalar walk softly; it must not
+                // suppress the existing constant typer.
+                Some(AncestorHit::Stop) => ScalarConstantRead::Miss,
+                None => ScalarConstantRead::Miss,
+            }
         }
         let mut candidate = |key: &str| {
             if self.source.project_declares_constant(key)
@@ -1588,13 +1606,21 @@ impl<'i> Typer<'i> {
             {
                 return Some(AncestorHit::Stop);
             }
-            if let Some(write) = self.source.scalar_const_write(key, ast.file_key(), foreign) {
-                let ty = self.intern_const_write_literal(write, interner);
-                return Some(AncestorHit::Answer(ty));
+            match self.source.scalar_const_write(key, ast.file_key(), foreign) {
+                crate::source_index::ScalarConstWrite::Value(write) => {
+                    let ty = self.intern_const_write_literal(write, interner);
+                    return Some(AncestorHit::Answer(ty));
+                }
+                crate::source_index::ScalarConstWrite::Stop => return Some(AncestorHit::HardStop),
+                crate::source_index::ScalarConstWrite::Miss => {}
             }
-            if self.source.constant_write_candidates_contains(key)
-                || self.constant_type_for(key, interner).is_some()
-            {
+            if self.source.exact_path_const_write_key_contains(key) {
+                return Some(AncestorHit::HardStop);
+            }
+            if self.source.exact_const_write_key_contains(key) {
+                return Some(AncestorHit::Stop);
+            }
+            if self.constant_type_for(key, interner).is_some() {
                 return Some(AncestorHit::Stop);
             }
             None
@@ -1602,7 +1628,7 @@ impl<'i> Typer<'i> {
         if !rooted && !prefix.is_empty() {
             for i in (1..=prefix.len()).rev() {
                 if let Some(hit) = candidate(&crate::source_index::qualify(&prefix[..i], name)) {
-                    return hit.answer();
+                    return finish(Some(hit));
                 }
             }
             if let Some((_, hit)) = self.agreed_ancestor_hit(&prefix.join("::"), |scopes| {
@@ -1610,10 +1636,10 @@ impl<'i> Typer<'i> {
                     candidate(&format!("{owner}::{name}")).map(|hit| (owner.clone(), hit))
                 })
             }) {
-                return hit.answer();
+                return finish(Some(hit));
             }
         }
-        candidate(name)?.answer()
+        finish(candidate(name))
     }
 
     /// Type one syntactically harvested constant literal. The empty-seed
@@ -1781,7 +1807,7 @@ impl<'i> Typer<'i> {
                     // The census stop is a HIT whose answer is silence: the
                     // candidate binds, so no lower rung — and not the
                     // top-level step 3 — may answer for it.
-                    Some((_, AncestorHit::Stop)) => return None,
+                    Some((_, AncestorHit::Stop | AncestorHit::HardStop)) => return None,
                     None => {}
                 }
             }
@@ -3013,6 +3039,17 @@ impl<'i> Typer<'i> {
 /// every MRI build (C's `M_PI` / `M_E`, the four IEEE-754 binary64
 /// magnitudes), which is the upstream admission criterion; `Float::NAN` is
 /// deliberately NOT folded upstream and neither here.
+/// What the scalar constant-write rung decided. `Stop` is a hard project-write
+/// stop: the lower constant rungs must not revive one arm of a write union or
+/// a predefined value the path write shadows. `Miss` includes the soft stops
+/// (a class/RBS/predefined binding, or a bare write the #910/C5 rungs own),
+/// which end this walk but leave the ordinary constant typer to answer.
+enum ScalarConstantRead {
+    Answer(TypeId),
+    Stop,
+    Miss,
+}
+
 /// What one ancestor-scope candidate answered — rigor-rs#905's half of the
 /// reference's truthy-hit/`WRITTEN_CANDIDATE` distinction: `constant_type_at`
 /// answers a TYPE for some candidates and the write/decl STOP for the rest,
@@ -3022,15 +3059,11 @@ impl<'i> Typer<'i> {
 enum AncestorHit {
     Answer(TypeId),
     Stop,
-}
-
-impl AncestorHit {
-    fn answer(self) -> Option<TypeId> {
-        match self {
-            Self::Answer(ty) => Some(ty),
-            Self::Stop => None,
-        }
-    }
+    /// A project PATH write the lower constant rungs cannot represent. Unlike
+    /// [`Self::Stop`], this is a hard stop for the scalar literal rung: falling
+    /// through would revive a bare write or predefined value the write union
+    /// already shadows.
+    HardStop,
 }
 
 fn folded_float_constant(name: &str) -> Option<f64> {
