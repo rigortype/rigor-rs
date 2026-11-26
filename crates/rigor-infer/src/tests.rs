@@ -1590,6 +1590,71 @@ fn for_element_mixed_ranges_and_receiver_call_chains() {
         ("x=\"a\"; if rand > 0; for x in [1].lazy.each; end; end; x.w", "\"a\" | Integer"),
         ("x=\"a\"; if rand > 0; for x in [1].each.each; end; end; x.w", "\"a\" | Integer"),
         ("x=\"a\"; if rand > 0; for x in [1].each.lazy.each; end; end; x.w", "\"a\" | Integer"),
+        // The pure self-returners preserve only the shape carriers. On an
+        // Enumerator nominal they take `-> self`, so the element type argument
+        // deep-widens (a pair element widens as one Array element).
+        ("x=\"a\"; if rand > 0; for x in [1].each.dup; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy.itself; end; end; x.w", "\"a\" | Integer"),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each.dup; end; end; x.w",
+            "\"a\" | Array[Integer | Symbol]",
+        ),
+        // Wrong-arity and block-passing spellings are diagnosed independently;
+        // the signature's block-param answer still applies. A block makes even
+        // a shape-backed pure self-returner take the widened `-> self` arm.
+        ("x=\"a\"; if rand > 0; for x in [1].dup(1).each; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].dup{}.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy(1); end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy{}; end; end; x.w", "\"a\" | 1"),
+        // A live break in the OUTERMOST block declines untyped, as does a
+        // plain-positional arity error on a block-form `each`. Inside the
+        // chain a nil break arm is only the union member the reference sees
+        // through, while a non-nil arm poisons the receiver type.
+        ("x=\"a\"; if rand > 0; for x in [1].dup { break }; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy { break }; end; end; x.w", "Dynamic[top]"),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(1) { |y| y }; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each(1) {}; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(k: 1) { |y| y }; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(*[], 1) { |y| y }; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        // A splat-only list may expand empty, so it can still take the
+        // zero-arity `-> self` overload.
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(*[]) { |y| y }; end; end; x.w",
+            "\"a\" | Integer",
+        ),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].each { break }.each; end; end; x.w", "\"a\" | Integer"),
+        // Nil also answers Object's self-returners, so the maybe-nil state
+        // survives `dup`/`freeze`/`clone`/`itself` until an `each`/`lazy`
+        // link drops it.
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].each { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.dup.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].dup { break }.freeze.each; end; end; x.w", "\"a\" | Integer"),
+        // Safe navigation does not drop the nil member: `recv&.each` and
+        // `recv&.lazy` skip the call on nil rather than dispatching it.
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }&.each; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }&.lazy; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.dup&.each; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.freeze { break }&.each_key; end; end; x.w", "Dynamic[top]"),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].freeze { break 1 }.each; end; end; x.w",
+            "Dynamic[top]",
+        ),
         // Hash iteration yields its pair. `each_pair` is hash-only, and a
         // second enumerator `each` deep-widens the pair type argument to an
         // Array, exactly as `SelfSubstitute.deep_widen` does.
@@ -1597,6 +1662,17 @@ fn for_element_mixed_ranges_and_receiver_call_chains() {
         (
             "x=\"a\"; if rand > 0; for x in {k:1}.each_pair.each; end; end; x.w",
             "\"a\" | Array[Integer | Symbol]",
+        ),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_key; end; end; x.w", "\"a\" | :k"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_value; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_key.each; end; end; x.w", "\"a\" | Symbol"),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each_value.each; end; end; x.w",
+            "\"a\" | Integer",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each_key { |y| y }; end; end; x.w",
+            "\"a\" | [Symbol, Integer]",
         ),
         // Arity is diagnosed independently; the fallback block-param answer
         // still types the element. A block form returns the receiver `self`,
@@ -1606,6 +1682,16 @@ fn for_element_mixed_ranges_and_receiver_call_chains() {
         (
             "x=\"a\"; if rand > 0; for x in {k:1}.each { |y| y }; end; end; x.w",
             "\"a\" | [Symbol, Integer]",
+        ),
+        // An empty Hash still has its `[untyped, untyped]` pair shell;
+        // a second enumerator `each` deep-widens that pair as one element.
+        (
+            "x=\"a\"; if rand > 0; for x in {}.each_pair; end; end; x.w",
+            "\"a\" | [Dynamic[top], Dynamic[top]]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in {}.each.each; end; end; x.w",
+            "\"a\" | Array[Dynamic[top]]",
         ),
     ] {
         assert_eq!(x_of(src), want, "{src}");

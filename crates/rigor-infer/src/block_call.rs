@@ -1347,6 +1347,37 @@ impl<'i> Typer<'i> {
             .any(|j| matches!(j.kind, JumpKind::Break))
     }
 
+    /// The dead-branch-filtered values a block-level `break` can carry out
+    /// of the yielding call. This is the caller-facing subset of
+    /// [`Self::block_break_arm_types`]: empty either when there is no
+    /// block-level `break` or when every one sits on a branch the block-entry
+    /// scopes prove dead.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn block_level_live_break_arms(
+        &self,
+        ast: &LoweredAst,
+        block_span: rigor_parse::Span,
+        block_body: &[NodeId],
+        block_params: &[(String, BlockParamKind)],
+        recv_ty: TypeId,
+        env: &TypeEnv,
+        interner: &mut Interner,
+    ) -> Vec<TypeId> {
+        let jumps = self.block_level_jumps(ast, block_span);
+        if !jumps.iter().any(|j| matches!(j.kind, JumpKind::Break)) {
+            return Vec::new();
+        }
+        self.block_break_arm_types(
+            ast,
+            block_body,
+            &jumps,
+            block_params,
+            recv_ty,
+            env,
+            interner,
+        )
+    }
+
     /// `call_break_arm_types` — the types the block-level `break`s carry out of
     /// the call, in source order. A bare `break` carries `nil`. A `break` on a
     /// branch the analysis proved dead contributes nothing (the reference's
