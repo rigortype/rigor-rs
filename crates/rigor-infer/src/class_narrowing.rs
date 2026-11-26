@@ -3420,6 +3420,60 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
     }
 }
 
+/// Whether a branch body leaves through a `next`/`break` jump on every
+/// terminal path — the jump-only subset of [`branch_terminates`]
+/// (rigor-rs#1044). Inside a jump-loop body such an arm's scope is NOT
+/// dead: the reference's `break`/`next` sinks carry it into
+/// `join_break_scopes` / the iteration-exit join (`loop_iteration`), so
+/// the loop overlay's arm walk must JOIN the arm where
+/// [`branch_terminates`] / [`value_branch_terminates`] /
+/// [`branch_certainly_exits`] drop it. The errors cost asymmetrically the
+/// other way than here — a false negative only keeps today's drop (a
+/// coverage loss), a false positive would join a write the reference
+/// drops — so the walk recognises only the shapes whose termination is
+/// EXCLUSIVELY a jump: a `next`/`break` statement (argument-less or
+/// valued) at the arm's tail, inside the pure statement carriers, or an
+/// `if`/`unless` whose BOTH arms jump-exit. `redo`/`retry` never qualify
+/// (a `redo` re-enters the iteration, a `retry` the `begin` — neither
+/// scope reaches the loop's exit joins), and neither do `return`/`raise`
+/// nor the `case`/`begin`-`rescue` recursions [`stmt_terminates`] knows.
+pub(crate) fn branch_jump_exits(ast: &LoweredAst, body: &[NodeId]) -> bool {
+    match body.last() {
+        Some(&last) => stmt_jump_exits(ast, last),
+        None => false,
+    }
+}
+
+fn stmt_jump_exits(ast: &LoweredAst, id: NodeId) -> bool {
+    match ast.get(id) {
+        // `Node::Other`'s `jump` tag is only ever `Some` for an
+        // argument-less `next`/`break` (ast/builder/jumps.rs).
+        Node::Other { jump: Some(_), .. } => true,
+        Node::Statements { kind: StatementsKind::Jump(kind), .. } => {
+            matches!(kind, JumpKind::Next | JumpKind::Break)
+        }
+        // The pure statement carriers — an `else` clause, a parenthesized
+        // group, a statement sequence, and a real clause-less `begin` —
+        // end where their last statement does; `ensure` contributes no
+        // value path exactly as in [`stmt_terminates`].
+        Node::BeginRescue { main_body, clauses, .. } if clauses.is_empty() => {
+            branch_jump_exits(ast, main_body)
+        }
+        Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+            branch_jump_exits(ast, body)
+        }
+        // Mirroring [`stmt_terminates`]'s `if` arm: both arms jumping
+        // leaves no fall-through path. A write inside either arm rides
+        // its own jump's sink scope, so the join is right for both.
+        Node::If { then_body, else_body, .. } => {
+            !else_body.is_empty()
+                && branch_jump_exits(ast, then_body)
+                && branch_jump_exits(ast, else_body)
+        }
+        _ => false,
+    }
+}
+
 /// `branch_certainly_exits?` (statement_evaluator.rb:9712) — the STRICT,
 /// syntactic-only exit test `if_join` applies to the body arm beside an
 /// `else`: a `return`/`next`/`break`, a receiverless `raise`/`fail`/`exit`/

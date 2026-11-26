@@ -5671,10 +5671,10 @@ impl<'i> Typer<'i> {
                             // stands in only for a predicate that never
                             // wrote the name.
                             let arm_entry = self
-                                .node_scope_ty(ast, env, *predicate, name, entry_ty, interner)
+                                .node_scope_ty(ast, env, *predicate, name, entry_ty, interner, false)
                                 .unwrap_or(entry_ty);
                             let j = self.if_scope_join_ty(
-                                ast, env, *is_unless, then_body, else_body, name, arm_entry, interner,
+                                ast, env, *is_unless, then_body, else_body, name, arm_entry, interner, false,
                             );
                             drop_indexed_narrowings(env, name);
                             env.insert(Rc::from(name.as_str()), j);
@@ -5810,15 +5810,18 @@ impl<'i> Typer<'i> {
                             continue;
                         }
                         let Some(body_ty) = self.arm_scope_ty(
-                            ast, &entry, &body, name, entry_ty, interner,
+                            ast, &entry, &body, name, entry_ty, interner, true,
                         ) else {
                             continue;
                         };
                         if Self::type_has_decline(interner, body_ty) || body_ty == entry_ty {
                             // Equal to the entry means the arm walk dropped a
-                            // terminating write (`if c; w = 1; next; end` →
-                            // entry). Overlaying it would re-pin the pre-loop
-                            // type and FP (`w.even?` for String, rigor-rs#133).
+                            // terminating write the jump sinks do not recover
+                            // (a `return`/`raise`-terminated arm — a
+                            // `next`/`break`-terminated one now JOINS through
+                            // the `jump_join` walk, rigor-rs#1044). Overlaying
+                            // it would re-pin the pre-loop type and FP
+                            // (`w.even?` for String, rigor-rs#133).
                             continue;
                         }
                         let j = rigor_types::Algebra::join(interner, entry_ty, body_ty);
@@ -5984,6 +5987,13 @@ impl<'i> Typer<'i> {
     /// else's scope only for a body arm `branch_certainly_exits?` — the
     /// strict test, so a `begin`/`rescue` or a `Bot`-typed arm still joins.
     /// Anything else joins both scopes.
+    ///
+    /// `jump_join` is set only for the jump-loop overlay's walk
+    /// (rigor-rs#1044): an arm whose termination is EXCLUSIVELY a
+    /// `next`/`break` jump ([`crate::class_narrowing::branch_jump_exits`])
+    /// then JOINS instead of dropping — the jump's sink scope reaches the
+    /// reference's `join_break_scopes` / iteration-exit join, so its writes
+    /// are not dead the way a `return`/`raise`-terminated arm's are.
     #[allow(clippy::too_many_arguments)]
     fn if_scope_join_ty(
         &self,
@@ -5995,21 +6005,34 @@ impl<'i> Typer<'i> {
         name: &str,
         entry: TypeId,
         interner: &mut Interner,
+        jump_join: bool,
     ) -> TypeId {
-        let then_ty = self.arm_scope_ty(ast, env, then_body, name, entry, interner).unwrap_or(entry);
-        let else_ty = self.arm_scope_ty(ast, env, else_body, name, entry, interner).unwrap_or(entry);
+        let then_ty = self.arm_scope_ty(ast, env, then_body, name, entry, interner, jump_join).unwrap_or(entry);
+        let else_ty = self.arm_scope_ty(ast, env, else_body, name, entry, interner, jump_join).unwrap_or(entry);
+        // A jump-terminated arm keeps the drop UNLESS the overlay's
+        // jump-join mode applies to it — the cancellation never widens a
+        // non-loop `if`'s join, where `jump_join` is always false.
+        // `jump_joins` is true exactly when the drop is CANCELLED: the
+        // arm's termination is exclusively a `next`/`break` whose sink
+        // scope the reference joins back.
+        let jump_joins = |body: &[NodeId]| {
+            jump_join && crate::class_narrowing::branch_jump_exits(ast, body)
+        };
         if else_body.is_empty()
             && !then_body.is_empty()
             && crate::class_narrowing::branch_terminates(self, ast, then_body)
+            && !jump_joins(then_body)
         {
             entry
         } else if !then_body.is_empty()
             && !else_body.is_empty()
             && crate::class_narrowing::value_branch_terminates(self, ast, else_body)
+            && !jump_joins(else_body)
         {
             then_ty
         } else if !else_body.is_empty()
             && crate::class_narrowing::branch_certainly_exits(self, ast, then_body)
+            && !jump_joins(then_body)
         {
             else_ty
         } else if is_unless {
@@ -6043,6 +6066,7 @@ impl<'i> Typer<'i> {
         name: &str,
         entry: TypeId,
         interner: &mut Interner,
+        jump_join: bool,
     ) -> Option<TypeId> {
         let mut cur: Option<TypeId> = None;
         for &s in body {
@@ -6051,7 +6075,7 @@ impl<'i> Typer<'i> {
                 continue;
             }
             cur = Some(
-                self.node_scope_ty(ast, env, s, name, at, interner)
+                self.node_scope_ty(ast, env, s, name, at, interner, jump_join)
                     .unwrap_or(at),
             );
         }
@@ -6090,6 +6114,7 @@ impl<'i> Typer<'i> {
         name: &str,
         at: TypeId,
         interner: &mut Interner,
+        jump_join: bool,
     ) -> Option<TypeId> {
         match ast.get(id) {
             // A straight-line carrier — an `else` clause, a parenthesized
@@ -6097,14 +6122,14 @@ impl<'i> Typer<'i> {
             Node::BeginRescue { body, clauses, ensure_body, has_else: false, .. }
                 if clauses.is_empty() && ensure_body.is_empty() =>
             {
-                self.arm_scope_ty(ast, env, body, name, at, interner)
+                self.arm_scope_ty(ast, env, body, name, at, interner, jump_join)
             }
             Node::Statements { body, kind: rigor_parse::StatementsKind::Sequence, .. } => {
-                self.arm_scope_ty(ast, env, body, name, at, interner)
+                self.arm_scope_ty(ast, env, body, name, at, interner, jump_join)
             }
             Node::If { predicate, then_body, else_body, is_unless, .. } => {
                 let post_pred = self
-                    .node_scope_ty(ast, env, *predicate, name, at, interner)
+                    .node_scope_ty(ast, env, *predicate, name, at, interner, jump_join)
                     .unwrap_or(at);
                 let truthy = crate::version_guard::guard_truthiness(ast, *predicate)
                     .or_else(|| self.expr_truthiness(ast, *predicate, &mut Vec::new()))
@@ -6132,15 +6157,16 @@ impl<'i> Typer<'i> {
                         // not the pre-`if` `at`.
                         if else_body.is_empty()
                             && crate::class_narrowing::branch_terminates(self, ast, then_body)
+                            && !(jump_join && crate::class_narrowing::branch_jump_exits(ast, then_body))
                         {
                             post_pred
                         } else {
-                            self.arm_scope_ty(ast, env, live, name, post_pred, interner)
+                            self.arm_scope_ty(ast, env, live, name, post_pred, interner, jump_join)
                                 .unwrap_or(post_pred)
                         }
                     }
                     None => self.if_scope_join_ty(
-                        ast, env, *is_unless, then_body, else_body, name, post_pred, interner,
+                        ast, env, *is_unless, then_body, else_body, name, post_pred, interner, jump_join,
                     ),
                 })
             }
@@ -6153,10 +6179,10 @@ impl<'i> Typer<'i> {
                 // (rigor-rs#362), leaving the left's scope alone to bind
                 // (`x or (x = "t"; raise)`).
                 let left_ty = self
-                    .node_scope_ty(ast, env, *left, name, at, interner)
+                    .node_scope_ty(ast, env, *left, name, at, interner, jump_join)
                     .unwrap_or(at);
                 let right_ty = self
-                    .node_scope_ty(ast, env, *right, name, left_ty, interner)
+                    .node_scope_ty(ast, env, *right, name, left_ty, interner, jump_join)
                     .unwrap_or(left_ty);
                 Some(rigor_types::Algebra::join(interner, left_ty, right_ty))
             }
@@ -6176,7 +6202,7 @@ impl<'i> Typer<'i> {
                 // masgn RHS does, a splat index as its rest slot
                 // (`bind_for_splat_index`).
                 let coll_scope = predicate
-                    .and_then(|c| self.node_scope_ty(ast, env, c, name, at, interner))
+                    .and_then(|c| self.node_scope_ty(ast, env, c, name, at, interner, jump_join))
                     .unwrap_or(at);
                 let index_ty = index_target.as_ref().and_then(|t| {
                     let element = match predicate {
@@ -6198,7 +6224,7 @@ impl<'i> Typer<'i> {
                 });
                 let body_entry = index_ty.unwrap_or(coll_scope);
                 let body_ty = self
-                    .arm_scope_ty(ast, env, body, name, body_entry, interner)
+                    .arm_scope_ty(ast, env, body, name, body_entry, interner, jump_join)
                     .unwrap_or(body_entry);
                 // The zero-iteration edge is the POST-COLLECTION scope: the
                 // collection evaluates unconditionally, so a write inside it

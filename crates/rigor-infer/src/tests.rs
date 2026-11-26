@@ -751,11 +751,25 @@ fn toplevel_check_env_widens_nested_rebinds() {
     let env = Typer::new(&empty).build_toplevel_check_env(&ast, &mut i);
     let get = |name: &str, i: &Interner| env.get(name).map(|&t| i.get(t).clone());
     let untyped = i.untyped();
-    // rigor-rs#133 / #958: a terminated then-arm write (`w = 1; next`) with
-    // no else is dropped by the if-join, so the overlay keeps the floor
-    // rather than re-pinning `"s"` (that pin FPs `w.even?`). The brief's
-    // else-break shape is the `jump_loop_keeps_if_arm_join_writes` test.
-    assert_eq!(env.get("w"), Some(&untyped));
+    // rigor-rs#133 / #958 / #1044: a terminated then-arm write (`w = 1;
+    // next`) with no else is dropped by the if-join, but the `next` sink
+    // scope reaches the reference's iteration-exit join, so the jump-loop
+    // overlay now JOINS it: `w` is `"s" | 1` on the oracle (`w.w` fires
+    // `for "s" | 1`, `w.even?` stays silent). The brief's else-break shape
+    // is the `jump_loop_keeps_if_arm_join_writes` test.
+    let w = env.get("w").copied().expect("w bound");
+    let w_members = match i.get(w) {
+        Type::Union(members) => members
+            .iter()
+            .map(|&m| i.get(m).clone())
+            .collect::<Vec<_>>(),
+        other => panic!("the next-terminated write joins, got {:?}", other),
+    };
+    assert_eq!(
+        w_members,
+        vec![Type::Constant(Scalar::Int(1)), Type::Constant(Scalar::Str("s".into()))],
+        "the next-terminated write joins the entry with the arm"
+    );
     assert_eq!(env.get("n"), Some(&untyped));
     assert_eq!(get("k", &i), Some(Type::Constant(Scalar::Str("s".into()))));
     assert_eq!(get("r", &i), Some(Type::Constant(Scalar::Str("t".into()))));
@@ -799,6 +813,53 @@ fn jump_loop_keeps_if_arm_join_writes() {
     );
     let want = join_as(&mut i);
     assert_eq!(env.get("x"), Some(&want), "while no-break control");
+
+    // rigor-rs#1044: a write in a TERMINATING jump arm joins too — the
+    // `break`/`next` sink scope reaches the reference's `join_break_scopes`
+    // / iteration-exit join, so `x` is `"a" | "s" | 1` and `x.even?` stays
+    // silent (the issue's FP row). Member order is the walk's, so compare
+    // as a sorted set of debug-rendered members.
+    let members_of = |env: &TypeEnv, i: &Interner| {
+        let mut members: Vec<String> = match i.get(*env.get("x").expect("x bound")) {
+            Type::Union(ms) => ms.iter().map(|&m| format!("{:?}", i.get(m))).collect(),
+            other => vec![format!("{:?}", other)],
+        };
+        members.sort();
+        members
+    };
+    let mut want3 = vec![
+        format!("{:?}", Type::Constant(Scalar::Int(1))),
+        format!("{:?}", Type::Constant(Scalar::Str("a".into()))),
+        format!("{:?}", Type::Constant(Scalar::Str("s".into()))),
+    ];
+    want3.sort();
+    for (label, jump) in [("break", "break 1"), ("next", "next")] {
+        let src = format!(
+            "x = \"a\"\nwhile rand > 0\n  if rand > 1\n    x = \"s\"\n  else\n    x = 1\n    {jump}\n  end\nend\n"
+        );
+        let (env, i) = env_of(src.as_bytes());
+        assert_eq!(members_of(&env, &i), want3, "while else-write then {label}");
+    }
+    // The jump-terminated THEN arm beside no else joins the same way (the
+    // rigor-rs#133 row: `w.w` fires `for "s" | 1` on the oracle).
+    let (env, i) = env_of(
+        b"x = \"a\"\nwhile rand > 0\n  if rand > 1\n    x = \"s\"\n    break\n  end\nend\n",
+    );
+    assert!(
+        members_of(&env, &i).iter().any(|m| m.contains("Str(\"s\"")),
+        "then-break write joins, got {:?}",
+        members_of(&env, &i)
+    );
+    // Drop-side control: a `raise`-terminated else's write still drops —
+    // its scope reaches no jump sink.
+    let (env, i) = env_of(
+        b"x = \"a\"\nwhile rand > 0\n  if rand > 1\n    x = \"s\"\n  else\n    x = 1\n    raise\n  end\nend\n",
+    );
+    assert!(
+        !members_of(&env, &i).iter().any(|m| m.contains("Int(1)")),
+        "the raise-terminated write stays dropped, got {:?}",
+        members_of(&env, &i)
+    );
 }
 
 /// rigor-rs#640: the loop-pass stale-write filter's env-polarity judge. A
