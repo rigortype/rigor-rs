@@ -2449,6 +2449,7 @@ impl<'i> Typer<'i> {
                     ifs: Vec::new(),
                     record_guards: Vec::new(),
                     retry_edges: crate::retry_edge::RetryEdges::default(),
+                    retrying_spans: Vec::new(),
                 }
             }
         };
@@ -2511,6 +2512,12 @@ impl<'i> Typer<'i> {
                 |s| !scope_spans.iter().any(|&b| within_span(s, b)),
             )
         };
+        // Spans of every retrying `begin`, including ivar/cvar/gvar-only
+        // ones `retry_edges` skips (`retry_drops` is local-write-keyed).
+        // Interior sites must reconstruct from the pre-begin env — the
+        // second walk's last-write types must not leak through the flat
+        // env (PR #1040 review).
+        let retrying_spans = self.retrying_begin_spans(ast);
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
         // (its own bindings + `=> e` reach only through replay — rigor-rs#368);
@@ -2521,7 +2528,8 @@ impl<'i> Typer<'i> {
         let record = !(rebinds.is_empty()
             && mutations.is_empty()
             && closure_muts.is_empty()
-            && retry_edges.is_empty())
+            && retry_edges.is_empty()
+            && retrying_spans.is_empty())
             || dead.has_folded()
             || dead.has_rescue();
         // A boundary env per statement is a full clone of a growing map —
@@ -2573,6 +2581,7 @@ impl<'i> Typer<'i> {
             ifs: self.collect_if_edges(ast),
             record_guards,
             retry_edges,
+            retrying_spans,
         }
     }
 
@@ -2953,7 +2962,8 @@ impl<'i> Typer<'i> {
                     .iter()
                     .any(|(_, w, _)| w.0 >= stmt_span.0)
                 || flow.dead.in_rescue(site)
-                || flow.retry_edges.holds(site);
+                || flow.retry_edges.holds(site)
+                || flow.retrying_spans.iter().any(|&s| within_span(site, s));
             if !later {
                 break 'env Cow::Borrowed(&flow.env);
             }
@@ -2995,7 +3005,10 @@ impl<'i> Typer<'i> {
         // exclusive sibling path): the reference reads the join of the
         // entry and every scope on the edge (`eval_retried_begin`). The
         // join's convergence is not modelled, so the local declines to
-        // `Dynamic[top]` ([`crate::retry_edge`]).
+        // `Dynamic[top]` ([`crate::retry_edge`]). rigor-rs#1031 layers the
+        // local/ivar-widened in-order replay under this overlay; the table
+        // still covers alias mutations, block-nested begins and index
+        // `||=` the first pass does not yet absorb.
         if !flow.retry_edges.is_empty() {
             let u = interner.untyped();
             let mut applied: Vec<&str> = Vec::new();
@@ -3009,9 +3022,6 @@ impl<'i> Typer<'i> {
                         }
                     }
                 }
-                // One env pass drops every applied local's slot records — a
-                // `retain` per name was quadratic on a `begin` with many
-                // derived writes (rigor-rs#1003).
                 if !applied.is_empty() {
                     drop_indexed_narrowings_for(env, &applied);
                 }
@@ -3228,6 +3238,15 @@ impl<'i> Typer<'i> {
                 main_body, clauses, span, ..
             } => {
                 let (main_body, clauses) = (main_body.clone(), clauses.clone());
+                // rigor-rs#1031 — `eval_retried_begin`: start the in-order
+                // descent from the local/ivar-widened entry so later writes
+                // and retrying-clause rebinds reach earlier reads, while
+                // sigilled names stay in source order.
+                if clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
+                    *env = self.widen_entry_for_retry(
+                        ast, id, env, &flow.effects, &flow.indexed, &flow.dead, interner,
+                    );
+                }
                 // rigor-rs#393 — every site inside a retrying `begin` reads
                 // the retry edge's widened entry (`eval_retried_begin`
                 // re-evaluates the body and the clauses under it, and the
@@ -5417,19 +5436,55 @@ impl<'i> Typer<'i> {
             // the post-`begin` join, so its writes do not widen the
             // continuation either (`begin 1 rescue x = "s" raise end; x.w`
             // fires `for 1` on the oracle — `x` keeps its pre-begin binding).
-            Node::BeginRescue { clauses, .. } if !clauses.is_empty() => {
+            Node::BeginRescue {
+                body,
+                main_body,
+                clauses,
+                ensure_body,
+                has_else,
+                ..
+            } if !clauses.is_empty() => {
                 let span = ast.get(id).span();
-                let live_rebinds: Vec<_> = effects
-                    .rebinds_within(span)
-                    .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
-                    .cloned()
-                    .collect();
-                let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
-                    dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
-                });
-                widen_flow_writes(live_rebinds.iter(), span, env, interner);
-                self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
-                self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
+                let (body, main_body, clauses, ensure_body, has_else) = (
+                    body.clone(),
+                    main_body.clone(),
+                    clauses.clone(),
+                    ensure_body.clone(),
+                    *has_else,
+                );
+                // rigor-rs#1031 — a retrying begin's post-scope is the
+                // second walk of `eval_retried_begin`, not a flat widen.
+                if clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
+                    self.bind_live_begin_rescue(
+                        ast,
+                        id,
+                        &body,
+                        &main_body,
+                        &clauses,
+                        &ensure_body,
+                        has_else,
+                        &effects.mutations,
+                        env,
+                        effects,
+                        indexed,
+                        dead,
+                        interner,
+                    );
+                } else {
+                    let live_rebinds: Vec<_> = effects
+                        .rebinds_within(span)
+                        .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
+                        .cloned()
+                        .collect();
+                    let live_mutations = effects.mutations_within(span).filter(|(w, _, m, _)| {
+                        dead.mutation_reaches(*w, (span.1, span.1), is_content_mutator(m))
+                    });
+                    widen_flow_writes(live_rebinds.iter(), span, env, interner);
+                    self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
+                    self.widen_mutated_locals(
+                        ast, live_mutations, indexed, dead, true, id, span, env, interner,
+                    );
+                }
             }
             Node::Loop { predicate, body, kind, .. } => {
                 use crate::def_local_marks::ExitKind as K;
@@ -6264,6 +6319,125 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// Spans of every `begin` whose rescue chain holds a `retry` that
+    /// re-enters it.
+    fn retrying_begin_spans(&self, ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+        ast.iter()
+            .filter_map(|(_, n)| match n {
+                Node::BeginRescue { span, clauses, .. } if !clauses.is_empty() => {
+                    clauses
+                        .iter()
+                        .any(|c| self.clause_retries(ast, c.span))
+                        .then_some(*span)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Names `widen_entry_for_retry` joins — the reference's
+    /// `RETRY_KIND_TABLES` (`:local` and `:ivar` only). Cvars/gvars are
+    /// never entry-widened: their retry-pass bindings change only through
+    /// in-order re-execution (rigor-rs#1031).
+    fn retry_kind_name(name: &str) -> bool {
+        !name.starts_with('$') && !name.starts_with("@@") && !name.contains('\u{1f}')
+    }
+
+    /// Join each local/ivar binding from `scopes` into `entry`
+    /// (`absorb_retry_rebinds`). An unbound local is `nil | post`; an
+    /// unbound ivar takes `post` alone.
+    fn absorb_retry_scopes(
+        entry: &TypeEnv,
+        scopes: &[TypeEnv],
+        interner: &mut Interner,
+    ) -> TypeEnv {
+        let mut out = entry.clone();
+        let nil = interner.nil();
+        for scope in scopes {
+            for (name, &post) in scope {
+                if !Self::retry_kind_name(name) {
+                    continue;
+                }
+                match out.get(name) {
+                    Some(&cur) if cur == post => {}
+                    Some(&cur) => {
+                        let j = rigor_types::Algebra::join(interner, cur, post);
+                        drop_indexed_narrowings(&mut out, name);
+                        out.insert(name.clone(), j);
+                    }
+                    None => {
+                        let ty = if name.starts_with('@') {
+                            post
+                        } else {
+                            rigor_types::Algebra::join(interner, nil, post)
+                        };
+                        out.insert(name.clone(), ty);
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// First half of `eval_retried_begin`: walk body + clauses once from
+    /// `entry`, collect `raise_scopes` (env after each protected-body
+    /// statement) and `retry_scopes` (envs along a retrying clause), then
+    /// join local/ivar bindings into the entry. `ensure` is not walked.
+    #[allow(clippy::too_many_arguments)]
+    fn widen_entry_for_retry(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        entry: &TypeEnv,
+        effects: &FlowEffects,
+        indexed: &IndexedFlow,
+        dead: &crate::dead::DeadPositions,
+        interner: &mut Interner,
+    ) -> TypeEnv {
+        let (main_body, clauses) = match ast.get(id) {
+            Node::BeginRescue {
+                main_body, clauses, ..
+            } if !clauses.is_empty() => (main_body.clone(), clauses.clone()),
+            _ => return entry.clone(),
+        };
+        if !clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
+            return entry.clone();
+        }
+        let mut scopes: Vec<TypeEnv> = Vec::new();
+        let mut body_env = entry.clone();
+        for &s in &main_body {
+            self.bind_check_statement(ast, s, &mut body_env, effects, indexed, dead, interner);
+            scopes.push(body_env.clone());
+        }
+        let body_region = match (main_body.first(), main_body.last()) {
+            (Some(&f), Some(&l)) => Some((ast.get(f).span().0, ast.get(l).span().1)),
+            _ => None,
+        };
+        for c in &clauses {
+            let mut cenv = entry.clone();
+            if let Some(region) = body_region {
+                widen_clause_entry(
+                    &effects.rebinds,
+                    region,
+                    &indexed.scope_spans,
+                    &mut cenv,
+                    interner,
+                );
+            }
+            let retries = self.clause_retries(ast, c.span);
+            for &s in &c.body {
+                self.bind_check_statement(ast, s, &mut cenv, effects, indexed, dead, interner);
+                if retries {
+                    scopes.push(cenv.clone());
+                }
+            }
+            if retries && c.body.is_empty() {
+                scopes.push(cenv);
+            }
+        }
+        Self::absorb_retry_scopes(entry, &scopes, interner)
+    }
+
     /// The live-arm replay of a real `begin`/`rescue` statement
     /// (rigor-rs#953). The reference's `eval_begin` exits with
     /// `reduce_scopes_with_nil_injection([primary_scope, *live_rescues])`:
@@ -6284,11 +6458,9 @@ impl<'i> Typer<'i> {
     /// falling back to `untyped` when the exception type is not known
     /// exactly — `bind_rescue_reference` binds `Dynamic[top]` regardless;
     /// past the construct `e` nil-injects and stays silent). A `retry`
-    /// re-entering
-    /// the `begin` routes the exit scope through the retry edge —
-    /// unmodelled here — so the names the `begin` writes decline, the
-    /// same side `replay_one`'s `has_else || retry` arm takes (an
-    /// `else`, though, IS modelled: it replaces the primary path).
+    /// re-entering the `begin` (rigor-rs#1031) re-walks from
+    /// `widen_entry_for_retry`'s local/ivar join — the second walk of
+    /// `eval_retried_begin` — rather than declining every written name.
     ///
     /// `ensure` runs on the joined exit scope (`eval_begin_ensure`): its
     /// statements read every name the construct changed as `untyped`,
@@ -6315,14 +6487,16 @@ impl<'i> Typer<'i> {
     ) {
         let bspan = ast.get(id).span();
         let marks = self.def_local_marks(ast);
-        // A `retry` inside the construct re-enters it: the edge's widening
-        // (`eval_retried_begin`) is unmodelled — decline the names it
-        // writes rather than leak the pre-`begin` binding.
-        if marks.has_exit_within(bspan, &[crate::def_local_marks::ExitKind::Retry]) {
-            Self::widen_names(env, &marks.written_within(bspan), interner);
-            return;
-        }
-        let entry = env.clone();
+        // rigor-rs#1031 — `eval_retried_begin`: re-walk from the local/ivar
+        // join of every raise/retry scope. Sigilled names stay at `entry`.
+        let entry = if marks.has_exit_within(bspan, &[crate::def_local_marks::ExitKind::Retry]) {
+            self.widen_entry_for_retry(ast, id, env, effects, indexed, dead, interner)
+        } else {
+            env.clone()
+        };
+        // Unchanged names keep the (possibly widened) entry, not the
+        // pre-`begin` env `join_arm_envs` would otherwise leave standing.
+        *env = entry.clone();
         let mut arm_envs: Vec<TypeEnv> = Vec::with_capacity(clauses.len() + 1);
         // The primary path: the protected body's exit scope, replaced by
         // the `else` clause's when one exists (the flat `body` merges it
@@ -8478,6 +8652,10 @@ pub struct CheckFlow {
     /// rigor-rs#972 — the top-level retrying `begin`s, for the reads their
     /// retry edge reaches ([`crate::retry_edge`]).
     retry_edges: crate::retry_edge::RetryEdges,
+    /// Every retrying `begin`'s span — including ivar/cvar/gvar-only
+    /// ones `retry_edges` does not hold. Interior sites reconstruct from
+    /// the pre-begin env (PR #1040 review).
+    retrying_spans: Vec<rigor_parse::Span>,
 }
 
 /// One span-escaped node for [`Typer::check_env_at`] (rigor-rs#492).
