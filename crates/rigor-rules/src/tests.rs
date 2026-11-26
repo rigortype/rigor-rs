@@ -6116,6 +6116,42 @@ fn retry_edge_derived_and_index_writes_decline() {
     }
 }
 
+/// rigor-rs#1030 — a kill whose target the retry edge itself mutates does
+/// not sever the edge when the kill's value can alias the mutated object:
+/// `d = c` runs again on the retry, but `d << 2` already mutated the object
+/// `c` both names share. Local, ivar, cvar and gvar targets all decline.
+#[test]
+fn retry_edge_mutation_of_kills_target_declines_aliased_write() {
+    let undefined = |src: &str| -> Vec<String> {
+        run(src.as_bytes())
+            .into_iter()
+            .filter(|d| d.rule_id == CALL_UNDEFINED_METHOD)
+            .map(|d| d.message)
+            .collect()
+    };
+    for src in [
+        "c = [1]; begin; d = c; d.nope; rescue; d << 2; retry; end\n",
+        "c = [1]; begin; @x = c; @x.nope; rescue; @x << 2; retry; end\n",
+        "c = [1]; begin; @@q = c; @@q.nope; rescue; @@q << 2; retry; end\n",
+        "c = [1]; begin; $g = c; $g.nope; rescue; $g << 2; retry; end\n",
+        "c = [1]; begin; d = c; d.nope; rescue; d[0] = 2; retry; end\n",
+    ] {
+        assert_eq!(undefined(src), Vec::<String>::new(), "{src:?}");
+    }
+    // Controls the reference still fires: a fresh literal is allocated again
+    // on every pass, and an edge REBIND (rather than an in-place mutation)
+    // does not mutate the object the kill's value aliases.
+    for (src, msg) in [
+        ("begin; d = [1]; d.nope; rescue; d << 2; retry; end\n", "for [1]"),
+        ("begin; d = [1]; d.nope; rescue; d[0] = \"s\"; retry; end\n", "for [1]"),
+        ("c = [1]; begin; d = c; d.nope; rescue; d = [2]; retry; end\n", "for [1]"),
+    ] {
+        let got = undefined(src);
+        assert_eq!(got.len(), 1, "{src:?}: {got:?}");
+        assert!(got[0].ends_with(msg), "{src:?}: {got:?}");
+    }
+}
+
 /// rigor-rs#1003 — the paths `declined_names`' dedup and the `kill_free`
 /// precompute serve: nested retrying `begin`s decline the same local once,
 /// a fresh rebind still kills the edge for the reads after it, and an

@@ -12,8 +12,8 @@ use rigor_types::{ClassId, Interner, ShapeKey, Type, TypeId};
 
 use crate::flow_writes::writes_within;
 use crate::{
-    block_bound_names, collect_flow_writes, collect_rebind_writes, indexed_flow_writes,
-    multi_target_binder, rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer,
+    block_bound_names, collect_content_mutations, collect_flow_writes, collect_rebind_writes,
+    indexed_flow_writes, multi_target_binder, rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer,
     ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
@@ -104,6 +104,7 @@ impl<'i> Typer<'i> {
         // own span filter; the order is not semantic — rigor-rs#424).
         writes.sort_by_key(|(w, _)| w.0);
         let rebinds = collect_rebind_writes(ast);
+        let content_mutations = collect_content_mutations(ast);
         let ctx = CollCtx {
             writes: &writes,
             rebinds: &rebinds,
@@ -137,6 +138,7 @@ impl<'i> Typer<'i> {
             ast,
             writes.iter().map(|(w, n)| (*w, n.as_str())),
             &rebinds,
+            content_mutations.iter().map(|(w, n)| (*w, n.as_str())),
             |_| true,
         );
         if !edges.is_empty() {
