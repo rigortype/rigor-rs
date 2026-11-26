@@ -431,8 +431,14 @@ impl SourceIndex {
         // `Math::PI`; a `M::K =` path write contributes each prefix-run
         // candidate of its head, like a read — an over-approximation that
         // only ever under-emits the fold it gates).
+        let mut scalars = super::constants::ScalarWrites::default();
         for (_, ast) in files {
+            let mutated_constants = mutated_constant_names(ast);
             for w in ast.const_writes() {
+                scalars.record(w, ast.file_key(), &mutated_constants, &idx, core);
+                if !w.plain || w.dynamic {
+                    continue;
+                }
                 if w.is_path {
                     idx.constant_write_candidates.insert(w.name.clone());
                     if !w.rooted {
@@ -446,6 +452,8 @@ impl SourceIndex {
                 }
             }
         }
+
+        scalars.finish(&mut idx);
 
         // Upstream v0.4.6 (#1817 / #2183): the rebinding-callee census,
         // joined project-wide — a slot two files (or two arms) define is one

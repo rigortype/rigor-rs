@@ -3,12 +3,209 @@
 
 use std::collections::{HashMap, HashSet};
 
-use rigor_parse::{FileKey, LoweredAst, Node, NodeId};
+use rigor_index::CoreIndex;
+use rigor_parse::{ConstWrite, ConstWriteLiteral, FileKey, LoweredAst, Node, NodeId};
 use rigor_types::{Scalar, ShapeKey};
 
 use super::{qualify, ConstLit, HarvestedConst, HarvestedConstWrite, SourceIndex, TypedConstWrite};
 
+pub(crate) struct ScalarWrite {
+    pub(crate) file: FileKey,
+    pub(crate) literal: ConstWriteLiteral,
+    pub(crate) path: bool,
+    pub(crate) mutated: bool,
+    publication: bool,
+}
+
+/// Accumulate the two constant-write censuses the reference keeps distinct:
+/// the per-file typed table (`#690`, keyed with the write namespace resolved)
+/// and the cross-file publication census (`#644`, keyed as written). A `None`
+/// slot is a proven non-answer, not absence: a repeat or unsupported write
+/// must not be revived by a later write.
+#[derive(Default)]
+pub(super) struct ScalarWrites {
+    typed: HashMap<String, HashMap<FileKey, Option<ScalarWrite>>>,
+    publication: HashMap<String, Option<ScalarWrite>>,
+    vetoed_leaves: HashSet<String>,
+}
+
+impl ScalarWrites {
+    pub(super) fn record(
+        &mut self,
+        w: &ConstWrite,
+        file: &FileKey,
+        mutated: &HashSet<String>,
+        index: &SourceIndex,
+        core: &CoreIndex,
+    ) {
+        if w.dynamic || w.uncertain_bare {
+            // A dynamic target can reach any constant with this leaf, so it
+            // retracts publication. It says nothing about the per-file table's
+            // exact static writes.
+            self.vetoed_leaves.insert(constant_leaf(&w.name).to_owned());
+            return;
+        }
+
+        let typed_name = if w.is_path {
+            resolved_path_write_name(w, index, core)
+        } else {
+            qualify(&w.prefix, &w.name)
+        };
+        // The publication census keeps a path write AS WRITTEN even where the
+        // typed table resolves its namespace through the enclosing nesting.
+        let publication_name = if w.is_path { w.name.clone() } else { qualify(&w.prefix, &w.name) };
+
+        // Bare writes already have the lowered-AST typed table (#910), whose
+        // lexical visibility and ambiguity gates are much stricter. This
+        // Prism census exists because PATH writes lower to a nameless marker;
+        // only those need the parallel typed table here.
+        if w.plain && w.is_path {
+            let mutated_write = mutated.contains(&typed_name);
+            self.typed
+                .entry(typed_name)
+                .or_default()
+                .entry(file.clone())
+                .and_modify(|slot| *slot = None)
+                .or_insert_with(|| {
+                    w.literal.clone().map(|literal| ScalarWrite {
+                        file: file.clone(),
+                        mutated: mutated_write,
+                        literal,
+                        path: w.is_path,
+                        publication: false,
+                    })
+                });
+        }
+
+        let publishable = w.plain
+            && w.literal.as_ref().is_some_and(|literal| {
+                matches!(
+                    literal,
+                    ConstWriteLiteral::Integer(_)
+                        | ConstWriteLiteral::Float(_)
+                        | ConstWriteLiteral::Symbol(_)
+                        | ConstWriteLiteral::Bool(_)
+                )
+            });
+        match self.publication.entry(publication_name) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(if publishable {
+                    w.literal.clone().map(|literal| ScalarWrite {
+                        file: file.clone(),
+                        mutated: false,
+                        literal,
+                        path: w.is_path,
+                        publication: true,
+                    })
+                } else {
+                    None
+                });
+            }
+        }
+    }
+
+    pub(super) fn finish(self, index: &mut SourceIndex) {
+        for (name, per_file) in self.typed {
+            let leaf = constant_leaf(&name).to_owned();
+            for (_, slot) in per_file {
+                if let Some(slot) = slot {
+                    index.scalar_const_writes.entry(leaf.clone()).or_default().insert(name.clone(), slot);
+                }
+            }
+        }
+        for (name, slot) in self.publication {
+            let leaf = constant_leaf(&name);
+            if self.vetoed_leaves.contains(leaf) {
+                continue;
+            }
+            if let Some(slot) = slot {
+                let entries = index.scalar_const_writes.entry(leaf.to_owned()).or_default();
+                match entries.entry(name) {
+                    std::collections::hash_map::Entry::Occupied(mut entry) => {
+                        if entry.get().file == slot.file {
+                            entry.get_mut().publication = true;
+                        }
+                    }
+                    std::collections::hash_map::Entry::Vacant(entry) => {
+                        entry.insert(slot);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// The typed in-source table's key for a static path write. Ruby resolves the
+/// write's namespace through the nesting first (`#690`): inside `module N`,
+/// `M::K = …` writes `N::M::K` when `N::M` is a namespace some source knows,
+/// and the as-written top-level `M::K` otherwise. The cross-file publication
+/// census deliberately keeps the as-written key; this resolved key is for the
+/// per-file value table only.
+fn resolved_path_write_name(w: &ConstWrite, index: &SourceIndex, core: &CoreIndex) -> String {
+    if w.rooted || w.prefix.is_empty() {
+        return w.name.clone();
+    }
+    let Some(pos) = w.name.rfind("::") else { return w.name.clone() };
+    let namespace = &w.name[..pos];
+    let base = &w.name[pos + 2..];
+    for i in (1..=w.prefix.len()).rev() {
+        let candidate = qualify(&w.prefix[..i], namespace);
+        if namespace_known(&candidate, index, core) {
+            return format!("{candidate}::{base}");
+        }
+    }
+    w.name.clone()
+}
+
+fn namespace_known(name: &str, index: &SourceIndex, core: &CoreIndex) -> bool {
+    index.project_declares_constant(name)
+        || index.knows_class(name)
+        || core.knows_qualified_class(name)
+        || (!name.contains("::") && core.knows_class(name))
+}
+
+pub(crate) fn constant_leaf(name: &str) -> &str {
+    name.rsplit("::").next().unwrap_or(name)
+}
+
 impl SourceIndex {
+    /// Withhold cross-file values if an unreadable or unparsed source could
+    /// have contributed another write. Per-file inference stays available.
+    pub fn mark_constant_census_incomplete(&mut self) {
+        self.incomplete_constant_census = true;
+    }
+
+    pub(crate) fn has_scalar_const_write(&self, name: &str, foreign: bool) -> bool {
+        !(foreign && self.incomplete_constant_census)
+            && self.scalar_const_writes.contains_key(constant_leaf(name))
+    }
+
+    /// The per-file path-literal rung precedes the foreign publication.
+    /// Bare writes in this file still use C5/the typed table; nil never
+    /// publishes. Callers opt in to foreign values only at a direct witness.
+    pub(crate) fn scalar_const_write(
+        &self,
+        qualified: &str,
+        file: &FileKey,
+        foreign: bool,
+    ) -> Option<&ScalarWrite> {
+        let w = self.scalar_const_writes.get(constant_leaf(qualified))?.get(qualified)?;
+        if w.file == *file {
+            // A bare publication stays out of the general same-file typer:
+            // bare writes belong to the #910 typed table. A path publication
+            // is still visible here because the reference merges the seeded
+            // table into the writing file too.
+            return (!w.publication || w.path).then_some(w);
+        }
+        // #644 publishes only the frozen scalar subset, which the publication
+        // census has already filtered. A foreign value is exposed only to the
+        // direct-witness caller that opts in with `foreign: true`.
+        (foreign && w.publication).then_some(w)
+    }
+
     /// C5: the harvested fully-literal value of constant `name` VISIBLE at a use
     /// site with lexical prefix `use_prefix`, or `None`. A recorded entry applies
     /// iff its defining namespace is visible at the use site — the JOINED

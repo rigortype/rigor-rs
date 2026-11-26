@@ -61,19 +61,35 @@ fn folded_constants_type_their_literal_value() {
     }
 }
 
-/// DECLINE — the `constant_shadowers`/`WRITTEN_CANDIDATE` stop: a project
-/// `=` write binding the folded name (or a lexical candidate of it) stops
-/// the fold, never minting `Constant[3.14…]` over the project's own
-/// constant. Under-emit by design: the reference types the written VALUE.
+/// A project `=` write binding the folded name stops the predefined fold and
+/// the harvested literal value answers instead — the reference's in-source
+/// constants table ahead of `PredefinedConstantRefinements`.
 #[test]
-fn project_writes_shadow_the_fold() {
+fn project_literal_writes_shadow_the_fold_with_their_value() {
+    for (src, want) in [
+        (b"Math::PI = 5\nMath::PI.bogus\n".as_slice(), 5),
+        (b"M::Math::PI = 5\nmodule M\n  Math::PI.bogus\nend\n".as_slice(), 5),
+        (b"module N\n  Math::PI = 5\nend\nMath::PI.bogus\n".as_slice(), 5),
+    ] {
+        let (i, ty) = ty_of_last_call_receiver(src);
+        assert!(
+            matches!(i.get(ty), Type::Constant(Scalar::Int(v)) if *v == want),
+            "{:?} -> {:?}",
+            std::str::from_utf8(src).unwrap(),
+            i.get(ty)
+        );
+    }
+}
+
+/// Writes this slice does not recover still shadow the fold, so their answer
+/// stays gradual rather than minting the predefined value. The bare-write rows
+/// belong to the older #910 table's lexical-path resolution gap; the
+/// non-literal row is outside this literal harvest.
+#[test]
+fn unrecovered_project_writes_shadow_the_fold_gradually() {
     for src in [
-        b"Math::PI = 5\nMath::PI.bogus\n".as_slice(),
         b"module Math\n  PI = 5\nend\nMath::PI.bogus\n".as_slice(),
         b"module Float\n  INFINITY = 1\nend\nFloat::INFINITY.bogus\n".as_slice(),
-        b"M::Math::PI = 5\nmodule M\n  Math::PI.bogus\nend\n".as_slice(),
-        b"module N\n  Math::PI = 5\nend\nMath::PI.bogus\n".as_slice(),
-        // A non-literal write shadows identically.
         b"def compute = 9.9\nMath::PI = compute()\nMath::PI.bogus\n".as_slice(),
     ] {
         let (i, ty) = ty_of_last_call_receiver(src);

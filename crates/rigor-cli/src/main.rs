@@ -1976,6 +1976,7 @@ fn analyze_files(
     // drain below turns into the same eprintln / push the serial loop did.
     enum Stage1 {
         Excluded,
+        IncompleteDiscovery,
         /// The lowered file plus its per-file [`rigor_infer::Harvest`], kept
         /// side by side so the serial drain can fill the two index-aligned Vecs.
         /// The harvest is BOXED to keep this variant close to the others in size
@@ -2134,7 +2135,7 @@ fn analyze_files(
                     return if item.analyze {
                         Stage1::IoError { path: path.to_string(), msg: e.to_string() }
                     } else {
-                        Stage1::Excluded
+                        Stage1::IncompleteDiscovery
                     };
                 }
             };
@@ -2198,7 +2199,7 @@ fn analyze_files(
                     source,
                     diags,
                 },
-                Ok(Lowered::Unparseable(_)) => Stage1::Excluded,
+                Ok(Lowered::Unparseable(_)) => Stage1::IncompleteDiscovery,
                 Ok(Lowered::Parsed(ast, comments)) => {
                     // Issue #92: the per-file HARVEST — everything the project
                     // index derives from this file's AST + the already-frozen
@@ -2242,13 +2243,13 @@ fn analyze_files(
                     path: path.to_string(),
                     msg: panic_message(&panic_val),
                 },
-                Err(_) => Stage1::Excluded,
+                Err(_) => Stage1::IncompleteDiscovery,
                 // Past the depth bound: like a panicked file, a discovery-only
                 // one contributes nothing.
                 Ok(Lowered::TooDeep(msg)) if item.analyze => {
                     Stage1::TooDeep { order, path: path.to_string(), msg }
                 }
-                Ok(Lowered::TooDeep(_)) => Stage1::Excluded,
+                Ok(Lowered::TooDeep(_)) => Stage1::IncompleteDiscovery,
             }
         })
         .collect();
@@ -2273,9 +2274,14 @@ fn analyze_files(
     let mut pl_cpu = std::time::Duration::ZERO;
     let mut hv_cpu = std::time::Duration::ZERO;
     let mut hv_cpu_max = std::time::Duration::ZERO;
+    let mut incomplete_discovery = false;
     for outcome in stage1 {
+        incomplete_discovery |= !matches!(
+            outcome,
+            Stage1::Excluded | Stage1::Prepared(..) | Stage1::Discovery { .. }
+        );
         match outcome {
-            Stage1::Excluded => {}
+            Stage1::Excluded | Stage1::IncompleteDiscovery => {}
             Stage1::Prepared(p, h, t) => {
                 pl_cpu += t.parse_lower;
                 hv_cpu += t.harvest;
@@ -2349,6 +2355,9 @@ fn analyze_files(
     let mut project_source =
         rigor_infer::SourceIndex::merge_with_pre_eval(&files, &index, pre_eval::load(&cfg.pre_eval));
     project_source.set_pre_eval_declared(!cfg.pre_eval.is_empty());
+    if incomplete_discovery {
+        project_source.mark_constant_census_incomplete();
+    }
     // `libraries: [prime]` activates a gated vendored feature the same as a
     // source `require "prime"` — `RequiredFeatures.tokens(features,
     // configured_libraries)` (rigor-rs#463).

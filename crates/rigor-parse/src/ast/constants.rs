@@ -459,74 +459,278 @@ pub struct ConstWrite {
     /// binds the top-level name unconditionally, so no lexical candidate
     /// joins apply.
     pub rooted: bool,
+    /// A dynamic target contributes only a last-segment publication veto.
+    pub dynamic: bool,
+    /// A bare write below a header whose cref this census cannot name reliably.
+    pub uncertain_bare: bool,
+    /// Compound and destructuring writes can veto publication but do not
+    /// participate in the existing plain-write shadow gate.
+    pub plain: bool,
+    /// The fully literal RHS visible to Prism. Composite literals are kept
+    /// for the same-file constant harvest; only the immutable scalar subset
+    /// may publish across files.
+    pub literal: Option<ConstWriteLiteral>,
 }
 
-/// `constant_write_census` (`scope_indexer.rb`): every plain-`=` constant
-/// write in the file, for [`ConstWrite`]. Runs on the Prism tree because a
-/// `M::K = …` path write lowers to a nameless [`Node::UnmodeledWrite`].
+/// The syntactically recognizable fully-literal RHS of a constant write.
+/// Dynamic array/hash members and ranges deliberately decline here: the
+/// reference types them through the typed in-source table with precision the
+/// literal harvest cannot reproduce, so silent is the parity-safe half.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstWriteLiteral {
+    Integer(i64),
+    Float(u64),
+    Symbol(String),
+    Bool(bool),
+    Nil,
+    Str(String),
+    Array(Vec<ConstWriteLiteral>),
+    Hash(Vec<(ConstWriteHashKey, ConstWriteLiteral)>),
+    /// A receiverful zero-arg `.freeze` tail. The wrapper matters at the
+    /// top level: a frozen empty literal is not the accumulator idiom.
+    Frozen(Box<ConstWriteLiteral>),
+}
+
+/// A static hash key in a fully literal constant hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ConstWriteHashKey {
+    Integer(i64),
+    Float(u64),
+    Symbol(String),
+    Str(String),
+    Bool(bool),
+    Nil,
+}
+
+impl ConstWriteLiteral {
+    fn from_prism(value: &PrismNode<'_>) -> Option<Self> {
+        if let Some(node) = value.as_integer_node() {
+            return super::builder::integer_value(&node.value()).map(Self::Integer);
+        }
+        if let Some(node) = value.as_float_node() {
+            return Some(Self::Float(node.value().to_bits()));
+        }
+        if let Some(node) = value.as_symbol_node() {
+            let value = node.value_loc().map_or_else(
+                || String::from_utf8_lossy(node.unescaped()).into_owned(),
+                |loc| String::from_utf8_lossy(loc.as_slice()).into_owned(),
+            );
+            return Some(Self::Symbol(value));
+        }
+        if let Some(node) = value.as_string_node() {
+            return Some(Self::Str(String::from_utf8_lossy(node.unescaped()).into_owned()));
+        }
+        if value.as_true_node().is_some() {
+            return Some(Self::Bool(true));
+        }
+        if value.as_false_node().is_some() {
+            return Some(Self::Bool(false));
+        }
+        if value.as_nil_node().is_some() {
+            return Some(Self::Nil);
+        }
+        if let Some(node) = value.as_array_node() {
+            let mut elements = Vec::new();
+            for element in node.elements().iter() {
+                elements.push(Self::from_prism(&element)?);
+            }
+            return Some(Self::Array(elements));
+        }
+        if let Some(node) = value.as_hash_node() {
+            let mut members = Vec::new();
+            for element in node.elements().iter() {
+                let assoc = element.as_assoc_node()?;
+                members.push((const_write_hash_key(&assoc.key())?, Self::from_prism(&assoc.value())?));
+            }
+            return Some(Self::Hash(members));
+        }
+        // A receiverful, argumentless, blockless `.freeze` is identity on
+        // the literal underneath (`CONST = %w[...].freeze`).
+        if let Some(call) = value.as_call_node() {
+            if constant_string(call.name().as_slice()) == "freeze"
+                && call.arguments().is_none()
+                && call.block().is_none()
+                && !call.is_safe_navigation()
+            {
+                if let Some(receiver) = call.receiver() {
+                    return Self::from_prism(&receiver).map(|lit| Self::Frozen(Box::new(lit)));
+                }
+            }
+        }
+        None
+    }
+}
+
+fn const_write_hash_key(node: &PrismNode<'_>) -> Option<ConstWriteHashKey> {
+    if let Some(node) = node.as_symbol_node() {
+        return Some(ConstWriteHashKey::Symbol(node.value_loc().map_or_else(
+            || String::from_utf8_lossy(node.unescaped()).into_owned(),
+            |loc| String::from_utf8_lossy(loc.as_slice()).into_owned(),
+        )));
+    }
+    if let Some(node) = node.as_string_node() {
+        return Some(ConstWriteHashKey::Str(String::from_utf8_lossy(node.unescaped()).into_owned()));
+    }
+    if let Some(node) = node.as_integer_node() {
+        return super::builder::integer_value(&node.value()).map(ConstWriteHashKey::Integer);
+    }
+    if let Some(node) = node.as_float_node() {
+        return Some(ConstWriteHashKey::Float(node.value().to_bits()));
+    }
+    if node.as_true_node().is_some() {
+        Some(ConstWriteHashKey::Bool(true))
+    } else if node.as_false_node().is_some() {
+        Some(ConstWriteHashKey::Bool(false))
+    } else if node.as_nil_node().is_some() {
+        Some(ConstWriteHashKey::Nil)
+    } else {
+        None
+    }
+}
+
+/// `constant_write_census` (`scope_indexer.rb`): the writes and publication
+/// vetoes in this file. Runs on Prism because a `M::K = …` path write lowers
+/// to a nameless marker.
 pub(crate) fn collect_const_writes(root: &PrismNode<'_>) -> Vec<ConstWrite> {
     use ruby_prism::Visit;
 
     struct Census {
         out: Vec<ConstWrite>,
         prefix: Vec<String>,
+        uncertain_cref: bool,
     }
 
-    impl<'pr> Visit<'pr> for Census {
-        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
-            let name = constant_path_string(&node.constant_path());
-            if name.is_empty() {
-                ruby_prism::visit_class_node(self, node);
-                return;
-            }
-            self.prefix.push(name);
-            if let Some(body) = node.body() {
-                self.visit(&body);
-            }
-            self.prefix.pop();
-        }
-
-        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
-            let name = constant_path_string(&node.constant_path());
-            if name.is_empty() {
-                ruby_prism::visit_module_node(self, node);
-                return;
-            }
-            self.prefix.push(name);
-            if let Some(body) = node.body() {
-                self.visit(&body);
-            }
-            self.prefix.pop();
-        }
-
-        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+    impl Census {
+        fn bare(&mut self, name: ruby_prism::ConstantId<'_>, plain: bool, literal: Option<ConstWriteLiteral>) {
             self.out.push(ConstWrite {
                 prefix: self.prefix.clone(),
-                name: constant_string(node.name().as_slice()),
+                name: constant_string(name.as_slice()),
                 is_path: false,
                 rooted: false,
+                dynamic: false,
+                uncertain_bare: self.uncertain_cref,
+                plain,
+                literal,
             });
-            // Descend the rvalue: `C = (D = 1)` chains name both writes.
-            ruby_prism::visit_constant_write_node(self, node);
         }
 
-        fn visit_constant_path_write_node(
-            &mut self,
-            node: &ruby_prism::ConstantPathWriteNode<'pr>,
-        ) {
-            if let Some(name) = strict_constant_path_string(&node.target().as_node()) {
+        fn declaration_body<'pr>(&mut self, header: &PrismNode<'pr>, body: Option<PrismNode<'pr>>) {
+            self.visit(header);
+            let name = constant_path_string(header);
+            let pushed = !name.is_empty();
+            let old = self.uncertain_cref;
+            self.uncertain_cref |= strict_constant_path_string(header).is_none()
+                || (rooted_constant_path(header) && !self.prefix.is_empty());
+            if pushed {
+                self.prefix.push(name);
+            }
+            if let Some(body) = body {
+                self.visit(&body);
+            }
+            if pushed {
+                self.prefix.pop();
+            }
+            self.uncertain_cref = old;
+        }
+
+        fn path(&mut self, target: &PrismNode<'_>, plain: bool, literal: Option<ConstWriteLiteral>) {
+            let strict = strict_constant_path_string(target);
+            let dynamic = strict.is_none();
+            if let Some(name) = strict.or_else(|| constant_node_name(target)) {
                 self.out.push(ConstWrite {
                     prefix: self.prefix.clone(),
                     name,
                     is_path: true,
-                    rooted: rooted_constant_path(&node.target().as_node()),
+                    rooted: rooted_constant_path(target),
+                    dynamic,
+                    uncertain_bare: false,
+                    plain,
+                    literal,
                 });
             }
-            ruby_prism::visit_constant_path_write_node(self, node);
         }
     }
 
-    let mut census = Census { out: Vec::new(), prefix: Vec::new() };
+    impl<'pr> Visit<'pr> for Census {
+        fn visit_class_node(&mut self, node: &ruby_prism::ClassNode<'pr>) {
+            if let Some(superclass) = node.superclass() {
+                self.visit(&superclass);
+            }
+            self.declaration_body(&node.constant_path(), node.body());
+        }
+
+        fn visit_module_node(&mut self, node: &ruby_prism::ModuleNode<'pr>) {
+            self.declaration_body(&node.constant_path(), node.body());
+        }
+
+        fn visit_singleton_class_node(&mut self, node: &ruby_prism::SingletonClassNode<'pr>) {
+            self.visit(&node.expression());
+            let old = std::mem::replace(&mut self.uncertain_cref, true);
+            if let Some(body) = node.body() {
+                self.visit(&body);
+            }
+            self.uncertain_cref = old;
+        }
+
+        fn visit_constant_write_node(&mut self, node: &ruby_prism::ConstantWriteNode<'pr>) {
+            self.bare(node.name(), true, ConstWriteLiteral::from_prism(&node.value()));
+            ruby_prism::visit_constant_write_node(self, node);
+        }
+
+        fn visit_constant_path_write_node(&mut self, node: &ruby_prism::ConstantPathWriteNode<'pr>) {
+            self.path(&node.target().as_node(), true, ConstWriteLiteral::from_prism(&node.value()));
+            ruby_prism::visit_constant_path_write_node(self, node);
+        }
+
+        fn visit_constant_or_write_node(&mut self, node: &ruby_prism::ConstantOrWriteNode<'pr>) {
+            self.bare(node.name(), false, None);
+            ruby_prism::visit_constant_or_write_node(self, node);
+        }
+
+        fn visit_constant_and_write_node(&mut self, node: &ruby_prism::ConstantAndWriteNode<'pr>) {
+            self.bare(node.name(), false, None);
+            ruby_prism::visit_constant_and_write_node(self, node);
+        }
+
+        fn visit_constant_operator_write_node(&mut self, node: &ruby_prism::ConstantOperatorWriteNode<'pr>) {
+            self.bare(node.name(), false, None);
+            ruby_prism::visit_constant_operator_write_node(self, node);
+        }
+
+        fn visit_constant_path_or_write_node(&mut self, node: &ruby_prism::ConstantPathOrWriteNode<'pr>) {
+            self.path(&node.target().as_node(), false, None);
+            ruby_prism::visit_constant_path_or_write_node(self, node);
+        }
+
+        fn visit_constant_path_and_write_node(&mut self, node: &ruby_prism::ConstantPathAndWriteNode<'pr>) {
+            self.path(&node.target().as_node(), false, None);
+            ruby_prism::visit_constant_path_and_write_node(self, node);
+        }
+
+        fn visit_constant_path_operator_write_node(&mut self, node: &ruby_prism::ConstantPathOperatorWriteNode<'pr>) {
+            self.path(&node.target().as_node(), false, None);
+            ruby_prism::visit_constant_path_operator_write_node(self, node);
+        }
+
+        fn visit_constant_target_node(&mut self, node: &ruby_prism::ConstantTargetNode<'pr>) {
+            self.bare(node.name(), false, None);
+        }
+
+        fn visit_constant_path_target_node(&mut self, node: &ruby_prism::ConstantPathTargetNode<'pr>) {
+            if let Some(name) = node.name() {
+                // This is a distinct node from ConstantPathNode. Use a
+                // last-segment veto rather than attributing it to a guess.
+                self.out.push(ConstWrite {
+                    prefix: Vec::new(), name: constant_string(name.as_slice()),
+                    is_path: true, rooted: false, dynamic: true, uncertain_bare: false,
+                    plain: false, literal: None,
+                });
+            }
+            ruby_prism::visit_constant_path_target_node(self, node);
+        }
+    }
+
+    let mut census = Census { out: Vec::new(), prefix: Vec::new(), uncertain_cref: false };
     census.visit(root);
     census.out
 }

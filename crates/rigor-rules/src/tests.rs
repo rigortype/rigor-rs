@@ -5006,6 +5006,41 @@ fn project_rule_methods(files: &[&[u8]], focus: usize) -> Vec<(&'static str, Str
         .collect()
 }
 
+/// #904: foreign scalars answer direct qualified and ancestor reads. A
+/// second write, a compound/multiwrite, a dynamic target, and a non-publishable
+/// literal each decline; the publication must not drive a flow warning.
+#[test]
+fn foreign_scalar_constant_receivers_use_the_publication_census() {
+    let files: [&[u8]; 3] = [
+        b"Math::PI = 5\nclass PubBase; KEY = 5; SHADOW = 6; end\n\
+          module PubConfig\n  FLAG = true\n  TEXT = 'x'\n  DATA = [1]\n  NOTHING = nil\n\
+          REPEAT = 8\n  COMPOUND = 9\n  DESTRUCTURED = 10\n  WILDCARD = 11\nend\n",
+        b"PubConfig::REPEAT = :other\nPubConfig::COMPOUND += 1\n\
+          _unused, PubConfig::DESTRUCTURED = [1, 2]\n\
+          [PubConfig].each { |owner| owner::WILDCARD = 'x' }\n",
+        b"Math::PI.bogus\nclass PubSub < PubBase\n  SHADOW = ENV['X']\n  KEY.bogus\n  SHADOW.bogus\nend\n\
+          PubConfig::FLAG.bogus\nPubConfig::TEXT.bogus\nPubConfig::DATA.bogus\nPubConfig::NOTHING.bogus\n\
+          PubConfig::REPEAT.bogus\nPubConfig::COMPOUND.bogus\nPubConfig::DESTRUCTURED.bogus\n\
+          PubConfig::WILDCARD.bogus\nif PubConfig::FLAG; puts :yes; end\n",
+    ];
+    let asts: Vec<_> = files.iter().map(|src| lower(&parse(src))).collect();
+    let refs: Vec<_> = asts.iter().collect();
+    let index = CoreIndex::new();
+    let source = rigor_infer::SourceIndex::build_project(&refs, &index);
+    let rows: Vec<_> = analyze_with_source(&asts[2], &mut Interner::new(), &index, &source)
+        .into_iter()
+        .map(|d| {
+            let line = files[2][..d.start_offset].iter().filter(|&&b| b == b'\n').count() + 1;
+            (line, d.rule_id, d.message)
+        })
+        .collect();
+    assert_eq!(rows, [
+        (1, CALL_UNDEFINED_METHOD, "undefined method `bogus' for 5".into()),
+        (4, CALL_UNDEFINED_METHOD, "undefined method `bogus' for 5".into()),
+        (7, CALL_UNDEFINED_METHOD, "undefined method `bogus' for true".into()),
+    ]);
+}
+
 /// Upstream v0.4.2 (#1706 / issue #1697), oracle-measured on a two-file
 /// project: a top-level `include` in ONE file reaches every other file. An
 /// unknown module silences each bare top-level call there but no explicit

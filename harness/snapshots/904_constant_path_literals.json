@@ -35,6 +35,69 @@
       "column": 10,
       "severity": "error",
       "message": "undefined method `bogus' for 5"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 13,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `bogus' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 15,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `bogus' for \"x\""
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 17,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `bogus' for { a: 1 }"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 19,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `bogus' for Array[Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 21,
+      "column": 18,
+      "severity": "error",
+      "message": "undefined method `bogus' for Hash[Dynamic[top], Dynamic[top]]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 23,
+      "column": 17,
+      "severity": "error",
+      "message": "undefined method `bogus' for String"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 25,
+      "column": 14,
+      "severity": "error",
+      "message": "undefined method `bogus' for [1]"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 27,
+      "column": 12,
+      "severity": "error",
+      "message": "undefined method `bogus' for nil"
+    },
+    {
+      "rule": "call.undefined-method",
+      "line": 32,
+      "column": 11,
+      "severity": "error",
+      "message": "undefined method `bogus' for 5"
     }
   ]
 }

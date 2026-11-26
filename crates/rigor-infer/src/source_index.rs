@@ -644,6 +644,10 @@ pub struct SourceIndex {
     /// `name` is the whole path and therefore misses the bare-name map.
     /// Backs [`Self::qualified_literal_constant`].
     qualified_literal_constants: HashMap<String, HarvestedConst>,
+    /// #904: exact scalar candidates from the raw constant-write census.
+    /// Keyed by last segment first so unrelated reads skip the extra lookup.
+    scalar_const_writes: HashMap<String, HashMap<String, constants::ScalarWrite>>,
+    incomplete_constant_census: bool,
     /// Collection-shape stage 2b: the BARE name of every `CONST = …` write the
     /// project makes in a class/module/program body — INCLUDING the ones C5
     /// declines to harvest (non-literal RHS, multiply assigned). The C1 shadow
