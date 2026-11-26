@@ -32,6 +32,8 @@
 //! literal tails), not env-typed carriers, so a position is only marked dead
 //! when the oracle proves it.
 
+use std::collections::HashSet;
+
 use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, Span, StatementsKind};
 
 use rigor_types::Scalar;
@@ -2035,8 +2037,38 @@ impl<'i> Typer<'i> {
         // per name (rigor-rs#422).
         let last = self.reach_index(ast).last_toplevel_def(method);
         let exits = last.is_some_and(|id| match ast.get(id) {
-            Node::Definition { body, .. } => {
-                call_binds_def_params(ast, call, id) && self.arm_bot(ast, body, seen)
+            Node::Definition { body, params, .. } => {
+                if !call_binds_def_params(ast, call, id) {
+                    return false;
+                }
+                if self.arm_bot(ast, body, seen) {
+                    return true;
+                }
+                // The reference types `bot` as a VALUE type through a def
+                // body. A tail that reads the parameter — directly or through
+                // a plain write — therefore keeps `g(raise)` bot when the
+                // `raise` argument feeds that parameter (`def g(a) = a`),
+                // while a tail that merely CALLS on it does not (`a + 1`,
+                // `a.upcase` stay dynamic). Seed exactly the positional
+                // parameters whose arguments are bot and replay the body's
+                // straight-line writes; anything not provably bot stays a
+                // value, so a miss only keeps the rescue arm live.
+                let Node::Call { args, args_plain_positional: true, .. } = ast.get(call) else {
+                    return false;
+                };
+                let Some(params) = params else {
+                    return false;
+                };
+                if params.len() != args.len() {
+                    return false;
+                }
+                let mut bot_locals: HashSet<String> = params
+                    .iter()
+                    .zip(args.iter())
+                    .filter(|&(_, &arg)| self.stmt_bot(ast, arg, seen))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                !bot_locals.is_empty() && self.sequence_bot_tracked(ast, body, &mut bot_locals, seen)
             }
             _ => false,
         });
@@ -2052,10 +2084,151 @@ impl<'i> Typer<'i> {
         body.last().is_some_and(|&l| self.stmt_bot(ast, l, seen))
     }
 
-    /// [`Self::stmt_exits`]'s Bot counterpart — does the statement yield a
-    /// value at all? Same shape walk minus the jump statements (they
-    /// produce the jump's payload or the method's `nil`), plus the
-    /// non-returning-call cases a `def` tail can carry.
+    /// [`Self::arm_bot`] with the direct dataflow of `bot` through local
+    /// writes tracked. `bot_locals` holds exactly the locals proven to carry
+    /// `bot`; every other local is a value in the reference's type lattice
+    /// (`Dynamic` included), so no third state is needed. Prefix statements
+    /// update that set; the tail answers with it.
+    fn sequence_bot_tracked(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        bot_locals: &mut HashSet<String>,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        let Some((&last, prefix)) = body.split_last() else {
+            return false;
+        };
+        for &stmt in prefix {
+            self.update_bot_bindings(ast, stmt, bot_locals, seen);
+        }
+        self.stmt_bot_tracked(ast, last, bot_locals, seen)
+    }
+
+    /// The straight-line part of [`Self::sequence_bot_tracked`]'s write
+    /// replay. A write whose value is bot makes its targets bot; any other
+    /// write clears them. Conditional and nested-scope writes are ignored —
+    /// they cannot make the tail MORE bot, and treating them as absent only
+    /// declines the proof (the reference-safe side here is still just a
+    /// coverage loss, never an extra diagnostic).
+    fn update_bot_bindings(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        bot_locals: &mut HashSet<String>,
+        seen: &mut Vec<String>,
+    ) {
+        match ast.get(id) {
+            Node::LocalVariableWrite { name, value, .. } => {
+                if self.stmt_bot_tracked(ast, *value, bot_locals, seen) {
+                    bot_locals.insert(name.clone());
+                } else {
+                    bot_locals.remove(name);
+                }
+            }
+            Node::MultiWrite { targets, value, .. } => {
+                let bot = self.stmt_bot_tracked(ast, *value, bot_locals, seen);
+                for (name, _) in targets.bound_names() {
+                    if bot {
+                        bot_locals.insert(name);
+                    } else {
+                        bot_locals.remove(&name);
+                    }
+                }
+            }
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                for &stmt in body {
+                    self.update_bot_bindings(ast, stmt, bot_locals, seen);
+                }
+            }
+            Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
+                for &stmt in main_body {
+                    self.update_bot_bindings(ast, stmt, bot_locals, seen);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// [`Self::stmt_bot`] under the local-write proof of
+    /// [`Self::sequence_bot_tracked`]. The only added leaf is a local read;
+    /// the carriers mirror `stmt_bot` so `return a`, `(a)`, a folded `if`
+    /// and a write of `a` keep the reference's value-type propagation.
+    fn stmt_bot_tracked(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        bot_locals: &HashSet<String>,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        match ast.get(id) {
+            Node::LocalVariableRead { name, .. } => bot_locals.contains(name),
+            Node::Return { values, .. } => match values.as_slice() {
+                [v] => self.stmt_bot_tracked(ast, *v, bot_locals, seen),
+                _ => false,
+            },
+            Node::Other { .. } => false,
+            Node::Statements {
+                kind: StatementsKind::Jump(JumpKind::Next | JumpKind::Break),
+                body,
+                ..
+            } => {
+                let mut locals = bot_locals.clone();
+                self.sequence_bot_tracked(ast, body, &mut locals, seen)
+            }
+            Node::Statements { body, kind, .. } => {
+                if !matches!(kind, StatementsKind::Sequence) {
+                    return false;
+                }
+                let mut locals = bot_locals.clone();
+                self.sequence_bot_tracked(ast, body, &mut locals, seen)
+            }
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                is_unless,
+                ..
+            } => {
+                let arm_bot = |arm: &[NodeId], seen: &mut Vec<String>| {
+                    let mut locals = bot_locals.clone();
+                    self.sequence_bot_tracked(ast, arm, &mut locals, seen)
+                };
+                match self.expr_truthiness(ast, *predicate, seen) {
+                    Some(truthy) => {
+                        let live = if truthy != *is_unless { then_body } else { else_body };
+                        arm_bot(live, seen)
+                    }
+                    None => arm_bot(then_body, seen) && arm_bot(else_body, seen),
+                }
+            }
+            Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
+                let mut locals = bot_locals.clone();
+                self.sequence_bot_tracked(ast, main_body, &mut locals, seen)
+            }
+            Node::LocalVariableWrite { value, .. } => {
+                self.stmt_bot_tracked(ast, *value, bot_locals, seen)
+            }
+            Node::InstanceVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. }
+            | Node::MultiWrite { value, .. } => {
+                self.stmt_bot_tracked(ast, *value, bot_locals, seen)
+            }
+            Node::Logical { left, .. } => self.stmt_bot_tracked(ast, *left, bot_locals, seen),
+            Node::Call {
+                args,
+                safe_nav,
+                attribute_write,
+                ..
+            } if *attribute_write && !*safe_nav => {
+                args.last().is_some_and(|&v| self.stmt_bot_tracked(ast, v, bot_locals, seen))
+            }
+            Node::Call { .. } => self.exit_call_bot_seen(ast, id, seen),
+            _ => false,
+        }
+    }
+
     /// Whether a non-local plain write's VALUE types `bot` (rigor-rs#956):
     /// a call value counts only through its own `bot` type — a
     /// receiverless `EXIT_CALLS` name, a Kernel-spelled non-returner
