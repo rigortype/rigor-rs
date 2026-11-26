@@ -490,7 +490,9 @@ pub(crate) fn alias_floor_reaches(
         })
 }
 
-pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+fn filtered_flow_writes(
+    ast: &LoweredAst,
+) -> Vec<(NodeId, rigor_parse::Span, String, bool)> {
     let mut out = raw_flow_writes(ast);
     // rigor-rs#409: a scan-visible mark inside a `while`/`until` body
     // survives a deeper shadow scope — see [`loop_body_spans`].
@@ -522,7 +524,26 @@ pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)>
             && (!ast.in_blocked_carrier(*w)
                 || (*scan && ast.in_iterative_blocked_carrier(*w)))
     });
-    out.into_iter().map(|(_, s, n, _)| (s, n)).collect()
+    out
+}
+
+pub fn collect_flow_writes(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    filtered_flow_writes(ast)
+        .into_iter()
+        .map(|(_, s, n, _)| (s, n))
+        .collect()
+}
+
+/// The in-place content-mutation half of [`collect_flow_writes`], with the
+/// rebinds left out. The retry-edge table needs the distinction: a mutation
+/// of the kill's own target can reach an object the kill's value aliases
+/// across the re-evaluation (rigor-rs#1030), while a rebind cannot.
+pub(crate) fn collect_content_mutations(ast: &LoweredAst) -> Vec<(rigor_parse::Span, String)> {
+    filtered_flow_writes(ast)
+        .into_iter()
+        .filter(|(_, _, _, scan_visible)| *scan_visible)
+        .map(|(_, s, n, _)| (s, n))
+        .collect()
 }
 
 /// Every rebind of a TOP-LEVEL local, span-keyed for [`widen_flow_writes`]: a

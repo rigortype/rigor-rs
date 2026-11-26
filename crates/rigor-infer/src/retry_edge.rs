@@ -53,6 +53,13 @@
 //! edge for it the same way (`$g = c; $g = [0]; $g.nope` fires `for [0]` on
 //! the oracle). A candidate's value also reads sigilled names — `d = $g`
 //! derives once `$g` does.
+//!
+//! rigor-rs#1030 — a kill does not hold against an edge mutation of its own
+//! target unless the kill's value is a fresh literal. `d = c` rebinds `d`
+//! on every pass, but `rescue; d << 2; retry` mutates the object `c` and
+//! the next pass's `d = c` binds that mutated object again. A literal
+//! (`d = [1]`) is re-allocated by the re-run, so the mutation stays on the
+//! previous pass's object and the kill still holds.
 
 use std::collections::{HashMap, HashSet};
 
@@ -84,6 +91,11 @@ struct EdgeWrites {
     /// Whether one of them reaches every read in any order: a rebind (not a
     /// mutation), an index write or a derived write (the module doc).
     rebind: bool,
+    /// Whether one edge write mutates this binding in place (`d << x`,
+    /// `d[k] = v`). Against such a write only a fresh-literal kill holds:
+    /// every other value can alias the object the mutation reached on an
+    /// earlier pass (rigor-rs#1030).
+    mutated: bool,
     /// No statement list in the `begin` holds a non-derived kill of this
     /// local, so [`Chain::reaches`] can skip the kill scan. Computed once
     /// [`RetryBegin::derive`] has found every derived write; `false` until
@@ -102,20 +114,26 @@ struct StmtList {
     /// Element spans, in source order.
     elems: Vec<Span>,
     /// Per local, the elements that kill it, in index order: a plain `x = v`
-    /// statement whose value does not read `x` ([`kills`]), with its span.
-    kills: HashMap<String, Vec<(usize, Span)>>,
+    /// statement whose value does not read `x` ([`kills`]), with its span
+    /// and whether the value is a fresh literal (rigor-rs#1030).
+    kills: HashMap<String, Vec<(usize, Span, bool)>>,
 }
 
 impl StmtList {
     /// The span of the last element before `holder` that kills `name`,
     /// skipping the derived writes.
-    fn last_kill_before(&self, name: &str, holder: usize, derived: &HashSet<Span>) -> Option<Span> {
+    fn last_kill_before(
+        &self,
+        name: &str,
+        holder: usize,
+        derived: &HashSet<Span>,
+    ) -> Option<(Span, bool)> {
         self.kills
             .get(name)?
             .iter()
             .rev()
-            .find(|(i, s)| *i < holder && !derived.contains(s))
-            .map(|&(_, s)| s)
+            .find(|(i, s, _)| *i < holder && !derived.contains(s))
+            .map(|&(_, s, fresh)| (s, fresh))
     }
 }
 
@@ -134,11 +152,13 @@ impl RetryEdges {
         ast: &LoweredAst,
         writes: impl Iterator<Item = (Span, &'w str)> + Clone,
         rebinds: &[(Span, String)],
+        mutations: impl Iterator<Item = (Span, &'w str)> + Clone,
         keep: impl Fn(Span) -> bool,
     ) -> Self {
         let idx = typer.reach_index(ast);
         let rebind_set: HashSet<(Span, &str)> =
             rebinds.iter().map(|(s, n)| (*s, n.as_str())).collect();
+        let mutation_set: HashSet<(Span, &str)> = mutations.collect();
         let mut begins = Vec::new();
         let scope_bodies: Vec<Span> = ast
             .iter()
@@ -182,11 +202,13 @@ impl RetryEdges {
                         let e = by_name.entry(name).or_insert_with(|| EdgeWrites {
                             starts: Vec::new(),
                             rebind: false,
+                            mutated: false,
                             kill_free: false,
                             derived_starts: Vec::new(),
                         });
                         e.starts.push(w.0);
                         e.rebind = true;
+                        e.mutated = true;
                     }
                 }
             }
@@ -198,11 +220,13 @@ impl RetryEdges {
                     let e = by_name.entry(name).or_insert_with(|| EdgeWrites {
                         starts: Vec::new(),
                         rebind: false,
+                        mutated: false,
                         kill_free: false,
                         derived_starts: Vec::new(),
                     });
                     e.starts.push(w.0);
                     e.rebind |= rebind_set.contains(&(w, name));
+                    e.mutated |= mutation_set.contains(&(w, name));
                 }
             }
             if by_name.is_empty() {
@@ -226,7 +250,7 @@ impl RetryEdges {
             for (name, w) in &mut begin.writes {
                 w.kill_free = begin.lists.iter().all(|l| {
                     l.kills.get(name.as_str()).is_none_or(|ks| {
-                        ks.iter().all(|(_, s)| begin.derived.contains(s))
+                        ks.iter().all(|(_, s, _)| begin.derived.contains(s))
                     })
                 });
             }
@@ -384,6 +408,7 @@ impl RetryBegin {
                 let fresh = EdgeWrites {
                     starts: Vec::new(),
                     rebind: false,
+                    mutated: false,
                     kill_free: false,
                     derived_starts: Vec::new(),
                 };
@@ -435,9 +460,16 @@ impl Chain<'_> {
     fn reaches(&self, site: Span, name: &str, w: &EdgeWrites, derived: &HashSet<Span>) -> bool {
         if !w.kill_free {
             let killed = self.links.iter().any(|(l, j)| {
-                let Some(kill) = l.last_kill_before(name, *j, derived) else {
+                let Some((kill, fresh)) = l.last_kill_before(name, *j, derived) else {
                     return false;
                 };
+                // rigor-rs#1030 — when the target itself is edge-mutated,
+                // only a fresh literal severs the mutated object across the
+                // retry. `d = c` rebinds the same object `d << 2` mutated on
+                // the prior pass; `d = [1]` allocates again and still kills.
+                if w.mutated && !fresh {
+                    return false;
+                }
                 // rigor-rs#1000 — the kill holds only until a derived write
                 // of `name` runs between it and the read: the second pass
                 // binds that write's target from the widened entry, so the
@@ -533,10 +565,10 @@ fn lists_within(
     raw.into_iter()
         .filter(|l| !l.is_empty())
         .map(|l| {
-            let mut kills: HashMap<String, Vec<(usize, Span)>> = HashMap::new();
+            let mut kills: HashMap<String, Vec<(usize, Span, bool)>> = HashMap::new();
             for (i, &s) in l.iter().enumerate() {
-                if let Some(name) = self::kills(ast, idx, s) {
-                    kills.entry(name).or_default().push((i, ast.get(s).span()));
+                if let Some((name, fresh)) = self::kills(ast, idx, s) {
+                    kills.entry(name).or_default().push((i, ast.get(s).span(), fresh));
                 }
             }
             StmtList { elems: l.iter().map(|&s| ast.get(s).span()).collect(), kills }
@@ -609,7 +641,11 @@ fn index_write_local(ast: &LoweredAst, id: NodeId) -> Option<&str> {
 /// `x = v` / `@x = v` / `$g = v` whose `v` reads no `x` / `@x` / `$g`
 /// (rigor-rs#1001 — a sigilled write kills the edge for its name the same
 /// way the local's does).
-fn kills(ast: &LoweredAst, idx: &crate::reach_index::ReachIndex, id: NodeId) -> Option<String> {
+fn kills(
+    ast: &LoweredAst,
+    idx: &crate::reach_index::ReachIndex,
+    id: NodeId,
+) -> Option<(String, bool)> {
     let (name, value) = match ast.get(id) {
         Node::LocalVariableWrite { name, value, .. }
         | Node::InstanceVariableWrite { name, value, .. }
@@ -621,5 +657,30 @@ fn kills(ast: &LoweredAst, idx: &crate::reach_index::ReachIndex, id: NodeId) -> 
         Node::LocalVariableRead { name: r, .. } | Node::VariableRead { name: r, .. } => r == name,
         _ => false,
     });
-    (!reads).then(|| name.clone())
+    (!reads).then(|| (name.clone(), fresh_literal(ast.get(*value))))
+}
+
+/// Whether evaluating `node` allocates the object it binds on every pass.
+/// Only then does a re-run assignment sever an edge mutation of the previous
+/// pass's object (rigor-rs#1030). Calls are never assumed fresh here: even
+/// `dup` can be overridden to return its receiver.
+fn fresh_literal(node: &Node) -> bool {
+    matches!(
+        node,
+        Node::StringLit { .. }
+            | Node::InterpolatedString { .. }
+            | Node::InterpolatedSymbol { .. }
+            | Node::IntegerLit { .. }
+            | Node::FloatLit { .. }
+            | Node::RegexpLit { .. }
+            | Node::RationalLit { .. }
+            | Node::ImaginaryLit { .. }
+            | Node::SymbolLit { .. }
+            | Node::NilLit { .. }
+            | Node::TrueLit { .. }
+            | Node::FalseLit { .. }
+            | Node::ArrayLit { .. }
+            | Node::HashLit { .. }
+            | Node::Range { .. }
+    )
 }
