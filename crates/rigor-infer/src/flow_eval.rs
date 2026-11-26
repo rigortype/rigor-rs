@@ -2440,7 +2440,7 @@ impl<'i> Typer<'i> {
                     boundaries: Vec::new(),
                     boundary_stmts: Vec::new(),
                     boundary_stride: 1,
-                    effects: FlowEffects::new(Vec::new(), Vec::new()),
+                    effects: FlowEffects::new(Vec::new(), Vec::new(), ast),
                     closure_mutations: Vec::new(),
                     escaped: Vec::new(),
                     indexed: IndexedFlow::default(),
@@ -2533,7 +2533,7 @@ impl<'i> Typer<'i> {
         let stride = (body.len() as f64).sqrt().ceil().max(1.0) as usize;
         let mut boundaries = Vec::new();
         let mut boundary_stmts = Vec::with_capacity(body.len());
-        let effects = FlowEffects::new(rebinds, mutations);
+        let effects = FlowEffects::new(rebinds, mutations, ast);
         for (i, &stmt) in body.iter().enumerate() {
             if record {
                 boundary_stmts.push((stmt, ast.get(stmt).span()));
@@ -8186,6 +8186,13 @@ pub(crate) struct FlowEffects {
     /// [`toplevel_mutations`]: every `local.<mutator>` call
     /// `(call span, name, method, drop_key)`.
     pub(crate) mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+    /// Plain local assignments that are themselves rescue exception designators
+    /// (including single-expression parentheses, which lowering unwraps).
+    /// `rescue_exception_type` keeps `sub_eval(exception, scope).first`, so
+    /// the assignment's scope does not land in the enclosing statement's exit.
+    /// The raw table still feeds read-site replay, including `ClauseWidening`
+    /// for `ensure`, which counts writes syntactically.
+    designator_rebinds: std::collections::HashSet<rigor_parse::Span>,
     /// Positions into `rebinds`, sorted by span start (stable — the
     /// tables' own order inside an equal start).
     rebind_starts: Vec<u32>,
@@ -8197,12 +8204,26 @@ impl FlowEffects {
     pub(crate) fn new(
         rebinds: Vec<(rigor_parse::Span, String)>,
         mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
+        ast: &LoweredAst,
     ) -> Self {
         let mut rebind_starts: Vec<u32> = (0..rebinds.len() as u32).collect();
         rebind_starts.sort_by_key(|&i| rebinds[i as usize].0 .0);
         let mut mutation_starts: Vec<u32> = (0..mutations.len() as u32).collect();
         mutation_starts.sort_by_key(|&i| mutations[i as usize].0 .0);
-        FlowEffects { rebinds, mutations, rebind_starts, mutation_starts }
+        let designator_rebinds = ast
+            .iter()
+            .filter_map(|(_, node)| match node {
+                Node::BeginRescue { clauses, .. } => Some(clauses),
+                _ => None,
+            })
+            .flatten()
+            .flat_map(|clause| &clause.exceptions)
+            .filter_map(|&id| match ast.get(id) {
+                Node::LocalVariableWrite { span, .. } => Some(*span),
+                _ => None,
+            })
+            .collect();
+        FlowEffects { rebinds, mutations, designator_rebinds, rebind_starts, mutation_starts }
     }
 
     /// The positions of `table`'s span-keyed entries whose START falls in
@@ -8228,12 +8249,14 @@ impl FlowEffects {
     }
 
     /// `rebinds` entries starting inside `span` (`w.0 <= span.1` — the end
-    /// check is the caller's).
+    /// check is the caller's), excluding a designator assignment's rebind
+    /// when replaying the continuation of an enclosing statement.
     pub(crate) fn rebinds_within(
         &self,
         span: rigor_parse::Span,
     ) -> impl Iterator<Item = &(rigor_parse::Span, String)> {
         Self::within(&self.rebinds, &self.rebind_starts, span, |r| r.0)
+            .filter(move |(w, _)| *w == span || !self.designator_rebinds.contains(w))
     }
 
     /// `mutations` entries starting inside `span`, same rule.

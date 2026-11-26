@@ -6194,12 +6194,24 @@ fn rescue_exception_designator_write_does_not_leak_to_continuation() {
     for src in [
         b"x = \"a\"; begin; raise; rescue (x = StandardError); end; x.w\n".as_slice(),
         b"x = \"a\"; if true; begin; raise; rescue (x = StandardError); end; end; x.w\n".as_slice(),
+        b"x = \"a\"; begin; raise; rescue x = StandardError; end; x.w\n".as_slice(),
+        b"x = \"a\"; begin; raise; rescue ArgumentError, (x = StandardError); end; x.w\n".as_slice(),
+        // The ensure mentions the name, so `ClauseWidening` still hides the
+        // in-ensure call. Only the call after the begin should be reported.
+        b"x = \"a\"; begin; raise; rescue (x = StandardError); ensure; x.w; end; x.w\n".as_slice(),
+        // With no assignment in the rescue list, the ensure call still fires.
+        b"x = \"a\"; begin; raise; rescue StandardError; ensure; x.w; end\n".as_slice(),
     ] {
         let diags = run(src);
         assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
         assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
         assert_eq!(diags[0].message, "undefined method `w' for \"a\"");
+        assert_eq!(diags[0].start_offset, src.iter().rposition(|&b| b == b'w').unwrap());
     }
+
+    // A real rescue-body rebind is not a discarded designator effect.
+    assert!(run(b"x = \"a\"; begin; raise; rescue; x = StandardError; end; x.w\n").is_empty());
+    assert!(run(b"x = \"a\"; begin; raise; rescue (x = StandardError); end; x.upcase\n").is_empty());
 
     // The designator expression itself still evaluates in order: the write
     // is visible to a read later in that same expression on both engines.
