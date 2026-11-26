@@ -29,6 +29,35 @@ fn flags_typo_method_on_string_literal() {
     assert_eq!(&src[d.start_offset..d.end_offset], b"lenght");
 }
 
+/// rigor-rs#292: a quoted symbol with an escape pins Prism's raw `value`
+/// (`symbol_type_for`), not `unescaped`, so the witness inspects the source
+/// spelling. A nearby unescaped ident still fires.
+#[test]
+fn escaped_symbol_witness_pins_raw_source_bytes() {
+    let src = b"[:\"a\\nb\"].frob\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].message, "undefined method `frob' for [:\"a\\\\nb\"]");
+
+    let src = b":\"\\x41\".frob\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].message, "undefined method `frob' for :\"\\\\x41\"");
+
+    let src = b"{:\"a\\nb\" => 1}.frob\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(
+        diags[0].message,
+        "undefined method `frob' for { :\"a\\\\nb\" => 1 }"
+    );
+
+    let src = b"[:foo].frob\n";
+    let diags = run(src);
+    assert_eq!(diags.len(), 1, "expected one undefined-method, got {diags:?}");
+    assert_eq!(diags[0].message, "undefined method `frob' for [:foo]");
+}
+
 /// Census mechanism 1: an `is_a?`-narrowed Dynamic local witnesses
 /// `call.undefined-method` against the narrowed class, rendered as the
 /// plain class name (`for Hash`) — and ONLY undefined-method (a narrowed

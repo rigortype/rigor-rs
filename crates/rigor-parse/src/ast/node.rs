@@ -276,8 +276,19 @@ pub enum Node {
     RationalLit { span: Span },
     /// An imaginary literal (`3i`) — nominal `Complex` (rigor-rs#493 item 7).
     ImaginaryLit { span: Span },
-    /// A symbol literal (`:foo`); `value` is the symbol name (no leading colon).
-    SymbolLit { value: String, span: Span },
+    /// A symbol literal (`:foo`).
+    ///
+    /// `value` is Prism's `unescaped` decoded name. Method-identity matching
+    /// (`send` / `define_method` / `respond_to?` / `alias` / `&:sym`) reads this.
+    ///
+    /// `raw` is Prism's `value` (`value_loc` source bytes). Type pins
+    /// (`symbol_type_for`) use this so witnesses render the source spelling
+    /// (rigor-rs#292).
+    SymbolLit {
+        value: String,
+        raw: String,
+        span: Span,
+    },
     /// The `nil` literal.
     NilLit { span: Span },
     /// The `true` literal.
