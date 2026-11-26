@@ -1743,6 +1743,20 @@ impl<'i> Typer<'i> {
             | Node::VariableWrite { value, .. }
             | Node::ConstantWrite { value, .. }
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, false),
+            // An attribute write's type is its assigned VALUE's
+            // (`h[:k] = raise`, `o.attr = raise`), so that value — the
+            // call's last argument — decides. Other argument positions do
+            // not (`h[raise] = 1` stays live), and neither does the
+            // explicit `h.[]=(k, raise)` spelling Prism does not mark as
+            // an attribute write (rigor-rs#964).
+            Node::Call {
+                args,
+                safe_nav,
+                attribute_write,
+                ..
+            } if *attribute_write && !*safe_nav => {
+                args.last().is_some_and(|&v| self.stmt_exits_at(ast, v, seen, false))
+            }
             // `branch_terminates?`'s OTHER half — a `Bot`-typed call
             // terminates too (`statement_evaluator.rb:4997`): the
             // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
@@ -2125,12 +2139,17 @@ impl<'i> Typer<'i> {
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, true),
             Node::Logical { left, .. } => self.stmt_bot(ast, *left, seen),
             Node::Call {
-                receiver, args, ..
-            } => {
-                receiver.is_some_and(|r| self.stmt_bot(ast, r, seen))
-                    || args.iter().any(|&a| self.stmt_bot(ast, a, seen))
-                    || self.exit_call_bot_seen(ast, id, seen)
+                args,
+                safe_nav,
+                attribute_write,
+                ..
+            } if *attribute_write && !*safe_nav => {
+                args.last().is_some_and(|&v| self.stmt_bot(ast, v, seen))
             }
+            // As in [`Self::stmt_exits_at`], an exiting receiver or
+            // argument does not make the enclosing call `bot`: the oracle
+            // types `foo(raise)` as `foo`'s return (rigor-rs#965).
+            Node::Call { .. } => self.exit_call_bot_seen(ast, id, seen),
             _ => false,
         }
     }
