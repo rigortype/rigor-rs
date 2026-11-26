@@ -230,6 +230,10 @@ impl<'i> Typer<'i> {
                 && marks
                     .decision_cg_reads_within(span, self.def_scope.get())
                     .is_empty();
+            let last_line_sequenced = Self::last_line_sequenced(ast.get(stmt));
+            if !last_line_sequenced {
+                self.forget_last_line_reader(ast, stmt, env, interner);
+            }
             if (guards.is_empty() || modelled) && !wild {
                 self.replay_one(ast, &marks, env, stmt, interner, returns);
             } else {
@@ -263,6 +267,9 @@ impl<'i> Typer<'i> {
                         None => {}
                     }
                 }
+            }
+            if last_line_sequenced {
+                self.forget_last_line_reader(ast, stmt, env, interner);
             }
             // Code after a statement that always leaves (`return`, `raise`,
             // `break`) is unreachable: the reference types it in a scope the
@@ -475,6 +482,7 @@ impl<'i> Typer<'i> {
                 if *has_else || retry {
                     // `else` replaces the body's value / `retry` re-enters it:
                     // not modelled — decline everything the begin writes.
+                    let error_info = Self::error_info(env);
                     let forgotten = if clauses.is_empty() {
                         Vec::new()
                     } else {
@@ -501,12 +509,16 @@ impl<'i> Typer<'i> {
                             let mut clause_entry = env.clone();
                             Self::widen_names(&mut clause_entry, &forgotten, interner);
                             Self::decline_rescue_last_line(clause, &mut clause_entry, interner);
+                            for (name, ty) in self.error_info_entry_binds(ast, clause, interner) {
+                                clause_entry.insert(Rc::from(name.as_str()), ty);
+                            }
                             self.replay_statements(ast, &mut clause_entry, &clause.body, interner, returns);
                             tail += clause.exceptions.len() + clause.body.len();
                         }
                         self.replay_statements(ast, &mut primary, &body[tail..], interner, returns);
                     }
                     Self::widen_names(env, &marks.written_within(span), interner);
+                    Self::restore_error_info(env, error_info);
                 } else if clauses.is_empty() {
                     if ensure_body.is_empty() {
                         self.replay_statements(ast, env, body, interner, returns);
@@ -529,6 +541,7 @@ impl<'i> Typer<'i> {
                     let mut binds: Vec<Vec<(String, TypeId)>> = vec![Vec::new()];
                     binds.extend(clauses.iter().map(|c| {
                         let mut binds = self.rescue_binding(ast, c, interner);
+                        binds.extend(self.error_info_entry_binds(ast, c, interner));
                         if c.sets_last_line && env.contains_key("$_") {
                             binds.push(("$_".to_owned(), interner.untyped()));
                         }
@@ -2487,6 +2500,7 @@ impl<'i> Typer<'i> {
                     record_guards: Vec::new(),
                     retry_edges: crate::retry_edge::RetryEdges::default(),
                     retrying_spans: Vec::new(),
+                    reader_spans: Vec::new(),
                 }
             }
         };
@@ -2555,6 +2569,18 @@ impl<'i> Typer<'i> {
         // second walk's last-write types must not leak through the flat
         // env (PR #1040 review).
         let retrying_spans = self.retrying_begin_spans(ast);
+        // A plain `gets`/`readline`/`foreach` is an env effect the write
+        // tables cannot see: it unbinds `$_` in the continuation. Treat each
+        // top-level statement that may run one as a boundary-relevant
+        // effect, or the end-of-file env (already unbound) would leak back
+        // into reads before the reader.
+        let reader_spans: Vec<rigor_parse::Span> = body
+            .iter()
+            .filter_map(|&stmt| {
+                self.scan_last_line_reader_setters(ast, &[stmt])
+                    .then(|| ast.get(stmt).span())
+            })
+            .collect();
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
         // (its own bindings + `=> e` reach only through replay — rigor-rs#368);
@@ -2566,7 +2592,8 @@ impl<'i> Typer<'i> {
             && mutations.is_empty()
             && closure_muts.is_empty()
             && retry_edges.is_empty()
-            && retrying_spans.is_empty())
+            && retrying_spans.is_empty()
+            && reader_spans.is_empty())
             || dead.has_folded()
             || dead.has_rescue();
         // A boundary env per statement is a full clone of a growing map —
@@ -2619,6 +2646,7 @@ impl<'i> Typer<'i> {
             record_guards,
             retry_edges,
             retrying_spans,
+            reader_spans,
         }
     }
 
@@ -2994,6 +3022,7 @@ impl<'i> Typer<'i> {
             // own bindings (`rescue => e`) reach only through it.
             let later = flow.effects.rebinds.iter().any(|(w, _)| w.0 >= stmt_span.0)
                 || flow.effects.mutations.iter().any(|(w, _, _, _)| w.0 >= stmt_span.0)
+                || flow.reader_spans.iter().any(|s| s.0 >= stmt_span.0)
                 || flow
                     .closure_mutations
                     .iter()
@@ -3184,6 +3213,9 @@ impl<'i> Typer<'i> {
         flow: &CheckFlow,
         interner: &mut Interner,
     ) {
+        if !Self::last_line_sequenced(ast.get(id)) {
+            self.forget_last_line_reader(ast, id, env, interner);
+        }
         match ast.get(id) {
             // `if` evaluates its predicate first, then ONE branch — the
             // sibling branch's writes never reach the site (upstream probe:
@@ -3312,6 +3344,9 @@ impl<'i> Typer<'i> {
                         let forgotten = self.rescue_entry_forgets(ast, id, env, interner);
                         Self::widen_names(env, &forgotten, interner);
                         Self::decline_rescue_last_line(c, env, interner);
+                        for (name, ty) in self.error_info_entry_binds(ast, c, interner) {
+                            env.insert(Rc::from(name.as_str()), ty);
+                        }
                         // Upstream #1837 (rigor #1231): the arm reads each
                         // local the protected body writes as `Dynamic[top]`
                         // — before the reference binds, so `rescue => e`
@@ -3357,6 +3392,16 @@ impl<'i> Typer<'i> {
                     && self.last_line_may_set(ast, id)
                 {
                     env.insert(Rc::from("$_"), interner.untyped());
+                }
+                // `else` and `ensure` run after the protected body. A plain
+                // reader anywhere in that body has already invalidated the
+                // entry binding there (`LastLine`'s continuation rule), even
+                // though this positional fallback cannot replay the body
+                // statement by statement.
+                if Self::last_line_precisely_bound(env, interner)
+                    && self.scan_last_line_reader_setters(ast, &main_body)
+                {
+                    env.remove("$_");
                 }
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
@@ -3546,6 +3591,10 @@ impl<'i> Typer<'i> {
         flow: &CheckFlow,
         interner: &mut Interner,
     ) {
+        // `LastLine.block_entry`: a block entered through a reader owning
+        // call (`IO.foreach`) — or whose own body may run one later in the
+        // same frame — does not keep the caller's narrowed `$_`.
+        self.forget_last_line_reader(ast, closure, env, interner);
         self.apply_subtree_effects(ast, closure, site, false, env, flow, interner);
     }
 
@@ -5166,6 +5215,14 @@ impl<'i> Typer<'i> {
         dead: &crate::dead::DeadPositions,
         interner: &mut Interner,
     ) {
+        // A non-sequenced node whose operands may run a plain reader is
+        // evaluated with `$_` already forgotten (`LastLine`'s
+        // `forget_last_line_first?`); a read before the reader pays the
+        // same conservative cost upstream documents.
+        let last_line_sequenced = Self::last_line_sequenced(ast.get(id));
+        if !last_line_sequenced {
+            self.forget_last_line_reader(ast, id, env, interner);
+        }
         // rigor-rs#891 — a sigilled write (`@x`/`@@c`/`$g`) at a position
         // this statement does not run unconditionally must not leave the
         // name's earlier binding live: the reference joins the construct's
@@ -5212,6 +5269,13 @@ impl<'i> Typer<'i> {
             let untyped = interner.untyped();
             for (wspan, name) in self.sigilled_writes(ast).iter() {
                 if !(span.0 <= wspan.0 && wspan.1 <= span.1 && dead.write_reaches(*wspan, (span.1, span.1))) {
+                    continue;
+                }
+                // `$!`/`$@` writes inside a rescue begin never escape it:
+                // `ErrorInfo.restore` puts the entry binding back as the
+                // begin exits. Treating them as conditional writes here
+                // would destroy that entry before the restore.
+                if self.restored_error_info_write(ast, span, *wspan, name) {
                     continue;
                 }
                 if loop_tracked.as_ref().is_some_and(|tracked| tracked.contains(name)) {
@@ -5521,6 +5585,7 @@ impl<'i> Typer<'i> {
                         interner,
                     );
                 } else {
+                    let error_info = Self::error_info(env);
                     let live_rebinds: Vec<_> = effects
                         .rebinds_within(span)
                         .filter(|(w, _)| dead.write_reaches(*w, (span.1, span.1)))
@@ -5534,6 +5599,7 @@ impl<'i> Typer<'i> {
                     self.widen_mutated_locals(
                         ast, live_mutations, indexed, dead, true, id, span, env, interner,
                     );
+                    Self::restore_error_info(env, error_info);
                 }
             }
             Node::Loop { predicate, body, kind, .. } => {
@@ -5742,6 +5808,13 @@ impl<'i> Typer<'i> {
                 self.drop_indexed_rebinds(live_rebinds.iter(), span, indexed, env);
                 self.widen_mutated_locals(ast, live_mutations, indexed, dead, true, id, span, env, interner);
             }
+        }
+        // A sequenced construct's own statements rebind precisely where
+        // they run; once the construct joins, a reader on ANY path still
+        // proves nothing about the line (and a path before the reader may
+        // be the one that left), so the binding does not survive past it.
+        if last_line_sequenced {
+            self.forget_last_line_reader(ast, id, env, interner);
         }
     }
 
@@ -6567,21 +6640,34 @@ impl<'i> Typer<'i> {
     /// The lowered forms of `LastLine.may_set?`. Use syntax, not liveness:
     /// the oracle checks possible setters even in an arm that folds away.
     fn scan_last_line_setters(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
+        self.scan_last_line_setters_mode(ast, body, true)
+    }
+
+    /// The reader/call half of `LastLine.may_set?` — the invalidation a
+    /// straight-line continuation needs. Explicit `$_` writes are left to
+    /// the ordinary write and join logic: `$_ = "x"` rebinds precisely and a
+    /// conditional write already widens, while a bare `gets` proves nothing
+    /// about the line it may have read.
+    fn scan_last_line_reader_setters(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
+        self.scan_last_line_setters_mode(ast, body, false)
+    }
+
+    fn scan_last_line_setters_mode(&self, ast: &LoweredAst, body: &[NodeId], include_writes: bool) -> bool {
         let setter = |name: &str| matches!(name, "gets" | "readline" | "foreach");
         let mut pending = body.to_vec();
         while let Some(id) = pending.pop() {
             let node = ast.get(id);
             match node {
                 Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => continue,
-                Node::VariableWrite { name, .. } if name == "$_" => return true,
+                Node::VariableWrite { name, .. } if include_writes && name == "$_" => return true,
                 // The compound write itself may be an orphan with an
                 // Other/Recovered carrier at the same source start.
                 Node::Other { span, .. }
                 | Node::Statements { kind: StatementsKind::Recovered, span, .. }
-                    if self.def_local_marks(ast).writes_name_at(span.0, "$_") => return true,
-                Node::MultiWrite { targets, .. } if targets.sets_last_line() => return true,
-                Node::Loop { index_target: Some(target), .. } if target.sets_last_line() => return true,
-                Node::BeginRescue { clauses, .. } if clauses.iter().any(|c| c.sets_last_line) => return true,
+                    if include_writes && self.def_local_marks(ast).writes_name_at(span.0, "$_") => return true,
+                Node::MultiWrite { targets, .. } if include_writes && targets.sets_last_line() => return true,
+                Node::Loop { index_target: Some(target), .. } if include_writes && target.sets_last_line() => return true,
+                Node::BeginRescue { clauses, .. } if include_writes && clauses.iter().any(|c| c.sets_last_line) => return true,
                 Node::Call {
                     method, receiver, args, block_span, block_body, explicit_arg_list, ..
                 } => {
@@ -6629,6 +6715,77 @@ impl<'i> Typer<'i> {
         false
     }
 
+    /// Whether the lowered node is one of the reference's
+    /// `LastLine::SEQUENCED_NODES` shapes — a node whose handler threads its
+    /// parts in order. Anything else that may run a reader is evaluated with
+    /// `$_` already forgotten, because one of its operands may run after the
+    /// reader.
+    fn last_line_sequenced(node: &Node) -> bool {
+        matches!(
+            node,
+            Node::Program { .. }
+                | Node::Statements { kind: StatementsKind::Sequence, .. }
+                | Node::If { .. }
+                | Node::Loop { .. }
+                | Node::Case { .. }
+                | Node::When { .. }
+                | Node::BeginRescue { .. }
+                | Node::Logical { .. }
+                | Node::Definition { .. }
+                | Node::ClassDef { .. }
+                | Node::ModuleDef { .. }
+                | Node::Lambda { .. }
+        )
+    }
+
+    fn last_line_precisely_bound(env: &TypeEnv, interner: &Interner) -> bool {
+        env.get("$_")
+            .is_some_and(|&ty| !matches!(interner.get(ty), Type::Dynamic(_) | Type::Top))
+    }
+
+    /// `LastLine`'s plain-reader invalidation: a reader outside a condition
+    /// leaves `$_` unbound (nothing proves the line non-nil), so the stale
+    /// entry binding must not reach the continuation. Scans run only while a
+    /// precise binding exists, as upstream's do.
+    fn forget_last_line_reader(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        env: &mut TypeEnv,
+        interner: &Interner,
+    ) {
+        if Self::last_line_precisely_bound(env, interner)
+            && self.scan_last_line_reader_setters(ast, &[id])
+        {
+            env.remove("$_");
+        }
+    }
+
+    /// `true` when `wspan` is a `$!`/`$@` write inside a real rescue begin
+    /// contained in `stmt_span`. Ruby restores both specials when that begin
+    /// exits, however it exits, so the write is not a conditional-write
+    /// effect of any statement at or outside the begin (it remains one for
+    /// statements evaluated inside the clause itself).
+    fn restored_error_info_write(
+        &self,
+        ast: &LoweredAst,
+        stmt_span: rigor_parse::Span,
+        wspan: rigor_parse::Span,
+        name: &str,
+    ) -> bool {
+        if !matches!(name, "$!" | "$@") {
+            return false;
+        }
+        ast.iter().any(|(_, node)| match node {
+            Node::BeginRescue { clauses, span, .. } if !clauses.is_empty() => {
+                within_span(wspan, *span)
+                    && stmt_span.0 <= span.0
+                    && span.1 <= stmt_span.1
+            }
+            _ => false,
+        })
+    }
+
     fn last_line_root_call(&self, ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
         let Some(receiver) = receiver else { return false };
         let Node::ConstantRead { name, dynamic_base: false, self_anchored: false, .. } = ast.get(receiver)
@@ -6665,6 +6822,164 @@ impl<'i> Typer<'i> {
                 env.remove(name);
             }
         }
+    }
+
+    /// The binding half of `ErrorInfo.rescue_entry`: `$!` is the rescued
+    /// exception instance and `$@` its `Array[String]` backtrace. The guard
+    /// and backtrace vetoes are upstream's: a class guard the narrowing
+    /// does not understand, any `set_backtrace` call in the clause, or a
+    /// project `backtrace` definition anywhere leaves the global unbound.
+    fn error_info_entry_binds(
+        &self,
+        ast: &LoweredAst,
+        clause: &rigor_parse::RescueClause,
+        interner: &mut Interner,
+    ) -> Vec<(String, TypeId)> {
+        if self.error_info_guarded(ast, &clause.body, clause.bound_name.as_deref()) {
+            return Vec::new();
+        }
+        let exception = self.rescue_reference_type(ast, clause, interner);
+        let rescued = self.rescued_error_type(exception, interner);
+        let mut out = vec![("$!".to_owned(), rescued)];
+        if self.error_info_backtrace_read(ast, &clause.body)
+            && !self.error_info_calls_set_backtrace(ast, &clause.body)
+            && !self.project_defines_anywhere("backtrace")
+        {
+            out.push(("$@".to_owned(), self.error_info_backtrace_type(interner)));
+        }
+        out
+    }
+
+    /// `ErrorInfo.rescued_type`: a rescue designator that is not certainly
+    /// an `Exception` instance contributes `Dynamic[top]` — a module with a
+    /// custom `===`, a non-exception class, or an unresolved name may match
+    /// something outside the nominal class.
+    fn rescued_error_type(&self, exception: TypeId, interner: &mut Interner) -> TypeId {
+        let members: Vec<TypeId> = match interner.get(exception) {
+            Type::Union(members) => members.clone(),
+            _ => vec![exception],
+        };
+        let mut out = interner.bottom();
+        for member in members {
+            let member = if self.exception_instance_type(member, interner) {
+                member
+            } else {
+                interner.untyped()
+            };
+            out = rigor_types::Algebra::join(interner, out, member);
+        }
+        out
+    }
+
+    fn exception_instance_type(&self, ty: TypeId, interner: &Interner) -> bool {
+        let Type::Nominal { class, .. } = interner.get(ty) else { return false };
+        let Some(name) = self
+            .index
+            .class_name_for_id(*class)
+            .or_else(|| self.source.class_name_for_id(*class))
+        else {
+            return false;
+        };
+        // `own_case_equality?`: a project `===` anywhere may make the
+        // rescued object escape the nominal class. This is deliberately
+        // coarser than upstream's per-class singleton lookup — a coverage
+        // loss, never a louder answer.
+        if self.project_defines_anywhere("===") {
+            return false;
+        }
+        self.exception_class_name(name)
+    }
+
+    /// Whether `name` is certainly below `Exception`, following the
+    /// project's written superclass links when the core RBS does not know
+    /// the class (`class MyError < StandardError`). Unknown links answer
+    /// false, matching `ErrorInfo.rescued_type`'s decline to `Dynamic`.
+    fn exception_class_name(&self, name: &str) -> bool {
+        let mut current = name.trim_start_matches("::").to_owned();
+        let mut seen = Vec::new();
+        loop {
+            if matches!(
+                self.index.class_ordering(&current, "Exception"),
+                rigor_index::ClassOrdering::Equal | rigor_index::ClassOrdering::Subclass
+            ) {
+                return true;
+            }
+            if seen.iter().any(|n| n == &current) || !self.source.knows_class(&current) {
+                return false;
+            }
+            seen.push(current.clone());
+            let Some(superclass) = self.source.discovered_superclass(&current) else {
+                return false;
+            };
+            current = superclass.trim_start_matches("::").to_owned();
+        }
+    }
+
+    fn error_info_backtrace_type(&self, interner: &mut Interner) -> TypeId {
+        let string = self.nominal_or_untyped("String", interner);
+        match self.index.class_id("Array") {
+            Some(class) => interner.intern(Type::Nominal { class, args: vec![string] }),
+            None => interner.untyped(),
+        }
+    }
+
+    /// `ErrorInfo.guarded?` over the lowered clause body: `$!` (or the
+    /// clause's `=> e`, the same object) under a class guard the port does
+    /// not narrow jointly means the bound `$!` would contradict the guard.
+    fn error_info_guarded(&self, ast: &LoweredAst, body: &[NodeId], reference: Option<&str>) -> bool {
+        let mut pending = body.to_vec();
+        while let Some(id) = pending.pop() {
+            let node = ast.get(id);
+            let guarded = match node {
+                Node::Call { receiver, method, args, .. } => {
+                    (matches!(method.as_str(), "is_a?" | "kind_of?" | "instance_of?" | "respond_to?")
+                        && receiver.is_some_and(|r| Self::error_info_read_node(ast, r, reference)))
+                        || (method == "==="
+                            && args.first().is_some_and(|&a| Self::error_info_read_node(ast, a, reference)))
+                }
+                Node::Case { predicate: Some(predicate), .. } => {
+                    Self::error_info_read_node(ast, *predicate, reference)
+                }
+                _ => false,
+            };
+            if guarded {
+                return true;
+            }
+            node_child_ids(node, &mut pending);
+        }
+        false
+    }
+
+    fn error_info_read_node(ast: &LoweredAst, id: NodeId, reference: Option<&str>) -> bool {
+        match ast.get(id) {
+            Node::VariableRead { name, .. } => name == "$!",
+            Node::LocalVariableRead { name, .. } => reference.is_some_and(|r| name == r),
+            _ => false,
+        }
+    }
+
+    fn error_info_backtrace_read(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
+        let mut pending = body.to_vec();
+        while let Some(id) = pending.pop() {
+            let node = ast.get(id);
+            if matches!(node, Node::VariableRead { name, .. } if name == "$@") {
+                return true;
+            }
+            node_child_ids(node, &mut pending);
+        }
+        false
+    }
+
+    fn error_info_calls_set_backtrace(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
+        let mut pending = body.to_vec();
+        while let Some(id) = pending.pop() {
+            let node = ast.get(id);
+            if matches!(node, Node::Call { method, .. } if method == "set_backtrace") {
+                return true;
+            }
+            node_child_ids(node, &mut pending);
+        }
+        false
     }
 
     /// The live-arm replay of a real `begin`/`rescue` statement
@@ -6776,6 +7091,9 @@ impl<'i> Typer<'i> {
             let mut e = entry.clone();
             Self::widen_names(&mut e, &forgotten, interner);
             Self::decline_rescue_last_line(clause, &mut e, interner);
+            for (name, ty) in self.error_info_entry_binds(ast, clause, interner) {
+                e.insert(Rc::from(name.as_str()), ty);
+            }
             // Body writes never flow in as values. `ClauseWidening`'s
             // names read as `untyped` where the entry already binds them.
             let cspan = crate::def_local_marks::body_span(ast, &clause.body)
@@ -7901,7 +8219,14 @@ impl<'i> Typer<'i> {
         out: &mut HashMap<NodeId, TypeId>,
     ) {
         for &s in stmts {
+            let last_line_sequenced = Self::last_line_sequenced(ast.get(s));
+            if !last_line_sequenced {
+                self.forget_last_line_reader(ast, s, env, interner);
+            }
             self.flow_eval_stmt(ast, s, env, in_loop_or_block, self_qual, self_kind, writes, rebinds, mutations, indexed, interner, out);
+            if last_line_sequenced {
+                self.forget_last_line_reader(ast, s, env, interner);
+            }
         }
     }
 
@@ -8142,6 +8467,7 @@ impl<'i> Typer<'i> {
             } => {
                 let (main_body, clauses, ensure_body, begin_span) =
                     (main_body.clone(), clauses.clone(), ensure_body.clone(), *begin_span);
+                let error_info = (!clauses.is_empty()).then(|| Self::error_info(env));
                 if !in_loop_or_block {
                     let mut scratch = env.clone();
                     self.flow_eval_scope(
@@ -8189,6 +8515,9 @@ impl<'i> Typer<'i> {
                         let mut cenv = env.clone();
                         Self::widen_names(&mut cenv, &forgotten, interner);
                         Self::decline_rescue_last_line(c, &mut cenv, interner);
+                        for (name, ty) in self.error_info_entry_binds(ast, c, interner) {
+                            cenv.insert(Rc::from(name.as_str()), ty);
+                        }
                         if self.clause_retries(ast, c.span) {
                             widen_flow_writes(rebinds.iter(), begin_span, &mut cenv, interner);
                         }
@@ -8274,6 +8603,9 @@ impl<'i> Typer<'i> {
                 self.land_indexed_stored(
                     ast, indexed, id, span, rebinds, mutations, stored, env, interner,
                 );
+                if let Some(saved) = error_info {
+                    Self::restore_error_info(env, saved);
+                }
             }
             // A `while`/`until`/`for` loop: the same flat widen as `other`,
             // then the ADR-56 slice-B rebind fixpoint — see
@@ -8454,6 +8786,10 @@ impl<'i> Typer<'i> {
         if ast.in_blocked_carrier(ast.get(id).span()) {
             return;
         }
+        let last_line_sequenced = Self::last_line_sequenced(ast.get(id));
+        if !last_line_sequenced {
+            self.forget_last_line_reader(ast, id, env, interner);
+        }
         match ast.get(id) {
             // `@x = v` / `@@c = v` / `$g = v`: the reference's scope
             // carries each sigilled kind in its own binding map
@@ -8616,6 +8952,9 @@ impl<'i> Typer<'i> {
                 }
             }
             _ => {}
+        }
+        if last_line_sequenced {
+            self.forget_last_line_reader(ast, id, env, interner);
         }
     }
 }
@@ -8894,6 +9233,11 @@ pub struct CheckFlow {
     /// ones `retry_edges` does not hold. Interior sites reconstruct from
     /// the pre-begin env (PR #1040 review).
     retrying_spans: Vec<rigor_parse::Span>,
+    /// Top-level statements that may run a plain last-line reader. Their
+    /// continuation effect (`$_` forgotten) is invisible to the write
+    /// tables, so they force positional replay exactly as a later rebind
+    /// does.
+    reader_spans: Vec<rigor_parse::Span>,
 }
 
 /// One span-escaped node for [`Typer::check_env_at`] (rigor-rs#492).

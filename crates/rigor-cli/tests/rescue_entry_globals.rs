@@ -110,6 +110,8 @@ fn plain_reader_unbinds_last_line_on_the_primary_path() {
         b"$_ = 1\nbegin\n  gets\nend\n$_.chomp\n".as_slice(),
         b"$_ = 1\nbegin\n  gets\nrescue\n  nil\nend\n$_.chomp\n".as_slice(),
         b"$_ = 1\nbegin\n  gets\nrescue\nend\n$_.chomp\n".as_slice(),
+        b"$_ = 1\nbegin\n  gets\nrescue\n  nil\nelse\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nbegin\n  gets\nrescue\n  nil\nensure\n  $_.chomp\nend\n".as_slice(),
         b"$_ = 1\ngets\nbegin\n  0\nrescue\n  $_.chomp\nend\n".as_slice(),
         b"$_ = 1\nIO.foreach(\"x\") { |line| $_.chomp }\n".as_slice(),
         b"$_ = 1\nIO.foreach(\"x\") { |line| nil }\n$_.chomp\n".as_slice(),
