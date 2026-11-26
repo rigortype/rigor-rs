@@ -63,7 +63,7 @@ fn scalar_literal(ast: &LoweredAst, id: NodeId) -> Option<rigor_types::Scalar> {
             .or_else(|| digits.clone().map(Scalar::BigInt)),
         Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
         Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
-        Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+        Node::SymbolLit { raw, .. } => Some(Scalar::Sym(raw.clone())),
         Node::TrueLit { .. } => Some(Scalar::Bool(true)),
         Node::FalseLit { .. } => Some(Scalar::Bool(false)),
         _ => None,

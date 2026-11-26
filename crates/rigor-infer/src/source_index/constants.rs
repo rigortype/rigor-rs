@@ -412,7 +412,7 @@ fn c5_namespace_depth(ns: &[String]) -> usize {
 /// `HashShape::ALLOWED_KEY_CLASSES`) so a harvested hash pins the same slots.
 fn const_shape_key_of(node: &Node) -> Option<ShapeKey> {
     match node {
-        Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
+        Node::SymbolLit { raw, .. } => Some(ShapeKey::Sym(raw.clone())),
         Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
         Node::IntegerLit { value, .. } => value.map(ShapeKey::Int),
         Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
@@ -586,7 +586,7 @@ pub(crate) fn const_lit_of(ast: &LoweredAst, node: NodeId) -> Option<ConstLit> {
         Node::IntegerLit { value, .. } => value.map(|v| ConstLit::Scalar(Scalar::Int(v))),
         Node::FloatLit { value, .. } => Some(ConstLit::Scalar(Scalar::Float(*value))),
         Node::StringLit { value, .. } => Some(ConstLit::Scalar(Scalar::Str(value.clone()))),
-        Node::SymbolLit { value, .. } => Some(ConstLit::Scalar(Scalar::Sym(value.clone()))),
+        Node::SymbolLit { raw, .. } => Some(ConstLit::Scalar(Scalar::Sym(raw.clone()))),
         Node::TrueLit { .. } => Some(ConstLit::Scalar(Scalar::Bool(true))),
         Node::FalseLit { .. } => Some(ConstLit::Scalar(Scalar::Bool(false))),
         Node::NilLit { .. } => Some(ConstLit::Scalar(Scalar::Nil)),

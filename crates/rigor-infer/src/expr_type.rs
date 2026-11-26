@@ -16,7 +16,7 @@ use crate::{kernel_fold, ConstLit, DefKind, TypeEnv, Typer};
 /// while `1` (an `Int`) stays a distinct key.
 fn static_shape_key_of_node(node: &Node) -> Option<ShapeKey> {
     match node {
-        Node::SymbolLit { value, .. } => Some(ShapeKey::Sym(value.clone())),
+        Node::SymbolLit { raw, .. } => Some(ShapeKey::Sym(raw.clone())),
         Node::StringLit { value, .. } => Some(ShapeKey::Str(value.clone())),
         Node::IntegerLit { value, .. } => value.map(ShapeKey::Int),
         Node::FloatLit { value, .. } => Some(ShapeKey::Float(value.to_bits())),
@@ -243,8 +243,8 @@ impl<'i> Typer<'i> {
             Node::FloatLit { value, .. } => {
                 interner.intern(Type::Constant(Scalar::Float(*value)))
             }
-            Node::SymbolLit { value, .. } => {
-                interner.intern(Type::Constant(Scalar::Sym(value.clone())))
+            Node::SymbolLit { raw, .. } => {
+                interner.intern(Type::Constant(Scalar::Sym(raw.clone())))
             }
             Node::NilLit { .. } => interner.intern(Type::Constant(Scalar::Nil)),
             // A `def` expression evaluates to its method name as a Symbol —

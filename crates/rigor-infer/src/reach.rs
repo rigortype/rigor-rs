@@ -1864,7 +1864,7 @@ pub(crate) fn literal_scalar(ast: &LoweredAst, id: NodeId) -> Option<Scalar> {
         Node::IntegerLit { digits: Some(d), .. } => Some(Scalar::BigInt(d.clone())),
         Node::FloatLit { value, .. } => Some(Scalar::Float(*value)),
         Node::StringLit { value, .. } => Some(Scalar::Str(value.clone())),
-        Node::SymbolLit { value, .. } => Some(Scalar::Sym(value.clone())),
+        Node::SymbolLit { raw, .. } => Some(Scalar::Sym(raw.clone())),
         Node::TrueLit { .. } => Some(Scalar::Bool(true)),
         Node::FalseLit { .. } => Some(Scalar::Bool(false)),
         Node::NilLit { .. } => Some(Scalar::Nil),
