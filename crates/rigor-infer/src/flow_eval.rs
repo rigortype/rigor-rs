@@ -5909,11 +5909,14 @@ impl<'i> Typer<'i> {
     /// (`for_iteration_element_type` → `collection_element_type`,
     /// statement_evaluator.rb): the collection's literal shape — a `Tuple`
     /// / `Array` carrier joins its elements, a `Hash` carrier its `[k, v]`
-    /// pair tuple, a literal range its first endpoint's class — and
-    /// `Dynamic[top]` for anything unresolved. The untyped answer is
-    /// load-bearing, not a decline: `for x in coll` on an unresolvable
-    /// `coll` binds `x` to `Dynamic[top]` on the oracle, which is what
-    /// keeps a later `x.m` SILENT there (rigor-rs#998).
+    /// pair tuple, a range its lifted endpoint class — and `Dynamic[top]`
+    /// for anything unresolved. When that structural answer is untyped, a
+    /// receiver-call collection (`[1].each` / `{k: 1}.each` / `[1].lazy`)
+    /// falls back to the receiver's element, the port of asking `each`'s
+    /// block params (rigor-rs#1006). The untyped answer is load-bearing,
+    /// not a decline: `for x in coll` on an unresolvable `coll` binds `x`
+    /// to `Dynamic[top]` on the oracle, which is what keeps a later `x.m`
+    /// SILENT there (rigor-rs#998).
     fn for_element_ty(
         &self,
         ast: &LoweredAst,
@@ -5921,18 +5924,99 @@ impl<'i> Typer<'i> {
         coll: NodeId,
         interner: &mut Interner,
     ) -> TypeId {
-        // `for x in a..b` — the reference's `constant_element_type` reads
-        // the literal range's `first.class`; the port types a literal range
-        // to `Nominal[Range]` with no args, so the endpoint class must come
-        // off the AST (`1..3` → `Integer`, `"a".."z"` → `String`).
-        if let Node::Range { left, .. } = ast.get(coll) {
-            return left
-                .and_then(|l| crate::reach::literal_scalar(ast, l))
-                .map(|s| self.nominal_or_untyped(crate::folding::scalar_class(&s), interner))
-                .unwrap_or_else(|| interner.untyped());
+        // Range element class. A missing left (`..3`) is beginless:
+        // `constant_element_type` reads `first == nil` and declines. A
+        // present left — literal, write, local, even `nil..3` — goes through
+        // `nominal_range_for_endpoints` (untyped/`nil` endpoints dropped).
+        if let Node::Range { left, right, .. } = ast.get(coll) {
+            return self.range_for_element_ty(ast, env, *left, *right, interner);
         }
         let ty = self.type_of(ast, coll, env, interner);
-        self.collection_element_ty(ty, interner)
+        let structural = self.collection_element_ty(ty, interner);
+        if !matches!(interner.get(structural), Type::Dynamic(_) | Type::Top) {
+            return structural;
+        }
+        // `for_iteration_element_type` asks `MethodDispatcher.expected_block_param_types`
+        // on `coll.each` when the structural answer is untyped. The port has
+        // no dispatcher probe here; a receiver-call `each` / `lazy` yields
+        // the receiver's own element (`[1].each` → `1`, `{k: 1}.each` →
+        // `[:k, 1]`), matching the oracle's block-param answer.
+        if let Node::Call {
+            receiver: Some(r),
+            method,
+            args,
+            block_body,
+            ..
+        } = ast.get(coll)
+        {
+            if args.is_empty()
+                && block_body.is_empty()
+                && matches!(method.as_str(), "each" | "lazy")
+            {
+                let r = *r;
+                let recv_ty = self.type_of(ast, r, env, interner);
+                let elem = self.collection_element_ty(recv_ty, interner);
+                if !matches!(interner.get(elem), Type::Dynamic(_) | Type::Top) {
+                    return elem;
+                }
+            }
+        }
+        structural
+    }
+
+    /// Range element class (`type_of_range` → `collection_element_type`).
+    /// A missing left (`..3`) is a beginless Constant range whose `first`
+    /// is nil → `Dynamic[top]`. Otherwise `nominal_range_for_endpoints`:
+    /// lift each endpoint (`range_endpoint_element_type`), drop untyped/`nil`,
+    /// union the rest (`nil..3` keeps `Integer` from the right).
+    fn range_for_element_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        left: Option<NodeId>,
+        right: Option<NodeId>,
+        interner: &mut Interner,
+    ) -> TypeId {
+        if left.is_none() {
+            return interner.untyped();
+        }
+        let mut ends = Vec::new();
+        for end in left.into_iter().chain(right) {
+            let ty = self.range_endpoint_element_ty(ast, env, end, interner);
+            if !matches!(interner.get(ty), Type::Dynamic(_) | Type::Top) {
+                ends.push(ty);
+            }
+        }
+        if ends.is_empty() {
+            interner.untyped()
+        } else {
+            rigor_types::Algebra::union(interner, &ends)
+        }
+    }
+
+    /// `range_endpoint_element_type` (expression_typer.rb): `type_of` the
+    /// endpoint, lift a `Constant` to its class, an `IntegerRange` to
+    /// `Integer`, and keep any other typed shape (a local already bound to
+    /// `Integer`). `nil` declines — a beginless range's `first` is nil.
+    fn range_endpoint_element_ty(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        id: NodeId,
+        interner: &mut Interner,
+    ) -> TypeId {
+        let ty = self.type_of(ast, id, env, interner);
+        if matches!(interner.get(ty), Type::Constant(Scalar::Nil)) {
+            return interner.untyped();
+        }
+        if let Type::Constant(s) = interner.get(ty) {
+            let class = crate::folding::scalar_class(s);
+            return self.nominal_or_untyped(class, interner);
+        }
+        if matches!(interner.get(ty), Type::IntegerRange { .. }) {
+            return self.nominal_or_untyped("Integer", interner);
+        }
+        ty
     }
 
     /// `collection_element_type` (statement_evaluator.rb): the element a

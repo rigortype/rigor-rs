@@ -1412,6 +1412,17 @@ fn arm_scope_join_reads_operands_index_and_post_pred() {
         ("x = \"a\"; if rand > 0; for x in [1]; if rand > 1; x = \"f\"; end; end; end; x.w", r#""a" | "f" | 1"#),
         // `describe` renders the Integer nominal by class id (`Class<1>`).
         ("x = \"a\"; if rand > 0; for x in 1..3; end; end; x.w", r#"Class<1> | "a""#),
+        // rigor-rs#1006 — non-literal range bounds: a write or local endpoint
+        // still lifts to the element class (`range_endpoint_element_type`).
+        ("x = \"a\"; if rand > 0; for x in (x=1)..(x=3); end; end; x.w", r#"Class<1> | "a" | 3"#),
+        ("a=1; b=3; x = \"a\"; if rand > 0; for x in a..b; end; end; x.w", r#"Class<1> | "a""#),
+        // `nil..3` is not beginless: the NilNode left drops, the right keeps Integer.
+        ("x = \"a\"; if rand > 0; for x in nil..3; end; end; x.w", r#"Class<1> | "a""#),
+        // Receiver-call element path: `.each` / `.lazy` yield the receiver's
+        // element when the collection itself types untyped.
+        ("x = \"a\"; if rand > 0; for x in [1].each; end; end; x.w", r#""a" | 1"#),
+        ("x = \"a\"; if rand > 0; for x in { k: 1 }.each; end; end; x.w", r#""a" | Tuple[:k, 1"#),
+        ("x = \"a\"; if rand > 0; for x in [1].lazy; end; end; x.w", r#""a" | 1"#),
         // `describe` spells the `[k, v]` pair `Tuple[:k, 1]` (the probe's
         // `]` strip leaves `Tuple[:k, 1`).
         ("x = \"a\"; if rand > 0; for x in { k: 1 }; end; end; x.w", r#""a" | Tuple[:k, 1"#),
