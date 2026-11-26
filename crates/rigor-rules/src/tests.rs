@@ -6171,9 +6171,20 @@ fn retried_begin_replay_matches_oracle_ordering() {
         "@iv = [4]; begin; foo; rescue; @iv.nope; @iv = @iv + [1]; retry; end\n",
         "x = nil; c = [1]; begin; d = [0]; p(d = c, d.nope); rescue; c << 2; retry; end\n",
         "x = nil; c = [1]; begin; d = [0]; (d = c) && d.nope; rescue; c << 2; retry; end\n",
+        // PR #1040 review: interior reads must not see the post-begin last
+        // write (ivar/cvar/gvar-only begins have empty `retry_edges`).
+        "@x = 1; begin; @x.abs; @x = \"s\"; rescue; retry; end\n",
+        "$g = 1; begin; $g.abs; $g = \"s\"; rescue; retry; end\n",
+        "@@c = 1; begin; @@c.abs; @@c = \"s\"; rescue; retry; end\n",
+        "@x = 1; begin; @x.abs; @x = \"s\"; c = 1; rescue; retry; end\n",
     ] {
         assert_eq!(undefined(src), Vec::<String>::new(), "{src:?}");
     }
+    // Ensure write must not land on a body read (oracle `for [1]`).
+    let src = "@x = [1]; begin; @x.nope; rescue; retry; ensure; @x = [2]; end\n";
+    let got = undefined(src);
+    assert_eq!(got.len(), 1, "{src:?}: {got:?}");
+    assert!(got[0].ends_with("for [1]"), "{src:?}: {got:?}");
 }
 
 /// rigor-rs#1003 — the paths `declined_names`' dedup and the `kill_free`

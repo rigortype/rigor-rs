@@ -2449,6 +2449,7 @@ impl<'i> Typer<'i> {
                     ifs: Vec::new(),
                     record_guards: Vec::new(),
                     retry_edges: crate::retry_edge::RetryEdges::default(),
+                    retrying_spans: Vec::new(),
                 }
             }
         };
@@ -2511,6 +2512,12 @@ impl<'i> Typer<'i> {
                 |s| !scope_spans.iter().any(|&b| within_span(s, b)),
             )
         };
+        // Spans of every retrying `begin`, including ivar/cvar/gvar-only
+        // ones `retry_edges` skips (`retry_drops` is local-write-keyed).
+        // Interior sites must reconstruct from the pre-begin env — the
+        // second walk's last-write types must not leak through the flat
+        // env (PR #1040 review).
+        let retrying_spans = self.retrying_begin_spans(ast);
         // Boundaries only matter while a recorded effect could postdate a use
         // site, a folded-dead arm could hold one, or a `rescue` clause could
         // (its own bindings + `=> e` reach only through replay — rigor-rs#368);
@@ -2521,7 +2528,8 @@ impl<'i> Typer<'i> {
         let record = !(rebinds.is_empty()
             && mutations.is_empty()
             && closure_muts.is_empty()
-            && retry_edges.is_empty())
+            && retry_edges.is_empty()
+            && retrying_spans.is_empty())
             || dead.has_folded()
             || dead.has_rescue();
         // A boundary env per statement is a full clone of a growing map —
@@ -2573,6 +2581,7 @@ impl<'i> Typer<'i> {
             ifs: self.collect_if_edges(ast),
             record_guards,
             retry_edges,
+            retrying_spans,
         }
     }
 
@@ -2953,7 +2962,8 @@ impl<'i> Typer<'i> {
                     .iter()
                     .any(|(_, w, _)| w.0 >= stmt_span.0)
                 || flow.dead.in_rescue(site)
-                || flow.retry_edges.holds(site);
+                || flow.retry_edges.holds(site)
+                || flow.retrying_spans.iter().any(|&s| within_span(site, s));
             if !later {
                 break 'env Cow::Borrowed(&flow.env);
             }
@@ -6225,6 +6235,22 @@ impl<'i> Typer<'i> {
         }
     }
 
+    /// Spans of every `begin` whose rescue chain holds a `retry` that
+    /// re-enters it.
+    fn retrying_begin_spans(&self, ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+        ast.iter()
+            .filter_map(|(_, n)| match n {
+                Node::BeginRescue { span, clauses, .. } if !clauses.is_empty() => {
+                    clauses
+                        .iter()
+                        .any(|c| self.clause_retries(ast, c.span))
+                        .then_some(*span)
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
     /// Names `widen_entry_for_retry` joins — the reference's
     /// `RETRY_KIND_TABLES` (`:local` and `:ivar` only). Cvars/gvars are
     /// never entry-widened: their retry-pass bindings change only through
@@ -8542,6 +8568,10 @@ pub struct CheckFlow {
     /// rigor-rs#972 — the top-level retrying `begin`s, for the reads their
     /// retry edge reaches ([`crate::retry_edge`]).
     retry_edges: crate::retry_edge::RetryEdges,
+    /// Every retrying `begin`'s span — including ivar/cvar/gvar-only
+    /// ones `retry_edges` does not hold. Interior sites reconstruct from
+    /// the pre-begin env (PR #1040 review).
+    retrying_spans: Vec<rigor_parse::Span>,
 }
 
 /// One span-escaped node for [`Typer::check_env_at`] (rigor-rs#492).
