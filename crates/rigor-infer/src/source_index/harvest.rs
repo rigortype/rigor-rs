@@ -431,8 +431,14 @@ impl SourceIndex {
         // `Math::PI`; a `M::K =` path write contributes each prefix-run
         // candidate of its head, like a read — an over-approximation that
         // only ever under-emits the fold it gates).
+        let mut scalars = super::constants::ScalarWrites::default();
         for (_, ast) in files {
+            let mutated_constants = mutated_constant_names(ast);
             for w in ast.const_writes() {
+                scalars.record(w, ast.file_key(), &mutated_constants);
+                if !w.plain || w.dynamic {
+                    continue;
+                }
                 if w.is_path {
                     idx.constant_write_candidates.insert(w.name.clone());
                     if !w.rooted {
@@ -557,7 +563,14 @@ impl SourceIndex {
             // The DECL-only half — no prefix synthesis: `class A::M` must
             // not shadow a bare `::M` operand.
             idx.discovered_decls.extend(h.discovered_decls.iter().cloned());
+            idx.discovered_meta_new.extend(h.discovered_names.iter().cloned());
         }
+        // #904's write tables resolve namespaces against the RAW declaration
+        // seed (`discovered_decls` + meta-new writes), which the loop above has
+        // now completed. Finish before the downstream typing passes so they see
+        // the same constant facts the early census used to install.
+        scalars.finish(&mut idx, core);
+
         // Materialize the trie into `discovered_classes`: node i's string is
         // its parent's + `::` + its segment — the segment alone under the
         // root, exactly the `segs.join("::")` the per-name loop built —
