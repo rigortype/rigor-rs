@@ -3,6 +3,7 @@
 
 use crate::ruby_prism::Node as PrismNode;
 use crate::ast::LoopKind;
+use crate::ast::multi_target::is_last_line_target;
 
 use super::{
     case_arm_exits, constant_string, for_index_writes, literal_truthiness, pattern_bound_locals,
@@ -550,6 +551,7 @@ impl<'src> Builder<'src> {
                     exceptions,
                     body: clause_body,
                     bound_name,
+                    sets_last_line: r.reference().as_ref().is_some_and(is_last_line_target),
                     index_writes,
                     span: (r.location().start_offset(), clause_end),
                 });

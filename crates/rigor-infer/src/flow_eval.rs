@@ -475,9 +475,37 @@ impl<'i> Typer<'i> {
                 if *has_else || retry {
                     // `else` replaces the body's value / `retry` re-enters it:
                     // not modelled — decline everything the begin writes.
-                    let mut arms: Vec<&[NodeId]> = vec![body];
-                    arms.extend(clauses.iter().map(|c| c.body.as_slice()));
-                    self.replay_discard(ast, env, &arms, interner, returns);
+                    let forgotten = if clauses.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.rescue_entry_forgets(ast, stmt, env, interner)
+                    };
+                    let writes_last_line = env.contains_key("$_") && clauses.iter().any(|c| c.sets_last_line);
+                    if forgotten.is_empty() && !writes_last_line {
+                        let mut arms: Vec<&[NodeId]> = vec![body];
+                        arms.extend(clauses.iter().map(|c| c.body.as_slice()));
+                        self.replay_discard(ast, env, &arms, interner, returns);
+                    } else {
+                        // The flat body already contains the rescue statements.
+                        // Don't collect a second copy of their returns under
+                        // the stale entry in the discard-only path.
+                        let mut primary = env.clone();
+                        self.replay_statements(ast, &mut primary, main_body, interner, returns);
+                        let mut header_entry = env.clone();
+                        if forgotten.iter().any(|name| name == "$_") {
+                            header_entry.insert(Rc::from("$_"), interner.untyped());
+                        }
+                        let mut tail = main_body.len();
+                        for clause in clauses {
+                            self.replay_discard(ast, &header_entry, &[&clause.exceptions], interner, returns);
+                            let mut clause_entry = env.clone();
+                            Self::widen_names(&mut clause_entry, &forgotten, interner);
+                            Self::decline_rescue_last_line(clause, &mut clause_entry, interner);
+                            self.replay_statements(ast, &mut clause_entry, &clause.body, interner, returns);
+                            tail += clause.exceptions.len() + clause.body.len();
+                        }
+                        self.replay_statements(ast, &mut primary, &body[tail..], interner, returns);
+                    }
                     Self::widen_names(env, &marks.written_within(span), interner);
                 } else if clauses.is_empty() {
                     if ensure_body.is_empty() {
@@ -488,21 +516,30 @@ impl<'i> Typer<'i> {
                         self.replay_statements(ast, env, ensure_body, interner, returns);
                     }
                 } else {
-                    let stale = crate::def_local_marks::body_span(ast, main_body)
+                    let mut stale = crate::def_local_marks::body_span(ast, main_body)
                         .map(|sp| marks.changed_within(sp))
                         .unwrap_or_default();
+                    stale.extend(self.rescue_entry_forgets(ast, stmt, env, interner));
+                    let error_info = Self::error_info(env);
                     let mut arms: Vec<(&[NodeId], &[String])> = vec![(main_body.as_slice(), &[])];
                     arms.extend(clauses.iter().map(|c| (c.body.as_slice(), stale.as_slice())));
                     // `rescue [T, …] => e` binds `e` inside its clause only
                     // (rigor-rs#548); past the construct `e` joins with the
                     // entry's decline and stays `untyped`.
                     let mut binds: Vec<Vec<(String, TypeId)>> = vec![Vec::new()];
-                    binds.extend(clauses.iter().map(|c| self.rescue_binding(ast, c, interner)));
+                    binds.extend(clauses.iter().map(|c| {
+                        let mut binds = self.rescue_binding(ast, c, interner);
+                        if c.sets_last_line && env.contains_key("$_") {
+                            binds.push(("$_".to_owned(), interner.untyped()));
+                        }
+                        binds
+                    }));
                     self.join_arm_writes_bound(ast, env, &arms, &binds, interner, returns);
                     if !ensure_body.is_empty() {
                         Self::widen_names(env, &marks.changed_within(span), interner);
                         self.replay_statements(ast, env, ensure_body, interner, returns);
                     }
+                    Self::restore_error_info(env, error_info);
                 }
             }
             Node::Case { branches, else_body, .. } => {
@@ -3272,6 +3309,9 @@ impl<'i> Typer<'i> {
                         .iter()
                         .find(|&&s| within_span(site, ast.get(s).span()))
                     {
+                        let forgotten = self.rescue_entry_forgets(ast, id, env, interner);
+                        Self::widen_names(env, &forgotten, interner);
+                        Self::decline_rescue_last_line(c, env, interner);
                         // Upstream #1837 (rigor #1231): the arm reads each
                         // local the protected body writes as `Dynamic[top]`
                         // — before the reference binds, so `rescue => e`
@@ -3307,6 +3347,16 @@ impl<'i> Typer<'i> {
                         self.entry_descend(ast, s, site, false, preserve_env, env, flow, interner);
                         return;
                     }
+                }
+                // The exception designators also run after a protected-body
+                // prefix, but run before ErrorInfo binds the new exception.
+                if env.get("$_").is_some_and(|&ty| ty != interner.untyped())
+                    && clauses.iter().any(|c| {
+                        c.exceptions.iter().any(|&e| within_span(site, ast.get(e).span()))
+                    })
+                    && self.last_line_may_set(ast, id)
+                {
+                    env.insert(Rc::from("$_"), interner.untyped());
                 }
                 self.apply_subtree_effects(ast, id, site, false, env, flow, interner);
                 self.entry_descend_site_child(ast, id, site, env, flow, interner);
@@ -6474,6 +6524,149 @@ impl<'i> Typer<'i> {
         Self::absorb_retry_scopes(entry, &scopes, interner)
     }
 
+    /// `rescue_entry_scope` and the forgetting half of `ErrorInfo.rescue_entry`.
+    /// A handler can run after any prefix of the protected body, so an
+    /// entry-bound `$_` does not survive a possible same-frame setter. `$!`
+    /// and `$@` describe the rescued exception and `$?` is unbound (e.g. a
+    /// subprocess wait may have raised). Do not synthesize exception/backtrace
+    /// types here: the reference's exception matching and guard vetoes are
+    /// separate from invalidating the incoming values.
+    fn rescue_entry_forgets(
+        &self,
+        ast: &LoweredAst,
+        begin: NodeId,
+        env: &TypeEnv,
+        interner: &Interner,
+    ) -> Vec<String> {
+        let bound = |name: &str| {
+            env.get(name)
+                .is_some_and(|&ty| !matches!(interner.get(ty), Type::Dynamic(_) | Type::Top))
+        };
+        let mut names: Vec<String> = ["$!", "$@", "$?"]
+            .into_iter()
+            .filter(|name| bound(name))
+            .map(str::to_owned)
+            .collect();
+        if bound("$_") && self.last_line_may_set(ast, begin) {
+            names.push("$_".to_owned());
+        }
+        names
+    }
+
+    fn last_line_may_set(&self, ast: &LoweredAst, begin: NodeId) -> bool {
+        let Node::BeginRescue { main_body, .. } = ast.get(begin) else { return false };
+        let uid = ast.uid();
+        let mut cache = self.last_line_scans.borrow_mut();
+        if cache.as_ref().is_some_and(|(cached_uid, _)| *cached_uid != uid) {
+            *cache = None;
+        }
+        let (_, by_begin) = cache.get_or_insert_with(|| (uid, HashMap::new()));
+        *by_begin.entry(begin).or_insert_with(|| self.scan_last_line_setters(ast, main_body))
+    }
+
+    /// The lowered forms of `LastLine.may_set?`. Use syntax, not liveness:
+    /// the oracle checks possible setters even in an arm that folds away.
+    fn scan_last_line_setters(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
+        let setter = |name: &str| matches!(name, "gets" | "readline" | "foreach");
+        let mut pending = body.to_vec();
+        while let Some(id) = pending.pop() {
+            let node = ast.get(id);
+            match node {
+                Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => continue,
+                Node::VariableWrite { name, .. } if name == "$_" => return true,
+                // The compound write itself may be an orphan with an
+                // Other/Recovered carrier at the same source start.
+                Node::Other { span, .. }
+                | Node::Statements { kind: StatementsKind::Recovered, span, .. }
+                    if self.def_local_marks(ast).writes_name_at(span.0, "$_") => return true,
+                Node::MultiWrite { targets, .. } if targets.sets_last_line() => return true,
+                Node::Loop { index_target: Some(target), .. } if target.sets_last_line() => return true,
+                Node::BeginRescue { clauses, .. } if clauses.iter().any(|c| c.sets_last_line) => return true,
+                Node::Call {
+                    method, receiver, args, block_span, block_body, explicit_arg_list, ..
+                } => {
+                    let name = method.as_str();
+                    let setter_call = match name {
+                        "sub" | "gsub" | "chop" | "chomp" => receiver.is_none(),
+                        "eval" | "instance_eval" | "class_eval" | "module_eval" => *explicit_arg_list,
+                        "send" | "__send__" | "public_send" => args.first().is_some_and(|&arg| {
+                            match ast.get(arg) {
+                                Node::StringLit { value, .. } | Node::SymbolLit { value, .. }
+                                    if !ast.paren_unwrapped(arg) => setter(value),
+                                _ => true,
+                            }
+                        }),
+                        name => setter(name),
+                    };
+                    if setter_call {
+                        return true;
+                    }
+                    // FreshFrameBlocks: a core execution-context root has its
+                    // own last-line slot. Its receiver, arguments and any
+                    // `&expr` expression are still evaluated in this frame.
+                    if self.last_line_root_call(ast, *receiver, name) {
+                        pending.extend(receiver);
+                        pending.extend(args);
+                        if block_span.is_none() {
+                            pending.extend(block_body);
+                        }
+                        continue;
+                    }
+                    let block_pass_sets = block_span.is_none() && block_body.iter().any(|&expr| {
+                        match ast.get(expr) {
+                            Node::SymbolLit { value, .. } if !ast.paren_unwrapped(expr) => setter(value),
+                            _ => true,
+                        }
+                    });
+                    if block_pass_sets {
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+            pending.extend(self.flow_children(node).into_iter().map(|(child, _)| child));
+        }
+        false
+    }
+
+    fn last_line_root_call(&self, ast: &LoweredAst, receiver: Option<NodeId>, method: &str) -> bool {
+        let Some(receiver) = receiver else { return false };
+        let Node::ConstantRead { name, dynamic_base: false, self_anchored: false, .. } = ast.get(receiver)
+        else { return false };
+        let name = name.trim_start_matches("::");
+        matches!((name, method), ("Thread", "new" | "start" | "fork") | ("Fiber" | "Ractor", "new"))
+            && !ast.paren_unwrapped(receiver)
+            && !self.source.constant_defined_anywhere(name)
+    }
+
+    fn decline_rescue_last_line(
+        clause: &rigor_parse::RescueClause,
+        env: &mut TypeEnv,
+        interner: &mut Interner,
+    ) {
+        if clause.sets_last_line && let Some(ty) = env.get_mut("$_") {
+            *ty = interner.untyped();
+        }
+    }
+
+    fn error_info(env: &TypeEnv) -> [Option<TypeId>; 2] {
+        ["$!", "$@"].map(|name| env.get(name).copied())
+    }
+
+    /// `ErrorInfo.restore`: the handler's exception does not escape the begin.
+    fn restore_error_info(env: &mut TypeEnv, saved: [Option<TypeId>; 2]) {
+        for (name, bound) in ["$!", "$@"].into_iter().zip(saved) {
+            if env.get(name).copied() == bound {
+                continue;
+            }
+            if let Some(ty) = bound {
+                env.insert(Rc::from(name), ty);
+            } else {
+                env.remove(name);
+            }
+        }
+    }
+
     /// The live-arm replay of a real `begin`/`rescue` statement
     /// (rigor-rs#953). The reference's `eval_begin` exits with
     /// `reduce_scopes_with_nil_injection([primary_scope, *live_rescues])`:
@@ -6573,6 +6766,7 @@ impl<'i> Typer<'i> {
                 *write_counts.entry(name).or_insert(0) += 1;
             }
         }
+        let forgotten = self.rescue_entry_forgets(ast, id, &entry, interner);
         for clause in clauses {
             // `live_rescue_results` — an arm that unconditionally exits
             // leaves through the `begin` and contributes no scope.
@@ -6580,10 +6774,10 @@ impl<'i> Typer<'i> {
                 continue;
             }
             let mut e = entry.clone();
-            // The arm's entry (`rescue_entry_scope`) IS the `begin`'s
-            // entry — body writes never flow in — with the
-            // `ClauseWidening` names rebound to `untyped` where the entry
-            // already binds them (`widen` skips an unbound name).
+            Self::widen_names(&mut e, &forgotten, interner);
+            Self::decline_rescue_last_line(clause, &mut e, interner);
+            // Body writes never flow in as values. `ClauseWidening`'s
+            // names read as `untyped` where the entry already binds them.
             let cspan = crate::def_local_marks::body_span(ast, &clause.body)
                 .unwrap_or(clause.span);
             let reads = marks.reads_within(cspan);
@@ -6661,6 +6855,7 @@ impl<'i> Typer<'i> {
                 }
             }
         }
+        Self::restore_error_info(env, Self::error_info(&entry));
     }
 
     /// The `join_with_nil_injection` memberwise join over ALREADY-REPLAYED
@@ -7967,6 +8162,11 @@ impl<'i> Typer<'i> {
                         .filter(|c| self.clause_retries(ast, c.span))
                         .map(|c| c.span)
                         .collect();
+                    let forgotten = if clauses.is_empty() {
+                        Vec::new()
+                    } else {
+                        self.rescue_entry_forgets(ast, id, env, interner)
+                    };
                     let mut arm_envs = Vec::with_capacity(clauses.len());
                     for c in &clauses {
                         // The arm's entry scope is the `begin`'s ENTRY scope —
@@ -7987,6 +8187,8 @@ impl<'i> Typer<'i> {
                         // gitlab-foss `migrator.rb#with_retry`,
                         // `source_internal_user_finder.rb#fetch_ghost_user`).
                         let mut cenv = env.clone();
+                        Self::widen_names(&mut cenv, &forgotten, interner);
+                        Self::decline_rescue_last_line(c, &mut cenv, interner);
                         if self.clause_retries(ast, c.span) {
                             widen_flow_writes(rebinds.iter(), begin_span, &mut cenv, interner);
                         }

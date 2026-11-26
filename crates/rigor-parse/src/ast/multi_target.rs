@@ -77,7 +77,7 @@ pub enum MultiTarget {
     },
     /// A target with no observable local binding (ivar / constant / call /
     /// const-path target, an implicit rest `a, = …`, an anonymous `*`).
-    Ignored { span: Span },
+    Ignored { span: Span, last_line: bool },
 }
 
 impl MultiTarget {
@@ -86,7 +86,16 @@ impl MultiTarget {
         match self {
             MultiTarget::Local { name_span, .. } => *name_span,
             MultiTarget::Nested(t) => t.span,
-            MultiTarget::Index { span, .. } | MultiTarget::Ignored { span } => *span,
+            MultiTarget::Index { span, .. } | MultiTarget::Ignored { span, .. } => *span,
+        }
+    }
+
+    /// Whether this target can set `$_` even though it binds no local.
+    pub fn sets_last_line(&self) -> bool {
+        match self {
+            MultiTarget::Ignored { last_line, .. } => *last_line,
+            MultiTarget::Nested(targets) => targets.sets_last_line(),
+            _ => false,
         }
     }
 
@@ -148,6 +157,11 @@ pub struct MultiTargets {
 }
 
 impl MultiTargets {
+    /// Whether a target anywhere in the decomposition writes `$_`.
+    pub fn sets_last_line(&self) -> bool {
+        self.lefts.iter().chain(self.rest.as_deref()).chain(&self.rights).any(MultiTarget::sets_last_line)
+    }
+
     /// Every local name bound by this target tree, in source order.
     pub fn collect_bound_names(&self, out: &mut Vec<(String, Span)>) {
         for t in &self.lefts {
@@ -285,10 +299,10 @@ fn lower_multi_target<'pr>(
                 // A splat's expression is never a nested multi-target in valid
                 // Ruby; guard anyway so the binder's rest slot only ever sees
                 // the shapes the reference's `bind_rest_target` handles.
-                MultiTarget::Nested(_) => MultiTarget::Ignored { span: span_of(&s.location()) },
+                MultiTarget::Nested(_) => MultiTarget::Ignored { span: span_of(&s.location()), last_line: false },
                 other => other,
             },
-            None => MultiTarget::Ignored { span: span_of(&s.location()) },
+            None => MultiTarget::Ignored { span: span_of(&s.location()), last_line: false },
         };
     }
     if let Some(t) = node.as_index_target_node() {
@@ -324,7 +338,12 @@ fn lower_multi_target<'pr>(
             ..ScopeMarks::default()
         },
     ));
-    MultiTarget::Ignored { span: span_of(&node.location()) }
+    MultiTarget::Ignored { span: span_of(&node.location()), last_line: is_last_line_target(node) }
+}
+
+/// `LastLine::WRITES` includes the target spellings in masgn, for and rescue.
+pub(crate) fn is_last_line_target(node: &PrismNode<'_>) -> bool {
+    node.as_global_variable_target_node().is_some_and(|target| target.name().as_slice() == b"$_")
 }
 
 /// The local-variable reads an in-place mutation of `receiver` reaches — the
@@ -518,7 +537,7 @@ pub(crate) fn for_index_writes(
         if let Some(e) = s.expression() {
             let mut ignored = Vec::new();
             let rest = lower_multi_target(&e, &mut ignored, false);
-            if !matches!(rest, MultiTarget::Ignored { .. }) {
+            if !matches!(rest, MultiTarget::Ignored { last_line: false, .. }) {
                 let span = span_of(&s.location());
                 let targets = MultiTargets {
                     lefts: Vec::new(),
@@ -531,7 +550,11 @@ pub(crate) fn for_index_writes(
             }
         }
     }
-    (Vec::new(), Vec::new(), None)
+    let last_line = is_last_line_target(index).then(|| MultiTarget::Ignored {
+        span: span_of(&index.location()),
+        last_line: true,
+    });
+    (Vec::new(), Vec::new(), last_line)
 }
 
 /// The local-variable reads an in-place mutation of a `rescue =>` reference
