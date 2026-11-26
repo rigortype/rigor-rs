@@ -135,7 +135,6 @@ fn toplevel_raise_def_vetoes_value_positions_only() {
     for tail in [
         "@q = raise",
         "y = raise",
-        "foo(raise)",
         "if rand > 0; raise; else; raise; end",
         "begin; raise; ensure; nil; end",
     ] {
@@ -143,6 +142,17 @@ fn toplevel_raise_def_vetoes_value_positions_only() {
         // Without the user def every one of them exits.
         assert!(rescue_arm_exits(&[&top("", tail)], 0), "{tail} (no def)");
     }
+    // rigor-rs#965 — an exiting OPERAND never terminates the enclosing
+    // call: the oracle types `foo(raise)` as `foo`'s return, not `bot`.
+    // That holds whether or not the operand's `raise` itself binds a
+    // project def.
+    assert!(!rescue_arm_exits(&[&top(user, "foo(raise)")], 0));
+    assert!(!rescue_arm_exits(&[&top("", "foo(raise)")], 0));
+    // The strict test still sees a call whose own target is `bot`.
+    assert!(rescue_arm_exits(
+        &[&top("def die; raise; end", "die(raise)")],
+        0
+    ));
     // A def on an unrelated class does not bind the toplevel call.
     assert!(rescue_arm_exits(&[&top("class C; def raise(*); end; end", "@q = raise")], 0));
     // A user def whose own body is `bot` keeps the call `bot`.

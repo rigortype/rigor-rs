@@ -1400,6 +1400,44 @@ fn terminating_arm_drops_recognise_nested_exits() {
     assert_eq!(env.get("x"), Some(&s));
 }
 
+/// rigor-rs#965 — a live rescue arm's local writes join the post-`begin`
+/// scope, while an arm whose own value is `bot` still contributes nothing.
+/// An exiting call OPERAND never makes the enclosing call an exit: the
+/// oracle types `foo(raise)` as `foo`'s return. Every expected value is
+/// the oracle's `undefined method` witness on `x.w`.
+#[test]
+fn live_rescue_arm_writes_join_post_begin_scope() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let x_of = |src: &str| {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        rigor_types::describe(&i, *env.get("x").expect(src))
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+
+    for tail in [
+        "nil",
+        "q += raise",
+        "[raise]",
+        "@q = (1 || raise)",
+        "foo(raise)",
+        "h = {}; h[raise] = 1",
+        "q = foo(raise)",
+        "q = raise.foo",
+    ] {
+        let src = format!("x = \"a\"; begin; raise; rescue; x = \"e\"; {tail}; end; x.w");
+        assert_eq!(x_of(&src), "\"a\" | \"e\"", "{tail}");
+    }
+
+    for tail in ["raise", "Kernel.raise"] {
+        let src = format!("x = \"a\"; begin; raise; rescue; x = \"e\"; {tail}; end; x.w");
+        assert_eq!(x_of(&src), "\"a\"", "{tail}");
+    }
+}
+
 /// rigor-rs#955 — the check flow's branch joins see the same `retry`-bot
 /// termination the oracle's `live_rescue_results` / `eval_if` see: an arm
 /// ending in `retry` contributes no scope, while a conditional retry keeps
