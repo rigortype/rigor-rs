@@ -6221,6 +6221,24 @@ fn rescue_exception_designator_write_does_not_leak_to_continuation() {
     assert_eq!(diags[0].rule_id, "flow.unreachable-branch");
     assert!(run(b"x = \"a\"; begin; begin; raise; rescue (x = StandardError); end; rescue; x.upcase; end; x.w\n").is_empty());
 
+    // A heredoc interpolation is a structural child of the construct even
+    // when its bytes sit after `end`. Filtering the designator must not
+    // restore the pre-begin pin over that write.
+    assert!(run(
+        b"x = \"a\"\nbegin\n  raise <<~TXT; rescue (x = StandardError); x.to_s; end\n    #{x = 1}\n  TXT\nx.w\n"
+    )
+    .is_empty());
+    assert!(run(
+        b"x = \"a\"\nbegin\n  raise\nrescue (x = StandardError)\nensure\n  puts <<~TXT; end\n    #{x = 1}\n  TXT\nx.odd?\n"
+    )
+    .is_empty());
+    let diags = run(
+        b"x = \"a\"\nbegin\n  raise <<~TXT; rescue (x = StandardError); x.to_s; end\n    no write\n  TXT\nx.w\n",
+    );
+    assert_eq!(diags.len(), 1, "expected one diagnostic, got {diags:?}");
+    assert_eq!(diags[0].rule_id, CALL_UNDEFINED_METHOD);
+    assert_eq!(diags[0].message, "undefined method `w' for \"a\"");
+
     // The designator expression itself still evaluates in order: the write
     // is visible to a read later in that same expression on both engines.
     let diags = run(b"begin; raise; rescue (x = StandardError; x.w); end\n");

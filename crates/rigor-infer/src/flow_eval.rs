@@ -2597,20 +2597,18 @@ impl<'i> Typer<'i> {
                 }
                 Node::Statements { body, kind: StatementsKind::Sequence, .. } => stack.extend(body),
                 Node::BeginRescue { body, .. } if ast.is_else_carrier(id) => stack.extend(body),
-                Node::BeginRescue { main_body, clauses, .. } => {
-                    let mut protected_writes = None;
+                Node::BeginRescue { clauses, .. } => {
+                    // `ClauseWidening` walks children, not source spans, so a
+                    // heredoc interpolation that sits after `end` still counts
+                    // as a write of the construct. Span containment missed
+                    // those and restoring the pre-begin pin was an FP.
+                    let skip: std::collections::HashSet<_> =
+                        clauses.iter().flat_map(|c| c.exceptions.iter().copied()).collect();
+                    let written = Self::construct_local_writes(ast, id, &skip);
                     for &ex in clauses.iter().flat_map(|c| &c.exceptions) {
                         let Node::LocalVariableWrite { name, span, .. } = ast.get(ex) else {
                             continue;
                         };
-                        // A syntactic write in the protected body can floor
-                        // the arm's entry (even a folded-dead write). Keep the
-                        // existing decline rather than resurrect a stale pin.
-                        let written = protected_writes.get_or_insert_with(|| {
-                            crate::def_local_marks::body_span(ast, main_body)
-                                .map(|region| self.def_local_marks(ast).written_within(region))
-                                .unwrap_or_default()
-                        });
                         if !written.contains(name) {
                             discarded.insert(*span);
                         }
@@ -2620,6 +2618,43 @@ impl<'i> Typer<'i> {
             }
         }
         discarded
+    }
+
+    /// Local names a `begin` construct writes, walking structural children so
+    /// a heredoc interpolation that escapes the node's source span still
+    /// counts. `skip` is the rescue exception-list (the discarded designator
+    /// assignments themselves). Nested `def`/`class`/`module` bodies are
+    /// another scope, matching `ClauseWidening`.
+    fn construct_local_writes(
+        ast: &LoweredAst,
+        root: NodeId,
+        skip: &std::collections::HashSet<NodeId>,
+    ) -> std::collections::HashSet<String> {
+        let mut names = std::collections::HashSet::new();
+        let mut stack = Vec::new();
+        node_child_ids(ast.get(root), &mut stack);
+        while let Some(id) = stack.pop() {
+            match ast.get(id) {
+                Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => {
+                    continue;
+                }
+                Node::LocalVariableWrite { name, .. } if !skip.contains(&id) => {
+                    names.insert(name.clone());
+                }
+                Node::LocalVariableOpWrite { name, .. } => {
+                    names.insert(name.clone());
+                }
+                Node::MultiWrite { targets, .. } => {
+                    names.extend(targets.bound_names().into_iter().map(|(n, _)| n));
+                }
+                Node::UnmodeledWrite { names: writes, .. } => {
+                    names.extend(writes.iter().cloned());
+                }
+                _ => {}
+            }
+            node_child_ids(ast.get(id), &mut stack);
+        }
+        names
     }
 
     /// [`CheckFlow::loops`]: every `while`/`until` loop with a predicate
