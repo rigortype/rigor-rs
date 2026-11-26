@@ -478,7 +478,7 @@ impl<'i> Typer<'i> {
                     let forgotten = if clauses.is_empty() {
                         Vec::new()
                     } else {
-                        self.rescue_entry_forgets(ast, main_body, env, interner)
+                        self.rescue_entry_forgets(ast, stmt, env, interner)
                     };
                     let writes_last_line = env.contains_key("$_") && clauses.iter().any(|c| c.sets_last_line);
                     if forgotten.is_empty() && !writes_last_line {
@@ -519,7 +519,7 @@ impl<'i> Typer<'i> {
                     let mut stale = crate::def_local_marks::body_span(ast, main_body)
                         .map(|sp| marks.changed_within(sp))
                         .unwrap_or_default();
-                    stale.extend(self.rescue_entry_forgets(ast, main_body, env, interner));
+                    stale.extend(self.rescue_entry_forgets(ast, stmt, env, interner));
                     let error_info = Self::error_info(env);
                     let mut arms: Vec<(&[NodeId], &[String])> = vec![(main_body.as_slice(), &[])];
                     arms.extend(clauses.iter().map(|c| (c.body.as_slice(), stale.as_slice())));
@@ -3309,7 +3309,7 @@ impl<'i> Typer<'i> {
                         .iter()
                         .find(|&&s| within_span(site, ast.get(s).span()))
                     {
-                        let forgotten = self.rescue_entry_forgets(ast, &main_body, env, interner);
+                        let forgotten = self.rescue_entry_forgets(ast, id, env, interner);
                         Self::widen_names(env, &forgotten, interner);
                         Self::decline_rescue_last_line(c, env, interner);
                         // Upstream #1837 (rigor #1231): the arm reads each
@@ -3354,7 +3354,7 @@ impl<'i> Typer<'i> {
                     && clauses.iter().any(|c| {
                         c.exceptions.iter().any(|&e| within_span(site, ast.get(e).span()))
                     })
-                    && self.last_line_may_set(ast, &main_body)
+                    && self.last_line_may_set(ast, id)
                 {
                     env.insert(Rc::from("$_"), interner.untyped());
                 }
@@ -6534,7 +6534,7 @@ impl<'i> Typer<'i> {
     fn rescue_entry_forgets(
         &self,
         ast: &LoweredAst,
-        main_body: &[NodeId],
+        begin: NodeId,
         env: &TypeEnv,
         interner: &Interner,
     ) -> Vec<String> {
@@ -6547,16 +6547,26 @@ impl<'i> Typer<'i> {
             .filter(|name| bound(name))
             .map(str::to_owned)
             .collect();
-        if bound("$_") && self.last_line_may_set(ast, main_body) {
+        if bound("$_") && self.last_line_may_set(ast, begin) {
             names.push("$_".to_owned());
         }
         names
     }
 
+    fn last_line_may_set(&self, ast: &LoweredAst, begin: NodeId) -> bool {
+        let Node::BeginRescue { main_body, .. } = ast.get(begin) else { return false };
+        let uid = ast.uid();
+        let mut cache = self.last_line_scans.borrow_mut();
+        if cache.as_ref().is_some_and(|(cached_uid, _)| *cached_uid != uid) {
+            *cache = None;
+        }
+        let (_, by_begin) = cache.get_or_insert_with(|| (uid, HashMap::new()));
+        *by_begin.entry(begin).or_insert_with(|| self.scan_last_line_setters(ast, main_body))
+    }
+
     /// The lowered forms of `LastLine.may_set?`. Use syntax, not liveness:
     /// the oracle checks possible setters even in an arm that folds away.
-    /// Only scan when the entry has a last-line fact to lose.
-    fn last_line_may_set(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
+    fn scan_last_line_setters(&self, ast: &LoweredAst, body: &[NodeId]) -> bool {
         let setter = |name: &str| matches!(name, "gets" | "readline" | "foreach");
         let mut pending = body.to_vec();
         while let Some(id) = pending.pop() {
@@ -6756,7 +6766,7 @@ impl<'i> Typer<'i> {
                 *write_counts.entry(name).or_insert(0) += 1;
             }
         }
-        let forgotten = self.rescue_entry_forgets(ast, main_body, &entry, interner);
+        let forgotten = self.rescue_entry_forgets(ast, id, &entry, interner);
         for clause in clauses {
             // `live_rescue_results` — an arm that unconditionally exits
             // leaves through the `begin` and contributes no scope.
@@ -8155,7 +8165,7 @@ impl<'i> Typer<'i> {
                     let forgotten = if clauses.is_empty() {
                         Vec::new()
                     } else {
-                        self.rescue_entry_forgets(ast, &main_body, env, interner)
+                        self.rescue_entry_forgets(ast, id, env, interner)
                     };
                     let mut arm_envs = Vec::with_capacity(clauses.len());
                     for c in &clauses {
