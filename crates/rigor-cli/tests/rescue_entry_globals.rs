@@ -101,3 +101,86 @@ fn folded_rescue_join_does_not_reintroduce_forgotten_last_line() {
     let source = b"$_ = 1\nif true\n  begin\n    gets\n  rescue\n    x = $_\n  end\nend\n$_.chomp\nx.chomp\n";
     assert!(undefined_methods(source).is_empty());
 }
+
+#[test]
+fn plain_reader_unbinds_last_line_on_the_primary_path() {
+    for source in [
+        b"$_ = 1\ngets\n$_.chomp\n".as_slice(),
+        b"$_ = 1\nif rand > 0\n  gets\nend\n$_.chomp\n".as_slice(),
+        b"$_ = 1\nbegin\n  gets\nend\n$_.chomp\n".as_slice(),
+        b"$_ = 1\nbegin\n  gets\nrescue\n  nil\nend\n$_.chomp\n".as_slice(),
+        b"$_ = 1\nbegin\n  gets\nrescue\nend\n$_.chomp\n".as_slice(),
+        b"$_ = 1\ngets\nbegin\n  0\nrescue\n  $_.chomp\nend\n".as_slice(),
+        b"$_ = 1\nIO.foreach(\"x\") { |line| $_.chomp }\n".as_slice(),
+        b"$_ = 1\nIO.foreach(\"x\") { |line| nil }\n$_.chomp\n".as_slice(),
+    ] {
+        assert!(undefined_methods(source).is_empty(), "{}", String::from_utf8_lossy(source));
+    }
+}
+
+#[test]
+fn reads_before_the_plain_reader_keep_the_last_line_binding() {
+    let source = "$_ = 1\n$_.chomp\ngets\n";
+    assert_eq!(
+        undefined_methods(source.as_bytes()),
+        [(
+            source.find("chomp").unwrap(),
+            "undefined method `chomp' for 1".into()
+        )],
+    );
+}
+
+#[test]
+fn rescue_binds_error_info_and_backtrace() {
+    for (source, method, expected) in [
+        (
+            "begin\n  0\nrescue\n  $!.chomp\nend\n",
+            "chomp",
+            "undefined method `chomp' for StandardError",
+        ),
+        (
+            "begin\n  0\nrescue ArgumentError\n  $!.chomp\nend\n",
+            "chomp",
+            "undefined method `chomp' for ArgumentError",
+        ),
+        (
+            "begin\n  0\nrescue\n  $@.even?\nend\n",
+            "even?",
+            "undefined method `even?' for Array[String]",
+        ),
+    ] {
+        assert_eq!(
+            undefined_methods(source.as_bytes()),
+            [(source.find(method).unwrap(), expected.into())],
+            "{source}",
+        );
+    }
+}
+
+#[test]
+fn error_info_binding_declines_on_guards_and_backtrace_vetoes() {
+    for source in [
+        b"begin\n  0\nrescue Integer\n  $!.chomp\nend\n".as_slice(),
+        b"begin\n  0\nrescue\n  $!.is_a?(StandardError)\n  $!.chomp\nend\n".as_slice(),
+        b"begin\n  0\nrescue => e\n  e.is_a?(StandardError)\n  $!.chomp\nend\n".as_slice(),
+        b"begin\n  0\nrescue\n  case $!\n  when StandardError then nil\n  end\n  $!.chomp\nend\n".as_slice(),
+        b"begin\n  0\nrescue\n  StandardError === $!\n  $!.chomp\nend\n".as_slice(),
+        b"begin\n  0\nrescue\n  $!.set_backtrace(nil)\n  $@.even?\nend\n".as_slice(),
+        b"def backtrace; end\nbegin\n  0\nrescue\n  $@.even?\nend\n".as_slice(),
+        b"begin\n  0\nrescue\n  $@.even?\nend\ndef backtrace; end\n".as_slice(),
+    ] {
+        assert!(undefined_methods(source).is_empty(), "{}", String::from_utf8_lossy(source));
+    }
+}
+
+#[test]
+fn handler_write_still_restores_the_outer_backtrace() {
+    let source = "$@ = [1]\nif true\n  begin\n    0\n  rescue\n    $@ = [2]\n  end\nend\n$@.first.chomp\n";
+    assert_eq!(
+        undefined_methods(source.as_bytes()),
+        [(
+            source.rfind("chomp").unwrap(),
+            "undefined method `chomp' for 1".into()
+        )],
+    );
+}
