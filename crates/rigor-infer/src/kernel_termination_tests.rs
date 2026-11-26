@@ -150,7 +150,7 @@ fn toplevel_raise_def_vetoes_value_positions_only() {
     assert!(!rescue_arm_exits(&[&top("", "foo(raise)")], 0));
     // The strict test still sees a call whose own target is `bot`.
     assert!(rescue_arm_exits(
-        &[&top("def die; raise; end", "die(raise)")],
+        &[&top("def die(a); raise; end", "die(raise)")],
         0
     ));
     // A def on an unrelated class does not bind the toplevel call.
