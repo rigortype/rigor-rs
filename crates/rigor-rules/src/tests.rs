@@ -6213,6 +6213,14 @@ fn rescue_exception_designator_write_does_not_leak_to_continuation() {
     assert!(run(b"x = \"a\"; begin; raise; rescue; x = StandardError; end; x.w\n").is_empty());
     assert!(run(b"x = \"a\"; begin; raise; rescue (x = StandardError); end; x.upcase\n").is_empty());
 
+    // ClauseWidening reads the protected body syntactically. It counts the
+    // two dead writes, and it counts a nested begin's designator write for an
+    // outer rescue that mentions the name. Neither continuation can pin x.
+    let diags = run(b"x = \"a\"; begin; if false; x = 1; x = 2; end; raise; rescue (x = StandardError); end; x.w\n");
+    assert_eq!(diags.len(), 1, "expected only the dead-branch warning, got {diags:?}");
+    assert_eq!(diags[0].rule_id, "flow.unreachable-branch");
+    assert!(run(b"x = \"a\"; begin; begin; raise; rescue (x = StandardError); end; rescue; x.upcase; end; x.w\n").is_empty());
+
     // The designator expression itself still evaluates in order: the write
     // is visible to a read later in that same expression on both engines.
     let diags = run(b"begin; raise; rescue (x = StandardError; x.w); end\n");

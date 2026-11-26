@@ -2440,7 +2440,7 @@ impl<'i> Typer<'i> {
                     boundaries: Vec::new(),
                     boundary_stmts: Vec::new(),
                     boundary_stride: 1,
-                    effects: FlowEffects::new(Vec::new(), Vec::new(), ast),
+                    effects: FlowEffects::new(Vec::new(), Vec::new(), Default::default()),
                     closure_mutations: Vec::new(),
                     escaped: Vec::new(),
                     indexed: IndexedFlow::default(),
@@ -2533,7 +2533,8 @@ impl<'i> Typer<'i> {
         let stride = (body.len() as f64).sqrt().ceil().max(1.0) as usize;
         let mut boundaries = Vec::new();
         let mut boundary_stmts = Vec::with_capacity(body.len());
-        let effects = FlowEffects::new(rebinds, mutations, ast);
+        let designator_rebinds = self.discarded_rescue_designator_rebinds(ast, &body);
+        let effects = FlowEffects::new(rebinds, mutations, designator_rebinds);
         for (i, &stmt) in body.iter().enumerate() {
             if record {
                 boundary_stmts.push((stmt, ast.get(stmt).span()));
@@ -2573,6 +2574,52 @@ impl<'i> Typer<'i> {
             record_guards,
             retry_edges,
         }
+    }
+
+    /// Plain local assignments that are themselves exception designators
+    /// (single-expression parentheses lower to the assignment). The reference
+    /// keeps `sub_eval(exception, scope).first`, not the resulting scope.
+    /// This slice handles statement and `if`-arm begins, not a begin nested
+    /// in another rescue's protected body, where the outer `ClauseWidening`
+    /// can still count the designator as a protected-body write.
+    fn discarded_rescue_designator_rebinds(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+    ) -> std::collections::HashSet<rigor_parse::Span> {
+        let mut discarded = std::collections::HashSet::new();
+        let mut stack = body.to_vec();
+        while let Some(id) = stack.pop() {
+            match ast.get(id) {
+                Node::If { then_body, else_body, .. } => {
+                    stack.extend(then_body);
+                    stack.extend(else_body);
+                }
+                Node::Statements { body, kind: StatementsKind::Sequence, .. } => stack.extend(body),
+                Node::BeginRescue { body, .. } if ast.is_else_carrier(id) => stack.extend(body),
+                Node::BeginRescue { main_body, clauses, .. } => {
+                    let mut protected_writes = None;
+                    for &ex in clauses.iter().flat_map(|c| &c.exceptions) {
+                        let Node::LocalVariableWrite { name, span, .. } = ast.get(ex) else {
+                            continue;
+                        };
+                        // A syntactic write in the protected body can floor
+                        // the arm's entry (even a folded-dead write). Keep the
+                        // existing decline rather than resurrect a stale pin.
+                        let written = protected_writes.get_or_insert_with(|| {
+                            crate::def_local_marks::body_span(ast, main_body)
+                                .map(|region| self.def_local_marks(ast).written_within(region))
+                                .unwrap_or_default()
+                        });
+                        if !written.contains(name) {
+                            discarded.insert(*span);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        discarded
     }
 
     /// [`CheckFlow::loops`]: every `while`/`until` loop with a predicate
@@ -8186,12 +8233,9 @@ pub(crate) struct FlowEffects {
     /// [`toplevel_mutations`]: every `local.<mutator>` call
     /// `(call span, name, method, drop_key)`.
     pub(crate) mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
-    /// Plain local assignments that are themselves rescue exception designators
-    /// (including single-expression parentheses, which lowering unwraps).
-    /// `rescue_exception_type` keeps `sub_eval(exception, scope).first`, so
-    /// the assignment's scope does not land in the enclosing statement's exit.
-    /// The raw table still feeds read-site replay, including `ClauseWidening`
-    /// for `ensure`, which counts writes syntactically.
+    /// Discarded designator rebinds for statement-exit replay only. The raw
+    /// table still feeds read-site replay, including `ClauseWidening` for
+    /// `ensure`, which counts writes syntactically.
     designator_rebinds: std::collections::HashSet<rigor_parse::Span>,
     /// Positions into `rebinds`, sorted by span start (stable — the
     /// tables' own order inside an equal start).
@@ -8204,25 +8248,12 @@ impl FlowEffects {
     pub(crate) fn new(
         rebinds: Vec<(rigor_parse::Span, String)>,
         mutations: Vec<(rigor_parse::Span, String, String, Option<ShapeKey>)>,
-        ast: &LoweredAst,
+        designator_rebinds: std::collections::HashSet<rigor_parse::Span>,
     ) -> Self {
         let mut rebind_starts: Vec<u32> = (0..rebinds.len() as u32).collect();
         rebind_starts.sort_by_key(|&i| rebinds[i as usize].0 .0);
         let mut mutation_starts: Vec<u32> = (0..mutations.len() as u32).collect();
         mutation_starts.sort_by_key(|&i| mutations[i as usize].0 .0);
-        let designator_rebinds = ast
-            .iter()
-            .filter_map(|(_, node)| match node {
-                Node::BeginRescue { clauses, .. } => Some(clauses),
-                _ => None,
-            })
-            .flatten()
-            .flat_map(|clause| &clause.exceptions)
-            .filter_map(|&id| match ast.get(id) {
-                Node::LocalVariableWrite { span, .. } => Some(*span),
-                _ => None,
-            })
-            .collect();
         FlowEffects { rebinds, mutations, designator_rebinds, rebind_starts, mutation_starts }
     }
 
