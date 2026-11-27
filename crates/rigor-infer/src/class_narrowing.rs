@@ -12,7 +12,7 @@ use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, StatementsKind};
 use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{
-    collect_flow_writes, indexed_flow_writes, multi_target_binder,
+    collect_flow_writes, indexed_flow_writes,
     widen_flow_writes, TypeEnv, Typer,
 };
 use crate::flow_writes::{is_shape_mutator, writes_within};
@@ -713,7 +713,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in self.bind_multi_targets(&targets, rhs, interner) {
                     cenv.kill_local(&name);
                     tenv.insert(Rc::from(name.as_str()), ty);
                 }
@@ -1179,7 +1179,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.class_flow_expr(ast, value, tenv, cenv, coarse, writes, interner, out, false);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in self.bind_multi_targets(&targets, rhs, interner) {
                     cenv.kill_local(&name);
                     tenv.insert(Rc::from(name.as_str()), ty);
                 }
