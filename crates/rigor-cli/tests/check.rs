@@ -45,6 +45,61 @@ fn dynamic_receiver_yields_zero_diagnostics() {
     assert!(diags.is_empty(), "expected zero diagnostics: {diags:?}");
 }
 
+/// rigor-rs#303: a scalar multiple-assignment RHS with no implicit
+/// `to_ary` conversion is wrapped as `[rhs]`: the first fixed slot binds the
+/// value and every later fixed slot binds `nil`. Before the conversion-freedom
+/// proof was ported every non-tuple RHS collapsed each slot to `Dynamic[top]`,
+/// so both witnesses stayed silent.
+#[test]
+fn scalar_rhs_multiassign_wraps_conversion_free_values() {
+    for (src, want) in [
+        (&b"a, z = 1\nz.foo\n"[..], "undefined method `foo' for nil"),
+        (&b"a, z = 1\na.foo\n"[..], "undefined method `foo' for 1"),
+        (&b"h = {}\nh[:a], z = 1\nz.foo\n"[..], "undefined method `foo' for nil"),
+        (&b"a, z = \"s\"\nz.foo\n"[..], "undefined method `foo' for nil"),
+        (&b"a, z = {}\nz.foo\n"[..], "undefined method `foo' for nil"),
+        (&b"(q, w), a = 1\nq.foo\n"[..], "undefined method `foo' for 1"),
+    ] {
+        let diags = check(src);
+        assert!(
+            diags.iter().any(|d| d.rule_id == CALL_UNDEFINED_METHOD && d.message == want),
+            "expected `{want}` for {src:?}, got {diags:?}"
+        );
+    }
+}
+
+/// rigor-rs#303: the wrap is exact only when the value cannot implicitly
+/// convert. A project hook on the receiver class or one of the default owners
+/// (`to_ary`, `method_missing`, or `respond_to_missing?`) declines it — the
+/// reference's `array_conversion_free?` guard. An unrelated class's hook does
+/// not decline.
+#[test]
+fn scalar_rhs_multiassign_respects_project_conversion_hooks() {
+    for owner in ["String", "Object", "Kernel", "BasicObject"] {
+        for (method, body) in [
+            ("to_ary", "[\"x\", \"y\"]"),
+            ("method_missing", "[\"x\", \"y\"]"),
+            ("respond_to_missing?", "true"),
+        ] {
+            let src = format!(
+                "class {owner}\n  def {method}(*args)\n    {body}\n  end\nend\na, z = \"s\"\nz.foo\n"
+            );
+            let diags = check(src.as_bytes());
+            assert!(
+                diags.is_empty(),
+                "expected {owner}#{method} to decline the scalar wrap, got {diags:?}"
+            );
+        }
+    }
+
+    let unrelated = b"class Foo\n  def to_ary\n    [\"x\", \"y\"]\n  end\nend\na, z = \"s\"\nz.foo\n";
+    let diags = check(unrelated);
+    assert!(
+        diags.iter().any(|d| d.message == "undefined method `foo' for nil"),
+        "an unrelated conversion hook must not decline the wrap: {diags:?}"
+    );
+}
+
 /// rigor-rs#343: `h.attr ||= v` / `&&=` / `+=` run
 /// `eval_attribute_compound_write` — `widen_attribute_write` under the
 /// WRITER name drops the indexed narrowings rooted at the receiver when

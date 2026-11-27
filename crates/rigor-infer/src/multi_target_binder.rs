@@ -291,6 +291,41 @@ mod tests {
     }
 
     #[test]
+    fn conversion_free_scalar_rhs_wraps_as_a_single_element_tuple() {
+        let mut i = Interner::new();
+        let rhs = i.int(1);
+        let t = targets("a, z = 1\n");
+        let out = bind_with_conversion(&t, rhs, &mut i, |_, ty| ty == rhs);
+        assert_eq!(names(&out), ["a", "z"]);
+        assert_eq!(out[0].1, rhs, "Ruby wraps the scalar RHS as `[rhs]`");
+        assert_eq!(out[1].1, i.nil(), "the slot past the one-element wrap is nil");
+    }
+
+    #[test]
+    fn conversion_free_scalar_rhs_recurses_into_nested_targets() {
+        let mut i = Interner::new();
+        let rhs = i.int(1);
+        let t = targets("(q, w), a = 1\n");
+        let out = bind_with_conversion(&t, rhs, &mut i, |_, ty| ty == rhs);
+        assert_eq!(names(&out), ["q", "w", "a"]);
+        assert_eq!(out[0].1, rhs);
+        assert_eq!(out[1].1, i.nil());
+        assert_eq!(out[2].1, i.nil());
+    }
+
+    #[test]
+    fn conversion_free_scalar_rhs_keeps_rest_positions() {
+        let mut i = Interner::new();
+        let rhs = i.int(1);
+        let t = targets("a, *r, z = 1\n");
+        let out = bind_with_conversion(&t, rhs, &mut i, |_, ty| ty == rhs);
+        assert_eq!(names(&out), ["a", "r", "z"]);
+        assert_eq!(out[0].1, rhs);
+        assert_eq!(out[1].1, i.intern(Type::Tuple(vec![])));
+        assert_eq!(out[2].1, i.nil());
+    }
+
+    #[test]
     fn splat_binds_the_middle_sub_tuple() {
         let mut i = Interner::new();
         let (a, b, c, d) = (i.int(1), i.int(2), i.int(3), i.int(4));
