@@ -163,6 +163,12 @@ pub struct Typer<'i> {
     /// answer re-walked the shared path prefix (the chain went cubic).
     /// Bounded: each table is O(root subtree).
     pub(crate) path_marks: RefCell<Vec<PathMarksEntry>>,
+    /// Memoized `ClauseWidening` write/mention censuses, keyed by the exact
+    /// statement-id slice one `begin` body or rescue clause evaluates. The
+    /// type-level arm walk asks the same census once per tracked local, and
+    /// nested begins otherwise repay the whole subtree walk once per name
+    /// (rigor-rs#965 review).
+    pub(crate) clause_census: RefCell<std::collections::HashMap<(usize, Vec<rigor_parse::NodeId>), ClauseCensus>>,
     /// Memoized [`crate::lexical_scopes`] for a Typer built WITHOUT the
     /// driver's per-file scopes, keyed by the AST's address — one Typer
     /// types every file in `infer_method_returns`, so the memo must not
@@ -184,6 +190,13 @@ pub struct Typer<'i> {
 
 type LexicalScopes = std::rc::Rc<Vec<(rigor_parse::Span, Vec<String>)>>;
 type LastLineScans = std::collections::HashMap<rigor_parse::NodeId, bool>;
+
+/// One memoized `ClauseWidening` census: per-name write counts plus the
+/// read/write mention set (see `flow_eval.rs`).
+pub(crate) type ClauseCensus = std::rc::Rc<(
+    std::collections::HashMap<String, usize>,
+    std::collections::HashSet<String>,
+)>;
 
 /// The memoized [`crate::flow_writes::sigilled_flow_writes`] table (see
 /// [`Typer::sigilled_writes`]).
@@ -222,7 +235,7 @@ impl<'i> Typer<'i> {
         source: &'i SourceIndex,
         folder: Option<&'i (dyn folding::RubyFolder + Sync)>,
     ) -> Self {
-        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_landed: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), loop_pass: Cell::new(false), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), sigilled_writes: RefCell::new(None), last_line_scans: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()), const_rvalue_typing: Cell::new(0) }
+        Typer { index, source, folder, lexical_scopes: EMPTY_LEXICAL_SCOPES, file_key: None, dead_cache: RefCell::new(None), dead_in_flight: Cell::new(false), dead_partial: RefCell::new(std::rc::Rc::new(crate::dead::DeadPositions::default())), truthy_memo: RefCell::new(std::collections::HashMap::new()), truthy_landed: RefCell::new(std::collections::HashMap::new()), truthy_in_flight: RefCell::new(std::collections::HashSet::new()), truthy_provisional: RefCell::new(std::collections::HashSet::new()), reach_index: RefCell::new(None), def_marks: RefCell::new(None), def_scope: Cell::new(None), loop_pass: Cell::new(false), reach_memo: RefCell::new(crate::reach_memo::ReachMemo::default()), reach_frames: RefCell::new(crate::reach_memo::MemoFrames::default()), stale_locals: RefCell::new(None), sigilled_writes: RefCell::new(None), last_line_scans: RefCell::new(None), own_lexical_scopes: RefCell::new(None), path_marks: RefCell::new(Vec::new()), clause_census: RefCell::new(std::collections::HashMap::new()), const_rvalue_typing: Cell::new(0) }
     }
 
     /// C1: attach the CURRENT FILE's lexical class/module scopes (from
