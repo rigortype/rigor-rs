@@ -59,6 +59,8 @@ fn scalar_rhs_multiassign_wraps_conversion_free_values() {
         (&b"a, z = \"s\"\nz.foo\n"[..], "undefined method `foo' for nil"),
         (&b"a, z = {}\nz.foo\n"[..], "undefined method `foo' for nil"),
         (&b"(q, w), a = 1\nq.foo\n"[..], "undefined method `foo' for 1"),
+        (&b"x = c ? 1 : \"s\"\na, z = x\nz.foo\n"[..], "undefined method `foo' for nil"),
+        (&b"x = c ? 1 : [1, 2]\na, z = x\nz.foo\n"[..], "undefined method `foo' for 2"),
     ] {
         let diags = check(src);
         assert!(

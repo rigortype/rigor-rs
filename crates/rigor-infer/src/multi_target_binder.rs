@@ -60,6 +60,15 @@ fn visit(
     conversion_free: &impl Fn(&Interner, TypeId) -> bool,
     out: &mut Vec<(String, TypeId)>,
 ) {
+    // Reference `visit_union`: a union RHS distributes — every member walks
+    // the same target tree, and each name binds the join of its per-member
+    // slot types. This is what lets `x = c ? 1 : "s"; a, z = x` wrap each
+    // conversion-free scalar member independently.
+    if let Type::Union(members) = interner.get(rhs_type) {
+        let members = members.clone();
+        return visit_union(node, &members, interner, conversion_free, out);
+    }
+
     let (fronts, rest_type, backs) = decompose(
         rhs_type,
         node.lefts.len(),
@@ -79,9 +88,79 @@ fn visit(
     }
 }
 
-/// Reference `decompose`: a `Type::Tuple` RHS decomposes element-wise; every
-/// other carrier (`Nominal[Array]`, `Dynamic[top]`, `Top`, `Bot`, a union, …)
-/// collapses to `Dynamic[top]` per slot.
+/// Reference `visit_union` + `join_member_bindings`: distribute the target
+/// tree over every union member and join each name's per-member bindings.
+/// `Dynamic[top]` in any member is the whole answer; a bare `nil` member drops
+/// out when another member binds a value, the cross-member form of
+/// [`soften_optional_slot`]. The port does not carry the reference's
+/// optimistic mark side-channel, but its type half is the same join.
+fn visit_union(
+    node: &MultiTargets,
+    members: &[TypeId],
+    interner: &mut Interner,
+    conversion_free: &impl Fn(&Interner, TypeId) -> bool,
+    out: &mut Vec<(String, TypeId)>,
+) {
+    let mut walks = Vec::with_capacity(members.len());
+    for &member in members {
+        let mut member_out = Vec::new();
+        visit(node, member, interner, conversion_free, &mut member_out);
+        walks.push(member_out);
+    }
+    let Some(first) = walks.first() else {
+        return;
+    };
+
+    // Ruby `Hash` key order: a duplicated target name keeps its FIRST
+    // insertion position even though the later slot's value wins. Every member
+    // walks the same tree, so the key set and order are identical across walks.
+    let mut names = Vec::new();
+    for (name, _) in first {
+        if !names.iter().any(|n| n == name) {
+            names.push(name.clone());
+        }
+    }
+    for name in names {
+        let types: Vec<TypeId> = walks
+            .iter()
+            .filter_map(|walk| {
+                walk.iter()
+                    .rev()
+                    .find(|(n, _)| *n == name)
+                    .map(|(_, ty)| *ty)
+            })
+            .collect();
+        if types.len() == walks.len() {
+            let joined = join_member_bindings(&types, interner);
+            out.push((name, joined));
+        }
+    }
+}
+
+/// Reference `join_member_bindings` (with `soften_slots: true`, the only mode
+/// the statement-level multi-write uses today).
+fn join_member_bindings(types: &[TypeId], interner: &mut Interner) -> TypeId {
+    let untyped = interner.untyped();
+    if types.iter().any(|&ty| ty == untyped) {
+        return untyped;
+    }
+    let nil = interner.nil();
+    let firm: Vec<TypeId> = types.iter().copied().filter(|&ty| ty != nil).collect();
+    let selected = if firm.is_empty() || firm.len() == types.len() {
+        types
+    } else {
+        firm.as_slice()
+    };
+    let Some((&first, rest)) = selected.split_first() else {
+        return untyped;
+    };
+    rest.iter().fold(first, |acc, &ty| Algebra::join(interner, acc, ty))
+}
+
+/// Reference `decompose`: a `Type::Tuple` RHS decomposes element-wise; a
+/// conversion-free scalar wraps as `[rhs]`; every other carrier
+/// (`Nominal[Array]`, `Dynamic[top]`, `Top`, `Bot`, …) collapses to
+/// `Dynamic[top]` per slot.
 fn decompose(
     rhs_type: TypeId,
     front_count: usize,
@@ -311,6 +390,56 @@ mod tests {
         assert_eq!(out[0].1, rhs);
         assert_eq!(out[1].1, i.nil());
         assert_eq!(out[2].1, i.nil());
+    }
+
+    #[test]
+    fn union_rhs_distributes_before_joining_slots() {
+        let mut i = Interner::new();
+        let one = i.int(1);
+        let s = i.intern(Type::Constant(Scalar::Str("s".into())));
+        let rhs = Algebra::join(&mut i, one, s);
+        assert!(matches!(i.get(rhs), Type::Union(_)), "precondition: a union");
+        let t = targets("a, z = x\n");
+        let out = bind_with_conversion(&t, rhs, &mut i, |_, _| true);
+        assert_eq!(names(&out), ["a", "z"]);
+        assert_eq!(out[0].1, rhs, "the first slot joins the two scalar members");
+        assert_eq!(out[1].1, i.nil(), "both wrapped members nil-pad the second slot");
+    }
+
+    #[test]
+    fn union_rhs_softens_a_bare_nil_member_against_a_valued_slot() {
+        let mut i = Interner::new();
+        let one = i.int(1);
+        let two = i.int(2);
+        let tuple = i.intern(Type::Tuple(vec![one, two]));
+        let s = i.intern(Type::Constant(Scalar::Str("s".into())));
+        let rhs = Algebra::join(&mut i, tuple, s);
+        let t = targets("a, z = x\n");
+        let out = bind_with_conversion(&t, rhs, &mut i, |_, ty| ty == s);
+        let a_want = Algebra::join(&mut i, one, s);
+        assert_eq!(out[0].1, a_want);
+        assert_eq!(
+            out[1].1,
+            two,
+            "the scalar member's bare-nil pad drops out against the tuple's valued slot"
+        );
+    }
+
+    #[test]
+    fn union_rhs_dynamic_member_is_the_whole_answer() {
+        let mut i = Interner::new();
+        let one = i.int(1);
+        // A nominal array member is opaque to this slice's binder (no
+        // `Array[T]` element projection), so its slots are `Dynamic[top]`.
+        let array = i.intern(Type::Nominal { class: rigor_types::ClassId(1), args: vec![] });
+        let rhs = Algebra::join(&mut i, one, array);
+        assert!(matches!(i.get(rhs), Type::Union(_)), "precondition: a union");
+        let t = targets("a, z = x\n");
+        // Only the scalar member is conversion-free; the nominal member keeps
+        // the opaque floor. Its `Dynamic[top]` dominates every joined name.
+        let out = bind_with_conversion(&t, rhs, &mut i, |_, ty| ty == one);
+        let u = i.untyped();
+        assert!(out.iter().all(|(_, ty)| *ty == u));
     }
 
     #[test]
