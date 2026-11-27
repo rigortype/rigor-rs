@@ -147,7 +147,7 @@ fn visit_union(
 /// the statement-level multi-write uses today).
 fn join_member_bindings(types: &[TypeId], interner: &mut Interner) -> TypeId {
     let untyped = interner.untyped();
-    if types.iter().any(|&ty| ty == untyped) {
+    if types.contains(&untyped) {
         return untyped;
     }
     let nil = interner.nil();

@@ -114,7 +114,7 @@ impl<'i> Typer<'i> {
         ARRAY_CONVERSION_HOOKS.iter().all(|hook| {
             self.index
                 .declaring_ancestor(class_name, hook)
-                .map_or(true, |owner| ARRAY_CONVERSION_DEFAULT_OWNERS.contains(&owner))
+                .is_none_or(|owner| ARRAY_CONVERSION_DEFAULT_OWNERS.contains(&owner))
         })
     }
 }
