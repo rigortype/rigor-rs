@@ -28,13 +28,25 @@ use crate::flow_writes::{
 /// The syntactic write/mention census `ClauseWidening` walks
 /// (`clause_widening.rb`): every local/ivar write under the statements,
 /// nested blocks included and nested `def`/`class`/`module` scopes excluded.
-/// This must be STRUCTURAL, not span-keyed: a heredoc interpolation's bytes
-/// can sit after the enclosing `end` while its write still belongs to the
-/// construct (`rigor-rs#965`; rigor-rs#1017's regression row). The second
-/// returned set is the mention census — reads plus writes, since a write
-/// mentions its target upstream.
+/// The census is the UNION of two walks, each covering the other's blind
+/// spot:
+///
+/// * the STRUCTURAL walk below — a heredoc interpolation's bytes can sit
+///   after the enclosing `end` while its write still belongs to the
+///   construct (`rigor-rs#965`; rigor-rs#1017's regression row), which a
+///   span-keyed table misses;
+/// * the SPAN-KEYED `DefLocalMarks` tables — the structural walk's child
+///   links do not descend a `Range` bound, so a write or read inside
+///   `(x = foo)..2` / `p(x..5)` is invisible to it while the byte-keyed
+///   marks see every lowered node (`rigor-rs#965` review).
+///
+/// Write counts merge by MAX per name — the same write counted by both
+/// walks must not count twice — and mentions union. The second returned
+/// set is the mention census — reads plus writes, since a write mentions
+/// its target upstream.
 fn clause_write_census(
     ast: &LoweredAst,
+    marks: &crate::def_local_marks::DefLocalMarks,
     stmts: &[NodeId],
 ) -> (HashMap<String, usize>, HashSet<String>) {
     fn walk(
@@ -99,6 +111,26 @@ fn clause_write_census(
     let mut mentions = HashSet::new();
     for &s in stmts {
         walk(ast, s, &mut writes, &mut mentions);
+    }
+    // The span-keyed half: positions the structural child links cannot
+    // reach (a `Range` bound's write or read). Max-merge the write counts
+    // — never sum the same write twice — and union the mentions.
+    if let Some(span) = crate::def_local_marks::body_span(ast, stmts) {
+        let mut span_counts: HashMap<&str, usize> = HashMap::new();
+        for (_, name) in marks.write_positions_outside(span, &[], None) {
+            *span_counts.entry(name).or_insert(0) += 1;
+        }
+        for (name, n) in span_counts {
+            let e = writes.entry(name.to_string()).or_insert(0);
+            *e = (*e).max(n);
+            mentions.insert(name.to_string());
+        }
+        for name in marks.reads_within(span) {
+            mentions.insert(name.to_string());
+        }
+        for name in marks.changed_within(span) {
+            mentions.insert(name);
+        }
     }
     (writes, mentions)
 }
@@ -6199,7 +6231,7 @@ impl<'i> Typer<'i> {
         }
 
         let marks = self.def_local_marks(ast);
-        let (body_write_counts, _) = clause_write_census(ast, main_body);
+        let (body_write_counts, _) = clause_write_census(ast, &marks, main_body);
         let body_writes = body_write_counts.get(name).copied().unwrap_or(0);
         let untyped = interner.untyped();
         let mut arm_types = vec![primary];
@@ -6207,7 +6239,7 @@ impl<'i> Typer<'i> {
             if crate::class_narrowing::branch_terminates(self, ast, &clause.body) {
                 continue;
             }
-            let (_, mentions) = clause_write_census(ast, &clause.body);
+            let (_, mentions) = clause_write_census(ast, &marks, &clause.body);
             let mentioned = mentions.contains(name);
             let mut arm_entry = if body_writes > 1 || mentioned { untyped } else { at };
             if clause.bound_name.as_deref() == Some(name) {
@@ -7495,11 +7527,28 @@ impl<'i> Typer<'i> {
         let marks = self.def_local_marks(ast);
         // rigor-rs#1031 — `eval_retried_begin`: re-walk from the local/ivar
         // join of every raise/retry scope. Sigilled names stay at `entry`.
-        let entry = if marks.has_exit_within(bspan, &[crate::def_local_marks::ExitKind::Retry]) {
+        let mut entry = if marks.has_exit_within(bspan, &[crate::def_local_marks::ExitKind::Retry]) {
             self.widen_entry_for_retry(ast, id, env, effects, indexed, dead, interner)
         } else {
             env.clone()
         };
+        // rigor-rs#965 review — the conservative floor the flat pass's
+        // `widen_flow_writes` used to give every write in the span. The
+        // positional replay binds exactly only a DIRECT write statement in
+        // one of its sequences (or a write inside a nested control-flow
+        // construct its own delegated handler joins); every other write in
+        // the construct — a callee argument floor (`fill(xs)` mutating its
+        // parameter, keyed at the whole-call span), a named capture, a
+        // write in a `Range` or call operand, a pattern bind — is invisible
+        // to the replay, so the precise entry binding would stand in every
+        // arm and re-pin the pre-write type downstream where the oracle at
+        // least drops it. Floor exactly those names in the entry every arm
+        // clones; direct writes keep the exact overlay the brief rows need
+        // (`x = "a"; begin; raise; rescue; x = "e"; end` stays `"a" | "e"`).
+        let floor = unmanaged_begin_writes(ast, id, main_body, clauses, body, ensure_body, has_else, effects, dead, bspan);
+        if !floor.is_empty() {
+            Self::widen_names(&mut entry, &floor, interner);
+        }
         // Unchanged names keep the (possibly widened) entry, not the
         // pre-`begin` env `join_arm_envs` would otherwise leave standing.
         *env = entry.clone();
@@ -7537,7 +7586,7 @@ impl<'i> Typer<'i> {
         // `LOCAL_WRITE_NODES | InstanceVariable*Node` set walks, and
         // `write_positions_outside` already drops the `def`/`class`/
         // `module` nested scopes the reference's `SCOPE_BODY_NODES` skips.
-        let (write_counts, _) = clause_write_census(ast, main_body);
+        let (write_counts, _) = clause_write_census(ast, &marks, main_body);
         let forgotten = self.rescue_entry_forgets(ast, id, &entry, interner);
         for clause in clauses {
             // `live_rescue_results` — an arm that unconditionally exits
@@ -7553,7 +7602,7 @@ impl<'i> Typer<'i> {
             }
             // Body writes never flow in as values. `ClauseWidening`'s
             // names read as `untyped` where the entry already binds them.
-            let (_, mentions) = clause_write_census(ast, &clause.body);
+            let (_, mentions) = clause_write_census(ast, &marks, &clause.body);
             let untyped = interner.untyped();
             for (name, n) in &write_counts {
                 if (*n > 1 || mentions.contains(name)) && e.contains_key(name.as_str()) {
@@ -9476,6 +9525,173 @@ fn loop_write_dominates(ast: &LoweredAst, body: &[NodeId], s: &LoopCapSite) -> b
                     | Node::UnmodeledWrite { .. }
             ) && bn.span() == s.span
         })
+}
+
+/// Names written inside a `begin`/`rescue` construct that the live-arm
+/// replay cannot bind or manage exactly — the conservative floor
+/// [`Typer::bind_live_begin_rescue`] widens in the entry every arm clones
+/// (rigor-rs#965 review). A write is MANAGED when it is a direct write
+/// statement in one of the replayed sequences (through transparent
+/// carriers), a clause's `=> e` reference (bound exactly in the arm), or
+/// anywhere inside a statement-level control-flow construct the replay
+/// delegates whole (an `if`/`case`/loop/nested `begin` — their own handlers
+/// widen and join the writes in their spans). Everything else — a callee
+/// argument floor keyed at a whole-call span, a named capture, a write in
+/// a `Range` or call operand, a pattern bind, a write inside a block the
+/// call may never run — keeps no precise binding, because no replay arm
+/// ever rebinds it. The span-keyed `effects` table is supplemented
+/// structurally: a heredoc interpolation write escapes the construct's
+/// byte span, and the table never holds it.
+#[allow(clippy::too_many_arguments)]
+fn unmanaged_begin_writes(
+    ast: &LoweredAst,
+    id: NodeId,
+    main_body: &[NodeId],
+    clauses: &[rigor_parse::RescueClause],
+    body: &[NodeId],
+    ensure_body: &[NodeId],
+    has_else: bool,
+    effects: &FlowEffects,
+    dead: &crate::dead::DeadPositions,
+    bspan: rigor_parse::Span,
+) -> Vec<String> {
+    // The replayed sequences: the protected body, the `else` clause's
+    // slice of the flat body, each rescue clause body, the ensure body.
+    let mut sequences: Vec<&[NodeId]> = Vec::with_capacity(clauses.len() + 3);
+    sequences.push(main_body);
+    if has_else {
+        let clause_ids: usize = clauses
+            .iter()
+            .map(|c| c.exceptions.len() + c.body.len())
+            .sum();
+        sequences.push(&body[main_body.len() + clause_ids..body.len() - ensure_body.len()]);
+    }
+    for clause in clauses {
+        sequences.push(&clause.body);
+    }
+    if !ensure_body.is_empty() {
+        sequences.push(ensure_body);
+    }
+    let mut managed: Vec<rigor_parse::Span> = Vec::new();
+    let mut exact: HashSet<usize> = HashSet::new();
+    for stmts in sequences {
+        replay_write_map(ast, stmts, &mut managed, &mut exact);
+    }
+    // A clause's `=> e` reference rebind is keyed at the clause's own
+    // span; the arm replay binds it exactly (`rescue_binding`).
+    for clause in clauses {
+        if clause.bound_name.is_some() {
+            exact.insert(clause.span.0);
+        }
+    }
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |out: &mut Vec<String>, name: &str| {
+        if !out.iter().any(|n| n == name) {
+            out.push(name.to_string());
+        }
+    };
+    for (wspan, name) in effects.rebinds_within(bspan) {
+        if !dead.write_reaches(*wspan, (bspan.1, bspan.1)) {
+            continue;
+        }
+        if exact.contains(&wspan.0) {
+            continue;
+        }
+        if managed
+            .iter()
+            .any(|m| m.0 <= wspan.0 && wspan.1 <= m.1)
+        {
+            continue;
+        }
+        push(&mut out, name);
+    }
+    // The structural supplement: a write node inside the construct whose
+    // byte span escapes it (a heredoc interpolation body) never enters the
+    // span-keyed table. It sits in an operand position virtually by
+    // construction, so it is always unmanaged.
+    let mut stack = vec![id];
+    while let Some(nid) = stack.pop() {
+        let node = ast.get(nid);
+        if nid != id
+            && matches!(node, Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. })
+        {
+            continue;
+        }
+        let mut note = |span: rigor_parse::Span, name: &str| {
+            if (span.0 < bspan.0 || span.1 > bspan.1) && !exact.contains(&span.0) {
+                push(&mut out, name);
+            }
+        };
+        match node {
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. }
+            | Node::InstanceVariableWrite { name, span, .. }
+            | Node::VariableWrite { name, span, .. } => note(*span, name),
+            Node::MultiWrite { targets, span, .. } => {
+                for (name, _) in targets.bound_names() {
+                    note(*span, &name);
+                }
+            }
+            Node::UnmodeledWrite { span, names, ivar_write, .. } => {
+                for name in names {
+                    note(*span, name);
+                }
+                if let Some(w) = ivar_write {
+                    note(*span, &w.name);
+                }
+            }
+            _ => {}
+        }
+        node_child_ids(node, &mut stack);
+        if let Node::Range { left, right, .. } = node {
+            stack.extend(left.iter().copied());
+            stack.extend(right.iter().copied());
+        }
+    }
+    out
+}
+
+/// One replayed sequence's contribution to [`unmanaged_begin_writes`]'
+/// map: statement-level control-flow constructs the replay delegates
+/// whole land in `managed` (every write inside one is the delegate's
+/// concern), direct write statements land their start in `exact`, and
+/// transparent carriers (a sequence, a clause-less `begin`) recurse.
+/// Inert carriers never run — nothing inside them writes. Operand
+/// positions need no walking at all: a write in one is unmanaged by
+/// exclusion.
+fn replay_write_map(
+    ast: &LoweredAst,
+    stmts: &[NodeId],
+    managed: &mut Vec<rigor_parse::Span>,
+    exact: &mut HashSet<usize>,
+) {
+    for &s in stmts {
+        match ast.get(s) {
+            Node::If { span, .. } | Node::Case { span, .. } | Node::Loop { span, .. } => {
+                managed.push(*span)
+            }
+            Node::BeginRescue { clauses, span, .. } if !clauses.is_empty() => {
+                managed.push(*span)
+            }
+            Node::BeginRescue { body, .. } => {
+                replay_write_map(ast, &body.clone(), managed, exact)
+            }
+            Node::Statements { body, kind, .. } => {
+                if !matches!(kind, StatementsKind::Inert) {
+                    replay_write_map(ast, &body.clone(), managed, exact)
+                }
+            }
+            Node::LocalVariableWrite { span, .. }
+            | Node::LocalVariableOpWrite { span, .. }
+            | Node::MultiWrite { span, .. }
+            | Node::VariableWrite { span, .. }
+            | Node::InstanceVariableWrite { span, .. }
+            | Node::ConstantWrite { span, .. } => {
+                exact.insert(span.0);
+            }
+            _ => {}
+        }
+    }
 }
 
 /// `(write span, name)` pairs for every write inside statement `root`'s
