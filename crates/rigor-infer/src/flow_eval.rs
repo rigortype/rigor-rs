@@ -2780,6 +2780,38 @@ impl<'i> Typer<'i> {
         // statements between a checkpoint and the queried one through the
         // same `bind_check_statement`, so the env it sees is identical.
         let stride = (body.len() as f64).sqrt().ceil().max(1.0) as usize;
+        // Exact `begin`/`rescue` replay makes a statement containing a
+        // large real begin expensive to REPLAY, and `check_env_at` replays
+        // the statements since the last checkpoint once per interior use
+        // site. Put a checkpoint after any top-level statement holding a
+        // large enough begin — including one nested under an `if` — so a
+        // later site does not repay that subtree for every query. The
+        // checkpoint is only the canonical env the same replay would
+        // produce, so this changes memory/time, never semantics. The byte
+        // floor keeps a flat file of tiny `begin`s from becoming one env
+        // clone per statement; a begin large enough to cross it is the one
+        // whose positional replay can dominate (rigor-rs#965 review).
+        const EXPENSIVE_BEGIN_BYTES: usize = 512;
+        let mut expensive_begins: Vec<rigor_parse::Span> = ast
+            .iter()
+            .filter_map(|(_, n)| match n {
+                Node::BeginRescue { span, clauses, .. }
+                    if !clauses.is_empty()
+                        && span.1.saturating_sub(span.0) >= EXPENSIVE_BEGIN_BYTES =>
+                {
+                    Some(*span)
+                }
+                _ => None,
+            })
+            .collect();
+        expensive_begins.sort_unstable();
+        let holds_expensive_begin = |span: rigor_parse::Span| {
+            let i = expensive_begins.partition_point(|b| b.0 < span.0);
+            expensive_begins[i..]
+                .iter()
+                .take_while(|b| b.0 < span.1)
+                .any(|b| b.1 <= span.1)
+        };
         let mut boundaries = Vec::new();
         let mut boundary_stmts = Vec::with_capacity(body.len());
         let designator_rebinds = self.discarded_rescue_designator_rebinds(ast, &body);
@@ -2787,11 +2819,18 @@ impl<'i> Typer<'i> {
         for (i, &stmt) in body.iter().enumerate() {
             if record {
                 boundary_stmts.push((stmt, ast.get(stmt).span()));
-                if i % stride == 0 {
+                if i % stride == 0 && boundaries.last().is_none_or(|(at, _)| *at != i) {
                     boundaries.push((i, env.clone()));
                 }
             }
             self.bind_check_statement(ast, stmt, &mut env, &effects, &indexed, &dead, interner);
+            if record
+                && i + 1 < body.len()
+                && holds_expensive_begin(ast.get(stmt).span())
+                && boundaries.last().is_none_or(|(at, _)| *at != i + 1)
+            {
+                boundaries.push((i + 1, env.clone()));
+            }
         }
         // rigor-rs#492 — a heredoc interpolation body lies outside its
         // statement's span, so `check_env_at`'s containment lookup cannot
