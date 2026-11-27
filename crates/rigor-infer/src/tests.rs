@@ -1400,6 +1400,171 @@ fn terminating_arm_drops_recognise_nested_exits() {
     assert_eq!(env.get("x"), Some(&s));
 }
 
+/// rigor-rs#965 — a live rescue arm's local writes join the post-`begin`
+/// scope, while an arm whose own value is `bot` still contributes nothing.
+/// An exiting call OPERAND never makes the enclosing call an exit: the
+/// oracle types `foo(raise)` as `foo`'s return. Every expected value is
+/// the oracle's `undefined method` witness on `x.w`.
+#[test]
+fn live_rescue_arm_writes_join_post_begin_scope() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let x_of = |src: &str| {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        rigor_types::describe(&i, *env.get("x").expect(src))
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+
+    for tail in [
+        "nil",
+        "q += raise",
+        "[raise]",
+        "@q = (1 || raise)",
+        "foo(raise)",
+        "h = {}; h[raise] = 1",
+        "q = foo(raise)",
+        "q = raise.foo",
+    ] {
+        let src = format!("x = \"a\"; begin; raise; rescue; x = \"e\"; {tail}; end; x.w");
+        assert_eq!(x_of(&src), "\"a\" | \"e\"", "{tail}");
+    }
+
+    for tail in ["raise", "Kernel.raise"] {
+        let src = format!("x = \"a\"; begin; raise; rescue; x = \"e\"; {tail}; end; x.w");
+        assert_eq!(x_of(&src), "\"a\"", "{tail}");
+    }
+
+    // The same join inside an undecided `if` arm reads the begin's
+    // primary and live-rescue exit scopes, not just the lexically-last
+    // rescue write.
+    for (begin_body, want) in [
+        ("raise", "\"a\" | \"e\" | \"s\""),
+        ("x = \"b\"; raise", "\"b\" | \"e\" | \"s\""),
+    ] {
+        let src = format!(
+            "x = \"a\"; if rand > 0; begin; {begin_body}; rescue; x = \"e\"; end; else; x = \"s\"; end; x.w"
+        );
+        assert_eq!(x_of(&src), want, "{begin_body}");
+    }
+    // A same-file toplevel def propagates `bot` only through a direct
+    // value dependency on the parameter the `raise` argument binds. The
+    // rescue arm then terminates and the pre-begin binding survives; a
+    // method call on the parameter is an ordinary value and keeps the arm
+    // live.
+    for (defn, want) in [
+        ("def g(a) = a; ", "\"a\""),
+        ("def g(a); z = a; z; end; ", "\"a\""),
+        ("def g(a); if rand > 0; a; else; a; end; end; ", "\"a\""),
+        ("def g(a); a.upcase; end; ", "\"a\" | \"e\""),
+        ("def g(a); z = a; z.upcase; end; ", "\"a\" | \"e\""),
+        // A write the proof cannot model exactly may replace the
+        // parameter's bot with a live value, so the arm stays live.
+        ("def g(a); a = 1 if rand > 0; a; end; ", "\"a\" | \"e\""),
+        ("def g(a); a += 1; a; end; ", "\"a\" | \"e\""),
+        ("def g(a); puts(a = 1); a; end; ", "\"a\" | \"e\""),
+        ("def g(a); a || 1; end; ", "\"a\" | \"e\""),
+    ] {
+        let src = format!(
+            "{defn}x = \"a\"; begin; raise; rescue; x = \"e\"; g(raise); end; x.w"
+        );
+        assert_eq!(x_of(&src), want, "{defn}");
+    }
+
+    // `rescue => x` binds inside the arm even when the arm never writes
+    // `x` again: the nested join keeps the entry, the sibling arm and the
+    // exception instance. Compare members structurally — the interned
+    // union's display order is the message renderer's concern, not the
+    // scope join's.
+    let src = "x = \"a\"; if rand > 0; begin; raise; rescue StandardError => x; end; else; x = \"s\"; end; x.w";
+    let ast = lower_src(src.as_bytes());
+    let mut i = Interner::new();
+    let env = typer.build_toplevel_check_env(&ast, &mut i);
+    let x = *env.get("x").expect(src);
+    let a = i.intern(Type::Constant(Scalar::Str("a".into())));
+    let s = i.intern(Type::Constant(Scalar::Str("s".into())));
+    let std = index
+        .class_id("StandardError")
+        .map(|class| i.intern(Type::Nominal { class, args: vec![] }))
+        .expect("core StandardError");
+    let Type::Union(members) = i.get(x) else {
+        panic!("expected a union, got {}", rigor_types::describe(&i, x))
+    };
+    assert_eq!(members.len(), 3);
+    for want in [a, s, std] {
+        assert!(members.contains(&want), "missing {}", rigor_types::describe(&i, want));
+    }
+}
+
+/// rigor-rs#965 review — the live begin replay keeps the flat pass's
+/// widening floor for writes it cannot bind exactly, while exact direct
+/// writes still overlay precisely. Without the floor the precise entry
+/// binding re-pinned the pre-write type downstream (a new FP versus both
+/// the oracle and master).
+#[test]
+fn live_begin_replay_keeps_unmanaged_write_floor() {
+    let index = CoreIndex::new();
+    let ty_of = |src: &str, name: &str| {
+        let ast = lower_src(src.as_bytes());
+        let source = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = *env.get(name).expect(src);
+        (ty, i)
+    };
+
+    for (src, name) in [
+        // A project callee may mutate the array passed to it.
+        ("def fill(a); a << 1; end; xs = []; begin; fill(xs); rescue; end; xs.w", "xs"),
+        ("def fill(a); a << 1; end; xs = []; begin; raise; rescue; fill(xs); end; xs.w", "xs"),
+        // A named capture is not a positional write the replay can bind.
+        ("x = \"a\"; begin; /(?<x>b)/ =~ \"b\"; rescue; end; x.w", "x"),
+        ("x = \"a\"; begin; raise; rescue; /(?<x>b)/ =~ \"b\"; end; x.w", "x"),
+        // A write inside a range operand escapes the structural child walk.
+        ("x = \"a\"; begin; (x = foo)..2; rescue; end; x.w", "x"),
+        ("x = \"a\"; begin; raise; rescue; (x = foo)..2; end; x.w", "x"),
+        // The arm MENTIONS `x` through a range bound, so ClauseWidening
+        // enters it as untyped even though the body's one write was exact.
+        ("x = \"a\"; begin; x = 1; foo; rescue; p(x..5); end; x.w", "x"),
+        // Block/lambda parameter defaults lower as orphaned expressions,
+        // so the span census sees their reads even though they are not
+        // body statements.
+        ("x = \"a\"; begin; x = 1; foo; rescue; [1].each { |a = x| a }; end; x.w", "x"),
+        ("x = \"a\"; begin; x = 1; foo; rescue; l = ->(a = x) { a }; end; x.w", "x"),
+    ] {
+        let (ty, i) = ty_of(src, name);
+        assert!(
+            matches!(i.get(ty), Type::Dynamic(_)),
+            "{src}: expected Dynamic[top], got {}",
+            rigor_types::describe(&i, ty)
+        );
+    }
+
+    // The floor must not eat direct writes the replay binds exactly, nor
+    // their self-reading folds.
+    let x_of = |src: &str| {
+        let (ty, i) = ty_of(src, "x");
+        rigor_types::describe(&i, ty)
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+    assert_eq!(
+        x_of("x = \"a\"; begin; raise; rescue; x = \"e\"; end; x.w"),
+        "\"a\" | \"e\""
+    );
+    assert_eq!(
+        x_of("x = 1; begin; raise; rescue; x += 1; end; x.w"),
+        "1 | 2"
+    );
+    assert_eq!(
+        x_of("x = 1; begin; raise; rescue; x = x + 1; end; x.w"),
+        "1 | 2"
+    );
+}
+
 /// rigor-rs#955 — the check flow's branch joins see the same `retry`-bot
 /// termination the oracle's `live_rescue_results` / `eval_if` see: an arm
 /// ending in `retry` contributes no scope, while a conditional retry keeps

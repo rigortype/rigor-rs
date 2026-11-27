@@ -135,7 +135,6 @@ fn toplevel_raise_def_vetoes_value_positions_only() {
     for tail in [
         "@q = raise",
         "y = raise",
-        "foo(raise)",
         "if rand > 0; raise; else; raise; end",
         "begin; raise; ensure; nil; end",
     ] {
@@ -143,10 +142,47 @@ fn toplevel_raise_def_vetoes_value_positions_only() {
         // Without the user def every one of them exits.
         assert!(rescue_arm_exits(&[&top("", tail)], 0), "{tail} (no def)");
     }
+    // rigor-rs#965 — an exiting OPERAND never terminates the enclosing
+    // call: the oracle types `foo(raise)` as `foo`'s return, not `bot`.
+    // That holds whether or not the operand's `raise` itself binds a
+    // project def.
+    assert!(!rescue_arm_exits(&[&top(user, "foo(raise)")], 0));
+    assert!(!rescue_arm_exits(&[&top("", "foo(raise)")], 0));
+    // The strict test still sees a call whose own target is `bot`.
+    assert!(rescue_arm_exits(
+        &[&top("def die(a); raise; end", "die(raise)")],
+        0
+    ));
     // A def on an unrelated class does not bind the toplevel call.
     assert!(rescue_arm_exits(&[&top("class C; def raise(*); end; end", "@q = raise")], 0));
     // A user def whose own body is `bot` keeps the call `bot`.
     assert!(rescue_arm_exits(&[&top("def raise(*); Kernel.raise; end", "@q = raise")], 0));
+}
+
+/// rigor-rs#965 — the strict operand rule's other half: an attribute
+/// write's assigned VALUE is the write's own value position, while an
+/// index key or ordinary argument is not. The same distinction holds when
+/// the shape sits in a `def` body whose return [`Typer::def_exits`] types.
+#[test]
+fn operand_exits_never_bot_the_enclosing_call() {
+    for tail in [
+        "h = {}; h[:k] = raise",
+        "h = {}; h[raise] = 1",
+        "h = {}; h.[]=( :k, raise )",
+    ] {
+        let want = tail.contains("h[:k] = raise");
+        assert_eq!(rescue_arm_exits(&[&top("", tail)], 0), want, "{tail}");
+    }
+
+    for (prelude, exits) in [
+        ("def die; foo(raise); end", false),
+        ("def die; q = foo(raise); end", false),
+        ("def die; raise.foo; end", false),
+        ("def die; h = {}; h[:k] = raise; end", true),
+        ("def die; h = {}; h[raise] = 1; end", false),
+    ] {
+        assert_eq!(rescue_arm_exits(&[&top(prelude, "die")], 0), exits, "{prelude}");
+    }
 }
 
 /// rigor-rs#966 — `def_exits` binds the toplevel def only where the call's

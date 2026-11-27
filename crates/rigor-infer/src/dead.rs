@@ -32,6 +32,8 @@
 //! literal tails), not env-typed carriers, so a position is only marked dead
 //! when the oracle proves it.
 
+use std::collections::HashSet;
+
 use rigor_parse::{JumpKind, LoweredAst, Node, NodeId, Span, StatementsKind};
 
 use rigor_types::Scalar;
@@ -1725,9 +1727,10 @@ impl<'i> Typer<'i> {
                 self.arm_exits_at(ast, main_body, seen, syntactic)
             }
             // A write whose value position exits types the write `Bot`
-            // (`x = raise`); a call with an exit in an evaluated operand the
-            // same (`f(raise)`). A receiver call's exit is already covered
-            // by `receiver`'s own check.
+            // (`x = raise`). A call, however, terminates only when the
+            // call itself types `Bot` — never because one of its evaluated
+            // operands exits. The oracle types `foo(raise)` as `foo`'s
+            // return, not `bot` (rigor-rs#965).
             Node::LocalVariableWrite { value, .. } => {
                 self.stmt_exits_at(ast, *value, seen, false)
             }
@@ -1742,24 +1745,32 @@ impl<'i> Typer<'i> {
             | Node::VariableWrite { value, .. }
             | Node::ConstantWrite { value, .. }
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, false),
+            // An attribute write's type is its assigned VALUE's
+            // (`h[:k] = raise`, `o.attr = raise`), so that value — the
+            // call's last argument — decides. Other argument positions do
+            // not (`h[raise] = 1` stays live), and neither does the
+            // explicit `h.[]=(k, raise)` spelling Prism does not mark as
+            // an attribute write (rigor-rs#964).
             Node::Call {
-                receiver, args, ..
-            } => {
-                receiver.is_some_and(|r| self.stmt_exits_at(ast, r, seen, false))
-                    || args.iter().any(|&a| self.stmt_exits_at(ast, a, seen, false))
-                    // `branch_terminates?`'s OTHER half — a `Bot`-typed call
-                    // terminates too (`statement_evaluator.rb:4997`): the
-                    // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
-                    // `::Kernel.abort`), an implicit-self call a same-file
-                    // toplevel `def` answers with a provably-bot body
-                    // (`begin 1 rescue q = 1; die end`, rigor-rs#386), the
-                    // `bot`-returning Kernel functions
-                    // [`Self::kernel_sig_bot`] holds (`exec`, `sleep`,
-                    // `loop`), and a resolvable constant receiver's
-                    // all-`bot` member ([`Self::const_receiver_call_bot`]
-                    // — `Process.exit`, rigor-rs#1011).
-                    || self.exit_call_bot_seen(ast, id, seen)
+                args,
+                safe_nav,
+                attribute_write,
+                ..
+            } if *attribute_write && !*safe_nav => {
+                args.last().is_some_and(|&v| self.stmt_exits_at(ast, v, seen, false))
             }
+            // `branch_terminates?`'s OTHER half — a `Bot`-typed call
+            // terminates too (`statement_evaluator.rb:4997`): the
+            // Kernel-spelled non-returners (`Kernel.raise`, `exit!`,
+            // `::Kernel.abort`), an implicit-self call a same-file
+            // toplevel `def` answers with a provably-bot body
+            // (`begin 1 rescue q = 1; die end`, rigor-rs#386), the
+            // `bot`-returning Kernel functions
+            // [`Self::kernel_sig_bot`] holds (`exec`, `sleep`,
+            // `loop`), and a resolvable constant receiver's
+            // all-`bot` member ([`Self::const_receiver_call_bot`]
+            // — `Process.exit`, rigor-rs#1011).
+            Node::Call { .. } => self.exit_call_bot_seen(ast, id, seen),
             _ => false,
         }
     }
@@ -2026,8 +2037,38 @@ impl<'i> Typer<'i> {
         // per name (rigor-rs#422).
         let last = self.reach_index(ast).last_toplevel_def(method);
         let exits = last.is_some_and(|id| match ast.get(id) {
-            Node::Definition { body, .. } => {
-                call_binds_def_params(ast, call, id) && self.arm_bot(ast, body, seen)
+            Node::Definition { body, params, .. } => {
+                if !call_binds_def_params(ast, call, id) {
+                    return false;
+                }
+                if self.arm_bot(ast, body, seen) {
+                    return true;
+                }
+                // The reference types `bot` as a VALUE type through a def
+                // body. A tail that reads the parameter — directly or through
+                // a plain write — therefore keeps `g(raise)` bot when the
+                // `raise` argument feeds that parameter (`def g(a) = a`),
+                // while a tail that merely CALLS on it does not (`a + 1`,
+                // `a.upcase` stay dynamic). Seed exactly the positional
+                // parameters whose arguments are bot and replay the body's
+                // straight-line writes; anything not provably bot stays a
+                // value, so a miss only keeps the rescue arm live.
+                let Node::Call { args, args_plain_positional: true, .. } = ast.get(call) else {
+                    return false;
+                };
+                let Some(params) = params else {
+                    return false;
+                };
+                if params.len() != args.len() {
+                    return false;
+                }
+                let mut bot_locals: HashSet<String> = params
+                    .iter()
+                    .zip(args.iter())
+                    .filter(|&(_, &arg)| self.stmt_bot(ast, arg, seen))
+                    .map(|(name, _)| name.clone())
+                    .collect();
+                !bot_locals.is_empty() && self.sequence_bot_tracked(ast, body, &mut bot_locals, seen)
             }
             _ => false,
         });
@@ -2043,10 +2084,198 @@ impl<'i> Typer<'i> {
         body.last().is_some_and(|&l| self.stmt_bot(ast, l, seen))
     }
 
-    /// [`Self::stmt_exits`]'s Bot counterpart — does the statement yield a
-    /// value at all? Same shape walk minus the jump statements (they
-    /// produce the jump's payload or the method's `nil`), plus the
-    /// non-returning-call cases a `def` tail can carry.
+    /// [`Self::arm_bot`] with the direct dataflow of `bot` through local
+    /// writes tracked. `bot_locals` holds exactly the locals proven to carry
+    /// `bot`; every other local is a value in the reference's type lattice
+    /// (`Dynamic` included), so no third state is needed. Prefix statements
+    /// update that set; the tail answers with it.
+    fn sequence_bot_tracked(
+        &self,
+        ast: &LoweredAst,
+        body: &[NodeId],
+        bot_locals: &mut HashSet<String>,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        let Some((&last, prefix)) = body.split_last() else {
+            return false;
+        };
+        for &stmt in prefix {
+            if !self.update_bot_bindings(ast, stmt, bot_locals, seen) {
+                return false;
+            }
+        }
+        self.stmt_bot_tracked(ast, last, bot_locals, seen)
+    }
+
+    /// The straight-line part of [`Self::sequence_bot_tracked`]'s write
+    /// replay. A write whose value is bot makes its targets bot; any other
+    /// write clears them — but ONLY a write the replay models exactly.
+    /// Kill-by-default: ANY write a prefix statement may make that the
+    /// replay cannot model exactly CLEARS its locals — a conditional arm
+    /// (`a = 1 if c`), a loop or block body (`[1].each { a = 1 }`), an
+    /// op-write (`a += 1`, `a ||= 1`), an operand write (`puts(a = 1)`) or a
+    /// pattern bind may all overwrite the parameter's bot with a live value,
+    /// so keeping the local bot over-proves the tail and drops a rescue arm
+    /// the oracle keeps live (`def g(a); a = 1 if rand > 0; a; end` fed
+    /// `g(raise)` reads `"a" | "e"` there, not `"a"`). A prefix `return`
+    /// diverts the method value away from the tail entirely, so it declines
+    /// the proof — the answer is `false` when the proof is declined.
+    fn update_bot_bindings(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        bot_locals: &mut HashSet<String>,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        match ast.get(id) {
+            Node::Return { .. } => false,
+            Node::LocalVariableWrite { name, value, .. } => {
+                // Writes nested in the value (`z = (a = 1)`) are operand
+                // writes the exact binding does not model — clear every
+                // local they may write before the target's binding lands.
+                let nested = local_writes_in(ast, *value);
+                let bot = self.stmt_bot_tracked(ast, *value, bot_locals, seen);
+                for n in &nested {
+                    if n != name {
+                        bot_locals.remove(n);
+                    }
+                }
+                if bot {
+                    bot_locals.insert(name.clone());
+                } else {
+                    bot_locals.remove(name);
+                }
+                true
+            }
+            Node::MultiWrite { targets, value, .. } => {
+                let nested = local_writes_in(ast, *value);
+                let bot = self.stmt_bot_tracked(ast, *value, bot_locals, seen);
+                for n in &nested {
+                    bot_locals.remove(n);
+                }
+                for (name, _) in targets.bound_names() {
+                    if bot {
+                        bot_locals.insert(name);
+                    } else {
+                        bot_locals.remove(&name);
+                    }
+                }
+                true
+            }
+            Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
+                for &stmt in body {
+                    if !self.update_bot_bindings(ast, stmt, bot_locals, seen) {
+                        return false;
+                    }
+                }
+                true
+            }
+            Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
+                for &stmt in main_body {
+                    if !self.update_bot_bindings(ast, stmt, bot_locals, seen) {
+                        return false;
+                    }
+                }
+                true
+            }
+            // Every other statement shape — a conditional, a loop, a call
+            // with a block or operand writes, a pattern bind — is not
+            // modeled exactly: clear every local it may write.
+            _ => {
+                for name in local_writes_in(ast, id) {
+                    bot_locals.remove(&name);
+                }
+                true
+            }
+        }
+    }
+
+    /// [`Self::stmt_bot`] under the local-write proof of
+    /// [`Self::sequence_bot_tracked`]. The only added leaf is a local read;
+    /// the carriers mirror `stmt_bot` so `return a`, `(a)`, a folded `if`
+    /// and a write of `a` keep the reference's value-type propagation.
+    fn stmt_bot_tracked(
+        &self,
+        ast: &LoweredAst,
+        id: NodeId,
+        bot_locals: &HashSet<String>,
+        seen: &mut Vec<String>,
+    ) -> bool {
+        match ast.get(id) {
+            Node::LocalVariableRead { name, .. } => bot_locals.contains(name),
+            Node::Return { values, .. } => match values.as_slice() {
+                [v] => self.stmt_bot_tracked(ast, *v, bot_locals, seen),
+                _ => false,
+            },
+            Node::Other { .. } => false,
+            Node::Statements {
+                kind: StatementsKind::Jump(JumpKind::Next | JumpKind::Break),
+                body,
+                ..
+            } => {
+                let mut locals = bot_locals.clone();
+                self.sequence_bot_tracked(ast, body, &mut locals, seen)
+            }
+            Node::Statements { body, kind, .. } => {
+                if !matches!(kind, StatementsKind::Sequence) {
+                    return false;
+                }
+                let mut locals = bot_locals.clone();
+                self.sequence_bot_tracked(ast, body, &mut locals, seen)
+            }
+            Node::If {
+                predicate,
+                then_body,
+                else_body,
+                is_unless,
+                ..
+            } => {
+                let arm_bot = |arm: &[NodeId], seen: &mut Vec<String>| {
+                    let mut locals = bot_locals.clone();
+                    self.sequence_bot_tracked(ast, arm, &mut locals, seen)
+                };
+                match self.expr_truthiness(ast, *predicate, seen) {
+                    Some(truthy) => {
+                        let live = if truthy != *is_unless { then_body } else { else_body };
+                        arm_bot(live, seen)
+                    }
+                    None => arm_bot(then_body, seen) && arm_bot(else_body, seen),
+                }
+            }
+            Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
+                let mut locals = bot_locals.clone();
+                self.sequence_bot_tracked(ast, main_body, &mut locals, seen)
+            }
+            Node::LocalVariableWrite { value, .. } => {
+                self.stmt_bot_tracked(ast, *value, bot_locals, seen)
+            }
+            Node::InstanceVariableWrite { value, .. }
+            | Node::VariableWrite { value, .. }
+            | Node::ConstantWrite { value, .. }
+            | Node::MultiWrite { value, .. } => {
+                self.stmt_bot_tracked(ast, *value, bot_locals, seen)
+            }
+            // A tracked `a || 1` / `a && 1` is NOT bot merely because the
+            // left local is: the oracle keeps the rescue arm live on a tail
+            // `a || 1`, so the proof requires BOTH operands bot — the
+            // decline side.
+            Node::Logical { left, right, .. } => {
+                self.stmt_bot_tracked(ast, *left, bot_locals, seen)
+                    && self.stmt_bot_tracked(ast, *right, bot_locals, seen)
+            }
+            Node::Call {
+                args,
+                safe_nav,
+                attribute_write,
+                ..
+            } if *attribute_write && !*safe_nav => {
+                args.last().is_some_and(|&v| self.stmt_bot_tracked(ast, v, bot_locals, seen))
+            }
+            Node::Call { .. } => self.exit_call_bot_seen(ast, id, seen),
+            _ => false,
+        }
+    }
+
     /// Whether a non-local plain write's VALUE types `bot` (rigor-rs#956):
     /// a call value counts only through its own `bot` type — a
     /// receiverless `EXIT_CALLS` name, a Kernel-spelled non-returner
@@ -2130,12 +2359,17 @@ impl<'i> Typer<'i> {
             | Node::MultiWrite { value, .. } => self.write_value_bot(ast, *value, seen, true),
             Node::Logical { left, .. } => self.stmt_bot(ast, *left, seen),
             Node::Call {
-                receiver, args, ..
-            } => {
-                receiver.is_some_and(|r| self.stmt_bot(ast, r, seen))
-                    || args.iter().any(|&a| self.stmt_bot(ast, a, seen))
-                    || self.exit_call_bot_seen(ast, id, seen)
+                args,
+                safe_nav,
+                attribute_write,
+                ..
+            } if *attribute_write && !*safe_nav => {
+                args.last().is_some_and(|&v| self.stmt_bot(ast, v, seen))
             }
+            // As in [`Self::stmt_exits_at`], an exiting receiver or
+            // argument does not make the enclosing call `bot`: the oracle
+            // types `foo(raise)` as `foo`'s return (rigor-rs#965).
+            Node::Call { .. } => self.exit_call_bot_seen(ast, id, seen),
             _ => false,
         }
     }
@@ -2341,4 +2575,59 @@ impl<'i> Typer<'i> {
         }
         out
     }
+}
+
+/// Every local name a node may WRITE, structurally — the kill-by-default
+/// census [`DeadPositions::update_bot_bindings`] clears. Write forms: a
+/// plain or operator local write, a masgn target, a pattern-binding
+/// `UnmodeledWrite` (named captures included), a `for` index, a `rescue
+/// => e` reference. The walk descends every child position — operands,
+/// block bodies, control-flow arms, `Range` bounds (which
+/// `node_child_ids` deliberately leaves unlinked for its other consumers)
+/// — because any of them may run and overwrite the local; nested
+/// `def`/`class`/`module` bodies are another scope and skipped. A missing
+/// write here over-proves `bot` (unsound), so the walk errs toward
+/// counting a shape rather than missing it.
+fn local_writes_in(ast: &LoweredAst, root: NodeId) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let node = ast.get(id);
+        match node {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => continue,
+            Node::LocalVariableWrite { name, .. } | Node::LocalVariableOpWrite { name, .. } => {
+                out.insert(name.clone());
+            }
+            Node::MultiWrite { targets, .. } => {
+                for (name, _) in targets.bound_names() {
+                    out.insert(name);
+                }
+            }
+            Node::UnmodeledWrite { names, .. } => {
+                out.extend(names.iter().cloned());
+            }
+            Node::Loop { index, .. } => {
+                for (name, _) in index {
+                    out.insert(name.clone());
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                for clause in clauses {
+                    if let Some(name) = &clause.bound_name {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        crate::flow_writes::node_child_ids(node, &mut stack);
+        // `Range` bounds are linked in the arena but deliberately absent
+        // from `node_child_ids` (its shadow-scope consumer keeps them
+        // declined); a write in one still runs.
+        if let Node::Range { left, right, .. } = node {
+            stack.extend(left.iter().copied());
+            stack.extend(right.iter().copied());
+        }
+    }
+    out
 }

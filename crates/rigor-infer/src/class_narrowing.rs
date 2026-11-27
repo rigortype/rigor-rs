@@ -3349,10 +3349,27 @@ fn stmt_terminates(t: &Typer<'_>, ast: &LoweredAst, id: NodeId, syntactic: bool)
         // arm's effects still landed where the reference drops the whole
         // scope (`if true; x = "s"; if c; raise; else; raise; end; end`
         // answered `for "a"` on the oracle — rigor-rs#942 review).
-        Node::If { then_body, else_body, .. } => {
-            !else_body.is_empty()
-                && value_branch_terminates(t, ast, then_body)
-                && value_branch_terminates(t, ast, else_body)
+        Node::If { predicate, then_body, else_body, is_unless, .. } => {
+            // `branch_terminates?`'s Bot half folds a decided predicate:
+            // `live_branch_for_if` evaluates ONE arm, so the if's type is
+            // the live arm's alone — `raise if helper` types `bot` when
+            // `helper` folds truthy and the arm exits even with no else
+            // (rigor-rs#965; `dead.rs`'s `stmt_exits_at` twin). An empty
+            // live arm — the implicit `nil` edge of `if false; raise; end`
+            // — never exits.
+            match crate::version_guard::guard_truthiness(ast, *predicate)
+                .or_else(|| t.expr_truthiness(ast, *predicate, &mut Vec::new()))
+            {
+                Some(truthy) => {
+                    let live = if truthy != *is_unless { then_body } else { else_body };
+                    value_branch_terminates(t, ast, live)
+                }
+                None => {
+                    !else_body.is_empty()
+                        && value_branch_terminates(t, ast, then_body)
+                        && value_branch_terminates(t, ast, else_body)
+                }
+            }
         }
         // `branch_terminates?`'s Bot half, approximated syntactically: a
         // `case`/`case…in` whose every arm exits types `Bot`. The else
