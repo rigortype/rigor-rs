@@ -7317,6 +7317,27 @@ impl<'i> Typer<'i> {
                         env,
                         interner,
                     );
+                    // rigor-rs#965 — a write nested in an OPERAND position
+                    // (`puts(x = 1)`, an interpolation part) evaluates with
+                    // the live statement but no replay binder reaches it;
+                    // leaving the entry binding standing re-pins the
+                    // pre-write type where the oracle at least drops it
+                    // (`x = "a"; begin; raise; rescue; ensure; puts(x = 1);
+                    // end; x.w` fired `for "a"`). Widen exactly those
+                    // writes — the same decline the flat pass gives them —
+                    // BEFORE `bind_statement` overlays the direct writes'
+                    // exact values. The walk is structural: a heredoc
+                    // interpolation body escapes its statement's byte
+                    // span, so the span-keyed rebind tables miss it.
+                    let nested = nested_operand_writes(ast, s);
+                    if !nested.is_empty() {
+                        let untyped = interner.untyped();
+                        for (wspan, name) in nested {
+                            if dead.write_reaches(wspan, (sspan.1, sspan.1)) {
+                                env.insert(Rc::from(name.as_str()), untyped);
+                            }
+                        }
+                    }
                     self.bind_statement(ast, s, env, interner);
                 }
             }
@@ -8083,7 +8104,20 @@ impl<'i> Typer<'i> {
             let espan = crate::def_local_marks::body_span(ast, ensure_body)
                 .unwrap_or(bspan);
             let stale = marks.changed_within((bspan.0, espan.0));
-            let changed = marks.changed_within(espan);
+            // `changed` gates which names land back, so it must see every
+            // write the clause can make — including one whose byte span
+            // escapes the clause's hull (a heredoc interpolation body,
+            // which the span-keyed census misses; rigor-rs#965). The
+            // structural walk covers the in-span writes too.
+            let mut changed = marks.changed_within(espan);
+            let no_skip = std::collections::HashSet::new();
+            for &s in ensure_body {
+                for name in Self::construct_local_writes(ast, s, &no_skip) {
+                    if !changed.iter().any(|c| *c == name) {
+                        changed.push(name);
+                    }
+                }
+            }
             let mut eenv = env.clone();
             Self::widen_names(&mut eenv, &stale, interner);
             self.bind_live_arm_stmts(
@@ -9934,6 +9968,116 @@ fn loop_write_dominates(ast: &LoweredAst, body: &[NodeId], s: &LoopCapSite) -> b
                     | Node::UnmodeledWrite { .. }
             ) && bn.span() == s.span
         })
+}
+
+/// `(write span, name)` pairs for every write inside statement `root`'s
+/// OPERAND positions — a call receiver/argument, an interpolation part, a
+/// write's value — which evaluate with the statement but the replay's
+/// `bind_statement` cannot reach positionally. The walk is structural
+/// rather than span-keyed: a heredoc interpolation body escapes its
+/// statement's byte span (rigor-rs#965). The transparent half mirrors the
+/// positions `bind_statement`/`bind_live_arm_stmts` recurse into — a write
+/// there binds exactly and needs no widening; everything else is an
+/// operand. Control-flow constructs the replay delegates whole
+/// (`if`/`case`/loop/a real `begin`/`rescue`) manage their own writes, so
+/// neither half descends them. Nested `def`/`class`/`module` bodies are
+/// another scope and inert carriers never run — neither counts as a write
+/// of the statement.
+fn nested_operand_writes(
+    ast: &LoweredAst,
+    root: rigor_parse::NodeId,
+) -> Vec<(rigor_parse::Span, String)> {
+    let mut out = Vec::new();
+    transparent_operand_writes(ast, root, &mut out);
+    out
+}
+
+fn transparent_operand_writes(
+    ast: &LoweredAst,
+    id: rigor_parse::NodeId,
+    out: &mut Vec<(rigor_parse::Span, String)>,
+) {
+    match ast.get(id) {
+        // Self-managing control flow — the replay handles their writes
+        // through its own joins.
+        Node::If { .. } | Node::Case { .. } | Node::Loop { .. } => {}
+        Node::BeginRescue { clauses, .. } if !clauses.is_empty() => {}
+        Node::BeginRescue { body, .. } => {
+            for &s in body.clone().iter() {
+                transparent_operand_writes(ast, s, out);
+            }
+        }
+        Node::Statements { kind: StatementsKind::Inert, .. } => {}
+        Node::Statements { body, .. } => {
+            for &s in body.clone().iter() {
+                transparent_operand_writes(ast, s, out);
+            }
+        }
+        // A write the replay binds exactly — but its VALUE is an operand
+        // position `bind_statement` never descends.
+        Node::LocalVariableWrite { value, .. }
+        | Node::LocalVariableOpWrite { value, .. }
+        | Node::InstanceVariableWrite { value, .. }
+        | Node::VariableWrite { value, .. }
+        | Node::ConstantWrite { value, .. }
+        | Node::MultiWrite { value, .. } => opaque_operand_writes(ast, *value, out),
+        // `bind_statement` recurses the operands of the store forms, so a
+        // direct write inside one binds exactly like the store's own.
+        Node::IndexWrite { receiver, indices, value, .. } => {
+            for c in receiver
+                .iter()
+                .chain(indices.iter())
+                .chain(std::iter::once(value))
+                .copied()
+            {
+                transparent_operand_writes(ast, c, out);
+            }
+        }
+        Node::AttrWrite { receiver, value, .. } => {
+            for c in receiver.iter().chain(std::iter::once(value)).copied() {
+                transparent_operand_writes(ast, c, out);
+            }
+        }
+        // Every other node — a call, an interpolated string, a logical —
+        // is an operand position: `bind_statement` binds nothing inside it.
+        _ => opaque_operand_writes(ast, id, out),
+    }
+}
+
+fn opaque_operand_writes(
+    ast: &LoweredAst,
+    id: rigor_parse::NodeId,
+    out: &mut Vec<(rigor_parse::Span, String)>,
+) {
+    let mut stack = vec![id];
+    while let Some(id) = stack.pop() {
+        match ast.get(id) {
+            // Another scope, and writes that never run.
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => continue,
+            Node::Statements { kind: StatementsKind::Inert, .. } => continue,
+            Node::LocalVariableWrite { name, span, .. }
+            | Node::LocalVariableOpWrite { name, span, .. }
+            | Node::InstanceVariableWrite { name, span, .. }
+            | Node::VariableWrite { name, span, .. } => {
+                out.push((*span, name.clone()));
+            }
+            Node::MultiWrite { targets, span, .. } => {
+                for (name, _) in targets.bound_names() {
+                    out.push((*span, name));
+                }
+            }
+            Node::UnmodeledWrite { span, names, ivar_write, .. } => {
+                for name in names {
+                    out.push((*span, name.clone()));
+                }
+                if let Some(w) = ivar_write {
+                    out.push((*span, w.name.clone()));
+                }
+            }
+            _ => {}
+        }
+        node_child_ids(ast.get(id), &mut stack);
+    }
 }
 
 /// Half-open span containment.
