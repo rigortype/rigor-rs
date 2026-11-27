@@ -2100,34 +2100,59 @@ impl<'i> Typer<'i> {
             return false;
         };
         for &stmt in prefix {
-            self.update_bot_bindings(ast, stmt, bot_locals, seen);
+            if !self.update_bot_bindings(ast, stmt, bot_locals, seen) {
+                return false;
+            }
         }
         self.stmt_bot_tracked(ast, last, bot_locals, seen)
     }
 
     /// The straight-line part of [`Self::sequence_bot_tracked`]'s write
     /// replay. A write whose value is bot makes its targets bot; any other
-    /// write clears them. Conditional and nested-scope writes are ignored —
-    /// they cannot make the tail MORE bot, and treating them as absent only
-    /// declines the proof (the reference-safe side here is still just a
-    /// coverage loss, never an extra diagnostic).
+    /// write clears them — but ONLY a write the replay models exactly.
+    /// Kill-by-default: ANY write a prefix statement may make that the
+    /// replay cannot model exactly CLEARS its locals — a conditional arm
+    /// (`a = 1 if c`), a loop or block body (`[1].each { a = 1 }`), an
+    /// op-write (`a += 1`, `a ||= 1`), an operand write (`puts(a = 1)`) or a
+    /// pattern bind may all overwrite the parameter's bot with a live value,
+    /// so keeping the local bot over-proves the tail and drops a rescue arm
+    /// the oracle keeps live (`def g(a); a = 1 if rand > 0; a; end` fed
+    /// `g(raise)` reads `"a" | "e"` there, not `"a"`). A prefix `return`
+    /// diverts the method value away from the tail entirely, so it declines
+    /// the proof — the answer is `false` when the proof is declined.
     fn update_bot_bindings(
         &self,
         ast: &LoweredAst,
         id: NodeId,
         bot_locals: &mut HashSet<String>,
         seen: &mut Vec<String>,
-    ) {
+    ) -> bool {
         match ast.get(id) {
+            Node::Return { .. } => false,
             Node::LocalVariableWrite { name, value, .. } => {
-                if self.stmt_bot_tracked(ast, *value, bot_locals, seen) {
+                // Writes nested in the value (`z = (a = 1)`) are operand
+                // writes the exact binding does not model — clear every
+                // local they may write before the target's binding lands.
+                let nested = local_writes_in(ast, *value);
+                let bot = self.stmt_bot_tracked(ast, *value, bot_locals, seen);
+                for n in &nested {
+                    if n != name {
+                        bot_locals.remove(n);
+                    }
+                }
+                if bot {
                     bot_locals.insert(name.clone());
                 } else {
                     bot_locals.remove(name);
                 }
+                true
             }
             Node::MultiWrite { targets, value, .. } => {
+                let nested = local_writes_in(ast, *value);
                 let bot = self.stmt_bot_tracked(ast, *value, bot_locals, seen);
+                for n in &nested {
+                    bot_locals.remove(n);
+                }
                 for (name, _) in targets.bound_names() {
                     if bot {
                         bot_locals.insert(name);
@@ -2135,18 +2160,33 @@ impl<'i> Typer<'i> {
                         bot_locals.remove(&name);
                     }
                 }
+                true
             }
             Node::Statements { body, kind: StatementsKind::Sequence, .. } => {
                 for &stmt in body {
-                    self.update_bot_bindings(ast, stmt, bot_locals, seen);
+                    if !self.update_bot_bindings(ast, stmt, bot_locals, seen) {
+                        return false;
+                    }
                 }
+                true
             }
             Node::BeginRescue { clauses, main_body, .. } if clauses.is_empty() => {
                 for &stmt in main_body {
-                    self.update_bot_bindings(ast, stmt, bot_locals, seen);
+                    if !self.update_bot_bindings(ast, stmt, bot_locals, seen) {
+                        return false;
+                    }
                 }
+                true
             }
-            _ => {}
+            // Every other statement shape — a conditional, a loop, a call
+            // with a block or operand writes, a pattern bind — is not
+            // modeled exactly: clear every local it may write.
+            _ => {
+                for name in local_writes_in(ast, id) {
+                    bot_locals.remove(&name);
+                }
+                true
+            }
         }
     }
 
@@ -2215,7 +2255,14 @@ impl<'i> Typer<'i> {
             | Node::MultiWrite { value, .. } => {
                 self.stmt_bot_tracked(ast, *value, bot_locals, seen)
             }
-            Node::Logical { left, .. } => self.stmt_bot_tracked(ast, *left, bot_locals, seen),
+            // A tracked `a || 1` / `a && 1` is NOT bot merely because the
+            // left local is: the oracle keeps the rescue arm live on a tail
+            // `a || 1`, so the proof requires BOTH operands bot — the
+            // decline side.
+            Node::Logical { left, right, .. } => {
+                self.stmt_bot_tracked(ast, *left, bot_locals, seen)
+                    && self.stmt_bot_tracked(ast, *right, bot_locals, seen)
+            }
             Node::Call {
                 args,
                 safe_nav,
@@ -2528,4 +2575,59 @@ impl<'i> Typer<'i> {
         }
         out
     }
+}
+
+/// Every local name a node may WRITE, structurally — the kill-by-default
+/// census [`DeadPositions::update_bot_bindings`] clears. Write forms: a
+/// plain or operator local write, a masgn target, a pattern-binding
+/// `UnmodeledWrite` (named captures included), a `for` index, a `rescue
+/// => e` reference. The walk descends every child position — operands,
+/// block bodies, control-flow arms, `Range` bounds (which
+/// `node_child_ids` deliberately leaves unlinked for its other consumers)
+/// — because any of them may run and overwrite the local; nested
+/// `def`/`class`/`module` bodies are another scope and skipped. A missing
+/// write here over-proves `bot` (unsound), so the walk errs toward
+/// counting a shape rather than missing it.
+fn local_writes_in(ast: &LoweredAst, root: NodeId) -> HashSet<String> {
+    let mut out = HashSet::new();
+    let mut stack = vec![root];
+    while let Some(id) = stack.pop() {
+        let node = ast.get(id);
+        match node {
+            Node::Definition { .. } | Node::ClassDef { .. } | Node::ModuleDef { .. } => continue,
+            Node::LocalVariableWrite { name, .. } | Node::LocalVariableOpWrite { name, .. } => {
+                out.insert(name.clone());
+            }
+            Node::MultiWrite { targets, .. } => {
+                for (name, _) in targets.bound_names() {
+                    out.insert(name);
+                }
+            }
+            Node::UnmodeledWrite { names, .. } => {
+                out.extend(names.iter().cloned());
+            }
+            Node::Loop { index, .. } => {
+                for (name, _) in index {
+                    out.insert(name.clone());
+                }
+            }
+            Node::BeginRescue { clauses, .. } => {
+                for clause in clauses {
+                    if let Some(name) = &clause.bound_name {
+                        out.insert(name.clone());
+                    }
+                }
+            }
+            _ => {}
+        }
+        crate::flow_writes::node_child_ids(node, &mut stack);
+        // `Range` bounds are linked in the arena but deliberately absent
+        // from `node_child_ids` (its shadow-scope consumer keeps them
+        // declined); a write in one still runs.
+        if let Node::Range { left, right, .. } = node {
+            stack.extend(left.iter().copied());
+            stack.extend(right.iter().copied());
+        }
+    }
+    out
 }
