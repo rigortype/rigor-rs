@@ -7621,7 +7621,7 @@ impl<'i> Typer<'i> {
             let no_skip = std::collections::HashSet::new();
             for &s in ensure_body {
                 for name in Self::construct_local_writes(ast, s, &no_skip) {
-                    if !changed.iter().any(|c| *c == name) {
+                    if !changed.contains(&name) {
                         changed.push(name);
                     }
                 }
