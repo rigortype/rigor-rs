@@ -6184,6 +6184,25 @@ impl<'i> Typer<'i> {
         cur
     }
 
+    /// [`clause_write_census`] memoized per exact statement slice. The
+    /// type-level arm walk asks the same begin's census once per tracked
+    /// local; without the shared entry, nested rescue trees repay a full
+    /// structural walk per name (rigor-rs#965 review).
+    fn clause_census(
+        &self,
+        ast: &LoweredAst,
+        marks: &crate::def_local_marks::DefLocalMarks,
+        stmts: &[NodeId],
+    ) -> crate::typer::ClauseCensus {
+        let key = (ast as *const LoweredAst as usize, stmts.to_vec());
+        if let Some(census) = self.clause_census.borrow().get(&key) {
+            return census.clone();
+        }
+        let census = std::rc::Rc::new(clause_write_census(ast, marks, stmts));
+        self.clause_census.borrow_mut().insert(key, census.clone());
+        census
+    }
+
     /// The binding `name` holds after a real `begin`/`rescue`, read with
     /// the reference's `eval_begin` shape rather than as one last-write
     /// span: the protected body's exit binding (then the `else` clause's,
@@ -6231,16 +6250,16 @@ impl<'i> Typer<'i> {
         }
 
         let marks = self.def_local_marks(ast);
-        let (body_write_counts, _) = clause_write_census(ast, &marks, main_body);
-        let body_writes = body_write_counts.get(name).copied().unwrap_or(0);
+        let body_census = self.clause_census(ast, &marks, main_body);
+        let body_writes = body_census.0.get(name).copied().unwrap_or(0);
         let untyped = interner.untyped();
         let mut arm_types = vec![primary];
         for clause in clauses {
             if crate::class_narrowing::branch_terminates(self, ast, &clause.body) {
                 continue;
             }
-            let (_, mentions) = clause_write_census(ast, &marks, &clause.body);
-            let mentioned = mentions.contains(name);
+            let clause_census = self.clause_census(ast, &marks, &clause.body);
+            let mentioned = clause_census.1.contains(name);
             let mut arm_entry = if body_writes > 1 || mentioned { untyped } else { at };
             if clause.bound_name.as_deref() == Some(name) {
                 arm_entry = self
@@ -7586,7 +7605,8 @@ impl<'i> Typer<'i> {
         // `LOCAL_WRITE_NODES | InstanceVariable*Node` set walks, and
         // `write_positions_outside` already drops the `def`/`class`/
         // `module` nested scopes the reference's `SCOPE_BODY_NODES` skips.
-        let (write_counts, _) = clause_write_census(ast, &marks, main_body);
+        let body_census = self.clause_census(ast, &marks, main_body);
+        let write_counts = &body_census.0;
         let forgotten = self.rescue_entry_forgets(ast, id, &entry, interner);
         for clause in clauses {
             // `live_rescue_results` — an arm that unconditionally exits
@@ -7602,9 +7622,10 @@ impl<'i> Typer<'i> {
             }
             // Body writes never flow in as values. `ClauseWidening`'s
             // names read as `untyped` where the entry already binds them.
-            let (_, mentions) = clause_write_census(ast, &marks, &clause.body);
+            let clause_census = self.clause_census(ast, &marks, &clause.body);
+            let mentions = &clause_census.1;
             let untyped = interner.untyped();
-            for (name, n) in &write_counts {
+            for (name, n) in write_counts {
                 if (*n > 1 || mentions.contains(name)) && e.contains_key(name.as_str()) {
                     e.insert(Rc::from(name.as_str()), untyped);
                 }
