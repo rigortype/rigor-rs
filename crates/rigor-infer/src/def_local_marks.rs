@@ -76,6 +76,12 @@ pub struct DefLocalMarks {
     /// `MatchWriteNode` and the arena has no node for, so the names are
     /// unknown — every typed local is stale after one.
     wild: Vec<usize>,
+    /// Start positions of the writes the type-level arm walk treats as
+    /// binding a local: direct writes, multi-targets, `for` indexes and
+    /// rescue reference binds. Kept apart from `writes` so using it as a
+    /// membership oracle cannot widen the replay's existing decline
+    /// tables.
+    arm_writes: Vec<(usize, String)>,
     /// `(position, local)` of every type test on a local — `x.nil?`,
     /// `x.is_a?(K)`, `x == v`, `x =~ r`, `case x` — sorted by position.
     narrow_tests: Vec<(usize, String)>,
@@ -211,6 +217,11 @@ impl DefLocalMarks {
         let mut reads: Vec<(usize, usize, &str)> = Vec::new();
         // Every local write (name by start offset), for the closure scan.
         let mut all_writes: Vec<(usize, String)> = Vec::new();
+        // The type-level arm walk's write membership oracle: the write
+        // forms `arm_scope_ty` itself recognises. Span-keyed, so a span
+        // query is a binary search plus the writes inside it rather than a
+        // full reach-index node scan per statement per name.
+        let mut arm_writes: Vec<(usize, String)> = Vec::new();
         for (_, n) in ast.iter() {
             match n {
                 Node::LocalVariableRead { name, span } => reads.push((span.0, span.1, name)),
@@ -228,13 +239,26 @@ impl DefLocalMarks {
                 Node::LocalVariableOpWrite { name, span, .. } => {
                     reads.push((span.0, span.1, name));
                     all_writes.push((span.0, name.clone()));
+                    arm_writes.push((span.0, name.clone()));
                 }
                 Node::LocalVariableWrite { name, span, .. } => {
                     all_writes.push((span.0, name.clone()));
+                    arm_writes.push((span.0, name.clone()));
                 }
                 Node::MultiWrite { targets, span, .. } => {
                     for (name, _) in targets.bound_names() {
-                        all_writes.push((span.0, name));
+                        all_writes.push((span.0, name.clone()));
+                        arm_writes.push((span.0, name));
+                    }
+                }
+                Node::Loop { index, span, .. } => {
+                    for (name, _) in index {
+                        arm_writes.push((span.0, name.clone()));
+                    }
+                }
+                Node::BeginRescue { clauses, span, .. } => {
+                    for name in clauses.iter().filter_map(|c| c.bound_name.as_ref()) {
+                        arm_writes.push((span.0, name.clone()));
                     }
                 }
                 Node::UnmodeledWrite { span, names, ivar_write, .. } => {
@@ -501,6 +525,7 @@ impl DefLocalMarks {
 
         // Closure writes: every local written inside a block / lambda body.
         all_writes.sort_by_key(|w| w.0);
+        arm_writes.sort_by_key(|w| w.0);
         let mut rebinds: Vec<(Span, Vec<String>)> = Vec::new();
         for cs in closures {
             let i = all_writes.partition_point(|w| w.0 < cs.0);
@@ -529,6 +554,7 @@ impl DefLocalMarks {
             rebinds,
             reads,
             writes: all_writes,
+            arm_writes,
             decisions,
             exits,
             scopes,
@@ -560,6 +586,16 @@ impl DefLocalMarks {
     /// `module` scopes excluded) — no mutation, escape or closure marks.
     pub fn written_within(&self, span: Span) -> Vec<String> {
         self.written_outside(span, &[], None)
+    }
+
+    /// Whether `span` holds a write of `name` in one of the forms the
+    /// type-level arm walk models (see the `arm_writes` field).
+    pub(crate) fn arm_writes_name_within(&self, span: Span, name: &str) -> bool {
+        let i = self.arm_writes.partition_point(|w| w.0 < span.0);
+        self.arm_writes[i..]
+            .iter()
+            .take_while(|w| w.0 < span.1)
+            .any(|w| w.1 == name)
     }
 
     /// The local names read inside `span`.
