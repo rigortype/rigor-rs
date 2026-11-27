@@ -12,14 +12,20 @@
 //! The reference's second surface (block-parameter destructuring via
 //! `BlockParameterBinder`, `|(a, b), c|`) is NOT wired here: rigor-rs does not
 //! lower block parameters into the arena, so there is no `MultiTargets` to bind.
-//! Everything else is ported rule-for-rule:
+//! The statement-level local-binding surface is ported here. Deliberate
+//! residuals are the reference's `Array[T]` element decomposition, its
+//! optimistic-mark side channel, and its ivar/index-target result channels
+//! (the parse tree and flow passes carry the index-target widening separately).
+//! The ported rules are:
 //!
 //! | reference | here |
 //! | --- | --- |
 //! | `visit` | [`visit`] |
 //! | `decompose` | [`decompose`] |
 //! | `decompose_tuple` | [`decompose_tuple`] |
-//! | `decompose_default` (non-tuple RHS ⇒ every slot `Dynamic[top]`) | [`decompose_default`] |
+//! | `visit_union` / `join_member_bindings` | [`visit_union`] / [`join_member_bindings`] |
+//! | `wraps_as_single_element?` | [`bind_with_conversion`] |
+//! | `decompose_default` (opaque RHS ⇒ every slot `Dynamic[top]`) | [`decompose_default`] |
 //! | `slot_type` (missing slot ⇒ `Constant[nil]`) | [`slot_type`] |
 //! | `soften_optional_slot` | [`soften_optional_slot`] |
 //! | `bind_target` / `bind_rest_target` | [`bind_target`] / [`bind_rest_target`] |
