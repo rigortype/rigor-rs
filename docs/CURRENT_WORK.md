@@ -11,15 +11,14 @@ Port map: [PORT_BACKLOG.md](PORT_BACKLOG.md). Hard byte budget
 
 ## Now / Next
 
-▶ NEXT: ADR-127 floor coverage cost; follow-ups #493/#600/#605,
-paren/`&.` residuals #838–#847; mutation seams →#777–#785;
-#877 residuals #894–#896; #898-review residuals #899–#903.
-- **Exit-predicate family** #955/#964/#965: three syntactic twins of
-  `branch_terminates?` — `class_narrowing::stmt_terminates`,
-  `dead::stmt_exits`/`stmt_bot`, `collection_shape::coll_arm_terminates`.
-  A fix in one leaves the others diverging; change all, or consolidate.
-  #966 reached the first two only; `coll_arm_terminates` still reads exit
-  names unvetoed. #957 closed by #1023.
+▶ PAUSED for root-cause analysis under #1069 (cluster epics / ADR-0047
+flow-env unification). Do not pull piecemeal F1a/F1g slices until the
+epics name them.
+- **Flow-env residuals to route, not patch piecemeal**: #1070 callee bot
+  over-proof, #1071 decided short-circuit exits, #1072 begin-checkpoint
+  memory, #1073 param container-index bot, #1014 rescue block writes. The
+  `stmt_terminates` / `stmt_exits` / `coll_arm_terminates` syntactic twins
+  still diverge; do not fix one in isolation.
 - **Retry-edge residuals**: take #1031 (`eval_retried_begin` wholesale)
   BEFORE piecemeal. Local/ivar replay now sits under the decline overlay —
   do not drop the overlay until alias/block/`||=` are absorbed. Remaining:
