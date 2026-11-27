@@ -16,6 +16,7 @@
 //! |---|---|
 //! | `typer` | the struct, its constructors and accessors |
 //! | `expr_type` | [`Typer::type_of`], the dispatch by node variant, projection folds |
+//! | `array_conversion` | the implicit-`to_ary` freedom proof multi-assign consumes |
 //! | `call_dispatch` | block-less call typing (`type_call`, the RBS return lookup) |
 //! | `block_call` | calls carrying a literal block (exactly-once, never-completes) |
 //! | `reach` | argument reach — the untyped-argument declines |
@@ -48,6 +49,7 @@ pub mod multi_target_binder;
 pub mod source_index;
 pub mod version_guard;
 
+mod array_conversion;
 mod block_call;
 mod call_dispatch;
 mod class_narrowing;

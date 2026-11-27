@@ -12,7 +12,7 @@ use rigor_types::{Interner, Scalar, Type, TypeId};
 
 use crate::{
     block_bound_names, collect_flow_writes, drop_indexed_narrowings, indexed_flow_writes,
-    is_shape_mutator, local_rebinds, multi_target_binder, rebound_within, widen_flow_writes,
+    is_shape_mutator, local_rebinds, rebound_within, widen_flow_writes,
     widen_penv_writes, TypeEnv, Typer,
 };
 
@@ -255,7 +255,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.nil_flow_expr(ast, value, tenv, nenv, penv, writes, rebinds, interner, out);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in self.bind_multi_targets(&targets, rhs, interner) {
                     nenv.remove(&name);
                     penv.remove(&name);
                     tenv.insert(Rc::from(name.as_str()), ty);

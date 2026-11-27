@@ -13,7 +13,7 @@ use rigor_types::{ClassId, Interner, ShapeKey, Type, TypeId};
 use crate::flow_writes::writes_within;
 use crate::{
     block_bound_names, collect_content_mutations, collect_flow_writes, collect_rebind_writes,
-    indexed_flow_writes, multi_target_binder, rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer,
+    indexed_flow_writes, rebound_within, span_hull, widen_flow_writes, TypeEnv, Typer,
     ARRAY_MUTATORS, HASH_MUTATORS,
 };
 
@@ -797,7 +797,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 self.coll_flow_expr(ast, value, tenv, ctx, interner, out, stmt_position);
                 let rhs = self.type_of(ast, value, tenv, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in self.bind_multi_targets(&targets, rhs, interner) {
                     coll_env_insert(ctx, tenv, name.as_str(), ty);
                 }
                 // An `h[k]` index target stores through `[]=` on the

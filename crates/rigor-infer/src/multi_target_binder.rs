@@ -31,8 +31,24 @@ use rigor_types::{Algebra, Interner, Scalar, Type, TypeId};
 /// Returns the `(name, type)` pairs in source order (reference `bind`).
 #[must_use]
 pub fn bind(targets: &MultiTargets, rhs_type: TypeId, interner: &mut Interner) -> Vec<(String, TypeId)> {
+    bind_with_conversion(targets, rhs_type, interner, |_, _| false)
+}
+
+/// [`bind`], plus the caller's answer to Ruby's implicit-`to_ary` question
+/// (`MethodDispatcher::RbsDispatch.array_conversion_free?` in the reference):
+/// when the predicate proves the non-tuple carrier cannot convert, Ruby wraps
+/// the scalar RHS as `[rhs]` and the decomposition binds the first slot to the
+/// value and every later fixed slot to `nil`. The predicate is caller-supplied
+/// because that proof needs the RBS and project-method indexes, which this pure
+/// binder deliberately does not own.
+pub fn bind_with_conversion(
+    targets: &MultiTargets,
+    rhs_type: TypeId,
+    interner: &mut Interner,
+    conversion_free: impl Fn(&Interner, TypeId) -> bool,
+) -> Vec<(String, TypeId)> {
     let mut out = Vec::new();
-    visit(targets, rhs_type, interner, &mut out);
+    visit(targets, rhs_type, interner, &conversion_free, &mut out);
     out
 }
 
@@ -41,6 +57,7 @@ fn visit(
     node: &MultiTargets,
     rhs_type: TypeId,
     interner: &mut Interner,
+    conversion_free: &impl Fn(&Interner, TypeId) -> bool,
     out: &mut Vec<(String, TypeId)>,
 ) {
     let (fronts, rest_type, backs) = decompose(
@@ -49,15 +66,16 @@ fn visit(
         node.rights.len(),
         node.rest.is_some(),
         interner,
+        conversion_free,
     );
     for (t, ty) in node.lefts.iter().zip(fronts) {
-        bind_target(t, ty, interner, out);
+        bind_target(t, ty, interner, conversion_free, out);
     }
     if let (Some(rest), Some(ty)) = (node.rest.as_deref(), rest_type) {
         bind_rest_target(rest, ty, out);
     }
     for (t, ty) in node.rights.iter().zip(backs) {
-        bind_target(t, ty, interner, out);
+        bind_target(t, ty, interner, conversion_free, out);
     }
 }
 
@@ -70,11 +88,19 @@ fn decompose(
     back_count: usize,
     rest_present: bool,
     interner: &mut Interner,
+    conversion_free: &impl Fn(&Interner, TypeId) -> bool,
 ) -> (Vec<TypeId>, Option<TypeId>, Vec<TypeId>) {
     match interner.get(rhs_type) {
         Type::Tuple(elements) => {
             let elements = elements.clone();
             decompose_tuple(&elements, front_count, back_count, rest_present, interner)
+        }
+        // `a, b = 1` is not an opaque two-slot destructure: when the carrier
+        // provably has no implicit `to_ary`, Ruby first wraps the RHS as
+        // `[1]`. Keep the wrap exact — the caller's predicate is the same
+        // conversion-freedom proof the reference's RBS dispatch makes.
+        _ if conversion_free(interner, rhs_type) => {
+            decompose_tuple(&[rhs_type], front_count, back_count, rest_present, interner)
         }
         _ => decompose_default(front_count, back_count, rest_present, interner),
     }
@@ -184,11 +210,12 @@ fn bind_target(
     target: &MultiTarget,
     ty: TypeId,
     interner: &mut Interner,
+    conversion_free: &impl Fn(&Interner, TypeId) -> bool,
     out: &mut Vec<(String, TypeId)>,
 ) {
     match target {
         MultiTarget::Local { name, .. } => out.push((name.clone(), ty)),
-        MultiTarget::Nested(inner) => visit(inner, ty, interner, out),
+        MultiTarget::Nested(inner) => visit(inner, ty, interner, conversion_free, out),
         MultiTarget::Index { .. } | MultiTarget::Ignored { .. } => {}
     }
 }

@@ -13,7 +13,7 @@ use rigor_types::{Interner, Scalar, ShapeKey, Type, TypeId};
 
 use crate::{
     closure_mutations, collect_flow_writes, indexed_flow_writes, join_flow_envs,
-    multi_target_binder, qualify_self, toplevel_argument_floor, toplevel_mutations, toplevel_rebinds,
+    qualify_self, toplevel_argument_floor, toplevel_mutations, toplevel_rebinds,
     widen_clause_entry, widen_flow_writes,
     DefKind, TypeEnv, Typer,
 };
@@ -6272,7 +6272,7 @@ impl<'i> Typer<'i> {
                             Some(element)
                         }
                         rigor_parse::MultiTarget::Nested(targets) => {
-                            crate::multi_target_binder::bind(targets, element, interner)
+                            self.bind_multi_targets(targets, element, interner)
                                 .into_iter()
                                 .find(|(n2, _)| n2 == name)
                                 .map(|(_, ty)| ty)
@@ -6992,7 +6992,7 @@ impl<'i> Typer<'i> {
                 }
                 Node::MultiWrite { targets, value, .. } => {
                     let rhs = self.type_of(ast, *value, env, interner);
-                    for (n2, ty) in crate::multi_target_binder::bind(targets, rhs, interner) {
+                    for (n2, ty) in self.bind_multi_targets(targets, rhs, interner) {
                         if n2 == name {
                             consider(wspan, ty);
                         }
@@ -9059,7 +9059,7 @@ impl<'i> Typer<'i> {
                     ast, indexed, id, vspan, rebinds, mutations, stored, env, interner,
                 );
                 let rhs = self.type_of(ast, value, env, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in self.bind_multi_targets(&targets, rhs, interner) {
                     drop_indexed_narrowings(env, &name);
                     env.insert(Rc::from(name.as_str()), ty);
                 }
@@ -9588,7 +9588,7 @@ impl<'i> Typer<'i> {
                 let (targets, value) = (targets.clone(), *value);
                 let bound = ast.closure_bound_names(id);
                 let rhs = self.type_of(ast, value, env, interner);
-                for (name, ty) in multi_target_binder::bind(&targets, rhs, interner) {
+                for (name, ty) in self.bind_multi_targets(&targets, rhs, interner) {
                     if bound.contains(&name) {
                         continue;
                     }
