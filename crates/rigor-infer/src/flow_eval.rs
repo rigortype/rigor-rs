@@ -3495,7 +3495,10 @@ impl<'i> Typer<'i> {
                 // descent from the local/ivar-widened entry so later writes
                 // and retrying-clause rebinds reach earlier reads, while
                 // sigilled names stay in source order.
-                if clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
+                let has_retry = self
+                    .def_local_marks(ast)
+                    .has_exit_within(*span, &[crate::def_local_marks::ExitKind::Retry]);
+                if has_retry && clauses.iter().any(|c| self.clause_retries(ast, c.span)) {
                     *env = self.widen_entry_for_retry(
                         ast, id, env, &flow.effects, &flow.indexed, &flow.dead, interner,
                     );
@@ -3544,12 +3547,14 @@ impl<'i> Typer<'i> {
                                 &flow.effects.rebinds, region, &flow.indexed.scope_spans, env, interner,
                             );
                         }
-                        for rs in clauses
-                            .iter()
-                            .filter(|rc| self.clause_retries(ast, rc.span))
-                            .map(|rc| rc.span)
-                        {
-                            widen_flow_writes(flow.effects.rebinds.iter(), rs, env, interner);
+                        if has_retry {
+                            for rs in clauses
+                                .iter()
+                                .filter(|rc| self.clause_retries(ast, rc.span))
+                                .map(|rc| rc.span)
+                            {
+                                widen_flow_writes(flow.effects.rebinds.iter(), rs, env, interner);
+                            }
                         }
                         // `rescue => e` binds the exception inside the arm —
                         // `bind_rescue_reference` on the oracle
@@ -6229,7 +6234,7 @@ impl<'i> Typer<'i> {
         let mut cur: Option<TypeId> = None;
         for &s in body {
             let at = cur.unwrap_or(entry);
-            if !self.writes_name_within(ast, ast.get(s).span(), name, interner) {
+            if !self.writes_name_within(ast, ast.get(s).span(), name) {
                 continue;
             }
             cur = Some(
@@ -7161,30 +7166,13 @@ impl<'i> Typer<'i> {
         ast: &LoweredAst,
         span: rigor_parse::Span,
         name: &str,
-        interner: &mut Interner,
     ) -> bool {
-        let idx = self.reach_index(ast);
-        let u = interner.untyped();
-        idx.nodes_within(ast, span).any(|n| match ast.get(n) {
-            Node::LocalVariableWrite { name: n2, .. } | Node::LocalVariableOpWrite { name: n2, .. } => {
-                n2 == name
-            }
-            Node::MultiWrite { targets, .. } => {
-                crate::multi_target_binder::bind(targets, u, interner).iter().any(|(t, _)| t == name)
-            }
-            // A `for` index binds its names per iteration (`bind_for_index`)
-            // — `for x in [1]` rebinds `x` although no write NODE does.
-            Node::Loop { kind: rigor_parse::LoopKind::For, index, .. } => {
-                index.iter().any(|(n2, _)| n2 == name)
-            }
-            // `rescue => x` binds inside the clause (`bind_rescue_reference`),
-            // so the begin's type-level arm walk must run even when the
-            // clause body never writes `x` again.
-            Node::BeginRescue { clauses, .. } => {
-                clauses.iter().any(|c| c.bound_name.as_deref() == Some(name))
-            }
-            _ => false,
-        })
+        // Span-keyed membership in the same write forms the arm walk
+        // models. The reach-index scan this replaces answered the same
+        // predicate, but paid a full node walk of every nested statement
+        // once per tracked name — quadratic on a deep begin/rescue tree
+        // (rigor-rs#965 review).
+        self.def_local_marks(ast).arm_writes_name_within(span, name)
     }
 
     /// The value the LAST write of `name` inside `span` binds, typed from its
@@ -7398,13 +7386,13 @@ impl<'i> Typer<'i> {
     /// Spans of every `begin` whose rescue chain holds a `retry` that
     /// re-enters it.
     fn retrying_begin_spans(&self, ast: &LoweredAst) -> Vec<rigor_parse::Span> {
+        let marks = self.def_local_marks(ast);
         ast.iter()
             .filter_map(|(_, n)| match n {
                 Node::BeginRescue { span, clauses, .. } if !clauses.is_empty() => {
-                    clauses
-                        .iter()
-                        .any(|c| self.clause_retries(ast, c.span))
-                        .then_some(*span)
+                    (marks.has_exit_within(*span, &[crate::def_local_marks::ExitKind::Retry])
+                        && clauses.iter().any(|c| self.clause_retries(ast, c.span)))
+                    .then_some(*span)
                 }
                 _ => None,
             })
@@ -8849,11 +8837,18 @@ impl<'i> Typer<'i> {
             if clauses.is_empty() || in_scope_body(*span) {
                 continue;
             }
-            let mut regions: Vec<rigor_parse::Span> = clauses
-                .iter()
-                .filter(|c| self.clause_retries(ast, c.span))
-                .map(|c| c.span)
-                .collect();
+            let has_retry = self
+                .def_local_marks(ast)
+                .has_exit_within(*span, &[crate::def_local_marks::ExitKind::Retry]);
+            let mut regions: Vec<rigor_parse::Span> = if has_retry {
+                clauses
+                    .iter()
+                    .filter(|c| self.clause_retries(ast, c.span))
+                    .map(|c| c.span)
+                    .collect()
+            } else {
+                Vec::new()
+            };
             if regions.is_empty() {
                 continue;
             }
@@ -9509,11 +9504,18 @@ impl<'i> Typer<'i> {
                     };
                     // Spans of the retrying clauses — see the sibling
                     // widening below (`absorb_retry_rebinds`).
-                    let retry_spans: Vec<(usize, usize)> = clauses
-                        .iter()
-                        .filter(|c| self.clause_retries(ast, c.span))
-                        .map(|c| c.span)
-                        .collect();
+                    let has_retry = self
+                        .def_local_marks(ast)
+                        .has_exit_within(begin_span, &[crate::def_local_marks::ExitKind::Retry]);
+                    let retry_spans: Vec<(usize, usize)> = if has_retry {
+                        clauses
+                            .iter()
+                            .filter(|c| self.clause_retries(ast, c.span))
+                            .map(|c| c.span)
+                            .collect()
+                    } else {
+                        Vec::new()
+                    };
                     let forgotten = if clauses.is_empty() {
                         Vec::new()
                     } else {
