@@ -509,6 +509,11 @@ impl<'src> Builder<'src> {
             if let Some(b) = lambda.body() {
                 self.iterated_body_spans.push(span_of(&b.location()));
             }
+            if let Some(params) = lambda.parameters() {
+                if let Some(bp) = params.as_block_parameters_node() {
+                    self.lower_closure_param_defaults(&bp);
+                }
+            }
             let body = self.lower_optional_body(lambda.body().as_ref());
             self.typed_depth = operand_typed;
             self.lexical_loop = lexical_loop;

@@ -1529,6 +1529,11 @@ fn live_begin_replay_keeps_unmanaged_write_floor() {
         // The arm MENTIONS `x` through a range bound, so ClauseWidening
         // enters it as untyped even though the body's one write was exact.
         ("x = \"a\"; begin; x = 1; foo; rescue; p(x..5); end; x.w", "x"),
+        // Block/lambda parameter defaults lower as orphaned expressions,
+        // so the span census sees their reads even though they are not
+        // body statements.
+        ("x = \"a\"; begin; x = 1; foo; rescue; [1].each { |a = x| a }; end; x.w", "x"),
+        ("x = \"a\"; begin; x = 1; foo; rescue; l = ->(a = x) { a }; end; x.w", "x"),
     ] {
         let (ty, i) = ty_of(src, name);
         assert!(
