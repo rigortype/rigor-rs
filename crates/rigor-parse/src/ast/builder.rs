@@ -673,6 +673,29 @@ impl<'src> Builder<'src> {
             || has_targeted_retry(node)
     }
 
+    /// Lower a closure parameter list's default-value expressions as
+    /// arena nodes, orphaned like a `def` default: the call rules and the
+    /// span-keyed read/write marks must see them (the reference checks
+    /// them), but they are not body statements. This covers both a literal
+    /// block (`each { |a = x| … }`) and a lambda (`->(a = x) { … }`),
+    /// whose parameter lists share Prism's `BlockParametersNode`
+    /// (rigor-rs#965 review).
+    fn lower_closure_param_defaults(&mut self, bp: &ruby_prism::BlockParametersNode<'_>) {
+        let Some(params) = bp.parameters() else {
+            return;
+        };
+        for opt in params.optionals().iter() {
+            if let Some(o) = opt.as_optional_parameter_node() {
+                let _ = self.lower_node(&o.value());
+            }
+        }
+        for kw in params.keywords().iter() {
+            if let Some(o) = kw.as_optional_keyword_parameter_node() {
+                let _ = self.lower_node(&o.value());
+            }
+        }
+    }
+
     /// Lower an *optional* body node (a `def`/`class`/`module`/block body, which
     /// Prism types as `Option<Node>`). A `StatementsNode` body is flattened to
     /// its statement ids so each lands in the arena individually; a `BeginNode`
