@@ -380,6 +380,15 @@ pub enum Node {
         /// block (`foo(a) { }`) does not count either. Consumed by
         /// `call.wrong-arity`, which declines when this is `false`.
         args_plain_positional: bool,
+        /// `true` iff at least one argument is neither a splat (`*a`) nor
+        /// forwarded arguments (`...`) — including a bare keyword hash. Such
+        /// an argument definitely contributes one syntactic positional even
+        /// when neighbouring splats make the total arity unknown. This is
+        /// the distinction the reference reads for a block-form core call
+        /// whose only overload is zero-arity: `each(1) { }`, `each(k: 1) { }`
+        /// and `each(*a, 1) { }` cannot take the zero-arity `-> self` arm,
+        /// while `each(*a) { }` still can because the splat may expand empty.
+        args_have_definite_positional: bool,
         /// `true` iff the argument list is plain positionals (the
         /// `args_plain_positional` test) followed by ONE trailing bare
         /// keyword hash whose every element is an `AssocNode` with a static

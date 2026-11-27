@@ -25,6 +25,62 @@ use crate::flow_writes::{
     STRING_MUTATORS,
 };
 
+/// The collection interface a receiver-call chain in a `for` collection
+/// still proves. `Enumerator` is a value already behind an enumerator
+/// interface (including `Enumerator::Lazy`), whose no-block `each` returns
+/// `self`; `Other` is a core enumerable whose element the shape/type layer
+/// proved. `ForChain::shape_backed` records whether an Array/Hash bottom is
+/// a shape carrier rather than a nominal.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ForChainKind {
+    Array,
+    Hash,
+    Enumerator,
+    Other,
+}
+
+/// The iteration element a collection expression carries, plus the element
+/// after a `-> self` call projects the collection through
+/// `SelfSubstitute.deep_widen`. The two differ for a Hash: its type arguments
+/// widen independently (`Hash[:k, 1]` iterates `[Symbol, Integer]` after a
+/// self return), while one Enumerator type argument widens as a whole
+/// (`Enumerator[[:k, 1]]` iterates `Array[Symbol | Integer]`).
+#[derive(Clone, Copy)]
+struct ForChain {
+    elem: TypeId,
+    self_elem: TypeId,
+    kind: ForChainKind,
+    /// A Hash receiver's key/value type arguments, before they collapse
+    /// into the `[k, v]` pair `elem` — `each_key` / `each_value` project
+    /// one side. `None` for arrays, enumerators and non-Hash enumerables.
+    hash_args: Option<(TypeId, TypeId)>,
+    /// Whether the bottom expression is a Tuple/HashShape carrier. Only
+    /// those carriers take ShapeDispatch's shape-preserving pure
+    /// self-returners; a nominal `-> self` deep-widens its type arguments.
+    shape_backed: bool,
+    /// Whether a nil-only block-level `break` can still make this chain's
+    /// value nil. `each`/`lazy` drop that member because nil lacks the
+    /// method; Object's self-returners (`dup`/`freeze`/`clone`/`itself`)
+    /// preserve it. A chain reaching the `for` collection with this set
+    /// has no precise element.
+    maybe_nil: bool,
+}
+
+/// Whether Ruby can build a Range from two static endpoint values. Integer
+/// and Float compare across the numeric tower; String compares with String.
+/// A NaN endpoint makes `<=>` nil, and mixed numerics/strings raise the
+/// `ArgumentError` that keeps `type_of_range` from pinning a Constant range.
+fn static_range_compatible(left: &Scalar, right: &Scalar) -> bool {
+    let numeric = |s: &Scalar| matches!(s, Scalar::Int(_) | Scalar::BigInt(_) | Scalar::Float(_));
+    if matches!(left, Scalar::Float(f) if f.is_nan())
+        || matches!(right, Scalar::Float(f) if f.is_nan())
+    {
+        return false;
+    }
+    (numeric(left) && numeric(right))
+        || (matches!(left, Scalar::Str(_)) && matches!(right, Scalar::Str(_)))
+}
+
 /// A slot mutation's literal key as the one element-read step it is
 /// (`ElementReadWidening.index_step`): an Integer a position, a Symbol or
 /// String a key, anything else (never recorded by `stable_index_key`
@@ -6268,42 +6324,446 @@ impl<'i> Typer<'i> {
         }
         let ty = self.type_of(ast, coll, env, interner);
         let structural = self.collection_element_ty(ty, interner);
-        if !matches!(interner.get(structural), Type::Dynamic(_) | Type::Top) {
+        if self.for_element_precise(structural, interner) {
             return structural;
         }
-        // `for_iteration_element_type` asks `MethodDispatcher.expected_block_param_types`
-        // on `coll.each` when the structural answer is untyped. The port has
-        // no dispatcher probe here; a receiver-call `each` / `lazy` yields
-        // the receiver's own element (`[1].each` → `1`, `{k: 1}.each` →
-        // `[:k, 1]`), matching the oracle's block-param answer.
-        if let Node::Call {
-            receiver: Some(r),
-            method,
-            args,
-            block_body,
-            ..
-        } = ast.get(coll)
+        // `for_iteration_element_type` asks
+        // `MethodDispatcher.expected_block_param_types` on `coll.each` when
+        // the structural answer is untyped. The port has no dispatcher probe
+        // here; the receiver-call chain walk below is its strict core-shape
+        // subset. It carries the element through the pure self-returners,
+        // `lazy`, and `each`/`each_pair`, including the self-return widening
+        // an enumerator's own no-block `each` performs (rigor-rs#1042).
+        let mut force_untyped = false;
+        if let Some(chain) =
+            self.for_collection_chain(ast, env, coll, interner, &mut force_untyped, true)
         {
-            if args.is_empty()
-                && block_body.is_empty()
-                && matches!(method.as_str(), "each" | "lazy")
-            {
-                let r = *r;
-                let recv_ty = self.type_of(ast, r, env, interner);
-                let elem = self.collection_element_ty(recv_ty, interner);
-                if !matches!(interner.get(elem), Type::Dynamic(_) | Type::Top) {
-                    return elem;
-                }
-            }
+            return if chain.maybe_nil {
+                interner.untyped()
+            } else {
+                chain.elem
+            };
+        }
+        // A live block-level `break` can replace the collection call's
+        // result, and a proven plain-positional arity error has no self
+        // return to read. Both decline to untyped even when the ordinary
+        // call type still looks like a bare Hash; keeping that
+        // `[untyped, untyped]` pair shell would invent a diagnostic
+        // (`{k:1}.each { break }`).
+        if force_untyped {
+            return interner.untyped();
         }
         structural
     }
 
+    /// Whether the structural element answer carries any precise
+    /// information. A bare nominal Hash projects to `[untyped, untyped]`,
+    /// which is a Tuple shell around no answer at all; treating that shell
+    /// as precise would hide the receiver-call fallback (`{k: 1}.each {}`).
+    /// A partially precise pair keeps its evidence.
+    fn for_element_precise(&self, ty: TypeId, interner: &Interner) -> bool {
+        match interner.get(ty) {
+            Type::Dynamic(_) | Type::Top => false,
+            Type::Tuple(elements) => elements
+                .iter()
+                .any(|&e| !matches!(interner.get(e), Type::Dynamic(_) | Type::Top)),
+            _ => true,
+        }
+    }
+
+    /// The strict collection-chain subset of the reference's
+    /// `expected_block_param_types` fallback. `None` declines unless the
+    /// chain bottoms out in a shape/type whose element answer the reference
+    /// also proves — a bare Array has no such answer, while even a bare Hash
+    /// carries the oracle's `[untyped, untyped]` pair shell.
+    fn for_collection_chain(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        id: NodeId,
+        interner: &mut Interner,
+        force_untyped: &mut bool,
+        is_root: bool,
+    ) -> Option<ForChain> {
+        if let Node::Call {
+            receiver: Some(receiver),
+            method,
+            args,
+            block_body,
+            block_params,
+            block_span,
+            safe_nav,
+            args_have_definite_positional,
+            ..
+        } = ast.get(id)
+        {
+            let receiver = *receiver;
+            let has_block = block_span.is_some() || !block_body.is_empty();
+            let mut own_nil_break = false;
+            // A break carried by the collection's OUTERMOST literal block
+            // replaces that call's result (`[1].dup { break }` is untyped).
+            // Inside the chain, a nil break arm is only the zero-ish union
+            // member the reference still sees through (`[1].freeze { break }.each`
+            // keeps Integer), while a non-nil arm poisons the receiver type
+            // (`break 1` / `break [2]` both decline). Dead break arms are
+            // filtered in the block-entry scope.
+            if let Some(span) = block_span {
+                if self.block_level_break(ast, *span) {
+                    let recv_ty = self.type_of(ast, receiver, env, interner);
+                    let arms = self.block_level_live_break_arms(
+                        ast,
+                        *span,
+                        block_body,
+                        block_params,
+                        recv_ty,
+                        env,
+                        interner,
+                    );
+                    let nonnil_arm = arms.iter().any(|&arm| {
+                        let nonnil = self.narrow_non_nil(arm, interner);
+                        !matches!(interner.get(nonnil), Type::Bottom)
+                    });
+                    if (!arms.is_empty() && is_root) || nonnil_arm {
+                        *force_untyped = true;
+                        return None;
+                    }
+                    // Inside the chain, nil is the one break member the
+                    // reference's next `each`/`lazy` link can still see
+                    // through. Keep it as a state rather than collapsing the
+                    // chain: Object's self-returners answer on nil and carry
+                    // that member onward.
+                    own_nil_break = !arms.is_empty();
+                }
+            }
+            // ShapeDispatch's pure self-returners preserve a Tuple/HashShape
+            // carrier byte-for-byte (`dup`/`clone` copy the object, not its
+            // immutable shape description).
+            if matches!(method.as_str(), "freeze" | "dup" | "clone" | "itself") {
+                if let Some(chain) =
+                    self.for_collection_chain(ast, env, receiver, interner, force_untyped, false)
+                {
+                    // ShapeDispatch's carrier-preserving arm is no-block
+                    // only. With a block the call falls to the RBS `-> self`
+                    // arm, whose type arguments deep-widen. Arguments do not
+                    // change either answer: a wrong-arity spelling is
+                    // diagnosed independently and the reference still types
+                    // the block parameters from the signature.
+                    let mut result = if chain.shape_backed && !has_block {
+                        chain
+                    } else {
+                        self.nominal_self_for_chain(chain, interner)
+                    };
+                    result.maybe_nil = chain.maybe_nil || own_nil_break;
+                    return Some(result);
+                }
+            }
+            match method.as_str() {
+                // `Enumerable#lazy: () -> Enumerator::Lazy[E]` constructs a
+                // fresh enumerator. The element variable is substituted
+                // directly, so a pinned element survives (`[1].lazy` yields
+                // `1`); only a later `-> self` call widens it.
+                "lazy" => {
+                    let chain = self.for_collection_chain(ast, env, receiver, interner, force_untyped, false)?;
+                    let mut result = self.enumerator_for_chain(chain.elem, interner);
+                    result.maybe_nil = if *safe_nav {
+                        // `recv&.lazy` skips the call on nil, so the nil
+                        // member survives instead of being dropped by dispatch.
+                        chain.maybe_nil || own_nil_break
+                    } else {
+                        own_nil_break
+                    };
+                    return Some(result);
+                }
+                // `Array#each` / `Hash#each`/`each_pair` without a block
+                // construct `Enumerator[E, self]` and preserve E, even on a
+                // wrong-arity spelling whose arity is diagnosed separately.
+                // On an Enumerator receiver, though, `Enumerator#each`
+                // returns `self`; the `SelfSubstitute` projection deep-widens
+                // the type argument. With a block, Array/Hash `each` itself
+                // returns `self`, so the same widening applies to the
+                // receiver's key/element/value type arguments.
+                "each" | "each_pair" | "each_key" | "each_value" => {
+                    if has_block && !args.is_empty() && *args_have_definite_positional {
+                        // A definite positional cannot reach the zero-arity
+                        // block overload's `-> self` arm. A splat-only list
+                        // is different: it may expand empty, so the
+                        // reference keeps the signature answer.
+                        *force_untyped = true;
+                        return None;
+                    }
+                    let chain = self.for_collection_chain(ast, env, receiver, interner, force_untyped, false)?;
+                    let hash_only = !matches!(method.as_str(), "each");
+                    if hash_only && chain.kind != ForChainKind::Hash {
+                        return None;
+                    }
+                    if has_block {
+                        // The block form of `Enumerator#each` returns its R
+                        // type parameter, not necessarily an enumerable. That
+                        // substitution is outside this subset; decline rather
+                        // than inventing a carrier.
+                        if chain.kind == ForChainKind::Enumerator {
+                            return None;
+                        }
+                        let hash_args = chain.hash_args.map(|(k, v)| {
+                            (
+                                self.deep_widen_for_self(k, interner),
+                                self.deep_widen_for_self(v, interner),
+                            )
+                        });
+                        return Some(ForChain {
+                            elem: chain.self_elem,
+                            self_elem: chain.self_elem,
+                            kind: chain.kind,
+                            hash_args,
+                            shape_backed: false,
+                            maybe_nil: if *safe_nav {
+                                chain.maybe_nil || own_nil_break
+                            } else {
+                                own_nil_break
+                            },
+                        });
+                    }
+                    let mut result = if chain.kind == ForChainKind::Enumerator {
+                        self.enumerator_for_chain(chain.self_elem, interner)
+                    } else {
+                        let elem = match method.as_str() {
+                            "each_key" => chain.hash_args?.0,
+                            "each_value" => chain.hash_args?.1,
+                            _ => chain.elem,
+                        };
+                        self.enumerator_for_chain(elem, interner)
+                    };
+                    result.maybe_nil = if *safe_nav {
+                        chain.maybe_nil || own_nil_break
+                    } else {
+                        own_nil_break
+                    };
+                    return Some(result);
+                }
+                _ => {}
+            }
+            if own_nil_break {
+                // The method is outside the modeled chain. Its ordinary
+                // return might still look like a precise collection, but a
+                // live nil break means this subset cannot prove that value
+                // is the one the loop receives.
+                *force_untyped = true;
+                return None;
+            }
+        }
+        if *force_untyped {
+            return None;
+        }
+        self.structural_for_chain(ast, env, id, interner)
+    }
+
+    /// One Enumerator-carried element. Its future `-> self` projection deep-
+    /// widens the element as ONE type argument (`SelfSubstitute.deep_widen`),
+    /// which is why a pair element becomes an Array on a second `each`.
+    fn enumerator_for_chain(&self, elem: TypeId, interner: &mut Interner) -> ForChain {
+        ForChain {
+            elem,
+            self_elem: self.deep_widen_for_self(elem, interner),
+            kind: ForChainKind::Enumerator,
+            hash_args: None,
+            shape_backed: false,
+            maybe_nil: false,
+        }
+    }
+
+    /// A nominal `-> self` projection of a collection chain: the object keeps
+    /// its collection interface, but its type arguments are deep-widened. This
+    /// is distinct from ShapeDispatch's carrier-preserving `dup`/`freeze` on
+    /// a Tuple/HashShape.
+    fn nominal_self_for_chain(&self, chain: ForChain, interner: &mut Interner) -> ForChain {
+        let hash_args = chain.hash_args.map(|(k, v)| {
+            (
+                self.deep_widen_for_self(k, interner),
+                self.deep_widen_for_self(v, interner),
+            )
+        });
+        ForChain {
+            elem: chain.self_elem,
+            self_elem: chain.self_elem,
+            kind: chain.kind,
+            hash_args,
+            shape_backed: false,
+            maybe_nil: chain.maybe_nil,
+        }
+    }
+
+    /// Bottom of [`Self::for_collection_chain`]: read the expression's type
+    /// and keep only the core collection shapes whose element is precise.
+    fn structural_for_chain(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        id: NodeId,
+        interner: &mut Interner,
+    ) -> Option<ForChain> {
+        let ty = self.type_of(ast, id, env, interner);
+        match interner.get(ty).clone() {
+            Type::Tuple(_) => {
+                let elem = self.collection_element_ty(ty, interner);
+                (!matches!(interner.get(elem), Type::Dynamic(_) | Type::Top)).then(|| ForChain {
+                    elem,
+                    self_elem: self.deep_widen_for_self(elem, interner),
+                    kind: ForChainKind::Array,
+                    hash_args: None,
+                    shape_backed: true,
+                    maybe_nil: false,
+                })
+            }
+            Type::HashShape(members) => {
+                let keys: Vec<TypeId> = members
+                    .iter()
+                    .map(|m| self.for_shape_key_ty(interner, &m.key))
+                    .collect();
+                let values: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                if keys.is_empty() {
+                    // `collection_element_type` reads an empty Hash shape as
+                    // its `[untyped, untyped]` pair (unlike an empty Array,
+                    // which has no element answer at all). Keep that shell:
+                    // it is the oracle's own binding for `{}.each`.
+                    let pair = vec![interner.untyped(), interner.untyped()];
+                    let elem = interner.intern(Type::Tuple(pair));
+                    return Some(ForChain {
+                        elem,
+                        self_elem: elem,
+                        kind: ForChainKind::Hash,
+                        hash_args: Some((interner.untyped(), interner.untyped())),
+                        shape_backed: true,
+                        maybe_nil: false,
+                    });
+                }
+                let k = rigor_types::Algebra::union(interner, &keys);
+                let v = rigor_types::Algebra::union(interner, &values);
+                let elem = interner.intern(Type::Tuple(vec![k, v]));
+                let self_k = self.deep_widen_for_self(k, interner);
+                let self_v = self.deep_widen_for_self(v, interner);
+                let self_elem = interner.intern(Type::Tuple(vec![self_k, self_v]));
+                Some(ForChain {
+                    elem,
+                    self_elem,
+                    kind: ForChainKind::Hash,
+                    hash_args: Some((k, v)),
+                    shape_backed: true,
+                    maybe_nil: false,
+                })
+            }
+            Type::Nominal { class, args } => {
+                let class_name = self.index.class_name_for_id(class)?;
+                let (kind, hash_parts) = match class_name {
+                    "Array" => (ForChainKind::Array, false),
+                    "Hash" => (ForChainKind::Hash, true),
+                    "Range" | "Set" => (ForChainKind::Other, false),
+                    "Enumerator" | "Enumerator::Lazy" => (ForChainKind::Enumerator, false),
+                    _ => return None,
+                };
+                let elem = self.collection_element_ty(ty, interner);
+                if matches!(interner.get(elem), Type::Dynamic(_) | Type::Top) {
+                    return None;
+                }
+                let hash_args = if hash_parts {
+                    let k = args.first().copied().unwrap_or_else(|| interner.untyped());
+                    let v = args.get(1).copied().unwrap_or_else(|| interner.untyped());
+                    Some((k, v))
+                } else {
+                    None
+                };
+                let self_elem = if let Some((k, v)) = hash_args {
+                    let k = self.deep_widen_for_self(k, interner);
+                    let v = self.deep_widen_for_self(v, interner);
+                    interner.intern(Type::Tuple(vec![k, v]))
+                } else {
+                    self.deep_widen_for_self(elem, interner)
+                };
+                Some(ForChain {
+                    elem,
+                    self_elem,
+                    kind,
+                    hash_args,
+                    shape_backed: false,
+                    maybe_nil: false,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// `SelfSubstitute.deep_widen`: value pins lift to their classes, and the
+    /// widening recurses through type arguments and nested shape carriers. A
+    /// Tuple becomes `Array[union]`; a HashShape becomes `Hash[key, value]`.
+    /// `Constant[nil]` keeps its pin, matching `widen_value_pinned`.
+    fn deep_widen_for_self(&self, ty: TypeId, interner: &mut Interner) -> TypeId {
+        match interner.get(ty).clone() {
+            Type::Tuple(elements) => {
+                let Some(array) = self.index.class_id("Array") else {
+                    return interner.untyped();
+                };
+                if elements.is_empty() {
+                    return interner.intern(Type::Nominal { class: array, args: vec![] });
+                }
+                let union = rigor_types::Algebra::union(interner, &elements);
+                let elem = self.deep_widen_for_self(union, interner);
+                interner.intern(Type::Nominal { class: array, args: vec![elem] })
+            }
+            Type::HashShape(members) => {
+                let Some(hash) = self.index.class_id("Hash") else {
+                    return interner.untyped();
+                };
+                if members.is_empty() {
+                    return interner.intern(Type::Nominal { class: hash, args: vec![] });
+                }
+                let keys: Vec<TypeId> = members
+                    .iter()
+                    .map(|m| self.for_shape_key_ty(interner, &m.key))
+                    .collect();
+                let values: Vec<TypeId> = members.iter().map(|m| m.value).collect();
+                let k = rigor_types::Algebra::union(interner, &keys);
+                let v = rigor_types::Algebra::union(interner, &values);
+                let k = self.deep_widen_for_self(k, interner);
+                let v = self.deep_widen_for_self(v, interner);
+                interner.intern(Type::Nominal { class: hash, args: vec![k, v] })
+            }
+            Type::Nominal { class, args } => {
+                if args.is_empty() {
+                    ty
+                } else {
+                    let args: Vec<TypeId> = args
+                        .iter()
+                        .map(|&a| self.deep_widen_for_self(a, interner))
+                        .collect();
+                    interner.intern(Type::Nominal { class, args })
+                }
+            }
+            Type::Union(members) => {
+                let members: Vec<TypeId> = members
+                    .iter()
+                    .map(|&m| self.deep_widen_for_self(m, interner))
+                    .collect();
+                rigor_types::Algebra::union(interner, &members)
+            }
+            Type::Dynamic(facet) => {
+                if matches!(interner.get(facet), Type::Top) {
+                    ty
+                } else {
+                    let facet = self.deep_widen_for_self(facet, interner);
+                    interner.intern(Type::Dynamic(facet))
+                }
+            }
+            _ => self.widen_value_pinned(ty, interner),
+        }
+    }
+
     /// Range element class (`type_of_range` → `collection_element_type`).
     /// A missing left (`..3`) is a beginless Constant range whose `first`
-    /// is nil → `Dynamic[top]`. Otherwise `nominal_range_for_endpoints`:
-    /// lift each endpoint (`range_endpoint_element_type`), drop untyped/`nil`,
-    /// union the rest (`nil..3` keeps `Integer` from the right).
+    /// is nil → `Dynamic[top]`. When both endpoints are static and Ruby can
+    /// build the range, `type_of_range` pins the Range object and
+    /// `constant_element_type` reads only `first.class` — `(1..3.5)` yields
+    /// `Integer`, `(1.5..3)` `Float`. Otherwise the endpoints feed
+    /// `nominal_range_for_endpoints`: lift each endpoint, drop untyped/`nil`,
+    /// union the rest (`1.."z"` keeps the invalid range's `Integer | String`).
     fn range_for_element_ty(
         &self,
         ast: &LoweredAst,
@@ -6312,8 +6772,20 @@ impl<'i> Typer<'i> {
         right: Option<NodeId>,
         interner: &mut Interner,
     ) -> TypeId {
-        if left.is_none() {
+        let Some(left_id) = left else {
             return interner.untyped();
+        };
+        let left_scalar = self.static_range_endpoint_scalar(ast, env, left_id, interner);
+        let right_scalar = right.map(|r| self.static_range_endpoint_scalar(ast, env, r, interner));
+        if let Some(left_scalar) = left_scalar {
+            let static_range = match right_scalar {
+                None => true, // endless: `Range.new(left, nil)` never compares the end
+                Some(Some(right_scalar)) => static_range_compatible(&left_scalar, &right_scalar),
+                Some(None) => false,
+            };
+            if static_range {
+                return self.nominal_or_untyped(crate::folding::scalar_class(&left_scalar), interner);
+            }
         }
         let mut ends = Vec::new();
         for end in left.into_iter().chain(right) {
@@ -6326,6 +6798,26 @@ impl<'i> Typer<'i> {
             interner.untyped()
         } else {
             rigor_types::Algebra::union(interner, &ends)
+        }
+    }
+
+    /// `static_range_endpoint`: the endpoint's statically pinned Integer,
+    /// Float or String value. Ruby Bignums are Integers for the class read;
+    /// booleans, symbols and nil deliberately do not qualify, as in the
+    /// reference.
+    fn static_range_endpoint_scalar(
+        &self,
+        ast: &LoweredAst,
+        env: &TypeEnv,
+        id: NodeId,
+        interner: &mut Interner,
+    ) -> Option<Scalar> {
+        let ty = self.type_of(ast, id, env, interner);
+        match interner.get(ty) {
+            Type::Constant(s @ (Scalar::Int(_) | Scalar::BigInt(_) | Scalar::Float(_) | Scalar::Str(_))) => {
+                Some(s.clone())
+            }
+            _ => None,
         }
     }
 
@@ -6392,7 +6884,7 @@ impl<'i> Typer<'i> {
             Type::Nominal { class, args } => {
                 let args = args.clone();
                 match self.index.class_name_for_id(*class) {
-                    Some("Array" | "Range" | "Set" | "Enumerator") => args
+                    Some("Array" | "Range" | "Set" | "Enumerator" | "Enumerator::Lazy") => args
                         .first()
                         .copied()
                         .unwrap_or_else(|| interner.untyped()),

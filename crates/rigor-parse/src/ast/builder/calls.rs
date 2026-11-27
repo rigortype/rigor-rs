@@ -268,6 +268,16 @@ impl<'src> Builder<'src> {
                 .map(|b| b.as_block_argument_node().is_some())
                 .unwrap_or(false);
             let args_all_plain = args_plain_positional && !block_is_pass;
+            // At least one argument that is neither splat nor forwarded `...`
+            // definitely contributes a syntactic positional. A bare keyword
+            // hash counts here: for a zero-arity core-call overload the
+            // reference treats its presence like a positional argument even
+            // though `plain_positional_call?` separately declines it.
+            let args_have_definite_positional = call.arguments().is_some_and(|a| {
+                a.arguments().iter().any(|x| {
+                    x.as_splat_node().is_none() && x.as_forwarding_arguments_node().is_none()
+                })
+            });
             // Plain positionals then one bare keyword hash of static-keyed
             // pairs — `static_hash_shape_for` / `static_hash_key`
             // (`expression_typer.rb`) type it a `HashShape` (rigor-rs#979).
@@ -410,6 +420,7 @@ impl<'src> Builder<'src> {
                 attribute_write: call.is_attribute_write(),
                 first_arg_nonplain,
                 args_plain_positional,
+                args_have_definite_positional,
                 args_all_plain,
                 args_static_kwhash_tail,
                 span: span_of(&call.location()),

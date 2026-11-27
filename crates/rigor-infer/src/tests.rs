@@ -1551,6 +1551,153 @@ fn arm_scope_join_reads_operands_index_and_post_pred() {
     }
 }
 
+/// rigor-rs#1042 — a statically folded mixed-type Range iterates its
+/// FIRST endpoint's class (`constant_element_type` reads `first.class`),
+/// and a receiver-call `each`/`lazy` collection keeps the element through
+/// the chain shapes the reference's block-param dispatch answers. Every
+/// expected value is the oracle's own `x.w` receiver message.
+#[test]
+fn for_element_mixed_ranges_and_receiver_call_chains() {
+    let index = CoreIndex::new();
+    let typer = Typer::new(&index);
+    let x_of = |src: &str| {
+        let ast = lower_src(src.as_bytes());
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = *env.get("x").expect(src);
+        rigor_types::describe_named(&i, ty, &|c| {
+            index.class_name_for_id(c).map(str::to_string)
+        })
+    };
+    for (src, want) in [
+        // `constant_element_type` on the folded Constant range reads
+        // `first.class`; it does not union the two endpoint classes.
+        ("x=\"a\"; if rand > 0; for x in 1..3.5; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in 1.5..3; end; end; x.w", "\"a\" | Float"),
+        ("x=\"a\"; if rand > 0; for x in 1.0..3.0; end; end; x.w", "\"a\" | Float"),
+        ("a=1.5; x=\"a\"; if rand > 0; for x in a..3; end; end; x.w", "\"a\" | Float"),
+        // An invalid mixed range never folds to a Constant, so the nominal
+        // endpoint union still applies.
+        ("x=\"a\"; if rand > 0; for x in 1..\"z\"; end; end; x.w", "\"a\" | Integer | String"),
+        // Receiver-call chains: pure self-returners keep the shape; an
+        // enumerator's own no-block `each` returns `self`, whose type args
+        // widen; `lazy` constructs a fresh lazy enumerator without that
+        // self-return widening.
+        ("x=\"a\"; if rand > 0; for x in [1].dup.each; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze.each; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].each.lazy; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy.lazy; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].each.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].each.lazy.each; end; end; x.w", "\"a\" | Integer"),
+        // The pure self-returners preserve only the shape carriers. On an
+        // Enumerator nominal they take `-> self`, so the element type argument
+        // deep-widens (a pair element widens as one Array element).
+        ("x=\"a\"; if rand > 0; for x in [1].each.dup; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy.itself; end; end; x.w", "\"a\" | Integer"),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each.dup; end; end; x.w",
+            "\"a\" | Array[Integer | Symbol]",
+        ),
+        // Wrong-arity and block-passing spellings are diagnosed independently;
+        // the signature's block-param answer still applies. A block makes even
+        // a shape-backed pure self-returner take the widened `-> self` arm.
+        ("x=\"a\"; if rand > 0; for x in [1].dup(1).each; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].dup{}.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy(1); end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy{}; end; end; x.w", "\"a\" | 1"),
+        // A live break in the OUTERMOST block declines untyped, as does a
+        // plain-positional arity error on a block-form `each`. Inside the
+        // chain a nil break arm is only the union member the reference sees
+        // through, while a non-nil arm poisons the receiver type.
+        ("x=\"a\"; if rand > 0; for x in [1].dup { break }; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy { break }; end; end; x.w", "Dynamic[top]"),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(1) { |y| y }; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each(1) {}; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(k: 1) { |y| y }; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(*[], 1) { |y| y }; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        // A splat-only list may expand empty, so it can still take the
+        // zero-arity `-> self` overload.
+        (
+            "x=\"a\"; if rand > 0; for x in [1].each(*[]) { |y| y }; end; end; x.w",
+            "\"a\" | Integer",
+        ),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].each { break }.each; end; end; x.w", "\"a\" | Integer"),
+        // Nil also answers Object's self-returners, so the maybe-nil state
+        // survives `dup`/`freeze`/`clone`/`itself` until an `each`/`lazy`
+        // link drops it.
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].each { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].lazy { break }.dup; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.dup.each; end; end; x.w", "\"a\" | Integer"),
+        ("x=\"a\"; if rand > 0; for x in [1].dup { break }.freeze.each; end; end; x.w", "\"a\" | Integer"),
+        // Safe navigation does not drop the nil member: `recv&.each` and
+        // `recv&.lazy` skip the call on nil rather than dispatching it.
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }&.each; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }&.lazy; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in [1].freeze { break }.dup&.each; end; end; x.w", "Dynamic[top]"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.freeze { break }&.each_key; end; end; x.w", "Dynamic[top]"),
+        (
+            "x=\"a\"; if rand > 0; for x in [1].freeze { break 1 }.each; end; end; x.w",
+            "Dynamic[top]",
+        ),
+        // Hash iteration yields its pair. `each_pair` is hash-only, and a
+        // second enumerator `each` deep-widens the pair type argument to an
+        // Array, exactly as `SelfSubstitute.deep_widen` does.
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_pair; end; end; x.w", "\"a\" | [:k, 1]"),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each_pair.each; end; end; x.w",
+            "\"a\" | Array[Integer | Symbol]",
+        ),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_key; end; end; x.w", "\"a\" | :k"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_value; end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in {k:1}.each_key.each; end; end; x.w", "\"a\" | Symbol"),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each_value.each; end; end; x.w",
+            "\"a\" | Integer",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each_key { |y| y }; end; end; x.w",
+            "\"a\" | [Symbol, Integer]",
+        ),
+        // Arity is diagnosed independently; the fallback block-param answer
+        // still types the element. A block form returns the receiver `self`,
+        // so the shape's pins widen to their classes.
+        ("x=\"a\"; if rand > 0; for x in [1].each(1); end; end; x.w", "\"a\" | 1"),
+        ("x=\"a\"; if rand > 0; for x in [1].each { |y| y }; end; end; x.w", "\"a\" | Integer"),
+        (
+            "x=\"a\"; if rand > 0; for x in {k:1}.each { |y| y }; end; end; x.w",
+            "\"a\" | [Symbol, Integer]",
+        ),
+        // An empty Hash still has its `[untyped, untyped]` pair shell;
+        // a second enumerator `each` deep-widens that pair as one element.
+        (
+            "x=\"a\"; if rand > 0; for x in {}.each_pair; end; end; x.w",
+            "\"a\" | [Dynamic[top], Dynamic[top]]",
+        ),
+        (
+            "x=\"a\"; if rand > 0; for x in {}.each.each; end; end; x.w",
+            "\"a\" | Array[Dynamic[top]]",
+        ),
+    ] {
+        assert_eq!(x_of(src), want, "{src}");
+    }
+}
+
 /// rigor-rs#952 — the `else` clause of a `begin`/`rescue` joins its type
 /// unconditionally: a non-exiting `else` (even unreachable behind an
 /// exiting body, and even an EMPTY `else; end` — `nil` either way) keeps
