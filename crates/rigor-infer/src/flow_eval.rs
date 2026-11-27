@@ -10077,7 +10077,7 @@ fn unmanaged_begin_writes(
         }
     }
     let mut out: Vec<String> = Vec::new();
-    let mut push = |out: &mut Vec<String>, name: &str| {
+    let push = |out: &mut Vec<String>, name: &str| {
         if !out.iter().any(|n| n == name) {
             out.push(name.to_string());
         }

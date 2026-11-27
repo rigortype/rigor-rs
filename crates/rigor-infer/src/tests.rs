@@ -1460,6 +1460,12 @@ fn live_rescue_arm_writes_join_post_begin_scope() {
         ("def g(a); if rand > 0; a; else; a; end; end; ", "\"a\""),
         ("def g(a); a.upcase; end; ", "\"a\" | \"e\""),
         ("def g(a); z = a; z.upcase; end; ", "\"a\" | \"e\""),
+        // A write the proof cannot model exactly may replace the
+        // parameter's bot with a live value, so the arm stays live.
+        ("def g(a); a = 1 if rand > 0; a; end; ", "\"a\" | \"e\""),
+        ("def g(a); a += 1; a; end; ", "\"a\" | \"e\""),
+        ("def g(a); puts(a = 1); a; end; ", "\"a\" | \"e\""),
+        ("def g(a); a || 1; end; ", "\"a\" | \"e\""),
     ] {
         let src = format!(
             "{defn}x = \"a\"; begin; raise; rescue; x = \"e\"; g(raise); end; x.w"
@@ -1490,6 +1496,68 @@ fn live_rescue_arm_writes_join_post_begin_scope() {
     for want in [a, s, std] {
         assert!(members.contains(&want), "missing {}", rigor_types::describe(&i, want));
     }
+}
+
+/// rigor-rs#965 review — the live begin replay keeps the flat pass's
+/// widening floor for writes it cannot bind exactly, while exact direct
+/// writes still overlay precisely. Without the floor the precise entry
+/// binding re-pinned the pre-write type downstream (a new FP versus both
+/// the oracle and master).
+#[test]
+fn live_begin_replay_keeps_unmanaged_write_floor() {
+    let index = CoreIndex::new();
+    let ty_of = |src: &str, name: &str| {
+        let ast = lower_src(src.as_bytes());
+        let source = SourceIndex::build(&ast, &index);
+        let typer = Typer::with_source(&index, &source);
+        let mut i = Interner::new();
+        let env = typer.build_toplevel_check_env(&ast, &mut i);
+        let ty = *env.get(name).expect(src);
+        (ty, i)
+    };
+
+    for (src, name) in [
+        // A project callee may mutate the array passed to it.
+        ("def fill(a); a << 1; end; xs = []; begin; fill(xs); rescue; end; xs.w", "xs"),
+        ("def fill(a); a << 1; end; xs = []; begin; raise; rescue; fill(xs); end; xs.w", "xs"),
+        // A named capture is not a positional write the replay can bind.
+        ("x = \"a\"; begin; /(?<x>b)/ =~ \"b\"; rescue; end; x.w", "x"),
+        ("x = \"a\"; begin; raise; rescue; /(?<x>b)/ =~ \"b\"; end; x.w", "x"),
+        // A write inside a range operand escapes the structural child walk.
+        ("x = \"a\"; begin; (x = foo)..2; rescue; end; x.w", "x"),
+        ("x = \"a\"; begin; raise; rescue; (x = foo)..2; end; x.w", "x"),
+        // The arm MENTIONS `x` through a range bound, so ClauseWidening
+        // enters it as untyped even though the body's one write was exact.
+        ("x = \"a\"; begin; x = 1; foo; rescue; p(x..5); end; x.w", "x"),
+    ] {
+        let (ty, i) = ty_of(src, name);
+        assert!(
+            matches!(i.get(ty), Type::Dynamic(_)),
+            "{src}: expected Dynamic[top], got {}",
+            rigor_types::describe(&i, ty)
+        );
+    }
+
+    // The floor must not eat direct writes the replay binds exactly, nor
+    // their self-reading folds.
+    let x_of = |src: &str| {
+        let (ty, i) = ty_of(src, "x");
+        rigor_types::describe(&i, ty)
+            .replace("Constant[", "")
+            .replace(']', "")
+    };
+    assert_eq!(
+        x_of("x = \"a\"; begin; raise; rescue; x = \"e\"; end; x.w"),
+        "\"a\" | \"e\""
+    );
+    assert_eq!(
+        x_of("x = 1; begin; raise; rescue; x += 1; end; x.w"),
+        "1 | 2"
+    );
+    assert_eq!(
+        x_of("x = 1; begin; raise; rescue; x = x + 1; end; x.w"),
+        "1 | 2"
+    );
 }
 
 /// rigor-rs#955 — the check flow's branch joins see the same `retry`-bot
